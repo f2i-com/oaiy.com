@@ -5,7 +5,7 @@
 //! host's cache) come back. The copy is brought up to date first with the rows the host wrote since (a prompt's;
 //! [`KvCache::dirty_from`]). On WebGPU a 3B Llama's step, its 113 round trips one, went from 33.6 ms to 16.6.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ggml_rs::{Backend, DeviceVec, QuantizedTensor, Tensor};
 
@@ -67,15 +67,30 @@ impl<'a> Dense<'a> {
 }
 
 /// The chained step's state on the device, made at the first step that can use one; None when the backend has no chain
-/// or a weight a step reads is not on its device.
+/// or a weight a step reads is not on its device. A model split over two devices ([`ChainDecoder::split`]) has a state
+/// on each for its share of the layers, the second's with the head: a step's or a prompt's rows go through the first's
+/// layers, their hidden states to the second (a row a step), which runs the rest; each device's copy of the cache holds
+/// its own layers' rows. A model too big for one card's memory beside its cache (a 33B's 19 GB and 28 GB of cache at
+/// 65,536 positions) so runs on two.
 #[derive(Default)]
 pub(crate) struct ChainDecoder {
     state: OnceLock<Option<ChainState>>,
+    /// The second device and the first of the layers it runs.
+    later: OnceLock<(Arc<dyn Backend>, usize)>,
+    later_state: OnceLock<Option<ChainState>>,
 }
 
 impl std::fmt::Debug for ChainDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChainDecoder({})", match self.state.get() { None => "not yet", Some(None) => "none", Some(Some(_)) => "on the device" })
+        let on = match self.state.get() {
+            None => "not yet",
+            Some(None) => "none",
+            Some(Some(_)) => "on the device",
+        };
+        match self.later.get() {
+            Some((_, from)) => write!(f, "ChainDecoder({on}, split at layer {from})"),
+            None => write!(f, "ChainDecoder({on})"),
+        }
     }
 }
 
@@ -90,10 +105,14 @@ struct ChainKv {
 }
 
 struct ChainState {
+    /// Its layers, `first..first + count`, and whether it runs the head after them (the last device's state).
+    first: usize,
+    count: usize,
+    head: bool,
     kv: Mutex<ChainKv>,
     /// A sine-and-cosine table a distinct RoPE of the layers.
     rope_tables: Vec<DeviceVec>,
-    /// Gemma 3's norms of a layer's attention and FFN outputs.
+    /// Gemma 3's norms of a layer's attention and FFN outputs (its layers' each, as the norms below).
     post_norms: Option<Vec<(DeviceVec, DeviceVec)>>,
     attn_norms: Vec<DeviceVec>,
     ffn_norms: Vec<DeviceVec>,
@@ -117,14 +136,15 @@ struct ChainState {
     logits: DeviceVec,
 }
 
-/// Room in the device's copy of the cache for `needed` rows (grown to a power of two, its rows kept).
-fn reserve(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, needed: usize) {
+/// Room in the device's copy of the cache for `needed` rows of its `layers` layers (grown to a power of two, its rows
+/// kept).
+fn reserve(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, needed: usize, layers: usize) {
     if g.cap >= needed {
         return;
     }
     let row = 2 * cfg.n_kv_heads * cfg.head_dim;
     let cap = needed.next_power_of_two().max(256);
-    g.layers = (0..cfg.n_layers)
+    g.layers = (0..layers)
         .map(|l| match g.layers.get(l) {
             Some(old) => chain.resize(old, cap * row),
             None => chain.vec(cap * row),
@@ -134,13 +154,14 @@ fn reserve(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig,
     g.cap = cap;
 }
 
-/// Bring the device's copy of the cache up to `past` rows: the rows the host wrote since (all of them for a cache the
-/// copy is not of).
-fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv: &KvCache, past: usize) {
+/// Bring the device's copy of the cache (its layers from `first`) up to `past` rows: the rows the host wrote since (all
+/// of them for a cache the copy is not of).
+fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv: &KvCache, past: usize, first: usize) {
     let (kvd, row) = (cfg.n_kv_heads * cfg.head_dim, 2 * cfg.n_kv_heads * cfg.head_dim);
     let from = if g.owner == kv.id { kv.dirty_from.min(past) } else { 0 };
     if from < past {
-        for l in 0..cfg.n_layers {
+        for (i, layer) in g.layers.iter().enumerate() {
+            let l = first + i;
             // the host's buffers read in place (a copy of one was its whole capacity: 0.3 s for 512 rows)
             let (kh, vh) = (kv.k_buffer(l), kv.v_buffer(l));
             let (kown, vown);
@@ -151,10 +172,69 @@ fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv
                 rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
                 rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
             }
-            chain.upload_at(&g.layers[l], from * row, &rows);
+            chain.upload_at(layer, from * row, &rows);
         }
     }
     g.owner = kv.id;
+}
+
+/// The state of `backend`'s share of `m`'s layers (`layers`, and the head where `head`): None where its chain does not
+/// hold one of their weights.
+fn make_state(backend: &dyn Backend, m: &Dense<'_>, layers: std::ops::Range<usize>, head: bool) -> Option<ChainState> {
+    let chain = backend.chain()?;
+    let held = |w: &Weight| match w {
+        Weight::Quant(q) if chain.holds(q) => Some(()),
+        _ => None,
+    };
+    let blocks = &m.common.blocks[layers.clone()];
+    for b in blocks {
+        for w in [&b.attn_q, &b.attn_k, &b.attn_v, &b.attn_output, &b.ffn_down] {
+            held(w)?;
+        }
+        match &b.ffn_pair {
+            FfnPair::Fused(w) => held(w)?,
+            FfnPair::Split { .. } => return None,
+        }
+    }
+    if head {
+        held(&m.common.output)?;
+    }
+    let cfg = m.cfg;
+    if cfg.n_kv_heads == 0 || cfg.n_heads % cfg.n_kv_heads != 0 {
+        return None;
+    }
+    let upload = |t: &Tensor| {
+        let t = if t.is_device() { t.to_host() } else { t.clone() };
+        let v = chain.vec(t.numel());
+        chain.upload(&v, t.data());
+        v
+    };
+    let ff = m.common.blocks[0].ffn_pair.ff();
+    let (d, qd, kvd) = (cfg.embedding_dim, cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
+    Some(ChainState {
+        first: layers.start,
+        count: layers.len(),
+        head,
+        kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
+        rope_tables: m.ropes().0.iter().map(|_| chain.vec(cfg.head_dim)).collect(),
+        post_norms: m.post_norms.as_ref().map(|norms| norms[layers.clone()].iter().map(|(a, f)| (upload(a), upload(f))).collect()),
+        attn_norms: blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
+        ffn_norms: blocks.iter().map(|b| upload(&b.ffn_norm)).collect(),
+        qk_norms: m.qk_norms.as_ref().map(|norms| norms[layers.clone()].iter().map(|(q, k)| (upload(q), upload(k))).collect()),
+        output_norm: upload(&m.common.output_norm),
+        x: chain.vec(d),
+        xn: chain.vec(d),
+        q: chain.vec(qd),
+        k: chain.vec(kvd),
+        v: chain.vec(kvd),
+        qn: chain.vec(qd),
+        kn: chain.vec(kvd),
+        proj: chain.vec(d),
+        proj_n: chain.vec(d),
+        gate_up: chain.vec(2 * ff),
+        act: chain.vec(ff),
+        logits: chain.vec(cfg.vocab_size),
+    })
 }
 
 /// Each distinct RoPE's sines and cosines for positions `past..past + rows`, `[rows, head_dim]`, as the CPU's rope
@@ -206,59 +286,22 @@ fn quant(w: &Weight) -> &QuantizedTensor {
 }
 
 impl ChainDecoder {
-    fn state(&self, backend: &dyn Backend, m: &Dense<'_>) -> Option<&ChainState> {
-        self.state
-            .get_or_init(|| {
-                let chain = backend.chain()?;
-                let held = |w: &Weight| match w {
-                    Weight::Quant(q) if chain.holds(q) => Some(()),
-                    _ => None,
-                };
-                for b in &m.common.blocks {
-                    for w in [&b.attn_q, &b.attn_k, &b.attn_v, &b.attn_output, &b.ffn_down] {
-                        held(w)?;
-                    }
-                    match &b.ffn_pair {
-                        FfnPair::Fused(w) => held(w)?,
-                        FfnPair::Split { .. } => return None,
-                    }
-                }
-                held(&m.common.output)?;
-                let cfg = m.cfg;
-                if cfg.n_kv_heads == 0 || cfg.n_heads % cfg.n_kv_heads != 0 {
-                    return None;
-                }
-                let upload = |t: &Tensor| {
-                    let t = if t.is_device() { t.to_host() } else { t.clone() };
-                    let v = chain.vec(t.numel());
-                    chain.upload(&v, t.data());
-                    v
-                };
-                let ff = m.common.blocks[0].ffn_pair.ff();
-                let (d, qd, kvd) = (cfg.embedding_dim, cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
-                Some(ChainState {
-                    kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
-                    rope_tables: m.ropes().0.iter().map(|_| chain.vec(cfg.head_dim)).collect(),
-                    post_norms: m.post_norms.as_ref().map(|norms| norms.iter().map(|(a, f)| (upload(a), upload(f))).collect()),
-                    attn_norms: m.common.blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
-                    ffn_norms: m.common.blocks.iter().map(|b| upload(&b.ffn_norm)).collect(),
-                    qk_norms: m.qk_norms.as_ref().map(|norms| norms.iter().map(|(q, k)| (upload(q), upload(k))).collect()),
-                    output_norm: upload(&m.common.output_norm),
-                    x: chain.vec(d),
-                    xn: chain.vec(d),
-                    q: chain.vec(qd),
-                    k: chain.vec(kvd),
-                    v: chain.vec(kvd),
-                    qn: chain.vec(qd),
-                    kn: chain.vec(kvd),
-                    proj: chain.vec(d),
-                    proj_n: chain.vec(d),
-                    gate_up: chain.vec(2 * ff),
-                    act: chain.vec(ff),
-                    logits: chain.vec(cfg.vocab_size),
-                })
-            })
-            .as_ref()
+    /// The layers from `from` on, and the head, run on `other` (whose chain holds their weights): asked before the first
+    /// step, else refused (false).
+    pub(crate) fn split(&self, other: Arc<dyn Backend>, from: usize) -> bool {
+        self.state.get().is_none() && self.later.set((other, from)).is_ok()
+    }
+
+    /// Each device's part in the order the layers go through them: its backend and its state there.
+    fn parts<'s>(&'s self, backend: &'s dyn Backend, m: &Dense<'_>) -> Option<Vec<(&'s dyn Backend, &'s ChainState)>> {
+        let to = self.later.get().map_or(m.cfg.n_layers, |(_, from)| *from);
+        let first = self.state.get_or_init(|| make_state(backend, m, 0..to, self.later.get().is_none())).as_ref()?;
+        let mut parts = vec![(backend, first)];
+        if let Some((other, from)) = self.later.get() {
+            let st = self.later_state.get_or_init(|| make_state(other.as_ref(), m, *from..m.cfg.n_layers, true)).as_ref()?;
+            parts.push((other.as_ref(), st));
+        }
+        Some(parts)
     }
 
     /// A prompt's chunk of `tokens`, chained in one submit, if the backend can: the last token's logits `[1, vocab]`;
@@ -282,7 +325,8 @@ impl ChainDecoder {
 
     /// [`Self::prompt`] of `t` rows given as their embeddings (`[t, d]`: a picture's tokens among a prompt's), at
     /// `positions` (each row's time, height and width; None: the rows after what `kv` holds), with `deepstack[i]`
-    /// (`[t, d]`, zero where no picture is) added to the states after layer `i`: Qwen3-VL's DeepStack.
+    /// (`[t, d]`, zero where no picture is) added to the states after layer `i`: Qwen3-VL's DeepStack. A split model's
+    /// chunk goes through each device's layers in turn, its hidden states read back and given to the next.
     pub(crate) fn prompt_embeds(&self, backend: &dyn Backend, m: &Dense<'_>, emb: &[f32], t: usize, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>]) -> Option<Tensor> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || t == 0 || emb.len() != t * m.cfg.embedding_dim {
             return None;
@@ -290,8 +334,10 @@ impl ChainDecoder {
         if positions.is_some_and(|p| p.len() != t) || deepstack.len() > m.cfg.n_layers || deepstack.iter().any(|d| d.len() != emb.len()) {
             return None;
         }
-        let st = self.state(backend, m)?;
-        let chain = backend.chain()?;
+        let parts = self.parts(backend, m)?;
+        if parts.len() > 1 && !deepstack.is_empty() {
+            return None;
+        }
         let cfg = m.cfg;
         let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
         let (qd, kvd, row) = (n_h * hd, n_kv * hd, 2 * n_kv * hd);
@@ -299,99 +345,115 @@ impl ChainDecoder {
         let past = kv.len;
         let scale = 1.0 / (hd as f32).sqrt();
         let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
-        let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        reserve(chain, &mut g, cfg, past + t);
-        sync(chain, &mut g, cfg, kv, past);
         let rope_of = m.ropes().1;
         let tables = match positions {
             Some(at) => rope_tables_at(m, at),
             None => rope_tables(m, past, t),
         };
-        let tables: Vec<DeviceVec> = tables
-            .iter()
-            .map(|values| {
-                let table = chain.vec(values.len());
-                chain.upload(&table, values);
-                table
-            })
-            .collect();
-        let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act] =
-            [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
-        let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
-        let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
-        chain.upload(&x, emb);
-        let deepstack: Vec<DeviceVec> = deepstack
-            .iter()
-            .map(|rows| {
-                let v = chain.vec(rows.len());
-                chain.upload(&v, rows);
-                v
-            })
-            .collect();
-        let mut rec = chain.begin();
-        // the chunk's vectors are its own: no bind groups kept to hold their memory after it
-        rec.keep_groups(false);
-        for l in 0..cfg.n_layers {
-            let b = &m.common.blocks[l];
-            rec.rmsnorm_rows(&x, &st.attn_norms[l], &xn, t, cfg.rms_eps);
-            rec.matmul_rows(quant(&b.attn_q), &xn, &q, t);
-            rec.matmul_rows(quant(&b.attn_k), &xn, &k, t);
-            rec.matmul_rows(quant(&b.attn_v), &xn, &v, t);
-            let (qq, kk) = match &st.qk_norms {
-                Some(norms) => {
-                    rec.rmsnorm_rows(&q, &norms[l].0, &qn, t * n_h, cfg.rms_eps);
-                    rec.rmsnorm_rows(&k, &norms[l].1, &kn, t * n_kv, cfg.rms_eps);
-                    (&qn, &kn)
+        // (the rows a part takes: the embeddings, then the part before's hidden states)
+        let mut rows_in: Vec<f32> = emb.to_vec();
+        let (mut out, mut kv_rows) = (Vec::new(), Vec::with_capacity(cfg.n_layers));
+        for &(part, st) in &parts {
+            let chain = part.chain()?;
+            let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+            reserve(chain, &mut g, cfg, past + t, st.count);
+            sync(chain, &mut g, cfg, kv, past, st.first);
+            let tables: Vec<DeviceVec> = tables
+                .iter()
+                .map(|values| {
+                    let table = chain.vec(values.len());
+                    chain.upload(&table, values);
+                    table
+                })
+                .collect();
+            let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act] =
+                [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
+            let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
+            let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
+            chain.upload(&x, &rows_in);
+            let deepstack: Vec<DeviceVec> = deepstack
+                .iter()
+                .map(|rows| {
+                    let v = chain.vec(rows.len());
+                    chain.upload(&v, rows);
+                    v
+                })
+                .collect();
+            let mut rec = chain.begin();
+            // the chunk's vectors are its own: no bind groups kept to hold their memory after it
+            rec.keep_groups(false);
+            for l in st.first..st.first + st.count {
+                let (b, i) = (&m.common.blocks[l], l - st.first);
+                rec.rmsnorm_rows(&x, &st.attn_norms[i], &xn, t, cfg.rms_eps);
+                rec.matmul_rows(quant(&b.attn_q), &xn, &q, t);
+                rec.matmul_rows(quant(&b.attn_k), &xn, &k, t);
+                rec.matmul_rows(quant(&b.attn_v), &xn, &v, t);
+                let (qq, kk) = match &st.qk_norms {
+                    Some(norms) => {
+                        rec.rmsnorm_rows(&q, &norms[i].0, &qn, t * n_h, cfg.rms_eps);
+                        rec.rmsnorm_rows(&k, &norms[i].1, &kn, t * n_kv, cfg.rms_eps);
+                        (&qn, &kn)
+                    }
+                    None => (&q, &k),
+                };
+                let table = &tables[rope_of[l]];
+                rec.rope_rows(qq, t, n_h, hd, table, neox);
+                rec.rope_rows(kk, t, n_kv, hd, table, neox);
+                rec.store_rows(kk, &g.layers[i], t, kvd, past, row, 0);
+                rec.store_rows(&v, &g.layers[i], t, kvd, past, row, kvd);
+                rec.attention_rows(qq, &g.layers[i], &attn, t, n_h, n_kv, hd, past, m.layer(l).2, scale);
+                rec.matmul_rows(quant(&b.attn_output), &attn, &proj, t);
+                match &st.post_norms {
+                    Some(norms) => {
+                        rec.rmsnorm_rows(&proj, &norms[i].0, &proj_n, t, cfg.rms_eps);
+                        rec.add(&x, &proj_n);
+                    }
+                    None => rec.add(&x, &proj),
                 }
-                None => (&q, &k),
-            };
-            let table = &tables[rope_of[l]];
-            rec.rope_rows(qq, t, n_h, hd, table, neox);
-            rec.rope_rows(kk, t, n_kv, hd, table, neox);
-            rec.store_rows(kk, &g.layers[l], t, kvd, past, row, 0);
-            rec.store_rows(&v, &g.layers[l], t, kvd, past, row, kvd);
-            rec.attention_rows(qq, &g.layers[l], &attn, t, n_h, n_kv, hd, past, m.layer(l).2, scale);
-            rec.matmul_rows(quant(&b.attn_output), &attn, &proj, t);
-            match &st.post_norms {
-                Some(norms) => {
-                    rec.rmsnorm_rows(&proj, &norms[l].0, &proj_n, t, cfg.rms_eps);
-                    rec.add(&x, &proj_n);
+                rec.rmsnorm_rows(&x, &st.ffn_norms[i], &xn, t, cfg.rms_eps);
+                let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
+                rec.matmul_rows(quant(gu), &xn, &gate_up, t);
+                if m.gelu {
+                    rec.gelu_mul_split_rows(&gate_up, &act, t);
+                } else {
+                    rec.silu_mul_split_rows(&gate_up, &act, t);
                 }
-                None => rec.add(&x, &proj),
+                rec.matmul_rows(quant(&b.ffn_down), &act, &proj, t);
+                match &st.post_norms {
+                    Some(norms) => {
+                        rec.rmsnorm_rows(&proj, &norms[i].1, &proj_n, t, cfg.rms_eps);
+                        rec.add(&x, &proj_n);
+                    }
+                    None => rec.add(&x, &proj),
+                }
+                // (Qwen3-VL: a DeepStack merger's tokens at the picture's rows, after the layer)
+                if let Some(ds) = deepstack.get(l) {
+                    rec.add(&x, ds);
+                }
             }
-            rec.rmsnorm_rows(&x, &st.ffn_norms[l], &xn, t, cfg.rms_eps);
-            let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
-            rec.matmul_rows(quant(gu), &xn, &gate_up, t);
-            if m.gelu {
-                rec.gelu_mul_split_rows(&gate_up, &act, t);
+            if st.head {
+                // the head of the last token's row only
+                rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
+                rec.copy(&xn, (t - 1) * d, &last, 0, d);
+                rec.matmul(quant(&m.common.output), &last, &logits);
+                rec.read(&logits);
             } else {
-                rec.silu_mul_split_rows(&gate_up, &act, t);
+                rec.read(&x);
             }
-            rec.matmul_rows(quant(&b.ffn_down), &act, &proj, t);
-            match &st.post_norms {
-                Some(norms) => {
-                    rec.rmsnorm_rows(&proj, &norms[l].1, &proj_n, t, cfg.rms_eps);
-                    rec.add(&x, &proj_n);
-                }
-                None => rec.add(&x, &proj),
+            for layer in g.layers.iter() {
+                rec.read_range(layer, past * row, t * row);
             }
-            // (Qwen3-VL: a DeepStack merger's tokens at the picture's rows, after the layer)
-            if let Some(ds) = deepstack.get(l) {
-                rec.add(&x, ds);
+            let mut got = rec.finish().into_iter();
+            let first = got.next().expect("the logits or the hidden states");
+            if st.head {
+                out = first;
+            } else {
+                rows_in = first;
             }
+            kv_rows.extend(got);
         }
-        // the head of the last token's row only
-        rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
-        rec.copy(&xn, (t - 1) * d, &last, 0, d);
-        rec.matmul(quant(&m.common.output), &last, &logits);
-        rec.read(&logits);
-        for l in 0..cfg.n_layers {
-            rec.read_range(&g.layers[l], past * row, t * row);
-        }
-        let mut got = rec.finish().into_iter();
-        let mut out = got.next().expect("the logits");
         // the chunk's K and V rows into the host's cache too, which the copy already holds
-        for (l, rows) in got.enumerate() {
+        for (l, rows) in kv_rows.into_iter().enumerate() {
             kv.append_rows(backend, l, &rows, t);
         }
         kv.commit(t);
@@ -409,94 +471,111 @@ impl ChainDecoder {
     }
 
     /// [`Self::step`] with the token at `position` (its time, height and width: a reply after a picture, which is
-    /// shorter in positions than in rows); None: at the row it takes.
+    /// shorter in positions than in rows); None: at the row it takes. A split model's step is a submit a device, its
+    /// hidden state (one row) read back and given to the next.
     pub(crate) fn step_at(&self, backend: &dyn Backend, m: &Dense<'_>, token: u32, kv: &mut KvCache, position: Option<[u32; 3]>) -> Option<Tensor> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() {
             return None;
         }
-        let st = self.state(backend, m)?;
-        let chain = backend.chain()?;
+        let parts = self.parts(backend, m)?;
         let cfg = m.cfg;
         let (n_h, n_kv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
         let (kvd, row) = (n_kv * hd, 2 * n_kv * hd);
         let past = kv.len;
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-        reserve(chain, &mut g, cfg, past + 1);
-        sync(chain, &mut g, cfg, kv, past);
         // each RoPE's sines and cosines at this position
         let rope_of = m.ropes().1;
-        for (values, table) in rope_tables_at(m, &[position.unwrap_or([past as u32; 3])]).iter().zip(&st.rope_tables) {
-            chain.upload(table, values);
-        }
+        let rope_values = rope_tables_at(m, &[position.unwrap_or([past as u32; 3])]);
         let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
         let emb = backend.embed_lookup(&m.common.tok_embd, &[token], cfg.embedding_dim);
         let mut emb = if emb.is_device() { emb.to_host() } else { emb };
         if let Some(s) = m.embed_scale {
             emb.data_mut().iter_mut().for_each(|v| *v *= s);
         }
-        chain.upload(&st.x, emb.data());
-        let mut rec = chain.begin();
-        for l in 0..cfg.n_layers {
-            let b = &m.common.blocks[l];
-            rec.rmsnorm(&st.x, &st.attn_norms[l], &st.xn, cfg.rms_eps);
-            rec.matmul(quant(&b.attn_q), &st.xn, &st.q);
-            rec.matmul(quant(&b.attn_k), &st.xn, &st.k);
-            rec.matmul(quant(&b.attn_v), &st.xn, &st.v);
-            let (q, k) = match &st.qk_norms {
-                Some(norms) => {
-                    rec.rmsnorm_rows(&st.q, &norms[l].0, &st.qn, n_h, cfg.rms_eps);
-                    rec.rmsnorm_rows(&st.k, &norms[l].1, &st.kn, n_kv, cfg.rms_eps);
-                    (&st.qn, &st.kn)
-                }
-                None => (&st.q, &st.k),
-            };
-            let table = &st.rope_tables[rope_of[l]];
-            rec.rope(q, n_h, hd, table, neox);
-            rec.rope(k, n_kv, hd, table, neox);
-            rec.store(k, &g.layers[l], past * row);
-            rec.store(&st.v, &g.layers[l], past * row + kvd);
-            // a sliding window sees the last `w` positions, as the CPU's attention does
-            let lo = m.layer(l).2.map_or(0, |w| (past + 1).saturating_sub(w));
-            rec.attention(q, &g.layers[l], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
-            rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
-            match &st.post_norms {
-                Some(norms) => {
-                    rec.rmsnorm(&st.proj, &norms[l].0, &st.proj_n, cfg.rms_eps);
-                    rec.add(&st.x, &st.proj_n);
-                }
-                None => rec.add(&st.x, &st.proj),
+        // (the row a part takes: the embedding, then the part before's hidden state)
+        let mut row_in: Vec<f32> = emb.data().to_vec();
+        let (mut logits, mut kv_rows) = (Vec::new(), Vec::with_capacity(cfg.n_layers));
+        for &(part, st) in &parts {
+            let chain = part.chain()?;
+            let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+            reserve(chain, &mut g, cfg, past + 1, st.count);
+            sync(chain, &mut g, cfg, kv, past, st.first);
+            for (values, table) in rope_values.iter().zip(&st.rope_tables) {
+                chain.upload(table, values);
             }
-            rec.rmsnorm(&st.x, &st.ffn_norms[l], &st.xn, cfg.rms_eps);
-            let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
-            rec.matmul(quant(gu), &st.xn, &st.gate_up);
-            if m.gelu {
-                rec.gelu_mul_split(&st.gate_up, &st.act);
+            chain.upload(&st.x, &row_in);
+            let mut rec = chain.begin();
+            for l in st.first..st.first + st.count {
+                let (b, i) = (&m.common.blocks[l], l - st.first);
+                rec.rmsnorm(&st.x, &st.attn_norms[i], &st.xn, cfg.rms_eps);
+                rec.matmul(quant(&b.attn_q), &st.xn, &st.q);
+                rec.matmul(quant(&b.attn_k), &st.xn, &st.k);
+                rec.matmul(quant(&b.attn_v), &st.xn, &st.v);
+                let (q, k) = match &st.qk_norms {
+                    Some(norms) => {
+                        rec.rmsnorm_rows(&st.q, &norms[i].0, &st.qn, n_h, cfg.rms_eps);
+                        rec.rmsnorm_rows(&st.k, &norms[i].1, &st.kn, n_kv, cfg.rms_eps);
+                        (&st.qn, &st.kn)
+                    }
+                    None => (&st.q, &st.k),
+                };
+                let table = &st.rope_tables[rope_of[l]];
+                rec.rope(q, n_h, hd, table, neox);
+                rec.rope(k, n_kv, hd, table, neox);
+                rec.store(k, &g.layers[i], past * row);
+                rec.store(&st.v, &g.layers[i], past * row + kvd);
+                // a sliding window sees the last `w` positions, as the CPU's attention does
+                let lo = m.layer(l).2.map_or(0, |w| (past + 1).saturating_sub(w));
+                rec.attention(q, &g.layers[i], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
+                rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
+                match &st.post_norms {
+                    Some(norms) => {
+                        rec.rmsnorm(&st.proj, &norms[i].0, &st.proj_n, cfg.rms_eps);
+                        rec.add(&st.x, &st.proj_n);
+                    }
+                    None => rec.add(&st.x, &st.proj),
+                }
+                rec.rmsnorm(&st.x, &st.ffn_norms[i], &st.xn, cfg.rms_eps);
+                let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
+                rec.matmul(quant(gu), &st.xn, &st.gate_up);
+                if m.gelu {
+                    rec.gelu_mul_split(&st.gate_up, &st.act);
+                } else {
+                    rec.silu_mul_split(&st.gate_up, &st.act);
+                }
+                rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
+                match &st.post_norms {
+                    Some(norms) => {
+                        rec.rmsnorm(&st.proj, &norms[i].1, &st.proj_n, cfg.rms_eps);
+                        rec.add(&st.x, &st.proj_n);
+                    }
+                    None => rec.add(&st.x, &st.proj),
+                }
+            }
+            if st.head {
+                rec.rmsnorm(&st.x, &st.output_norm, &st.xn, cfg.rms_eps);
+                rec.matmul(quant(&m.common.output), &st.xn, &st.logits);
+                rec.read(&st.logits);
             } else {
-                rec.silu_mul_split(&st.gate_up, &st.act);
+                rec.read(&st.x);
             }
-            rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
-            match &st.post_norms {
-                Some(norms) => {
-                    rec.rmsnorm(&st.proj, &norms[l].1, &st.proj_n, cfg.rms_eps);
-                    rec.add(&st.x, &st.proj_n);
-                }
-                None => rec.add(&st.x, &st.proj),
+            for layer in g.layers.iter() {
+                rec.read_range(layer, past * row, row);
             }
+            let mut got = rec.finish().into_iter();
+            let first = got.next().expect("the logits or the hidden state");
+            if st.head {
+                logits = first;
+            } else {
+                row_in = first;
+            }
+            kv_rows.extend(got);
         }
-        rec.rmsnorm(&st.x, &st.output_norm, &st.xn, cfg.rms_eps);
-        rec.matmul(quant(&m.common.output), &st.xn, &st.logits);
-        rec.read(&st.logits);
-        for l in 0..cfg.n_layers {
-            rec.read_range(&g.layers[l], past * row, row);
-        }
-        let mut got = rec.finish().into_iter();
-        let mut logits = got.next().expect("the logits");
         if let Some(c) = m.softcap {
             logits.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
         }
         // the step's K and V rows into the host's cache too, which the copy already holds
-        for (l, kvrow) in got.enumerate() {
+        for (l, kvrow) in kv_rows.into_iter().enumerate() {
             let k = Tensor::from_vec(kvrow[..kvd].to_vec(), vec![1, n_kv, hd]);
             let v = Tensor::from_vec(kvrow[kvd..].to_vec(), vec![1, n_kv, hd]);
             kv.append(backend, l, &k, &v);

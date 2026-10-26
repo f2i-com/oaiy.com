@@ -873,9 +873,17 @@ the text's start alone where the GGUF says `tokenizer.ggml.metaspace.prepend_sch
 `first` (a Hugging Face Metaspace's), not after every special token as llama.cpp's
 default has it: `<|im_start|>system` was `▁system`, and each line after `<|im_end|>`
 began with a `▁` the model never saw; Nanbeige4.3-33B's own tokenizer and ours now
-give the same 20,029 tokens of a long chat. Such a model's context is the dense
-default's 16,384 where none is asked for: the card's copy of its cache is f32
-(426 KB a token for a 33B, 14 GB at 32,768 beside 19 GB of Q4_K_M weights).
+give the same 20,029 tokens of a long chat.
+
+A dense Llama too big for one card beside its cache, where it may use two
+(`--devices-for NAME=1,0`), is split over them (`LlamaModel::split_onto`,
+`ChainDecoder::split`): its later half of the layers and its head move to the
+second card, each card's copy of the cache holds its own layers' rows, and a
+step or a prompt's chunk runs as a submit a card, the hidden state (a row a token)
+read back from the first and given to the second; the logits are one card's to the
+bit. The card's copy of the cache is f32, 426 KB a token for a 33B: one card held
+16,384 positions beside 19.4 GB of Q4_K_M weights, two hold 65,536 (the context
+then where none is asked for).
 
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the

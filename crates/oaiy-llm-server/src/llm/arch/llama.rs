@@ -77,6 +77,36 @@ impl LlamaModel {
         Ok(Self { config, tokenizer, weights, backend, chain: Default::default() })
     }
 
+    /// Its layers from `from` on and its head moved to `other` (another card of its backend's kind), whose chain then
+    /// runs them after this one's ([`crate::llm::chain::decode::ChainDecoder::split`]): each weight copied there and let
+    /// go of here, so each card holds its share of the weights and of the cache. Before the first step; false, and
+    /// nothing moved, where a weight is not one a chain holds, `other` has no room, or chains are switched off.
+    pub fn split_onto(&mut self, other: Arc<dyn Backend>, from: usize) -> bool {
+        use crate::llm::loader::{FfnPair, Weight};
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || from == 0 || from >= self.weights.blocks.len() {
+            return false;
+        }
+        let Some(chain) = other.chain() else { return false };
+        let copy = |w: &Weight| match w {
+            Weight::Quant(q) => chain.copy_weight(q).map(Weight::Quant),
+            _ => None,
+        };
+        // every weight copied first, so a refusal leaves the model as it was
+        let mut moved = Vec::with_capacity(self.weights.blocks.len() - from);
+        for b in &self.weights.blocks[from..] {
+            let FfnPair::Fused(gu) = &b.ffn_pair else { return false };
+            let Some(w) = [&b.attn_q, &b.attn_k, &b.attn_v, &b.attn_output, gu, &b.ffn_down].into_iter().map(copy).collect::<Option<Vec<_>>>() else { return false };
+            moved.push(w);
+        }
+        let Some(output) = copy(&self.weights.output) else { return false };
+        for (b, w) in self.weights.blocks[from..].iter_mut().zip(moved) {
+            let [q, k, v, o, gu, down]: [Weight; 6] = w.try_into().unwrap_or_else(|_| unreachable!("six weights a block"));
+            (b.attn_q, b.attn_k, b.attn_v, b.attn_output, b.ffn_pair, b.ffn_down) = (q, k, v, o, FfnPair::Fused(gu), down);
+        }
+        self.weights.output = output;
+        self.chain.split(other, from)
+    }
+
     pub fn new_kv_cache(&self, max_len: usize) -> KvCache {
         KvCache::new(
             &*self.backend,
@@ -164,5 +194,36 @@ impl LlamaModel {
     /// passing logits to a sampler.
     pub fn last_logits(&self, logits: &Tensor) -> Tensor {
         self.backend.last_row_to_host(logits)
+    }
+}
+
+#[cfg(all(test, feature = "webgpu"))]
+mod tests {
+    use super::*;
+
+    /// A Llama split over two cards ([`LlamaModel::split_onto`]) gives one card's logits to the bit, for a prompt's
+    /// chunk and the steps after it: each card runs the same kernels, and the hidden state goes between them whole.
+    /// LLAMA_GGUF: a small Llama GGUF; two GPUs.
+    #[test]
+    #[ignore]
+    fn a_llama_split_over_two_cards_gives_one_cards_logits() {
+        let Some(path) = std::env::var_os("LLAMA_GGUF") else { return };
+        let Ok(a) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
+        let Some(b) = a.others(Some(8 << 30)).into_iter().next() else { return };
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        let one = LlamaModel::from_gguf(&g, Arc::new(a.clone())).unwrap();
+        let mut two = LlamaModel::from_gguf(&g, Arc::new(a)).unwrap();
+        let from = two.config.n_layers / 2;
+        assert!(two.split_onto(Arc::new(b), from), "the later layers moved to the second card");
+        let prompt = one.tokenizer.encode("The quick brown fox jumps over the lazy dog, and then it runs into the forest where", true).unwrap();
+        let (mut kv1, mut kv2) = (one.new_kv_cache(256), two.new_kv_cache(256));
+        let (mut l1, mut l2) = (one.last_logits(&one.forward(&prompt, &mut kv1)), two.last_logits(&two.forward(&prompt, &mut kv2)));
+        for step in 0..8 {
+            assert_eq!(l1.data(), l2.data(), "the logits after {} tokens", prompt.len() + step);
+            let next = l1.data().iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i as u32).unwrap();
+            l1 = one.last_logits(&one.forward(&[next], &mut kv1));
+            l2 = two.last_logits(&two.forward(&[next], &mut kv2));
+        }
+        assert_eq!(l1.data(), l2.data());
     }
 }

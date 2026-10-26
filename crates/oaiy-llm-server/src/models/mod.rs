@@ -1622,8 +1622,42 @@ impl Models {
         // what people keep, and most of the catalog) could not be served at all. They chat; tool calls are read in the
         // GLM and Qwen3.5 formats only, so the Agent's tools need one of those.
         if let Some(arch) = dense_arch(&gguf) {
-            let model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            #[allow(unused_mut)]
+            let mut model = crate::llm::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
             self.say_placement(&spec.name, backend.as_ref());
+            // A Llama too big for one card beside its cache for the context it is to have, where it may use two cards:
+            // its later layers and its head moved to the second, each card's copy of the cache its own layers', and the
+            // context nobody asked for 65,536 where the two hold that (a 33B's 19.4 GB of Q4_K_M weights and 28 GB of
+            // f32 cache there, where one card held 16,384).
+            #[allow(unused_mut)]
+            let mut split_ctx: Option<usize> = None;
+            #[cfg(feature = "webgpu")]
+            if let (crate::llm::Model::Llama(m), Some(b)) = (&mut model, backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>()) {
+                let (layers, model_max) = (m.config.n_layers, m.config.context_length);
+                let want = if self.opts.ctx_asked && self.opts.ctx != 0 { self.opts.ctx.min(model_max) } else { AUTO_CTX.min(model_max) };
+                // (a layer's row of a card's f32 copy of the cache, and what a prompt's run makes beside it)
+                let row = (2 * m.config.n_kv_heads * m.config.head_dim * 4) as u64;
+                let cache = |rows: usize, of: usize| rows as u64 * of as u64 * row;
+                let spare = self.activations_spare();
+                let (used, budget) = b.usage();
+                if used + cache(want, layers) + spare > budget {
+                    if let Some(other) = crate::engines::backend::others(o, &devices, b).into_iter().next() {
+                        let from = layers / 2;
+                        let fits = |ctx: usize| used / 2 + cache(ctx, from.max(layers - from)) + spare <= budget.min(other.usage().1);
+                        let mut ctx = want;
+                        while ctx > DENSE_CTX && !fits(ctx) {
+                            ctx -= 4096;
+                        }
+                        let (at, name) = (other.adapter().pci_bus_id.clone(), other.adapter().name.clone());
+                        if m.split_onto(Arc::new(other), from) {
+                            self.say(format!("{}: its layers from {from} on and its head on the {name} at {at}, each card its layers' cache: {ctx} positions", spec.name));
+                            split_ctx = Some(ctx);
+                        } else {
+                            self.say(format!("{}: its later layers could not go to the {name} at {at}: it stays on one card", spec.name));
+                        }
+                    }
+                }
+            }
             let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
             let plain = gguf.get_str("tokenizer.chat_template").ok().and_then(PlainPrompt::of_template);
             // (a model of another family whose own template is ChatML with thought blocks and Qwen's XML calls)
@@ -1640,7 +1674,7 @@ impl Models {
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
             // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
-            let max_seq = self.dense_context(model.config().context_length);
+            let max_seq = split_ctx.unwrap_or_else(|| self.dense_context(model.config().context_length));
             let mut cfg = self.base_cfg(spec, max_seq);
             if let Some([temp, top_p, repeat]) = sampling {
                 cfg.temperature = temp.unwrap_or(cfg.temperature);
