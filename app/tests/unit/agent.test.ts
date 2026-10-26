@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, announcesWork, readingStatus, type AgentEvent } from '../../src/agent/agent';
+import { Agent, announcesWork, readingStatus, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
 import { TOOLS, planAfter, planChanges, readPlan, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
@@ -266,6 +266,25 @@ describe('tool rules', () => {
       await make().run('hello', (e) => events.push(e));
       expect(fake.bodies).toHaveLength(2);
       expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    });
+
+    it('a found tool called by its name beside a listed one is asked for again through use_tool, read from the quoted call', async () => {
+      // the Qwen engine's words before it named the tool: the calls quoted, find_tools listed and file_info found
+      const wrote = '<tool_call><function=find_tools><parameter=query>page</parameter></function></tool_call><tool_call><function=file_info><parameter=path>a.txt</parameter></function></tool_call>';
+      const refused = { error: { status: 422, body: JSON.stringify({ error: { message: `tool_contract_error: Qwen called an undeclared function; no tool from this batch was executed. The model wrote: "${wrote}"`, code: 'tool_contract_error' } }) } };
+      fakeProvider('openai', [refused, (body) => ({ text: JSON.stringify(body.messages).match(/\[OAIY\] ([^,]*) is not one of your listed tools/)?.[1] ?? 'not told' })]);
+      const events: AgentEvent[] = [];
+      await make().run('hello', (e) => events.push(e));
+      expect(events.at(-1)).toMatchObject({ type: 'done', text: 'file_info' });
+    });
+
+    it('names the found tools a refused reply called, by the server\'s words or by the calls it quotes', () => {
+      const listed = new Set(['find_tools', 'use_tool', 'read_file']);
+      const usable = new Set([...listed, 'softn_docs', 'file_info']);
+      expect(unlistedCalls('tool_contract_error: unknown tool softn_docs', listed, usable)).toEqual(['softn_docs']);
+      expect(unlistedCalls('The model wrote: "<function=find_tools>…<function=softn_docs>…<function=softn_docs>…<function=made_up>"', listed, usable)).toEqual(['softn_docs']);
+      expect(unlistedCalls('{"name": "file_info", "arguments": {}} {"name": "read_file"}', listed, usable)).toEqual(['file_info']);
+      expect(unlistedCalls('no calls here', listed, usable)).toEqual([]);
     });
 
     it('lists its tools in brief, and find_tools gives one whole by its name', async () => {

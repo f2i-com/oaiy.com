@@ -299,7 +299,7 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
         let f = block.trim().strip_prefix("<function=").ok_or("missing function tag")?;
         let (name, params) = f.split_once('>').ok_or("incomplete function tag")?;
         identifier(name)?;
-        let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or("Qwen called an undeclared function")?;
+        let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or_else(|| format!("unknown tool {name}: Qwen called an undeclared function"))?;
         let mut params = params.trim().strip_suffix("</function>").ok_or("missing closing function tag")?.trim();
         out.push_str(&format!("<{DSML} invoke name=\"{name}\">"));
         let mut seen = std::collections::BTreeSet::new();
@@ -332,7 +332,7 @@ fn json_call(block: &str, tools: &[Json]) -> Result<String, String> {
     let call = Json::parse(block.trim().as_bytes()).map_err(|e| format!("invalid JSON tool call: {e}"))?;
     let name = call.get("name").and_then(Json::as_str).ok_or("a JSON tool call without its name")?;
     identifier(name)?;
-    let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or("Qwen called an undeclared function")?;
+    let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or_else(|| format!("unknown tool {name}: Qwen called an undeclared function"))?;
     let args = match call.get("arguments").or_else(|| call.get("parameters")) {
         Some(Json::Str(s)) => Json::parse(s.as_bytes()).map_err(|e| format!("invalid JSON arguments: {e}"))?,
         Some(v) => v.clone(),

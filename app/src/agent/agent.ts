@@ -270,6 +270,15 @@ const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
   ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
 ];
 
+/**
+ * The found tools (`usable` and not `listed`) a reply the server refused called by their own names: those it names
+ * (OAIY's engine: "unknown tool NAME") and those in the calls it quotes (`<function=NAME>`, `"name": "NAME"`), each once.
+ */
+export function unlistedCalls(said: string, listed: Set<string>, usable: Set<string>): string[] {
+  const names = [...said.matchAll(/unknown tool ([A-Za-z0-9_.-]+)|<function=([A-Za-z0-9_.-]+)>|"name":\s*"([A-Za-z0-9_.-]+)"/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+  return [...new Set(names)].filter((n) => usable.has(n) && !listed.has(n));
+}
+
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
 const guideLoaded = (topic: GuideTopic) => `[OAIY] The ${topic} guide is now in your instructions`;
 /** The note that a guide's text follows (in a result or the request, where the tools are found: see LISTED). */
@@ -1078,7 +1087,7 @@ export class Agent {
 
   /** A guide given where the tools are found: its mark, its text, and where its tools are. */
   private guideGivenText(topic: GuideTopic, names: Set<string>): string {
-    const tools = topic === 'app' ? '\n\nThe app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours: find_tools gives their parameters.' : topic === 'web' ? '\n\nThe page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours: find_tools gives their parameters.' : '';
+    const tools = topic === 'app' ? '\n\nThe app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : topic === 'web' ? '\n\nThe page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : '';
     return `${guideGiven(topic)} (follow it from now on; read it again with guide if it is out of view):\n${this.guideText(topic, names)}${tools}`;
   }
 
@@ -1717,9 +1726,10 @@ ${this.instructions}` : ''}`;
         if (unreadableCall && !callRetried) {
           callRetried = true;
           // (a tool found but called by its name, where the server takes only the listed ones: asked again, through use_tool)
-          const unlisted = this.discovering ? /unknown tool ([A-Za-z0-9_.-]+)/.exec(said)?.[1] : undefined;
-          if (unlisted && this.usable.some((t) => t.name === unlisted)) {
-            this.turns.push({ role: 'user', text: `[OAIY] ${unlisted} is not one of your listed tools, so that call did not run. Run it with use_tool: {"name": "${unlisted}", "arguments": {its parameters}}.`, automatic: true });
+          const unlisted = this.discovering ? unlistedCalls(said, new Set(this.listed.map((t) => t.name)), new Set(this.usable.map((t) => t.name))) : [];
+          if (unlisted.length) {
+            const which = unlisted.length === 1 ? `${unlisted[0]} is not one of your listed tools` : `${unlisted.join(', ')} are not among your listed tools`;
+            this.turns.push({ role: 'user', text: `[OAIY] ${which}, so none of that reply's calls ran. Run ${unlisted.length === 1 ? 'it' : 'each'} with use_tool: {"name": "${unlisted[0]}", "arguments": {its parameters}}; call the listed ones (find_tools among them) by their own names.`, automatic: true });
           }
           emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
           continue;
