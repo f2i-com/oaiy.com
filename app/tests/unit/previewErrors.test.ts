@@ -45,4 +45,19 @@ describe('the errors a running app raised', () => {
     expect(clean.isError).toBe(false);
     expect(clean.content).toContain('Errors: none reported.');
   });
+
+  it('come with a hint where something is null and the logic looks its elements up, which SoftN draws', async () => {
+    const timer: Problem = { level: 'error', message: "[SoftN] A timer callback in the logic failed: TypeError: Cannot read properties of null (reading 'setAttribute') (in step)", at: 1000 };
+    const ctx = context(preview([timer], 5000));
+    ctx.vfs.writeFile('/apps/cat/main.js', 'let bike = document.getElementById("bike")\nfunction step() { bike.setAttribute("transform", "rotate(1)") }\n');
+    ctx.vfs.writeFile('/apps/cat/index.html', '<script src="main.js"></script>\n<App><Text>Cat</Text></App>');
+    ctx.vfs.writeFile('/apps/cat/manifest.json', JSON.stringify({ name: 'Cat', main: 'index.html', files: { ui: ['index.html'], logic: ['main.js'] } }));
+    const checked = await runTool({ id: '1', name: 'softn_check', input: { app: 'apps/cat' } }, ctx);
+    expect(checked.content).toContain('Hint: the logic looks elements up');
+    expect(checked.content).toContain('Keep what changes in state and bind it in the markup');
+    // logic that looks nothing up: no hint
+    ctx.vfs.writeFile('/apps/cat/main.js', 'let angle = 0\nfunction step() { angle = angle + 1 }\n');
+    const plain = await runTool({ id: '2', name: 'softn_check', input: { app: 'apps/cat' } }, ctx);
+    expect(plain.content).not.toContain('Hint: the logic looks elements up');
+  });
 });

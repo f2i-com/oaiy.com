@@ -12,7 +12,7 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { FrameReview, ToolCall, ToolResult, ToolSpec, Turn } from './protocol';
-import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp, softnAppOf } from '../softn/softn';
+import { appFiles, appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp, softnAppOf } from '../softn/softn';
 import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
 import { findModels, isModelPath, resolveModel } from '../preview/model';
@@ -1865,6 +1865,20 @@ function pageReport(title: string, report: PageReport): string {
   return text;
 }
 
+/**
+ * Said beside a render error of something null where the app's logic looks its elements up: browser code reaches the
+ * page's plain HTML alone, and what SoftN draws (inside a component, a `{…}` value, `#if` or `#each`) it finds as null.
+ * A 33B drew a cat on a bicycle as an SVG inside <Container> and <Stack>, moved its parts from a timer by
+ * getElementById, and checked the app again and again on "Cannot read properties of null (reading 'setAttribute')".
+ */
+const ELEMENTS_HINT = 'Hint: the logic looks elements up (document.getElementById, querySelector), which finds the page\'s plain HTML only. What sits inside a SoftN component (<Container>, <Stack>, <Card>, …), a {…} value, #if or #each is drawn by SoftN and is not found: null. Keep what changes in state and bind it in the markup (transform={`rotate(${angle} 110 222)`} on the SVG element), changing the state in the timer or a <Loop>\'s @tick; or put the element in plain HTML outside the components.';
+
+/** Whether an app's logic looks elements up the way browser code does. */
+function looksUpElements(vfs: Vfs, root: string): boolean {
+  const decoder = new TextDecoder();
+  return appFiles(vfs, root).some(([path, data]) => /\.(js|logic|html)$/.test(path) && /getElementById\(|querySelector(All)?\(/.test(decoder.decode(data)));
+}
+
 export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
   const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => [])), ...(await checkEvents(ctx.vfs, root).catch(() => []))];
   const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
@@ -1877,6 +1891,7 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
     const result = await ctx.preview.check({ kind: 'app', root });
     problems.push(...result.errors);
     lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
+    if (!result.ok && result.errors.some((e) => /of null|is null|of undefined/.test(e)) && looksUpElements(ctx.vfs, root)) lines.push(ELEMENTS_HINT);
     if (result.warnings?.length) lines.push(`Warnings while it loaded (often a handler or name the logic does not define):\n${[...new Set(result.warnings)].slice(0, 8).map((w) => `- ${w}`).join('\n')}`);
   }
   // The same errors again mean the fixes are not working.
