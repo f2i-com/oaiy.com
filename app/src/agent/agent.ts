@@ -12,7 +12,7 @@ import { AIProviderError } from './providers/aiProvider';
 import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit, overflowWindow } from './context';
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
-import { sendTurn, type Attachment, type FrameReview, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
+import { sendTurn, type Attachment, type FrameReview, type Reasoning, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
 import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
@@ -466,8 +466,11 @@ export interface AgentOptions {
   sessionTools?: SessionTool[] | (() => SessionTool[]);
   /** Flows in front of the agent's tools (made so in the flow editor); a function when they change. */
   toolHooks?: ToolHook[] | (() => ToolHook[]);
-  /** How hard the model thinks before it answers (`none` on a phone call). */
-  reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
+  /**
+   * How hard the model thinks before it answers (`none` on a phone call); a function when the person may change it
+   * between steps (the chat's thinking chip), undefined leaving it to the engine (OAIY's Think by default).
+   */
+  reasoning?: Reasoning | (() => Reasoning | undefined);
   /**
    * A conversation with a person (a phone call, a text thread): a reply in words is a whole
    * answer, so it is never asked to start work or carry on (on a call those asks were spoken aloud).
@@ -913,11 +916,15 @@ export class Agent {
 
   /**
    * A step's calls and results against the steps before: how many in a row were the same (numbers aside, as a
-   * timing in a result changes). [`SAME_STEP_NOTE`] of them, the step's result is told so; [`SAME_STEP_STOP`], the run
-   * stops.
+   * timing in a result changes; a step that changed no file and not the plan, its calls' number values aside too, as
+   * a longer wait for what does not come is the same look). [`SAME_STEP_NOTE`] of them, the step's result is told so; [`SAME_STEP_STOP`], the
+   * run stops. A 33B clicked an app's Ride, waited 24 s, then 25 s, … 30 s, on a ride whose pace stayed 0.0.
    */
-  private repeatedStep(calls: ToolCall[], results: ToolResult[]): number {
-    const signature = JSON.stringify([calls.map((c) => [c.name, c.input]), results.map((r) => r.content.replace(/\d+(\.\d+)?/g, '#'))]);
+  private repeatedStep(calls: ToolCall[], results: ToolResult[], wrote: boolean): number {
+    const numbersAside = (text: string) => text.replace(/\d+(\.\d+)?/g, '#');
+    // (a call's number values aside, not the digits in its names: big1.txt and big2.txt are other files)
+    const valuesAside = (input: unknown) => JSON.stringify(input, (_, v: unknown) => (typeof v === 'number' ? '#' : v));
+    const signature = JSON.stringify([calls.map((c) => [c.name, wrote ? c.input : valuesAside(c.input)]), results.map((r) => numbersAside(r.content))]);
     this.sameStep = signature === this.sameStep.signature ? { signature, count: this.sameStep.count + 1 } : { signature, count: 1 };
     return this.sameStep.count;
   }
@@ -1324,6 +1331,12 @@ ${this.instructions}` : ''}`;
    * is about the script, or its last step wrote or read a script.md. It then
    * thinks harder first, for a more complete story.
    */
+  /** How hard the model thinks before this step: harder on a video's script, never where thinking was turned off. */
+  private reasoning(): Reasoning | undefined {
+    const chosen = typeof this.options.reasoning === 'function' ? this.options.reasoning() : this.options.reasoning;
+    return chosen !== 'none' && this.writingScript() ? 'high' : chosen;
+  }
+
   private writingScript(): boolean {
     if (!this.usable.some((t) => t.name === 'generate_video')) return false;
     const active = this.plan?.items.find((i) => i.status === 'active');
@@ -1699,7 +1712,7 @@ ${this.instructions}` : ''}`;
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
-          reasoning: this.writingScript() ? 'high' : this.options.reasoning,
+          reasoning: this.reasoning(),
           sink: {
             text: (delta) => {
               this.streamed += delta;
@@ -1812,7 +1825,7 @@ ${this.instructions}` : ''}`;
       await sendTurn(provider, this.systemPrompt, sent, this.listed, {
         maxOutputTokens: WARM_TOKENS,
         signal: signal ? AbortSignal.any([signal, read.signal]) : read.signal,
-        reasoning: this.options.reasoning,
+        reasoning: this.reasoning(),
         sink: { text: done, thinking: done, toolStart: done, toolArgs: done, draft: done },
       });
     } catch {
@@ -2286,9 +2299,9 @@ ${this.instructions}` : ''}`;
           }
         }
         const stop = await this.autoCheck(reply.calls, results, changes, emit);
-        const same = this.repeatedStep(reply.calls, results);
+        const same = this.repeatedStep(reply.calls, results, changes.length > 0 || reply.calls.some((c) => c.name === 'update_plan'));
         if (same >= SAME_STEP_NOTE && results.length) {
-          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls with the same arguments, and the same results. Nothing has changed, so running them again will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If you cannot, stop and tell the user what is wrong.`;
+          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls (numbers aside), and the same results. Nothing has changed, so running them again, or waiting longer, will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If what they show is not what the app should do (a value that should change and does not), read the code that should change it and fix that. If you cannot, stop and tell the user what is wrong.`;
         }
         this.turns.push({ role: 'tool', results });
         if (stop) {

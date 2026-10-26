@@ -19,7 +19,7 @@
   "gate": { "mode": "allowlist", "allow": ["example.com"], "deny": ["bad.example"] },
   "lastProjectId": "p1",
   "lastKeptProjectId": "p1",
-  "agent": { "compactAt": 0.75, "subAgentTokens": 32000 },
+  "agent": { "compactAt": 0.75, "subAgentTokens": 32000, "thinking": "auto" },
   "media": {
     "baseUrl": "http://127.0.0.1:8080/v1",
     "apiKey": "",

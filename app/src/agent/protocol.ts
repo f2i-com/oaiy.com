@@ -99,6 +99,9 @@ export interface Reply {
   anthropicContent?: unknown[];
 }
 
+/** How hard a model thinks before it answers (OAIY's `reasoning_effort`). */
+export type Reasoning = 'none' | 'low' | 'medium' | 'high' | 'max';
+
 export interface RequestOptions {
   signal?: AbortSignal;
   sink?: StreamSink;
@@ -109,7 +112,7 @@ export interface RequestOptions {
    * all (a phone call cannot wait), also asked of other local servers through
    * the chat template; APIs are not asked.
    */
-  reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
+  reasoning?: Reasoning;
 }
 
 function anthropicMessages(turns: Turn[]): unknown[] {

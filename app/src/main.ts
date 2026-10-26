@@ -5,7 +5,7 @@ import type { ProviderConfig } from './agent/providers/types';
 import { HELP, PHONE_HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
-import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
+import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders, type AgentThinking } from './settings';
 import { Desktop, type Contact, type NetworkModel } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
 import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
@@ -19,7 +19,7 @@ import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
 import { personState } from './ui/chat/outreachCard';
 import { rememberComputers, rememberToolTitles } from './ui/chat/tools';
-import type { Turn } from './agent/protocol';
+import type { Reasoning, Turn } from './agent/protocol';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore, type FlowTool } from './desktop/flowTools';
 import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
@@ -643,6 +643,22 @@ async function main(): Promise<void> {
           : 'Internet on, to the allowed hosts only (/internet lists them).');
     },
   });
+  // The person's own conversations' thinking: as OAIY's engine is set (auto), on, or off; a click goes on to the next.
+  const THINKING_NEXT: Record<AgentThinking, AgentThinking> = { auto: 'on', on: 'off', off: 'auto' };
+  const thinkingChip = h('button.chip.toggle.think', {
+    onclick: () => {
+      agentSettings = { ...agentSettings, thinking: THINKING_NEXT[agentSettings.thinking] };
+      void saveAgentSettings(agentSettings);
+      renderChips();
+      chat.system(agentSettings.thinking === 'on'
+        ? 'Thinking on: the model thinks before each step from the next one on (slower, more careful).'
+        : agentSettings.thinking === 'off'
+          ? 'Thinking off: the model answers each step at once.'
+          : "Thinking as OAIY's engine is set (Engines → Think by default).");
+    },
+  });
+  /** What the person's own conversations ask of the model's thinking: none where it is off, the engine's own where auto. */
+  const chosenReasoning = (): Reasoning | undefined => (agentSettings.thinking === 'on' ? 'medium' : agentSettings.thinking === 'off' ? 'none' : undefined);
   const providerChip = h('button.chip.model', { title: 'AI provider', onclick: () => void editSettings() });
   // Where the Agent runs on OAIY's engine, the chip is a menu of the engine's language models instead: choosing one is
   // choosing it in Engines (the one model loaded, on a Mac's eGPU or on the Mac, as Engines sets it). See renderPickers.
@@ -701,6 +717,9 @@ async function main(): Promise<void> {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
     gateChip.setAttribute('aria-checked', String(gate.mode !== 'blocked'));
+    thinkingChip.textContent = `thinking: ${agentSettings.thinking}`;
+    thinkingChip.dataset.think = agentSettings.thinking;
+    thinkingChip.title = `Thinking ${agentSettings.thinking === 'auto' ? "as OAIY's engine is set (Engines → Think by default)" : agentSettings.thinking}: whether the model thinks before each step. Click for ${THINKING_NEXT[agentSettings.thinking]}. (Asked of OAIY's engine; of another local server only off; an online API is not asked.)`;
     // The model the person's own conversation runs on: the engine's (Settings), or ChatGPT's, as the desktop says.
     const p = agentProvider('project');
     const chatgpt = p?.id.startsWith('oaiy-chatgpt') ?? false;
@@ -1192,6 +1211,8 @@ async function main(): Promise<void> {
         // The person's own conversation: a reply they stopped is kept as far as it got, and the model told it was
         // stopped (a phone conversation's agents keep what the caller heard of a reply cut off, sessions.ts).
         keepStopped: given === undefined,
+        // (and thinks as the chat's thinking chip says)
+        ...(given === undefined ? { reasoning: chosenReasoning } : {}),
         projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
         ...(withPreview ? { preview } : {}),
         compactAt: () => agentSettings.compactAt,
@@ -2281,6 +2302,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     callChip,
     outreachChip,
     gateChip,
+    thinkingChip,
     providerChip,
     modelPick,
     h('button.settings-button', { title: 'Settings: AI providers, the agent, and images, video and audio', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),

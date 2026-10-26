@@ -83,9 +83,16 @@ export interface AgentSettings {
   compactAt: number;
   /** The context a sub-agent works in, in tokens (never more than the model's window). */
   subAgentTokens: number;
+  /**
+   * Whether the model thinks before each step of the person's own conversations (the chat's thinking chip): `auto`
+   * as OAIY's engine is set (Think by default), else on or off whatever it says.
+   */
+  thinking: AgentThinking;
 }
 
-export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000 };
+export type AgentThinking = 'auto' | 'on' | 'off';
+
+export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000, thinking: 'auto' };
 
 /** OAIY Desktop on this computer, once paired: where it is and the token it gave. */
 export interface DesktopSettings {

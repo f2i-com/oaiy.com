@@ -458,6 +458,29 @@ describe('tool rules', () => {
     }
   });
 
+  it('thinks as the person chose at each step, and not at all where they turned it off, a video script too', async () => {
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video' };
+    const script = { goal: 'a short film', items: [{ text: 'Write the script in video/film/script.md', status: 'active' }] };
+    let chosen: 'medium' | 'none' | undefined = undefined;
+    const fake = fakeProvider('openai', [
+      () => {
+        chosen = 'medium';
+        return { calls: [{ name: 'read_file', input: { path: 'a.txt' } }] };
+      },
+      () => {
+        chosen = 'none';
+        return { calls: [{ name: 'update_plan', input: script }] };
+      },
+      { text: 'done' },
+    ]);
+    const vfs = new Vfs();
+    vfs.writeFile('/a.txt', 'a');
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, serverKind: 'oaiy', contextTokens: 32_000 }), projectSummary: () => '', media: () => media, reasoning: () => chosen });
+    await agent.run('make a short film', () => {});
+    // the engine's own first (auto), then on, then off while the step is the script
+    expect(fake.bodies.slice(0, 3).map((b) => b.reasoning_effort)).toEqual([undefined, 'medium', 'none']);
+  });
+
   it("shows OAIY's tool call as it is written", () => {
     const drafts: Array<[string, boolean]> = [];
     const stream = new OpenAIStream({ text: () => {}, toolStart: () => {}, toolArgs: () => {}, draft: (t, s) => drafts.push([t, s]) });
@@ -560,6 +583,34 @@ describe('tool rules', () => {
     // and stopped after the sixth: no seventh request
     expect(fake.bodies).toHaveLength(6);
     expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('the same calls with the same results 6 times in a row') });
+  });
+
+  it("counts a look whose numbers alone change as the same step, where a step that writes is not", async () => {
+    // a longer wait each step (24 s, 25 s, …) for what does not come: the same look, numbers aside
+    let n = 0;
+    const look = () => ({ calls: [{ name: 'read_file', input: { path: 'src/app.js', char_start: 1000 + n++ } }] });
+    const fake = fakeProvider('openai', Array.from({ length: 8 }, () => look));
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('look at the app', emit);
+    expect(JSON.stringify(fake.bodies[3].messages)).toContain('same as the 2 before it');
+    expect(fake.bodies).toHaveLength(6);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('6 times in a row') });
+    // a file written with another number each step is work going on
+    let m = 0;
+    const write = () => ({ calls: [{ name: 'write_file', input: { path: 'src/speed.js', content: `const speed = ${m++};\n` } }] });
+    const writing = fakeProvider('openai', [...Array.from({ length: 4 }, () => write), { text: 'done' }]);
+    const other = setup(OPENAI);
+    await other.agent.run('tune the speed', other.emit);
+    expect(writing.bodies.some((b) => JSON.stringify(b.messages).includes('This step is the same as the'))).toBe(false);
+    expect(other.events.at(-1)).toMatchObject({ type: 'done' });
+    // and files named apart by a number (frame 1, frame 2, …) are other files, however alike they read
+    let f = 1;
+    const frames = setup(OPENAI);
+    for (let i = 1; i <= 7; i++) frames.vfs.writeFile(`/frame${i}.txt`, `frame ${i}\n`);
+    const framing = fakeProvider('openai', [...Array.from({ length: 7 }, () => () => ({ calls: [{ name: 'read_file', input: { path: `frame${f++}.txt` } }] })), { text: 'done' }]);
+    await frames.agent.run('read the frames', frames.emit);
+    expect(framing.bodies.some((b) => JSON.stringify(b.messages).includes('This step is the same as the'))).toBe(false);
+    expect(frames.events.at(-1)).toMatchObject({ type: 'done' });
   });
 
   it('drops old pictures a few at a time, so the start of the prompt stays the same between steps', () => {

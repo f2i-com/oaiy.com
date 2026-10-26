@@ -758,12 +758,13 @@ function pickGate(v: Record<string, unknown>): Partial<NetGateSettings> {
   return out as Partial<NetGateSettings>;
 }
 
-/** How the Agent manages its work: two numbers, within their limits. */
+/** How the Agent manages its work: two numbers, within their limits, and whether it thinks. */
 function pickAgent(v: Record<string, unknown>): Partial<AgentSettings> {
   const out: Record<string, unknown> = {};
   if (typeof v.compactAt === 'number' && Number.isFinite(v.compactAt) && v.compactAt >= 0.05 && v.compactAt <= 1) out.compactAt = v.compactAt;
   const tokens = whole(v.subAgentTokens, 1000, 10_000_000);
   if (tokens !== undefined) out.subAgentTokens = tokens;
+  if (v.thinking === 'auto' || v.thinking === 'on' || v.thinking === 'off') out.thinking = v.thinking;
   return out as Partial<AgentSettings>;
 }
 

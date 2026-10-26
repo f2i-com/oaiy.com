@@ -1246,7 +1246,7 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       providers: [{ id: 'p-set', type: 'anthropic', name: 'Set', baseUrl: 'https://set.example/v1', modelId: 'model-set', followEngine: true, orgId: 'org-set', serverKind: 'ollama', contextTokens: 32000, parallelAgents: 3 }],
       activeProviderId: 'p-set',
       gate: { mode: 'allowlist', allow: ['set.example'], deny: ['bad.example'] },
-      agent: { compactAt: 0.6, subAgentTokens: 64000 },
+      agent: { compactAt: 0.6, subAgentTokens: 64000, thinking: 'on' as const },
       media: { baseUrl: 'https://media.set.example/v1', enabled: false, imageModel: 'img-set', videoModel: 'vid-set', speechModel: 'speech-set', musicModel: 'music-set', soundModel: 'sound-set', model3dModel: 'model3d-set' },
       messages: { answer: true, calls: true, callBack: true, instructions: 'set instructions', callInstructions: 'set call instructions', callBackFilter: 'any', callBackLine: 'set line', country: 'NZ' },
     };
@@ -1255,7 +1255,7 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       providers: [{ id: 'p-empty', type: 'openai', name: '', baseUrl: '', modelId: '', followEngine: false, orgId: '', serverKind: '', contextTokens: 0, parallelAgents: 1 }],
       activeProviderId: 'p-empty',
       gate: { mode: 'open', allow: [] as string[], deny: [] as string[] },
-      agent: { compactAt: 0.05, subAgentTokens: 1000 },
+      agent: { compactAt: 0.05, subAgentTokens: 1000, thinking: 'off' as const },
       media: { baseUrl: '', enabled: true, imageModel: '', videoModel: '', speechModel: '', musicModel: '', soundModel: '', model3dModel: '' },
       messages: { answer: false, calls: false, callBack: false, instructions: '', callInstructions: '', callBackFilter: 'answered', callBackLine: '', country: '' },
     };
@@ -1911,7 +1911,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     settings({
       providers: [{ id: 'p1', type: 'openai', name: 'Main', apiKey: KEY, baseUrl: 'https://api.openai.com/v1', contextTokens: 9000 }],
       gate: { mode: 'allowlist', allow: ['a.example'], deny: ['b.example'] },
-      agent: { compactAt: 0.5, subAgentTokens: 5000 },
+      agent: { compactAt: 0.5, subAgentTokens: 5000, thinking: 'auto' },
       media: { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY, enabled: false, imageModel: 'mine' },
       messages: { ...DEFAULT_MESSAGE_SETTINGS, instructions: 'my own words', callInstructions: 'my call words', answer: false },
     });
@@ -1923,13 +1923,13 @@ describe('the settings come back key by key, and only what the desktop let throu
   };
 
   it('a part of a section leaves the rest of it as it is here', async () => {
-    const { target, outcome } = await apply({ messages: { country: 'NZ' }, gate: { mode: 'blocked' }, media: { imageModel: 'img-x' }, agent: { compactAt: 0.9 } });
+    const { target, outcome } = await apply({ messages: { country: 'NZ' }, gate: { mode: 'blocked' }, media: { imageModel: 'img-x' }, agent: { compactAt: 0.9, thinking: 'off' } });
     expect(outcome.ok).toBe(true);
     const s = target.settings;
     expect(s.messages).toMatchObject({ country: 'NZ', instructions: 'my own words', callInstructions: 'my call words', answer: false });
     expect(s.gate).toEqual({ mode: 'blocked', allow: ['a.example'], deny: ['b.example'] });
     expect(s.media).toMatchObject({ baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY, imageModel: 'img-x', enabled: false });
-    expect(s.agent).toEqual({ compactAt: 0.9, subAgentTokens: 5000 });
+    expect(s.agent).toEqual({ compactAt: 0.9, subAgentTokens: 5000, thinking: 'off' });
     expect(s.providers[0]).toMatchObject({ id: 'p1', apiKey: KEY, contextTokens: 9000 });
   });
 
@@ -1945,7 +1945,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     const { target, outcome } = await apply({
       messages: { answer: 'yes', instructions: 5, extra: 'x', callBackFilter: 'sometimes', callBack: true, calls: 1, callBackLine: 'x'.repeat(3000), country: 'AUSTRALIA!' },
       gate: { mode: 'wide-open', allow: ['ok.example', 5, 'x'.repeat(300)], evil: true },
-      agent: { compactAt: 7, subAgentTokens: 12.5, extra: 1 },
+      agent: { compactAt: 7, subAgentTokens: 12.5, thinking: 'always', extra: 1 },
       media: { enabled: 'yes', imageModel: 42, endpoints: { images: 'http://attacker.example' }, imageModels: [{ id: 'x' }] },
       lastProjectId: 'p-evil',
       lastKeptProjectId: 'p-evil',
@@ -1956,7 +1956,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     const s = target.settings as unknown as Record<string, unknown> & Settings;
     expect(s.messages).toEqual({ ...localSettings().messages, callBack: true });
     expect(s.gate).toEqual({ mode: 'allowlist', allow: ['ok.example'], deny: ['b.example'] });
-    expect(s.agent).toEqual({ compactAt: 0.5, subAgentTokens: 5000 });
+    expect(s.agent).toEqual({ compactAt: 0.5, subAgentTokens: 5000, thinking: 'auto' });
     expect(s.media).toEqual(localSettings().media);
     expect(s.lastProjectId).toBe('p-kept');
     expect(s.desktop).toEqual({ origin: 'http://127.0.0.1:17972', token: DESKTOP_TOKEN });

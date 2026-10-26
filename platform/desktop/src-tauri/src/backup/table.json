@@ -713,6 +713,7 @@
         { "path": "agent", "class": "runs", "tick": "agentSettings", "type": "object", "what": "How the Agent manages its work" },
         { "path": "agent.compactAt", "class": "runs", "tick": "agentSettings", "type": "number", "min": 0.05, "max": 1, "what": "When the conversation is compacted", "reason": "A share of the context window: it decides how much of a conversation the model still sees." },
         { "path": "agent.subAgentTokens", "class": "runs", "tick": "agentSettings", "type": "int", "min": 1000, "max": 10000000, "what": "A sub-agent's context, in tokens", "reason": "How much a sub-agent may read and spend." },
+        { "path": "agent.thinking", "class": "runs", "tick": "agentSettings", "type": "enum", "options": ["auto", "on", "off"], "what": "Whether the model thinks before each step", "reason": "It decides how the model answers in the person's own conversations." },
         { "path": "media", "class": "runs", "tick": "agentSettings", "type": "object", "what": "The image, video and audio service" },
         { "path": "media.baseUrl", "class": "runs", "tick": "agentSettings", "type": "url", "maxChars": 2048, "what": "The media service's address", "reason": "Prompts and pictures are sent to it." },
         { "path": "media.enabled", "class": "runs", "tick": "agentSettings", "type": "bool", "what": "The Agent may use the media service" },

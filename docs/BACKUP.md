@@ -268,6 +268,7 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `agent` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | How the Agent manages its work |
 | `agent.compactAt` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | When the conversation is compacted: A share of the context window: it decides how much of a conversation the model still sees. |
 | `agent.subAgentTokens` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | A sub-agent's context, in tokens: How much a sub-agent may read and spend. |
+| `agent.thinking` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Whether the model thinks before each step: It decides how the model answers in the person's own conversations. |
 | `media` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The image, video and audio service |
 | `media.baseUrl` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's address: Prompts and pictures are sent to it. |
 | `media.enabled` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The Agent may use the media service |
