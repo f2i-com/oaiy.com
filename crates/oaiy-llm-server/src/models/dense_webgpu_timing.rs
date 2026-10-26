@@ -2086,3 +2086,45 @@ fn a_chained_runs_rows_are_its_devices_alone_and_come_back_where_wanted() {
     let _ = chained(&mut a, &[argmax(&host)]);
     assert_eq!(a.host_valid(), 0);
 }
+
+
+/// What a check of a token and drafts costs a dense Llama against a step ([`crate::llm::LlamaModel::check`]): 32 steps,
+/// then 32 checks of DENSE_ROWS rows (4) each rolled back to its first, after a prompt of DENSE_PROMPT tokens (2,048),
+/// each with the chains' time on the host and on the GPU. DENSE_MODEL: a Llama GGUF; DENSE_GB: the card's budget (28).
+#[test]
+#[ignore = "a timing; needs a WebGPU adapter and a Llama GGUF (DENSE_MODEL); run with --nocapture"]
+fn measure_a_dense_llamas_checks_on_webgpu() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    let Ok(path) = std::env::var("DENSE_MODEL") else { return };
+    let gb: u64 = std::env::var("DENSE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(28);
+    let Ok(b) = ggml_rs_wgpu::WgpuBackend::new(Some(gb << 30)) else { return };
+    let backend: Arc<dyn ggml_rs::Backend> = Arc::new(b);
+    let gguf = gguf::GgufFile::open(&path).unwrap();
+    let crate::llm::Model::Llama(m) = crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap() else { panic!("not a Llama") };
+    let n: u32 = std::env::var("DENSE_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let rows: usize = std::env::var("DENSE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut kv = m.new_kv_cache(n as usize + 512);
+    let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
+    let argmax = |l: &ggml_rs::Tensor| l.data().iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+    let mut next = argmax(&m.last_logits(&m.forward(&prompt, &mut kv)));
+    for _ in 0..4 {
+        next = argmax(&m.last_logits(&m.forward(&[next], &mut kv)));
+    }
+    let _ = m.check(&vec![next; rows], &mut kv);
+    m.rollback(&mut kv, rows, 1);
+    ggml_rs_wgpu::profile::take_line();
+    let t = Instant::now();
+    for _ in 0..32 {
+        next = argmax(&m.last_logits(&m.forward(&[next], &mut kv)));
+    }
+    eprintln!("32 steps after {} positions: {:.2} ms a step; {}", kv.len, t.elapsed().as_secs_f64() * 1e3 / 32.0, ggml_rs_wgpu::profile::take_line());
+    let t = Instant::now();
+    for i in 0..32u32 {
+        let checked: Vec<u32> = std::iter::once(next).chain((1..rows as u32).map(|j| 1000 + (i * 31 + j) % 20000)).collect();
+        let got = m.check(&checked, &mut kv).expect("a chained check");
+        m.rollback(&mut kv, rows, 1);
+        next = argmax(&got[0]);
+    }
+    eprintln!("32 checks of {rows} rows: {:.2} ms a check; {}", t.elapsed().as_secs_f64() * 1e3 / 32.0, ggml_rs_wgpu::profile::take_line());
+}
