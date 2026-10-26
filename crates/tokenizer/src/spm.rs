@@ -220,8 +220,19 @@ fn merge(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
 
 pub fn decode(tok: &Tokenizer, ids: &[u32]) -> String {
     let mut out = String::new();
+    // Byte-fallback tokens in a row are one character's bytes (an emoji is four): read together. Each on its own was a
+    // U+FFFD, and a 33B's bell button read as four of them.
+    let mut bytes: Vec<u8> = Vec::new();
     for &id in ids {
         let Some(s) = tok.token(id) else { continue };
+        if let Some(byte) = parse_byte_fallback(s) {
+            bytes.push(byte);
+            continue;
+        }
+        if !bytes.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+            bytes.clear();
+        }
 
         // Skip unknown / control / unused tokens — markers like `<s>`, `<unk>`, `<start_of_turn>` that shouldn't
         // render. USER_DEFINED pieces are text, written as they are (as llama.cpp's `token_to_piece` does): Gemma's
@@ -239,13 +250,9 @@ pub fn decode(tok: &Tokenizer, ids: &[u32]) -> String {
             }
         }
 
-        // Byte-fallback tokens "<0xXX>" decode to a single byte.
-        if let Some(byte) = parse_byte_fallback(s) {
-            out.push_str(&String::from_utf8_lossy(&[byte]));
-        } else {
-            out.push_str(&s.replace(SPM_SPACE, " "));
-        }
+        out.push_str(&s.replace(SPM_SPACE, " "));
     }
+    out.push_str(&String::from_utf8_lossy(&bytes));
     // We deliberately do NOT strip a leading space — for streaming token-at-a-time decoding, the leading ▁ on each
     // word IS the inter-word space. Callers doing full-sequence decoding can `.trim_start()` themselves.
     out

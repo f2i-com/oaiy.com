@@ -101,6 +101,20 @@ fn a_user_defined_newline_is_one_token_and_the_line_after_it_takes_no_space() {
 }
 
 #[test]
+fn byte_tokens_in_a_row_decode_as_the_character_they_spell() {
+    // an emoji the vocabulary lacks is its four UTF-8 bytes, a byte-fallback token each (<0xXX> is id 1 + the byte)
+    let tok = spm(&[("\u{2581}Ring", -1.0, 1), ("\u{2581}", -2.0, 1)], Some(true));
+    let bell: Vec<u32> = "\u{1f514}".bytes().map(|b| 1 + b as u32).collect();
+    let ring = tok.token_id("\u{2581}Ring").unwrap();
+    let ids: Vec<u32> = [vec![ring], bell.clone(), vec![ring]].concat();
+    assert_eq!(tok.decode(&ids), " Ring\u{1f514} Ring");
+    // the start of one, as a reply streams, is one replacement character until the rest comes
+    assert_eq!(tok.decode(&bell[..2]), "\u{fffd}");
+    // and the encoder's own bytes read back
+    assert_eq!(tok.decode(&tok.encode("\u{1f514}", false).unwrap()).trim_start(), "\u{1f514}");
+}
+
+#[test]
 fn a_vocabulary_that_does_not_say_takes_the_leading_space_after_specials() {
     // llama.cpp's default for SentencePiece (Llama 1/2): a space before the text, and after each special token.
     let tok = spm(VOCAB, None);
