@@ -525,6 +525,17 @@ describe('tool rules', () => {
     expect([1, 3, 4, 5, 6, 7, 8, 9, 10].map(dropped)).toEqual([-2, 0, 0, 0, 3, 3, 3, 6, 6]);
   });
 
+  it('keeps more pictures, and drops them more at a time, where a local model finds its tools', () => {
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 65_536 }), projectSummary: () => '', discoverTools: () => true });
+    const pixel = { mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' };
+    const dropped = (n: number) => {
+      agent.turns = Array.from({ length: n }, (_, i) => ({ role: 'tool' as const, results: [{ id: String(i), name: 'view_image', content: `look ${i}`, isError: false, images: [pixel] }] }));
+      return n - (agent as unknown as { keepImages: number }).keepImages;
+    };
+    // Eight stay at least; the prompt changes at an early picture a third as often as with three.
+    expect([3, 8, 9, 15, 16, 23, 24].map(dropped)).toEqual([-5, 0, 0, 0, 8, 8, 16]);
+  });
+
   it('fixes flagged pictures first, one at a time, then goes back to its work', async () => {
     const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
     // What each request lacked (a failed expect inside the fake would only show as a network error).

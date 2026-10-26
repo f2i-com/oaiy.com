@@ -173,6 +173,12 @@ const DRIFT_STEPS = 12;
 const SAME_CHECK_LIMIT = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
 const KEEP_IMAGE_TURNS = 3;
+/**
+ * Where the tools are found (a local model): a dropped picture has its engine read the prompt again from its turn on
+ * (a step of DeepSeek on its own GPUs reads some 40 tokens a second: a minute for a few pictures and the steps between),
+ * where a cloud provider reads what it cached at a fraction of the cost, so more stay, and go more at a time.
+ */
+const KEEP_IMAGE_TURNS_FOUND = 8;
 
 /** How to make media: only when the media service's tools are there. */
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice, generate_music and generate_sound_effect, when they are among your tools, make pictures, short videos (talking ones too), speech, music and sound effects with the user's media service and save them in the project; media_compose lays sound effects and music under clips. remove_background (when it is among your tools) cuts a picture's subject out onto a transparent background, for sprites, icons and product shots, and upscale_image makes a picture two or four times larger with its detail restored. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
@@ -1101,7 +1107,7 @@ export class Agent {
    */
   private get keepImages(): number {
     if (!this.imagesAccepted) return 0;
-    const keep = this.options.keepImages ?? KEEP_IMAGE_TURNS;
+    const keep = this.options.keepImages ?? (this.discovering ? KEEP_IMAGE_TURNS_FOUND : KEEP_IMAGE_TURNS);
     const withImages = this.turns.filter(hasImages).length;
     return withImages <= keep ? keep : keep + ((withImages - keep) % keep);
   }
