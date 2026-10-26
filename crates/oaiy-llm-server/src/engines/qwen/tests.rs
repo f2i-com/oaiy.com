@@ -683,3 +683,22 @@ fn a_template_that_writes_qwens_calls_is_known() {
     assert!(!writes_qwen_calls(chatml_json));
     assert!(!writes_qwen_calls(llama3));
 }
+
+/// A dense Llama's drafts come from where the conversation's last tokens came before: the longest such run first, at
+/// its latest place, as many tokens as follow it there up to the most asked for; none where they came nowhere before.
+#[test]
+fn drafts_are_looked_up_where_the_last_tokens_came_before() {
+    // "a b c d e" then later "x b c" (3 tokens of it) then "b c d": the last 3 (b c d) came before, followed by e
+    let recent = [1, 2, 3, 4, 5, 9, 2, 3, 7, 2, 3, 4];
+    assert_eq!(lookup(&recent, 3), Some(vec![5, 9, 2]));
+    assert_eq!(lookup(&recent, 1), Some(vec![5]));
+    // only the last three (9 2 3) came before: at their latest place (followed by 7, not 4 or the end)
+    assert_eq!(lookup(&[1, 9, 2, 3, 4, 5, 9, 2, 3, 7, 8, 9, 2, 3], 2), Some(vec![7, 8]));
+    // the last two alone came before: too short a run to draft from
+    assert_eq!(lookup(&[1, 2, 3, 4, 5, 2, 3], 2), None);
+    // a run's place at the end gives what follows up to there
+    assert_eq!(lookup(&[5, 6, 7, 5, 6, 7], 4), Some(vec![5, 6, 7]));
+    // nothing came before twice: none
+    assert_eq!(lookup(&[1, 2, 3, 4, 5, 6], 4), None);
+    assert_eq!(lookup(&[1], 4), None);
+}

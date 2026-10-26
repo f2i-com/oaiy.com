@@ -885,6 +885,27 @@ bit. The card's copy of the cache is f32, 426 KB a token for a 33B: one card hel
 16,384 positions beside 19.4 GB of Q4_K_M weights, two hold 65,536 (the context
 then where none is asked for).
 
+Its step's attention takes a KV head's whole group of query heads together where
+no share of the group's kernel takes them (seven of 128 a KV head, Nanbeige4.3's:
+seven is a share of none), the kernel's workgroup memory grown to hold the shares'
+sums (33 KB of the RTX 5090's 48), each key's row read by a subgroup's lanes
+together (2026-10-27). A workgroup a query head had read the cache seven times
+over: 5.3 ms of a 22.6 ms step at 2,500 to 4,800 positions. Its replies are drafted
+from what the conversation holds (prompt lookup: where its last three or four
+tokens came before, the three tokens that followed there), the token sampled and
+the drafts checked in one run of four rows, which reads the weights once (the
+several rows' kernels take four a workgroup) and costs little more than a step; a
+check's attention takes a KV head's group of heads together too, its rows the
+grid's first axis so they read each run of the cache at once. Nanbeige4.3-33B
+Q4_K_M over two RTX 5090s, greedy, its file of 7.7 KB written again with a class
+renamed (2,364 tokens), prose (some 400) and a reply after a 22,508-token prompt:
+
+| Nanbeige4.3-33B | Rewrite | Prose | After 22,508 tokens |
+|---|---:|---:|---:|
+| Before (a workgroup a query head, no drafts) | 41.5 to 44.2 tok/s | 49.4 to 53.6 tok/s | 25.0 tok/s |
+| The group's attention, by lanes | 52.8 | 53.9 | 39.6 |
+| And drafts looked up | 99.9 | 53.9 | 39.5 |
+
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
 cache and took the softmax on one thread), a tied head heads with the GGUF's

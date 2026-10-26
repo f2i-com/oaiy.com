@@ -190,6 +190,27 @@ impl LlamaModel {
         self.weights.output.linear(backend, &x_last)
     }
 
+    /// Whether its replies may be drafted from what the conversation holds and the drafts checked in one run
+    /// ([`Self::check`]): where its steps are chained (OAIY_NO_LOOKUP: not).
+    pub fn checks(&self) -> bool {
+        self.backend.chain().is_some() && std::env::var_os("OAIY_NO_CHAIN").is_none() && std::env::var_os("OAIY_NO_LOOKUP").is_none()
+    }
+
+    /// A check of `tokens` (a token sampled, then drafts of the tokens after it) after what `kv` holds, in one chained
+    /// run: every row's logits, the rows kept in `kv` until [`Self::rollback`]. None where it is not chained.
+    pub fn check(&self, tokens: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
+        let dense = crate::llm::chain::decode::Dense::plain(&self.config, &self.weights);
+        self.chain.check(&*self.backend, &dense, tokens, kv)
+    }
+
+    /// The last check's `rows` taken back past its first `keep`: the cache's rows after them are written again before
+    /// any attention reads them (the device's copy's too, by position).
+    pub fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
+        assert!(keep <= rows && rows <= kv.len, "a rollback of {rows} rows to {keep}");
+        kv.len -= rows - keep;
+        kv.host_rows = kv.host_rows.min(kv.len);
+    }
+
     /// Take last-row logits as a host tensor (always on CPU). Use this before
     /// passing logits to a sampler.
     pub fn last_logits(&self, logits: &Tensor) -> Tensor {
@@ -225,5 +246,58 @@ mod tests {
             l2 = two.last_logits(&two.forward(&[next], &mut kv2));
         }
         assert_eq!(l1.data(), l2.data());
+    }
+
+    /// A check of a token and drafts after it ([`LlamaModel::check`]) gives each row the logits a step of it gives (the
+    /// same picks, the rows' sums in another order: within rounding), and a check rolled back past its drafts not taken
+    /// leaves the cache as steps would have: the next step's logits are a step's. LLAMA_GGUF: a small Llama GGUF.
+    #[test]
+    #[ignore]
+    fn a_checks_rows_are_its_steps_and_its_rollback_their_cache() {
+        let Some(path) = std::env::var_os("LLAMA_GGUF") else { return };
+        let Ok(a) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        let m = LlamaModel::from_gguf(&g, Arc::new(a)).unwrap();
+        assert!(m.checks(), "a chained Llama checks drafts");
+        let pick = |l: &Tensor| l.data().iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i as u32).unwrap();
+        let near = |a: &Tensor, b: &Tensor, what: &str| {
+            let dot: f64 = a.data().iter().zip(b.data()).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let norm = |t: &Tensor| t.data().iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (norm(a) * norm(b));
+            // (a check's rows from int8 activations where a step's may be f32: 0.99984 on a 1B's first row)
+            assert!(cos > 0.999, "{what}: cosine {cos}");
+        };
+        let prompt = m.tokenizer.encode("The quick brown fox jumps over the lazy dog, and then it runs into the forest where", true).unwrap();
+        // steps: the picks after the prompt and each one's logits
+        let mut kv1 = m.new_kv_cache(256);
+        let mut l = m.last_logits(&m.forward(&prompt, &mut kv1));
+        let (mut picks, mut steps) = (Vec::new(), Vec::new());
+        for _ in 0..4 {
+            let t = pick(&l);
+            picks.push(t);
+            l = m.last_logits(&m.forward(&[t], &mut kv1));
+            steps.push(l.clone());
+        }
+        // a check of the same four tokens: each row its step's
+        let mut kv2 = m.new_kv_cache(256);
+        let _ = m.forward(&prompt, &mut kv2);
+        let rows = m.check(&picks, &mut kv2).expect("a chained check");
+        assert_eq!(rows.len(), 4);
+        for (i, (row, step)) in rows.iter().zip(&steps).enumerate() {
+            assert_eq!(pick(row), pick(step), "row {i}'s pick");
+            near(row, step, &format!("row {i}"));
+        }
+        assert_eq!(kv2.len, kv1.len);
+        // a check whose last two drafts are not the model's, rolled back to its first two: the next step is a step's
+        let mut kv3 = m.new_kv_cache(256);
+        let _ = m.forward(&prompt, &mut kv3);
+        let wrong = [picks[0], picks[1], picks[2] ^ 1, picks[3] ^ 1];
+        let rows = m.check(&wrong, &mut kv3).expect("a chained check");
+        assert_eq!(pick(&rows[1]), picks[2]);
+        m.rollback(&mut kv3, 4, 2);
+        assert_eq!(kv3.len, prompt.len() + 2);
+        let next = m.last_logits(&m.forward(&[picks[2]], &mut kv3));
+        assert_eq!(pick(&next), pick(&steps[2]));
+        near(&next, &steps[2], "the step after the rollback");
     }
 }

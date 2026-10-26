@@ -610,13 +610,23 @@ impl Hybrid {
             Self::Fake(f) => Ok(Tensor::zeros(vec![tokens.len(), f.width])),
         }
     }
-    /// Whether the model drafts tokens a check takes (its multi-token-prediction layer, chained).
+    /// Whether the model drafts tokens a check takes (its multi-token-prediction layer, chained; a dense Llama's from
+    /// what the conversation holds, [`lookup`]).
     fn drafts(&self) -> bool {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.drafts(),
+            Self::Qwen35(Model::Llama(m)) => m.checks(),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.drafts(),
             _ => false,
+        }
+    }
+    /// The most drafts a check takes after its token: a dense Llama's looked-up ones [`LOOKUP_DRAFTS`] (a copied run
+    /// goes on long), the others' [`drafts_most`].
+    fn drafts_most(&self) -> usize {
+        match self {
+            Self::Qwen35(Model::Llama(_)) => lookup_drafts(),
+            _ => drafts_most(),
         }
     }
     /// The tokens before a draft's `next` it may need (its layer catches up on the last run's rows): at most this many.
@@ -624,6 +634,8 @@ impl Hybrid {
         match self {
             #[cfg(feature = "webgpu")]
             Self::Flash(_) => crate::engines::flashnext::CHECK_ROWS,
+            // (a Llama's drafts are looked up in the whole conversation)
+            Self::Qwen35(Model::Llama(_)) => LOOKUP_WINDOW,
             _ => crate::llm::SPEC_ROWS,
         }
     }
@@ -631,6 +643,7 @@ impl Hybrid {
     fn draft(&self, kv: &KvCache, recent: &[u32], k: usize) -> Option<Vec<u32>> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.draft(kv, recent, k),
+            Self::Qwen35(Model::Llama(_)) => lookup(recent, k),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.draft(kv, recent, k),
             _ => None,
@@ -640,6 +653,7 @@ impl Hybrid {
     fn check(&self, rows: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.check(rows, kv),
+            Self::Qwen35(Model::Llama(m)) => m.check(rows, kv),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.check(rows, kv),
             _ => None,
@@ -676,6 +690,7 @@ impl Hybrid {
     fn rollback(&self, kv: &mut KvCache, rows: usize, keep: usize) {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => m.rollback(kv, rows, keep),
+            Self::Qwen35(Model::Llama(m)) => m.rollback(kv, rows, keep),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => {
                 let _ = rows;
@@ -1435,11 +1450,11 @@ impl QwenEngine {
                 // another token to take than the run's: the model's pick alone has none)
                 let pick = greedy && !(self.cycles && cycles.near(turned, 16));
                 // its drafts, then the token and them in one check; else the token alone
-                let checked = drafter.filter(|_| self.kv.len + 1 + drafts_most() <= self.kv.max_len).and_then(|m| {
+                let checked = drafter.filter(|m| self.kv.len + 1 + m.drafts_most() <= self.kv.max_len).and_then(|m| {
                     let recent: Vec<u32> = self.covered[self.covered.len().saturating_sub(m.draft_window())..].iter().map(|&k| k as u32).chain([next]).collect();
                     // none the layer is sure enough of: a step of the token alone
                     let began = std::time::Instant::now();
-                    let drafts = m.draft(&self.kv, &recent, drafts_most()).filter(|d| !d.is_empty());
+                    let drafts = m.draft(&self.kv, &recent, m.drafts_most()).filter(|d| !d.is_empty());
                     t_draft += began.elapsed().as_secs_f64();
                     let drafts = drafts?;
                     let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
@@ -1668,6 +1683,47 @@ const DRAFTS: usize = 3;
 /// [`DRAFTS`], or OAIY_DRAFTS's (1 to 7: a check is 8 rows at most). More than three loses on Flash-Next, whose check
 /// is some 1.9 steps (its 66 tokens after 3,780: 0.84 s with three, 42 of 51 drafts taken; 0.96 with four, 45 of 59;
 /// 0.94 with five; 0.99 with six).
+/// How far back a dense Llama's drafts are looked for ([`lookup`]): the whole conversation.
+const LOOKUP_WINDOW: usize = usize::MAX;
+
+/// The longest run of the conversation's last tokens [`lookup`] matches, and the shortest.
+const LOOKUP_LONGEST: usize = 4;
+const LOOKUP_SHORTEST: usize = 3;
+
+/// Drafts of the tokens after `recent`'s last ones from what the conversation already holds (prompt lookup): where its
+/// last [`LOOKUP_LONGEST`] tokens (then fewer, to [`LOOKUP_SHORTEST`]) came before, at the latest such place, the up to
+/// `k` tokens that followed there. A reply that copies (a file written again with an edit, a call's arguments that
+/// quote the prompt) is then checked several tokens a run, which costs a dense model's run of its weights little more
+/// than one token's. None where they came nowhere before.
+fn lookup(recent: &[u32], k: usize) -> Option<Vec<u32>> {
+    for n in (LOOKUP_SHORTEST..=LOOKUP_LONGEST).rev() {
+        if recent.len() <= n || k == 0 {
+            continue;
+        }
+        let tail = &recent[recent.len() - n..];
+        let found = (0..recent.len() - n).rev().find(|&at| &recent[at..at + n] == tail);
+        if let Some(at) = found {
+            let from = at + n;
+            return Some(recent[from..(from + k).min(recent.len())].to_vec());
+        }
+    }
+    None
+}
+
+/// The most looked-up drafts a check takes ([`lookup`]; OAIY_LOOKUP_DRAFTS, 1 to 15): three, so a check's four rows
+/// are one workgroup's of the several rows' kernels (`ggml_rs_wgpu::quant::shaders::MULTI_ROWS`), which read each
+/// weight once for them, and a check costs Nanbeige4.3's 33B little more than a step (25 ms where a step took 19, at a
+/// few thousand positions). Seven read the weights twice: a check took 33 ms, and one whose first draft was not taken
+/// more than one step lost. Over Nanbeige4.3's file rewritten with a rename, three a check made 99.9 tokens a second
+/// and seven 105.9, its prose 53.9 and 51.8 (52.8 and 53.9 with none), a reply after 22,500 tokens of prompt 39.5 and
+/// 27.4 (39.6 with none).
+const LOOKUP_DRAFTS: usize = 3;
+
+fn lookup_drafts() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("OAIY_LOOKUP_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=15).contains(n)).unwrap_or(LOOKUP_DRAFTS))
+}
+
 fn drafts_most() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| std::env::var("OAIY_DRAFTS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=7).contains(n)).unwrap_or(DRAFTS))

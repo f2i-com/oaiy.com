@@ -328,6 +328,29 @@ impl ChainDecoder {
     /// (`[t, d]`, zero where no picture is) added to the states after layer `i`: Qwen3-VL's DeepStack. A split model's
     /// chunk goes through each device's layers in turn, its hidden states read back and given to the next.
     pub(crate) fn prompt_embeds(&self, backend: &dyn Backend, m: &Dense<'_>, emb: &[f32], t: usize, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>]) -> Option<Tensor> {
+        let out = self.rows(backend, m, emb, t, kv, positions, deepstack, false)?;
+        Some(Tensor::from_vec(out, vec![1, m.cfg.vocab_size]))
+    }
+
+    /// A check of `tokens` (a token sampled and drafts after it) after what `kv` holds, chained as a prompt's chunk is:
+    /// every row's logits (`[1, vocab]` each), the rows kept in `kv` (as a prompt's are) until the caller takes back
+    /// those past the drafts taken (`kv.len` less them). None leaves the tokens to the model's own path.
+    pub(crate) fn check(&self, backend: &dyn Backend, m: &Dense<'_>, tokens: &[u32], kv: &mut KvCache) -> Option<Vec<Tensor>> {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || tokens.is_empty() {
+            return None;
+        }
+        let emb = backend.embed_lookup(&m.common.tok_embd, tokens, m.cfg.embedding_dim);
+        let mut emb = if emb.is_device() { emb.to_host() } else { emb };
+        if let Some(s) = m.embed_scale {
+            emb.data_mut().iter_mut().for_each(|e| *e *= s);
+        }
+        let out = self.rows(backend, m, emb.data(), tokens.len(), kv, None, &[], true)?;
+        Some(out.chunks_exact(m.cfg.vocab_size).map(|row| Tensor::from_vec(row.to_vec(), vec![1, m.cfg.vocab_size])).collect())
+    }
+
+    /// [`Self::prompt_embeds`]'s run of `t` rows: the last row's logits, or with `every` every row's (a check's).
+    #[allow(clippy::too_many_arguments)]
+    fn rows(&self, backend: &dyn Backend, m: &Dense<'_>, emb: &[f32], t: usize, kv: &mut KvCache, positions: Option<&[[u32; 3]]>, deepstack: &[Vec<f32>], every: bool) -> Option<Vec<f32>> {
         if std::env::var_os("OAIY_NO_CHAIN").is_some() || t == 0 || emb.len() != t * m.cfg.embedding_dim {
             return None;
         }
@@ -369,7 +392,7 @@ impl ChainDecoder {
             let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act] =
                 [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
             let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
-            let (last, logits) = (chain.vec(d), chain.vec(cfg.vocab_size));
+            let (last, logits) = (chain.vec(d), chain.vec(if every { t } else { 1 } * cfg.vocab_size));
             chain.upload(&x, &rows_in);
             let deepstack: Vec<DeviceVec> = deepstack
                 .iter()
@@ -432,10 +455,14 @@ impl ChainDecoder {
                 }
             }
             if st.head {
-                // the head of the last token's row only
                 rec.rmsnorm_rows(&x, &st.output_norm, &xn, t, cfg.rms_eps);
-                rec.copy(&xn, (t - 1) * d, &last, 0, d);
-                rec.matmul(quant(&m.common.output), &last, &logits);
+                if every {
+                    rec.matmul_rows(quant(&m.common.output), &xn, &logits, t);
+                } else {
+                    // the head of the last token's row only
+                    rec.copy(&xn, (t - 1) * d, &last, 0, d);
+                    rec.matmul(quant(&m.common.output), &last, &logits);
+                }
                 rec.read(&logits);
             } else {
                 rec.read(&x);
@@ -461,7 +488,7 @@ impl ChainDecoder {
         if let Some(c) = m.softcap {
             out.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
         }
-        Some(Tensor::from_vec(out, vec![1, cfg.vocab_size]))
+        Some(out)
     }
 
     /// One decode step of `token`, chained, if the backend can: the logits `[1, vocab]`; None leaves the step to the
