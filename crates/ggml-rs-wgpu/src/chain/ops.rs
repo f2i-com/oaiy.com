@@ -990,6 +990,15 @@ impl ChainRecorder for Recorder<'_> {
         self.attention_rows_coop_of(q, kv, true, out, rows, n_h, n_kv, head_dim, past, None, scale, false)
     }
 
+    fn attention_rows_halved_grouped(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, scale: f32) -> bool {
+        let per_kv = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        if rows == 0 || !self.backend.attention_halves(n_h, n_kv, head_dim) || !attention_group_wide_for(per_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size) {
+            return false;
+        }
+        self.attention_rows_group_wide(q, kv, true, out, rows, n_h, n_kv, head_dim, past, None, scale);
+        true
+    }
+
     fn attention_rows(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
         if !self.attention_rows_coop(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale) {
             self.attention_rows_f32(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale);
@@ -1055,9 +1064,42 @@ impl ChainRecorder for Recorder<'_> {
             ["chain-attention-lanes-8-64", "chain-attention-lanes-8-128", "chain-attention-lanes-8-256"],
         ];
         static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        // a KV head's query heads at once, or in whole shares (`attention_halves`: one there is), a workgroup a share
-        let g = attention_group_of(n_h / n_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size, 0).expect("a share of the heads");
         let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
+        // a KV head's query heads at once, or in whole shares (`attention_halves`: one there is), a workgroup a share;
+        // else its whole group with the workgroup's memory grown for it (seven heads of 128: `attention_group_wide_for`)
+        let Some(g) = attention_group_of(n_h / n_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size, 0) else {
+            const WIDE: [[&str; 3]; 9] = [
+                ["", "", ""],
+                ["", "", ""],
+                ["chain-attention-halves-wide-2-64", "chain-attention-halves-wide-2-128", "chain-attention-halves-wide-2-256"],
+                ["chain-attention-halves-wide-3-64", "chain-attention-halves-wide-3-128", "chain-attention-halves-wide-3-256"],
+                ["chain-attention-halves-wide-4-64", "chain-attention-halves-wide-4-128", "chain-attention-halves-wide-4-256"],
+                ["chain-attention-halves-wide-5-64", "chain-attention-halves-wide-5-128", "chain-attention-halves-wide-5-256"],
+                ["chain-attention-halves-wide-6-64", "chain-attention-halves-wide-6-128", "chain-attention-halves-wide-6-256"],
+                ["chain-attention-halves-wide-7-64", "chain-attention-halves-wide-7-128", "chain-attention-halves-wide-7-256"],
+                ["chain-attention-halves-wide-8-64", "chain-attention-halves-wide-8-128", "chain-attention-halves-wide-8-256"],
+            ];
+            const WIDE_LANES: [[&str; 3]; 9] = [
+                ["", "", ""],
+                ["", "", ""],
+                ["chain-attention-halves-wide-lanes-2-64", "chain-attention-halves-wide-lanes-2-128", "chain-attention-halves-wide-lanes-2-256"],
+                ["chain-attention-halves-wide-lanes-3-64", "chain-attention-halves-wide-lanes-3-128", "chain-attention-halves-wide-lanes-3-256"],
+                ["chain-attention-halves-wide-lanes-4-64", "chain-attention-halves-wide-lanes-4-128", "chain-attention-halves-wide-lanes-4-256"],
+                ["chain-attention-halves-wide-lanes-5-64", "chain-attention-halves-wide-lanes-5-128", "chain-attention-halves-wide-lanes-5-256"],
+                ["chain-attention-halves-wide-lanes-6-64", "chain-attention-halves-wide-lanes-6-128", "chain-attention-halves-wide-lanes-6-256"],
+                ["chain-attention-halves-wide-lanes-7-64", "chain-attention-halves-wide-lanes-7-128", "chain-attention-halves-wide-lanes-7-256"],
+                ["chain-attention-halves-wide-lanes-8-64", "chain-attention-halves-wide-lanes-8-128", "chain-attention-halves-wide-lanes-8-256"],
+            ];
+            let per_kv = n_h / n_kv;
+            assert!(attention_group_wide_for(per_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size), "chain: no group's kernel for {per_kv} heads of {head_dim} a KV head");
+            let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
+            let names = if lanes { &WIDE_LANES } else { &WIDE };
+            let part = self.gpu().named_pipeline(names[per_kv][at], || attention_part_group_wide_halved(per_kv, head_dim, lanes));
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+            let join = self.named("chain-attention-join", ATTENTION_JOIN);
+            self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+            return;
+        };
         let part = if lanes {
             let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
             self.gpu().named_pipeline(LANES[g][at], || attention_part_group_lanes(g, head_dim))

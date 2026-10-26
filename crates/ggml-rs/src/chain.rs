@@ -201,6 +201,12 @@ pub trait DeviceChain: Send + Sync {
         let _ = (n_h, n_kv, head_dim);
         false
     }
+    /// Whether a few rows' attention (a check of drafts) of these heads takes a cache held as f16 halves alone
+    /// ([`ChainRecorder::attention_rows_halved_grouped`]), besides [`Self::halves_only`].
+    fn halves_few_rows(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        let _ = (n_h, n_kv, head_dim);
+        false
+    }
     /// The length [`ChainRecorder::attention`]'s `out` needs for `n_h` heads of `head_dim` over a cache of `cap` rows:
     /// the result and the device's scratch.
     fn attention_out_len(&self, n_h: usize, head_dim: usize, cap: usize) -> usize;
@@ -333,6 +339,13 @@ pub trait ChainRecorder {
     /// caller attends a row at a time ([`Self::attention_halved`]).
     #[allow(clippy::too_many_arguments)]
     fn attention_rows_halved(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, scale: f32) -> bool {
+        let _ = (q, kv, out, rows, n_h, n_kv, head_dim, past, scale);
+        false
+    }
+    /// [`Self::attention_rows`] of a few rows (a check of drafts) over a cache held as f16 halves, a KV head's query heads
+    /// together: false (nothing recorded) where the device has no such kernel for these heads.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows_halved_grouped(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, scale: f32) -> bool {
         let _ = (q, kv, out, rows, n_h, n_kv, head_dim, past, scale);
         false
     }

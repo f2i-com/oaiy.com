@@ -95,13 +95,32 @@ impl std::fmt::Debug for ChainDecoder {
 }
 
 /// A chained step's copy of a KV cache on the device, a buffer a layer (row `t`: its K `[n_kv, head_dim]` then its V),
-/// `cap` rows of them, and the attention's output and scratch.
+/// `cap` rows of them, and the attention's output and scratch. With `halves` its values are f16, two a word (half the
+/// bytes a step's attention reads of a long cache, and of the card's memory it takes): where the device attends such a
+/// cache for a step, a prompt's rows and a check's few, and no layer keeps a window (OAIY_KV_F32: f32).
 struct ChainKv {
     layers: Vec<DeviceVec>,
     cap: usize,
     out: DeviceVec,
     /// The [`KvCache::id`] the rows are a copy of (0: none).
     owner: u64,
+    halves: bool,
+}
+
+/// `values` (pairs) as f16 halves, two a word, as a cache held as halves keeps them.
+fn to_halves(values: &[f32]) -> Vec<f32> {
+    values.chunks_exact(2).map(|p| f32::from_bits(u32::from(ggml_rs::tensor::f32_to_f16_bits(p[0])) | (u32::from(ggml_rs::tensor::f32_to_f16_bits(p[1])) << 16))).collect()
+}
+
+/// A cache's rows read back as halves (two a word) as f32 values, for the host's cache.
+fn from_halves(words: &[f32]) -> Vec<f32> {
+    words
+        .iter()
+        .flat_map(|w| {
+            let b = w.to_bits();
+            [ggml_rs::tensor::f16_bits_to_f32(b as u16), ggml_rs::tensor::f16_bits_to_f32((b >> 16) as u16)]
+        })
+        .collect()
 }
 
 struct ChainState {
@@ -144,10 +163,11 @@ fn reserve(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig,
     }
     let row = 2 * cfg.n_kv_heads * cfg.head_dim;
     let cap = needed.next_power_of_two().max(256);
+    let len = if g.halves { cap * row / 2 } else { cap * row };
     g.layers = (0..layers)
         .map(|l| match g.layers.get(l) {
-            Some(old) => chain.resize(old, cap * row),
-            None => chain.vec(cap * row),
+            Some(old) => chain.resize(old, len),
+            None => chain.vec(len),
         })
         .collect();
     g.out = chain.vec(chain.attention_out_len(cfg.n_heads, cfg.head_dim, cap));
@@ -172,7 +192,11 @@ fn sync(chain: &dyn ggml_rs::DeviceChain, g: &mut ChainKv, cfg: &ModelConfig, kv
                 rows.extend_from_slice(&kd[t * kvd..(t + 1) * kvd]);
                 rows.extend_from_slice(&vd[t * kvd..(t + 1) * kvd]);
             }
-            chain.upload_at(layer, from * row, &rows);
+            if g.halves {
+                chain.upload_at(layer, from * row / 2, &to_halves(&rows));
+            } else {
+                chain.upload_at(layer, from * row, &rows);
+            }
         }
     }
     g.owner = kv.id;
@@ -211,11 +235,12 @@ fn make_state(backend: &dyn Backend, m: &Dense<'_>, layers: std::ops::Range<usiz
     };
     let ff = m.common.blocks[0].ffn_pair.ff();
     let (d, qd, kvd) = (cfg.embedding_dim, cfg.n_heads * cfg.head_dim, cfg.n_kv_heads * cfg.head_dim);
+    let halves = chain.halves_only(cfg.n_heads, cfg.n_kv_heads, cfg.head_dim) && chain.halves_few_rows(cfg.n_heads, cfg.n_kv_heads, cfg.head_dim) && (0..cfg.n_layers).all(|l| m.layer(l).2.is_none());
     Some(ChainState {
         first: layers.start,
         count: layers.len(),
         head,
-        kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0 }),
+        kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, halves }),
         rope_tables: m.ropes().0.iter().map(|_| chain.vec(cfg.head_dim)).collect(),
         post_norms: m.post_norms.as_ref().map(|norms| norms[layers.clone()].iter().map(|(a, f)| (upload(a), upload(f))).collect()),
         attn_norms: blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
@@ -422,9 +447,17 @@ impl ChainDecoder {
                 let table = &tables[rope_of[l]];
                 rec.rope_rows(qq, t, n_h, hd, table, neox);
                 rec.rope_rows(kk, t, n_kv, hd, table, neox);
-                rec.store_rows(kk, &g.layers[i], t, kvd, past, row, 0);
-                rec.store_rows(&v, &g.layers[i], t, kvd, past, row, kvd);
-                rec.attention_rows(qq, &g.layers[i], &attn, t, n_h, n_kv, hd, past, m.layer(l).2, scale);
+                if g.halves {
+                    rec.store_rows_halved(kk, &g.layers[i], t, kvd, past, row, 0);
+                    rec.store_rows_halved(&v, &g.layers[i], t, kvd, past, row, kvd);
+                    // (on the tensor cores from 16 rows, a check's few a KV head's query heads together)
+                    let attended = rec.attention_rows_halved(qq, &g.layers[i], &attn, t, n_h, n_kv, hd, past, scale) || rec.attention_rows_halved_grouped(qq, &g.layers[i], &attn, t, n_h, n_kv, hd, past, scale);
+                    assert!(attended, "chain: {t} rows' attention over a cache held as halves");
+                } else {
+                    rec.store_rows(kk, &g.layers[i], t, kvd, past, row, 0);
+                    rec.store_rows(&v, &g.layers[i], t, kvd, past, row, kvd);
+                    rec.attention_rows(qq, &g.layers[i], &attn, t, n_h, n_kv, hd, past, m.layer(l).2, scale);
+                }
                 rec.matmul_rows(quant(&b.attn_output), &attn, &proj, t);
                 match &st.post_norms {
                     Some(norms) => {
@@ -468,7 +501,11 @@ impl ChainDecoder {
                 rec.read(&x);
             }
             for layer in g.layers.iter() {
-                rec.read_range(layer, past * row, t * row);
+                if g.halves {
+                    rec.read_range(layer, past * row / 2, t * row / 2);
+                } else {
+                    rec.read_range(layer, past * row, t * row);
+                }
             }
             let mut got = rec.finish().into_iter();
             let first = got.next().expect("the logits or the hidden states");
@@ -477,7 +514,7 @@ impl ChainDecoder {
             } else {
                 rows_in = first;
             }
-            kv_rows.extend(got);
+            kv_rows.extend(got.map(|r| if g.halves { from_halves(&r) } else { r }));
         }
         // the chunk's K and V rows into the host's cache too, which the copy already holds
         for (l, rows) in kv_rows.into_iter().enumerate() {
@@ -549,11 +586,17 @@ impl ChainDecoder {
                 let table = &st.rope_tables[rope_of[l]];
                 rec.rope(q, n_h, hd, table, neox);
                 rec.rope(k, n_kv, hd, table, neox);
-                rec.store(k, &g.layers[i], past * row);
-                rec.store(&st.v, &g.layers[i], past * row + kvd);
                 // a sliding window sees the last `w` positions, as the CPU's attention does
                 let lo = m.layer(l).2.map_or(0, |w| (past + 1).saturating_sub(w));
-                rec.attention(q, &g.layers[i], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
+                if g.halves {
+                    rec.store_rows_halved(k, &g.layers[i], 1, kvd, past, row, 0);
+                    rec.store_rows_halved(&st.v, &g.layers[i], 1, kvd, past, row, kvd);
+                    rec.attention_halved(q, &g.layers[i], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
+                } else {
+                    rec.store(k, &g.layers[i], past * row);
+                    rec.store(&st.v, &g.layers[i], past * row + kvd);
+                    rec.attention(q, &g.layers[i], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
+                }
                 rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
                 match &st.post_norms {
                     Some(norms) => {
@@ -587,7 +630,11 @@ impl ChainDecoder {
                 rec.read(&st.x);
             }
             for layer in g.layers.iter() {
-                rec.read_range(layer, past * row, row);
+                if g.halves {
+                    rec.read_range(layer, past * row / 2, row / 2);
+                } else {
+                    rec.read_range(layer, past * row, row);
+                }
             }
             let mut got = rec.finish().into_iter();
             let first = got.next().expect("the logits or the hidden state");
@@ -596,7 +643,7 @@ impl ChainDecoder {
             } else {
                 row_in = first;
             }
-            kv_rows.extend(got);
+            kv_rows.extend(got.map(|r| if g.halves { from_halves(&r) } else { r }));
         }
         if let Some(c) = m.softcap {
             logits.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);

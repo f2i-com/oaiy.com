@@ -28,7 +28,7 @@ impl Recorder<'_> {
         let per_kv = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
         let memory = self.gpu().limits.max_compute_workgroup_storage_size;
         if !full && !attention_tiled_for(rows, head_dim) && attention_group_of(per_kv, head_dim, memory, 0).is_none() && attention_group_wide_for(per_kv, head_dim, memory) && rows_group_on() {
-            self.attention_rows_group_wide(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale);
+            self.attention_rows_group_wide(q, kv, false, out, rows, n_h, n_kv, head_dim, past, window, scale);
             return;
         }
         if attention_tiled_for(rows, head_dim) {
@@ -193,15 +193,17 @@ impl Recorder<'_> {
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
     }
 
-    /// A few causal rows' attention ([`attention_rows_part_group_wide`]) a workgroup a (KV head, run, row), each KV head's
-    /// whole group of query heads together, the runs joined as [`Self::attention_rows_runs`]'s are; out as theirs.
+    /// A few causal rows' attention ([`attention_rows_part_group_wide`]) a workgroup a (row, KV head, run), each KV head's
+    /// whole group of query heads together, the runs joined as [`Self::attention_rows_runs`]'s are; out as theirs. Over
+    /// the cache's f16 halves with `halves` (`kv`'s rows two values a word).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn attention_rows_group_wide(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
+    pub(crate) fn attention_rows_group_wide(&mut self, q: &DeviceVec, kv: &DeviceVec, halves: bool, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
         let kv_len = past + rows;
         let runs = kv_len.div_ceil(SPLIT).max(1);
         let g = n_h / n_kv.max(1);
+        let kv_values = if halves { kv.len * 2 } else { kv.len };
         assert!(
-            rows > 0 && n_kv > 0 && n_h % n_kv == 0 && kv.len >= kv_len * 2 * n_kv * head_dim && q.len >= rows * n_h * head_dim && out.len >= rows * n_h * head_dim + rows * n_h * runs * (head_dim + 2),
+            rows > 0 && n_kv > 0 && n_h % n_kv == 0 && kv_values >= kv_len * 2 * n_kv * head_dim && q.len >= rows * n_h * head_dim && out.len >= rows * n_h * head_dim + rows * n_h * runs * (head_dim + 2),
             "chain: a few rows' grouped attention's buffers"
         );
         const NAMES: [[&str; 3]; 9] = [
@@ -228,12 +230,36 @@ impl Recorder<'_> {
         ];
         static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
+        const HALVES: [[&str; 3]; 9] = [
+            ["", "", ""],
+            ["", "", ""],
+            ["chain-attention-rows-group-halves-2-64", "chain-attention-rows-group-halves-2-128", "chain-attention-rows-group-halves-2-256"],
+            ["chain-attention-rows-group-halves-3-64", "chain-attention-rows-group-halves-3-128", "chain-attention-rows-group-halves-3-256"],
+            ["chain-attention-rows-group-halves-4-64", "chain-attention-rows-group-halves-4-128", "chain-attention-rows-group-halves-4-256"],
+            ["chain-attention-rows-group-halves-5-64", "chain-attention-rows-group-halves-5-128", "chain-attention-rows-group-halves-5-256"],
+            ["chain-attention-rows-group-halves-6-64", "chain-attention-rows-group-halves-6-128", "chain-attention-rows-group-halves-6-256"],
+            ["chain-attention-rows-group-halves-7-64", "chain-attention-rows-group-halves-7-128", "chain-attention-rows-group-halves-7-256"],
+            ["chain-attention-rows-group-halves-8-64", "chain-attention-rows-group-halves-8-128", "chain-attention-rows-group-halves-8-256"],
+        ];
+        const HALVES_LANES: [[&str; 3]; 9] = [
+            ["", "", ""],
+            ["", "", ""],
+            ["chain-attention-rows-group-halves-lanes-2-64", "chain-attention-rows-group-halves-lanes-2-128", "chain-attention-rows-group-halves-lanes-2-256"],
+            ["chain-attention-rows-group-halves-lanes-3-64", "chain-attention-rows-group-halves-lanes-3-128", "chain-attention-rows-group-halves-lanes-3-256"],
+            ["chain-attention-rows-group-halves-lanes-4-64", "chain-attention-rows-group-halves-lanes-4-128", "chain-attention-rows-group-halves-lanes-4-256"],
+            ["chain-attention-rows-group-halves-lanes-5-64", "chain-attention-rows-group-halves-lanes-5-128", "chain-attention-rows-group-halves-lanes-5-256"],
+            ["chain-attention-rows-group-halves-lanes-6-64", "chain-attention-rows-group-halves-lanes-6-128", "chain-attention-rows-group-halves-lanes-6-256"],
+            ["chain-attention-rows-group-halves-lanes-7-64", "chain-attention-rows-group-halves-lanes-7-128", "chain-attention-rows-group-halves-lanes-7-256"],
+            ["chain-attention-rows-group-halves-lanes-8-64", "chain-attention-rows-group-halves-lanes-8-128", "chain-attention-rows-group-halves-lanes-8-256"],
+        ];
         let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
-        let part = if lanes {
-            self.gpu().named_pipeline(LANES[g][at], || attention_rows_part_group_wide(g, head_dim, true))
-        } else {
-            self.gpu().named_pipeline(NAMES[g][at], || attention_rows_part_group_wide(g, head_dim, false))
+        let names = match (halves, lanes) {
+            (false, false) => &NAMES,
+            (false, true) => &LANES,
+            (true, false) => &HALVES,
+            (true, true) => &HALVES_LANES,
         };
+        let part = self.gpu().named_pipeline(names[g][at], || attention_rows_part_group_wide(g, head_dim, lanes, halves));
         let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, window.unwrap_or(0) as u32, runs as u32, scale.to_bits(), rows as u32]);
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (rows as u32, n_kv as u32, runs as u32));
         let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);

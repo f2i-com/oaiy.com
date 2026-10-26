@@ -816,7 +816,12 @@ pub(in crate::chain) fn attention_group_wide_for(per_kv: usize, head_dim: usize,
 /// [`attention_part_group`] over a cache held as f16 halves ([`HALVE`]'s): each key and value a vec4 of f16, half the
 /// bytes (a step's parts over 15,888 positions read 130 MB a layer at half the card's bandwidth).
 pub(in crate::chain) fn attention_part_group_halved(g: usize) -> String {
-    let f32s = attention_part_group(g);
+    halved_of(attention_part_group(g))
+}
+
+/// A group's parts over an f32 cache (`f32s`: [`attention_part_group`]'s or one made from it) over the cache held as
+/// f16 halves: its two reads of the cache's vec4s read vec4s of halves.
+fn halved_of(f32s: String) -> String {
     let halved = f32s
         .replace("var<storage, read> kv4: array<vec4<f32>>;", "var<storage, read> kv4: array<vec4<f16>>;")
         .replace("let k = kv4[kb + d];", "let k = vec4<f32>(kv4[kb + d]);")
@@ -859,7 +864,7 @@ pub(in crate::chain) fn attention_part_group_wide_lanes(g: usize, hd: usize) -> 
 /// scale, rows), each key read by a subgroup's lanes together with `lanes`. A workgroup a (head, run, row) read the
 /// cache once for each of a check's query heads and rows: Nanbeige4.3's check of 8 rows over 22,600 positions 2.4 ms a
 /// layer, a step of the 8 tokens 0.21.
-pub(in crate::chain) fn attention_rows_part_group_wide(g: usize, hd: usize, lanes: bool) -> String {
+pub(in crate::chain) fn attention_rows_part_group_wide(g: usize, hd: usize, lanes: bool, halves: bool) -> String {
     let swap = |s: String, old: &str, new: &str, times: usize| {
         assert_eq!(s.matches(old).count(), times, "the rows' grouped parts: {old}");
         s.replace(old, new)
@@ -879,6 +884,19 @@ pub(in crate::chain) fn attention_rows_part_group_wide(g: usize, hd: usize, lane
     let s = swap(s, "buf[i] = q4[grp * G * hd4 + i];", "buf[i] = q4[(r * n_h + grp * G) * hd4 + i];", 1);
     let s = swap(s, "let ml = n_h * hd + n_h * runs * hd + ((grp * G + ", "let ml = rows * n_h * hd + rows * n_h * runs * hd + ((r * n_h + grp * G + ", g);
     let s = swap(s, "let at = n_h * hd + ((grp * G + ", "let at = rows * n_h * hd + ((r * n_h + grp * G + ", g);
+    // (over the cache's f16 halves where it is held so: a check's rows of a dense model whose cache is)
+    let s = if halves { halved_of(s) } else { s };
+    if lanes {
+        lanes_of(s, g, hd, (hd / 4).min(32), 4)
+    } else {
+        s
+    }
+}
+
+/// [`attention_part_group_wide`] over the cache held as f16 halves, each key read by a subgroup's lanes together with
+/// `lanes`: a step's attention of a group the shares do not take (seven heads of 128) over half the bytes.
+pub(in crate::chain) fn attention_part_group_wide_halved(g: usize, hd: usize, lanes: bool) -> String {
+    let s = halved_of(attention_part_group_wide(g, hd));
     if lanes {
         lanes_of(s, g, hd, (hd / 4).min(32), 4)
     } else {

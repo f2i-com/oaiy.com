@@ -255,11 +255,12 @@ fn qsas_attention_by_groups_is_the_heads() {
 /// A step's attention over its cache's f16 halves gives what the f32 cache gives, to f16's rounding: the halves
 /// made in two goes (rows added since the first), groups of 2, 3, 4 (Qwen3.5 9B's) and 6, heads 64, 128 and 256 wide
 /// (where subgroups are 32 lanes, a key read by a subgroup's lanes together), and groups more than a workgroup holds
-/// at once, in shares: 8 of 256 (the 35B MiniCPM-V's, two fours) and 12 of 128 (three fours).
+/// at once, in shares: 8 of 256 (the 35B MiniCPM-V's, two fours) and 12 of 128 (three fours); and groups no share takes,
+/// the workgroup's memory grown: seven of 128 (Nanbeige4.3's 56 over 8) and of 64.
 #[test]
 fn a_steps_attention_over_halves_is_the_f32_caches() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (16, 4, 256, 0, 5000), (8, 2, 128, 37, 300), (16, 2, 256, 0, 4100), (24, 2, 128, 9, 777)] {
+    for (n_h, n_kv, hd, lo, kv_len) in [(24usize, 4usize, 256usize, 0usize, 3000usize), (8, 4, 64, 0, 700), (24, 8, 128, 100, 1111), (16, 4, 256, 0, 5000), (8, 2, 128, 37, 300), (16, 2, 256, 0, 4100), (24, 2, 128, 9, 777), (56, 8, 128, 0, 3600), (56, 8, 128, 300, 301), (14, 2, 64, 0, 2000)] {
         if !b.attention_halves(n_h, n_kv, hd) {
             return;
         }
@@ -325,7 +326,7 @@ fn a_few_rows_attention_by_a_wide_group_is_the_runs() {
         let (want, got) = (b.vec(len), b.vec(len));
         let mut rec = Recorder::new(&b);
         rec.attention_rows_runs(&qv, &kv, &want, rows, n_h, n_kv, hd, past, window, scale, false);
-        rec.attention_rows_group_wide(&qv, &kv, &got, rows, n_h, n_kv, hd, past, window, scale);
+        rec.attention_rows_group_wide(&qv, &kv, false, &got, rows, n_h, n_kv, hd, past, window, scale);
         rec.read_range(&want, 0, rows * qd);
         rec.read_range(&got, 0, rows * qd);
         let r = Box::new(rec).finish();
@@ -333,6 +334,46 @@ fn a_few_rows_attention_by_a_wide_group_is_the_runs() {
         let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past} (window {window:?}): worst {worst} of {top}");
+    }
+}
+
+/// A few causal rows' attention over a cache held as f16 halves, a KV head's query heads together
+/// ([`ChainRecorder::attention_rows_halved_grouped`]), gives what the runs' kernel gives over the f32 cache within the
+/// halves' rounding: a check's rows of seven heads a KV head (Nanbeige4.3's 56 of 128 over 8) and of four (a 1B Llama's
+/// 32 of 64 over 8), from the start and past it.
+#[test]
+fn a_few_rows_attention_over_halves_by_groups_is_the_f32_runs() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    for (n_h, n_kv, hd, past, rows) in [(56usize, 8usize, 128usize, 3600usize, 8usize), (56, 8, 128, 0, 4), (32, 8, 64, 1111, 4), (24, 8, 128, 515, 1)] {
+        if !b.attention_halves(n_h, n_kv, hd) {
+            return;
+        }
+        let kv_len = past + rows;
+        let (qd, row) = (n_h * hd, 2 * n_kv * hd);
+        let mut next = rng((qd + past + rows) as u32);
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
+        let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * 2.0).collect();
+        let (qv, kv, half) = (b.vec(rows * qd), b.vec(kv_len * row), b.vec(kv_len * row / 2));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let len = attention_runs_out_len(rows, n_h, hd, kv_len);
+        let (want, got) = (b.vec(len), b.vec(len));
+        let mut rec = Recorder::new(&b);
+        rec.attention_rows_runs(&qv, &kv, &want, rows, n_h, n_kv, hd, past, None, scale, false);
+        rec.halve(&kv, &half, 0, kv_len * row);
+        assert!(rec.attention_rows_halved_grouped(&qv, &half, &got, rows, n_h, n_kv, hd, past, scale), "{n_h} heads of {hd} over {n_kv}: by groups");
+        rec.read_range(&want, 0, rows * qd);
+        rec.read_range(&got, 0, rows * qd);
+        let r = Box::new(rec).finish();
+        let (want, got) = (&r[0], &r[1]);
+        let dot: f64 = got.iter().zip(want).map(|(a, e)| *a as f64 * *e as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(got) * norm(want));
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        eprintln!("{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
+        assert!(cos > 0.99999 && worst <= 4e-3 * top, "{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past}: cosine {cos}, worst {worst} of {top}");
     }
 }
 

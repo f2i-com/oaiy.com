@@ -146,6 +146,11 @@ impl DeviceChain for WgpuBackend {
             && n_h.is_multiple_of(n_kv)
     }
 
+    fn halves_few_rows(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
+        let g = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        self.attention_halves(n_h, n_kv, head_dim) && attention_group_wide_for(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size)
+    }
+
     fn attention_halves(&self, n_h: usize, n_kv: usize, head_dim: usize) -> bool {
         // (OAIY_ATTENTION_F32: a step's attention over the cache as it is)
         static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -153,8 +158,10 @@ impl DeviceChain for WgpuBackend {
         !*F32.get_or_init(|| std::env::var_os("OAIY_ATTENTION_F32").is_some() || std::env::var_os("OAIY_ATTENTION_PART4").is_some())
             && self.gpu.device.features().contains(wgpu::Features::SHADER_F16)
             // (a KV head's query heads in whole shares where all of them are more than a workgroup holds: the 35B
-            // MiniCPM-V's 8 of 256 in two fours)
-            && attention_group_of(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size, 0).is_some()
+            // MiniCPM-V's 8 of 256 in two fours; or all of them with the workgroup's memory grown, where no share
+            // takes them: Nanbeige4.3's seven of 128)
+            && (attention_group_of(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size, 0).is_some()
+                || attention_group_wide_for(g, head_dim, self.gpu.limits.max_compute_workgroup_storage_size))
     }
 
     fn vec(&self, len: usize) -> DeviceVec {
