@@ -788,6 +788,31 @@ pub(in crate::chain) fn attention_part_group(g: usize) -> String {
         )
 }
 
+/// [`attention_part_group`] of a KV head's whole group of `g` query heads `head_dim` wide whose shares' sums are more
+/// than its workgroup memory's 1,152 vec4s hold ([`attention_group_for`]), that memory grown to hold them
+/// ([`attention_group_wide_for`]): Nanbeige4.3's seven query heads of 128 a KV head (seven is a share of none), 1,568
+/// vec4s and 33 KB with the weights, of an RTX 5090's 48. A workgroup a query head read the cache seven times over:
+/// 5.3 ms of a 22.6 ms step at 2,500 to 4,800 positions.
+pub(in crate::chain) fn attention_part_group_wide(g: usize, head_dim: usize) -> String {
+    let s = attention_part_group(g);
+    let old = "var<workgroup> buf: array<vec4<f32>, 1152>;";
+    assert_eq!(s.matches(old).count(), 1, "the grouped parts' workgroup memory");
+    s.replace(old, &format!("var<workgroup> buf: array<vec4<f32>, {}>;", attention_group_buf(g, head_dim)))
+}
+
+/// The vec4s of workgroup memory [`ATTENTION_PART_GROUP`]'s `buf` takes for `g` query heads `head_dim` wide: the
+/// group's queries, a run's scores (two a key), or its shares' sums but the first's, the most of them.
+pub(in crate::chain) fn attention_group_buf(g: usize, head_dim: usize) -> usize {
+    (g * head_dim / 4).max(512).max(g * (256 - head_dim / 4))
+}
+
+/// Whether [`attention_part_group_wide`] takes a KV head's whole group of `per_kv` query heads `head_dim` wide, where
+/// [`attention_group_of`] takes none: 2 to 8 of them, the head 64, 128 or 256 wide, its memory (`buf` and the weights'
+/// 512 vec4s) within the workgroup's.
+pub(in crate::chain) fn attention_group_wide_for(per_kv: usize, head_dim: usize, workgroup_bytes: u32) -> bool {
+    matches!(head_dim, 64 | 128 | 256) && (2..=8).contains(&per_kv) && 16 * (attention_group_buf(per_kv, head_dim) + 512) <= workgroup_bytes as usize
+}
+
 /// [`attention_part_group`] over a cache held as f16 halves ([`HALVE`]'s): each key and value a vec4 of f16, half the
 /// bytes (a step's parts over 15,888 positions read 130 MB a layer at half the card's bandwidth).
 pub(in crate::chain) fn attention_part_group_halved(g: usize) -> String {
@@ -817,8 +842,54 @@ pub(in crate::chain) fn attention_part_group_lanes(g: usize, hd: usize) -> Strin
 /// [`attention_part_group_lanes`] with `lanes` lanes a key (each `hd / 4 / lanes` of its vec4s, the lanes' side by side),
 /// `unroll` keys a lane at a time.
 pub(in crate::chain) fn attention_part_group_lanes_by(g: usize, hd: usize, lanes: usize, unroll: usize) -> String {
+    lanes_of(attention_part_group_halved(g), g, hd, lanes, unroll)
+}
+
+/// [`attention_part_group_wide`] (over an f32 cache) with each key read by the lanes of a subgroup together, as
+/// [`attention_part_group_lanes`] reads the halves: a thread a key read its key's row alone, a subgroup's loads 32 rows
+/// 8 KB apart (Nanbeige4.3's 8 KV heads of 128), its parts 0.21 ms a layer over 22,600 positions (870 GB/s of the
+/// cache's 185 MB) on an RTX 5090.
+pub(in crate::chain) fn attention_part_group_wide_lanes(g: usize, hd: usize) -> String {
+    lanes_of(attention_part_group_wide(g, hd), g, hd, (hd / 4).min(32), 4)
+}
+
+/// [`attention_part_group_wide`] for a few queries' rows (a check of drafts), the grid's third axis the rows: row `r`'s
+/// query (at `past + r`) over the positions to its own, the last `window` of them where it has one, the parts laid out
+/// as [`ATTENTION_ROWS_PART`]'s for [`ATTENTION_ROWS_JOIN`] (`p` as theirs: heads, KV heads, width, `past`; window, runs,
+/// scale, rows), each key read by a subgroup's lanes together with `lanes`. A workgroup a (head, run, row) read the
+/// cache once for each of a check's query heads and rows: Nanbeige4.3's check of 8 rows over 22,600 positions 2.4 ms a
+/// layer, a step of the 8 tokens 0.21.
+pub(in crate::chain) fn attention_rows_part_group_wide(g: usize, hd: usize, lanes: bool) -> String {
+    let swap = |s: String, old: &str, new: &str, times: usize| {
+        assert_eq!(s.matches(old).count(), times, "the rows' grouped parts: {old}");
+        s.replace(old, new)
+    };
+    let s = attention_part_group_wide(g, hd);
+    // (the rows the grid's first axis, its KV heads and runs the others: a run's rows read its keys and values at once,
+    // so all but the first find them in the card's cache)
+    let s = swap(s, "    let grp = wg.x;\n", "    let grp = wg.y;\n", 1);
+    let s = swap(s, "    let run = wg.y;\n", "    let run = wg.z;\n", 1);
+    let s = swap(s, "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {", "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {", 1);
+    let s = swap(
+        s,
+        "    let hi = p[0].w;\n    let lo = p[1].x;\n",
+        "    // the row's query at `past + r`: the positions to its own, the last `window` of them where it has one\n    let rows = nwg.x;\n    let r = wg.x;\n    let hi = p[0].w + r + 1u;\n    var lo = 0u;\n    if (p[1].x > 0u && hi > p[1].x) { lo = hi - p[1].x; }\n",
+        1,
+    );
+    let s = swap(s, "buf[i] = q4[grp * G * hd4 + i];", "buf[i] = q4[(r * n_h + grp * G) * hd4 + i];", 1);
+    let s = swap(s, "let ml = n_h * hd + n_h * runs * hd + ((grp * G + ", "let ml = rows * n_h * hd + rows * n_h * runs * hd + ((r * n_h + grp * G + ", g);
+    let s = swap(s, "let at = n_h * hd + ((grp * G + ", "let at = rows * n_h * hd + ((r * n_h + grp * G + ", g);
+    if lanes {
+        lanes_of(s, g, hd, (hd / 4).min(32), 4)
+    } else {
+        s
+    }
+}
+
+/// A group's parts (`halved`: [`attention_part_group_halved`]'s or an f32 one's, whose reads are its `vec4<f32>(...)`
+/// alike) with each key read by `lanes` lanes of a subgroup together, `unroll` keys a lane at a time.
+fn lanes_of(halved: String, g: usize, hd: usize, lanes: usize, unroll: usize) -> String {
     assert!(matches!(hd, 64 | 128 | 256) && (2..=8).contains(&g) && matches!(lanes, 8 | 16 | 32) && hd / 4 >= lanes && matches!(unroll, 1 | 2 | 4), "the lanes' attention's heads");
-    let halved = attention_part_group_halved(g);
     let from = halved.find("    let t = start + li;\n").expect("the scores' start");
     let to = halved.find("    workgroupBarrier();\n    buf[2u * li] = s0;").expect("the scores' end");
     let per = 32 / lanes;

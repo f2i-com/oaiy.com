@@ -150,6 +150,42 @@ fn a_steps_attention_by_groups_is_the_heads() {
     }
 }
 
+/// A step's attention with a KV head's whole group of query heads that no share of the group's kernel takes, its
+/// workgroup memory grown (seven heads a KV head: Nanbeige4.3's 56 of 128 over 8, and of 64 and 256), gives what a
+/// workgroup a head gives: at a few positions, a run short of its 256, a window's start, thousands.
+#[test]
+fn a_steps_attention_by_a_wide_group_is_the_heads() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    let memory = b.gpu.limits.max_compute_workgroup_storage_size;
+    for (n_h, n_kv, hd, lo, kv_len) in [(56usize, 8usize, 128usize, 0usize, 3600usize), (56, 8, 128, 0, 1), (56, 8, 128, 300, 1111), (14, 2, 64, 0, 513), (7, 1, 256, 0, 2052)] {
+        assert!(attention_group_of(n_h / n_kv, hd, memory, 0).is_none(), "{n_h} heads of {hd} over {n_kv}: no share of the group's kernel");
+        if !attention_group_wide_for(n_h / n_kv, hd, memory) {
+            eprintln!("{n_h} heads of {hd} over {n_kv}: the device's {memory} bytes of workgroup memory hold no wide group");
+            continue;
+        }
+        let (qd, row, cap) = (n_h * hd, 2 * n_kv * hd, kv_len + 3);
+        let mut next = rng((qd + kv_len) as u32);
+        let q: Vec<f32> = (0..qd).map(|_| next() * 2.0).collect();
+        let cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+        let (qv, kv) = (b.vec(qd), b.vec(cap * row));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let len = b.attention_out_len(n_h, hd, cap);
+        let (want, got) = (b.vec(len), b.vec(len));
+        let mut rec = Recorder::new(&b);
+        rec.attention_by(&qv, &kv, &want, n_h, n_kv, hd, lo, kv_len, cap, scale, false);
+        rec.attention_by(&qv, &kv, &got, n_h, n_kv, hd, lo, kv_len, cap, scale, true);
+        rec.read_range(&want, 0, qd);
+        rec.read_range(&got, 0, qd);
+        let r = Box::new(rec).finish();
+        let (want, got) = (&r[0], &r[1]);
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: worst {worst} of {top}");
+    }
+}
+
 /// QSA's attention with a KV head's query heads together gives what a workgroup a head gives, for a step's row and a
 /// check's few: Flash-Next's 24 heads over 2 of 256 in sixes past its dense span (blocks of 16, 128 kept), and smaller
 /// shapes whose queries keep every block they see, a spread of them, and have a tail block or none. And with every
@@ -254,6 +290,49 @@ fn a_steps_attention_over_halves_is_the_f32_caches() {
         let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         eprintln!("{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: cosine {cos:.7}, worst {worst:.2e} of {top:.2}");
         assert!(cos > 0.99999 && worst <= 4e-3 * top, "{n_h} heads ({n_kv} kv) {hd} wide over {lo}..{kv_len}: cosine {cos}, worst {worst} of {top}");
+    }
+}
+
+/// A few causal rows' attention with a KV head's whole group of query heads together (seven heads a KV head, the
+/// group's memory grown: Nanbeige4.3's 56 of 128 over 8) gives what the runs' kernel gives, a workgroup a head: a check's
+/// rows over a long cache, from its start, windowed, a single row, heads 64 and 256 wide.
+#[test]
+fn a_few_rows_attention_by_a_wide_group_is_the_runs() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    let memory = b.gpu.limits.max_compute_workgroup_storage_size;
+    for (n_h, n_kv, hd, past, rows, window) in [
+        (56usize, 8usize, 128usize, 3600usize, 8usize, None),
+        (56, 8, 128, 0, 5, None),
+        (56, 8, 128, 1111, 1, None),
+        (56, 8, 128, 700, 6, Some(300usize)),
+        (14, 2, 64, 513, 3, None),
+        (7, 1, 256, 2050, 4, None),
+    ] {
+        if !attention_group_wide_for(n_h / n_kv, hd, memory) {
+            eprintln!("{n_h} heads of {hd} over {n_kv}: the device's {memory} bytes of workgroup memory hold no wide group");
+            continue;
+        }
+        let kv_len = past + rows;
+        let (qd, row) = (n_h * hd, 2 * n_kv * hd);
+        let mut next = rng((qd + past + rows) as u32);
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
+        let cache: Vec<f32> = (0..kv_len * row).map(|_| next() * 2.0).collect();
+        let (qv, kv) = (b.vec(rows * qd), b.vec(kv_len * row));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let len = attention_runs_out_len(rows, n_h, hd, kv_len);
+        let (want, got) = (b.vec(len), b.vec(len));
+        let mut rec = Recorder::new(&b);
+        rec.attention_rows_runs(&qv, &kv, &want, rows, n_h, n_kv, hd, past, window, scale, false);
+        rec.attention_rows_group_wide(&qv, &kv, &got, rows, n_h, n_kv, hd, past, window, scale);
+        rec.read_range(&want, 0, rows * qd);
+        rec.read_range(&got, 0, rows * qd);
+        let r = Box::new(rec).finish();
+        let (want, got) = (&r[0], &r[1]);
+        let top = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(top > 0.0 && worst <= 2e-5 * top, "{n_h} heads ({n_kv} kv) {hd} wide, {rows} rows after {past} (window {window:?}): worst {worst} of {top}");
     }
 }
 

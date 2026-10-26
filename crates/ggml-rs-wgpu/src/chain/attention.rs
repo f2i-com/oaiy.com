@@ -23,6 +23,14 @@ impl Recorder<'_> {
             self.attention_rows_wide(q, kv, out, rows, n_h, n_kv, head_dim, past + rows, scale, Some((past, window)));
             return;
         }
+        // (a few causal rows whose KV heads' query heads a group's kernel takes only with its memory grown (seven heads
+        // of 128): a KV head's group together, its keys and values read once a row; OAIY_ATTENTION_ROWS_RUNS: not)
+        let per_kv = if n_kv > 0 && n_h % n_kv == 0 { n_h / n_kv } else { 0 };
+        let memory = self.gpu().limits.max_compute_workgroup_storage_size;
+        if !full && !attention_tiled_for(rows, head_dim) && attention_group_of(per_kv, head_dim, memory, 0).is_none() && attention_group_wide_for(per_kv, head_dim, memory) && rows_group_on() {
+            self.attention_rows_group_wide(q, kv, out, rows, n_h, n_kv, head_dim, past, window, scale);
+            return;
+        }
         if attention_tiled_for(rows, head_dim) {
             let per_row = 4.0 * (if full { past } else { past + rows }).max(1) as f64 * (n_h * head_dim) as f64;
             let tq = attention_tile(head_dim).0;
@@ -140,6 +148,42 @@ impl Recorder<'_> {
             const NAMES: [&str; 9] = ["", "", "chain-attention-group-2", "chain-attention-group-3", "chain-attention-group-4", "chain-attention-group-5", "chain-attention-group-6", "chain-attention-group-7", "chain-attention-group-8"];
             let part = self.gpu().named_pipeline(NAMES[g], || attention_part_group(g));
             self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, ((n_h / g) as u32, runs as u32, 1));
+        } else if group && attention_group_wide_for(per_kv, head_dim, self.gpu().limits.max_compute_workgroup_storage_size) {
+            // a whole group whose shares' sums want more of the workgroup's memory (seven heads of 128: none of the
+            // shares above takes them), where the device has it
+            const NAMES: [[&str; 3]; 9] = [
+                ["", "", ""],
+                ["", "", ""],
+                ["chain-attention-group-wide-2-64", "chain-attention-group-wide-2-128", "chain-attention-group-wide-2-256"],
+                ["chain-attention-group-wide-3-64", "chain-attention-group-wide-3-128", "chain-attention-group-wide-3-256"],
+                ["chain-attention-group-wide-4-64", "chain-attention-group-wide-4-128", "chain-attention-group-wide-4-256"],
+                ["chain-attention-group-wide-5-64", "chain-attention-group-wide-5-128", "chain-attention-group-wide-5-256"],
+                ["chain-attention-group-wide-6-64", "chain-attention-group-wide-6-128", "chain-attention-group-wide-6-256"],
+                ["chain-attention-group-wide-7-64", "chain-attention-group-wide-7-128", "chain-attention-group-wide-7-256"],
+                ["chain-attention-group-wide-8-64", "chain-attention-group-wide-8-128", "chain-attention-group-wide-8-256"],
+            ];
+            // (a device whose subgroups are 32 lanes: a key's row read by a subgroup's lanes together; OAIY_ATTENTION_LANES=0:
+            // a thread a key)
+            const LANES: [[&str; 3]; 9] = [
+                ["", "", ""],
+                ["", "", ""],
+                ["chain-attention-group-wide-lanes-2-64", "chain-attention-group-wide-lanes-2-128", "chain-attention-group-wide-lanes-2-256"],
+                ["chain-attention-group-wide-lanes-3-64", "chain-attention-group-wide-lanes-3-128", "chain-attention-group-wide-lanes-3-256"],
+                ["chain-attention-group-wide-lanes-4-64", "chain-attention-group-wide-lanes-4-128", "chain-attention-group-wide-lanes-4-256"],
+                ["chain-attention-group-wide-lanes-5-64", "chain-attention-group-wide-lanes-5-128", "chain-attention-group-wide-lanes-5-256"],
+                ["chain-attention-group-wide-lanes-6-64", "chain-attention-group-wide-lanes-6-128", "chain-attention-group-wide-lanes-6-256"],
+                ["chain-attention-group-wide-lanes-7-64", "chain-attention-group-wide-lanes-7-128", "chain-attention-group-wide-lanes-7-256"],
+                ["chain-attention-group-wide-lanes-8-64", "chain-attention-group-wide-lanes-8-128", "chain-attention-group-wide-lanes-8-256"],
+            ];
+            static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
+            let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
+            let part = if lanes {
+                self.gpu().named_pipeline(LANES[per_kv][at], || attention_part_group_wide_lanes(per_kv, head_dim))
+            } else {
+                self.gpu().named_pipeline(NAMES[per_kv][at], || attention_part_group_wide(per_kv, head_dim))
+            };
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
         } else {
             // a head a multiple of 4 wide (at most 512): the vec4 kernel
             let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
@@ -147,6 +191,54 @@ impl Recorder<'_> {
         }
         let join = self.named("chain-attention-join", ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
+    }
+
+    /// A few causal rows' attention ([`attention_rows_part_group_wide`]) a workgroup a (KV head, run, row), each KV head's
+    /// whole group of query heads together, the runs joined as [`Self::attention_rows_runs`]'s are; out as theirs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_rows_group_wide(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
+        let kv_len = past + rows;
+        let runs = kv_len.div_ceil(SPLIT).max(1);
+        let g = n_h / n_kv.max(1);
+        assert!(
+            rows > 0 && n_kv > 0 && n_h % n_kv == 0 && kv.len >= kv_len * 2 * n_kv * head_dim && q.len >= rows * n_h * head_dim && out.len >= rows * n_h * head_dim + rows * n_h * runs * (head_dim + 2),
+            "chain: a few rows' grouped attention's buffers"
+        );
+        const NAMES: [[&str; 3]; 9] = [
+            ["", "", ""],
+            ["", "", ""],
+            ["chain-attention-rows-group-wide-2-64", "chain-attention-rows-group-wide-2-128", "chain-attention-rows-group-wide-2-256"],
+            ["chain-attention-rows-group-wide-3-64", "chain-attention-rows-group-wide-3-128", "chain-attention-rows-group-wide-3-256"],
+            ["chain-attention-rows-group-wide-4-64", "chain-attention-rows-group-wide-4-128", "chain-attention-rows-group-wide-4-256"],
+            ["chain-attention-rows-group-wide-5-64", "chain-attention-rows-group-wide-5-128", "chain-attention-rows-group-wide-5-256"],
+            ["chain-attention-rows-group-wide-6-64", "chain-attention-rows-group-wide-6-128", "chain-attention-rows-group-wide-6-256"],
+            ["chain-attention-rows-group-wide-7-64", "chain-attention-rows-group-wide-7-128", "chain-attention-rows-group-wide-7-256"],
+            ["chain-attention-rows-group-wide-8-64", "chain-attention-rows-group-wide-8-128", "chain-attention-rows-group-wide-8-256"],
+        ];
+        const LANES: [[&str; 3]; 9] = [
+            ["", "", ""],
+            ["", "", ""],
+            ["chain-attention-rows-group-wide-lanes-2-64", "chain-attention-rows-group-wide-lanes-2-128", "chain-attention-rows-group-wide-lanes-2-256"],
+            ["chain-attention-rows-group-wide-lanes-3-64", "chain-attention-rows-group-wide-lanes-3-128", "chain-attention-rows-group-wide-lanes-3-256"],
+            ["chain-attention-rows-group-wide-lanes-4-64", "chain-attention-rows-group-wide-lanes-4-128", "chain-attention-rows-group-wide-lanes-4-256"],
+            ["chain-attention-rows-group-wide-lanes-5-64", "chain-attention-rows-group-wide-lanes-5-128", "chain-attention-rows-group-wide-lanes-5-256"],
+            ["chain-attention-rows-group-wide-lanes-6-64", "chain-attention-rows-group-wide-lanes-6-128", "chain-attention-rows-group-wide-lanes-6-256"],
+            ["chain-attention-rows-group-wide-lanes-7-64", "chain-attention-rows-group-wide-lanes-7-128", "chain-attention-rows-group-wide-lanes-7-256"],
+            ["chain-attention-rows-group-wide-lanes-8-64", "chain-attention-rows-group-wide-lanes-8-128", "chain-attention-rows-group-wide-lanes-8-256"],
+        ];
+        static LANES_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lanes = self.gpu().subgroups32() && *LANES_ON.get_or_init(|| std::env::var("OAIY_ATTENTION_LANES").map_or(true, |v| v != "0"));
+        let at = match head_dim { 64 => 0, 128 => 1, _ => 2 };
+        let part = if lanes {
+            self.gpu().named_pipeline(LANES[g][at], || attention_rows_part_group_wide(g, head_dim, true))
+        } else {
+            self.gpu().named_pipeline(NAMES[g][at], || attention_rows_part_group_wide(g, head_dim, false))
+        };
+        let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, window.unwrap_or(0) as u32, runs as u32, scale.to_bits(), rows as u32]);
+        self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (rows as u32, n_kv as u32, runs as u32));
+        let join = self.named("chain-attention-rows-join", ATTENTION_ROWS_JOIN);
+        self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
+        self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
     }
 
     pub(crate) fn attention_rows_runs(&mut self, q: &DeviceVec, kv: &DeviceVec, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32, full: bool) {
@@ -477,4 +569,11 @@ fn grouped_on() -> bool {
 pub(crate) fn rows_kernel() -> bool {
     static ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| std::env::var("OAIY_ATTENTION_KERNEL").is_ok_and(|v| v == "rows"))
+}
+
+/// Whether a few rows' attention takes [`Recorder::attention_rows_group_wide`] where it can (OAIY_ATTENTION_ROWS_RUNS: the
+/// runs' kernel, a workgroup a head).
+fn rows_group_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OAIY_ATTENTION_ROWS_RUNS").is_none())
 }
