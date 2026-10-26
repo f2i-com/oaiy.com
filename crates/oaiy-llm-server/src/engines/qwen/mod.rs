@@ -42,6 +42,42 @@ pub fn writes_qwen_calls(template: &str) -> bool {
     ["<|im_start|>", "<tool_call>", "<function=", "<parameter=", "<think>"].iter().all(|t| template.contains(t))
 }
 
+/// The system message a [`Pictures::None`] template writes where a conversation has none (its literal
+/// `'<|im_start|>system\n…<|im_end|>\n'`, Nanbeige4.3's saying who the model is): a model trained with it there
+/// thinks before it answers. Without it Nanbeige's wrote its answer where its thought goes and never closed the thought,
+/// so a client showed the whole reply as thinking and no answer.
+pub fn default_system(template: &str) -> Option<String> {
+    const OPEN: &str = "<|im_start|>system";
+    let mut from = 0;
+    while let Some(at) = template[from..].find(OPEN) {
+        let start = from + at;
+        from = start + OPEN.len();
+        // a quoted literal that begins there, read as Jinja reads one (\n, \', \\)
+        let Some(quote) = template[..start].chars().next_back().filter(|q| matches!(q, '\'' | '"')) else { continue };
+        let (mut text, mut chars, mut closed) = (String::new(), template[start..].chars(), false);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some('n') => text.push('\n'),
+                    Some(c) => text.push(c),
+                    None => break,
+                },
+                c if c == quote => {
+                    closed = true;
+                    break;
+                }
+                c => text.push(c),
+            }
+        }
+        // (a literal the message's own text is added to, `'<|im_start|>system\n' + …`, says nothing of its own)
+        let body = text.strip_prefix("<|im_start|>system\n").and_then(|t| t.strip_suffix("<|im_end|>\n"));
+        if let Some(body) = body.filter(|b| closed && !b.is_empty()) {
+            return Some(body.to_owned());
+        }
+    }
+    None
+}
+
 fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Result<String, String> {
     match value {
         None | Some(Json::Null) => Ok(String::new()),
@@ -75,6 +111,21 @@ fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Res
 
 pub fn chat_prompt(msgs: &[Json], opts: &Options) -> Result<Encoded, String> {
     chat_prompt_as(msgs, opts, Pictures::Qwen)
+}
+
+/// [`chat_prompt_as`] for [`Pictures::None`]: `system` (its template's own, [`default_system`]) first where the
+/// conversation has no system message, as its template writes it. (One with tools has one: the API gives it one.)
+pub fn chatml_prompt(msgs: &[Json], opts: &Options, system: Option<&str>) -> Result<Encoded, String> {
+    let has_system = msgs.first().and_then(|m| m.get("role")).and_then(Json::as_str) == Some("system");
+    match system.filter(|_| !has_system) {
+        Some(text) => {
+            let mut with = Vec::with_capacity(msgs.len() + 1);
+            with.push(Json::obj([("role", Json::str("system")), ("content", Json::str(text))]));
+            with.extend_from_slice(msgs);
+            chat_prompt_as(&with, opts, Pictures::None)
+        }
+        None => chat_prompt_as(msgs, opts, Pictures::None),
+    }
 }
 
 /// [`chat_prompt`], its pictures standing as `style` has them.

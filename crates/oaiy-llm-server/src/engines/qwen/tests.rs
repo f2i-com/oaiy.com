@@ -653,6 +653,25 @@ fn a_chatml_template_with_qwens_calls_is_written_as_it_writes_itself() {
     assert!(refused.contains("image"), "{refused}");
 }
 
+/// Such a template's own system message, where a conversation has none, is read from it (the whole literal, not one
+/// the message's text is added to) and written first, as the template writes it; a conversation with its own keeps it.
+#[test]
+fn a_chatml_template_s_own_system_message_is_written_where_there_is_none() {
+    // as Nanbeige4.3's: the system's text where there is one, its own where not
+    let template = r#"{%- if messages[0].role == 'system' %}{{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}{%- else %} {{- '<|im_start|>system\nYou are Example, a model made by an example lab.<|im_end|>\n' }} {%- endif %}"#;
+    assert_eq!(default_system(template).as_deref(), Some("You are Example, a model made by an example lab."));
+    assert_eq!(default_system(&template.replace('\'', "\"")).as_deref(), Some("You are Example, a model made by an example lab."));
+    assert_eq!(default_system("{{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}"), None);
+    let options = Options { mode: Mode::Thinking, effort: 50, drop_thinking: true };
+    let asked = Json::parse(br#"[{"role": "user", "content": "hi"}]"#).unwrap();
+    let encoded = chatml_prompt(asked.as_array().unwrap(), &options, Some("You are Example.")).unwrap();
+    assert_eq!(encoded.prompt, "<|im_start|>system\nYou are Example.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    let own = Json::parse(br#"[{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}]"#).unwrap();
+    let encoded = chatml_prompt(own.as_array().unwrap(), &options, Some("You are Example.")).unwrap();
+    assert!(encoded.prompt.starts_with("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nhi"), "{}", encoded.prompt);
+    assert!(!encoded.prompt.contains("Example"), "{}", encoded.prompt);
+}
+
 /// Which templates are served so: ChatML that writes Qwen's XML calls and opens thought blocks, not Qwen3-VL's JSON
 /// calls nor another family's turns.
 #[test]

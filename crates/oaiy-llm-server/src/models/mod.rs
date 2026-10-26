@@ -122,6 +122,10 @@ pub enum Flavour {
     /// Qwen3.5 (and Flash-Next): its pictures as Qwen3.5's own, or as MiniCPM-V 4.7's (a Qwen3.5 model with its
     /// projector).
     Qwen(Arc<tokenizer::Tokenizer>, crate::engines::qwen::Pictures),
+    /// A dense model of another family served as a Qwen model, its template ChatML with thought blocks and Qwen's XML
+    /// calls (`crate::engines::qwen::writes_qwen_calls`, Nanbeige4.3's Llama): text alone, and the system message its
+    /// template writes where a conversation has none (`crate::engines::qwen::default_system`).
+    Chatml(Arc<tokenizer::Tokenizer>, Option<String>),
     /// LFM2 (`lfm2moe`, served as a Qwen3.5 hybrid): its own template and Python-list calls (`crate::engines::lfm2`).
     Lfm2(Arc<tokenizer::Tokenizer>),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
@@ -136,7 +140,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // `llm` applies BOS through the template, so not again here.
-            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Chatml(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -154,6 +158,7 @@ impl Flavour {
                 crate::dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
             Self::Qwen(_, style) => crate::engines::qwen::chat_prompt_as(msgs, opts, *style),
+            Self::Chatml(_, system) => crate::engines::qwen::chatml_prompt(msgs, opts, system.as_deref()),
             Self::Lfm2(_) => crate::engines::lfm2::chat_prompt(msgs, opts),
             Self::Gguf(_, marker) => {
                 // The same messages through `llm`'s GLM template. `reasoning
@@ -1662,6 +1667,7 @@ impl Models {
             let plain = gguf.get_str("tokenizer.chat_template").ok().and_then(PlainPrompt::of_template);
             // (a model of another family whose own template is ChatML with thought blocks and Qwen's XML calls)
             let qwen_calls = gguf.get_str("tokenizer.chat_template").is_ok_and(crate::engines::qwen::writes_qwen_calls);
+            let default_system = gguf.get_str("tokenizer.chat_template").ok().and_then(crate::engines::qwen::default_system);
             // A plain-prompt model was evaluated at its own sampling (the humanizer at temperature 1.0, top-p 0.95, no
             // repetition penalty), which its GGUF records (`general.sampling.*`, as llama.cpp reads them): that is its
             // default, over the server's chat-wide one (0.6). A request's own still wins.
@@ -1692,7 +1698,7 @@ impl Models {
                 let (jobs, rx) = std::sync::mpsc::channel();
                 let e = crate::engines::qwen::QwenEngine::new(model, None, max_seq, !o.quiet && !o.silent).repetition_guard(o.repetition_guard).calls(crate::engines::qwen::Calls::Qwen);
                 let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
-                return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::engines::qwen::Pictures::None)) });
+                return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Chatml(tok, default_system)) });
             }
             // Gemma 4 reads pictures through its mmproj's vision tower (on the GPU); another dense model's projector
             // is not read.

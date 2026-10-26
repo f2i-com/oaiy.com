@@ -934,6 +934,7 @@ impl Server {
                 error = Some(detail);
             }
         }
+        let in_thought = parser.is_reasoning();
         let (rest, calls) = parser.finish();
         if !stop.hit && malformed_tools.is_none() {
             for d in rest {
@@ -946,6 +947,14 @@ impl Server {
             content.push_str(&tail);
             if let Some(s) = sse.as_mut() {
                 let c = chunk(Json::obj([("content", Json::str(&tail))]), None);
+                gone |= s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err();
+            }
+        }
+        if let Some(answer) = answer_left_in_thought(in_thought, finish, calls.len(), &content, &reasoning).filter(|_| error.is_none() && !stop.hit) {
+            content = answer;
+            reasoning.clear();
+            if let Some(s) = sse.as_mut() {
+                let c = chunk(Json::obj([("content", Json::str(&content))]), None);
                 gone |= s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err();
             }
         }
@@ -1246,6 +1255,13 @@ impl StopFilter {
     }
 }
 
+/// The answer of a reply that ended (its stop token, not its length) inside its thought, with no answer and no call:
+/// its thought, the model having written its answer where its thought goes (Nanbeige4.3's did, given no system
+/// message), said again as the content. A client showed the whole reply as thinking and no answer.
+fn answer_left_in_thought(in_thought: bool, finish: Finish, calls: usize, content: &str, reasoning: &str) -> Option<String> {
+    (in_thought && finish == Finish::Stop && calls == 0 && content.trim().is_empty() && !reasoning.trim().is_empty()).then(|| reasoning.trim().to_owned())
+}
+
 #[cfg(test)]
 mod gate_tests {
     use super::*;
@@ -1303,6 +1319,18 @@ mod gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_that_stopped_in_its_thought_with_no_answer_answers_with_it() {
+        let said = "\n## Mixture-of-experts models\n\nThey route each token to a few experts.\n";
+        assert_eq!(answer_left_in_thought(true, Finish::Stop, 0, "", said).as_deref(), Some(said.trim()));
+        // not one cut off by its length (still thinking), one that answered or called, or one that left the thought
+        assert_eq!(answer_left_in_thought(true, Finish::Length, 0, "", said), None);
+        assert_eq!(answer_left_in_thought(true, Finish::Stop, 0, "The answer.", said), None);
+        assert_eq!(answer_left_in_thought(true, Finish::Stop, 1, "", said), None);
+        assert_eq!(answer_left_in_thought(false, Finish::Stop, 0, "", said), None);
+        assert_eq!(answer_left_in_thought(true, Finish::Stop, 0, "", " \n"), None);
+    }
 
     #[test]
     fn stop_filter_cuts_at_the_first_stop_across_pieces() {
