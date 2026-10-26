@@ -533,6 +533,35 @@ describe('tool rules', () => {
     expect(agent.turns.filter((t) => t.role === 'tool' && t.results[0].images?.length)).toHaveLength(5);
   });
 
+  it('puts an app whose check fails before the plan: a step marked done is told to fix it first', async () => {
+    const plan = { goal: 'an app', items: [{ text: 'Write the app', status: 'active' }, { text: 'Test it', status: 'pending' }] };
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan }] },
+      // its manifest names a main page that is not there: the automatic check fails
+      { calls: [{ name: 'write_file', input: { path: 'apps/cat/manifest.json', content: JSON.stringify({ name: 'Cat', main: 'index.html', files: { ui: ['index.html'] } }) } }] },
+      { calls: [{ name: 'update_plan', input: { step: 1, status: 'done' } }] },
+      { text: 'ok' },
+    ]);
+    const { agent, emit } = setup(OPENAI);
+    await agent.run('make an app', emit);
+    expect(JSON.stringify(fake.bodies[3].messages)).toContain('still fails its last check, so fix that before marking steps done');
+  });
+
+  it('says so when a step is the same as the ones before it, and stops a run that goes on repeating it', async () => {
+    // the same call, the same arguments and the same result, step after step, nothing changed in between
+    const same = { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] };
+    const fake = fakeProvider('openai', Array.from({ length: 8 }, () => same));
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('look at the app', emit);
+    const told = (n: number) => JSON.stringify(fake.bodies[n].messages).includes('This step is the same as the');
+    // told from the third same step on, in that step's result (the request after it)
+    expect([1, 2, 3].map(told)).toEqual([false, false, true]);
+    expect(JSON.stringify(fake.bodies[3].messages)).toContain('same as the 2 before it');
+    // and stopped after the sixth: no seventh request
+    expect(fake.bodies).toHaveLength(6);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('the same calls with the same results 6 times in a row') });
+  });
+
   it('drops old pictures a few at a time, so the start of the prompt stays the same between steps', () => {
     const { agent } = setup(OPENAI);
     const pixel = { mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' };

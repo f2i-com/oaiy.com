@@ -171,6 +171,14 @@ const MAX_SPEAK_NUDGES = 2;
 const DRIFT_STEPS = 12;
 /** The same automatic-check errors this many times in a row stop the run. */
 const SAME_CHECK_LIMIT = 3;
+/**
+ * The same step again and again (the same calls, the same arguments, the same results: a check run over and over with
+ * nothing changed in between): told after this many in a row, and the run stopped after [`SAME_STEP_STOP`]. A 33B
+ * on an app whose timer failed ran softn_check and softn_inspect 30 times so, one saying the error and the other
+ * (before it said what the app raised earlier) none.
+ */
+const SAME_STEP_NOTE = 3;
+const SAME_STEP_STOP = 6;
 /** Images stay in the conversation for this many image-bearing turns. */
 const KEEP_IMAGE_TURNS = 3;
 /**
@@ -804,6 +812,9 @@ export class Agent {
     for (const i of done) for (const f of this.stepFiles.get(next.items[i].text) ?? []) changed.add(f);
     if (done.length) this.looseFiles.clear();
     const files = [...changed].sort();
+    // An app still failing its last check: its errors come before the plan's steps.
+    const failing = done.length ? [...this.failingApps.entries()].find(([root]) => this.checkedRoots.has(root)) : undefined;
+    if (failing) lines.push(`[OAIY] ${appLabel(failing[0])} still fails its last check, so fix that before marking steps done (set the step back to "active" while you do):\n${failing[1]}`);
     if (finished === total) {
       lines.push(`Plan updated: all ${total} steps done. Check the result, then tell the user what you did.`);
       if (files.length) lines.push(`Before you finish, review ${done.length > 1 ? 'the last steps' : step(done[0])}: it changed ${files.map((f) => `/${f}`).join(', ')}. ${this.reviewHint(files)}, and make sure it does what the user asked for. If something falls short, fix it (set its step back to "active" while you do).`);
@@ -898,6 +909,18 @@ export class Agent {
   /** Apps whose last check failed, with what it said: the run is not done while any are here. */
   readonly failingApps = new Map<string, string>();
   private sameCheck = { signature: '', count: 0 };
+  private sameStep = { signature: '', count: 0 };
+
+  /**
+   * A step's calls and results against the steps before: how many in a row were the same (numbers aside, as a
+   * timing in a result changes). [`SAME_STEP_NOTE`] of them, the step's result is told so; [`SAME_STEP_STOP`], the run
+   * stops.
+   */
+  private repeatedStep(calls: ToolCall[], results: ToolResult[]): number {
+    const signature = JSON.stringify([calls.map((c) => [c.name, c.input]), results.map((r) => r.content.replace(/\d+(\.\d+)?/g, '#'))]);
+    this.sameStep = signature === this.sameStep.signature ? { signature, count: this.sameStep.count + 1 } : { signature, count: 1 };
+    return this.sameStep.count;
+  }
 
   /**
    * After a step: check each SoftN app the step changed, unless the step
@@ -2051,6 +2074,7 @@ ${this.instructions}` : ''}`;
     // The results of the step in progress: kept if the run stops part-way.
     let stepResults: ToolResult[] = [];
     this.sameCheck = { signature: '', count: 0 };
+    this.sameStep = { signature: '', count: 0 };
     let planThisRun = false;
     let planNoted = false;
     // Steps since the plan last changed, for a reminder when the work drifts.
@@ -2262,9 +2286,17 @@ ${this.instructions}` : ''}`;
           }
         }
         const stop = await this.autoCheck(reply.calls, results, changes, emit);
+        const same = this.repeatedStep(reply.calls, results);
+        if (same >= SAME_STEP_NOTE && results.length) {
+          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls with the same arguments, and the same results. Nothing has changed, so running them again will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If you cannot, stop and tell the user what is wrong.`;
+        }
         this.turns.push({ role: 'tool', results });
         if (stop) {
           emit({ type: 'error', message: stop });
+          return;
+        }
+        if (same >= SAME_STEP_STOP) {
+          emit({ type: 'error', message: `The agent ran the same calls with the same results ${same} times in a row without changing anything, so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
         // Its finishing tool has done its job: nothing more to ask the model.

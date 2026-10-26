@@ -160,7 +160,7 @@ export interface PreviewHost {
   check(target?: PreviewTarget): Promise<PreviewResult>;
   inspect(target?: PreviewTarget): Promise<PageReport>;
   act(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport>;
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView }): Promise<Shot & { problems: Problem[] }>;
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView }): Promise<Shot & { problems: Problem[]; since?: number }>;
   setViewport(size: Viewport | null): ViewportInfo;
   viewport(): ViewportInfo;
   /** What it shows now. */
@@ -1374,7 +1374,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const view = await viewImage(shot.png, 'image/png', { maxSize: Math.min(ctx.viewSize ?? MAX_VIEW_SIZE, MAX_VIEW_SIZE), label: shown });
       out.images.push(view.image);
       if (view.shownWidth < shot.width * 0.9) lines.push(`Shown at ${view.shownWidth}×${view.shownHeight}; save_to and view_image zoom into parts.`);
-      const problems = formatProblems(shot.problems);
+      const problems = formatProblems(shot.problems, shot.since);
       if (problems) lines.push(problems);
       return lines.join('\n');
     }
@@ -1821,12 +1821,14 @@ function htmlToText(html: string): string {
   }
 }
 
-function formatProblems(problems: PageReport['problems']): string {
+function formatProblems(problems: PageReport['problems'], since?: number): string {
   if (!problems.length) return '';
   const errors = problems.filter((p) => p.level === 'error');
   const warnings = problems.filter((p) => p.level === 'warning');
+  // (an error raised before this call, since the app last loaded: still the app's, a timer that failed and stopped)
+  const earlier = (p: { at: number }) => (since !== undefined && p.at < since ? ' (raised earlier, since the app loaded: still unfixed)' : '');
   return [
-    errors.length ? `Errors the app raised (from the running app):\n${errors.slice(0, 8).map((p) => `- ${p.message}`).join('\n')}` : '',
+    errors.length ? `Errors the app raised (from the running app; fix them first):\n${errors.slice(0, 8).map((p) => `- ${p.message}${earlier(p)}`).join('\n')}` : '',
     warnings.length ? `Warnings:\n${warnings.slice(0, 8).map((p) => `- ${p.message}`).join('\n')}` : '',
   ].filter(Boolean).join('\n');
 }
@@ -1856,7 +1858,7 @@ function pageReport(title: string, report: PageReport): string {
   const lines = [title];
   if (report.done?.length) lines.push(`Done: ${report.done.join('; ')}`);
   if (report.error) lines.push(`Could not: ${report.error}`);
-  lines.push(formatProblems(report.problems) || 'Errors: none reported.');
+  lines.push(formatProblems(report.problems, report.since) || 'Errors: none reported.');
   lines.push('The page now shows:', report.page || '(nothing)');
   const text = cut(lines.join('\n'));
   if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);

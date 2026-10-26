@@ -55,8 +55,13 @@ export interface PageReport {
   page: string;
   done?: string[];
   error?: string;
-  /** Problems the app reported while this ran. */
+  /**
+   * Problems the app reported since it last loaded: those while this ran, and those before it (`since`), which a
+   * timer that failed once and stopped leaves behind with the app still broken.
+   */
   problems: Problem[];
+  /** When this began: the problems before it were raised earlier, the app as it is still loaded. */
+  since?: number;
 }
 
 export interface Shot {
@@ -571,7 +576,7 @@ export class Preview {
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
     const result = await this.requestAgain({ type: 'bot:inspect' });
-    return { ...result, problems: this.problems.filter((p) => p.at >= since) };
+    return { ...result, problems: [...this.problems], since };
   }
 
   /** Click, fill, choose and press keys in the app or page, then describe it. */
@@ -587,11 +592,11 @@ export class Preview {
     if (result.error === RELOADED) return { ok: false, page: '', error: 'the page was re-rendered while the actions ran (its files changed); run them again', problems: [] };
     // Errors a click causes can arrive a moment after it.
     await new Promise((r) => setTimeout(r, 200));
-    return { ...result, problems: this.problems.filter((p) => p.at >= since) };
+    return { ...result, problems: [...this.problems], since };
   }
 
   /** A PNG of what the app or page shows: the viewport, or the whole page; a 3D model from four sides, or from `view`. */
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[] }> {
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[]; since: number }> {
     return this.exclusive(async () => {
       const rendered = await this.ready(target);
       if (!this.frame) throw new Error(rendered.errors.join('; ') || 'nothing is rendered');
@@ -605,7 +610,7 @@ export class Preview {
       const since = Date.now();
       const result = await this.requestAgain({ type: 'bot:screenshot', fullPage: options.fullPage === true, view: options.view }, 60_000);
       if (!result.ok || !result.shot) throw new Error(result.error || 'the preview could not take a screenshot');
-      return { ...result.shot, png: new Uint8Array(result.shot.png), problems: this.problems.filter((p) => p.at >= since) };
+      return { ...result.shot, png: new Uint8Array(result.shot.png), problems: [...this.problems], since };
     });
   }
 
