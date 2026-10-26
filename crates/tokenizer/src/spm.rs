@@ -7,7 +7,8 @@
 //!      (2 .. 31) USER_DEFINED, so they are taken out here as single tokens.
 //!   2. Each piece of plain text: a leading space when the vocabulary asks for one (`tokenizer.ggml.add_space_prefix`,
 //!      true unless the GGUF says otherwise; Gemma's says false) and the piece opens the text or follows a special
-//!      token; spaces become U+2581 (`▁`).
+//!      token (opens the text alone where `tokenizer.ggml.metaspace.prepend_scheme` is `"first"`, as a Hugging Face
+//!      Metaspace has it); spaces become U+2581 (`▁`).
 //!   3. Its characters are merged pairwise, always the neighbouring pair whose merge is the highest-scoring vocabulary
 //!      piece (the leftmost of equals), until no pair merges; a symbol left that is not a piece becomes byte-fallback
 //!      tokens (`<0xXX>`), else unk. Gemma 4's vocabulary gives every piece the same score and its order as merges
@@ -31,7 +32,7 @@ pub fn encode(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
         return Ok(());
     }
     let mut prev_special = true;
-    for frag in partition(text, tok.special_tokens()) {
+    for (n, frag) in partition(text, tok.special_tokens()).into_iter().enumerate() {
         match frag {
             Frag::Special(id) => {
                 out.push(id);
@@ -39,7 +40,7 @@ pub fn encode(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
             }
             Frag::Text(piece) => {
                 let mut escaped = String::with_capacity(piece.len() + 3);
-                if tok.add_space_prefix() && prev_special {
+                if tok.add_space_prefix() && prev_special && (n == 0 || !tok.space_first_only()) {
                     escaped.push(SPM_SPACE);
                 }
                 escaped.extend(piece.chars().map(|c| if c == ' ' { SPM_SPACE } else { c }));

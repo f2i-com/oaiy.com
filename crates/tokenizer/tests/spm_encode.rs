@@ -16,6 +16,11 @@ fn spm(pieces: &[(&str, f32, i32)], add_space_prefix: Option<bool>) -> Tokenizer
 
 /// [`spm`] for another `tokenizer.ggml.model`, with merges.
 fn spm_model(model: &str, pieces: &[(&str, f32, i32)], merges: &[&str], add_space_prefix: Option<bool>) -> Tokenizer {
+    spm_with(model, pieces, merges, add_space_prefix, None)
+}
+
+/// [`spm_model`] with `tokenizer.ggml.metaspace.prepend_scheme` where given.
+fn spm_with(model: &str, pieces: &[(&str, f32, i32)], merges: &[&str], add_space_prefix: Option<bool>, prepend: Option<&str>) -> Tokenizer {
     let mut tokens: Vec<String> = vec!["<unk>".into()];
     let mut scores = vec![0.0f32];
     let mut types = vec![2i32];
@@ -41,6 +46,9 @@ fn spm_model(model: &str, pieces: &[(&str, f32, i32)], merges: &[&str], add_spac
     md.insert("tokenizer.ggml.unknown_token_id".into(), Value::U32(0));
     if let Some(a) = add_space_prefix {
         md.insert("tokenizer.ggml.add_space_prefix".into(), Value::Bool(a));
+    }
+    if let Some(p) = prepend {
+        md.insert("tokenizer.ggml.metaspace.prepend_scheme".into(), Value::String(p.into()));
     }
     let info = TensorInfo { name: "noop".into(), shape: vec![1], dtype: GgmlType::F32, offset: 0 };
     let bytes = gguf::reader::write_to_vec(&md, &[(info, vec![0u8; 4])], 32).unwrap();
@@ -98,6 +106,18 @@ fn a_vocabulary_that_does_not_say_takes_the_leading_space_after_specials() {
     let tok = spm(VOCAB, None);
     let ids = tok.encode("<start_of_turn>user\nthe cat", false).unwrap();
     assert_eq!(pieces(&tok, &ids), ["<start_of_turn>", "▁user", "\n", "▁the", "▁cat"]);
+}
+
+#[test]
+fn a_metaspace_that_prepends_first_puts_the_space_at_the_texts_start_alone() {
+    // A Hugging Face Metaspace with prepend_scheme "first" (Nanbeige's): the text's start takes the space, the text
+    // after a special token none (llama.cpp's default gave `<|im_start|>` a `▁system`, and each line after `<|im_end|>`
+    // a `▁` of its own, where the model was trained on neither).
+    let tok = spm_with("llama", VOCAB, &[], Some(true), Some("first"));
+    let ids = tok.encode("<start_of_turn>user\nthe cat", false).unwrap();
+    assert_eq!(pieces(&tok, &ids), ["<start_of_turn>", "user", "\n", "the", "▁cat"]);
+    let ids = tok.encode("the cat<start_of_turn>user", false).unwrap();
+    assert_eq!(pieces(&tok, &ids), ["▁the", "▁cat", "<start_of_turn>", "user"]);
 }
 
 #[test]

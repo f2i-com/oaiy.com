@@ -28,9 +28,19 @@ pub(crate) const PREFILL_CHUNK: usize = 512;
 /// How a picture stands in a Qwen prompt: Qwen3.5's own `<|vision_start|><|image_pad|><|vision_end|>` beside its
 /// text, or MiniCPM-V 4.7's bare `<|image_pad|>`, a message's parts each on a line of its own and the whole trimmed (its
 /// template's `join('\n')` and `trim`). Qwen3-VL's stand as Qwen3.5's, in a template with no thought: an instruct
-/// model's turns open and close without the `<think>` block Qwen3.5's carry.
+/// model's turns open and close without the `<think>` block Qwen3.5's carry. `None`: a dense model of another family
+/// whose own template is ChatML with `<think>` blocks and Qwen's XML calls ([`writes_qwen_calls`]), which reads no
+/// pictures; its prompt as that template writes it (the system's text, then its tools with Qwen3's preamble and an
+/// example call; a call after the reply's text a blank line on).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Pictures { Qwen, MiniCpmV, Qwen3Vl }
+pub enum Pictures { Qwen, MiniCpmV, Qwen3Vl, None }
+
+/// Whether a GGUF's chat template is ChatML that writes Qwen's XML calls (`<tool_call>` around `<function=…>` and
+/// `<parameter=…>`) and opens its replies' `<think>` blocks: a model the Qwen engine can serve whatever its layers'
+/// family (as Nanbeige's dense Llama does), its calls read as Qwen3.5's are.
+pub fn writes_qwen_calls(template: &str) -> bool {
+    ["<|im_start|>", "<tool_call>", "<function=", "<parameter=", "<think>"].iter().all(|t| template.contains(t))
+}
 
 fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Result<String, String> {
     match value {
@@ -48,13 +58,16 @@ fn content(value: Option<&Json>, images: &mut Vec<Json>, style: Pictures) -> Res
                         let rec = if let Some(url) = p.get("image_url") {
                             Json::obj([("url", url.get("url").unwrap_or(url).clone())])
                         } else { p.clone() };
+                        if style == Pictures::None {
+                            return Err("this model reads text only, and a message holds an image".into());
+                        }
                         images.push(rec);
-                        out.push(match style { Pictures::Qwen | Pictures::Qwen3Vl => IMAGE, Pictures::MiniCpmV => "<|image_pad|>" }.to_owned());
+                        out.push(match style { Pictures::Qwen | Pictures::Qwen3Vl | Pictures::None => IMAGE, Pictures::MiniCpmV => "<|image_pad|>" }.to_owned());
                     }
                     _ => return Err("unsupported Qwen content block".into()),
                 }
             }
-            Ok(match style { Pictures::Qwen | Pictures::Qwen3Vl => out.concat(), Pictures::MiniCpmV => out.join("\n").trim().to_owned() })
+            Ok(match style { Pictures::Qwen | Pictures::Qwen3Vl | Pictures::None => out.concat(), Pictures::MiniCpmV => out.join("\n").trim().to_owned() })
         }
         _ => Err("message content must be text or blocks".into()),
     }
@@ -81,6 +94,10 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
             continue;
         }
         prompt.push_str(&format!("<|im_start|>{role}\n"));
+        if style == Pictures::None {
+            chatml_turn(&mut prompt, m, role, &text)?;
+            continue;
+        }
         // (Qwen3-VL's own template: the system's text, then its tools as JSON, each call asked for as JSON in the call's
         // tags, the form it was trained on; a past call shown the same way)
         if style == Pictures::Qwen3Vl {
@@ -148,6 +165,62 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
     prompt.push_str("<|im_start|>assistant\n<think>\n");
     if opts.mode != Mode::Thinking { prompt.push_str("\n</think>\n\n"); }
     Ok(Encoded { prompt, images })
+}
+
+/// A turn of [`Pictures::None`]'s template after its `<|im_start|>{role}\n`: the system's text and then its tools
+/// (Qwen3's preamble, each tool's JSON on a line, the XML call's form shown by an example), an assistant's empty thought
+/// then its text and its calls (the first a blank line after any text, each next on a line of its own), a user's text;
+/// then `<|im_end|>`.
+fn chatml_turn(prompt: &mut String, m: &Json, role: &str, text: &str) -> Result<(), String> {
+    if role == "system" {
+        prompt.push_str(text);
+        if let Some(tools) = m.get("tools").and_then(Json::as_array).filter(|t| !t.is_empty()) {
+            if !text.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+            for t in tools {
+                prompt.push('\n');
+                prompt.push_str(&t.to_json());
+            }
+            prompt.push_str("\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>");
+        }
+        prompt.push_str("<|im_end|>\n");
+        return Ok(());
+    }
+    if role != "assistant" {
+        prompt.push_str(text);
+        prompt.push_str("<|im_end|>\n");
+        return Ok(());
+    }
+    let text = text.trim();
+    prompt.push_str("<think>\n\n</think>\n\n");
+    prompt.push_str(text);
+    for (n, call) in m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]).iter().enumerate() {
+        let f = call.get("function").unwrap_or(call);
+        let name = f.get("name").and_then(Json::as_str).ok_or("tool call without name")?;
+        identifier(name)?;
+        let args = match f.get("arguments") {
+            Some(Json::Str(s)) => Json::parse(s.as_bytes()).map_err(|e| e.to_string())?,
+            Some(v) => v.clone(),
+            None => Json::Obj(vec![]),
+        };
+        let Json::Obj(args) = args else { return Err("tool arguments must be an object".into()) };
+        prompt.push_str(match (n, text.is_empty()) {
+            (0, true) => "",
+            (0, false) => "\n\n",
+            _ => "\n",
+        });
+        prompt.push_str(&format!("<tool_call>\n<function={name}>\n"));
+        for (k, v) in args {
+            identifier(&k)?;
+            let value = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_json());
+            prompt.push_str(&format!("<parameter={k}>\n{value}\n</parameter>\n"));
+        }
+        prompt.push_str("</function>\n</tool_call>");
+    }
+    prompt.push_str("<|im_end|>\n");
+    Ok(())
 }
 
 fn identifier(s: &str) -> Result<(), String> {
@@ -433,6 +506,7 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
             Self::Qwen35(Model::Qwen3(m)) => Ok(&m.tokenizer),
+            Self::Qwen35(Model::Llama(m)) => Ok(&m.tokenizer),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => Ok(&f.tokenizer),
@@ -475,6 +549,8 @@ impl Hybrid {
         match self {
             Self::Qwen35(Model::Qwen35(m)) => Ok(m.embed_text(tokens).to_host()),
             Self::Qwen35(Model::Qwen3(m)) => Ok(m.embed_text(tokens)),
+            // (a Llama reads its tokens' own rows itself: it takes no pictures, so the rows given are never read)
+            Self::Qwen35(Model::Llama(m)) => Ok(Tensor::zeros(vec![tokens.len(), m.config.embedding_dim])),
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
@@ -722,6 +798,12 @@ impl Hybrid {
                 Ok(m.forward_embeds_positions(&embeds, tokens.len(), kv, positions).map_err(|e| e.to_string())?.to_host())
             }
             Self::Qwen35(Model::Qwen3(m)) => Ok(m.forward_embeds_positions(tokens, &embeds, kv, positions, deepstack).map_err(|e| e.to_string())?.to_host()),
+            // (a Llama served for its template's calls, as Nanbeige's: its text at the rows that follow, chained on the
+            // device as the dense engine runs it)
+            Self::Qwen35(Model::Llama(m)) if positions.is_none() => {
+                drop(embeds);
+                Ok(m.last_logits(&m.forward(tokens, kv)))
+            }
             Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
             #[cfg(feature = "webgpu")]
             Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),

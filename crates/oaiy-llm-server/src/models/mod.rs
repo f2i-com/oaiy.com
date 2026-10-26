@@ -1626,6 +1626,8 @@ impl Models {
             self.say_placement(&spec.name, backend.as_ref());
             let empty_thought = gguf.get_str("tokenizer.chat_template").is_ok_and(opens_empty_thought);
             let plain = gguf.get_str("tokenizer.chat_template").ok().and_then(PlainPrompt::of_template);
+            // (a model of another family whose own template is ChatML with thought blocks and Qwen's XML calls)
+            let qwen_calls = gguf.get_str("tokenizer.chat_template").is_ok_and(crate::engines::qwen::writes_qwen_calls);
             // A plain-prompt model was evaluated at its own sampling (the humanizer at temperature 1.0, top-p 0.95, no
             // repetition penalty), which its GGUF records (`general.sampling.*`, as llama.cpp reads them): that is its
             // default, over the server's chat-wide one (0.6). A request's own still wins.
@@ -1644,6 +1646,19 @@ impl Models {
                 cfg.temperature = temp.unwrap_or(cfg.temperature);
                 cfg.top_p = top_p.unwrap_or(cfg.top_p);
                 cfg.repeat_penalty = repeat.unwrap_or(cfg.repeat_penalty);
+            }
+            // A dense model whose template writes Qwen's XML calls (Nanbeige4.3's Llama) is served by the Qwen engine,
+            // which reads those calls and keeps its prompt states, its prompt as its template writes it: the Agent's
+            // tools take one of the formats the server reads, which the dense engine's prompt gives none of.
+            if qwen_calls && plain.is_none() {
+                if o.vision_projectors.contains_key(&spec.name) {
+                    self.say(format!("{}: its vision projector is not read: it reads text alone", spec.name));
+                }
+                self.say(format!("{}: its template writes Qwen's tool calls: served as a Qwen model, text alone", spec.name));
+                let (jobs, rx) = std::sync::mpsc::channel();
+                let e = crate::engines::qwen::QwenEngine::new(model, None, max_seq, !o.quiet && !o.silent).repetition_guard(o.repetition_guard).calls(crate::engines::qwen::Calls::Qwen);
+                let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
+                return Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok, crate::engines::qwen::Pictures::None)) });
             }
             // Gemma 4 reads pictures through its mmproj's vision tower (on the GPU); another dense model's projector
             // is not read.

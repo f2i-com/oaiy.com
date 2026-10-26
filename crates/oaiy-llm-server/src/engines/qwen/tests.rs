@@ -621,3 +621,46 @@ fn qwen3_vl_tools_are_offered_in_its_own_form() {
     assert!(p.contains("<|im_start|>user\n<tool_response>\ndone\n</tool_response><|im_end|>\n"), "{p}");
     assert!(!p.contains("<function="), "{p}");
 }
+
+/// A dense model of another family whose template is ChatML with thought blocks and Qwen's XML calls is told of its
+/// tools as that template tells it (the system's text, then Qwen3's preamble, the tools and an example call), and shown
+/// a past reply as it writes one (an empty thought, its text, its first call a blank line on and the next a line on).
+#[test]
+fn a_chatml_template_with_qwens_calls_is_written_as_it_writes_itself() {
+    let msgs = Json::parse(br#"[
+        {"role": "system", "content": "Be brief.", "tools": [{"type": "function", "function": {"name": "computer", "parameters": {"type": "object"}}}]},
+        {"role": "user", "content": "press h"},
+        {"role": "assistant", "content": "Pressing it.", "tool_calls": [{"function": {"name": "computer", "arguments": "{\"action\": \"key\", \"count\": 2}"}}, {"function": {"name": "wait", "arguments": "{}"}}]},
+        {"role": "tool", "content": "done"},
+        {"role": "tool", "content": "ok"}
+    ]"#).unwrap();
+    let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::None).unwrap();
+    let tool = msgs.as_array().unwrap()[0].get("tools").and_then(Json::as_array).unwrap()[0].to_json();
+    let want = format!(
+        "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tool}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call><|im_end|>\n\
+         <|im_start|>user\npress h<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\nPressing it.\n\n<tool_call>\n<function=computer>\n<parameter=action>\nkey\n</parameter>\n<parameter=count>\n2\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=wait>\n</function>\n</tool_call><|im_end|>\n\
+         <|im_start|>user\n<tool_response>\ndone\n</tool_response>\n<tool_response>\nok\n</tool_response><|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+    assert_eq!(encoded.prompt, want);
+    // thinking: the reply opens its thought
+    let thinking = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Thinking, effort: 50, drop_thinking: true }, Pictures::None).unwrap();
+    assert!(thinking.prompt.ends_with("<|im_start|>assistant\n<think>\n"), "{}", thinking.prompt);
+    // a picture is refused (the model reads text alone), in words an agent knows to go on in text by
+    let picture = Json::parse(br#"[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]}]"#).unwrap();
+    let refused = chat_prompt_as(picture.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::None).unwrap_err();
+    assert!(refused.contains("image"), "{refused}");
+}
+
+/// Which templates are served so: ChatML that writes Qwen's XML calls and opens thought blocks, not Qwen3-VL's JSON
+/// calls nor another family's turns.
+#[test]
+fn a_template_that_writes_qwens_calls_is_known() {
+    let chatml_xml = "{{- '<|im_start|>system\n' }}<tools></tools>{{- '<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>' }}{{- '<|im_start|>assistant\n<think>\n' }}";
+    let chatml_json = "{{- '<|im_start|>system\n' }}<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+    let llama3 = "{{- '<|start_header_id|>system<|end_header_id|>\n\n' }}";
+    assert!(writes_qwen_calls(chatml_xml));
+    assert!(!writes_qwen_calls(chatml_json));
+    assert!(!writes_qwen_calls(llama3));
+}

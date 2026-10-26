@@ -76,6 +76,11 @@ pub struct Tokenizer {
     /// default for SentencePiece); Gemma's GGUFs say false.
     add_space_prefix: bool,
 
+    /// Whether that space opens the text alone, never after a special token: `tokenizer.ggml.metaspace.prepend_scheme`
+    /// `"first"`, a Hugging Face Metaspace's (Nanbeige's): `<|im_start|>system` is `system`, not `▁system`, and a line
+    /// after `<|im_end|>` takes no `▁` (llama.cpp's way, the default, puts one after each special token).
+    space_first_only: bool,
+
     /// Whether the SPM encoder merges by merge rank rather than by score:
     /// Gemma 4 (`"gemma4"`), whose pieces all score the same and whose merges
     /// carry the order.
@@ -115,7 +120,7 @@ impl Tokenizer {
         let merges_rank=merges.into_iter().enumerate().map(|(i,m)|(m,i as u32)).collect();
         let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).collect();
         special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
-        Ok(Self{qwen3_pre:true,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,spm_by_merge_rank:false,token_types:None,
+        Ok(Self{qwen3_pre:true,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,space_first_only:false,spm_by_merge_rank:false,token_types:None,
             merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens})
     }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
@@ -172,6 +177,7 @@ impl Tokenizer {
         let unk = gguf.get_u64("tokenizer.ggml.unknown_token_id").ok().map(|v| v as u32);
         let pad = gguf.get_u64("tokenizer.ggml.padding_token_id").ok().map(|v| v as u32);
         let add_space_prefix = gguf.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(true);
+        let space_first_only = gguf.get_str("tokenizer.ggml.metaspace.prepend_scheme").is_ok_and(|s| s == "first");
         let spm_by_merge_rank = model_name == "gemma4" && !merges_rank.is_empty();
 
         // Build the special-token table: any token with type 3 (CONTROL) or 4
@@ -204,6 +210,7 @@ impl Tokenizer {
             token_to_id,
             scores,
             add_space_prefix,
+            space_first_only,
             spm_by_merge_rank,
             token_types,
             merges_rank,
@@ -281,6 +288,10 @@ impl Tokenizer {
 
     pub(crate) fn add_space_prefix(&self) -> bool {
         self.add_space_prefix
+    }
+
+    pub(crate) fn space_first_only(&self) -> bool {
+        self.space_first_only
     }
 
     pub(crate) fn spm_by_merge_rank(&self) -> bool {

@@ -862,6 +862,21 @@ of the chunk's positions, its K and V stored into the GPU's copy of the cache, a
 the causal attention over it. Both run when every weight a step reads is on the
 GPU; otherwise, and with `OAIY_NO_CHAIN`, the op-by-op path.
 
+A dense GGUF whose own chat template is ChatML with `<think>` blocks and Qwen's XML
+tool calls (`<tool_call>` around `<function=…>` and `<parameter=…>`: Nanbeige4.3's,
+a plain Llama network) is served by the Qwen engine instead of the dense one
+(2026-10-26): its prompt as its template writes it (`engines::qwen::Pictures::None`:
+the system's text, then its tools with Qwen3's preamble and an example call), its
+calls read back as Qwen3.5's are, its thinking and its prompt states as a Qwen
+model's; the network the same chained Llama. Its tokenizer's leading space goes at
+the text's start alone where the GGUF says `tokenizer.ggml.metaspace.prepend_scheme`
+`first` (a Hugging Face Metaspace's), not after every special token as llama.cpp's
+default has it: `<|im_start|>system` was `▁system`, and each line after `<|im_end|>`
+began with a `▁` the model never saw; Nanbeige4.3-33B's own tokenizer and ours now
+give the same 20,029 tokens of a long chat. Such a model's context is the dense
+default's 16,384 where none is asked for: the card's copy of its cache is f32
+(426 KB a token for a 33B, 14 GB at 32,768 beside 19 GB of Q4_K_M weights).
+
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
 cache and took the softmax on one thread), a tied head heads with the GGUF's
