@@ -635,7 +635,7 @@ fn a_chatml_template_with_qwens_calls_is_written_as_it_writes_itself() {
         {"role": "tool", "content": "ok"}
     ]"#).unwrap();
     let encoded = chat_prompt_as(msgs.as_array().unwrap(), &Options { mode: Mode::Chat, effort: 50, drop_thinking: true }, Pictures::None).unwrap();
-    let tool = msgs.as_array().unwrap()[0].get("tools").and_then(Json::as_array).unwrap()[0].to_json();
+    let tool = msgs.as_array().unwrap()[0].get("tools").and_then(Json::as_array).unwrap()[0].to_python_json();
     let want = format!(
         "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tool}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call><|im_end|>\n\
          <|im_start|>user\npress h<|im_end|>\n\

@@ -179,9 +179,10 @@ fn chatml_turn(prompt: &mut String, m: &Json, role: &str, text: &str) -> Result<
                 prompt.push_str("\n\n");
             }
             prompt.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+            // (each as Python's json.dumps writes it, as the template's `tojson` did for what the model learned from)
             for t in tools {
                 prompt.push('\n');
-                prompt.push_str(&t.to_json());
+                prompt.push_str(&t.to_python_json());
             }
             prompt.push_str("\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>");
         }
@@ -214,7 +215,7 @@ fn chatml_turn(prompt: &mut String, m: &Json, role: &str, text: &str) -> Result<
         prompt.push_str(&format!("<tool_call>\n<function={name}>\n"));
         for (k, v) in args {
             identifier(&k)?;
-            let value = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_json());
+            let value = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_python_json());
             prompt.push_str(&format!("<parameter={k}>\n{value}\n</parameter>\n"));
         }
         prompt.push_str("</function>\n</tool_call>");
@@ -1251,6 +1252,14 @@ impl QwenEngine {
         let mut thinking = job.think_budget.is_some();
         let mut generated = Vec::new(); let mut think_used = 0usize;
         let mut stream = NativeStream { calls: self.calls, ..Default::default() };
+        // The reply's prose (past its thought, outside its tool calls, where code rightly repeats): its recent tokens,
+        // for its repeat, presence and frequency penalties (`crate::engines::job::penalize_reply`). Its thought is open
+        // where the prompt's last `<think>` has no `</think>` after it.
+        let think_start = tok.token_id("<think>");
+        let opened = job.prompt.iter().rposition(|&t| Some(t) == think_start);
+        let mut in_thought = opened.is_some_and(|at| !job.prompt[at..].iter().any(|&t| Some(t) == think_end));
+        let (mut in_call, mut prose) = (false, std::collections::VecDeque::<u32>::new());
+        let close = match self.calls { Calls::Qwen => "</tool_call>", Calls::Lfm2 => crate::engines::lfm2::CALL_END };
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
         // (OAIY_CHAIN_PROFILE: the prompt's kernels said here, the reply's alone after)
         #[cfg(feature = "webgpu")]
@@ -1297,7 +1306,15 @@ impl QwenEngine {
                 return Ok(());
             }
             let clock = std::time::Instant::now();
-            let mut next = logits.sample(&job.sampling, &mut rng);
+            let in_prose = !in_thought && !in_call && crate::engines::job::penalizes(&job.sampling);
+            let mut next = match &logits {
+                Row::Logits(l) if in_prose => {
+                    let mut penalized = l.data().to_vec();
+                    crate::engines::job::penalize_reply(&mut penalized, &prose, &job.sampling);
+                    sample(&penalized, &job.sampling, &mut rng)
+                }
+                _ => logits.sample(&job.sampling, &mut rng),
+            };
             // A run that repeats without end (a list's same item again and again): the model picks another token
             // than the run's next, at the run's comma or line end where it has one (a list's place to close) and
             // anywhere once a whole turn has passed with none. Each time halves what the next run is let be. A reply
@@ -1331,8 +1348,18 @@ impl QwenEngine {
             if stop { finish = Finish::Stop; break; }
             generated.push(next);
             cycles.push(next);
+            if in_prose {
+                prose.push_back(next);
+                while prose.len() > job.sampling.repeat_last_n {
+                    prose.pop_front();
+                }
+            }
+            if Some(next) == think_end {
+                in_thought = false;
+            }
             let clock = std::time::Instant::now();
             let decoded = tok.decode(&generated);
+            in_call = decoded.rfind(self.calls.open().0).is_some_and(|at| decoded.rfind(close).is_none_or(|end| end < at));
             let delta = stream.push(&decoded, &job.tools, false)?;
             if !delta.is_empty() { let _ = job.events.send(Event::Text(delta)); }
             if let Some((text,start)) = stream.tool_preview(&decoded)? {

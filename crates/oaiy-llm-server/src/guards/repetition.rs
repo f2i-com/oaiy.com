@@ -33,7 +33,7 @@ impl Guard {
 /// `{"key":"ArrowRight"},` until it was stopped (a list no penalty on prose reaches, and nothing else ended it before
 /// the reply's 64,000 tokens).
 ///
-/// A run is the reply's last tokens being the same every `period` tokens, 64 at most. What a reply means to write
+/// A run is the reply's last tokens being the same every `period` tokens, 1,024 at most. What a reply means to write
 /// repeats too (a map's rows of zeros, a table's rules), so a run is let be until it is longer than such things are:
 /// [`CycleGuard::limit`]. Past that, [`CycleGuard::over`] says of the token sampled next whether it is the run's
 /// next, and the caller has the model pick another, which ends a list where its next item was the same again.
@@ -60,8 +60,12 @@ impl Default for CycleGuard {
 }
 
 impl CycleGuard {
-    /// The longest period watched.
-    pub const MOST: usize = 64;
+    /// The longest period watched: a function or a test written again and again, a few hundred tokens a turn (a 33B
+    /// writing code into a tool call at 0.6 did so until its reply's 8,192 tokens, where 64 was watched).
+    pub const MOST: usize = 1024;
+
+    /// The longest period [`Self::limit`] gives its limit alone; a longer one's is [`Self::limit_of`]'s.
+    pub const SHORT: usize = 64;
 
     /// The tokens a run of `period` may be before it is taken for one without end: 128 of its turns and 2,048 tokens
     /// at least, or 4,096 tokens of a run of one to three tokens. What a reply means to write repeats for that long:
@@ -72,6 +76,32 @@ impl CycleGuard {
         if period <= 3 { 4096 } else { (128 * period).max(2048) }
     }
 
+    /// The limit of a run of `period` whose turn is `turn`: [`Self::limit`] up to [`Self::SHORT`] tokens a turn; past
+    /// that, by what the turn is made of. A few tokens over and over (a map's row of cells, `0` and `,`) is data, let be
+    /// 32 turns and 4,096 tokens at least; a turn of many (a function written again) is a run without end after eight
+    /// turns and 1,024 tokens: no code means the same block of 65 tokens or more eight times in a row.
+    pub fn limit_of(period: usize, turn: &[u32]) -> usize {
+        if period <= Self::SHORT {
+            return Self::limit(period);
+        }
+        let mut seen: Vec<u32> = Vec::with_capacity(9);
+        for &t in turn {
+            if !seen.contains(&t) {
+                seen.push(t);
+                if seen.len() > 8 {
+                    return (8 * period).max(1024);
+                }
+            }
+        }
+        (32 * period).max(4096)
+    }
+
+    /// The newest `period` tokens: a run's turn.
+    fn turn(&self, period: usize) -> Vec<u32> {
+        let n = self.last.len();
+        self.last.range(n - period..).copied().collect()
+    }
+
     /// Whether a run is within `margin` tokens of its limit, so that [`Self::over`] may soon say so of a token: a
     /// greedy request's rows are then read back whole, as the model's pick alone (made on its GPU) leaves no other
     /// token to take, and the reply would be stopped where it could have been turned. `margin` covers the rows a
@@ -79,8 +109,13 @@ impl CycleGuard {
     pub fn near(&self, turned: usize, margin: usize) -> bool {
         let n = self.last.len();
         (1..=Self::MOST.min(n)).any(|period| {
-            let limit = (Self::limit(period) >> turned.min(8)).max(8 * period);
-            self.run[period] > 0 && self.run[period] + 1 + period + margin >= limit
+            // (a long turn's limit is at least 1,024 tokens: what it is made of read only for a run that long)
+            let least = if period <= Self::SHORT { Self::limit(period) } else { (8 * period).max(1024) };
+            if self.run[period] == 0 || self.run[period] + 1 + period + margin < (least >> turned.min(8)).max(8 * period) {
+                return false;
+            }
+            let limit = (Self::limit_of(period, &self.turn(period)) >> turned.min(8)).max(8 * period);
+            self.run[period] + 1 + period + margin >= limit
         })
     }
 
@@ -107,8 +142,13 @@ impl CycleGuard {
                 return None;
             }
             let span = self.run[period] + 1 + period;
+            // (a long turn's limit is at least 1,024 tokens: what it is made of, and its divisors, read only past that)
+            let least = if period <= Self::SHORT { Self::limit(period) } else { (8 * period).max(1024) };
+            if span < (least >> turned.min(8)).max(8 * period) {
+                return None;
+            }
             let shorter = (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span);
-            let limit = (Self::limit(period) >> turned.min(8)).max(8 * period);
+            let limit = (Self::limit_of(period, &self.turn(period)) >> turned.min(8)).max(8 * period);
             (!shorter && span >= limit).then(|| Cycle { period, span, past: span - limit })
         })
     }
@@ -213,6 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn a_function_written_again_and_again_is_a_cycle_after_eight_turns() {
+        // a 150-token function of many tokens, written over and over (inside a tool call, where the prose guards do
+        // not look): eight of it, 1,200 tokens, then the next token of the ninth is refused
+        let function: Vec<u32> = (0..150).map(|i| 1000 + (i * 7919) % 400).collect();
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &function, 20_000).expect("a function written without end");
+        assert_eq!((cycle.period, pushed), (150, 1199));
+        // a longer one, the same: eight turns
+        let block: Vec<u32> = (0..400).map(|i| 3000 + (i * 104_729) % 900).collect();
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &block, 20_000).unwrap();
+        assert_eq!((cycle.period, pushed), (400, 3199));
+        // a map's row of 50 cells (`0` and `,`, 100 tokens, then a newline): data, let be 32 rows and more
+        let row: Vec<u32> = (0..50).flat_map(|_| [10, 11]).chain([12]).collect();
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &row, 20_000).unwrap();
+        assert_eq!((cycle.period, pushed), (101, 4095));
+        // code that goes on (each block another) is no run at all
+        let mut guard = CycleGuard::default();
+        let flowing: Vec<u32> = (0..6000).map(|i| 5000 + (i * 7919) % 3000).collect();
+        assert!(until_over(&mut guard, &flowing, 6000).is_none());
+    }
+
+    #[test]
     fn a_list_item_repeated_without_end_is_a_cycle_after_its_limit() {
         // `{"key":"ArrowRight"},` as seven tokens, after a call's opening
         let mut guard = CycleGuard::default();
@@ -306,10 +370,10 @@ mod tests {
             assert_eq!(guard.over(next, 0), None);
             guard.push(next);
         }
-        // nor one whose repeats are longer than it watches (a verse sung again: the other guards' to judge)
-        let verse: Vec<u32> = (0..80).collect();
+        // nor one whose repeats are longer than it watches (a chapter written again: the other guards' to judge)
+        let chapter: Vec<u32> = (0..1100).collect();
         let mut guard = CycleGuard::default();
-        assert!(until_over(&mut guard, &verse, 8_000).is_none());
+        assert!(until_over(&mut guard, &chapter, 12_000).is_none());
     }
 
     #[test]

@@ -140,6 +140,32 @@ pub(crate) fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Whether `s` asks for any of the reply's penalties ([`penalize_reply`]).
+pub fn penalizes(s: &Sampling) -> bool {
+    s.repeat_penalty > 1.0 || s.presence_penalty != 0.0 || s.frequency_penalty != 0.0
+}
+
+/// The reply's penalties over its recent prose (`history`, its last `repeat_last_n` tokens of it): repeat (sign-aware,
+/// once a token), presence (once a token) and frequency (each time). The engines apply them to the reply's prose
+/// alone: not its thinking, never inside a tool call, where code rightly repeats.
+pub fn penalize_reply(logits: &mut [f32], history: &std::collections::VecDeque<u32>, s: &Sampling) {
+    if !penalizes(s) {
+        return;
+    }
+    let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for &id in history {
+        *counts.entry(id).or_insert(0.0) += 1.0;
+    }
+    for (id, count) in counts {
+        if let Some(value) = logits.get_mut(id as usize) {
+            if s.repeat_penalty > 1.0 {
+                *value = if *value < 0.0 { *value * s.repeat_penalty } else { *value / s.repeat_penalty };
+            }
+            *value -= s.presence_penalty + s.frequency_penalty * count;
+        }
+    }
+}
+
 /// Pick the next token: greedy at temperature 0, else temperature, top-k
 /// and top-p (nucleus) sampling over the leading candidates.
 pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
@@ -181,4 +207,27 @@ pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
         }
     }
     idx[keep - 1]
+}
+
+
+#[cfg(test)]
+mod penalty_tests {
+    use super::*;
+
+    /// The reply's penalties push its recent tokens down (repeat sign-aware, once a token; presence once; frequency
+    /// each time) and are off unless asked for.
+    #[test]
+    fn reply_penalties_push_recent_tokens_down_and_are_off_by_default() {
+        let history = std::collections::VecDeque::from(vec![0, 0, 1]);
+        let original = vec![2.0, -2.0, 1.5];
+        let base = Sampling { temperature: 1.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
+        let mut logits = original.clone();
+        penalize_reply(&mut logits, &history, &base);
+        assert_eq!(logits, original);
+        penalize_reply(&mut logits, &history, &Sampling { repeat_penalty: 2.0, ..base.clone() });
+        assert_eq!(logits, vec![1.0, -4.0, 1.5]);
+        let mut logits = original.clone();
+        penalize_reply(&mut logits, &history, &Sampling { presence_penalty: 0.5, frequency_penalty: 0.25, ..base });
+        assert_eq!(logits, vec![2.0 - 0.5 - 0.5, -2.0 - 0.5 - 0.25, 1.5]);
+    }
 }
