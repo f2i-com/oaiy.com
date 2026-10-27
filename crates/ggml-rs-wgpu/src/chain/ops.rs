@@ -1102,7 +1102,7 @@ impl ChainRecorder for Recorder<'_> {
             let names = if lanes { &WIDE_LANES } else { &WIDE };
             let part = self.gpu().named_pipeline(names[per_kv][at], || attention_part_group_wide_halved(per_kv, head_dim, lanes));
             self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
-            let join = self.named("chain-attention-join", ATTENTION_JOIN);
+            let join = self.named("chain-attention-join", &ATTENTION_JOIN);
             self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
             return;
         };
@@ -1113,7 +1113,7 @@ impl ChainRecorder for Recorder<'_> {
             self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g))
         };
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, ((n_h / g) as u32, runs as u32, 1));
-        let join = self.named("chain-attention-join", ATTENTION_JOIN);
+        let join = self.named("chain-attention-join", &ATTENTION_JOIN);
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
     }
 

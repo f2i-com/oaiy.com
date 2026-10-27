@@ -1677,7 +1677,7 @@ fn measure_step_attention() {
         let record = |rec: &mut Recorder| {
             let params = rec.uniform(&[n_h as u32, n_kv as u32, hd as u32, kv_len as u32, 0, runs as u32, scale.to_bits()]);
             rec.dispatch(&part, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_kv as u32, runs as u32, 1));
-            let join = rec.named("chain-attention-join", ATTENTION_JOIN);
+            let join = rec.named("chain-attention-join", &ATTENTION_JOIN);
             rec.dispatch(&join, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_h as u32, 1, 1));
         };
         let mut rec = Recorder::new(&b);
@@ -1705,7 +1705,7 @@ fn measure_step_attention() {
             let mut rec = Recorder::new(&b);
             for _ in 0..16 {
                 let params = rec.uniform(&[n_h as u32, n_kv as u32, hd as u32, kv_len as u32, 0, runs as u32, scale.to_bits()]);
-                let join = rec.named("chain-attention-join", ATTENTION_JOIN);
+                let join = rec.named("chain-attention-join", &ATTENTION_JOIN);
                 rec.dispatch(&join, buffer(&kv), buffer(&qv), buffer(&out), &params, (n_h as u32, 1, 1));
             }
             rec.read_range(&out, 0, 1);

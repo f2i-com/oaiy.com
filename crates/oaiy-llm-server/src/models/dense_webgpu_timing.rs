@@ -2121,18 +2121,36 @@ fn measure_a_dense_llamas_checks_on_webgpu() {
     let mut kv = m.new_kv_cache(n as usize + 512);
     let prompt: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 20000).collect();
     let argmax = |l: &ggml_rs::Tensor| l.data().iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
-    let mut next = argmax(&m.last_logits(&m.forward(&prompt, &mut kv)));
+    // (the prompt 2,048 tokens a run, as the engine reads one: a run's vectors for all of a long one past a binding's 2 GB)
+    let mut last = None;
+    for chunk in prompt.chunks(2048) {
+        last = Some(m.forward(chunk, &mut kv));
+    }
+    let mut next = argmax(&m.last_logits(&last.expect("a prompt")));
     for _ in 0..4 {
         next = argmax(&m.last_logits(&m.forward(&[next], &mut kv)));
     }
     let _ = m.check(&vec![next; rows], &mut kv);
     m.rollback(&mut kv, rows, 1);
     ggml_rs_wgpu::profile::take_line();
+    // (OAIY_CHAIN_PROFILE: each kernel's GPU time a step or a check, and its dispatches; OAIY_PIECE_STAMPS: the GPU's
+    // busy time against its first piece's start to its last's end)
+    let kernels = |per: f64| {
+        for (name, ms, n) in ggml_rs_wgpu::profile::take_kernels().into_iter().take(24) {
+            eprintln!("    {name}: {:.3} ms, {:.0} dispatches", ms / per, n as f64 / per);
+        }
+        let (busy, span, pieces) = ggml_rs_wgpu::profile::take_pieces();
+        if pieces > 0 {
+            eprintln!("    the GPU busy {:.2} ms of a span of {:.2}, {:.1} pieces", busy / per, span / per, pieces as f64 / per);
+        }
+    };
+    kernels(1.0);
     let t = Instant::now();
     for _ in 0..32 {
         next = argmax(&m.last_logits(&m.forward(&[next], &mut kv)));
     }
     eprintln!("32 steps after {} positions: {:.2} ms a step; {}", kv.len, t.elapsed().as_secs_f64() * 1e3 / 32.0, ggml_rs_wgpu::profile::take_line());
+    kernels(32.0);
     let t = Instant::now();
     for i in 0..32u32 {
         let checked: Vec<u32> = std::iter::once(next).chain((1..rows as u32).map(|j| 1000 + (i * 31 + j) % 20000)).collect();
@@ -2141,4 +2159,5 @@ fn measure_a_dense_llamas_checks_on_webgpu() {
         next = argmax(&got[0]);
     }
     eprintln!("32 checks of {rows} rows: {:.2} ms a check; {}", t.elapsed().as_secs_f64() * 1e3 / 32.0, ggml_rs_wgpu::profile::take_line());
+    kernels(32.0);
 }

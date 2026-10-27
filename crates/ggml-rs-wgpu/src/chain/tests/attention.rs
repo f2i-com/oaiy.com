@@ -294,6 +294,70 @@ fn a_steps_attention_over_halves_is_the_f32_caches() {
     }
 }
 
+/// A step's attention and a few rows' over many runs of 256 positions are the host's (in f64), their runs' parts put
+/// together by the joins: more runs than a column's slices of them (8 for a head 128 wide), more than a workgroup's 256
+/// threads (70,000 positions), over the cache in f32 and as f16 halves; Nanbeige4.3's 56 heads of 128 over 8, 8 of 64
+/// over 2, 16 of 256 over 4.
+#[test]
+fn attention_over_many_runs_is_the_hosts() {
+    let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
+    for (n_h, n_kv, hd, kv_len, rows) in [(56usize, 8usize, 128usize, 3600usize, 4usize), (8, 2, 64, 70_000, 3), (16, 4, 256, 5000, 2)] {
+        let (qd, row, g) = (n_h * hd, 2 * n_kv * hd, n_h / n_kv);
+        let cap = kv_len + rows;
+        let mut next = rng((qd + kv_len) as u32);
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
+        let cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        // the host's: query `r` of the rows (at `kv_len - 1 + r`; the step's the first) over the positions to its own
+        let host = |r: usize, h: usize| -> Vec<f64> {
+            let (kh, hi) = (h / g, kv_len + r);
+            let qh = &q[r * qd + h * hd..r * qd + (h + 1) * hd];
+            let s: Vec<f64> = (0..hi).map(|t| (0..hd).map(|d| qh[d] as f64 * cache[t * row + kh * hd + d] as f64).sum::<f64>() * scale as f64).collect();
+            let m = s.iter().fold(f64::MIN, |a, &v| a.max(v));
+            let w: Vec<f64> = s.iter().map(|v| (v - m).exp()).collect();
+            let l: f64 = w.iter().sum();
+            (0..hd).map(|d| (0..hi).map(|t| w[t] * cache[t * row + n_kv * hd + kh * hd + d] as f64).sum::<f64>() / l).collect()
+        };
+        let compare = |what: &str, got: &[f32], r: usize, tol: f32| {
+            let want: Vec<f64> = (0..n_h).flat_map(|h| host(r, h)).collect();
+            let top = want.iter().fold(0f64, |m, v| m.max(v.abs())) as f32;
+            let worst = got.iter().zip(&want).fold(0f32, |m, (a, e)| m.max((*a as f64 - e).abs() as f32));
+            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide over {kv_len}, {what} row {r}: worst {worst:.2e} of {top:.2}");
+            assert!(worst <= tol * top, "{n_h} heads ({n_kv} kv) {hd} wide over {kv_len}, {what} row {r}: worst {worst} of {top}");
+        };
+        let (qv, kv, half) = (b.vec(rows * qd), b.vec(cap * row), b.vec(cap * row / 2));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &kv, &cache);
+        let (step, step_h) = (b.vec(b.attention_out_len(n_h, hd, cap)), b.vec(b.attention_out_len(n_h, hd, cap)));
+        let rows_len = b.attention_rows_out_len(rows, n_h, hd, kv_len - 1 + rows);
+        let (few, few_h) = (b.vec(rows_len), b.vec(rows_len));
+        let mut rec = Recorder::new(&b);
+        rec.halve(&kv, &half, 0, cap * row);
+        rec.attention_by(&qv, &kv, &step, n_h, n_kv, hd, 0, kv_len, cap, scale, true);
+        let halves = b.attention_halves(n_h, n_kv, hd);
+        if halves {
+            rec.attention_halved(&qv, &half, &step_h, n_h, n_kv, hd, 0, kv_len, cap, scale);
+        }
+        rec.attention_rows(&qv, &kv, &few, rows, n_h, n_kv, hd, kv_len - 1, None, scale);
+        let few_halves = rec.attention_rows_halved_grouped(&qv, &half, &few_h, rows, n_h, n_kv, hd, kv_len - 1, scale);
+        rec.read_range(&step, 0, qd);
+        rec.read_range(&step_h, 0, qd);
+        rec.read_range(&few, 0, rows * qd);
+        rec.read_range(&few_h, 0, rows * qd);
+        let r = Box::new(rec).finish();
+        compare("a step's (f32)", &r[0], 0, 1e-4);
+        if halves {
+            compare("a step's (halves)", &r[1], 0, 4e-3);
+        }
+        for i in 0..rows {
+            compare("the rows' (f32)", &r[2][i * qd..(i + 1) * qd], i, 1e-4);
+            if few_halves {
+                compare("the rows' (halves)", &r[3][i * qd..(i + 1) * qd], i, 4e-3);
+            }
+        }
+    }
+}
+
 /// A few causal rows' attention with a KV head's whole group of query heads together (seven heads a KV head, the
 /// group's memory grown: Nanbeige4.3's 56 of 128 over 8) gives what the runs' kernel gives, a workgroup a head: a check's
 /// rows over a long cache, from its start, windowed, a single row, heads 64 and 256 wide.

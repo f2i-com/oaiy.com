@@ -354,6 +354,60 @@ fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
     }
 }
 
+/// The K-quants' int8 kernels for a few rows (a check of drafts) give the f32 kernel's sums within the rounding of the
+/// rows to int8, 2 to 8 rows; and Q6_K's of 5 to 8 rows, 8 a workgroup, each row's the 4 rows' kernel's to the bit (a
+/// row's sums made alike in both).
+#[test]
+fn a_few_rows_from_int8_are_the_f32_kernels() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.int8_rows() {
+        return;
+    }
+    for (dtype, bytes, scales) in [(GgmlType::Q4_K, 144usize, &[0usize, 2][..]), (GgmlType::Q6_K, 210, &[208][..])] {
+        let (n, k) = (300usize, 2048usize);
+        let mut next = rng(n as u32 + bytes as u32);
+        let mut raw = vec![0u8; n * (k / 256) * bytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        for blk in raw.chunks_exact_mut(bytes) {
+            for &at in scales {
+                let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
+                blk[at] = d[0];
+                blk[at + 1] = d[1];
+            }
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+        let xs: Vec<f32> = (0..8 * k).map(|_| next()).collect();
+        let x = b.vec(8 * k);
+        DeviceChain::upload(&b, &x, &xs);
+        let mut four = Vec::new();
+        for m in [2usize, 4, 5, 8] {
+            let (y, yq) = (b.vec(m * n), b.vec(m * n));
+            let mut rec = Recorder::new(&b);
+            rec.matmul_rows_f32(&w, &x, &y, m);
+            rec.read(&y);
+            let want = Box::new(rec).finish().pop().unwrap();
+            let mut rec = Recorder::new(&b);
+            assert!(rec.matmul_rows_q8(&w, &x, &yq, m), "{dtype:?} of {m} rows from int8");
+            rec.read(&yq);
+            let got = Box::new(rec).finish().pop().unwrap();
+            for r in 0..m {
+                let (g, e) = (&got[r * n..(r + 1) * n], &want[r * n..(r + 1) * n]);
+                let dot: f64 = g.iter().zip(e).map(|(a, e)| *a as f64 * *e as f64).sum();
+                let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let cos = dot / (norm(g) * norm(e));
+                assert!(cos > 0.9999, "{dtype:?} [{n}, {k}] row {r} of {m} from int8: cosine {cos}");
+            }
+            if m == 4 {
+                four = got;
+            } else if m == 8 {
+                assert!(four.iter().zip(&got[..4 * n]).all(|(a, b)| a.to_bits() == b.to_bits()), "{dtype:?}: 8 rows' first 4 the 4 rows'");
+            }
+        }
+    }
+}
+
 /// The tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's rounding:
 /// Q3_K, Q4_K, Q5_K, Q6_K and Q8_0, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
 #[test]

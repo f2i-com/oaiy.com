@@ -373,8 +373,13 @@ impl Recorder<'_> {
         let (xq, xs_at) = self.x_q8(x, m, k);
         // (one row by the several rows' kernel where the recording's rows are alike: the one-row int8 kernel sums a
         // row in another order)
-        let mr = if m == 1 && !self.alike { 1 } else { crate::quant::shaders::MULTI_ROWS };
+        // (Q6_K's 5 to 8 rows 8 a workgroup, its weights read once: Nanbeige4.3-33B's in a check of 8 rows 4.4 ms where
+        // twice took 6.1 on an RTX 5090. Q4_K's took 16.3 where twice 15.9, its rows' int8 values read for each of a
+        // lane's 2 or 4 weight rows the more of its time)
+        let eight = m > 4 && q.dtype == ggml_quants::GgmlType::Q6_K && multi8();
+        let mr = if m == 1 && !self.alike { 1 } else if eight { 8 } else { crate::quant::shaders::MULTI_ROWS };
         let name = match (q.dtype, mr == 1) {
+            (ggml_quants::GgmlType::Q6_K, false) if eight => "chain-q8-Q6_K-multi8",
             (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode",
             (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-multi",
             (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode",
@@ -397,6 +402,13 @@ impl Recorder<'_> {
         }
         true
     }
+}
+
+/// Whether 5 to 8 rows of Q6_K take the int8 kernel of 8 rows a workgroup (OAIY_MULTI8=0: of 4, the weights read
+/// twice).
+fn multi8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OAIY_MULTI8").map_or(true, |v| v != "0"))
 }
 
 /// Whether the shared expert's fused kernels are taken (OAIY_MOE_UNFUSED: its matmuls, SwiGLU and sum each their own).

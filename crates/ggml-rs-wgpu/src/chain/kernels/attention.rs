@@ -419,39 +419,12 @@ pub(crate) fn attention_runs_out_len(rows: usize, n_h: usize, head_dim: usize, k
 /// past it (a dispatch's own time under the OS's limit on a submission, Windows' 2 s, however slow the GPU).
 pub(in crate::chain) const ATTENTION_DISPATCH_FLOPS: f64 = (1u64 << 37) as f64;
 
-/// The runs of [`ATTENTION_ROWS_PART`] put together, a workgroup a (head, query); a run with nothing (`l` 0) adds
-/// nothing. `p` as for the parts.
-pub(in crate::chain) const ATTENTION_ROWS_JOIN: &str = r#"
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-    let n_h = p[0].x;
-    let hd = p[0].z;
-    let runs = p[1].y;
-    let rows = p[1].w;
-    let h = wg.x;
+/// The runs of [`ATTENTION_ROWS_PART`] put together, a workgroup a (head, query): [`JOIN_RUNS`] of query `wg.y` of
+/// `p[1].w`. `p` as for the parts.
+pub(in crate::chain) static ATTENTION_ROWS_JOIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| JOIN_RUNS.replace("ROWS
+", "    let rows = p[1].w;
     let s = wg.y;
-    let first = (s * n_h + h) * runs;
-    let ml = rows * n_h * hd + rows * n_h * runs * hd + first * 2u;
-    var m = -3.4e38;
-    for (var r = 0u; r < runs; r++) {
-        if (y[ml + r * 2u + 1u] > 0.0) { m = max(m, y[ml + r * 2u]); }
-    }
-    var l = 0.0;
-    for (var r = 0u; r < runs; r++) {
-        let lr = y[ml + r * 2u + 1u];
-        if (lr > 0.0) { l += exp(y[ml + r * 2u] - m) * lr; }
-    }
-    for (var d = li; d < hd; d += 256u) {
-        var acc = 0.0;
-        for (var r = 0u; r < runs; r++) {
-            if (y[ml + r * 2u + 1u] > 0.0) {
-                acc += exp(y[ml + r * 2u] - m) * y[rows * n_h * hd + (first + r) * hd + d];
-            }
-        }
-        y[(s * n_h + h) * hd + d] = acc / l;
-    }
-}
-"#;
+"));
 
 /// Positions a workgroup of [`ATTENTION_PART`] takes.
 pub(in crate::chain) const SPLIT: usize = 256;
@@ -614,26 +587,84 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-/// The runs of [`ATTENTION_PART`] put together, a workgroup a head: each run's values rescaled from its largest to the
-/// head's, over the sum of the rescaled sums. `p` as for the parts.
-pub(in crate::chain) const ATTENTION_JOIN: &str = r#"
+/// The runs of [`ATTENTION_PART`] put together, a workgroup a head: [`JOIN_RUNS`] of one row. `p` as for the parts.
+pub(in crate::chain) static ATTENTION_JOIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| JOIN_RUNS.replace("ROWS
+", "    let rows = 1u;
+    let s = 0u;
+"));
+
+/// The runs of a head's parts put together (its query's, `s` of `rows`): each run's values rescaled from its largest
+/// to the head's, over the sum of the rescaled sums; a run with nothing (`l` 0) adds nothing. The largest and the sum
+/// each thread's share of the runs, then the workgroup's; the values a thread a column of four and a slice of the
+/// runs, the slices' sums added by the first. A thread a column walked every run three times in turn: a step's join
+/// over 15,500 positions (61 runs, 56 heads of 128) 19 us a layer on an RTX 5090, 1.0 ms of its 52 layers'. `p` as for
+/// the parts (heads, KV heads, width; runs `p[1].y`).
+const JOIN_RUNS: &str = r#"
+var<workgroup> red: array<f32, 256>;
+var<workgroup> sums: array<vec4<f32>, 256>;
+
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n_h = p[0].x;
     let hd = p[0].z;
     let runs = p[1].y;
+ROWS
     let h = wg.x;
-    let ml = n_h * hd + n_h * runs * hd + h * runs * 2u;
+    let first = (s * n_h + h) * runs;
+    let ml = rows * n_h * hd + rows * n_h * runs * hd + first * 2u;
     var m = -3.4e38;
-    for (var r = 0u; r < runs; r++) { m = max(m, y[ml + r * 2u]); }
+    for (var r = li; r < runs; r += 256u) {
+        if (y[ml + r * 2u + 1u] > 0.0) { m = max(m, y[ml + r * 2u]); }
+    }
+    red[li] = m;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] = max(red[li], red[li + st]); }
+        workgroupBarrier();
+    }
+    m = red[0];
+    workgroupBarrier();
     var l = 0.0;
-    for (var r = 0u; r < runs; r++) { l += exp(y[ml + r * 2u] - m) * y[ml + r * 2u + 1u]; }
-    for (var d = li; d < hd; d += 256u) {
-        var acc = 0.0;
-        for (var r = 0u; r < runs; r++) {
-            acc += exp(y[ml + r * 2u] - m) * y[n_h * hd + (h * runs + r) * hd + d];
+    for (var r = li; r < runs; r += 256u) {
+        let lr = y[ml + r * 2u + 1u];
+        if (lr > 0.0) { l += exp(y[ml + r * 2u] - m) * lr; }
+    }
+    red[li] = l;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st /= 2u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    l = red[0];
+    // (a column's four values read whole, the last column's past the head the next run's or the largest's: not stored)
+    let cols = (hd + 3u) / 4u;
+    let span = min(cols, 256u);
+    let slices = 256u / span;
+    let sl = li / span;
+    for (var c0 = 0u; c0 < cols; c0 += span) {
+        let c = c0 + li % span;
+        var acc = vec4<f32>(0.0);
+        if (sl < slices && c < cols) {
+            for (var r = sl; r < runs; r += slices) {
+                let lr = y[ml + r * 2u + 1u];
+                if (lr > 0.0) {
+                    let at = rows * n_h * hd + (first + r) * hd + c * 4u;
+                    acc += exp(y[ml + r * 2u] - m) * vec4<f32>(y[at], y[at + 1u], y[at + 2u], y[at + 3u]);
+                }
+            }
         }
-        y[h * hd + d] = acc / l;
+        sums[li] = acc;
+        workgroupBarrier();
+        if (sl == 0u && c < cols) {
+            for (var o = 1u; o < slices; o++) { acc += sums[o * span + c - c0]; }
+            let v = acc / l;
+            let at = (s * n_h + h) * hd + c * 4u;
+            y[at] = v.x;
+            if (c * 4u + 1u < hd) { y[at + 1u] = v.y; }
+            if (c * 4u + 2u < hd) { y[at + 2u] = v.z; }
+            if (c * 4u + 3u < hd) { y[at + 3u] = v.w; }
+        }
+        workgroupBarrier();
     }
 }
 "#;
