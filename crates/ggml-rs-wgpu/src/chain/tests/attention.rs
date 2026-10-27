@@ -297,16 +297,26 @@ fn a_steps_attention_over_halves_is_the_f32_caches() {
 /// A step's attention and a few rows' over many runs of 256 positions are the host's (in f64), their runs' parts put
 /// together by the joins: more runs than a column's slices of them (8 for a head 128 wide), more than a workgroup's 256
 /// threads (70,000 positions), over the cache in f32 and as f16 halves; Nanbeige4.3's 56 heads of 128 over 8, 8 of 64
-/// over 2, 16 of 256 over 4.
+/// over 2, 16 of 256 over 4. And with a key in each run past its first block made a query's (its score some 15 past
+/// the others'): a one-pass kernel's reference moved there, the sums before it scaled.
 #[test]
 fn attention_over_many_runs_is_the_hosts() {
     let Ok(b) = WgpuBackend::new(Some(2 << 30)) else { return };
-    for (n_h, n_kv, hd, kv_len, rows) in [(56usize, 8usize, 128usize, 3600usize, 4usize), (8, 2, 64, 70_000, 3), (16, 4, 256, 5000, 2)] {
+    for (n_h, n_kv, hd, kv_len, rows, planted) in [(56usize, 8usize, 128usize, 3600usize, 4usize, false), (56, 8, 128, 3600, 4, true), (8, 2, 64, 70_000, 3, false), (32, 8, 64, 1500, 5, true), (16, 4, 256, 5000, 2, false)] {
         let (qd, row, g) = (n_h * hd, 2 * n_kv * hd, n_h / n_kv);
         let cap = kv_len + rows;
         let mut next = rng((qd + kv_len) as u32);
         let q: Vec<f32> = (0..rows * qd).map(|_| next() * 2.0).collect();
-        let cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+        let mut cache: Vec<f32> = (0..cap * row).map(|_| next() * 2.0).collect();
+        if planted {
+            // (each run's position 100: its KV heads' keys the first row's first query head of each group's)
+            for t in (100..kv_len).step_by(256) {
+                for kh in 0..n_kv {
+                    let h = kh * g;
+                    cache[t * row + kh * hd..t * row + (kh + 1) * hd].copy_from_slice(&q[h * hd..(h + 1) * hd]);
+                }
+            }
+        }
         let scale = 1.0 / (hd as f32).sqrt();
         // the host's: query `r` of the rows (at `kv_len - 1 + r`; the step's the first) over the positions to its own
         let host = |r: usize, h: usize| -> Vec<f64> {
@@ -322,8 +332,8 @@ fn attention_over_many_runs_is_the_hosts() {
             let want: Vec<f64> = (0..n_h).flat_map(|h| host(r, h)).collect();
             let top = want.iter().fold(0f64, |m, v| m.max(v.abs())) as f32;
             let worst = got.iter().zip(&want).fold(0f32, |m, (a, e)| m.max((*a as f64 - e).abs() as f32));
-            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide over {kv_len}, {what} row {r}: worst {worst:.2e} of {top:.2}");
-            assert!(worst <= tol * top, "{n_h} heads ({n_kv} kv) {hd} wide over {kv_len}, {what} row {r}: worst {worst} of {top}");
+            eprintln!("{n_h} heads ({n_kv} kv) {hd} wide over {kv_len} (planted {planted}), {what} row {r}: worst {worst:.2e} of {top:.2}");
+            assert!(worst <= tol * top, "{n_h} heads ({n_kv} kv) {hd} wide over {kv_len} (planted {planted}), {what} row {r}: worst {worst} of {top}");
         };
         let (qv, kv, half) = (b.vec(rows * qd), b.vec(cap * row), b.vec(cap * row / 2));
         DeviceChain::upload(&b, &qv, &q);

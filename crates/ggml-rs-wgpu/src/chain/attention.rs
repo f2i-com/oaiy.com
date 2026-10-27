@@ -206,6 +206,29 @@ impl Recorder<'_> {
             rows > 0 && n_kv > 0 && n_h % n_kv == 0 && kv_values >= kv_len * 2 * n_kv * head_dim && q.len >= rows * n_h * head_dim && out.len >= rows * n_h * head_dim + rows * n_h * runs * (head_dim + 2),
             "chain: a few rows' grouped attention's buffers"
         );
+        // (over halves on the tensor cores where the rows' queries of a group are a tile's 64 at most, a workgroup a (KV
+        // head, run): [`attention_coop_runs`]; OAIY_ATTENTION_COOP_RUNS=0 the kernels below)
+        static COOP_RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if halves && window.is_none() && matches!(head_dim, 64 | 128) && (2..=8).contains(&g) && rows * g <= 64 && self.gpu().coop16() && self.gpu().subgroups32() && *COOP_RUNS.get_or_init(|| std::env::var("OAIY_ATTENTION_COOP_RUNS").map_or(true, |v| v != "0")) {
+            const RUNS: [[&str; 2]; 9] = [
+                ["", ""],
+                ["", ""],
+                ["chain-attention-coop-runs-2-64", "chain-attention-coop-runs-2-128"],
+                ["chain-attention-coop-runs-3-64", "chain-attention-coop-runs-3-128"],
+                ["chain-attention-coop-runs-4-64", "chain-attention-coop-runs-4-128"],
+                ["chain-attention-coop-runs-5-64", "chain-attention-coop-runs-5-128"],
+                ["chain-attention-coop-runs-6-64", "chain-attention-coop-runs-6-128"],
+                ["chain-attention-coop-runs-7-64", "chain-attention-coop-runs-7-128"],
+                ["chain-attention-coop-runs-8-64", "chain-attention-coop-runs-8-128"],
+            ];
+            let part = self.gpu().named_pipeline(RUNS[g][usize::from(head_dim == 128)], || attention_coop_runs(head_dim, g));
+            let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
+            self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
+            let join = self.named("chain-attention-rows-join", &ATTENTION_ROWS_JOIN);
+            self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
+            self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
+            return;
+        }
         const NAMES: [[&str; 3]; 9] = [
             ["", "", ""],
             ["", "", ""],
