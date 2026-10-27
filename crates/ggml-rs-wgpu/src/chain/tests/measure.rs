@@ -1004,11 +1004,14 @@ fn measure_q8_matmuls() {
 /// A step's row (`--ignored --nocapture`) through each of a dense 33B's matrices (Nanbeige4.3's: its Q4_K queries and
 /// output [7168, 7168], keys and values [1024, 7168], gate and up together [44032, 7168], down [7168, 22016]; its
 /// Q6_K values, down and output [166912, 7168]), int8 and f32, the bandwidth each reaches: eight copies in turn, past
-/// the L2, as a model's layers stream; the int8 times with their row's quantizing, once a matrix.
+/// the L2, as a model's layers stream; the int8 times with their row's quantizing, once a matrix. MEASURE_ROWS: a
+/// check's rows (through the several rows' kernels) in place of a step's one.
 #[test]
 #[ignore = "a measurement"]
 fn measure_a_dense_33bs_step_matmuls() {
     let Ok(b) = WgpuBackend::new(Some(16 << 30)) else { return };
+    // (MEASURE_ROWS: a check's rows in place of a step's one, through the several rows' kernels)
+    let m: usize = std::env::var("MEASURE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     for (dtype, n, k, bytes, scales) in [(GgmlType::Q4_K, 7168usize, 7168usize, 144usize, &[0usize, 2][..]), (GgmlType::Q4_K, 1024, 7168, 144, &[0, 2][..]), (GgmlType::Q4_K, 44032, 7168, 144, &[0, 2][..]), (GgmlType::Q4_K, 7168, 22016, 144, &[0, 2][..]), (GgmlType::Q6_K, 1024, 7168, 210, &[208][..]), (GgmlType::Q6_K, 7168, 22016, 210, &[208][..]), (GgmlType::Q6_K, 166912, 7168, 210, &[208][..])] {
         let nbytes = n * (k / 256) * bytes;
         let mut next = rng(n as u32 + k as u32);
@@ -1025,8 +1028,8 @@ fn measure_a_dense_33bs_step_matmuls() {
         }
         let copies = (512 << 20) / nbytes + 2;
         let ws: Vec<_> = (0..copies.min(8)).map(|_| ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw.clone(), vec![n, k], dtype))).collect();
-        let (x, y) = (b.vec(k), b.vec(n));
-        DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+        let (x, y) = (b.vec(m * k), b.vec(m * n));
+        DeviceChain::upload(&b, &x, &(0..m * k).map(|_| next()).collect::<Vec<_>>());
         let reps = 32;
         let time = |q8: bool| {
             let run = || {
@@ -1034,9 +1037,9 @@ fn measure_a_dense_33bs_step_matmuls() {
                 for i in 0..reps {
                     if q8 {
                         rq.q8.clear();
-                        assert!(rq.matmul_rows_q8(&ws[i % ws.len()], &x, &y, 1));
+                        assert!(rq.matmul_rows_q8(&ws[i % ws.len()], &x, &y, m));
                     } else {
-                        rq.matmul_rows_f32(&ws[i % ws.len()], &x, &y, 1);
+                        rq.matmul_rows_f32(&ws[i % ws.len()], &x, &y, m);
                     }
                 }
                 rq.read_range(&y, 0, 1);
@@ -1056,7 +1059,7 @@ fn measure_a_dense_33bs_step_matmuls() {
         };
         let ((f, fm), (q, qm)) = (time(false), time(true));
         let gb = |t: f64| nbytes as f64 / t / 1e9;
-        eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB): f32 {:.1} us ({:.0} GB/s; middle {:.0}), int8 {:.1} us ({:.0} GB/s; middle {:.0})", nbytes as f64 / 1e6, f * 1e6, gb(f), gb(fm), q * 1e6, gb(q), gb(qm));
+        eprintln!("{dtype:?} [{n}, {k}] x {m} ({:.1} MB): f32 {:.1} us ({:.0} GB/s; middle {:.0}), int8 {:.1} us ({:.0} GB/s; middle {:.0})", nbytes as f64 / 1e6, f * 1e6, gb(f), gb(fm), q * 1e6, gb(q), gb(qm));
     }
 }
 
