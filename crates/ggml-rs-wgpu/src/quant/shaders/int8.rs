@@ -122,6 +122,18 @@ pub fn q8_threads(subgroups: bool) -> u32 {
 /// Qwen3.5 9B's Q4_K [12288, 4096] in 199 us where 222, its Q5_K [8192, 4096] in 160 where 179, its Q6_K output
 /// [248320, 4096] in 5.2 ms where 5.7.
 pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option<String> {
+    rb_kernel_q8_by(dtype, r, mr, subgroups, false)
+}
+
+/// [`rb_kernel_q8`] for a step's one row on a device whose subgroups are 32 lanes, each workgroup's `r` weight rows
+/// along `k` by all its 256 lanes (each subgroup a slice of a row's tasks in turn), the subgroups' sums added through
+/// the workgroup's memory: a lane walked a row's tasks 32 at a time, seven turns of a 7,168-wide row one after another
+/// (Nanbeige4.3's keys [1024, 7168] 12.7 us a step on an RTX 5090, 330 GB/s; its queries [7168, 7168] 25.4, 1,140).
+pub fn rb_kernel_q8_split(dtype: GgmlType, r: u32) -> Option<String> {
+    rb_kernel_q8_by(dtype, r, 1, true, true)
+}
+
+fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: bool) -> Option<String> {
     let (vec4_weights, tasks, block) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
@@ -144,6 +156,9 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
     if !subgroups {
         l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
     }
+    if split {
+        l(&format!("var<workgroup> sums: array<f32, {}>;", 8 * r));
+    }
     l(RB_HELPERS);
     if !vec4_weights {
         l(RB_Q6K_HELPERS);
@@ -156,7 +171,11 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
     if subgroups {
         // (a subgroup's lanes and which of the eight it is as the device has them: its sums are its own lanes')
         l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {");
-        l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + sgi * {r}u;", q8_threads(subgroups) / 32 * r));
+        if split {
+            l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {r}u;"));
+        } else {
+            l(&format!("    let rbase = (wg.y + wg.z * 65535u) * {}u + sgi * {r}u;", q8_threads(subgroups) / 32 * r));
+        }
     } else {
         l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {");
         l("    let lane = li & 31u;");
@@ -178,7 +197,11 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
             l(&format!("    var acc{i}_{m} = 0.0;"));
         }
     }
-    l(&format!("    for (var c = lane; c < blocks * {tasks}u; c += 32u) {{"));
+    if split {
+        l(&format!("    for (var c = sgi * 32u + lane; c < blocks * {tasks}u; c += 256u) {{"));
+    } else {
+        l(&format!("    for (var c = lane; c < blocks * {tasks}u; c += 32u) {{"));
+    }
     let comps = ["x", "y", "z", "w"];
     // a row's 16 values of a 32-block (its half `hf`), the block's scale and that half's sum
     let x_half = |l: &mut dyn FnMut(&str), m: u32, name: &str, block: &str, hf: &str| {
@@ -381,6 +404,25 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
         }
     }
     l("    }");
+    if split {
+        // each subgroup's sums, then the workgroup's by its first `r` lanes
+        for i in 0..r {
+            l(&format!("    let t{i} = subgroupAdd(acc{i}_0);"));
+        }
+        l("    if (lane == 0u) {");
+        for i in 0..r {
+            l(&format!("        sums[sgi * {r}u + {i}u] = t{i};"));
+        }
+        l("    }");
+        l("    workgroupBarrier();");
+        l(&format!("    if (sgi == 0u && lane < {r}u && rbase + lane < p.rows) {{"));
+        l("        var t = 0.0;");
+        l(&format!("        for (var g = 0u; g < 8u; g++) {{ t += sums[g * {r}u + lane]; }}"));
+        l("        y[m0 * p.n + p.row0 + rbase + lane] = t;");
+        l("    }");
+        l("}");
+        return Some(s);
+    }
     if subgroups {
         for i in 0..r {
             for m in 0..mr {

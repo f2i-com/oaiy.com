@@ -394,14 +394,43 @@ impl Recorder<'_> {
             (_, false) => "chain-q8-Q6_K-multi",
         };
         let subgroups = self.gpu().subgroups32();
-        let pipeline = self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8(q.dtype, crate::quant::shaders::rb_rows_q8(q.dtype, mr), mr, subgroups).expect("a K-quant's int8 kernel"));
+        // (a step's one row along k by a whole workgroup, 4 weight rows each: [`crate::quant::shaders::rb_kernel_q8_split`];
+        // OAIY_Q8_SPLIT=0 a subgroup's rows. Nanbeige4.3-33B's step on an RTX 5090, the GPU busy 15.2 ms where 16.25: its
+        // keys and values [1024, 7168] 9.1 and 10.5 us where 12.7 and 17.1, its gate and up together [44032, 7168] 112
+        // where 118, its output [166912, 7168] 609 where 633, its queries the same)
+        let split = mr == 1 && subgroups && q8_split();
+        let (pipeline, per) = match split {
+            true => {
+                let name = match q.dtype {
+                    ggml_quants::GgmlType::Q3_K => "chain-q8-Q3_K-decode-split",
+                    ggml_quants::GgmlType::Q4_K => "chain-q8-Q4_K-decode-split",
+                    ggml_quants::GgmlType::Q5_K => "chain-q8-Q5_K-decode-split",
+                    ggml_quants::GgmlType::Q4_0 => "chain-q8-Q4_0-decode-split",
+                    ggml_quants::GgmlType::Q8_0 => "chain-q8-Q8_0-decode-split",
+                    _ => "chain-q8-Q6_K-decode-split",
+                };
+                (self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8_split(q.dtype, 4).expect("a K-quant's int8 kernel")), 4)
+            }
+            false => (
+                self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8(q.dtype, crate::quant::shaders::rb_rows_q8(q.dtype, mr), mr, subgroups).expect("a K-quant's int8 kernel")),
+                crate::quant::shaders::q8_threads(subgroups) / 32 * crate::quant::shaders::rb_rows_q8(q.dtype, mr),
+            ),
+        };
         for (chunk, row0, rows) in &q.chunks {
             let words = [k as u32, n as u32, m as u32, *row0, *rows, q.row_bytes as u32, xs_at as u32, 0];
-            let groups = crate::quant::shaders::grid_q8(q.dtype, m, mr, *rows, subgroups);
+            let g = rows.div_ceil(per);
+            let groups = ((m as u32).div_ceil(mr), g.min(65535), g.div_ceil(65535));
             self.dispatch_kept(&pipeline, chunk, buffer(&xq), buffer(y), &words, groups);
         }
         true
     }
+}
+
+/// Whether a step's one row from int8 takes the kernel along k by a whole workgroup (OAIY_Q8_SPLIT=0: a subgroup's
+/// rows each, along k by their lanes).
+fn q8_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OAIY_Q8_SPLIT").map_or(true, |v| v != "0"))
 }
 
 /// Whether 5 to 8 rows of Q6_K take the int8 kernel of 8 rows a workgroup (OAIY_MULTI8=0: of 4, the weights read

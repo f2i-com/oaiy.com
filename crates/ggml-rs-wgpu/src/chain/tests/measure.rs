@@ -1001,6 +1001,65 @@ fn measure_q8_matmuls() {
     }
 }
 
+/// A step's row (`--ignored --nocapture`) through each of a dense 33B's matrices (Nanbeige4.3's: its Q4_K queries and
+/// output [7168, 7168], keys and values [1024, 7168], gate and up together [44032, 7168], down [7168, 22016]; its
+/// Q6_K values, down and output [166912, 7168]), int8 and f32, the bandwidth each reaches: eight copies in turn, past
+/// the L2, as a model's layers stream; the int8 times with their row's quantizing, once a matrix.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_dense_33bs_step_matmuls() {
+    let Ok(b) = WgpuBackend::new(Some(16 << 30)) else { return };
+    for (dtype, n, k, bytes, scales) in [(GgmlType::Q4_K, 7168usize, 7168usize, 144usize, &[0usize, 2][..]), (GgmlType::Q4_K, 1024, 7168, 144, &[0, 2][..]), (GgmlType::Q4_K, 44032, 7168, 144, &[0, 2][..]), (GgmlType::Q4_K, 7168, 22016, 144, &[0, 2][..]), (GgmlType::Q6_K, 1024, 7168, 210, &[208][..]), (GgmlType::Q6_K, 7168, 22016, 210, &[208][..]), (GgmlType::Q6_K, 166912, 7168, 210, &[208][..])] {
+        let nbytes = n * (k / 256) * bytes;
+        let mut next = rng(n as u32 + k as u32);
+        let mut raw = vec![0u8; nbytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        for blk in raw.chunks_exact_mut(bytes) {
+            for &at in scales {
+                let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
+                blk[at] = d[0];
+                blk[at + 1] = d[1];
+            }
+        }
+        let copies = (512 << 20) / nbytes + 2;
+        let ws: Vec<_> = (0..copies.min(8)).map(|_| ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw.clone(), vec![n, k], dtype))).collect();
+        let (x, y) = (b.vec(k), b.vec(n));
+        DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+        let reps = 32;
+        let time = |q8: bool| {
+            let run = || {
+                let mut rq = Recorder::new(&b);
+                for i in 0..reps {
+                    if q8 {
+                        rq.q8.clear();
+                        assert!(rq.matmul_rows_q8(&ws[i % ws.len()], &x, &y, 1));
+                    } else {
+                        rq.matmul_rows_f32(&ws[i % ws.len()], &x, &y, 1);
+                    }
+                }
+                rq.read_range(&y, 0, 1);
+                Box::new(rq).finish();
+            };
+            run();
+            // (the best and the middle of seven: a card's clocks move under its power limit)
+            let mut ts: Vec<f64> = (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    run();
+                    t.elapsed().as_secs_f64() / reps as f64
+                })
+                .collect();
+            ts.sort_by(f64::total_cmp);
+            (ts[0], ts[3])
+        };
+        let ((f, fm), (q, qm)) = (time(false), time(true));
+        let gb = |t: f64| nbytes as f64 / t / 1e9;
+        eprintln!("{dtype:?} [{n}, {k}] ({:.1} MB): f32 {:.1} us ({:.0} GB/s; middle {:.0}), int8 {:.1} us ({:.0} GB/s; middle {:.0})", nbytes as f64 / 1e6, f * 1e6, gb(f), gb(fm), q * 1e6, gb(q), gb(qm));
+    }
+}
+
 /// A prompt's Q3_K matmul through the int8 tiled kernel against the f32 one (`--ignored --nocapture`): Qwen3.8 27B's
 /// FFN gate [17408, 5120] and down [5120, 17408] for chunks of 512 and of 100 tokens, the results within int8's
 /// rounding.

@@ -354,19 +354,20 @@ fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
     }
 }
 
-/// The K-quants' int8 kernels for a few rows (a check of drafts) give the f32 kernel's sums within the rounding of the
-/// rows to int8, 2 to 8 rows; and Q6_K's of 5 to 8 rows, 8 a workgroup, each row's the 4 rows' kernel's to the bit (a
-/// row's sums made alike in both).
+/// The K-quants' and Q4_0's int8 kernels for a step's row (along k by a whole workgroup) and a few rows (a check of
+/// drafts) give the f32 kernel's sums within the rounding of the rows to int8, 1 to 8 rows, over rows off a
+/// workgroup's 4; and Q6_K's of 5 to 8 rows, 8 a workgroup, each row's the 4 rows' kernel's to the bit (a row's sums
+/// made alike in both).
 #[test]
 fn a_few_rows_from_int8_are_the_f32_kernels() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
     if !b.gpu.int8_rows() {
         return;
     }
-    for (dtype, bytes, scales) in [(GgmlType::Q4_K, 144usize, &[0usize, 2][..]), (GgmlType::Q6_K, 210, &[208][..])] {
-        let (n, k) = (300usize, 2048usize);
+    for (dtype, bytes, scales, block) in [(GgmlType::Q3_K, 110usize, &[108usize][..], 256usize), (GgmlType::Q4_K, 144, &[0, 2][..], 256), (GgmlType::Q5_K, 176, &[0, 2][..], 256), (GgmlType::Q6_K, 210, &[208][..], 256), (GgmlType::Q4_0, 18, &[0][..], 32)] {
+        let (n, k) = (301usize, 2048usize);
         let mut next = rng(n as u32 + bytes as u32);
-        let mut raw = vec![0u8; n * (k / 256) * bytes];
+        let mut raw = vec![0u8; n * (k / block) * bytes];
         for v in raw.iter_mut() {
             *v = ((next() + 1.0) * 100.0) as u8;
         }
@@ -382,7 +383,7 @@ fn a_few_rows_from_int8_are_the_f32_kernels() {
         let x = b.vec(8 * k);
         DeviceChain::upload(&b, &x, &xs);
         let mut four = Vec::new();
-        for m in [2usize, 4, 5, 8] {
+        for m in [1usize, 2, 4, 5, 8] {
             let (y, yq) = (b.vec(m * n), b.vec(m * n));
             let mut rec = Recorder::new(&b);
             rec.matmul_rows_f32(&w, &x, &y, m);
