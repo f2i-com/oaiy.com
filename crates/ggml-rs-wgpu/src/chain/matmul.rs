@@ -121,6 +121,26 @@ impl Recorder<'_> {
         (xq, xs_at)
     }
 
+    /// [`ChainRecorder::rmsnorm`] of a step's one row with its int8 rows made in the same pass
+    /// ([`crate::quant::shaders::NORM_Q8_LANES`]), for every int8 matmul that reads `out` until something writes it
+    /// (as [`Self::x_q8`] keeps them). False (nothing recorded) where the device's subgroups are not 32 lanes or it
+    /// does not take int8 rows, or the row is not a multiple of 32 long; OAIY_NORM_Q8=0 always.
+    pub(super) fn rmsnorm_q8(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let k = x.len;
+        if k == 0 || k % 32 != 0 || w.len < k || out.len < k || !self.gpu().subgroups32() || !self.gpu().int8_rows() || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0")) {
+            return false;
+        }
+        let (len, xs_at) = crate::quant::shaders::q8_len(1, k);
+        let ob = buffer(out).clone();
+        // (a kept recording's own buffer for them, the same every run, so the recording is replayed; else scratch)
+        let xq = if self.keeps() { DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, k, (len * 4) as u64)) } } else { self.scratch(len) };
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide("chain-rmsnorm-q8", crate::quant::shaders::NORM_Q8_LANES, [buffer(x), buffer(w), &d, &d, &d, &d, buffer(out), buffer(&xq)], &[k as u32, eps.to_bits(), xs_at as u32], ((k as u32 / 32).div_ceil(32), 1, 1));
+        self.q8.push((ob, 1, k, xq));
+        true
+    }
+
     /// `y[r] = W x[r]` as [`ChainRecorder::matmul_rows`] for a prompt's rows on the tensor cores
     /// ([`crate::quant::shaders::coop_tiled`]: f16 weights and tokens into f32 sums). False where the device has no cooperative
     /// matrices or the type no such kernel.
@@ -357,6 +377,16 @@ impl Recorder<'_> {
     /// kernels, a check of drafts' rows in about 1.3 of a step's time where the f32 kernels take 1.7. False for a type
     /// without one (nothing recorded).
     pub(super) fn matmul_rows_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize) -> bool {
+        self.matmul_rows_q8_into(w, x, y, m, false)
+    }
+
+    /// A step's row from int8 activations, its sums added to what `y` holds (`y += W x`, the k-split kernel's: a
+    /// residual stream's add in the matmul's store). False (nothing recorded) where that kernel does not take it.
+    pub(super) fn matmul_q8_add(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec) -> bool {
+        self.matmul_rows_q8_into(w, x, y, 1, true)
+    }
+
+    fn matmul_rows_q8_into(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize, add: bool) -> bool {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
         let (n, k) = (w.shape()[0], w.shape()[1]);
         let block = if matches!(q.dtype, ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) { 32 } else { 256 };
@@ -367,6 +397,9 @@ impl Recorder<'_> {
         // it too: Music 3's language model steps its guided and unguided rows together, and by f32 its [12288, 4096]
         // matrices took 9.5 ms each on an NVIDIA A2, a frame 1.4 s)
         if q.dtype == ggml_quants::GgmlType::Q8_0 && self.alike {
+            return false;
+        }
+        if add && (m != 1 || self.alike || !self.gpu().subgroups32() || !q8_split()) {
             return false;
         }
         assert!(x.len >= m * k && y.len >= m * n, "chain: an int8 matmul [{n}, {k}] of {m} rows");
@@ -401,15 +434,22 @@ impl Recorder<'_> {
         let split = mr == 1 && subgroups && q8_split();
         let (pipeline, per) = match split {
             true => {
-                let name = match q.dtype {
-                    ggml_quants::GgmlType::Q3_K => "chain-q8-Q3_K-decode-split",
-                    ggml_quants::GgmlType::Q4_K => "chain-q8-Q4_K-decode-split",
-                    ggml_quants::GgmlType::Q5_K => "chain-q8-Q5_K-decode-split",
-                    ggml_quants::GgmlType::Q4_0 => "chain-q8-Q4_0-decode-split",
-                    ggml_quants::GgmlType::Q8_0 => "chain-q8-Q8_0-decode-split",
-                    _ => "chain-q8-Q6_K-decode-split",
+                let name = match (q.dtype, add) {
+                    (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-decode-split",
+                    (ggml_quants::GgmlType::Q4_K, false) => "chain-q8-Q4_K-decode-split",
+                    (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-decode-split",
+                    (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-decode-split",
+                    (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-decode-split",
+                    (_, false) => "chain-q8-Q6_K-decode-split",
+                    (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q5_K, true) => "chain-q8-Q5_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode-split-add",
+                    (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode-split-add",
+                    (_, true) => "chain-q8-Q6_K-decode-split-add",
                 };
-                (self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8_split(q.dtype, 4).expect("a K-quant's int8 kernel")), 4)
+                let make = if add { crate::quant::shaders::rb_kernel_q8_split_add } else { crate::quant::shaders::rb_kernel_q8_split };
+                (self.gpu().named_pipeline(name, || make(q.dtype, 4).expect("a K-quant's int8 kernel")), 4)
             }
             false => (
                 self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8(q.dtype, crate::quant::shaders::rb_rows_q8(q.dtype, mr), mr, subgroups).expect("a K-quant's int8 kernel")),

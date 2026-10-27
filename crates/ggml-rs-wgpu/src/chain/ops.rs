@@ -33,7 +33,25 @@ impl ChainRecorder for Recorder<'_> {
         self.weigh(2.0 * m as f64 * w.shape().iter().product::<usize>() as f64);
     }
 
+    fn matmul_add(&mut self, w: &QuantizedTensor, x: &DeviceVec, acc: &DeviceVec, tmp: &DeviceVec) {
+        // (a step's row from int8 activations with the k-split kernel: its sums added where they are stored, a weight on
+        // the card (one in its file is written into the card's slots first: as `matmul_rows` has it))
+        static Q8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let q8 = *Q8.get_or_init(|| std::env::var_os("OAIY_NO_Q8").is_none());
+        let on_card = w.device_storage().and_then(|s| s.as_any().downcast_ref::<crate::quant::WgpuQuant>()).is_some_and(|q| q.file.is_none());
+        if on_card && q8 && self.gpu().int8_rows() && super::matmul::decode_in_int8(self.backend, w) && self.matmul_q8_add(w, x, acc) {
+            self.weigh(2.0 * w.shape().iter().product::<usize>() as f64);
+            return;
+        }
+        self.matmul(w, x, tmp);
+        self.add(acc, tmp);
+    }
+
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) {
+        // (its int8 rows made in the same pass, for the int8 matmuls that read it: `rmsnorm_q8`)
+        if self.rmsnorm_q8(x, w, out, eps) {
+            return;
+        }
         // (a row a multiple of 4 long: the rows' kernel, vec4 loads and three barriers, where this one's scalar loads
         // and tree of halvings took 16 us of a 7,168-wide row on an RTX 5090, 105 of them a 33B's step, 1.7 ms of 22)
         if x.len % 4 == 0 && x.len > 0 {

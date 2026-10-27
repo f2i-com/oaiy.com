@@ -748,13 +748,13 @@ impl ChainDecoder {
                     rec.store(&st.v, &g.layers[i], past * row + kvd);
                     rec.attention(q, &g.layers[i], &g.out, n_h, n_kv, hd, lo, past + 1, g.cap, scale);
                 }
-                rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
                 match &st.post_norms {
                     Some(norms) => {
+                        rec.matmul(quant(&b.attn_output), &g.out, &st.proj);
                         rec.rmsnorm(&st.proj, &norms[i].0, &st.proj_n, cfg.rms_eps);
                         rec.add(&st.x, &st.proj_n);
                     }
-                    None => rec.add(&st.x, &st.proj),
+                    None => rec.matmul_add(quant(&b.attn_output), &g.out, &st.x, &st.proj),
                 }
                 rec.rmsnorm(&st.x, &st.ffn_norms[i], &st.xn, cfg.rms_eps);
                 let FfnPair::Fused(gu) = &b.ffn_pair else { unreachable!("the chain state checked the pair") };
@@ -764,13 +764,13 @@ impl ChainDecoder {
                 } else {
                     rec.silu_mul_split(&st.gate_up, &st.act);
                 }
-                rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
                 match &st.post_norms {
                     Some(norms) => {
+                        rec.matmul(quant(&b.ffn_down), &st.act, &st.proj);
                         rec.rmsnorm(&st.proj, &norms[i].1, &st.proj_n, cfg.rms_eps);
                         rec.add(&st.x, &st.proj_n);
                     }
-                    None => rec.add(&st.x, &st.proj),
+                    None => rec.matmul_add(quant(&b.ffn_down), &st.act, &st.x, &st.proj),
                 }
             }
             if st.head {

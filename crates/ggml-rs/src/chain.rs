@@ -230,6 +230,12 @@ pub trait ChainRecorder {
     }
     /// `y[r] = W x[r]` for `rows` rows of `x` (`[rows, k]`) into `y` (`[rows, n]`): a prompt's.
     fn matmul_rows(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, rows: usize);
+    /// `acc += W x` for one row `x` (a projection into a residual stream), `tmp` (`[n]`) the matmul's where the device
+    /// adds it after (its default: [`Self::matmul`] into `tmp`, then [`Self::add`]).
+    fn matmul_add(&mut self, w: &QuantizedTensor, x: &DeviceVec, acc: &DeviceVec, tmp: &DeviceVec) {
+        self.matmul(w, x, tmp);
+        self.add(acc, tmp);
+    }
     /// `out = x / rms(x) * w`.
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32);
     /// [`Self::rmsnorm`] of each of `rows` rows of `x` (a head's q or k), all with the same `w` (`[x.len / rows]`).

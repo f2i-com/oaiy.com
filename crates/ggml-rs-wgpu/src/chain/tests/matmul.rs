@@ -409,6 +409,95 @@ fn a_few_rows_from_int8_are_the_f32_kernels() {
     }
 }
 
+/// A step's norm with its int8 rows made in the same pass ([`ChainRecorder::rmsnorm`] where the device takes int8
+/// rows) is the CPU's norm, and an int8 matmul from those rows is the one from the norm's output quantized on its own
+/// ([`crate::quant::shaders::QUANT_Q8_LANES`]), to the bit: rows 7,168, 2,048 and 4,128 long (off a workgroup's 32
+/// blocks).
+#[test]
+fn a_steps_norm_with_its_int8_rows_is_the_norm_then_their_own_pass() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.int8_rows() || !b.gpu.subgroups32() {
+        return;
+    }
+    let cpu = ggml_rs::CpuBackend::new();
+    for k in [7168usize, 2048, 4128] {
+        let n = 96usize;
+        let mut next = rng(k as u32 + 3);
+        let mut raw = vec![0u8; n * (k / 32) * 34];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 127.9) as u8;
+        }
+        for blk in raw.chunks_exact_mut(34) {
+            let d = half::f16::from_f32(0.001 + (blk[9] as f32) * 1e-5).to_bits().to_le_bytes();
+            (blk[0], blk[1]) = (d[0], d[1]);
+        }
+        let w8 = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], GgmlType::Q8_0));
+        let xv: Vec<f32> = (0..k).map(|_| next() * 2.0).collect();
+        let nw: Vec<f32> = (0..k).map(|_| next() * 0.5 + 1.0).collect();
+        let want = ggml_rs::Backend::rmsnorm(&cpu, &ggml_rs::Tensor::from_vec(xv.clone(), vec![1, k]), &ggml_rs::Tensor::from_vec(nw.clone(), vec![k]), 1e-5);
+        let (x, nwd, out, y, y2) = (b.vec(k), b.vec(k), b.vec(k), b.vec(n), b.vec(n));
+        DeviceChain::upload(&b, &x, &xv);
+        DeviceChain::upload(&b, &nwd, &nw);
+        let mut rec = Recorder::new(&b);
+        rec.rmsnorm(&x, &nwd, &out, 1e-5);
+        assert!(rec.q8.iter().any(|(xb, m, kk, _)| xb == buffer(&out) && *m == 1 && *kk == k), "{k}: the norm's int8 rows kept for its matmuls");
+        assert!(rec.matmul_rows_q8(&w8, &out, &y, 1));
+        // (the same rows quantized again from the norm's output by their own pass)
+        rec.q8.clear();
+        assert!(rec.matmul_rows_q8(&w8, &out, &y2, 1));
+        rec.read(&out);
+        rec.read(&y);
+        rec.read(&y2);
+        let r = Box::new(rec).finish();
+        let top = want.data().iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = r[0].iter().zip(want.data()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(worst <= 1e-5 * top, "{k}: the norm {worst} off of {top}");
+        assert!(r[1].iter().zip(&r[2]).all(|(p, q)| p.to_bits() == q.to_bits()), "{k}: the matmul from the norm's int8 rows, the one from their own pass's");
+    }
+}
+
+/// A step's projection added into a residual stream by the matmul's own store ([`ChainRecorder::matmul_add`], the
+/// k-split int8 kernel's) is the matmul's then the add's, to the bit: Q4_K and Q6_K, their step's rows taken from
+/// int8 as decided.
+#[test]
+fn a_matmul_added_where_it_is_stored_is_the_matmul_then_the_add() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.int8_rows() || !b.gpu.subgroups32() {
+        return;
+    }
+    for (dtype, bytes, scales) in [(GgmlType::Q4_K, 144usize, &[0usize, 2][..]), (GgmlType::Q6_K, 210, &[208][..])] {
+        b.gpu.decode_int8.lock().unwrap().insert(dtype, true);
+        let (n, k) = (301usize, 2048usize);
+        let mut next = rng(n as u32 + bytes as u32 + 1);
+        let mut raw = vec![0u8; n * (k / 256) * bytes];
+        for v in raw.iter_mut() {
+            *v = ((next() + 1.0) * 100.0) as u8;
+        }
+        for blk in raw.chunks_exact_mut(bytes) {
+            for &at in scales {
+                let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
+                blk[at] = d[0];
+                blk[at + 1] = d[1];
+            }
+        }
+        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+        let (x, a, c, t, u) = (b.vec(k), b.vec(n), b.vec(n), b.vec(n), b.vec(n));
+        let acc: Vec<f32> = (0..n).map(|_| next() * 3.0).collect();
+        DeviceChain::upload(&b, &x, &(0..k).map(|_| next()).collect::<Vec<_>>());
+        DeviceChain::upload(&b, &a, &acc);
+        DeviceChain::upload(&b, &c, &acc);
+        let mut rec = Recorder::new(&b);
+        rec.matmul_add(&w, &x, &a, &t);
+        rec.matmul(&w, &x, &u);
+        rec.add(&c, &u);
+        rec.read(&a);
+        rec.read(&c);
+        let r = Box::new(rec).finish();
+        assert!(r[0] != acc, "{dtype:?}: something added");
+        assert!(r[0].iter().zip(&r[1]).all(|(p, q)| p.to_bits() == q.to_bits()), "{dtype:?}: added where stored, the matmul's then the add's");
+    }
+}
+
 /// The tensor-core matmuls (where the device has them) give their f32 tiled kernels' sums within f16's rounding:
 /// Q3_K, Q4_K, Q5_K, Q6_K and Q8_0, a tile's worth of tokens and a tile and a bit (the edge), rows off the tile.
 #[test]

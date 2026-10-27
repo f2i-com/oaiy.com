@@ -100,6 +100,68 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// A step's row normed (`y = x / rms(x) * w`, `p[0].y` the bits of `eps`) and its int8 rows made from it as
+/// [`QUANT_Q8_LANES`] makes them (into `q`, its scales from vec4 `p[0].z`), in one pass: each workgroup the row's sum of
+/// squares for itself (the row read again from the card's cache), then its 32 blocks, 8 lanes a block. On the wide
+/// layout (`x` its first vector, `w` its second, `y` and `q` its two written). A norm then the int8 rows' own pass
+/// were two dispatches, a 33B's 105 a step each (the quantizing's 0.54 ms of them).
+pub const NORM_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> red: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let k = p[0].x;
+    let eps = bitcast<f32>(p[0].y);
+    let xs_at = p[0].z;
+    let k4 = k / 4u;
+    var s = 0.0;
+    for (var i = li; i < k4; i += 256u) {
+        let v = x4[i];
+        s += dot(v, v);
+    }
+    s = subgroupAdd(s);
+    if (lane == 0u) { red[sgi] = s; }
+    workgroupBarrier();
+    let total = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+    let inv = 1.0 / sqrt(total / f32(k) + eps);
+    // the thread's block and its part of it (values 4 part..), a block's 8 lanes side by side in a subgroup
+    let blocks = k / 32u;
+    let b = wg.x * 32u + li / 8u;
+    let part = li % 8u;
+    let at4 = min(b, blocks - 1u) * 8u + part;
+    let v = x4[at4] * inv * w4[at4];
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    // the half's sum (its 4 lanes'), and the other half's
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        y4[at4] = v;
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
 /// Elements (4-byte) a buffer of [`QUANT_Q8`]'s output takes for `rows` rows of `k`: the packed rows, then the blocks'
 /// scales and sums; and where the scales start, in vec4s.
 pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
@@ -122,7 +184,7 @@ pub fn q8_threads(subgroups: bool) -> u32 {
 /// Qwen3.5 9B's Q4_K [12288, 4096] in 199 us where 222, its Q5_K [8192, 4096] in 160 where 179, its Q6_K output
 /// [248320, 4096] in 5.2 ms where 5.7.
 pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option<String> {
-    rb_kernel_q8_by(dtype, r, mr, subgroups, false)
+    rb_kernel_q8_by(dtype, r, mr, subgroups, false, false)
 }
 
 /// [`rb_kernel_q8`] for a step's one row on a device whose subgroups are 32 lanes, each workgroup's `r` weight rows
@@ -130,10 +192,16 @@ pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option
 /// the workgroup's memory: a lane walked a row's tasks 32 at a time, seven turns of a 7,168-wide row one after another
 /// (Nanbeige4.3's keys [1024, 7168] 12.7 us a step on an RTX 5090, 330 GB/s; its queries [7168, 7168] 25.4, 1,140).
 pub fn rb_kernel_q8_split(dtype: GgmlType, r: u32) -> Option<String> {
-    rb_kernel_q8_by(dtype, r, 1, true, true)
+    rb_kernel_q8_by(dtype, r, 1, true, true, false)
 }
 
-fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: bool) -> Option<String> {
+/// [`rb_kernel_q8_split`] with each row's sum added to what `y` holds there (a residual stream: a row's one writer,
+/// after its workgroup's sums), the add's own pass not needed.
+pub fn rb_kernel_q8_split_add(dtype: GgmlType, r: u32) -> Option<String> {
+    rb_kernel_q8_by(dtype, r, 1, true, true, true)
+}
+
+fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: bool, add: bool) -> Option<String> {
     let (vec4_weights, tasks, block) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
@@ -418,7 +486,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         l(&format!("    if (sgi == 0u && lane < {r}u && rbase + lane < p.rows) {{"));
         l("        var t = 0.0;");
         l(&format!("        for (var g = 0u; g < 8u; g++) {{ t += sums[g * {r}u + lane]; }}"));
-        l("        y[m0 * p.n + p.row0 + rbase + lane] = t;");
+        l(if add { "        y[m0 * p.n + p.row0 + rbase + lane] += t;" } else { "        y[m0 * p.n + p.row0 + rbase + lane] = t;" });
         l("    }");
         l("}");
         return Some(s);
