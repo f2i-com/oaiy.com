@@ -34,6 +34,12 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn rmsnorm(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) {
+        // (a row a multiple of 4 long: the rows' kernel, vec4 loads and three barriers, where this one's scalar loads
+        // and tree of halvings took 16 us of a 7,168-wide row on an RTX 5090, 105 of them a 33B's step, 1.7 ms of 22)
+        if x.len % 4 == 0 && x.len > 0 {
+            self.rmsnorm_rows(x, w, out, 1, eps);
+            return;
+        }
         let pipeline = self.named("chain-rmsnorm", RMSNORM);
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[x.len as u32, eps.to_bits()], (1, 1, 1));
     }
