@@ -640,6 +640,13 @@ impl WgpuBackend {
         self.gpu.coop_tile == 16
     }
 
+    /// Whether this device takes a decode step's row of some weight type from int8 activations (as timed or asked, once
+    /// a type: `chain::matmul::decode_in_int8`; false until a step has asked): a test's tolerance for a chained run
+    /// against the host's f32 path.
+    pub fn steps_from_int8(&self) -> bool {
+        self.gpu.decode_int8.lock().unwrap_or_else(|p| p.into_inner()).values().any(|&v| v)
+    }
+
     /// The most bytes one vector an op reads or writes may hold (the adapter's storage binding limit: 2 GB here).
     pub fn max_binding(&self) -> u64 {
         (self.gpu.limits.max_storage_buffer_binding_size as u64).min(self.gpu.limits.max_buffer_size)

@@ -1916,15 +1916,28 @@ fn a_qwen35_prompt_run_whole_answers_as_its_chunks_one_at_a_time() {
 }
 
 /// Qwen3.5's hybrid chained on the GPU (QWEN35_MODEL: the 9B, or Qwen3.8 27B; or a Qwen3.5-MoE one, `qwen35moe`, or an
-/// LFM2-MoE one, `lfm2moe`, their experts the GPU's) answers as its host path does: the same prompt (QWEN35_PROMPT
-/// tokens, or QWEN35_IDS's, in chunks of 512 as the server sends them) then 64 greedy steps each way give the same tokens, every step's logits close (up to where the
-/// tokens part, if they do: only at a near tie, the host's two within a hair, as the prompt's matmuls' f16 sums can
-/// tip); and the chain did run. A MoE model's within a percent, its tokens parting where both paths' two are within a
-/// quarter of a logit: a layer's top 8 of its experts tips where the paths' sums differ in their last bits (the
-/// chain's f16 cache and sums), and a row with another expert is another row (MiniCPM-V 4.7 35B-A3B on an RTX
-/// 4090, 600 prompt tokens: the prompt's logits at 0.99971, the first step's 0.99531, the tokens parting there with the
-/// host's two 0.11 apart and the chain's 0.03; its chained replies are tinygrad's word for word). A cache the device
-/// holds in f16 alone (the 27B's on an RTX 4090) within a tenth of a percent.
+/// LFM2-MoE one, `lfm2moe`, their experts the GPU's) answers as its host path does: the same prompt (a chat's,
+/// QWEN35_TEXT's or a story's; QWEN35_PROMPT made-up tokens, or QWEN35_IDS's; in chunks of 512 as the server sends
+/// them), then QWEN35_STEPS greedy steps (64) on the host path and the chained steps on its tokens, every step's
+/// logits close and the same token the best but at a near tie (the host's two within a hair, as the prompt's matmuls'
+/// f16 sums can tip); and the chain did run. A MoE model's within a percent, its tokens parting where both paths' two
+/// are within a quarter of a logit: a layer's top 8 of its experts tips where the paths' sums differ in their last
+/// bits (the chain's f16 cache and sums), and a row with another expert is another row (MiniCPM-V 4.7 35B-A3B on an
+/// RTX 4090, 600 prompt tokens: the prompt's logits at 0.99971, the first step's 0.99531, the tokens parting there
+/// with the host's two 0.11 apart and the chain's 0.03; its chained replies are tinygrad's word for word). A cache the
+/// device holds in f16 alone (the 27B's on an RTX 4090) within a tenth of a percent.
+///
+/// Steps whose rows the device takes from int8 activations (`decode_in_int8`'s choice: on an RTX 5090 every K-quant's
+/// and Q8_0's), each 32 of a row rounded to 127 steps of its largest as llama.cpp's MMVQ rounds them, are judged by
+/// their next-token odds (KL from the host's, in nats; a step's logits shifted alike, which their cosine counts, are
+/// the same odds): on an RTX 5090 the story's 64 steps 6.7e-4 a step on average, 4.6e-3 at most (Qwen3.5 9B),
+/// 4.8e-4 and 2.8e-3 (4B), 3.1e-4 and 2.2e-3 (27B), 2.3e-4 and 1.3e-3 (Qwen3.8 27B Q3_K_M), where f32's rows give
+/// some 1e-6; a 9B story of 512 steps 7.1e-4 and 7.5e-3, as much in its last quarter as its first (the delta nets'
+/// states gather none of it), the tokens parting at 8 steps, the host's two 0.077 apart at the widest. Made-up tokens
+/// fall into a loop (`\n`, two tabs, `}`) whose steps between a tab and a `}` take any rounding the furthest: the 9B's
+/// 1.0e-3 and 3.7e-2 (its logits' cosine 0.75 there, mostly their shift), the 27B's 9.9e-4 and 1.5e-2 (the 9B's f32 rows'
+/// cosine 0.99997 at those steps). So 3e-3 on average and 0.1 at most, the tokens parting where the host's two are
+/// within a quarter (a MoE model's as before).
 #[test]
 #[ignore = "needs a WebGPU adapter and a Qwen3.5 GGUF (E:/models/Qwen3.5-9B-Q4_K_M.gguf, or QWEN35_MODEL)"]
 fn a_chained_qwen35_run_answers_as_the_host_path() {
@@ -1947,16 +1960,19 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         crate::llm::Model::load(&gguf, Arc::clone(&backend)).unwrap()
     };
     let crate::llm::Model::Qwen35(m) = &model else { panic!("a Qwen3.5 hybrid") };
-    let n: u32 = std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     let steps: usize = std::env::var("QWEN35_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    // (QWEN35_IDS: a file of the prompt's token ids, in place of QWEN35_PROMPT's made-up ones: a chat's, to hold both
-    // paths' first rows against another engine's)
-    let prompt: Vec<u32> = match std::env::var("QWEN35_IDS") {
-        Ok(file) => std::fs::read_to_string(file).unwrap().split_whitespace().map(|v| v.parse().unwrap()).collect(),
-        Err(_) => (0..n).map(|i| 1000 + (i * 7919) % 20000).collect(),
+    // (QWEN35_IDS: a file of the prompt's token ids, to hold both paths' first rows against another engine's;
+    // QWEN35_PROMPT: that many made-up ids, a long prompt's chunks)
+    let text = std::env::var("QWEN35_TEXT").unwrap_or_else(|_| "Write a short story about a cat called Moss who lives on a boat.".into());
+    let prompt: Vec<u32> = match (std::env::var("QWEN35_IDS"), std::env::var("QWEN35_PROMPT").ok().and_then(|v| v.parse::<u32>().ok())) {
+        (Ok(file), _) => std::fs::read_to_string(file).unwrap().split_whitespace().map(|v| v.parse().unwrap()).collect(),
+        (_, Some(n)) => (0..n).map(|i| 1000 + (i * 7919) % 20000).collect(),
+        _ => m.tokenizer.encode(&format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"), false).unwrap(),
     };
     let argmax = |l: &[f32]| l.iter().enumerate().fold((0, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m }).0 as u32;
-    let run = |chained: bool| {
+    // (the chained run steps on the host's tokens: each greedy on its own, a near tie gone the other way put every step
+    // after it on another text)
+    let run = |chained: bool, given: Option<&[u32]>| {
         let mut kv = model.new_kv_cache(prompt.len() + steps + 16);
         let forward = |t: &[u32], kv: &mut crate::llm::KvCache| {
             let e = m.embed_text(t);
@@ -1969,8 +1985,8 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         }
         let mut next = argmax(&l);
         let (mut tokens, mut all) = (vec![next], vec![l]);
-        for _ in 0..steps {
-            let l = forward(&[next], &mut kv);
+        for i in 0..steps {
+            let l = forward(&[given.map_or(next, |g| g[i])], &mut kv);
             next = argmax(&l);
             tokens.push(next);
             all.push(l);
@@ -1978,11 +1994,11 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         (tokens, all)
     };
     let t = std::time::Instant::now();
-    let (host_tokens, host_logits) = run(false);
+    let (host_tokens, host_logits) = run(false, None);
     let host_s = t.elapsed().as_secs_f64();
     assert_eq!(m.chain.runs.load(Ordering::Relaxed), 0, "the host path never chains");
     let t = std::time::Instant::now();
-    let (chain_tokens, chain_logits) = run(true);
+    let (chain_tokens, chain_logits) = run(true, Some(&host_tokens));
     let chain_s = t.elapsed().as_secs_f64();
     let runs = m.chain.runs.load(Ordering::Relaxed);
     let cosine = |a: &[f32], b: &[f32]| {
@@ -1991,12 +2007,26 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         dot / (n(a) * n(b))
     };
     let each: Vec<f64> = host_logits.iter().zip(&chain_logits).map(|(a, b)| cosine(a, b)).collect();
-    let first_diff = host_tokens.iter().zip(&chain_tokens).position(|(a, b)| a != b);
-    // (past where the tokens part the steps' inputs are not the same)
-    let upto = first_diff.map_or(each.len(), |i| i + 1);
-    let worst = each[..upto].iter().copied().fold(1.0f64, f64::min);
-    eprintln!("prompt {n}: host {host_s:.2} s, chained {chain_s:.2} s ({runs} runs) for {steps} steps; prompt logits cosine {:.6}, worst {worst:.6}; first differing token {first_diff:?}", each[0]);
-    eprintln!("  each step's cosine up to there: {:?}", each[..upto].iter().map(|c| format!("{c:.5}")).collect::<Vec<_>>());
+    let worst = each.iter().copied().fold(1.0f64, f64::min);
+    // each step's divergence of the chain's next-token odds from the host's (KL, in nats: a shift of all the logits
+    // alike, which their cosine counts, leaves the odds as they were)
+    let kl = |p: &[f32], q: &[f32]| {
+        let lse = |l: &[f32]| {
+            let m = l.iter().copied().fold(f32::MIN, f32::max) as f64;
+            m + l.iter().map(|v| (*v as f64 - m).exp()).sum::<f64>().ln()
+        };
+        let (lp, lq) = (lse(p), lse(q));
+        p.iter().zip(q).map(|(a, b)| (*a as f64 - lp).exp() * ((*a as f64 - lp) - (*b as f64 - lq))).sum::<f64>()
+    };
+    let kls: Vec<f64> = host_logits.iter().zip(&chain_logits).map(|(a, b)| kl(a, b)).collect();
+    let (mean_kl, max_kl) = (kls.iter().sum::<f64>() / kls.len() as f64, kls.iter().copied().fold(0.0f64, f64::max));
+    let int8 = gpu.steps_from_int8();
+    eprintln!(
+        "prompt {}: host {host_s:.2} s, chained {chain_s:.2} s ({runs} runs) for {steps} steps{}; the logits' cosine {:.6} the prompt's, {worst:.6} at worst; KL from the host's {mean_kl:.2e} a step, {max_kl:.2e} at most",
+        prompt.len(),
+        if int8 { " (their rows from int8)" } else { "" },
+        each[0]
+    );
     // the prompt's row's five likeliest tokens each way, each by how far it is below the first
     let five = |l: &[f32]| {
         let mut top: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
@@ -2005,23 +2035,31 @@ fn a_chained_qwen35_run_answers_as_the_host_path() {
         top.iter().map(|(t, v)| format!("{t}:{:.3}", top[0].1 - v)).collect::<Vec<_>>().join(" ")
     };
     eprintln!("  the prompt's five: host {}; chained {}", five(&host_logits[0]), five(&chain_logits[0]));
-    // where the tokens part, how far apart the two are by each path's own logits
-    let gaps = first_diff.map(|i| {
-        let (h, c) = (&host_logits[i], &chain_logits[i]);
-        let (ht, ct) = (host_tokens[i] as usize, chain_tokens[i] as usize);
-        (i, h[ht] - h[ct], c[ct] - c[ht])
-    });
-    if let Some((i, host_gap, chain_gap)) = gaps {
-        eprintln!("  at step {i} the host's logit of its token {} is {host_gap:.4} above the chain's {}; by the chain's logits, {chain_gap:.4} the other way", host_tokens[i], chain_tokens[i]);
+    // where the best tokens differ, how far apart the two are by each path's own logits
+    let parted: Vec<(usize, f32, f32)> = (0..host_tokens.len())
+        .filter(|&i| host_tokens[i] != chain_tokens[i])
+        .map(|i| {
+            let (h, c) = (&host_logits[i], &chain_logits[i]);
+            let (ht, ct) = (host_tokens[i] as usize, chain_tokens[i] as usize);
+            (i, h[ht] - h[ct], c[ct] - c[ht])
+        })
+        .collect();
+    if let Some(&(i, host_gap, chain_gap)) = parted.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+        eprintln!("  the best tokens differ at {} of {} steps; the widest at step {i}, the host's {} {host_gap:.4} above the chain's {}, by the chain's logits {chain_gap:.4} the other way", parted.len(), host_tokens.len(), host_tokens[i], chain_tokens[i]);
     }
     assert!(runs > prompt.len().div_ceil(512), "the chain ran ({runs} runs)");
     let moe = m.blocks.iter().any(|b| matches!(b, crate::llm::Qwen35Block::Attention { moe: Some(_), .. } | crate::llm::Qwen35Block::Ssm { moe: Some(_), .. } | crate::llm::Qwen35Block::Conv { moe: Some(_), .. }));
     // (a cache held in f16 alone, as a card with tensor cores holds the 27B's, within a tenth of a percent: 0.99985
     // at worst over 32 steps)
-    let (agree, tie) = if moe { (0.99, 0.25) } else if m.chain.cache_in_halves(m) { (0.999, 0.05) } else { (0.9999, 0.05) };
-    assert!(worst >= agree, "{worst}");
-    if let Some((_, host_gap, chain_gap)) = gaps {
-        assert!(host_gap < tie && (!moe || chain_gap < tie), "the tokens part where the host's two are {host_gap} apart, the chain's {chain_gap}");
+    let agree = if moe { 0.99 } else if m.chain.cache_in_halves(m) { 0.999 } else { 0.9999 };
+    let tie = if moe || int8 { 0.25 } else { 0.05 };
+    if int8 && !moe {
+        assert!(mean_kl <= 3e-3 && max_kl <= 0.1, "from int8: KL {mean_kl} a step, {max_kl} at most");
+    } else {
+        assert!(worst >= agree, "{worst}");
+    }
+    for &(i, host_gap, chain_gap) in &parted {
+        assert!(host_gap < tie && (!moe || chain_gap < tie), "step {i}: the tokens part where the host's two are {host_gap} apart, the chain's {chain_gap}");
     }
 }
 

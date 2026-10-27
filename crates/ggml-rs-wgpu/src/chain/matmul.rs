@@ -488,10 +488,14 @@ fn moe_fused() -> bool {
 
 /// Whether a decode step's one row of `w`'s type takes the K-quants' int8 kernel on this device (its activations
 /// rounded to int8 once and multiplied with packed int8 dot products, llama.cpp's MMVQ arithmetic) rather than the
-/// f32 one. Neither is the faster everywhere. The f32 kernels were chosen on an RTX 5090, where the weights' reads
-/// decide (a 27B step's matmuls at 1,090 GB/s); on an NVIDIA A2 held to 45 W, ten SMs at their power cap's clocks, the
-/// work of unpacking each weight decides, and the int8 kernel made Qwen3.5 9B's replies 19.1 tokens a second where
-/// the f32 one made 12.5 (the same replies but where a near-tie went the other way, as a check's rows from int8 do).
+/// f32 one. Neither is the faster everywhere. The f32 kernels were first chosen on an RTX 5090, where the weights'
+/// reads decide (a 27B step's matmuls at 1,090 GB/s); its int8 ones are the faster there now (2026-10-27: a 4096 x 4096
+/// Q4_K row in 10 to 12 us where 14, Q6_K's 13 to 17 where 18 to 20; a step of Qwen3.5 9B 5.27 ms where 5.86, of
+/// Nanbeige4.3-33B 16.1 where 18.5), the next token's odds from them within some 2e-4 to 7e-4 nats a step of f32's
+/// (Qwen3.5 4B to 27B: `a_chained_qwen35_run_answers_as_the_host_path`). On an NVIDIA A2 held to 45 W, ten SMs at
+/// their power cap's clocks, the work of unpacking each weight decides, and the int8 kernel made Qwen3.5 9B's replies
+/// 19.1 tokens a second where the f32 one made 12.5 (the same replies but where a near-tie went the other way, as a
+/// check's rows from int8 do).
 /// So it is timed, once a type on each device, at the first step's row of it: [`time_decode`]. The int8 kernel is
 /// taken where it is 5% faster or more; a tie keeps f32's exact sums. `OAIY_Q8_DECODE=1` or `0` decides without
 /// timing; `OAIY_NO_Q8` (no int8 kernels) and a device whose packed dot products are wrapped (`Gpu::int8_rows`) never

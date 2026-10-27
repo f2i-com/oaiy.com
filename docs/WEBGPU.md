@@ -389,9 +389,15 @@ wherever it is the faster on the device, and the f32 one elsewhere: neither is t
 faster everywhere, so each type is timed once on each device at its first step's row
 (`chain::matmul::decode_in_int8`: a 4096 x 4096 weight, 16 chained matmuls each way,
 int8 where it is 5% faster or more), and the choice is logged ("Q4_K: a step's row in
-89 us from int8 activations, 110 us in f32 ... : int8"). Where the weights' reads
-decide (the RTX 5090 the f32 kernels were chosen on; not timed this way yet), the two
-should tie and f32's exact sums are kept. On an NVIDIA A2 held to 45 W (2026-10-13;
+89 us from int8 activations, 110 us in f32 ... : int8"). On an RTX 5090, where the
+weights' reads decide, the two were first close, and the int8 kernels have been the
+faster since (2026-10-27: a 4096 x 4096 Q4_K row in 10 to 12 us where 14, Q6_K 13 to
+17 where 18 to 20; a step of Qwen3.5 9B 5.27 ms where 5.86, of Nanbeige4.3-33B 16.1
+where 18.5). Rounding a row to int8 moves the next token's odds a little (KL from the
+f32 path's 2e-4 to 7e-4 nats a step, Qwen3.5 4B to 27B, as much in a 512-step reply's
+last quarter as its first: the delta nets' states gather none of it), the replies the
+same but where a near-tie goes the other way; the int8 kernels themselves give the CPU's
+product of the rows as rounded, within f32's rounding. On an NVIDIA A2 held to 45 W (2026-10-13;
 ten SMs at their power cap's clocks, PCIe through Thunderbolt) unpacking each weight
 decides: Q6_K 143 us where 269, Q5_K 101 where 163, Q4_K 89 where 110, and Qwen3.5 9B
 Q4_K_M replied at 18.7 to 19.1 tokens a second where 12.5, its replies the same but

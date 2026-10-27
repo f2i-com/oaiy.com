@@ -411,6 +411,81 @@ fn a_few_rows_from_int8_are_the_f32_kernels() {
     }
 }
 
+/// A step's row and a few rows from int8 activations are the product of the rows as the device rounded them, within
+/// f32's rounding (the CPU's product of the device's int8 values times their scales): the K-quants', Q4_0's and Q8_0's
+/// kernels (a step's row along k by a workgroup), over Qwen3.5 9B's widths, the rows with a model's outliers (one value
+/// in 997 30 to 60 times the rest) as well as without. And the device rounds them as llama.cpp's q8_1 does: each 32 by
+/// its largest over 127, to the nearest, its scale within a few ulps of the host's (the device's division is not
+/// rounded exactly), so a value a step from the host's only within 1e-4 of halfway. (Against the host's own rounding
+/// a few rows' products were 1e-4 of the largest off: a value or two a step apart.)
+#[test]
+fn int8_rows_are_the_product_of_the_rows_as_the_device_rounds_them() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !b.gpu.int8_rows() {
+        return;
+    }
+    let cpu = ggml_rs::CpuBackend::new();
+    for (dtype, bytes, scales, block) in [(GgmlType::Q3_K, 110usize, &[108usize][..], 256usize), (GgmlType::Q4_K, 144, &[0, 2][..], 256), (GgmlType::Q5_K, 176, &[0, 2][..], 256), (GgmlType::Q6_K, 210, &[208][..], 256), (GgmlType::Q4_0, 18, &[0][..], 32), (GgmlType::Q8_0, 34, &[0][..], 32)] {
+        b.gpu.decode_int8.lock().unwrap().insert(dtype, true);
+        for (n, k) in [(301usize, 2048usize), (4096, 4096), (32, 4096), (4096, 12288)] {
+            let mut next = rng(n as u32 + bytes as u32 + 7);
+            let mut raw = vec![0u8; n * (k / block) * bytes];
+            for v in raw.iter_mut() {
+                *v = ((next() + 1.0) * 100.0) as u8;
+            }
+            for blk in raw.chunks_exact_mut(bytes) {
+                for &at in scales {
+                    let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
+                    blk[at] = d[0];
+                    blk[at + 1] = d[1];
+                }
+            }
+            let host = ggml_rs::QuantizedTensor::from_bytes_cpu(raw.clone(), vec![n, k], dtype);
+            let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+            for outliers in [false, true] {
+                let mut xs: Vec<f32> = (0..4 * k).map(|_| next()).collect();
+                if outliers {
+                    for i in (0..xs.len()).step_by(997) {
+                        xs[i] *= 30.0 + 30.0 * next().abs();
+                    }
+                }
+                let x = b.vec(4 * k);
+                DeviceChain::upload(&b, &x, &xs);
+                let what = |m: usize| format!("{dtype:?} [{n}, {k}] of {m} rows{}", if outliers { " with outliers" } else { "" });
+                // (Q8_0's a step's row alone: a few rows' by f32)
+                for &m in if dtype == GgmlType::Q8_0 { &[1usize][..] } else { &[1, 4][..] } {
+                    let yq = b.vec(m * n);
+                    let mut rec = Recorder::new(&b);
+                    assert!(rec.matmul_rows_q8(&w, &x, &yq, m), "{} from int8", what(m));
+                    rec.read(&yq);
+                    let xq = rec.q8.iter().find(|(xb, ..)| xb == buffer(&x)).expect("the rows' int8").3.clone();
+                    rec.read(&xq);
+                    let mut r = Box::new(rec).finish();
+                    let (words, got) = (r.pop().unwrap(), r.pop().unwrap());
+                    // the rows as the device rounded them (a value's byte, its 32's scale), against the host's rounding
+                    let (_, xs_at) = crate::quant::shaders::q8_len(m, k);
+                    let code = |i: usize| (words[i / 4].to_bits() >> (8 * (i % 4))) as u8 as i8;
+                    let scale = |i: usize| words[(xs_at + i / 32) * 4];
+                    for i in 0..m * k {
+                        let d = xs[i / 32 * 32..i / 32 * 32 + 32].iter().fold(0f32, |a, v| a.max(v.abs())) / 127.0;
+                        assert!((scale(i) - d).abs() <= d * 1e-6, "{}: [{i}]'s scale {} where {d}", what(m), scale(i));
+                        let t = xs[i] / d;
+                        let want = t.round_ties_even().clamp(-127.0, 127.0) as i8;
+                        let halfway = ((t.abs().fract() - 0.5).abs()) < 1e-4;
+                        assert!(code(i) == want || (halfway && (code(i) as i32 - want as i32).abs() == 1), "{}: [{i}] {} rounded to {} where {want}", what(m), xs[i], code(i));
+                    }
+                    let device: Vec<f32> = (0..m * k).map(|i| code(i) as f32 * scale(i)).collect();
+                    let want = ggml_rs::Backend::linear_q(&cpu, &ggml_rs::Tensor::from_vec(device, vec![m, k]), &host).data().to_vec();
+                    let top = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+                    let worst = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).fold(0f32, f32::max);
+                    assert!(worst <= top * 2e-5, "{} from int8: {worst} off of a largest {top}", what(m));
+                }
+            }
+        }
+        b.gpu.decode_int8.lock().unwrap().remove(&dtype);
+    }
+}
+
 /// A step's norm with its int8 rows made in the same pass ([`ChainRecorder::rmsnorm`] where the device takes int8
 /// rows) is the CPU's norm, and an int8 matmul from those rows is the one from the norm's output quantized on its own
 /// ([`crate::quant::shaders::QUANT_Q8_LANES`]), to the bit: rows 7,168, 2,048 and 4,128 long (off a workgroup's 32
