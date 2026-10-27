@@ -921,6 +921,23 @@ weights apart in parts summed after), a run's vectors kept from run to run, and 
 two cards each card's part of a chunk runs beside the other's of the next: a
 22,492-token prompt in 11.5 s where 51.8 (18.8 without the overlap).
 
+A step's int8 matmuls take a row along k by a whole workgroup (four weight rows each,
+the subgroups' sums added through its memory: a lane had walked a 7,168-wide row's
+tasks in seven turns, and the keys' and values' [1024, 7168] read at 330 GB/s), its
+norms make their int8 rows in the same pass, and its output and down projections add
+into the residual where they store: a step's GPU time on one card 14.6 ms where 16.25.
+A check's attention runs on the tensor cores (`attention_coop_runs`: a workgroup a KV
+head and run of 256 positions, the check's rows' queries of the group together as one
+tile, each block of keys and values staged once for all of them), and a step's and a
+check's runs are joined in parallel: over 15,500 positions a check of 4 rows' attention
+2.75 ms where 7.0, of 8 rows 3.1 where 12.7. At OAIY's sampling (0.6, 0.95, a repeat
+penalty of 1.1) over two RTX 5090s, run in turn with the build before (2026-10-27):
+
+| Nanbeige4.3-33B | Rewrite | Prose | After 22,508 tokens | Rewrite after 24,929 tokens |
+|---|---:|---:|---:|---:|
+| Its prompts read beside each other (4d79f43e) | 93.6 tok/s | 51.8 tok/s | 41.2 tok/s | 104.3 tok/s |
+| The step's kernels and the check's attention | 101.6 to 102.8 | 57.6 to 58.1 | 48.7 to 49.1 | 153.8 to 159.4 |
+
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
 cache and took the softmax on one thread), a tied head heads with the GGUF's
