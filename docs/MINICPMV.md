@@ -90,4 +90,4 @@ about the 1024 x 512 one (three tiles, 223 tokens) in 0.9 s. tinygrad's own `qwe
 prompt and greedy steps chained and op by op. On the 4090, 600 prompt tokens: chained 1.95 s against 5.7 s op by op, the
 prompt's logits at cosine 0.99971; the two part at the first step, where both paths' two likeliest tokens are within
 0.11 of a logit (a layer's top 8 of 256 experts tips on the last bits of a sum), so a MoE model is held to a cosine of
-0.99 and such a near tie, a dense one to 0.9999.
+0.99 and such a near tie, a dense one to 0.9999 (from f32 step rows; from int8 ones, by the steps' next-token odds).

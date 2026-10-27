@@ -1126,7 +1126,9 @@ On the RTX 5090 (Vulkan), greedy, through `oaiy-llm-server-webgpu`:
 
 Each gives the host path's tokens after 64- and 1,500-token prompts, the prompt's
 logits and every step's cosine 1.000000 (`a_chained_qwen35_run_answers_as_the_host_path`,
-which also checks that the chain ran); the same replies through a conversation
+which also checks that the chain ran; that is from f32 step rows: from int8 ones, as an
+RTX 5090 takes them since, it judges the steps' next-token odds, within 2e-4 to 7e-4
+nats a step); the same replies through a conversation
 that goes back to a checkpoint as with `OAIY_NO_CHAIN`; and Qwen3.8 27B the right
 answer after up to 2,011 tokens. Its decode step is about 17 ms on the GPU, 12 of
 them the matmuls (Q3_K, 8 GB of its 13.4, at 1,090 GB/s).
