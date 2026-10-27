@@ -916,6 +916,11 @@ copied) and comes back when it goes on, its GPU copy made again from the host's:
 22,559-token conversation going on after another of 2,443 had its first token after
 4.5 s where its prompt was read again (49 s).
 
+Its prompt is read 2,048 tokens a chained run (at 512 its tensor-core matmuls took the
+weights apart in parts summed after), a run's vectors kept from run to run, and over
+two cards each card's part of a chunk runs beside the other's of the next: a
+22,492-token prompt in 11.5 s where 51.8 (18.8 without the overlap).
+
 Also for the dense models on WebGPU: the CPU's attention runs in one pass (each
 KV head's rows read once for its group of query heads; the default copied the
 cache and took the softmax on one thread), a tied head heads with the GGUF's
