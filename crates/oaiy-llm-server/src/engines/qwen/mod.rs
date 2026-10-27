@@ -739,6 +739,11 @@ impl Hybrid {
             }
             return last.ok_or_else(|| "no chunk to run".to_string());
         }
+        // (a dense Llama over two devices: each device's part of a chunk beside the other's of the next)
+        if let Self::Qwen35(Model::Llama(m)) = self {
+            let tokens: Vec<&[u32]> = chunks.iter().map(|(t, _)| *t).collect();
+            return Ok(m.last_logits(&m.forward_chunks(&tokens, kv, done)));
+        }
         // the Qwen3.5 hybrid's as one run (its chain records each chunk as the one before runs)
         if let (Self::Qwen35(Model::Qwen35(_)), true) = (self, chunks.len() > 1) {
             let (tokens, emb) = self.joined(chunks);
@@ -795,7 +800,15 @@ impl Hybrid {
         if let Self::Flash(f) = self {
             return f.devices_len() > 1;
         }
-        matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some())
+        matches!(self, Self::Qwen35(Model::Qwen35(m)) if m.backend.chain().is_some()) || matches!(self, Self::Qwen35(Model::Llama(m)) if m.split())
+    }
+    /// The most rows of a prompt that go to [`Self::forward_chunks`] together: eight chunks (a dense Llama over two
+    /// devices, its devices' parts of them each beside the other's), else eight of [`PREFILL_CHUNK`].
+    fn run_rows(&self) -> usize {
+        match self {
+            Self::Qwen35(Model::Llama(_)) => 8 * self.prompt_rows(),
+            _ => 8 * PREFILL_CHUNK,
+        }
     }
     /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
     /// `chunks`' tokens one after another and their embeddings side by side (copied on every core: 64 MB a run of
@@ -1312,10 +1325,10 @@ impl QwenEngine {
                 // (its states copied as the run goes: a prompt's last two, before the assistant's header and before
                 // its last token, were a run of 6 rows and a run of 1 of their own), else a run's end each as before
                 // (the disk's whole states are made from them once the reply is out: `Snapshot::from_checkpoint`)
-                let far = (pos + 8 * PREFILL_CHUNK).min(keys.len());
+                let far = (pos + hybrid.run_rows()).min(keys.len());
                 let due: Vec<usize> = stops.iter().copied().filter(|&s| s > pos && s <= far && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..s])).collect();
                 let inside = !due.is_empty() && self.kv.len == pos && hybrid.can_tap(far - pos, &self.kv, &due.iter().map(|s| s - pos).collect::<Vec<_>>());
-                let stop = if inside { far } else { stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + 8 * PREFILL_CHUNK) };
+                let stop = if inside { far } else { stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()).min(keys.len()).min(pos + hybrid.run_rows()) };
                 let rows = hybrid.prompt_rows();
                 let spans: Vec<(usize, usize)> = (pos..stop).step_by(rows).map(|a| (a, (a + rows).min(stop))).collect();
                 // (a dense hybrid's chunks' embeddings on every core: its table's rows, 16 ms a run of 3,150 on one)

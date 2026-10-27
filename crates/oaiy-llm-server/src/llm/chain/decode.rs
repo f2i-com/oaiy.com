@@ -360,6 +360,11 @@ impl ChainDecoder {
         self.state.get().is_none() && self.later.set((other, from)).is_ok()
     }
 
+    /// Whether its layers run over two devices ([`Self::split`]).
+    pub(crate) fn is_split(&self) -> bool {
+        self.later.get().is_some()
+    }
+
     /// Each device's part in the order the layers go through them: its backend and its state there.
     fn parts<'s>(&'s self, backend: &'s dyn Backend, m: &Dense<'_>) -> Option<Vec<(&'s dyn Backend, &'s ChainState)>> {
         let to = self.later.get().map_or(m.cfg.n_layers, |(_, from)| *from);
@@ -430,13 +435,7 @@ impl ChainDecoder {
             return None;
         }
         let cfg = m.cfg;
-        let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
-        let (qd, kvd, row) = (n_h * hd, n_kv * hd, 2 * n_kv * hd);
-        let ff = m.common.blocks[0].ffn_pair.ff();
         let past = kv.len;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
-        let rope_of = m.ropes().1;
         let tables = match positions {
             Some(at) => rope_tables_at(m, at),
             None => rope_tables(m, past, t),
@@ -446,9 +445,122 @@ impl ChainDecoder {
         let (mut out, mut kv_rows) = (Vec::new(), Vec::with_capacity(cfg.n_layers));
         for &(part, st) in &parts {
             let chain = part.chain()?;
+            {
+                let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+                reserve(chain, &mut g, cfg, past + t, st.count);
+                sync(chain, &mut g, cfg, kv, past, st.first);
+            }
+            let (rec, _, halves) = record_part(chain, m, st, t, past, &tables, deepstack, every, Some(&rows_in));
+            let mut got = rec.finish().into_iter();
+            let first = got.next().expect("the logits or the hidden states");
+            if st.head {
+                out = first;
+            } else {
+                rows_in = first;
+            }
+            kv_rows.extend(got.map(|r| if halves { from_halves(&r) } else { r }));
+        }
+        // the chunk's K and V rows into the host's cache too, which the copy already holds
+        kv.append_rows_all(backend, &kv_rows, t);
+        kv.commit(t);
+        kv.dirty_from = usize::MAX;
+        if let Some(c) = m.softcap {
+            out.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
+        }
+        Some(out)
+    }
+
+    /// A prompt's `chunks` (one after another after what `kv` holds) through a model split over two devices, the
+    /// second's part of a chunk running as the first runs its part of the next: each device's own work in its turn,
+    /// the hidden states between them, the cache's rows into the host's a chunk at a time (`done(i)` once chunk `i`'s
+    /// are). The last chunk's logits `[1, vocab]`; None (nothing run) where the model is on one device, or there is one
+    /// chunk, and each goes through [`Self::prompt`]. A chunk at a time, each device waited for the other half the time.
+    pub(crate) fn prompt_chunks(&self, backend: &dyn Backend, m: &Dense<'_>, chunks: &[&[u32]], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Option<Tensor> {
+        if std::env::var_os("OAIY_NO_CHAIN").is_some() || std::env::var_os("OAIY_NO_PROMPT_OVERLAP").is_some() || chunks.len() < 2 || chunks.iter().any(|c| c.is_empty()) {
+            return None;
+        }
+        let parts = self.parts(backend, m)?;
+        let &[(da, sa), (db, sb)] = parts.as_slice() else { return None };
+        let (ca, cb) = (da.chain()?, db.chain()?);
+        let cfg = m.cfg;
+        let past0 = kv.len;
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        // room for every chunk's rows first, so no copy of the cache grows under a run going on
+        for (chain, st) in [(ca, sa), (cb, sb)] {
             let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
-            reserve(chain, &mut g, cfg, past + t, st.count);
-            sync(chain, &mut g, cfg, kv, past, st.first);
+            reserve(chain, &mut g, cfg, past0 + total, st.count);
+            sync(chain, &mut g, cfg, kv, past0, st.first);
+        }
+        let pasts: Vec<usize> = chunks.iter().scan(past0, |at, c| { let p = *at; *at += c.len(); Some(p) }).collect();
+        let embed = |c: &[u32]| {
+            let emb = backend.embed_lookup(&m.common.tok_embd, c, cfg.embedding_dim);
+            let mut emb = if emb.is_device() { emb.to_host() } else { emb };
+            if let Some(s) = m.embed_scale {
+                emb.data_mut().iter_mut().for_each(|e| *e *= s);
+            }
+            emb
+        };
+        let first = embed(chunks[0]);
+        let (rec, _, halves) = record_part(ca, m, sa, chunks[0].len(), pasts[0], &rope_tables(m, pasts[0], chunks[0].len()), &[], false, Some(first.data()));
+        let mut run_a = Some((rec.submit(), halves));
+        let mut run_b: Option<(Box<dyn ggml_rs::chain::ChainSubmitted + '_>, usize, bool)> = None;
+        let mut a_rows: Vec<Vec<Vec<f32>>> = Vec::with_capacity(chunks.len());
+        let mut logits = Vec::new();
+        let mut append = |kv: &mut KvCache, j: usize, mut got: std::vec::IntoIter<Vec<f32>>, halves: bool, a_rows: &mut Vec<Vec<Vec<f32>>>, logits: &mut Vec<f32>| {
+            *logits = got.next().expect("the logits");
+            let mut rows = std::mem::take(&mut a_rows[j]);
+            rows.extend(got.map(|r| if halves { from_halves(&r) } else { r }));
+            kv.append_rows_all(backend, &rows, chunks[j].len());
+            kv.commit(chunks[j].len());
+            done(j);
+        };
+        for c in 0..chunks.len() {
+            let t = chunks[c].len();
+            // the second part of this chunk recorded and held as the first device runs its part
+            let (rec_b, x_b, halves_b) = record_part(cb, m, sb, t, pasts[c], &rope_tables(m, pasts[c], t), &[], false, None);
+            let (run, halves_a) = run_a.take().expect("the first part of every chunk runs");
+            let mut got = run.wait().into_iter();
+            let hidden = got.next().expect("the hidden states");
+            a_rows.push(got.map(|r| if halves_a { from_halves(&r) } else { r }).collect());
+            cb.upload(&x_b, &hidden);
+            // the first part of the next chunk at once, beside this one's second
+            if c + 1 < chunks.len() {
+                let next = embed(chunks[c + 1]);
+                let (rec, _, halves) = record_part(ca, m, sa, chunks[c + 1].len(), pasts[c + 1], &rope_tables(m, pasts[c + 1], chunks[c + 1].len()), &[], false, Some(next.data()));
+                run_a = Some((rec.submit(), halves));
+            }
+            if let Some((run, j, halves)) = run_b.take() {
+                append(kv, j, run.wait().into_iter(), halves, &mut a_rows, &mut logits);
+            }
+            run_b = Some((rec_b.submit(), c, halves_b));
+        }
+        let (run, j, halves) = run_b.take().expect("the last chunk's second part");
+        append(kv, j, run.wait().into_iter(), halves, &mut a_rows, &mut logits);
+        kv.dirty_from = usize::MAX;
+        if let Some(c) = m.softcap {
+            logits.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
+        }
+        Some(Tensor::from_vec(logits, vec![1, cfg.vocab_size]))
+    }
+}
+
+/// Part `st`'s run of `t` rows at `past` recorded on `chain`: its vectors (kept from run to run, [`RunVecs`]), the
+/// rows' RoPE tables (`tables`, each distinct RoPE's), each of its layers, then the head where it has it (the last
+/// row's logits, or with `every` every row's) else its rows' hidden states read, and its layers' cache rows read. The
+/// rows it takes (`input`) written now; None: the recording held (nothing of it submitted) for the caller to write
+/// them into the vector returned before it submits. And whether its cache is held as halves (its rows read so).
+#[allow(clippy::too_many_arguments)]
+fn record_part<'c>(chain: &'c dyn ggml_rs::DeviceChain, m: &Dense<'_>, st: &ChainState, t: usize, past: usize, tables: &[Vec<f32>], deepstack: &[Vec<f32>], every: bool, input: Option<&[f32]>) -> (Box<dyn ggml_rs::ChainRecorder + 'c>, DeviceVec, bool) {
+    {
+        let cfg = m.cfg;
+        let (n_h, n_kv, hd, d) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.embedding_dim);
+        let (qd, kvd, row) = (n_h * hd, n_kv * hd, 2 * n_kv * hd);
+        let ff = m.common.blocks[0].ffn_pair.ff();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let neox = matches!(cfg.arch.rope_type(), ggml_rs::RopeType::NeoX);
+        let rope_of = m.ropes().1;
+        {
+            let g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
             let tables: Vec<DeviceVec> = tables
                 .iter()
                 .map(|values| {
@@ -460,7 +572,9 @@ impl ChainDecoder {
             let mut vecs = st.run_vecs.lock().unwrap_or_else(|p| p.into_inner());
             let lens = [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff, chain.attention_rows_out_len(t, n_h, hd, past + t), d, if every { t } else { 1 } * cfg.vocab_size];
             let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act, attn, last, logits]: [DeviceVec; 14] = std::array::from_fn(|i| vecs.get(chain, i, lens[i]));
-            chain.upload(&x, &rows_in);
+            if let Some(rows) = input {
+                chain.upload(&x, rows);
+            }
             let deepstack: Vec<DeviceVec> = deepstack
                 .iter()
                 .map(|rows| {
@@ -470,6 +584,9 @@ impl ChainDecoder {
                 })
                 .collect();
             let mut rec = chain.begin();
+            if input.is_none() {
+                rec.hold();
+            }
             // the chunk's vectors are its own: no bind groups kept to hold their memory after it
             rec.keep_groups(false);
             for l in st.first..st.first + st.count {
@@ -549,25 +666,12 @@ impl ChainDecoder {
                     rec.read_range(layer, past * row, t * row);
                 }
             }
-            let mut got = rec.finish().into_iter();
-            let first = got.next().expect("the logits or the hidden states");
-            if st.head {
-                out = first;
-            } else {
-                rows_in = first;
-            }
-            kv_rows.extend(got.map(|r| if g.halves { from_halves(&r) } else { r }));
+            (rec, x, g.halves)
         }
-        // the chunk's K and V rows into the host's cache too, which the copy already holds
-        kv.append_rows_all(backend, &kv_rows, t);
-        kv.commit(t);
-        kv.dirty_from = usize::MAX;
-        if let Some(c) = m.softcap {
-            out.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);
-        }
-        Some(out)
     }
+}
 
+impl ChainDecoder {
     /// One decode step of `token`, chained, if the backend can: the logits `[1, vocab]`; None leaves the step to the
     /// model's own path.
     pub(crate) fn step(&self, backend: &dyn Backend, m: &Dense<'_>, token: u32, kv: &mut KvCache) -> Option<Tensor> {

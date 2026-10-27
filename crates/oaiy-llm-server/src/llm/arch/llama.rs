@@ -190,6 +190,28 @@ impl LlamaModel {
         self.weights.output.linear(backend, &x_last)
     }
 
+    /// Whether it runs over two devices ([`Self::split_onto`]): a prompt's chunks then go through
+    /// [`Self::forward_chunks`] together, a device's part of one beside the other's of the next.
+    pub fn split(&self) -> bool {
+        self.chain.is_split()
+    }
+
+    /// A prompt's `chunks` one after another after what `kv` holds, split over two devices, each device's part of one
+    /// chunk running as the other runs its part of the next ([`crate::llm::chain::decode::ChainDecoder::prompt_chunks`]),
+    /// else a chunk at a time: the last chunk's logits, `done(i)` once chunk `i` is in.
+    pub fn forward_chunks(&self, chunks: &[&[u32]], kv: &mut KvCache, done: &mut dyn FnMut(usize)) -> Tensor {
+        let dense = crate::llm::chain::decode::Dense::plain(&self.config, &self.weights);
+        if let Some(logits) = self.chain.prompt_chunks(&*self.backend, &dense, chunks, kv, done) {
+            return logits;
+        }
+        let mut last = None;
+        for (i, c) in chunks.iter().enumerate() {
+            last = Some(self.forward(c, kv));
+            done(i);
+        }
+        last.expect("a chunk")
+    }
+
     /// Whether its replies may be drafted from what the conversation holds and the drafts checked in one run
     /// ([`Self::check`]): where its steps are chained (OAIY_NO_LOOKUP: not).
     pub fn checks(&self) -> bool {
@@ -246,6 +268,44 @@ mod tests {
             l2 = two.last_logits(&two.forward(&[next], &mut kv2));
         }
         assert_eq!(l1.data(), l2.data());
+    }
+
+    /// A prompt's chunks through a Llama split over two cards, each card's part of a chunk beside the other's of the
+    /// next ([`LlamaModel::forward_chunks`]), give one card's logits to the bit, a chunk at a time, and the steps after
+    /// them too: the same kernels on the same rows, only when each runs. LLAMA_GGUF: a small Llama GGUF; two GPUs.
+    #[test]
+    #[ignore]
+    fn a_split_llamas_chunks_beside_each_other_give_one_cards_logits() {
+        let Some(path) = std::env::var_os("LLAMA_GGUF") else { return };
+        let Ok(a) = ggml_rs_wgpu::WgpuBackend::new(Some(8 << 30)) else { return };
+        let Some(b) = a.others(Some(8 << 30)).into_iter().next() else { return };
+        let g = GgufFile::open(std::path::Path::new(&path)).unwrap();
+        let one = LlamaModel::from_gguf(&g, Arc::new(a.clone())).unwrap();
+        let mut two = LlamaModel::from_gguf(&g, Arc::new(a)).unwrap();
+        let from = two.config.n_layers / 2;
+        assert!(two.split_onto(Arc::new(b), from));
+        assert!(two.split());
+        let text = "The quick brown fox jumps over the lazy dog, and then it runs into the forest where it finds a river. ".repeat(12);
+        let prompt = one.tokenizer.encode(&text, true).unwrap();
+        let chunks: Vec<&[u32]> = prompt.chunks(prompt.len() / 3 + 1).collect();
+        assert!(chunks.len() >= 3);
+        let (mut kv1, mut kv2) = (one.new_kv_cache(1024), two.new_kv_cache(1024));
+        let mut l1 = None;
+        for c in &chunks {
+            l1 = Some(one.last_logits(&one.forward(c, &mut kv1)));
+        }
+        let mut done = Vec::new();
+        let l2 = two.last_logits(&two.forward_chunks(&chunks, &mut kv2, &mut |i| done.push(i)));
+        assert_eq!(done, (0..chunks.len()).collect::<Vec<_>>());
+        let mut l1 = l1.unwrap();
+        assert_eq!(kv1.len, kv2.len);
+        assert_eq!(l1.data(), l2.data(), "the last chunk's logits");
+        for step in 0..4 {
+            let next = l1.data().iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i as u32).unwrap();
+            l1 = one.last_logits(&one.forward(&[next], &mut kv1));
+            let l2 = two.last_logits(&two.forward(&[next], &mut kv2));
+            assert_eq!(l1.data(), l2.data(), "step {step} after the chunks");
+        }
     }
 
     /// A check of a token and drafts after it ([`LlamaModel::check`]) gives each row the logits a step of it gives (the
