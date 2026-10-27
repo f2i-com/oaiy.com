@@ -356,8 +356,9 @@ fn iq4_xs_from_int8_rows_is_the_f32_kernels() {
 
 /// The K-quants' and Q4_0's int8 kernels for a step's row (along k by a whole workgroup) and a few rows (a check of
 /// drafts) give the f32 kernel's sums within the rounding of the rows to int8, 1 to 8 rows, over rows off a
-/// workgroup's 4; and Q6_K's of 5 to 8 rows, 8 a workgroup, each row's the 4 rows' kernel's to the bit (a row's sums
-/// made alike in both).
+/// workgroup's 4 and Qwen3.5 9B's widths (a row's tasks for a workgroup's 2 to 8 subgroups, and past its 256 lanes);
+/// and Q6_K's of 5 to 8 rows, 8 a workgroup, each row's the 4 rows' kernel's to the bit (a row's sums made alike in
+/// both).
 #[test]
 fn a_few_rows_from_int8_are_the_f32_kernels() {
     let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
@@ -365,45 +366,46 @@ fn a_few_rows_from_int8_are_the_f32_kernels() {
         return;
     }
     for (dtype, bytes, scales, block) in [(GgmlType::Q3_K, 110usize, &[108usize][..], 256usize), (GgmlType::Q4_K, 144, &[0, 2][..], 256), (GgmlType::Q5_K, 176, &[0, 2][..], 256), (GgmlType::Q6_K, 210, &[208][..], 256), (GgmlType::Q4_0, 18, &[0][..], 32)] {
-        let (n, k) = (301usize, 2048usize);
-        let mut next = rng(n as u32 + bytes as u32);
-        let mut raw = vec![0u8; n * (k / block) * bytes];
-        for v in raw.iter_mut() {
-            *v = ((next() + 1.0) * 100.0) as u8;
-        }
-        for blk in raw.chunks_exact_mut(bytes) {
-            for &at in scales {
-                let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
-                blk[at] = d[0];
-                blk[at + 1] = d[1];
+        for (n, k) in [(301usize, 2048usize), (4096, 4096), (1024, 4096), (4096, 12288), (24576, 4096)] {
+            let mut next = rng(n as u32 + bytes as u32);
+            let mut raw = vec![0u8; n * (k / block) * bytes];
+            for v in raw.iter_mut() {
+                *v = ((next() + 1.0) * 100.0) as u8;
             }
-        }
-        let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
-        let xs: Vec<f32> = (0..8 * k).map(|_| next()).collect();
-        let x = b.vec(8 * k);
-        DeviceChain::upload(&b, &x, &xs);
-        let mut four = Vec::new();
-        for m in [1usize, 2, 4, 5, 8] {
-            let (y, yq) = (b.vec(m * n), b.vec(m * n));
-            let mut rec = Recorder::new(&b);
-            rec.matmul_rows_f32(&w, &x, &y, m);
-            rec.read(&y);
-            let want = Box::new(rec).finish().pop().unwrap();
-            let mut rec = Recorder::new(&b);
-            assert!(rec.matmul_rows_q8(&w, &x, &yq, m), "{dtype:?} of {m} rows from int8");
-            rec.read(&yq);
-            let got = Box::new(rec).finish().pop().unwrap();
-            for r in 0..m {
-                let (g, e) = (&got[r * n..(r + 1) * n], &want[r * n..(r + 1) * n]);
-                let dot: f64 = g.iter().zip(e).map(|(a, e)| *a as f64 * *e as f64).sum();
-                let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
-                let cos = dot / (norm(g) * norm(e));
-                assert!(cos > 0.9999, "{dtype:?} [{n}, {k}] row {r} of {m} from int8: cosine {cos}");
+            for blk in raw.chunks_exact_mut(bytes) {
+                for &at in scales {
+                    let d = half::f16::from_f32(0.01 + (blk[(at + 4) % bytes] as f32) * 1e-4).to_bits().to_le_bytes();
+                    blk[at] = d[0];
+                    blk[at + 1] = d[1];
+                }
             }
-            if m == 4 {
-                four = got;
-            } else if m == 8 {
-                assert!(four.iter().zip(&got[..4 * n]).all(|(a, b)| a.to_bits() == b.to_bits()), "{dtype:?}: 8 rows' first 4 the 4 rows'");
+            let w = ggml_rs::Backend::to_device_quant(&b, ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![n, k], dtype));
+            let xs: Vec<f32> = (0..8 * k).map(|_| next()).collect();
+            let x = b.vec(8 * k);
+            DeviceChain::upload(&b, &x, &xs);
+            let mut four = Vec::new();
+            for m in [1usize, 2, 4, 5, 8] {
+                let (y, yq) = (b.vec(m * n), b.vec(m * n));
+                let mut rec = Recorder::new(&b);
+                rec.matmul_rows_f32(&w, &x, &y, m);
+                rec.read(&y);
+                let want = Box::new(rec).finish().pop().unwrap();
+                let mut rec = Recorder::new(&b);
+                assert!(rec.matmul_rows_q8(&w, &x, &yq, m), "{dtype:?} of {m} rows from int8");
+                rec.read(&yq);
+                let got = Box::new(rec).finish().pop().unwrap();
+                for r in 0..m {
+                    let (g, e) = (&got[r * n..(r + 1) * n], &want[r * n..(r + 1) * n]);
+                    let dot: f64 = g.iter().zip(e).map(|(a, e)| *a as f64 * *e as f64).sum();
+                    let norm = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                    let cos = dot / (norm(g) * norm(e));
+                    assert!(cos > 0.9999, "{dtype:?} [{n}, {k}] row {r} of {m} from int8: cosine {cos}");
+                }
+                if m == 4 {
+                    four = got;
+                } else if m == 8 {
+                    assert!(four.iter().zip(&got[..4 * n]).all(|(a, b)| a.to_bits() == b.to_bits()), "{dtype:?}: 8 rows' first 4 the 4 rows'");
+                }
             }
         }
     }
