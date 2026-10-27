@@ -25,6 +25,11 @@ const IMAGE: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 // to keep activations small alongside the configured long-context KV cache.
 pub(crate) const PREFILL_CHUNK: usize = 512;
 
+/// A dense Llama's prompt chunk (its rows a chained run): at 512 a 33B's matmuls on the tensor cores took their
+/// weights apart in parts summed after, 30.7 s of a 22,492-token prompt's 51.8 (Nanbeige4.3 over two RTX 5090s); at
+/// 1,024 the prompt took 21.0 s, at 2,048 20.3 and at 4,096 20.9.
+const LLAMA_CHUNK: usize = 2048;
+
 /// How a picture stands in a Qwen prompt: Qwen3.5's own `<|vision_start|><|image_pad|><|vision_end|>` beside its
 /// text, or MiniCPM-V 4.7's bare `<|image_pad|>`, a message's parts each on a line of its own and the whole trimmed (its
 /// template's `join('\n')` and `trim`). Qwen3-VL's stand as Qwen3.5's, in a template with no thought: an instruct
@@ -755,6 +760,10 @@ impl Hybrid {
         #[cfg(feature = "webgpu")]
         if let Self::Flash(f) = self {
             return f.prompt_rows();
+        }
+        // (a dense Llama's: [`LLAMA_CHUNK`], OAIY_DENSE_CHUNK's where it says)
+        if let Self::Qwen35(Model::Llama(_)) = self {
+            return std::env::var("OAIY_DENSE_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| (16..=8192).contains(n)).unwrap_or(LLAMA_CHUNK);
         }
         PREFILL_CHUNK
     }

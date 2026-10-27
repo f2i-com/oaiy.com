@@ -932,4 +932,29 @@ pub trait ChainRecorder {
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize);
     /// Run what was recorded (one submit) and return what was read, in order.
     fn finish(self: Box<Self>) -> Vec<Vec<f32>>;
+    /// [`Self::finish`] in two halves: what was recorded submitted now, its reads waited for by the returned
+    /// [`ChainSubmitted::wait`]; what the caller does between the two runs beside the device's work (another device's
+    /// recording, the vectors it is given written to its queue before its own submit). Where the device cannot, it
+    /// runs now and the wait only hands its reads back.
+    fn submit<'s>(self: Box<Self>) -> Box<dyn ChainSubmitted + 's>
+    where
+        Self: 's,
+    {
+        Box::new(Finished(self.finish()))
+    }
+}
+
+/// A recording submitted, its reads not yet waited for ([`ChainRecorder::submit`]).
+pub trait ChainSubmitted {
+    /// Its reads waited for, in the order they were recorded.
+    fn wait(self: Box<Self>) -> Vec<Vec<f32>>;
+}
+
+/// A recording that ran already ([`ChainRecorder::submit`]'s default): its reads.
+struct Finished(Vec<Vec<f32>>);
+
+impl ChainSubmitted for Finished {
+    fn wait(self: Box<Self>) -> Vec<Vec<f32>> {
+        self.0
+    }
 }

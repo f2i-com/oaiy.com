@@ -303,6 +303,38 @@ impl KvCache {
         self.host_rows = self.len + seq;
     }
 
+    /// [`Self::append_rows`] of every layer's `seq` rows at once (`rows[l]` layer `l`'s), the layers' copies on every
+    /// core where the host holds every layer's K and V and they are many (a prompt's chunk of 2,048 rows of a 33B's 52
+    /// layers is 870 MB), else a layer at a time (a check's few rows: handing them out cost more than the copies).
+    pub fn append_rows_all(&mut self, backend: &dyn Backend, rows: &[Vec<f32>], seq: usize) {
+        if seq < 64 || rows.len() != self.k.len() || self.k.iter().chain(&self.v).any(Tensor::is_device) {
+            for (l, r) in rows.iter().enumerate() {
+                self.append_rows(backend, l, r, seq);
+            }
+            return;
+        }
+        self.materialize(backend, self.len);
+        for l in 0..rows.len() {
+            self.reserve_layer(backend, l, self.len + seq);
+        }
+        let at = self.len;
+        let inners: Vec<usize> = (0..rows.len()).map(|l| self.n_kv_heads_per_layer[l] * self.head_dims[l]).collect();
+        for (r, &inner) in rows.iter().zip(&inners) {
+            assert_eq!(r.len(), seq * 2 * inner, "a cache's {seq} rows, K then V");
+        }
+        use rayon::prelude::*;
+        self.k.par_iter_mut().zip(self.v.par_iter_mut()).zip(rows.par_iter()).zip(inners.par_iter()).for_each(|(((k, v), r), &inner)| {
+            for (half, dst) in [k, v].into_iter().enumerate() {
+                let dst = &mut dst.data_mut()[at * inner..(at + seq) * inner];
+                for (d, src) in dst.chunks_exact_mut(inner).zip(r.chunks_exact(2 * inner)) {
+                    d.copy_from_slice(&src[half * inner..(half + 1) * inner]);
+                }
+            }
+        });
+        self.dirty_from = self.dirty_from.min(self.len);
+        self.host_rows = self.len + seq;
+    }
+
     pub fn n_kv_heads_for(&self, layer: usize) -> usize {
         self.n_kv_heads_per_layer[layer]
     }

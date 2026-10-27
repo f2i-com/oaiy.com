@@ -107,6 +107,26 @@ struct ChainKv {
     halves: bool,
 }
 
+/// A run's vectors (a prompt's chunk's, a check's), each kept from run to run and made again only where a run needs
+/// it longer, lent at the length a run asks for: new memory on a card costs about a third of a second a GiB, and a
+/// chunk of 2,048 rows of a 33B's took 1.5 GB of it, 5 s of a 22,492-token prompt's 19.8 (each chunk's its own).
+struct RunVecs(Vec<DeviceVec>);
+
+impl RunVecs {
+    /// Vector `slot`, `len` long.
+    fn get(&mut self, chain: &dyn ggml_rs::DeviceChain, slot: usize, len: usize) -> DeviceVec {
+        while self.0.len() <= slot {
+            self.0.push(chain.vec(1));
+        }
+        if self.0[slot].len < len {
+            // (the shorter one let go first: its memory the longer one's)
+            self.0[slot] = chain.vec(1);
+            self.0[slot] = chain.vec(len);
+        }
+        DeviceVec { len, inner: Arc::clone(&self.0[slot].inner) }
+    }
+}
+
 /// `values` (pairs) as f16 halves into `words`, two a word, as a cache held as halves keeps them.
 fn halves_into(values: &[f32], words: &mut [f32]) {
     for (w, p) in words.iter_mut().zip(values.chunks_exact(2)) {
@@ -114,15 +134,25 @@ fn halves_into(values: &[f32], words: &mut [f32]) {
     }
 }
 
-/// A cache's rows read back as halves (two a word) as f32 values, for the host's cache.
+/// A cache's rows read back as halves (two a word) as f32 values, for the host's cache, a long run of them on every
+/// core (a prompt's chunk of 2,048 rows is 218 million values of a 33B's 52 layers; a step's or a check's few on one,
+/// where handing them out cost more than the work).
 fn from_halves(words: &[f32]) -> Vec<f32> {
-    words
-        .iter()
-        .flat_map(|w| {
+    use rayon::prelude::*;
+    let unpack = |out: &mut [f32], words: &[f32]| {
+        for (pair, w) in out.chunks_exact_mut(2).zip(words) {
             let b = w.to_bits();
-            [ggml_rs::tensor::f16_bits_to_f32(b as u16), ggml_rs::tensor::f16_bits_to_f32((b >> 16) as u16)]
-        })
-        .collect()
+            pair[0] = ggml_rs::tensor::f16_bits_to_f32(b as u16);
+            pair[1] = ggml_rs::tensor::f16_bits_to_f32((b >> 16) as u16);
+        }
+    };
+    let mut out = vec![0f32; 2 * words.len()];
+    if words.len() < 1 << 18 {
+        unpack(&mut out, words);
+    } else {
+        out.par_chunks_mut(1 << 16).zip(words.par_chunks(1 << 15)).for_each(|(out, words)| unpack(out, words));
+    }
+    out
 }
 
 struct ChainState {
@@ -131,6 +161,8 @@ struct ChainState {
     count: usize,
     head: bool,
     kv: Mutex<ChainKv>,
+    /// A prompt's chunk's and a check's vectors, kept from run to run ([`RunVecs`]).
+    run_vecs: Mutex<RunVecs>,
     /// A sine-and-cosine table a distinct RoPE of the layers.
     rope_tables: Vec<DeviceVec>,
     /// Gemma 3's norms of a layer's attention and FFN outputs (its layers' each, as the norms below).
@@ -251,6 +283,7 @@ fn make_state(backend: &dyn Backend, m: &Dense<'_>, layers: std::ops::Range<usiz
         count: layers.len(),
         head,
         kv: Mutex::new(ChainKv { layers: Vec::new(), cap: 0, out: chain.vec(1), owner: 0, halves }),
+        run_vecs: Mutex::new(RunVecs(Vec::new())),
         rope_tables: m.ropes().0.iter().map(|_| chain.vec(cfg.head_dim)).collect(),
         post_norms: m.post_norms.as_ref().map(|norms| norms[layers.clone()].iter().map(|(a, f)| (upload(a), upload(f))).collect()),
         attn_norms: blocks.iter().map(|b| upload(&b.attn_norm)).collect(),
@@ -424,10 +457,9 @@ impl ChainDecoder {
                     table
                 })
                 .collect();
-            let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act] =
-                [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff].map(|len| chain.vec(len));
-            let attn = chain.vec(chain.attention_rows_out_len(t, n_h, hd, past + t));
-            let (last, logits) = (chain.vec(d), chain.vec(if every { t } else { 1 } * cfg.vocab_size));
+            let mut vecs = st.run_vecs.lock().unwrap_or_else(|p| p.into_inner());
+            let lens = [t * d, t * d, t * qd, t * kvd, t * kvd, t * qd, t * kvd, t * d, t * d, t * 2 * ff, t * ff, chain.attention_rows_out_len(t, n_h, hd, past + t), d, if every { t } else { 1 } * cfg.vocab_size];
+            let [x, xn, q, k, v, qn, kn, proj, proj_n, gate_up, act, attn, last, logits]: [DeviceVec; 14] = std::array::from_fn(|i| vecs.get(chain, i, lens[i]));
             chain.upload(&x, &rows_in);
             let deepstack: Vec<DeviceVec> = deepstack
                 .iter()
@@ -527,9 +559,7 @@ impl ChainDecoder {
             kv_rows.extend(got.map(|r| if g.halves { from_halves(&r) } else { r }));
         }
         // the chunk's K and V rows into the host's cache too, which the copy already holds
-        for (l, rows) in kv_rows.into_iter().enumerate() {
-            kv.append_rows(backend, l, &rows, t);
-        }
+        kv.append_rows_all(backend, &kv_rows, t);
         kv.commit(t);
         kv.dirty_from = usize::MAX;
         if let Some(c) = m.softcap {
@@ -569,6 +599,9 @@ impl ChainDecoder {
         // (the row a part takes: the embedding, then the part before's hidden state)
         let mut row_in: Vec<f32> = emb.data().to_vec();
         let (mut logits, mut kv_rows) = (Vec::new(), Vec::with_capacity(cfg.n_layers));
+        // A part after the first is recorded while the one before runs, held (nothing of it submitted) until that one's
+        // hidden state is read and given to it: its recording, some 1 ms of a step, beside the other device's work.
+        let mut before: Option<(Box<dyn ggml_rs::chain::ChainSubmitted + '_>, bool, bool)> = None;
         for &(part, st) in &parts {
             let chain = part.chain()?;
             let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
@@ -577,8 +610,12 @@ impl ChainDecoder {
             for (values, table) in rope_values.iter().zip(&st.rope_tables) {
                 chain.upload(table, values);
             }
-            chain.upload(&st.x, &row_in);
             let mut rec = chain.begin();
+            if before.is_some() {
+                rec.hold();
+            } else {
+                chain.upload(&st.x, &row_in);
+            }
             for l in st.first..st.first + st.count {
                 let (b, i) = (&m.common.blocks[l], l - st.first);
                 rec.rmsnorm(&st.x, &st.attn_norms[i], &st.xn, cfg.rms_eps);
@@ -646,14 +683,24 @@ impl ChainDecoder {
                     rec.read_range(layer, past * row, row);
                 }
             }
-            let mut got = rec.finish().into_iter();
-            let first = got.next().expect("the logits or the hidden state");
-            if st.head {
-                logits = first;
-            } else {
-                row_in = first;
+            // the part before's reads: its hidden state this one's input, written before this one goes
+            if let Some((run, head, halves)) = before.take() {
+                let mut got = run.wait().into_iter();
+                let first = got.next().expect("the logits or the hidden state");
+                if head {
+                    logits = first;
+                } else {
+                    row_in = first;
+                }
+                kv_rows.extend(got.map(|r| if halves { from_halves(&r) } else { r }));
+                chain.upload(&st.x, &row_in);
             }
-            kv_rows.extend(got.map(|r| if g.halves { from_halves(&r) } else { r }));
+            before = Some((rec.submit(), st.head, g.halves));
+        }
+        if let Some((run, _, halves)) = before.take() {
+            let mut got = run.wait().into_iter();
+            logits = got.next().expect("the logits");
+            kv_rows.extend(got.map(|r| if halves { from_halves(&r) } else { r }));
         }
         if let Some(c) = m.softcap {
             logits.iter_mut().for_each(|v| *v = (*v * (1.0 / c)).tanh() * c);

@@ -1183,6 +1183,19 @@ impl ChainRecorder for Recorder<'_> {
     fn finish(self: Box<Self>) -> Vec<Vec<f32>> {
         self.launch().wait()
     }
+
+    fn submit<'s>(self: Box<Self>) -> Box<dyn ggml_rs::chain::ChainSubmitted + 's>
+    where
+        Self: 's,
+    {
+        Box::new(self.launch())
+    }
+}
+
+impl ggml_rs::chain::ChainSubmitted for Launched<'_> {
+    fn wait(self: Box<Self>) -> Vec<Vec<f32>> {
+        Launched::wait(*self)
+    }
 }
 
 /// A recording submitted, its reads not yet waited for ([`Recorder::launch`]): what the caller does before
