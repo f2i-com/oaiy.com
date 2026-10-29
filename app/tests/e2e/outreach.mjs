@@ -121,13 +121,19 @@ function answer(body) {
     }
     return { text: 'Recorded and replied.' };
   }
-  asked.runner.push({ tools, last });
+  asked.runner.push({ tools, last, results });
   if (/\[OAIY\] Outreach "[^"]+" is finished/.test(last)) {
     reports.push(last);
     const name = /Outreach "([^"]+)"/.exec(last)[1];
     return { text: `"${name}" is done. I have the results; tell me if you want anything changed.` };
   }
-  const start = (input) => (steps === 0 ? { calls: [{ name: 'start_outreach', input }] } : { text: /declined/.test(results.at(-1) ?? '') ? 'Okay, I will leave it.' : 'Started: I will work through the list and report back here.' });
+  // The runner's model is a local one, listed the everyday tools alone: it finds start_outreach and runs it through use_tool.
+  const start = (input) =>
+    steps === 0
+      ? { calls: [{ name: 'find_tools', input: { query: 'start_outreach' } }] }
+      : steps === 1
+        ? { calls: [{ name: 'use_tool', input: { name: 'start_outreach', arguments: input } }] }
+        : { text: /declined/.test(results.at(-1) ?? '') ? 'Okay, I will leave it.' : 'Started: I will work through the list and report back here.' };
   if (/call these people/i.test(last)) return start(CALLS);
   if (/text these people/i.test(last)) return start(TEXTS);
   if (/check on Hal/i.test(last)) return start(RELOAD);
@@ -391,7 +397,8 @@ try {
     expect(/This also turns on outbound calling on the phone\./.test(shown.text) && /Only contact people who expect to hear from you/.test(shown.text), 'the notes are missing');
     expect(/the phone allows 20 calls a day, shared with call backs, so about 1 day/.test(shown.text), 'the timing is missing');
     expect(dials().length === 0, 'it dialled before it was approved');
-    expect(asked.runner.some((r) => r.tools.includes('start_outreach')), 'start_outreach was not offered to the runner');
+    expect(asked.runner.every((r) => r.tools.includes('find_tools') && r.tools.includes('use_tool') && !r.tools.includes('start_outreach')), `the runner's listed tools: ${JSON.stringify(asked.runner.map((r) => r.tools))}`);
+    expect(asked.runner.some((r) => r.results.some((x) => x.startsWith('start_outreach: '))), 'find_tools did not give the runner start_outreach');
   });
   await shoot(page, 'confirm');
 

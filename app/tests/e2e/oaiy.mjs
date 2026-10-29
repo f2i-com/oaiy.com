@@ -62,22 +62,32 @@ const models3d = [];
 let polls = 0;
 let modelPolls = 0;
 let songPolls = 0;
+// OAIY's model is a local one, so the agent lists it the everyday tools alone (find_tools and use_tool among them):
+// the model finds the others by name and runs them through use_tool.
+const use = (name, args) => ({ name: 'use_tool', input: { name, arguments: args } });
 const script = [
-  { calls: [{ name: 'generate_image', input: { prompt: 'a red fox in snow, watercolour', path: 'art/fox.png' } }] },
-  { calls: [{ name: 'generate_video', input: { prompt: 'the fox runs through the snow, camera follows', path: 'media/fox.mp4', seconds: 4, start_image: 'art/fox.png' } }] },
+  { calls: [{ name: 'find_tools', input: { query: 'generate_image' } }, { name: 'find_tools', input: { query: 'generate_video' } }] },
+  { calls: [use('generate_image', { prompt: 'a red fox in snow, watercolour', path: 'art/fox.png' })] },
+  { calls: [use('generate_video', { prompt: 'the fox runs through the snow, camera follows', path: 'media/fox.mp4', seconds: 4, start_image: 'art/fox.png' })] },
   { text: 'Made art/fox.png and media/fox.mp4.' },
   // A talking fox: a voice, a line, a song, and a clip whose lips follow the line.
-  { calls: [{ name: 'create_voice', input: { name: 'Fox', description: 'a sly young fox, quick and playful' } }] },
-  { calls: [{ name: 'generate_speech', input: { text: 'Catch me if you can!', voice: 'Fox', path: 'audio/line.wav' } }] },
-  { calls: [{ name: 'generate_music', input: { style: 'playful pizzicato strings', instrumental: true, seconds: 20, path: 'audio/theme.mp3' } }] },
-  { calls: [{ name: 'generate_sound_effect', input: { description: 'snow crunching under quick paws', seconds: 3, path: 'audio/steps.wav' } }] },
-  { calls: [{ name: 'generate_video', input: { prompt: 'the fox grins and talks to camera', path: 'media/talk.mp4', start_image: 'art/fox.png', end_image: 'art/fox.png', say: 'Catch me if you can!', voice: 'Fox' } }] },
+  { calls: [use('create_voice', { name: 'Fox', description: 'a sly young fox, quick and playful' })] },
+  { calls: [{ name: 'find_tools', input: { query: 'generate_speech' } }] },
+  { calls: [use('generate_speech', { text: 'Catch me if you can!', voice: 'Fox', path: 'audio/line.wav' })] },
+  { calls: [use('generate_music', { style: 'playful pizzicato strings', instrumental: true, seconds: 20, path: 'audio/theme.mp3' })] },
+  { calls: [use('generate_sound_effect', { description: 'snow crunching under quick paws', seconds: 3, path: 'audio/steps.wav' })] },
+  { calls: [use('generate_video', { prompt: 'the fox grins and talks to camera', path: 'media/talk.mp4', start_image: 'art/fox.png', end_image: 'art/fox.png', say: 'Catch me if you can!', voice: 'Fox' })] },
   { text: 'The fox talks in media/talk.mp4.' },
   // A 3D model of the fox, from its picture: the model and the cut-out land in the project.
-  { calls: [{ name: 'generate_3d_model', input: { image: 'art/fox.png', path: 'assets/models/fox', faces: 20000 } }] },
-  { calls: [{ name: 'file_info', input: { path: 'assets/models/fox.glb' } }, { name: 'file_info', input: { path: 'assets/models/fox.cutout.png' } }] },
+  { calls: [{ name: 'find_tools', input: { query: 'generate_3d_model' } }] },
+  { calls: [use('generate_3d_model', { image: 'art/fox.png', path: 'assets/models/fox', faces: 20000 })] },
+  { calls: [use('file_info', { path: 'assets/models/fox.glb' }), use('file_info', { path: 'assets/models/fox.cutout.png' })] },
   { text: 'The fox is in 3D: assets/models/fox.glb.' },
 ];
+/** The results a request carries, as one text. */
+const resultsIn = (chat) => chat.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n');
+/** What find_tools said of a tool asked for by name (its description and parameters), the latest time it was asked. */
+const foundTool = (name) => chats.map(resultsIn).filter((text) => text.includes(`${name}: `)).pop() ?? `${name} was not found`;
 function sse(step, n) {
   const events = [];
   for (const piece of step.text?.match(/.{1,6}/gs) ?? []) events.push({ choices: [{ index: 0, delta: { content: piece } }] });
@@ -256,12 +266,14 @@ try {
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Made art/fox.png and media/fox.mp4.'), { timeout: 60_000 });
     const tools = chats[0].tools.map((t) => t.function.name);
-    expect(tools.includes('generate_image') && tools.includes('generate_video'), `tools offered: ${tools}`);
-    const imageTool = chats[0].tools.find((t) => t.function.name === 'generate_image').function;
-    expect(imageTool.description.includes('qwen-image-turbo-q4 (default): default size 1024x1024'), imageTool.description);
+    expect(tools.includes('find_tools') && tools.includes('use_tool') && !tools.includes('generate_image'), `tools listed: ${tools}`);
+    expect(chats.every((c) => JSON.stringify(c.tools) === JSON.stringify(chats[0].tools)), 'the listed tools changed from one request to the next');
+    const imageTool = foundTool('generate_image');
+    expect(imageTool.includes('qwen-image-turbo-q4 (default): default size 1024x1024'), imageTool);
+    expect(foundTool('generate_video').includes('ltx-2.3'), foundTool('generate_video'));
     expect(images.length === 1 && images[0].model === 'qwen-image-turbo-q4' && images[0].response_format === 'b64_json' && images[0].prompt.includes('red fox'), JSON.stringify(images));
     expect(videos.length === 1 && videos[0].model === 'ltx-2.3' && videos[0].seconds === '4' && /^data:image\/png;base64,/.test(videos[0].input_reference?.image_url), JSON.stringify(videos).slice(0, 300));
-    const results = chats.slice(1).map((c) => c.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n')).join('\n');
+    const results = chats.slice(1).map(resultsIn).join('\n');
     expect(results.includes('Saved /art/fox.png: 1×1 px, made with qwen-image-turbo-q4') && results.includes('Saved /media/fox.mp4 (4 s, 768x512'), results);
     const shown = await page.$$eval('.msg.presented', (els) => els.map((e) => ({ img: !!e.querySelector('img'), video: !!e.querySelector('video'), text: e.textContent })));
     expect(shown.some((s) => s.img) && shown.some((s) => s.video || s.text.includes('fox.mp4')), JSON.stringify(shown));
@@ -281,8 +293,8 @@ try {
     const talk = videos[1];
     expect(talk && talk.speech?.input === 'Catch me if you can!' && talk.speech?.voice === 'Fox' && /^data:image\/png;base64,/.test(talk.end_image?.image_url) && !('seconds' in talk), JSON.stringify(talk).slice(0, 300));
     // The new voice is offered by name from then on.
-    const speechTool = chats[chats.length - 2].tools.find((t) => t.function.name === 'generate_speech').function;
-    expect(speechTool.description.includes('Fox (a sly young fox'), speechTool.description);
+    const speechTool = foundTool('generate_speech');
+    expect(speechTool.includes('Fox (a sly young fox'), speechTool);
     const names = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
     expect(names.includes('audio'), `tree: ${names}`);
     const players = await page.$$eval('.msg.presented audio, .msg.presented .media-name', (els) => els.length);
@@ -292,10 +304,10 @@ try {
     await page.type('.chat-input', 'Make a 3D model of the fox.');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('The fox is in 3D: assets/models/fox.glb.'), { timeout: 60_000 });
-    const tool = chats[0].tools.find((t) => t.function.name === 'generate_3d_model')?.function;
-    expect(tool && tool.description.includes('three-quarter view') && tool.description.includes('pixal3d (default)'), tool?.description ?? 'generate_3d_model was not offered');
+    const tool = foundTool('generate_3d_model');
+    expect(tool.includes('three-quarter view') && tool.includes('pixal3d (default)'), tool);
     expect(models3d.length === 1 && models3d[0].model === 'pixal3d' && models3d[0].faces === 20000 && models3d[0].image === `data:image/png;base64,${PNG.toString('base64')}`, JSON.stringify(models3d).slice(0, 300));
-    const results = chats.slice(-2).map((c) => c.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n')).join('\n');
+    const results = chats.slice(-2).map(resultsIn).join('\n');
     expect(results.includes('Saved /assets/models/fox.glb (1 face, 3 vertices, 1 KB, made in 70 s), made with pixal3d, and beside it the object as the service cut it out (a PNG with a transparent background: its plain background cut away), /assets/models/fox.cutout.png.') && results.includes('Look at it with preview_screenshot (path: assets/models/fox.glb) before using it.'), results);
     // The files as saved: the GLB byte for byte in size, and the cut-out a real picture.
     expect(results.includes(`/assets/models/fox.glb: ${GLB.length} bytes`) && results.includes(`/assets/models/fox.cutout.png: ${PNG.length} bytes, image image/png, 1×1 px`), results);
