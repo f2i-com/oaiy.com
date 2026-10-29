@@ -460,7 +460,8 @@ const NORM_AS_HOST: &str = r#"
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> sq: array<vec4<f32>, 2048>;
+// (8,128 squares and the scale: within the 32 KB of a workgroup an Apple GPU, or Direct3D 12, has)
+var<workgroup> sq: array<vec4<f32>, 2032>;
 var<workgroup> scale: f32;
 
 fn bf16(v: f32) -> f32 {
@@ -575,8 +576,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     // eight thousand squares at a time, each thread's four side by side (zeros past the row), thread 0 adding them in
     // order, eight reads of four at once ahead of their adds (a read of four at a time waited before its adds: some
     // 30 us a row of 5,120, the adds' own chain some 8)
-    for (var c = 0u; c < d; c += 8192u) {
-        for (var q = t; q < 2048u; q += 256u) {
+    for (var c = 0u; c < d; c += 8128u) {
+        for (var q = t; q < 2032u; q += 256u) {
             var v = vec4<f32>(0.0);
             for (var i = 0u; i < 4u; i++) {
                 if (c + 4u * q + i < d) {
@@ -588,7 +589,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         }
         workgroupBarrier();
         if (t == 0u) {
-            let n = min(8192u, d - c);
+            let n = min(8128u, d - c);
             var j = 0u;
             for (; j + 8u <= n / 4u; j += 8u) {
                 let s0 = sq[j];

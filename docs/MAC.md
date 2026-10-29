@@ -357,6 +357,13 @@ Nothing here has run on a Mac. What was done instead, on a Windows PC:
   translator runs anywhere: all 205 kernels the tests make were written as Metal's
   language, for Metal 3.1 and 2.4, with the options wgpu gives it; the most buffers one
   of them binds is 10 of Metal's 31. Apple's compiler itself runs only on a Mac.
+  Again on 2026-10-30, before 0.1.10: the 419 kernels the backend's tests make held to the limits above were all
+  written as Metal's language, each within an Apple GPU's 32 KB of workgroup memory and 1,024 threads. Of the 546 they
+  make on an RTX 5090 unheld, the ones past those were the 16 x 16 tensor-core kernels (which a Mac is never given),
+  attention kernels made only where a device has the memory, and DeepSeek-V4.1's exact norm (`exl3-rmsnorm-host`,
+  32,772 bytes, now 32,516). Held so, three tests stop at the limits' 256 threads a workgroup (WebGPU's default, a
+  browser's): a head of 384's tiled attention (384 threads) and DeepSeek-V4.1's candidate blocks (512), which an Apple
+  GPU's 1,024 takes.
 - **Right answers under those limits** (the same RTX 5090): a Llama 3B and a Gemma 3 4B
   chained answer as their host paths (64 greedy steps the same, logits' cosine 1.000000);
   the server with a 24 GB Mac's share (`--webgpu-gb 12`) answered a 2,786-token prompt
