@@ -414,6 +414,18 @@ describe('About and updates', () => {
     }
   });
 
+  it('counts the wait from one reading of the clock, so a busy computer says 30 seconds and not 31', async () => {
+    // A clock a millisecond on at every reading, as a loaded computer's is between two calls.
+    let t = Date.parse('2026-10-01T03:00:00Z');
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => ++t);
+    try {
+      await mount(status({ state: 'upToDate', latestVersion: '0.1.0', lastCheckedAt: '2026-10-01T03:00:00Z', nextCheckIn: 30 }));
+      expect(button('Check for updates')?.title).toContain('in 30 seconds');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it('says so when the status cannot be read at all, with a way to ask again', async () => {
     h.status.mockRejectedValue(new Error('the desktop is busy'));
     await act(async () => {

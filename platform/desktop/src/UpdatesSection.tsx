@@ -112,8 +112,10 @@ export default function UpdatesSection() {
   const [now, setNow] = useState(() => Date.now());
   const nextCheckIn = s?.nextCheckIn ?? null;
   useEffect(() => {
-    setNow(Date.now());
-    setCheckAllowedAt(nextCheckIn != null ? Date.now() + nextCheckIn * 1000 : null);
+    // (one reading of the clock for both: two, a millisecond apart, made a wait of 30 s read "31 seconds")
+    const t = Date.now();
+    setNow(t);
+    setCheckAllowedAt(nextCheckIn != null ? t + nextCheckIn * 1000 : null);
   }, [nextCheckIn, s]);
   useEffect(() => {
     if (checkAllowedAt === null || Date.now() >= checkAllowedAt) return;
