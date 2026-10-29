@@ -2,8 +2,9 @@
 /**
  * Regenerate src/softn/guide.generated.ts, the SoftN writing guide the agent
  * reads, from softn.com's own Studio guide (apps/softn-studio/src/lib/agent/
- * guide.ts, Apache-2.0), so OAIY's agent is taught exactly what
- * SoftN Studio's is. The output is committed; run this after a SoftN update:
+ * guide.ts, Apache-2.0), so OAIY's agent is taught what SoftN Studio's
+ * is, but for what OAIY's preview does (OAIY_PREVIEW). The output is
+ * committed; run this after a SoftN update:
  *
  *   SOFTN_REPO=../softn.com node scripts/generate-softn-guide.mjs
  */
@@ -25,9 +26,22 @@ if (/from\s+'/.test(source)) throw new Error('guide.ts has imports this generato
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 const guide = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
 
+// Where Studio's preview and OAIY's differ: [Studio's words, OAIY's]. OAIY's preview is the hosted runtime, which
+// runs every app with no capabilities and has no Allow button (its formlogic:init takes no declaration).
+const OAIY_PREVIEW = [
+  [
+    'The preview withholds them until the person presses Allow in preview above the app, so these calls fail there until then;',
+    'The preview grants no capabilities, so these calls fail there;',
+  ],
+];
+const forOaiy = (text) =>
+  OAIY_PREVIEW.reduce((out, [studio, oaiy]) => {
+    if (!out.includes(studio)) throw new Error(`guide.ts no longer says "${studio}": say what OAIY's preview does in its place`);
+    return out.replaceAll(studio, oaiy);
+  }, text);
 const variants = {
-  JAVASCRIPT: guide.buildGuide({ python: false, torch: false, backend: false, style: 'clean' }),
-  PYTHON: guide.buildGuide({ python: true, torch: false, backend: false, style: 'clean' }),
+  JAVASCRIPT: forOaiy(guide.buildGuide({ python: false, torch: false, backend: false, style: 'clean' })),
+  PYTHON: forOaiy(guide.buildGuide({ python: true, torch: false, backend: false, style: 'clean' })),
 };
 let commit = 'unknown';
 try {
