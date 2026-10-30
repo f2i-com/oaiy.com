@@ -49,6 +49,10 @@ export function copyBridge(dir) {
  * it becomes, and a piece of the edit that says it is made]; the code must be
  * found once, and a release that words it otherwise is left as it is, and said so
  * (v0.0.20 named a variable `s` that v0.0.19 named `c`).
+ *
+ * From SoftN v0.0.28 the runtime serves glTF, GLB, OBJ, STL and FBX itself, and
+ * from v0.0.30 Scene3D loads the data: URLs it gives them, so a runtime that
+ * names its own glTF type is left as it is: these edits are for older ones.
  */
 const ID = '[\\w$]+';
 const MODEL_ASSETS = [
@@ -69,6 +73,8 @@ function allowModelAssets(dir) {
     const file = join(assets, name);
     const code = readFileSync(file, 'utf8');
     if (!code.includes('formlogic:init') || MODEL_ASSETS.every(([, , made]) => code.includes(made))) continue;
+    // The runtime serves models itself (SoftN v0.0.28 on; see MODEL_ASSETS).
+    if (/glb:\s*["'`]model\/gltf-binary["'`]/.test(code)) continue;
     if (!MODEL_ASSETS.every(([from]) => (code.match(from) ?? []).length === 1)) {
       console.warn(`softn-bridge: ${name} does not read as the edits for 3D models expect: a SoftN app's Scene3D cannot load a model from its assets in the preview`);
       continue;
