@@ -80,7 +80,13 @@ pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
 /// The engines' gateway and the model chosen in Engines, asked of the engines now
 /// (their control page's state gives the gateway, the gateway's discovery the model).
 pub(super) async fn engine_now(st: &AiState) -> Result<(String, String), String> {
-    let (gateway, discovery) = engine_discovery(st).await?;
+    engine_now_at(st.engines_ui()).await
+}
+
+/// [`engine_now`], for a caller that holds no `AiState` (the FormLogic relay's tunnel): the
+/// engines whose control pages are at `ui` (none: not running), asked exactly as the routes ask.
+pub(crate) async fn engine_now_at(ui: Option<String>) -> Result<(String, String), String> {
+    let (gateway, discovery, _) = engine_discovery_snapshot_at(ui, false).await?;
     Ok((gateway, chosen_model(&discovery)))
 }
 
@@ -196,7 +202,11 @@ fn plugin_engine_source_snapshot(discovery: &Value, state: &Value) -> Result<Plu
 }
 
 async fn engine_discovery_snapshot(st: &AiState, bounded: bool) -> Result<(String, Value, Value), String> {
-    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
+    engine_discovery_snapshot_at(st.engines_ui(), bounded).await
+}
+
+async fn engine_discovery_snapshot_at(ui: Option<String>, bounded: bool) -> Result<(String, Value, Value), String> {
+    let ui = ui.ok_or("OAIY's engines are not running")?;
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
     if bounded { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
     let client = builder.build().map_err(|e| e.to_string())?;
@@ -226,7 +236,7 @@ pub(super) fn chosen_model(discovery: &Value) -> String {
 }
 
 /// The engine as a provider record the gateway code can forward to.
-fn engine_provider(gateway: String, model: String) -> AiProvider {
+pub(crate) fn engine_provider(gateway: String, model: String) -> AiProvider {
     AiProvider {
         id: ENGINE_PROVIDER_ID.into(),
         name: "OAIY engine".into(),
@@ -977,7 +987,7 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1378,9 +1388,10 @@ mod tests {
 
     /// A stand-in for the engines: their control page (`/api/state`, which names the gateway) and
     /// a gateway behind it (discovery, models, chat and one media route) that records what it is asked.
-    struct FakeEngines {
-        ui: String,
-        asked: Arc<Mutex<Vec<(&'static str, Value)>>>,
+    /// The relay's tunnel tests use it too.
+    pub(crate) struct FakeEngines {
+        pub(crate) ui: String,
+        pub(crate) asked: Arc<Mutex<Vec<(&'static str, Value)>>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -1390,7 +1401,7 @@ mod tests {
         }
     }
 
-    async fn fake_engines() -> FakeEngines {
+    pub(crate) async fn fake_engines() -> FakeEngines {
         use axum::routing::{get, post};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui = format!("http://{}", listener.local_addr().unwrap());

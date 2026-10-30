@@ -200,6 +200,9 @@ pub struct AiTunnel {
     /// Log-once latch, so a provider that is down does not fill the log.
     publish_note: std::sync::Mutex<Option<String>>,
     codex_catalog_probe: OptionalProviderProbe,
+    /// Where the engines are, when a test says (the outer `Option`); otherwise
+    /// `http::engines_ui`, as the AI routes ask (`AiState::engines_ui`).
+    engines: Option<Option<String>>,
     /// The client this lane keeps from poll to poll, so that a poll, the claim it
     /// leads to, the turn's frames and its completion share a connection instead
     /// of each making one. Its default timeout is what a turn's [`Lane`] has
@@ -241,6 +244,10 @@ impl OptionalProviderProbe {
 
 impl AiTunnel {
     pub fn new(data_dir: &std::path::Path, sources: AiSources) -> Result<Arc<Self>, String> {
+        Self::with_engines(data_dir, sources, None)
+    }
+
+    fn with_engines(data_dir: &std::path::Path, sources: AiSources, engines: Option<Option<String>>) -> Result<Arc<Self>, String> {
         let identity = E2eIdentity::load_or_create(data_dir)?;
         Ok(Arc::new(Self {
             identity,
@@ -249,8 +256,17 @@ impl AiTunnel {
             published_marker: data_dir.join("desktop-e2e-published.json"),
             publish_note: std::sync::Mutex::new(None),
             codex_catalog_probe: OptionalProviderProbe::default(),
+            engines,
             http: crate::link::net::LaneClient::new(build_client),
         }))
+    }
+
+    /// Where the engines' control pages are (none: not running).
+    fn engines_ui(&self) -> Option<String> {
+        match &self.engines {
+            Some(own) => own.clone(),
+            None => crate::http::engines_ui(),
+        }
     }
 
     pub fn public_key_b64(&self) -> String {
@@ -711,6 +727,27 @@ impl AiTunnel {
                 rows.push(row);
             }
         }
+        // OAIY's own engine, offered when the engines answer with a language model
+        // chosen, as `/api/ai/sources` offers it on this computer. Not in the store,
+        // it was missing here, so FormLogic could not pick it through the relay. The
+        // engines are asked within two seconds, like the ChatGPT probe below: a slow
+        // or stopped engine must not hold up the list.
+        if let Ok(Ok((_, model))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::ai::routes::engine_now_at(self.engines_ui()),
+        )
+        .await
+        {
+            if !model.is_empty() {
+                rows.push(json!({
+                    "id": crate::ai::routes::ENGINE_PROVIDER_ID,
+                    "label": "OAIY engine",
+                    "capabilities": ["chat"],
+                    "enabled": true,
+                    "model": model,
+                }));
+            }
+        }
         // The managed ChatGPT connector, offered only when it is actually signed
         // in — listing it otherwise offers a guaranteed failure.
         let codex = self.sources.codex.clone();
@@ -739,7 +776,7 @@ impl AiTunnel {
                 .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?
                 .map_err(|e| TunnelError::new("provider_unavailable", e.message()))?
         } else {
-            let provider = self.resolve(provider_id)?;
+            let (provider, _) = self.resolve(provider_id).await?;
             crate::ai::gateway::models(&provider)
                 .await
                 .map_err(|e| TunnelError::new("provider_unavailable", e.message()))?
@@ -826,7 +863,14 @@ impl AiTunnel {
             return self.stream_codex(lane, chat_body).await;
         }
 
-        let provider = self.resolve(provider_id)?;
+        let (provider, engine) = self.resolve(provider_id).await?;
+        // The engine answers with the model chosen in Engines, as its local route does: the
+        // gateway puts the provider's model in when the request names none.
+        if engine {
+            if let Some(obj) = chat_body.as_object_mut() {
+                obj.remove("model");
+            }
+        }
         if crate::ai::gateway::streamable(&provider) {
             chat_body["stream"] = json!(true);
             return self.stream_registry(lane, &provider, chat_body).await;
@@ -851,13 +895,14 @@ impl AiTunnel {
         messages: &[Value],
         run: ToolRun<'_>,
     ) -> Result<Vec<u8>, TunnelError> {
-        let native = if is_codex(provider_id) {
-            None
+        let (native, model) = if is_codex(provider_id) {
+            (None, model)
         } else {
-            let p = self.resolve(provider_id)?;
+            let (p, engine) = self.resolve(provider_id).await?;
             // Only the OpenAI dialect carries tool schemas out and tool calls
             // back; anything translated would drop them on one leg or the other.
-            (p.protocol == crate::ai::providers::Protocol::OpenAi).then_some(p)
+            // The engine answers with the model chosen in Engines (see `chat`).
+            ((p.protocol == crate::ai::providers::Protocol::OpenAi).then_some(p), if engine { None } else { model })
         };
 
         let mut convo: Vec<Value> = messages.to_vec();
@@ -1202,7 +1247,32 @@ impl AiTunnel {
 
     /// Fail closed: an unknown, disabled or keyless provider is refused by name
     /// rather than silently substituted for whatever else is configured.
-    fn resolve(&self, provider_id: &str) -> Result<crate::ai::providers::AiProvider, TunnelError> {
+    ///
+    /// `oaiy-engine` is OAIY's own engine, asked of the engines now as the local
+    /// AI routes ask (`resolve_chat_provider`): it is not in the store. Looked up
+    /// there alone, the relay refused the engine this desktop lists to FormLogic
+    /// ("no provider named \"oaiy-engine\""), so a computer whose only AI is its
+    /// engine could not be used through the relay at all. The `bool` says the
+    /// engine is the one answering, which answers with the model chosen in
+    /// Engines whatever the turn names.
+    async fn resolve(&self, provider_id: &str) -> Result<(crate::ai::providers::AiProvider, bool), TunnelError> {
+        if provider_id == crate::ai::routes::ENGINE_PROVIDER_ID {
+            let (gateway, model) = crate::ai::routes::engine_now_at(self.engines_ui())
+                .await
+                .map_err(|e| TunnelError::new("provider_unavailable", format!("OAIY's engine cannot answer: {e}")))?;
+            if model.is_empty() {
+                return Err(TunnelError::new(
+                    "provider_unavailable",
+                    "OAIY's engine has no language model chosen: choose one in Engines",
+                ));
+            }
+            return Ok((crate::ai::routes::engine_provider(gateway, model), true));
+        }
+        self.resolve_stored(provider_id).map(|provider| (provider, false))
+    }
+
+    /// A provider of the store, held to the rules above.
+    fn resolve_stored(&self, provider_id: &str) -> Result<crate::ai::providers::AiProvider, TunnelError> {
         let provider = {
             let store = self
                 .sources
@@ -1412,6 +1482,73 @@ mod tests {
             codex: crate::ai::codex::new_handle(&dir),
         };
         (AiTunnel::new(&dir, sources).unwrap(), dir)
+    }
+
+    /// A tunnel told where OAIY's engines are (none: nowhere), whatever `http` says.
+    fn tunnel_with_engines(tag: &str, engines: Option<String>) -> (Arc<AiTunnel>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("oaiy-tunnel-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        (AiTunnel::with_engines(&dir, sources, Some(engines)).unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn the_relay_lists_oaiys_engine_and_its_models() {
+        // FormLogic picks a provider from this list and then asks for its models: the engine,
+        // which /api/ai/sources offers on this computer, was missing from it, and its models
+        // were refused as "no provider named \"oaiy-engine\"".
+        let engines = crate::ai::routes::tests::fake_engines().await;
+        let (tunnel, dir) = tunnel_with_engines("engine-list", Some(engines.ui.clone()));
+        let listed: Value = serde_json::from_slice(&tunnel.list_providers().await).unwrap();
+        let rows: Vec<&Value> = listed["providers"].as_array().unwrap().iter().filter(|r| r["id"] == "oaiy-engine").collect();
+        assert_eq!(
+            rows,
+            [&json!({ "id": "oaiy-engine", "label": "OAIY engine", "capabilities": ["chat"], "enabled": true, "model": "flash" })],
+            "the engine, bare, once, with the model chosen in Engines: {listed}"
+        );
+        let models: Value = serde_json::from_slice(&tunnel.list_models("oaiy-engine").await.unwrap()).unwrap();
+        assert_eq!(models["models"][0]["id"], "flash", "{models}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_chat_reaches_oaiys_engine_with_the_model_chosen_in_engines() {
+        // As the local route answers (chat_through_the_engine_provider_reaches_the_engines_and_
+        // answers_with_the_chosen_model): the turn's own model name is not the engine's to use.
+        let engines = crate::ai::routes::tests::fake_engines().await;
+        let (tunnel, dir) = tunnel_with_engines("engine-chat", Some(engines.ui.clone()));
+        // The engine answers in one piece, so nothing is posted to the account on this path.
+        let account = linked("http://127.0.0.1:9".into(), "flk_ai");
+        let spec = descriptor::builtin().remove(0).desktop_ai.unwrap();
+        let lane = Lane { http: reqwest::Client::new(), account: &account, spec: &spec, instance: "oaiy-test", id: "turn-1" };
+        let body = json!({ "v": 1, "messages": [{ "role": "user", "content": "hi" }] });
+        let answer = tunnel.chat(&lane, "oaiy-engine", Some("a-model-nobody-chose"), &body, "unused").await.unwrap();
+        let answer = String::from_utf8(answer).unwrap();
+        assert!(answer.contains("hello from the engine"), "{answer}");
+        {
+            let asked = engines.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1, "one call reached the engines' gateway");
+            assert_eq!(asked[0].1["model"], "flash", "the model chosen in Engines, not the one the turn named");
+            assert_eq!(asked[0].1["messages"][0]["content"], "hi");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn with_no_engines_running_the_relay_offers_no_engine_and_says_so() {
+        let (tunnel, dir) = tunnel_with_engines("engine-none", None);
+        let listed: Value = serde_json::from_slice(&tunnel.list_providers().await).unwrap();
+        assert!(listed["providers"].as_array().unwrap().iter().all(|r| r["id"] != "oaiy-engine"), "{listed}");
+        let refused = tunnel.list_models("oaiy-engine").await.unwrap_err();
+        assert_eq!(refused.code(), "provider_unavailable");
+        assert!(refused.message.contains("OAIY's engine cannot answer"), "{}", refused.message);
+        // A name the store does not hold is refused by that name, as before.
+        let unknown = tunnel.list_models("nowhere").await.unwrap_err();
+        assert!(unknown.message.contains("no provider named \"nowhere\""), "{}", unknown.message);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn linked(base: String, credential: &str) -> LinkedAccount {
