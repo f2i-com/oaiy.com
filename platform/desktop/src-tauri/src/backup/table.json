@@ -14,7 +14,7 @@
     {
       "id": "tunnel-identity",
       "class": "excluded",
-      "paths": ["desktop-e2e-identity.key", "desktop-e2e-published.json", "desktop-e2e-spent.bin"],
+      "paths": ["desktop-e2e-identity.key", "desktop-e2e-published.json", "desktop-e2e-spent.bin", "desktop-e2e-spent.lock"],
       "pattern": "desktop-e2e-identity.key",
       "what": "The tunnel identity key",
       "reason": "The tunnel identity key: browsers pinned the old key, and a key is never copied into a backup.",
@@ -888,6 +888,7 @@
       "desktop-e2e-identity.key": "tunnel-identity",
       "desktop-e2e-published.json": "tunnel-identity",
       "desktop-e2e-spent.bin": "tunnel-identity",
+      "desktop-e2e-spent.lock": "tunnel-identity",
       "disabled.json": "plugins",
       "endpoint.key": "companion",
       "engines": "engines",

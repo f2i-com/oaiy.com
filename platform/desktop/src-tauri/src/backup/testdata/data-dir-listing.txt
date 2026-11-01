@@ -37,6 +37,7 @@ desktop-config.json	excluded
 desktop-e2e-identity.key	excluded
 desktop-e2e-published.json	excluded
 desktop-e2e-spent.bin	excluded
+desktop-e2e-spent.lock	excluded
 engines/oaiy-studio.json	excluded
 hf-token	excluded
 link/account.json	excluded

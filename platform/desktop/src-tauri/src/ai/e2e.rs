@@ -138,8 +138,10 @@ struct SpentBoxes {
 #[derive(Default)]
 struct SpentState {
     known: HashSet<[u8; SPENT_BOX_BYTES]>,
-    /// Why the file could not be read. Nothing is sealed until it can: a forgotten box is a replay.
-    unreadable: Option<String>,
+    /// Held for the life of the process, because the list is read once. A server on the same data
+    /// folder as the window would hold a list of its own, and both would answer one row.
+    lock: Option<std::fs::File>,
+    read: bool,
 }
 
 impl SpentBoxes {
@@ -155,57 +157,71 @@ impl SpentBoxes {
         open.entry(dir.to_path_buf()).or_insert_with(|| Arc::new(Self::load(dir.join("desktop-e2e-spent.bin")))).clone()
     }
 
+    /// Nothing is touched until a request comes: the list is read once this process holds it.
     fn load(path: PathBuf) -> Self {
-        let state = Self::read(&path);
-        Self { file: Some(path), limit: MAX_SPENT_BOXES, state: Mutex::new(state) }
+        Self { file: Some(path), limit: MAX_SPENT_BOXES, state: Mutex::new(SpentState::default()) }
     }
 
-    fn read(path: &Path) -> SpentState {
-        let mut state = SpentState::default();
+    fn hold(path: &Path) -> Result<std::fs::File, String> {
+        let folder = path.parent().unwrap_or(Path::new("."));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(folder.join("desktop-e2e-spent.lock"))
+            .map_err(|e| format!("could not open the spent boxes' lock: {e}"))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .map_err(|_| "another OAIY process is serving sealed requests from this data folder".to_string())?;
+        Ok(lock)
+    }
+
+    fn read(path: &Path) -> Result<HashSet<[u8; SPENT_BOX_BYTES]>, String> {
         let mut bytes = Vec::new();
         match std::fs::File::open(path).and_then(|mut file| file.read_to_end(&mut bytes)) {
-            Ok(_) => {
-                // A crash can leave part of the last entry. The whole ones count, and the rest
-                // goes, or every later entry would be read out of step.
-                let whole = bytes.len() - bytes.len() % SPENT_BOX_BYTES;
-                if whole != bytes.len() {
-                    if let Err(e) = std::fs::OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(whole as u64)) {
-                        state.unreadable = Some(format!("could not repair the spent boxes: {e}"));
-                    }
-                }
-                for entry in bytes[..whole].chunks_exact(SPENT_BOX_BYTES) {
-                    let mut known = [0u8; SPENT_BOX_BYTES];
-                    known.copy_from_slice(entry);
-                    state.known.insert(known);
-                }
-            }
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => state.unreadable = Some(format!("could not read the spent boxes: {e}")),
+            Err(e) => return Err(format!("could not read the spent boxes: {e}")),
         }
-        if let Some(why) = &state.unreadable {
-            log::error!("sealed requests are refused until this is fixed: {why}");
+        // A crash can leave part of the last entry. The whole ones count, and `append` cuts the rest.
+        Ok(bytes
+            .chunks_exact(SPENT_BOX_BYTES)
+            .map(|entry| {
+                let mut known = [0u8; SPENT_BOX_BYTES];
+                known.copy_from_slice(entry);
+                known
+            })
+            .collect())
+    }
+
+    /// The list, in this process's hands. A failure is tried again at the next request: it may have
+    /// been a moment's trouble, a scanner holding the file or a full disk.
+    fn ready(path: &Path, state: &mut SpentState) -> Result<(), String> {
+        if state.lock.is_none() {
+            state.lock = Some(Self::hold(path)?);
         }
-        state
+        if !state.read {
+            state.known = Self::read(path)?;
+            state.read = true;
+        }
+        Ok(())
     }
 
     /// Mark a box used, durably, before anything is sealed with it. False: it was used before.
     fn spend(&self, entry: [u8; SPENT_BOX_BYTES]) -> Result<bool, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.unreadable.is_some() {
-            // It may have been a moment's trouble: a scanner holding the file, a full disk.
-            if let Some(path) = &self.file {
-                *state = Self::read(path);
-            }
-        }
-        if let Some(why) = &state.unreadable {
-            return Err(why.clone());
+        if let Some(path) = &self.file {
+            Self::ready(path, &mut state).map_err(|why| {
+                log::error!("a sealed request was refused: {why}");
+                why
+            })?;
         }
         if state.known.contains(&entry) {
             return Ok(false);
         }
         if state.known.len() >= self.limit {
-            let why = "this desktop has opened as many sealed requests as its identity may: move desktop-e2e-identity.key \
-                       and desktop-e2e-spent.bin aside to mint a new one, and browsers will ask to trust it again";
+            let why = "this desktop has opened as many sealed requests as its identity may: it needs a new one \
+                       (move desktop-e2e-identity.key and desktop-e2e-spent.bin aside), and each browser that \
+                       trusted this one will refuse the new key until its pin is cleared";
             log::error!("{why}");
             return Err(why.into());
         }
@@ -919,6 +935,20 @@ mod tests {
         for entry in [[1u8; 16], [2u8; 16], [3u8; 16]] {
             assert!(!store.spend(entry).unwrap());
         }
+    }
+
+    #[test]
+    fn a_second_process_on_the_folder_answers_nothing_until_the_first_has_gone() {
+        // A server beside the window, on one data folder: each read the list once, and both opened a
+        // recorded row at counter 0.
+        let dir = crate::secret_file::testing::TempDir::new("e2espent-two");
+        let path = dir.0.join(SPENT_KEYS_FILE);
+        let first = SpentBoxes::load(path.clone());
+        let second = SpentBoxes::load(path);
+        assert!(first.spend([1u8; 16]).unwrap());
+        assert!(second.spend([1u8; 16]).unwrap_err().contains("another OAIY process"));
+        drop(first);
+        assert!(!second.spend([1u8; 16]).unwrap(), "and it reads what the first spent");
     }
 
     #[test]
