@@ -403,6 +403,15 @@ describe('the control tools that ask the person first', () => {
     expect(called()).toEqual([{ name: 'plugin_command', arguments: SMS }]);
   });
 
+  it('asks before a plugin\'s settings change too: it reaches the plugin as a command does', async () => {
+    const { asked, run, called } = asking(true);
+    const settings = { pluginId: 'aokie', settings: { forwardTo: '+61491570006' } };
+    await run('plugin_settings_set', settings);
+    expect(asked).toHaveLength(1);
+    for (const part of ['aokie', 'forwardTo', '+61491570006']) expect(asked[0].message).toContain(part);
+    expect(called()).toEqual([{ name: 'plugin_settings_set', arguments: settings }]);
+  });
+
   it('asks before every tool that removes something, saying what with', async () => {
     const removals = parseTools(TOOLS).filter((t) => t.destructive).map((t) => t.name);
     expect(removals).toEqual(expect.arrayContaining(['plugin_uninstall', 'service_uninstall', 'flow_delete', 'chatgpt_sign_out', 'contact_forget_fact']));

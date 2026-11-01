@@ -251,6 +251,8 @@ opt-level = 3
 opt-level = 3
 
 [dev-dependencies]
+# The spellings of one X25519 key, for the tests of what a sealed box may answer.
+curve25519-dalek = { version = "4", default-features = false }
 
 # The tests encrypt and decrypt backups with age's default scrypt cost (about a second
 # when optimised), which is tens of seconds unoptimised: keep the hot crates optimised in

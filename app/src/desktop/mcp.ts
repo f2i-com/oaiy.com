@@ -270,11 +270,11 @@ export interface ControlToolDeps {
 /**
  * Does running `tool` take the person's leave? What removes something cannot be put back, and a plugin's command can be a
  * text or a call: the same conversation reads web pages and imported files, whose words can ask the model for either, and
- * the same effects through a plugin's own tools and outreach already ask. (`plugin_command` is the one change tool that
- * says nothing of what it changes, so its annotations cannot speak for it.)
+ * the same effects through a plugin's own tools and outreach already ask. (`plugin_command` and `plugin_settings_set`, which
+ * reaches the same plugin through its settings command, say nothing of what they change, so their annotations cannot speak for them.)
  */
 function asksFirst(tool: ControlTool): boolean {
-  return tool.destructive || tool.name === 'plugin_command';
+  return tool.destructive || tool.name === 'plugin_command' || tool.name === 'plugin_settings_set';
 }
 
 /** `value` as the person reads it: all of it, or the start of it and how much more there is. */

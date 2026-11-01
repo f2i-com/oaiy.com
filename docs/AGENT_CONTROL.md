@@ -77,7 +77,8 @@ desktop only through these tools.
 
 The conversations that do get the change tools also read web pages and imported files,
 and the words in those can ask the model for anything. So the Agent app asks the person
-before it runs a tool with `destructiveHint`, and before every `plugin_command`, whatever
+before it runs a tool with `destructiveHint`, and before every `plugin_command` and
+`plugin_settings_set`, whatever
 the command: the question says what would be sent (the plugin, the command and its
 payload) or removed, and nothing reaches the desktop until they allow it. If they do not,
 the model is told so and that it should not try again unless they ask. This is the app's
