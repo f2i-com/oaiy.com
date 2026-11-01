@@ -10,23 +10,33 @@
 //!   * KV cache append/commit is consistent across multiple steps.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::Path;
 
 use ggml_rs::default_backend;
 use gguf::value::{Array, Value};
 use gguf::{GgmlType, GgufFile, TensorInfo};
 use oaiy_llm_server::llm::{LlamaModel, SampleParams, Sampler};
+use oaiy_llm_server::Options;
 use tokenizer::byte_encoder::byte_to_char;
+use tokenizer::Tokenizer;
 
 /// Build a synthetic Llama GGUF with the given config and (random-but-deterministic) weights.
 fn build_tiny_llama_gguf() -> Vec<u8> {
-    let vocab = 16usize;
+    // Minimal tokenizer: byte-level BPE with no merges, vocab = 16 single-byte tokens.
+    tiny_llama_gguf((0..16u8).map(|b| byte_to_char(b).to_string()).collect(), 32)
+}
+
+/// The tiny Llama, on the vocabulary `toks` and with a context of `ctx`.
+fn tiny_llama_gguf(toks: Vec<String>, ctx: usize) -> Vec<u8> {
+    let vocab = toks.len();
     let embed = 8usize;
     let layers = 2usize;
     let heads = 2usize;
     let kv_heads = 1usize;
     let head_dim = embed / heads;       // 4
     let ff = 16usize;
-    let ctx = 32usize;
 
     let mut md: BTreeMap<String, Value> = BTreeMap::new();
     md.insert("general.architecture".into(),               Value::String("llama".into()));
@@ -40,8 +50,6 @@ fn build_tiny_llama_gguf() -> Vec<u8> {
     md.insert("llama.attention.layer_norm_rms_epsilon".into(), Value::F32(1e-5));
     md.insert("llama.rope.freq_base".into(),               Value::F32(10000.0));
 
-    // Minimal tokenizer: byte-level BPE with no merges, vocab = 16 single-byte tokens.
-    let toks: Vec<String> = (0..vocab as u8).map(|b| byte_to_char(b).to_string()).collect();
     md.insert("tokenizer.ggml.model".into(),  Value::String("gpt2".into()));
     md.insert("tokenizer.ggml.tokens".into(), Value::Array(Array::String(toks)));
     md.insert("tokenizer.ggml.merges".into(), Value::Array(Array::String(vec![])));
@@ -99,6 +107,47 @@ fn build_tiny_llama_gguf() -> Vec<u8> {
 
     // Compute the offsets pass and write.
     gguf::reader::write_to_vec(&md, &tensors, 32).unwrap()
+}
+
+/// One request over HTTP: the status and the whole answer.
+fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    write!(stream, "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    (answer.split(' ').nth(1).unwrap().parse().unwrap(), answer)
+}
+
+/// A `!` in a prompt is a `!`, on the real server with a model that has no picture token. In a byte-level vocabulary it
+/// is token 0, which was also that model's "no picture token": `Hello!` was refused as an image placeholder with no
+/// image, and a reply of `Hello!` then refused every later turn of its conversation.
+#[test]
+fn a_model_with_no_pictures_reads_a_bang_as_a_bang() {
+    // (in the order a real byte-level vocabulary has, which opens on the printable bytes)
+    let toks = (33u8..=255).chain(0..33).map(|b| byte_to_char(b).to_string()).collect();
+    let gguf = tiny_llama_gguf(toks, 1024);
+    assert_eq!(Tokenizer::from_gguf(&GgufFile::from_bytes(gguf.clone()).unwrap()).unwrap().encode("!", false).unwrap(), [0]);
+    let model = Path::new(env!("CARGO_TARGET_TMPDIR")).join("a-bang-is-a-bang.gguf");
+    std::fs::write(&model, gguf).unwrap();
+    let server = oaiy_llm_server::start(Options { port: 0, model, name: "tiny".into(), backend: "cpu".into(), silent: true, ..Options::default() }).unwrap();
+
+    let chat = |messages: &str| post(server.addr(), "/v1/chat/completions", &format!(r#"{{"messages":{messages},"max_tokens":2}}"#));
+    for messages in [
+        r#"[{"role":"user","content":"Hello!"}]"#,
+        r#"[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!"},{"role":"user","content":"Again"}]"#,
+    ] {
+        let (status, answer) = chat(messages);
+        assert_eq!(status, 200, "{messages}: {answer}");
+        assert!(answer.contains("\"chat.completion\""), "{answer}");
+    }
+    let (status, answer) = post(server.addr(), "/v1/completions", r#"{"prompt":"Hello!","max_tokens":2}"#);
+    assert_eq!(status, 200, "{answer}");
+    assert!(answer.contains("\"text_completion\""), "{answer}");
+    // a picture to a model with none is still told so, in the words a client goes on in text by
+    let (status, answer) = chat(r#"[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]"#);
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer.contains("text only") || answer.contains("no vision"), "{answer}");
 }
 
 #[test]

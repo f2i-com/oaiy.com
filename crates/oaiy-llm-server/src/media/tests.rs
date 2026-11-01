@@ -221,8 +221,37 @@ fn video_requests_use_trusted_paths_and_bounded_memory() {
         .contains("not ready"));
     std::fs::remove_dir_all(root).unwrap();
 }
-fn config() -> Config {
-    Config {
+/// A folder a test made: gone when the test ends, passed or failed.
+struct Scratch(std::path::PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+/// [`config`]'s configuration, and its output folder gone with it: whichever `output_root` the test ended with.
+struct TestConfig(Config);
+impl std::ops::Deref for TestConfig {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TestConfig {
+    fn deref_mut(&mut self) -> &mut Config {
+        &mut self.0
+    }
+}
+impl Drop for TestConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0.output_root);
+    }
+}
+/// Each test's output folder its own: a folder of the whole process was removed by the one test that removed it, under
+/// the others, and whichever wrote there last left it behind.
+fn config() -> TestConfig {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TestConfig(Config {
         media_dir: None,
         default_weights: "gguf".into(),
         image_model: None,
@@ -237,13 +266,13 @@ fn config() -> Config {
         adapter: Some("turbo.safetensors".into()),
         loras: Vec::new(),
         output_root: std::env::temp_dir()
-            .join(format!("oaiy-image-test-{}", std::process::id())),
+            .join(format!("oaiy-image-test-{}-{n}", std::process::id())),
         controller_name: "controller".into(),
         controller_path: "controller.gguf".into(),
         controller_device: 0,
         image_device: 1,
         video_config: None,
-    }
+    })
 }
 /// A FLUX 3 Image Klein model: its paths the catalog's (its text encoder a folder), its steps and guidance the
 /// checkpoint's own unless named, up to ten references (Qwen Image three), with references no size (the first's), and
@@ -282,11 +311,11 @@ fn flux3_catalog_dispatch_takes_ten_references() {
 fn klein_catalog_dispatch_owns_paths_and_can_disable_style_loras() {
     let mut cfg=config();
     let root=std::env::temp_dir().join(format!("oaiy-klein-catalog-{}",std::process::id()));
+    let _scratch=Scratch(root.clone());
     std::fs::create_dir_all(&root).unwrap();
     for file in ["transformer.safetensors","text.safetensors","vae.safetensors","tokenizer.json","style.safetensors"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
     std::fs::write(root.join("image.json"),br#"{"default_model":"klein","models":{"klein":{"architecture":"flux2-klein-4b","transformer":"transformer.safetensors","text_encoder":"text.safetensors","vae":"vae.safetensors","tokenizer":"tokenizer.json","loras":[{"path":"style.safetensors","strength":0.75}]}}}"#).unwrap();
     cfg.media_dir=Some(root.clone());
-    // (its batches' directories its own: the default root is another test's to remove)
     cfg.output_root=root.join("output");
     let request=prepare(&cfg,&Json::parse(br#"{"model":"klein","prompt":"fox","transformer":"untrusted","device":99}"#).unwrap()).unwrap();
     assert_eq!(request.get("architecture").and_then(Json::as_str),Some("flux2-klein-4b"));
@@ -305,7 +334,6 @@ fn klein_catalog_dispatch_owns_paths_and_can_disable_style_loras() {
         assert!(prepare(&cfg,&Json::obj([("model",Json::str("klein")),("prompt",Json::str("fox")),("negative_prompt",negative)])).is_err());
     }
     for bad in [br#"{"model":"klein","prompt":"fox","steps":8}"#.as_slice(),br#"{"model":"klein","prompt":"fox","cfg":4}"#.as_slice(),br#"{"model":"klein","prompt":"fox","input_reference":"untrusted"}"#.as_slice()] { assert!(prepare(&cfg,&Json::parse(bad).unwrap()).is_err()); }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -387,7 +415,6 @@ fn batch_parameters_and_server_owned_paths_are_preserved() {
     assert_eq!(custom.get("transformer").and_then(Json::as_str), Some("custom.safetensors"));
     let gguf = prepare(&cfg, &Json::parse(br#"{"prompt":"x","weights":"gguf"}"#).unwrap()).unwrap();
     assert_eq!(gguf.get("transformer").and_then(Json::as_str), Some("model.gguf"));
-    std::fs::remove_dir_all(&cfg.output_root).unwrap();
 }
 #[test]
 fn a_catalogs_backend_reaches_the_worker_and_a_requests_does_not() {
@@ -424,7 +451,6 @@ fn image_memory_defaults_to_auto_and_respects_catalog_caps() {
     for extra in [r#","ram_gb":9"#, r#","vram_gb":13"#, r#","memory":"disk""#, r#","ram_gb":"4""#] {
         assert!(prepare(&cfg, &body(&format!(r#"{{"prompt":"x"{extra}}}"#))).is_err(), "{extra}");
     }
-    std::fs::remove_dir_all(&cfg.output_root).unwrap();
 }
 #[test]
 fn configured_safetensors_override_is_optional_and_validated() {

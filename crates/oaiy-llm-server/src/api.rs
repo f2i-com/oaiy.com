@@ -57,10 +57,20 @@ pub struct Config {
     pub gemma_vision: Option<GemmaVision>,
     /// GLM-5.3 Flash's pictures, where its vision projector is loaded.
     pub glm_vision: Option<GlmVision>,
-    pub image_token_id: u32,
+    /// The token a picture stands as in a prompt; none on a model with no picture token. (No number can mean none:
+    /// every id is some model's token, and id 0 is `!` in a byte-level vocabulary, so a text-only model that said 0
+    /// refused any prompt with a `!` in it.)
+    pub image_token_id: Option<u32>,
     /// Whether an image may name a file on this machine (a path or file://
     /// URL); off unless the server only listens on loopback.
     pub local_images: bool,
+}
+
+impl Config {
+    /// Whether a prompt holds this model's picture token, which a prompt with no picture to go with it must not.
+    pub(crate) fn holds_image_token(&self, prompt: &[u32]) -> bool {
+        self.image_token_id.is_some_and(|id| prompt.contains(&id))
+    }
 }
 
 /// How Gemma 4 takes a picture: sized to at most `max_soft_tokens` (of `patch` pixels' patches, 3 x 3 a token), its
@@ -492,22 +502,23 @@ impl Server {
     /// Decode and size a request's images and expand their placeholders in
     /// the prompt into image spans.
     fn prepare_images(&self, a: &crate::models::Active, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
+        // (worded for a client that looks for "image" or "vision" to go on in text, as OAIY's Agent does)
+        let no_vision = || bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name));
+        // (each vision config below is set with its token: a model with no token has none of them)
+        let Some(image) = a.cfg.image_token_id else { return Err(no_vision()) };
         if let Some(m) = &a.cfg.minicpmv {
-            return crate::engines::qwen::prepare_minicpmv(records, prompt, a.cfg.image_token_id, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_minicpmv(records, prompt, image, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
         }
         if let Some(vc) = &a.cfg.qwen_vision {
-            return crate::engines::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_images(records, prompt, image, vc, self.local_images, a.cfg.max_seq).map_err(bad);
         }
         if let Some(gv) = &a.cfg.gemma_vision {
-            return gemma_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+            return gemma_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(bad);
         }
         if let Some(gv) = &a.cfg.glm_vision {
-            return glm_images(records, prompt, a.cfg.image_token_id, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+            return glm_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(bad);
         }
-        let Some(vc) = &a.cfg.vision else {
-            // (worded for a client that looks for "image" or "vision" to go on in text, as OAIY's Agent does)
-            return Err(bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name)));
-        };
+        let Some(vc) = &a.cfg.vision else { return Err(no_vision()) };
         let mut preps = Vec::with_capacity(records.len());
         let mut hashes = Vec::with_capacity(records.len());
         for (i, rec) in records.iter().enumerate() {
@@ -520,7 +531,7 @@ impl Server {
             hashes.push(std::hash::Hasher::finish(&h));
             preps.push(prep);
         }
-        let (ids, starts) = vision::expand_placeholders(&prompt, a.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
+        let (ids, starts) = vision::expand_placeholders(&prompt, image, &preps).map_err(|e| bad(e.to_string()))?;
         let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep: crate::engines::job::ImagePrep::Deepseek(prep), hash }).collect();
         Ok((ids, images))
     }
@@ -684,7 +695,7 @@ impl Server {
             .map_err(bad)?;
         let prompt = a.flavour.encode(&encoded.prompt);
         let (prompt, images) = if encoded.images.is_empty() { (prompt, Vec::new()) } else { self.prepare_images(&a, &encoded.images, prompt)? };
-        if images.is_empty() && prompt.contains(&a.cfg.image_token_id) {
+        if images.is_empty() && a.cfg.holds_image_token(&prompt) {
             return Err(bad("the prompt holds an image placeholder but no image"));
         }
         let n_prompt = prompt.len();
@@ -1092,7 +1103,7 @@ impl Server {
         if prompt.is_empty() {
             return Err(bad("prompt is empty"));
         }
-        if prompt.contains(&a.cfg.image_token_id) {
+        if a.cfg.holds_image_token(&prompt) {
             return Err(bad("raw completions take no images; send them to /v1/chat/completions"));
         }
         let n_prompt = prompt.len();
