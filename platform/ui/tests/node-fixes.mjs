@@ -280,6 +280,9 @@ const openai = (message, finish_reason = 'stop', extra = {}) => ({ choices: [{ m
 const CALL = { id: 'call_1', type: 'function', function: { name: 'look_up', arguments: '{}' } };
 const TOOL_TURN = openai({ content: null, tool_calls: [CALL] }, 'tool_calls');
 const TOOL_TURN_BLANK = openai({ content: '', tool_calls: [CALL] }, 'tool_calls');
+const THINKING_TURN = openai({ content: '<think>I should call look_up</think>', tool_calls: [CALL] }, 'tool_calls');
+const OPEN_THINKING_TURN = openai({ content: '<think>I should call', tool_calls: [CALL] }, 'tool_calls');
+const BLANK_TURN = openai({ content: '\n\n', tool_calls: [CALL] }, 'tool_calls');
 const PICTURES = [{ type: 'image_url', image_url: { url: PICTURE } }];
 const OWN_LIST = { choices: ['yes', 'no'], picked: 'yes' };
 const AT_CLAUDE = { endpoint: ENDPOINT.replace('/anthropic/v1/messages', '/claude/v1/chat/completions') };
@@ -307,6 +310,17 @@ const SHAPES = [
   ['an error body', {}, { error: { message: 'model overloaded' } }, /model overloaded/, JSON_REPLY],
   ['an error beside the start of an answer', {}, { choices: [{ error: { message: 'upstream gone' }, message: { content: 'Par' }, finish_reason: 'error' }] }, /upstream gone/, 'Par'],
   ['an answer in parts (not read, then or now)', {}, openai({ content: [{ type: 'text', text: 'Paris' }] }), STRUCTURED, STRUCTURED],
+  // What holds text and says it was stopped, or ended in a failure: that text is a part, and goes on as the whole.
+  ['a filtered answer', {}, openai({ content: 'Par' }, 'content_filter'), /finish_reason: content_filter/, 'Par'],
+  ['a failed end with no error named', {}, openai({ content: 'Par' }, 'error'), /finish_reason: error/, 'Par'],
+  ['an error beside text, no finish said', {}, { choices: [{ message: { content: 'Par' }, finish_reason: null }], error: { message: 'upstream gone' } }, /upstream gone/, 'Par'],
+  ['an error beside text cut off', {}, openai({ content: 'Par' }, 'length', { error: { message: 'upstream gone' } }), /upstream gone/, 'Par'],
+  // What holds a turn and nothing behind it, and a turn that says more than nothing in its text.
+  ['a finish that says tools, and no calls', {}, openai({ content: null }, 'tool_calls'), /without a message \(finish_reason: tool_calls\)/, JSON_REPLY],
+  ['a refusal beside a finish that says tools', {}, openai({ content: null, refusal: 'No.' }, 'tool_calls'), /The model refused: No\./, JSON_REPLY],
+  ['a turn with its thinking left in the text', {}, THINKING_TURN, JSON_REPLY, ''],
+  ['a turn with its thinking still open in the text', {}, OPEN_THINKING_TURN, JSON_REPLY, ''],
+  ['a turn with white space for text', {}, BLANK_TURN, JSON_REPLY, ''],
 
   // An address with Anthropic in it, or `claude`.
   ['text blocks', AT_ANTHROPIC, { content: [{ type: 'thinking', thinking: 'hm' }, { type: 'text', text: 'Par' }, { type: 'text', text: 'is' }], stop_reason: 'end_turn' }, 'Paris', 'Paris'],
@@ -316,9 +330,18 @@ const SHAPES = [
   ['thinking to the limit', AT_ANTHROPIC, { content: [{ type: 'thinking', thinking: 'hm' }], stop_reason: 'max_tokens' }, SPENT, JSON_REPLY],
   ['a turn that only calls a tool', AT_ANTHROPIC, { content: [{ type: 'tool_use', id: 't', name: 'look_up', input: {} }], stop_reason: 'tool_use' }, JSON_REPLY, JSON_REPLY],
   ["Anthropic's error body", AT_ANTHROPIC, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }, /Overloaded/, JSON_REPLY],
+  ['a partial answer it stopped for a refusal', AT_ANTHROPIC, { content: [{ type: 'text', text: 'Par' }], stop_reason: 'refusal' }, /stop_reason: refusal/, 'Par'],
+  ['a stop reason that says tools, and no call', AT_ANTHROPIC, { content: [], stop_reason: 'tool_use' }, /without a message \(stop_reason: tool_use\)/, JSON_REPLY],
 
   // A service's own template with no response path.
   ['a template: a turn that only calls tools', CUSTOM, TOOL_TURN, JSON_REPLY, JSON_REPLY],
+  ['a template: a turn with its thinking left in the text', CUSTOM, THINKING_TURN, JSON_REPLY, ''],
+  ['a template: a turn with white space for text', CUSTOM, BLANK_TURN, JSON_REPLY, ''],
+  ['a template: a plain completions reply', CUSTOM, { object: 'text_completion', choices: [{ text: 'Paris', finish_reason: 'stop' }] }, JSON_REPLY, JSON_REPLY],
+  ["a template: an endpoint's own `choices` of objects", CUSTOM, { choices: [{ label: 'yes', score: 0.9 }], picked: 'yes' }, JSON_REPLY, JSON_REPLY],
+  ['a template: an error beside the start of an answer', CUSTOM, { choices: [{ error: { message: 'upstream gone' }, message: { content: 'Par' }, finish_reason: 'error' }] }, /upstream gone/, 'Par'],
+  ['a template: a filtered answer', CUSTOM, openai({ content: 'Par' }, 'content_filter'), /finish_reason: content_filter/, 'Par'],
+  ['a template: a finish that says tools, and no calls', CUSTOM, openai({ content: null }, 'tool_calls'), /without a message \(finish_reason: tool_calls\)/, JSON_REPLY],
   ['a template: a turn that only calls tools, its text blank', CUSTOM, TOOL_TURN_BLANK, JSON_REPLY, ''],
   ['a template: pictures and no text', CUSTOM, openai({ content: '', images: PICTURES }), JSON_REPLY, ''],
   ["a template: an endpoint's own `choices` list", CUSTOM, OWN_LIST, JSON_REPLY, JSON_REPLY],
@@ -332,7 +355,13 @@ const SHAPES = [
 
   // The same with a response path.
   ['at a path: a turn that only calls tools', AT_PATH, TOOL_TURN, JSON_REPLY, JSON_REPLY],
+  ['at a path: a turn with its thinking left in the text', AT_PATH, THINKING_TURN, JSON_REPLY, ''],
+  ['at a path: a turn with its thinking still open in the text', AT_PATH, OPEN_THINKING_TURN, JSON_REPLY, ''],
+  ['at a path: a turn with white space for text', AT_PATH, BLANK_TURN, JSON_REPLY, ''],
   ['at a path: the tool calls themselves', AT_TOOL_CALLS, TOOL_TURN, JSON.stringify([CALL]), JSON.stringify([CALL])],
+  ['at a path: an error beside the start of an answer', AT_PATH, { choices: [{ error: { message: 'upstream gone' }, message: { content: 'Par' }, finish_reason: 'error' }] }, /upstream gone/, 'Par'],
+  ['at a path: a filtered answer', AT_PATH, openai({ content: 'Par' }, 'content_filter'), /finish_reason: content_filter/, 'Par'],
+  ['at a path: a plain completions reply', { template: TEMPLATE, path: 'choices.0.text' }, { choices: [{ text: 'Paris', finish_reason: 'stop' }] }, 'Paris', 'Paris'],
   ['at a path: nothing there', AT_PATH, { choices: [] }, /nothing at choices\.0\.message\.content/, JSON_REPLY],
   ['at a path: an empty answer', AT_PATH, openai({ content: '' }), '', ''],
   ["at a path: an endpoint's own `choices` list", { template: TEMPLATE, path: 'picked' }, OWN_LIST, 'yes', 'yes'],
@@ -356,7 +385,10 @@ for (const [name, where, body, now] of SHAPES) {
 const localModel = (text) => ({ endpoint: 'oaiy-llm://local', host: { tauri: { invoke: async (command) => (command.endsWith('|llm_chat') ? { text, modelId: 'm', backend: 'cpu', promptTokens: 1, generatedTokens: 1 } : 0) } } });
 await fails('a local model that only thought', null, SPENT, localModel('<think>Still going'));
 await answers("a local model's answer after its thought", null, 'Paris', localModel('<think>Hm.</think>Paris'));
+await fails('a local model that answered nothing', null, /without a message/, localModel(''));
+await fails('a local model that answered white space', null, /without a message/, localModel(' \n'));
 await fails('an external AI that only thought', null, SPENT, { host: { useClaudeForAI: true, yieldForAI: async () => '<think>Still going' } });
+await fails('an external AI that answered nothing', null, /without a message/, { host: { useClaudeForAI: true, yieldForAI: async () => '' } });
 
 await new Promise((resolve) => server.close(resolve));
 

@@ -5,12 +5,17 @@
  * `<call>` is a literal the runtime consumes. The node type appears in the
  * generated code only as data inside that literal — the emitter branches on the
  * OPERATION, which is a closed set, never on the name.
+ *
+ * That literal names the node and carries its data, and no more: the runtime
+ * takes the node's path, method and the rest from the config by that name. The
+ * script is not a boundary (a Logic Block runs in it), so what it says of where
+ * a request goes would be the script's to change.
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
 import { resolveRefsExpr } from 'oaiy-core/src/value-refs';
 import { CONNECTOR_RUNTIME_NAME } from './runtime';
-import type { ConnectorCall, ConnectorConfig, ConnectorNodeSpec } from './types';
+import type { ConnectorCallSite, ConnectorConfig, ConnectorNodeSpec } from './types';
 
 /**
  * Keys the compiler injects into node data that must not be shipped to the
@@ -37,7 +42,7 @@ function nodeData(node: { id: string; data: Record<string, unknown> }): Record<s
  * module compiler's caller turns a throw here into a named compile failure, so
  * the flow refuses to run rather than running with a mangled node.
  */
-function serialiseCall(call: ConnectorCall): string {
+function serialiseCall(call: ConnectorCallSite): string {
   try {
     return JSON.stringify(call);
   } catch (e) {
@@ -67,22 +72,7 @@ export function createConnectorCompiler(config: ConnectorConfig): ModuleCompiler
       const { node, inputs, outputVar, skipVarDeclaration } = ctx;
       const letOrAssign = skipVarDeclaration ? '' : 'let ';
 
-      const call: ConnectorCall = {
-        nodeId: node.id,
-        nodeType,
-        operation: spec.operation,
-        data: nodeData(node),
-      };
-      if (spec.path) call.path = spec.path;
-      if (spec.method) call.method = spec.method;
-      // Carried through so the runtime never looks a node type up: how this
-      // provider shapes a listing, and how its row filters are spelled.
-      if (spec.listResult) call.listResult = spec.listResult;
-      if (spec.filters) call.filters = spec.filters;
-      if (spec.recordField) call.recordField = spec.recordField;
-      if (spec.replyField) call.replyField = spec.replyField;
-      if (spec.runField) call.runField = spec.runField;
-      if (spec.limit) call.limit = spec.limit;
+      const call: ConnectorCallSite = { nodeId: node.id, nodeType, data: nodeData(node) };
 
       let callLiteral: string;
       try {

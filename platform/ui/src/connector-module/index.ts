@@ -83,5 +83,6 @@ export type {
   ConnectorNodeSpec,
   ConnectorOperation,
   ConnectorCall,
+  ConnectorCallSite,
   ConnectorHostOptions,
 } from './types';

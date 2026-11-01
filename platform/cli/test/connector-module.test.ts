@@ -216,7 +216,7 @@ function compile(
 {
   const { code, call } = compile(modA, 'ledger_list_entries', { book: 'b1' });
   check('compile: emits a Connector call for the bound operation', code.includes('await Connector.listRecords('));
-  check('compile: the call carries the provider path from config', call.path === '/api/v1/books/{book}/entries');
+  check('compile: the call names the node and carries its data, and nothing else', Object.keys(call).sort().join() === 'data,nodeId,nodeType' && call.nodeType === 'ledger_list_entries');
   check('compile: the call carries the node data', call.data.book === 'b1');
   // The argument, not its formatting: the emitted call is wrapped across lines
   // once a node carries value references, so an exact-substring match here was
@@ -541,6 +541,21 @@ async function main(): Promise<void> {
     const { ctx } = mkCtx(() => ({ body: { choices: [{ message: { content: '', reasoning_content: 'thinking' } }] } }));
     return modA.runtime.createMethods!(ctx).chat('x', callFor(modA, 'llm_chat'));
   });
+  {
+    // A reasoning model on the desktop's gateway leaves its thinking in the text. This node took that text as it came,
+    // and the next step (an email, as a rule) sent the person the model's reasoning, or nothing but that.
+    const reply = (content: unknown, finish_reason = 'stop', extra = {}) => ({ choices: [{ message: { content }, finish_reason }], ...extra });
+    const ask = async (body: unknown) => modA.runtime.createMethods!(mkCtx(() => ({ body })).ctx).chat('x', callFor(modA, 'llm_chat'));
+    check('chat: an answer after its thought is the answer', (await ask(reply('<think>Hm.</think>\nParis'))) === 'Paris');
+    await rejectsWith('chat: a thought that never closes is the token limit, as it is on the AI node', 'token limit', () => ask(reply('<think>Still going', 'length')));
+    await rejectsWith('chat: a thought that closes on nothing is no message', 'without a message', () => ask(reply('<think>Hm.</think>')));
+    await rejectsWith('chat: white space is no message', 'without a message', () => ask(reply(' \n')));
+    await rejectsWith('chat: an error named beside a start of an answer fails', 'upstream gone', () => ask(reply('Par', 'error', { error: { message: 'upstream gone' } })));
+    await rejectsWith('chat: a filtered answer fails', 'content_filter', () => ask(reply('Par', 'content_filter')));
+    await rejectsWith('chat: the failure names the node', 'llm_chat node', () => ask(reply('')));
+    const turn = { choices: [{ message: { content: '<think>look it up', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'look_up', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] };
+    check('chat: a turn that calls tools is its JSON, whole, its open thought and all', (await ask(turn)) === JSON.stringify(turn));
+  }
   await rejectsWith('chat: an empty gateway answer fails loudly', 'answered without a message', async () => {
     const { ctx } = mkCtx(() => ({ body: { choices: [] } }));
     const m = modA.runtime.createMethods!(ctx);
@@ -653,6 +668,150 @@ async function main(): Promise<void> {
     const m = modA.runtime.createMethods!(ctx);
     return m.runInput({ a: 1 }, callFor(modA, 'input', { key: 'nope' }));
   });
+
+  // -- a call is a node of the config, whoever makes it ---------------------
+  //
+  // A Logic Block runs in the same script as the compiled calls, and a pack's flow
+  // runs on this desktop with this desktop's link. These are the calls a script made
+  // for itself: the bearer went wherever its `path` said (`5/steal` on a base of
+  // `http://127.0.0.1:1834` is port 18345), with the verb it chose, and the run's id
+  // went out under a name it chose, or not at all.
+  {
+    const raw = {
+      baseUrl: 'http://provider-d.local',
+      credential: 'cred_ddd',
+      nodes: [
+        { nodeType: 'add_row', operation: 'createRecord', path: '/rows/{sheet}', recordField: 'fields', runField: 'madeBy', replyField: 'row' },
+        { nodeType: 'set_row', operation: 'updateRecord', path: '/rows/{rowId}', method: 'PUT', recordField: 'fields' },
+        { nodeType: 'pull_rows', operation: 'listRecords', path: '/rows/{sheet}', limit: { field: 'limit', param: 'count', default: 200, max: 500 } },
+      ],
+    };
+    const running = createConnectorModule(parseConnectorConfig(raw), { runId: 'run-7f3a' });
+    const forged: Array<[string, string, unknown, unknown]> = [
+      ['a path of its own', 'createRecord', { flowRunId: 'forged', answers: { a: 1 } }, { operation: 'createRecord', path: '/api/v1/forms/forged/responses', data: {} }],
+      ['a run field of its own', 'createRecord', { answers: { a: 1 } }, { operation: 'createRecord', path: '/rows/x', runField: 'stolenRun', data: {} }],
+      ['a verb of its own', 'updateRecord', { a: 1 }, { method: 'DELETE', path: '/api/v1/forms/forged3', data: {} }],
+      ['a path with no slash', 'listRecords', null, { path: '5/steal', data: {} }],
+      ['a type no node has', 'listRecords', null, { nodeType: 'not_in_the_config', path: '/api/v1/flows', data: {} }],
+      ['a type that is another operation', 'listRecords', null, { nodeType: 'add_row', data: { sheet: 's' } }],
+      ['no call at all', 'listRecords', null, undefined],
+      ['a call that is not an object', 'listRecords', null, 'add_row'],
+    ];
+    for (const [name, method, input, site] of forged) {
+      const { ctx, sent } = mkCtx(() => ({ body: {} }));
+      await rejectsWith(`a script's call: ${name} is refused`, 'no such node of this connector', async () => running.runtime.createMethods!(ctx)[method](input, site));
+      check(`a script's call: ${name} sends nothing`, sent.length === 0);
+    }
+
+    // Naming a real node gets that node, and whatever else the call says is not read.
+    const { ctx, sent } = mkCtx(() => ({ body: { row: { id: 'r1' } } }));
+    const m = running.runtime.createMethods!(ctx);
+    const out = await m.createRecord({ noise: 1 }, {
+      nodeType: 'add_row',
+      nodeId: 'mine',
+      operation: 'updateRecord',
+      method: 'DELETE',
+      path: '/api/v1/flows',
+      runField: 'stolenRun',
+      recordField: 'stolen',
+      replyField: 'nothing',
+      data: { sheet: 's1', fields: { a: 1 }, flowRunId: 'forged', madeBy: 'forged', stolen: { b: 2 } },
+    });
+    check('a real node: its own path and verb', sent[0].url === 'http://provider-d.local/rows/s1' && sent[0].method === 'POST');
+    check('a real node: its own field holds the record, and the run is named as its config says', sent[0].body === '{"fields":{"a":1},"madeBy":"run-7f3a"}');
+    check('a real node: its reply is read as its config says', (out as { id?: string }).id === 'r1');
+    await m.updateRecord(null, { nodeType: 'set_row', method: 'DELETE', runField: 'stolenRun', data: { rowId: 'r1', fields: { a: 2 } } });
+    check('a real node: an update that names no run in its config does not start to', sent[1].method === 'PUT' && sent[1].body === '{"fields":{"a":2}}');
+    await m.listRecords(null, { nodeType: 'pull_rows', limit: { field: 'x', param: 'stolen', default: 1, max: 9 }, data: { sheet: 's1' } });
+    check('a real node: a listing is limited as its config says', sent[2].url === 'http://provider-d.local/rows/s1?count=200');
+
+    // With no run to name, a value of that name that a graph planted does not stand in for one.
+    const plain = { ...raw, nodes: [{ nodeType: 'add_plain', operation: 'createRecord', path: '/plain', runField: 'madeBy' }] };
+    const noRun = createConnectorModule(parseConnectorConfig(plain));
+    const none = mkCtx(() => ({ body: {} }));
+    await noRun.runtime.createMethods!(none.ctx).createRecord({ madeBy: 'forged', a: 1 }, callFor(noRun, 'add_plain'));
+    check('a real node: with no run, the graph does not name one for it', none.sent[0].body === '{"a":1}');
+  }
+  {
+    // A node's path is checked as a URL here too, not only when the config is parsed: a module can be built from a
+    // config nobody parsed (`createConnectorModule`), and this is where the bearer goes on.
+    const built = (baseUrl: string, path: string) =>
+      createConnectorModule({ baseUrl, credential: 'cred', nodes: [{ nodeType: 'pull', operation: 'listRecords', path }] });
+    for (const [baseUrl, path] of [
+      ['http://127.0.0.1:1834', '5/steal'],
+      ['https://provider.example', '.attacker.example/x'],
+      ['https://provider.example', '@attacker.example/x'],
+      ['https://provider.example/base', '/../x'],
+      ['https://provider.example/base', '/a/../../x'],
+    ]) {
+      const mod = built(baseUrl, path);
+      const { ctx, sent } = mkCtx(() => ({ body: [] }));
+      await rejectsWith(`recordUrl: ${path} on ${baseUrl} is refused`, 'nothing was sent', async () => mod.runtime.createMethods!(ctx).listRecords(null, callFor(mod, 'pull')));
+      check(`recordUrl: ${path} on ${baseUrl} sends nothing`, sent.length === 0);
+    }
+    const under = built('https://provider.example/base', '/v2/items');
+    const { ctx, sent } = mkCtx(() => ({ body: [] }));
+    await under.runtime.createMethods!(ctx).listRecords(null, callFor(under, 'pull'));
+    check("recordUrl: a base with a path of its own keeps it", sent[0].url === 'https://provider.example/base/v2/items');
+  }
+  {
+    // A value a flow sets is one segment of the path. Encoding it leaves `..` as it is, and what a proxy or a framework
+    // decodes on the way in is not what was checked here.
+    const climbing = ['..', '.', '...', ' .. ', '%2e%2e', '%2E%2e', '.%2e', '%252e%252e', 'a/b', '../x', 'a%2Fb', '%252F', '..%2F..%2Fadmin', 'a\\b', '%5c', '..\\x', 'a\nb', '%00'];
+    const aimed: Array<[string, string, string, (v: string) => Record<string, unknown>]> = [
+      ['a record path', 'listRecords', 'ledger_list_entries', (v) => ({ book: v })],
+      ["chat's provider", 'chat', 'llm_chat', (v) => ({ provider: v, prompt: 'hi' })],
+      ["the connector's id", 'connectorRequest', 'connector_request', (v) => ({ connector: v, command: 'do' })],
+      ["a service's id", 'serviceControl', 'desktop_services', (v) => ({ action: 'start', service: v })],
+    ];
+    for (const [name, method, nodeType, data] of aimed) {
+      for (const value of climbing) {
+        const { ctx, sent } = mkCtx(() => ({ body: {} }));
+        await rejectsWith(`${name}: ${JSON.stringify(value)} is refused`, 'is not one part of a path', async () => modA.runtime.createMethods!(ctx)[method](null, callFor(modA, nodeType, data(value))));
+        check(`${name}: ${JSON.stringify(value)} sends nothing`, sent.length === 0);
+      }
+    }
+    for (const [value, url] of [
+      ['b7', 'b7'],
+      ['a.b', 'a.b'],
+      ['..a', '..a'],
+      ['v1.2', 'v1.2'],
+      ['a b', 'a%20b'],
+      ['100%', '100%25'],
+      ['a?b#c', 'a%3Fb%23c'],
+      ['e7b1f7ee-6a7e-4a2c-9f60-2c8d3a6e3a10', 'e7b1f7ee-6a7e-4a2c-9f60-2c8d3a6e3a10'],
+    ]) {
+      const { ctx, sent } = mkCtx(() => ({ body: [] }));
+      await modA.runtime.createMethods!(ctx).listRecords(null, callFor(modA, 'ledger_list_entries', { book: value }));
+      check(`a record path: the id ${JSON.stringify(value)} still goes`, sent[0].url === `http://provider-a.local/api/v1/books/${url}/entries`);
+    }
+  }
+  {
+    // A block can catch a failure and read it, so what it says is the path and not where the provider is, and not
+    // what a provider's error text may repeat back.
+    const running = createConnectorModule(parseConnectorConfig({ ...VOCAB_A, nodes: [{ nodeType: 'add', operation: 'createRecord', path: '/rows', runField: 'madeBy' }] }), { ...HOST, runId: 'run-7f3a' });
+    const echoes = mkCtx((r) => ({ status: 500, body: `no: ${r.url} ${r.headers.Authorization} ${r.body}` }));
+    let said = '';
+    try {
+      await running.runtime.createMethods!(echoes.ctx).createRecord({ a: 1 }, callFor(running, 'add'));
+    } catch (e) {
+      said = (e as Error).message;
+    }
+    check('a failure: says what failed and where on the provider', said.includes('POST /rows returned HTTP 500'));
+    check('a failure: not the address, the credential or the run', !said.includes('provider-a.local') && !said.includes('cred_aaa') && !said.includes('run-7f3a'));
+
+    const away = mkCtx(() => ({}));
+    (away.ctx as { secureFetch: unknown }).secureFetch = async (url: string) => {
+      throw new Error(`POST ${url} failed — ECONNREFUSED`);
+    };
+    let unsent = '';
+    try {
+      await running.runtime.createMethods!(away.ctx).createRecord({ a: 1 }, callFor(running, 'add'));
+    } catch (e) {
+      unsent = (e as Error).message;
+    }
+    check('a failure: a request that could not be sent says the same', unsent.includes('ECONNREFUSED') && !unsent.includes('provider-a.local'));
+  }
 
   // -- per-job isolation ---------------------------------------------------
   {

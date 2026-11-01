@@ -369,6 +369,92 @@ await check("a shipped flow's secrets stay out of its export, wherever they were
   assert.equal(node.data.endpoint, 'https://example.com/v1?key=__REDACTED__');
 });
 
+/** A node's data as it comes back from an export, on the real schemas. */
+const exported = (type, data, constants = []) =>
+  JSON.parse(JSON.stringify(M.sanitizeProjectForExport({ name: 'Mine', constants, flows: [{ id: 'f', name: 'F', graph: { nodes: [{ id: 'n', type, position: { x: 0, y: 0 }, data }], edges: [] } }] }))).flows[0].graph.nodes[0].data;
+
+await check("a key in a request written out as text goes by the name it is under, and a placeholder stays", () => {
+  // `customHeaders` and `customBodyTemplate` are text on the AI node (a `textarea`, parsed when it runs), so the rule for
+  // names never saw inside them, and none of these has a vendor's shape to catch it.
+  const back = exported('ai_llm', {
+    customHeaders: '{"x-api-key":"plain-key-123","Authorization":"Bearer short","X-Auth":"Basic dXNlcjpwYXNz","api-key":"azure-key","Accept":"application/json","X-Token":"{{apiKey}}","Authorization2":"Bearer {{apiKey}}"}',
+    customBodyTemplate: '{"api_key": "plain-key-123", "password":"hunter2", "model":"{{model}}", "max_tokens":800, "maxTokens":"800", "token":"{{apiKey}}", "messages": {{messagesJsonRaw}}}',
+    endpoint: 'https://user:hunter2@example.com/v1?api_key=plainvalue&token=plaintoken&model=x&key={{apiKey}}',
+    systemPrompt: 'Answer as {"key": "value"} and ?token=abc',
+  });
+  assert.equal(back.customHeaders, '{"x-api-key":"__REDACTED__","Authorization":"__REDACTED__","X-Auth":"Basic __REDACTED__","api-key":"__REDACTED__","Accept":"application/json","X-Token":"{{apiKey}}","Authorization2":"Bearer {{apiKey}}"}');
+  assert.equal(back.customBodyTemplate, '{"api_key": "__REDACTED__", "password":"__REDACTED__", "model":"{{model}}", "max_tokens":800, "maxTokens":"800", "token":"{{apiKey}}", "messages": {{messagesJsonRaw}}}');
+  assert.equal(back.endpoint, 'https://example.com/v1?api_key=__REDACTED__&token=__REDACTED__&model=x&key={{apiKey}}');
+  assert.equal(back.systemPrompt, 'Answer as {"key": "value"} and ?token=abc', 'a prompt says these as its own words');
+  assert.equal(exported('ai_llm', { endpoint: 'https://{{user}}:{{pass}}@example.com/v1' }).endpoint, 'https://{{user}}:{{pass}}@example.com/v1', 'a login by placeholder stays');
+  assert.equal(exported('ai_llm', { endpoint: 'https://example.com/search?keyword=cats&author=me&tokenizer=x' }).endpoint, 'https://example.com/search?keyword=cats&author=me&tokenizer=x', 'a word with a part in it is no secret');
+});
+
+await check('a secret in a list goes, at any depth, and the rest of the list stays where it was', () => {
+  const known = 'the-value-of-a-secret-constant';
+  const sk = `sk-${'a'.repeat(30)}`;
+  const google = `AIza${'a'.repeat(35)}`;
+  const data = {
+    headers: [{ name: 'Authorization', value: `Bearer ${sk}` }, { name: 'X-Api-Key', value: 'short' }, { key: 'X-Auth-Token', value: 'plain' }, { name: 'Accept', value: 'json' }, { key: 'Accept', value: 'json' }, { name: 'Authorization', value: 'Bearer {{apiKey}}' }],
+    picks: [sk, 'a word', google, known, 5, null],
+    urls: ['https://example.com/?token=plain', 'https://example.com/?page=2'],
+    accounts: [{ password: 'hunter2', apiKey: 'plain', label: 'Mine' }],
+    config: { list: [{ token: 'plain', kept: 1 }, ['nested', sk]] },
+    inputNames: ['prompt', 'seed'],
+  };
+  assert.deepEqual(exported('a_package_not_here', data, [{ key: 'MINE', value: known, isSecret: true }]), {
+    headers: [{ name: 'Authorization' }, { name: 'X-Api-Key' }, { key: 'X-Auth-Token' }, { name: 'Accept', value: 'json' }, { key: 'Accept', value: 'json' }, { name: 'Authorization', value: 'Bearer {{apiKey}}' }],
+    picks: ['__REDACTED__', 'a word', '__REDACTED__', '__REDACTED__', 5, null],
+    urls: ['https://example.com/?token=__REDACTED__', 'https://example.com/?page=2'],
+    accounts: [{ label: 'Mine' }],
+    config: { list: [{ kept: 1 }, ['nested', '__REDACTED__']] },
+    inputNames: ['prompt', 'seed'],
+  });
+});
+
+await check('a key under a harmless name goes by its shape, and what only looks a little like one stays', () => {
+  const b64 = Buffer.from('user:a-password').toString('base64');
+  const jwt = `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.${'c'.repeat(32)}`;
+  for (const key of [`gsk_${'a'.repeat(40)}`, `hf_${'a'.repeat(34)}`, `r8_${'a'.repeat(37)}`, `xai-${'a'.repeat(40)}`, `pplx-${'a'.repeat(40)}`, `sk_live_${'a'.repeat(24)}`, `glpat-${'a'.repeat(20)}`, `npm_${'a'.repeat(36)}`, 'AKIAIOSFODNN7EXAMPLE', jwt, `Basic ${b64}`]) {
+    assert.deepEqual(exported('a_package_not_here', { note: key, kept: 1 }), { kept: 1 }, `${key} as the whole of a value`);
+    const inside = exported('a_package_not_here', { note: `use ${key} here` }).note;
+    assert.equal(inside.includes(key.replace('Basic ', '')), false, `${key} inside a value`);
+    assert.ok(inside.startsWith('use ') && inside.endsWith(' here') && inside.includes('__REDACTED__'), inside);
+  }
+  for (const plain of ['Basic information', 'Basic Information about this flow', 'hf_short', 'gsk_', 'xai-model', 'npm_config_cache', 'AKIA', 'r8_small']) {
+    assert.deepEqual(exported('a_package_not_here', { note: plain }), { note: plain }, plain);
+  }
+  assert.deepEqual(exported('ai_llm', { apiKeyConstant: 'AKIAIOSFODNN7EXAMPLE', maxTokens: 5 }), { maxTokens: 5 }, 'an all-capitals key in a field that names a constant');
+});
+
+await check('what only sounds like a secret is a string or a number: an object or a list under such a name goes', () => {
+  assert.deepEqual(exported('a_package_not_here', { secretConstant: { value: 'plain' }, tokenConstant: ['plain'], refreshTokens: ['987654321'], maxTokens: 5, maxOutputTokens: '4096', apiKeyConstant: 'OPENAI_API_KEY' }), { maxTokens: 5, maxOutputTokens: '4096', apiKeyConstant: 'OPENAI_API_KEY' });
+});
+
+await check("a project's endpoints, presets and settings leave with no key in them, and with everything else they held", () => {
+  const google = `AIza${'a'.repeat(35)}`;
+  const known = 'the-value-of-a-secret-constant';
+  const out = M.sanitizeProjectForExport({
+    name: 'Mine',
+    flows: [],
+    constants: [{ key: 'MINE', value: known, isSecret: true }],
+    llmEndpoints: [{ id: 'l', name: 'Mine', endpoint: `https://user:hunter2@example.com/v1?key=${google}&token=plain`, apiKeyEnvVar: 'MY_KEY', isLocal: false }],
+    imageGenEndpoints: [{ id: 'i', name: 'Mine', endpoint: `https://example.com/v1?auth=${known}`, apiKeyEnvVar: 'sk-pasted-here', model: 'm' }],
+    httpPresets: [{ id: 'h', name: 'Mine', baseUrl: 'https://example.com/?api_key=plain', defaultHeaders: { Authorization: 'Bearer plain', Accept: 'application/json' }, authType: 'bearer', authHeaderName: 'X-Api-Key', apiKeyEnvVar: 'MY_KEY' }],
+    settings: { defaultAIEndpoint: 'https://example.com/?token=plain', defaultAIApiKeyConstant: 'OPENAI_API_KEY', defaultImageApiKeyConstant: 'sk-pasted-here', serviceIdleTimeoutOverrides: { 'key-server': 60 }, localNetworkWhitelist: ['localhost:11434'], showDemoFlows: true, logPathPolicy: 'tilde' },
+  });
+  assert.deepEqual(out.llmEndpoints, [{ id: 'l', name: 'Mine', endpoint: 'https://example.com/v1?key=__REDACTED__&token=__REDACTED__', apiKeyEnvVar: 'MY_KEY', isLocal: false }]);
+  assert.deepEqual(out.imageGenEndpoints, [{ id: 'i', name: 'Mine', endpoint: 'https://example.com/v1?auth=__REDACTED__', model: 'm' }]);
+  assert.deepEqual(out.httpPresets, [{ id: 'h', name: 'Mine', baseUrl: 'https://example.com/?api_key=__REDACTED__', defaultHeaders: { Accept: 'application/json' }, authType: 'bearer', authHeaderName: 'X-Api-Key', apiKeyEnvVar: 'MY_KEY' }]);
+  assert.deepEqual(out.settings, { defaultAIEndpoint: 'https://example.com/?token=__REDACTED__', defaultAIApiKeyConstant: 'OPENAI_API_KEY', serviceIdleTimeoutOverrides: { 'key-server': 60 }, localNetworkWhitelist: ['localhost:11434'], showDemoFlows: true, logPathPolicy: 'tilde' });
+});
+
+await check("a new project's endpoints, presets and settings come back from an export as they went", () => {
+  const fresh = M.parseImportedProject(JSON.stringify({ name: 'Mine', flows: [] }));
+  const back = roundTrip(fresh);
+  for (const list of ['llmEndpoints', 'imageGenEndpoints', 'httpPresets', 'settings']) assert.deepEqual(back[list], fresh[list], list);
+});
+
 await check('a name with a secret in it goes from a node with no schema to say otherwise, and only a count, a constant or a known key stay', () => {
   // Each of these went out in plain text with no vendor shape to catch it, on a package's node that is not loaded.
   const secrets = Object.fromEntries(['api_key', 'access_token', 'refresh_token', 'botToken', 'webhookSecret', 'signingSecret', 'smtpPassword', 'dbPassword', 'password2', 'hfToken', 'sessionToken', 'xApiKey', 'openaiKey', 'authHeader'].map((name) => [name, `value-of-${name}`]));

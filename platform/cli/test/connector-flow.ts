@@ -483,6 +483,57 @@ async function main(): Promise<void> {
   check('write: nothing in the inputs stands in for it, and a graph that asks for it finds nothing', !written.fields?.seen, `body=${JSON.stringify(written)}`);
   check('write: the run is not among what the graph can read', !JSON.stringify(writeJob?.nodeOutputs ?? {}).includes('run-7f3a'), JSON.stringify(writeJob?.nodeOutputs));
 
+  // --- a Logic Block that calls the connector itself ----------------------
+  //
+  // On the real engine: every way a block can make the call, none of which a scope could take away, since the compiled
+  // calls are in the same script (`Connector`, an awaited `{_kind}`, `host.call`). Each of these reached the provider with
+  // the bearer on it, at a path, with a verb and under a run field the block chose. A pack's flow runs here with this
+  // desktop's link, so that was the key going wherever a pack said. Now a call names a node of the config or it stops.
+  sent.length = 0;
+  const forgedCalls = [
+    ['createRecord', { flowRunId: 'forged-by-script', answers: { a: 1 } }, { operation: 'createRecord', path: '/api/v1/forms/forged/responses', data: {} }],
+    ['createRecord', { answers: { a: 1 } }, { operation: 'createRecord', path: '/api/v1/forms/forged2/responses', runField: 'stolenRun', data: {} }],
+    ['updateRecord', { a: 1 }, { method: 'DELETE', path: '/api/v1/forms/forged3', data: {} }],
+    ['listRecords', null, { path: '5/steal', data: {} }],
+  ];
+  const blockId = engine.submit(
+    'test',
+    'connector-from-a-block',
+    graph(
+      [
+        {
+          id: 'block',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: {
+            code: `const calls = ${JSON.stringify(forgedCalls)};
+const told = [];
+for (let i = 0; i < calls.length; i++) {
+  try { told.push({ went: await Connector[calls[i][0]](calls[i][1], calls[i][2]) }); } catch (e) { told.push({ refused: e.message }); }
+}
+try { told.push({ went: await { _kind: 'Connector.listRecords', _args: [JSON.stringify([null, { path: '/api/v1/by-kind', data: {} }])] } }); } catch (e) { told.push({ refused: e.message }); }
+host.call('Connector.listRecords', [JSON.stringify([null, { path: '/api/v1/by-host-call', data: {} }])], function () {});
+let written = null;
+try { written = await Connector.createRecord({}, { nodeType: 'shelf_write', method: 'DELETE', path: '/api/v1/flows', runField: 'stolenRun', data: { shelf: 'fixed', fields: { name: 'by a block' } } }); } catch (e) { told.push({ refused: e.message }); }
+({ told, written, reach: [typeof Connector, typeof host] })`,
+          },
+        },
+      ],
+      [],
+    ),
+    {},
+  );
+  const blockJob = await runToEnd(engine, blockId);
+  check('block: the flow completed', blockJob?.status === 'completed', `error=${blockJob?.error ?? ''}`);
+  const blockSaid = blockJob?.nodeOutputs?.block as any;
+  check('block: it can reach the connector, so this was never about its scope', JSON.stringify(blockSaid?.reach) === '["object","object"]', JSON.stringify(blockSaid?.reach));
+  check('block: every call of its own was refused', blockSaid?.told?.length === 5 && blockSaid.told.every((t: any) => /no such node of this connector/.test(t.refused ?? '')), JSON.stringify(blockSaid?.told));
+  check('block: and nothing of those went out', !sent.some((s) => /forged|steal|by-kind|by-host-call/.test(s.url)), JSON.stringify(sent.map((s) => s.url)));
+  const byBlock = sent.filter((s) => s.method === 'POST');
+  check('block: a node it names is that node: its path, its verb', sent.length === 1 && byBlock[0]?.url === 'http://provider.test/api/v1/shelves/fixed/items', JSON.stringify(sent.map((s) => `${s.method} ${s.url}`)));
+  const byBlockBody = JSON.parse(byBlock[0]?.body ?? '{}');
+  check('block: and the run is named by the host, under the name the config gave', byBlockBody.madeBy === 'run-7f3a' && !('stolenRun' in byBlockBody), JSON.stringify(byBlockBody));
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

@@ -176,23 +176,32 @@ export interface ConnectorConfig {
 }
 
 /**
- * The per-node call descriptor the compiler bakes into the generated script and
- * the runtime receives. Everything the runtime needs to perform one operation,
- * with no lookups back into the config's node list.
+ * What the compiler bakes into the generated script: which of the config's nodes
+ * this is, and the node's own data. A Logic Block shares that script's scope and
+ * can make the same call with values of its own, so nothing that says where a
+ * request goes, how it is sent or what it says of the run may travel here.
  */
-export interface ConnectorCall {
+export interface ConnectorCallSite {
   nodeId: string;
+  /** Looked up in the config's node list: the entry there is the rest of the call. */
   nodeType: string;
+  /** The node instance's own data (its configured fields). */
+  data: Record<string, unknown>;
+}
+
+/**
+ * The call the runtime performs: the call site's two values, and the rest from
+ * the node's entry in the config, never from the script.
+ */
+export interface ConnectorCall extends ConnectorCallSite {
   operation: ConnectorOperation;
   path?: string;
   method?: string;
-  /** The node instance's own data (its configured fields). */
-  data: Record<string, unknown>;
-  /** Copied from the node spec: how a listing is shaped for the graph. */
+  /** From the node spec: how a listing is shaped for the graph. */
   listResult?: ConnectorListResultSpec;
-  /** Copied from the node spec: how row filters reach the provider. */
+  /** From the node spec: how row filters reach the provider. */
   filters?: ConnectorFilterSpec;
-  /** Copied from the node spec: what a write sends, what comes back, how many rows a listing asks for. */
+  /** From the node spec: what a write sends, what comes back, how many rows a listing asks for. */
   recordField?: string;
   replyField?: string;
   runField?: string;

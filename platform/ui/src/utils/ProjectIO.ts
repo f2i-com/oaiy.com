@@ -44,6 +44,34 @@ export interface ExportedProject extends OAIYProject {
 }
 
 /**
+ * Keys by a shape of their own, whether they are the whole of a value or inside one: Groq, Hugging Face, Replicate, xAI,
+ * Perplexity, Stripe, GitLab, npm, AWS and a JWT. With a length to them, so an id that begins the same way stays.
+ */
+const KEY_SHAPES = [
+  /\bgsk_[A-Za-z0-9]{20,}/,
+  /\bhf_[A-Za-z0-9]{20,}/,
+  /\br8_[A-Za-z0-9]{20,}/,
+  /\bxai-[A-Za-z0-9]{20,}/,
+  /\bpplx-[A-Za-z0-9]{20,}/,
+  /\bsk_live_[A-Za-z0-9]{16,}/,
+  /\bglpat-[A-Za-z0-9_-]{20,}/,
+  /\bnpm_[A-Za-z0-9]{20,}/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+];
+const WHOLE_KEY_SHAPES = KEY_SHAPES.map((shape) => new RegExp(`^(?:${shape.source})$`));
+const KEY_SHAPES_IN_TEXT = KEY_SHAPES.map((shape) => new RegExp(shape.source, 'g'));
+
+/** Whether what follows `Basic` decodes to a `user:password`, as a credential does and the rest of "Basic information" does not. */
+const isBasicCredential = (encoded: string): boolean => {
+  try {
+    return /^[\x20-\x7e]*:[\x20-\x7e]*$/.test(atob(encoded));
+  } catch {
+    return false;
+  }
+};
+
+/**
  * Check if a value looks like a secret (API key, token, etc.)
  */
 export const looksLikeSecret = (value: unknown): boolean => {
@@ -58,33 +86,76 @@ export const looksLikeSecret = (value: unknown): boolean => {
     /^xoxb-[0-9]{10,}-[0-9]{10,}-[A-Za-z0-9]{24}$/,  // Slack bot tokens
     /^Bearer\s+[A-Za-z0-9._-]{20,}$/i, // Bearer tokens
     /^[A-Za-z0-9]{32,}$/,              // Generic long alphanumeric (potential keys)
+    ...WHOLE_KEY_SHAPES,
   ];
-  return secretPatterns.some(pattern => pattern.test(value));
+  if (secretPatterns.some(pattern => pattern.test(value))) return true;
+  const basic = /^Basic\s+([A-Za-z0-9+/]{8,}={0,2})$/i.exec(value);
+  return !!basic && isBasicCredential(basic[1]);
 };
 
 /**
  * A name with one of these in it goes from an export, in any case and at any depth. For a node with no `secret` type to
- * go by (a package's that is not loaded, a flow from elsewhere), and for what is inside a node's object (`X-Api-Key` in
- * its Custom Headers), the name is all there is. Whole names let `botToken` and `smtpPassword` through.
+ * go by (a package's that is not loaded, a flow from elsewhere), and for what is inside a node's object or list, the name
+ * is all there is. Whole names let `botToken` and `smtpPassword` through.
  */
 const SENSITIVE_NAME_PARTS = ['password', 'token', 'secret', 'key', 'credential', 'auth'];
 
+const sensitiveName = (name: string): boolean => {
+  const lower = name.toLowerCase();
+  return SENSITIVE_NAME_PARTS.some(part => lower.includes(part));
+};
+
 /**
- * A field that should name a constant and holds something else: a key pasted there, of whatever shape. A constant's name
- * is as Settings makes it (`OPENAI_API_KEY`), and no longer than the runtime takes a name to be (`resolveApiKey`).
+ * A field that should name a constant or a variable and holds something else: a key pasted there, of whatever shape. A
+ * constant's name is as Settings makes it (`OPENAI_API_KEY`), and no longer than the runtime takes a name to be
+ * (`resolveApiKey`).
  */
 const holdsLiteralKey = (field: string, value: string): boolean =>
-  field.endsWith('Constant') && !/^[A-Z0-9_]{0,40}$/.test(value);
+  /(Constant|EnvVar)$/.test(field) && !/^[A-Z0-9_]{0,40}$/.test(value);
 
 /**
  * A node's own field that only sounds like a secret, and went from every export with no word said: a count of tokens
  * (`maxTokens`), the name of a constant (`apiKeyConstant`, which an imported flow needs to find its key, and which
  * `holdsLiteralKey` holds to being one), and a field called `key` on a node whose schema says what it is (a memory's).
+ * Each of these is a string or a number. An object or a list under such a name is what the name says it is.
  */
-const onlySoundsSecret = (field: string, value: unknown, schemaPlainFields?: Set<string>): boolean =>
-  (/tokens$/i.test(field) && /^\d+$/.test(String(value))) ||
-  field.endsWith('Constant') ||
-  (field === 'key' && schemaPlainFields?.has(field) === true);
+const onlySoundsSecret = (field: string, value: unknown, schemaPlainFields?: Set<string>): boolean => {
+  if (typeof value !== 'string' && typeof value !== 'number') return false;
+  return (
+    (/tokens$/i.test(field) && /^\d+$/.test(String(value))) ||
+    field.endsWith('Constant') ||
+    (field === 'key' && schemaPlainFields?.has(field) === true)
+  );
+};
+
+/**
+ * The fields that hold a request as text: where it goes, its headers, its body (`endpoint`, `customHeaders`,
+ * `customBodyTemplate`). Only these are read for the names in them. A prompt or a block's code that says `"key": "x"`
+ * says it as its own words.
+ */
+const REQUEST_TEXT = /(endpoints?|urls?|headers?|body|bodytemplate)$/i;
+
+/**
+ * A list inside a node, at any depth: the strings by what they look like, and the objects as a node's objects. A secret
+ * leaves its place in the list marked, so what comes after it stays where it was.
+ */
+const sanitizeList = (
+  list: unknown[],
+  field: string,
+  knownSecrets: Set<string>,
+  schemaSecretFields?: Set<string>
+): unknown[] =>
+  list.map((item) => {
+    if (typeof item === 'string') {
+      if (looksLikeSecret(item) || knownSecrets.has(item)) return REDACTED_TOKEN;
+      return REQUEST_TEXT.test(field) ? redactRequestText(item, knownSecrets) : redactSecretsInText(item, knownSecrets);
+    }
+    if (Array.isArray(item)) return sanitizeList(item, field, knownSecrets, schemaSecretFields);
+    if (item && typeof item === 'object') {
+      return sanitizeNodeData(item as Record<string, unknown>, knownSecrets, schemaSecretFields, undefined, true);
+    }
+    return item;
+  });
 
 /**
  * Sanitize node data by removing sensitive fields and secret-looking values.
@@ -99,6 +170,9 @@ export const sanitizeNodeData = (
   nested = false
 ): Record<string, unknown> => {
   const result: Record<string, unknown> = {};
+  // A pair, as a list of headers holds them (`{name: 'X-Api-Key', value: '…'}`): its name is in a field of its own, and
+  // `value` is what that name says it is. A `key` there is such a name, not a key.
+  const pairName = nested && 'value' in data ? [data.name, data.key, data.header].find((n) => typeof n === 'string') as string | undefined : undefined;
 
   for (const [key, value] of Object.entries(data)) {
     // Skip temporary fields
@@ -109,9 +183,12 @@ export const sanitizeNodeData = (
       continue;
     }
 
+    if (pairName !== undefined && key === 'value' && sensitiveName(pairName) && !String(value).includes('{{')) {
+      continue;
+    }
+
     // Skip fields with sensitive names (case-insensitive)
-    const name = key.toLowerCase();
-    if (SENSITIVE_NAME_PARTS.some(part => name.includes(part)) && (nested || !onlySoundsSecret(key, value, schemaPlainFields))) {
+    if (sensitiveName(key) && !(pairName !== undefined && key === 'key') && (nested || !onlySoundsSecret(key, value, schemaPlainFields))) {
       continue;
     }
 
@@ -121,7 +198,9 @@ export const sanitizeNodeData = (
     }
 
     // Recursively sanitize nested objects
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (Array.isArray(value)) {
+      result[key] = sanitizeList(value, key, knownSecrets, schemaSecretFields);
+    } else if (value && typeof value === 'object') {
       result[key] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, schemaSecretFields, undefined, true);
     } else if (typeof value === 'string') {
       // Scrub a secret embedded MID-STRING — e.g. a literal key pasted inside the
@@ -129,7 +208,7 @@ export const sanitizeNodeData = (
       // "Bearer sk-..."}`, `?key=AIza...`). looksLikeSecret above is anchored
       // (whole-value) and misses substrings; redactSecretsInText is un-anchored and
       // keeps the surrounding JSON/URL syntactically valid (__REDACTED__).
-      result[key] = redactSecretsInText(value, knownSecrets);
+      result[key] = REQUEST_TEXT.test(key) ? redactRequestText(value, knownSecrets) : redactSecretsInText(value, knownSecrets);
     } else {
       result[key] = value;
     }
@@ -213,8 +292,37 @@ export const redactSecretsInText = (
     .replace(/AIza[A-Za-z0-9_-]{35}/g, REDACTED_TOKEN)
     .replace(/gh[pousr]_[A-Za-z0-9]{36}/g, REDACTED_TOKEN)
     .replace(/xox[baprs]-[A-Za-z0-9-]{10,}/g, REDACTED_TOKEN)
-    .replace(/(Bearer\s+)[A-Za-z0-9._-]{20,}/gi, `$1${REDACTED_TOKEN}`);
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]{20,}/gi, `$1${REDACTED_TOKEN}`)
+    .replace(/\b(Basic\s+)([A-Za-z0-9+/]{8,}={0,2})(?![A-Za-z0-9+/=])/gi, (whole, scheme: string, encoded: string) =>
+      isBasicCredential(encoded) ? `${scheme}${REDACTED_TOKEN}` : whole);
+  for (const shape of KEY_SHAPES_IN_TEXT) out = out.replace(shape, REDACTED_TOKEN);
   return out;
+};
+
+/**
+ * `redactSecretsInText` for a request written out as text, where a key has no need of a shape: the value under a JSON key
+ * or in a query parameter with a sensitive name goes, and so does a URL's `user:pass@`. A `{{placeholder}}` stays: that is
+ * how such a field names a key, and an imported flow needs it. So do counts (`"max_tokens": "800"`), and any value that is
+ * not a quoted string (`"max_tokens": 800`).
+ */
+export const redactRequestText = (
+  text: string,
+  knownSecrets: Set<string>,
+): string => {
+  if (typeof text !== 'string' || text.length === 0) return text;
+  // (a search's `keyword`, a post's `author` and a model's `tokenizer` have a part in them, in a URL that has to keep working)
+  const stays = (name: string, value: string): boolean =>
+    !sensitiveName(name.replace(/keyword|author(?!i)|tokeni[sz]/gi, '')) ||
+    !value ||
+    value.includes('{{') ||
+    value.includes(REDACTED_TOKEN) ||
+    (/tokens$/i.test(name) && /^\d+$/.test(value));
+  return redactSecretsInText(text, knownSecrets)
+    .replace(/"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"/g, (whole, name: string, colon: string, value: string) =>
+      stays(name, value) ? whole : `"${name}"${colon}"${REDACTED_TOKEN}"`)
+    .replace(/([?&])([^=&#\s"']+)=([^&#\s"']*)/g, (whole, mark: string, name: string, value: string) =>
+      stays(name, value) ? whole : `${mark}${name}=${REDACTED_TOKEN}`)
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s"'?#@]+@/gi, (whole, scheme: string) => (whole.includes('{{') ? whole : scheme));
 };
 
 /**
@@ -233,11 +341,32 @@ function sanitizeServiceForExport(
     // `isBuiltIn: false` for the export — the importer always treats these as
     // user services so the receiving user can edit them.
     isBuiltIn: false,
-    endpoint: redactSecretsInText(svc.endpoint, knownSecrets),
-    headers: redactSecretsInText(svc.headers, knownSecrets),
-    bodyTemplate: redactSecretsInText(svc.bodyTemplate, knownSecrets),
+    endpoint: redactRequestText(svc.endpoint, knownSecrets),
+    headers: redactRequestText(svc.headers, knownSecrets),
+    bodyTemplate: redactRequestText(svc.bodyTemplate, knownSecrets),
   };
 }
+
+/**
+ * What a project keeps beside its flows: an endpoint, a preset, its settings. Their fields are the app's own and most
+ * name a secret without holding one (`apiKeyEnvVar`, `authType`, `authHeaderName`, a default's `…ApiKeyConstant`), so the
+ * rule for names is kept for their header maps, and everything else is judged by what it holds: a key in a URL went out
+ * with the file.
+ */
+const sanitizeProjectRecord = <T extends object>(record: T, knownSecrets: Set<string>): T => {
+  const result: Record<string, unknown> = {};
+  for (const [field, value] of Object.entries(record)) {
+    if (typeof value === 'string') {
+      if (looksLikeSecret(value) || knownSecrets.has(value) || holdsLiteralKey(field, value)) continue;
+      result[field] = REQUEST_TEXT.test(field) ? redactRequestText(value, knownSecrets) : redactSecretsInText(value, knownSecrets);
+    } else if (/headers$/i.test(field) && value && typeof value === 'object') {
+      result[field] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, undefined, undefined, true);
+    } else {
+      result[field] = value;
+    }
+  }
+  return result as T;
+};
 
 /**
  * Walk every flow's graph and collect the CustomService definitions any
@@ -301,6 +430,10 @@ export const sanitizeProjectForExport = (project: OAIYProject): ExportedProject 
       ...c,
       value: c.isSecret ? '' : c.value,
     })),
+    llmEndpoints: project.llmEndpoints?.map((endpoint) => sanitizeProjectRecord(endpoint, knownSecrets)),
+    imageGenEndpoints: project.imageGenEndpoints?.map((endpoint) => sanitizeProjectRecord(endpoint, knownSecrets)),
+    httpPresets: project.httpPresets?.map((preset) => sanitizeProjectRecord(preset, knownSecrets)),
+    settings: project.settings && sanitizeProjectRecord(project.settings, knownSecrets),
     // Web-only addition — embedded service definitions. Omitted entirely
     // when no service_call nodes are present so old desktop imports stay
     // byte-for-byte compatible.

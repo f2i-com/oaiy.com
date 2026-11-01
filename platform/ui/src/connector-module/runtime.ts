@@ -2,11 +2,11 @@
  * Connector module — runtime.
  *
  * One method per operation in the closed set. Every method receives the node's
- * input plus the `ConnectorCall` the compiler baked in (node id, node type,
- * operation, path template, the node's own data) — so the runtime never looks a
- * node type up anywhere, and therefore cannot know one.
+ * input plus what the compiler baked in (the node id, the node type, the node's
+ * own data). The node type is looked up in the config this runtime was built
+ * from, so a type is only ever data: nothing here knows one.
  *
- * Three rules hold throughout:
+ * Four rules hold throughout:
  *
  *   1. **Real work or a real error.** No method returns a placeholder, an empty
  *      array, or its input when it cannot do the thing. It throws, naming the
@@ -16,14 +16,23 @@
  *   3. **Every HTTP call goes through `ctx.secureFetch`**, which is the
  *      policy-enforced gateway (local-network permission, SSRF guard, DNS
  *      pinning). Module code must never touch a raw `fetch`.
+ *   4. **A call is a node of the config, or nothing.** A Logic Block runs in the
+ *      same script as the compiled calls and reaches this module the way they
+ *      do (`Connector`, an awaited `{_kind}`, `host.call`), and a pack's flow
+ *      runs on this desktop with this desktop's link. So the script names a node
+ *      and gives its data. What a request is, where it goes and what it says of
+ *      the run come from the config, and a script can do what a node of the
+ *      config can do and no more: it could place that node in its graph anyway.
  */
 
 import type { RuntimeContext, RuntimeMethod, RuntimeModule } from 'oaiy-core/src/module-types';
+import { answerIn } from '../bundled-modules/core-ai/reply';
 import {
   DEFAULT_LOOPBACK_BASE_URL,
   type ConnectorCall,
   type ConnectorConfig,
   type ConnectorHostOptions,
+  type ConnectorOperation,
 } from './types';
 
 /** The runtime module name; compiled scripts call `Connector.<operation>(…)`. */
@@ -168,6 +177,34 @@ function truncate(text: string, max = 400): string {
 const PLACEHOLDER_RE = /\{([^}\s/]+)\}/g;
 
 /**
+ * A value a flow set, as one segment of a URL's path.
+ *
+ * Encoding is not enough. `encodeURIComponent` leaves dots alone, so `..` climbs out
+ * of the path it was put in, on this side or the provider's. It turns a slash into
+ * `%2F` and `..` written as `%2e%2e` into `%252e%252e`, which a proxy or a framework
+ * may decode on the way in, once or twice. So the value is judged as whatever it
+ * comes to however often it is decoded: no ids look like these.
+ */
+function pathSegment(call: ConnectorCall, what: string, value: unknown): string {
+  const text = String(value);
+  let plain = text;
+  for (;;) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(plain);
+    } catch {
+      break;
+    }
+    if (decoded === plain) break;
+    plain = decoded;
+  }
+  if (/[/\\\u0000-\u001f]/.test(plain) || /^\s*\.+\s*$/.test(plain)) {
+    fail(call, `${what} ${JSON.stringify(text)} is not one part of a path, so nothing was sent.`);
+  }
+  return encodeURIComponent(text);
+}
+
+/**
  * Substitute `{placeholder}` segments from the node's own data (falling back to
  * an object input). A placeholder with no value is a hard error: the alternative
  * is calling the provider on a malformed path, which either 404s confusingly or,
@@ -186,7 +223,7 @@ export function resolvePath(call: ConnectorCall, input: unknown, template: strin
     if (typeof value === 'object') {
       fail(call, `the path placeholder {${name}} needs a scalar value, got an object.`);
     }
-    return encodeURIComponent(String(value));
+    return pathSegment(call, `the value of {${name}}`, value);
   });
 }
 
@@ -396,6 +433,40 @@ export function createConnectorRuntime(
   const providerBase = config.baseUrl.replace(/\/+$/, '');
   const loopbackBase = (host.loopbackBaseUrl || DEFAULT_LOOPBACK_BASE_URL).replace(/\/+$/, '');
   const loopbackToken = host.loopbackToken || '';
+  const specs = new Map(config.nodes.map((n) => [n.nodeType, n]));
+
+  /**
+   * What a compiled call asks for, as this config's node of that name does it.
+   * Only the node id and the node's data are the script's. A call that names no
+   * node of the config, or one that does another operation, is refused before
+   * anything else is read from it.
+   */
+  const described = (operation: ConnectorOperation, site: unknown): ConnectorCall => {
+    const { nodeId, nodeType, data } = isRecord(site) ? site : ({} as Record<string, unknown>);
+    const spec = typeof nodeType === 'string' ? specs.get(nodeType) : undefined;
+    if (!spec || spec.operation !== operation) {
+      throw new Error(`Connector.${operation} was called for ${JSON.stringify(nodeType) ?? 'nothing'}, which is no such node of this connector.`);
+    }
+    return { ...spec, nodeId: String(nodeId ?? ''), data: isRecord(data) ? data : {} };
+  };
+
+  /**
+   * A failure as the script gets it: a block can catch it and read it. It says
+   * what failed and on which path, and not where the provider is, nor anything
+   * this runtime holds that a provider's error text may have repeated.
+   */
+  const told = (e: unknown): Error => {
+    let text = e instanceof Error ? e.message : String(e);
+    for (const [held, shown] of [
+      [config.credential, '[credential]'],
+      [loopbackToken, '[credential]'],
+      [host.runId, '[run]'],
+      [providerBase, ''],
+    ] as const) {
+      if (held) text = text.split(held).join(shown);
+    }
+    return new Error(text);
+  };
 
   const providerHeaders = (withBody: boolean): Record<string, string> => {
     const h: Record<string, string> = {
@@ -452,10 +523,14 @@ export function createConnectorRuntime(
      * What a write sends: `payload`, and the run making it where the provider's
      * node asks for that and the host has one. Without it a provider counts the
      * write as a person's, and a flow that writes into the form it is bound to
-     * starts itself again with nothing to end it.
+     * starts itself again with nothing to end it. Only the host says which run:
+     * a value of that name in the payload is the graph's, and goes either way.
      */
-    const asThisRun = (call: ConnectorCall, payload: Record<string, unknown>): Record<string, unknown> =>
-      call.runField && host.runId ? { ...payload, [call.runField]: host.runId } : payload;
+    const asThisRun = (call: ConnectorCall, payload: Record<string, unknown>): Record<string, unknown> => {
+      if (!call.runField) return payload;
+      const { [call.runField]: _graphs, ...rest } = payload;
+      return host.runId ? { ...rest, [call.runField]: host.runId } : rest;
+    };
 
     const recordUrl = (call: ConnectorCall, input: unknown, withQuery: boolean): string => {
       if (!call.path) {
@@ -463,7 +538,20 @@ export function createConnectorRuntime(
         // record operations — but a hand-built call must not silently GET the base.
         fail(call, `${call.operation} has no path configured for this node type.`);
       }
-      return providerBase + resolvePath(call, input, call.path) + (withQuery ? queryString(call, input) : '');
+      const path = resolvePath(call, input, call.path);
+      // The provider's bearer goes on this request, so its address is checked and
+      // not assumed. Put together as text, a path of `.attacker.example/x` on
+      // `https://provider` is another host, and one of `/../x` climbs out of a base
+      // with a path of its own. `new URL(path, base)` would lose that base's path.
+      if (!path.startsWith('/')) {
+        fail(call, `the path ${JSON.stringify(path)} must start with "/", so nothing was sent.`);
+      }
+      const base = new URL(providerBase);
+      const built = new URL(providerBase + path);
+      if (built.origin !== base.origin || built.pathname + built.search !== base.pathname.replace(/\/$/, '') + path) {
+        fail(call, `the path ${JSON.stringify(path)} leaves the provider's address, so nothing was sent.`);
+      }
+      return providerBase + path + (withQuery ? queryString(call, input) : '');
     };
 
     const methods: Record<string, RuntimeMethod> = {
@@ -505,7 +593,7 @@ export function createConnectorRuntime(
       chat: async (input: unknown, call: ConnectorCall): Promise<string> => {
         const provider = providerId(field(call, input, 'provider', 'providerId'));
         const url = nonEmpty(provider)
-          ? `${loopbackBase}/api/ai/providers/${encodeURIComponent(String(provider))}/v1/chat/completions`
+          ? `${loopbackBase}/api/ai/providers/${pathSegment(call, 'the AI provider', provider)}/v1/chat/completions`
           : `${loopbackBase}/api/ai/v1/chat/completions`;
 
         const declaredMessages = field(call, input, 'messages');
@@ -565,14 +653,14 @@ export function createConnectorRuntime(
           what: 'chat completion from this machine\'s AI gateway',
         });
 
-        const content = dig(json, 'choices.0.message.content');
-        if (typeof content !== 'string' || !content.trim()) {
-          fail(
-            call,
-            `the AI gateway answered without a message. Response: ${truncate(JSON.stringify(json) ?? 'null')}`,
-          );
+        // The checks the AI node makes: a reasoning model leaves its thinking in
+        // the reply's text, and a 200 may hold an error or nothing at all. Taken
+        // as it came, that text is what the next step sends on.
+        try {
+          return answerIn(json);
+        } catch (e) {
+          fail(call, e instanceof Error ? e.message : String(e));
         }
-        return content;
       },
 
       // -- listRecords ------------------------------------------------------
@@ -665,7 +753,7 @@ export function createConnectorRuntime(
               `${String(connectorId)}|${String(command)}|${JSON.stringify(payload)}`,
             )}`;
 
-        const url = `${loopbackBase}/api/bridge/connectors/${encodeURIComponent(String(connectorId))}/request`;
+        const url = `${loopbackBase}/api/bridge/connectors/${pathSegment(call, 'the connector id', connectorId)}/request`;
         log(`${label(call)}: relaying ${String(command)} to connector ${String(connectorId)}`);
         const json = await http(ctx, {
           url,
@@ -691,7 +779,7 @@ export function createConnectorRuntime(
         if (needsId && !nonEmpty(serviceId)) {
           fail(call, `the "${action}" action needs a service id — set the node's "service" field.`);
         }
-        const id = encodeURIComponent(String(serviceId ?? ''));
+        const id = needsId ? pathSegment(call, 'the service id', serviceId) : '';
 
         switch (action) {
           case 'list':
@@ -747,7 +835,18 @@ export function createConnectorRuntime(
       },
     };
 
-    return methods;
+    // What the script can call: each method, on a call made from the config.
+    const called: Record<string, RuntimeMethod> = {};
+    for (const [operation, method] of Object.entries(methods)) {
+      called[operation] = async (input: unknown, site: unknown): Promise<unknown> => {
+        try {
+          return await method(input, described(operation as ConnectorOperation, site));
+        } catch (e) {
+          throw told(e);
+        }
+      };
+    }
+    return called;
   };
 
   return {

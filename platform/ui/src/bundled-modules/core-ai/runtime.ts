@@ -8,6 +8,7 @@
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { mayAskDesktop } from '../../lib/desktopDetection';
 import { absoluteUrl, desktopAccess, desktopCredential, desktopFileBytes } from '../core-service/contractRuntime';
+import { NO_MESSAGE, answerIn, answerOf, endedInError, errorIn, holdsChoices, noMessage, turnWithoutText, whyNoAnswer } from './reply';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAIMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -393,124 +394,6 @@ function resolveApiKey(apiKeyConstant: string): string {
  * llm holds before its own load so VRAM stays safe. Set the env var
  * to restore the pre-2026-05-14 behaviour where every chat unloaded.
  */
-/**
- * Strip reasoning-model `<think>...</think>` (and `<thinking>...</thinking>`)
- * blocks from a chat completion before handing it back to the workflow.
- *
- * Why this matters: Qwen 3.5 thinking variants, DeepSeek R1, and the
- * various Reasoner-style local + cloud LLMs interleave their chain of
- * thought into the same response stream as the final answer. Without
- * stripping, the user-visible text starts with several paragraphs of
- * scratchpad ("Let me think about this... Actually, the user wants...")
- * before the actual answer — which then propagates downstream into any
- * node that consumes the AI output (Save File, another LLM, a diffusion
- * prompt, etc.) and produces nonsense results.
- *
- * Cleanup:
- *   - Removes well-formed `<think>...</think>` / `<thinking>...</thinking>`
- *     blocks. Case-insensitive, multiline-safe, non-greedy so multiple
- *     blocks in the same response each get stripped.
- *   - If an opening tag has no matching close (model hit max_tokens
- *     mid-thought), drops everything from that tag to the end — the
- *     half-finished reasoning isn't useful as an answer.
- *   - Trims leading whitespace so the visible text starts on a real
- *     character rather than the gap the stripped block used to occupy.
- *
- * Applied at every return path of `chat()` that produces user-visible
- * text. Models that don't emit think tags are unaffected (the regex
- * just doesn't match anything).
- */
-function stripThinkTags(text: string): string {
-  if (!text) return text;
-  let out = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
-  // Trailing unclosed-thought drop. `i` flag handles either case mix.
-  const openTail = out.match(/<think(?:ing)?>[\s\S]*$/i);
-  if (openTail && typeof openTail.index === 'number') {
-    out = out.slice(0, openTail.index);
-  }
-  return out.replace(/^\s+/, '');
-}
-
-const NO_MESSAGE = 'The AI service answered without a message.';
-const LIMIT_SPENT_THINKING = 'The model reached its token limit before it answered: its thinking used it up. Raise Max Tokens.';
-
-/**
- * `stripThinkTags`, for a reply that has to hold an answer: one that was thought and nothing else fails the step. Empty
- * text would go on as the step's answer, into whatever the flow does with it next.
- */
-function answerOf(text: string): string {
-  const answer = stripThinkTags(text);
-  if (!answer && /<think(?:ing)?>/i.test(text)) {
-    throw new Error(/<\/think(?:ing)?>/i.test(text) ? NO_MESSAGE : LIMIT_SPENT_THINKING);
-  }
-  return answer;
-}
-
-/**
- * The `error` a provider's 200 carries, if it does: of the reply, or of its first choice as some gateways put it. An
- * empty one says nothing: a gateway's `error: {}` beside a good answer is no error.
- */
-function errorIn(data: any): unknown {
-  const said = (error: unknown) => (error && typeof error === 'object' ? Object.keys(error).length > 0 : !!error);
-  return [data?.error, data?.choices?.[0]?.error].find(said);
-}
-
-/**
- * A reply that is the answer without being text: a turn that calls tools (no text, `tool_calls`), or an image (no text,
- * `images`). The flow reads its JSON. Text it does not have is not a missing answer.
- */
-function holdsOtherThanText(data: any): boolean {
-  const choice = data?.choices?.[0];
-  const some = (list: unknown) => Array.isArray(list) && list.length > 0;
-  return some(choice?.message?.tool_calls) || choice?.finish_reason === 'tool_calls' || data?.stop_reason === 'tool_use' || some(choice?.message?.images);
-}
-
-/** A list of `choices` that is a reply's choices. A custom endpoint may have a `choices` of its own, of words or numbers. */
-function holdsChoices(data: any): boolean {
-  return Array.isArray(data?.choices) && (data.choices.length === 0 || (typeof data.choices[0] === 'object' && data.choices[0] !== null));
-}
-
-/** The reply's text, whatever the shape: by what it is, since the address says nothing (a proxy with `claude` in its URL speaks OpenAI). */
-function replyText(data: any): string {
-  const said = data?.choices?.[0]?.message?.content || data?.message?.content || data?.response;
-  if (said) return said;
-  // (every text block, in order: the answer can come in several, after a thinking block that has no text)
-  const texts: string[] = Array.isArray(data?.content)
-    ? data.content.filter((b: { type?: unknown; text?: unknown }) => b?.type === 'text' && typeof b.text === 'string').map((b: { text: string }) => b.text)
-    : [];
-  return texts.join('');
-}
-
-/** `NO_MESSAGE`, with how the reply says it ended where it does. */
-function noMessage(data: any): string {
-  const finish = data?.choices?.[0]?.finish_reason;
-  if (finish) return `The AI service answered without a message (finish_reason: ${finish}).`;
-  return data?.stop_reason ? `The AI service answered without a message (stop_reason: ${data.stop_reason}).` : NO_MESSAGE;
-}
-
-/**
- * What a provider's 200 says about why it holds no answer, where it says. A status of 200 is not an answer: a body with
- * an `error` in it, a refusal, or a reasoning model's that used its tokens thinking, otherwise reached the flow as text.
- */
-function whyNoAnswer(data: any): string | null {
-  const failure: any = errorIn(data);
-  if (failure) {
-    const said = typeof failure === 'string' ? failure : typeof failure.message === 'string' ? failure.message : JSON.stringify(failure);
-    return `The AI service answered with an error: ${said}`;
-  }
-  const choice = data?.choices?.[0];
-  if (typeof choice?.message?.refusal === 'string' && choice.message.refusal) {
-    return `The model refused: ${choice.message.refusal}${choice.finish_reason ? ` (finish_reason: ${choice.finish_reason})` : ''}`;
-  }
-  if (choice?.finish_reason === 'content_filter' || data?.stop_reason === 'refusal') return noMessage(data);
-  return choice?.finish_reason === 'length' || data?.stop_reason === 'max_tokens' ? LIMIT_SPENT_THINKING : null;
-}
-
-/** A reply that holds the start of an answer and says it failed there is a failure, not that start. */
-function endedInError(data: any): boolean {
-  return !!errorIn(data) && data?.choices?.[0]?.finish_reason === 'error';
-}
-
 async function tryEagerLlmUnload(modelId: string): Promise<void> {
   const tauri = ctx.tauri;
   if (!tauri) return;
@@ -1016,6 +899,8 @@ async function chat(
           (hasImages ? ` [+${imagePaths.length} image(s) via mmproj]` : ''),
       );
       const answer = answerOf(result.text);
+      // (the same as a provider's empty reply: `""` would go on as the step's answer)
+      if (!answer) throw new Error(NO_MESSAGE);
       ctx.onNodeStatus?.(nodeId, 'completed');
       return answer;
     } catch (err) {
@@ -1497,6 +1382,7 @@ async function chat(
       // through this branch and a downstream Reasoner-style fallback
       // shouldn't leak its scratchpad either.
       const cleaned = answerOf(externalResponse);
+      if (!cleaned) throw new Error(NO_MESSAGE);
 
       // Stream the response if callback available
       if (ctx.onStreamToken && streaming) {
@@ -1562,16 +1448,19 @@ async function chat(
 
     // Extract content based on format
     let content: string;
+    // (the step's answer as it stands: text already cleaned, or a turn's JSON, which cleaning as text would cut short)
+    let finished = false;
     if (useCustomTemplate) {
       if (!jsonOk) {
         // Endpoint returned raw text — use it verbatim.
         content = responseText;
       } else if (typeof customResponsePath === 'string' && customResponsePath.trim() !== '') {
         const extracted = extractJsonPath(data, customResponsePath);
-        if (extracted !== null && extracted !== undefined) {
-          content = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
-        } else if (holdsOtherThanText(data)) {
+        if (turnWithoutText(extracted, data)) {
           content = JSON.stringify(data);
+          finished = true;
+        } else if (extracted !== null && extracted !== undefined) {
+          content = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
         } else {
           throw new Error(whyNoAnswer(data) ?? `The response has nothing at ${customResponsePath}.`);
         }
@@ -1579,8 +1468,9 @@ async function chat(
         // Custom template, no explicit path — try common shapes, else raw JSON: an endpoint's shape of its own, for the
         // flow to read. Not an error body, or an OpenAI reply with no choice in it.
         const shaped = data?.choices?.[0]?.message?.content ?? data?.response ?? data?.text;
-        if (!shaped && holdsOtherThanText(data)) {
+        if (turnWithoutText(shaped, data)) {
           content = JSON.stringify(data);
+          finished = true;
         } else if ((shaped === null || shaped === undefined) && (errorIn(data) || holdsChoices(data))) {
           throw new Error(whyNoAnswer(data) ?? noMessage(data));
         } else {
@@ -1592,10 +1482,11 @@ async function chat(
         const why = whyNoAnswer(data);
         if (why) throw new Error(why);
       }
+      // And what it did answer is no answer where the reply says it failed or was stopped there.
+      if (jsonOk && endedInError(data)) throw new Error(whyNoAnswer(data) ?? noMessage(data));
     } else {
-      content = replyText(data);
-      if (!content && holdsOtherThanText(data)) content = JSON.stringify(data);
-      if (!content || endedInError(data)) throw new Error(whyNoAnswer(data) ?? noMessage(data));
+      content = answerIn(data);
+      finished = true;
     }
 
     ctx.log('info', `[AI] Response received (${content.length} chars)`);
@@ -1605,8 +1496,7 @@ async function chat(
     // cousins all interleave scratchpad reasoning that should never
     // reach the user-facing output. Cloud + local paths both go through
     // this so the behaviour is provider-agnostic.
-    const cleaned = answerOf(content);
-    if (!cleaned && !useCustomTemplate) throw new Error(whyNoAnswer(data) ?? noMessage(data));
+    const cleaned = finished ? content : answerOf(content);
 
     // Stream the response if callback available
     if (ctx.onStreamToken && streaming) {

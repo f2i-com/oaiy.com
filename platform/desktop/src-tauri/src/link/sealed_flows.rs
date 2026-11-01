@@ -206,6 +206,7 @@ fn poll_once(
     // each later poll until it is taken: a flow that ran, its effects made, is not reported as never done because the
     // provider was away for half a minute.
     for attempt in 0..6u32 {
+        let mut asked = Duration::ZERO;
         if let Ok(response) = http
             .post(&url)
             .timeout(timeout)
@@ -214,27 +215,46 @@ fn poll_once(
             .send()
         {
             let status = response.status();
+            asked = super::net::retry_after(response.headers()).unwrap_or_default();
             super::net::drain(response);
             if status.is_success() {
                 return Ok(true);
             }
-            if status.is_client_error() {
+            if refused_for_good(status) {
                 return Err(format!(
                     "sealed flow completion: HTTP {status}; flow will not be repeated"
                 ));
             }
         }
-        // Not taken, and not refused either: the same sealed result is sent again.
-        if attempt < 5 {
-            std::thread::sleep(Duration::from_secs(1 << attempt));
-        }
+        // Not taken, and not refused either: the same sealed result is sent again, and no
+        // sooner than the provider asked.
+        std::thread::sleep(if attempt < 5 { asked.max(Duration::from_secs(1 << attempt)) } else { asked });
     }
     keep_completion(&id, &account.base_url, &url, &body);
     Err("sealed flow completion could not be confirmed yet: it is kept and sent again; the flow will not be repeated".into())
 }
 
+/// A completion the provider refuses for good, which nothing is gained by sending again. A 408, a 425 or a 429 says not
+/// now, as a 5xx does: taken for a refusal, the result of a run that had done its work was gone on that one answer, at
+/// the moment every lane comes back at once.
+fn refused_for_good(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429)
+}
+
 /// Where completions not taken yet are kept (`<data>/link/sealed-pending`), set when the lane starts.
 static KEPT_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// How long a kept completion holds the next claim back. A day of one result not landing is no longer the provider being
+/// away for a while: it is that file, or that one route, and this desktop is not kept from its work for it.
+const KEPT_HOLDS_CLAIMS_FOR: Duration = Duration::from_secs(24 * 3600);
+/// How long a completion is kept before it is let go.
+const KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How far apart a result past [`KEPT_HOLDS_CLAIMS_FOR`] is sent again, beside the lane's claims: it is not worth a request
+/// at every poll, on a route that has been failing for a day.
+const LATE_EVERY: Duration = Duration::from_secs(60);
+/// What the log says while a result is past [`KEPT_HOLDS_CLAIMS_FOR`]: the same words each time, so it is one line. Not the
+/// lane's status, which the panel shows as "Encrypted flows unavailable": the lane is working.
+const LATE_NOTE: &str = "a finished flow's result has not been taken for over a day: it is sent again now and then, and new flows are claimed beside it";
 
 /// Keep a sealed completion the provider has not taken, to be sent again ([`resend_kept`]). The body is sealed: no
 /// input, output or error is in it in the clear.
@@ -248,39 +268,104 @@ fn keep_completion(id: &str, base_url: &str, url: &str, body: &Value) {
     let _ = crate::secret_file::write(&dir.join(format!("{safe}.json")), kept.to_string());
 }
 
-/// Send the kept completions again: each goes once it is taken or refused for good; while the provider is away the
-/// rest wait. A week unsent, one is let go. Whether none is left for this account.
-fn resend_kept(http: &Client, account: &LinkedAccount, timeout: Duration) -> bool {
-    KEPT_DIR.get().is_none_or(|dir| resend_kept_in(dir, http, account, timeout))
+/// What the kept completions say about the next claim.
+#[derive(Debug, Default)]
+struct Kept {
+    /// Why it has to wait: a completion not taken yet, and not a day old.
+    held: Option<String>,
+    /// A completion is past [`KEPT_HOLDS_CLAIMS_FOR`] and still not taken.
+    late: bool,
+    /// How long the provider asked to be left, where it said.
+    asked: Option<Duration>,
 }
 
-fn resend_kept_in(dir: &std::path::Path, http: &Client, account: &LinkedAccount, timeout: Duration) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return true };
+/// How long a kept file has waited. A date in the future (a clock that was wrong, a copy from elsewhere) counts from now,
+/// and the file is dated so: read as young each time, it would hold the lane for good. One that cannot be dated does not
+/// hold it either.
+fn kept_age(path: &std::path::Path, modified: std::time::SystemTime) -> Duration {
+    modified.elapsed().unwrap_or_else(|_| {
+        let now = std::time::SystemTime::now();
+        match std::fs::File::options().write(true).open(path).and_then(|file| file.set_modified(now)) {
+            Ok(()) => Duration::ZERO,
+            Err(_) => KEPT_HOLDS_CLAIMS_FOR,
+        }
+    })
+}
+
+/// Whether `url` is an address at the provider: the account's bearer goes on what is sent to it.
+fn at_provider(url: &str, base_url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok() && url.starts_with(&format!("{}/", base_url.trim_end_matches('/')))
+}
+
+/// Put aside a kept file that can never be sent: it would otherwise wait out its week.
+fn set_aside(path: &std::path::Path) {
+    if let Err(why) = super::put_aside(path, "a kept sealed flow result") {
+        log::warn!("{why}");
+    }
+}
+
+/// Send the kept completions again: each goes once it is taken or refused for good, and while the provider is away the
+/// rest wait. One that is more than a day old waits beside the lane rather than ahead of it, and is sent only when
+/// `try_late` says so. A file that cannot be sent goes aside, and a week unsent, one is let go.
+fn resend_kept_in(dir: &std::path::Path, http: &Client, account: &LinkedAccount, timeout: Duration, try_late: bool) -> Kept {
+    let mut kept = Kept::default();
+    let Ok(entries) = std::fs::read_dir(dir) else { return kept };
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(7 * 24 * 3600)) {
+        let age = entry.metadata().ok().and_then(|m| m.modified().ok()).map_or(Duration::ZERO, |modified| kept_age(&path, modified));
+        if age > KEPT_FOR {
+            log::warn!("a finished flow's result was not taken in a week: it is let go");
             let _ = std::fs::remove_file(&path);
             continue;
         }
-        let Some(kept) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
-        if kept["baseUrl"].as_str() != Some(account.base_url.as_str()) {
+        // (what was put aside stays aside until then)
+        if path.extension().is_none_or(|extension| extension != "json") {
             continue;
         }
-        let Some(url) = kept["url"].as_str() else { continue };
-        match http.post(url).timeout(timeout).bearer_auth(&account.credential).json(&kept["body"]).send() {
+        // (a file another program holds for now is read the next time)
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(file) = serde_json::from_slice::<Value>(&bytes) else {
+            set_aside(&path);
+            continue;
+        };
+        let Some(base_url) = file["baseUrl"].as_str() else {
+            set_aside(&path);
+            continue;
+        };
+        if base_url != account.base_url {
+            continue;
+        }
+        let Some(url) = file["url"].as_str().filter(|url| at_provider(url, base_url)) else {
+            set_aside(&path);
+            continue;
+        };
+        let late = age >= KEPT_HOLDS_CLAIMS_FOR;
+        if late && !try_late {
+            kept.late = true;
+            continue;
+        }
+        let why = match http.post(url).timeout(timeout).bearer_auth(&account.credential).json(&file["body"]).send() {
             Ok(response) => {
                 let status = response.status();
+                let asked = super::net::retry_after(response.headers());
                 super::net::drain(response);
-                if status.is_success() || status.is_client_error() {
+                if status.is_success() || refused_for_good(status) {
                     let _ = std::fs::remove_file(&path);
-                } else {
-                    return false;
+                    continue;
                 }
+                kept.asked = kept.asked.max(asked);
+                format!("HTTP {status}")
             }
-            Err(_) => return false,
+            Err(_) => "the provider could not be reached".to_string(),
+        };
+        if late {
+            kept.late = true;
+            continue;
         }
+        kept.held = Some(format!("a finished flow's result has not been taken yet ({why}): it is sent again, and new flows wait until it lands"));
+        return kept;
     }
-    true
+    kept
 }
 
 pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
@@ -291,7 +376,8 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
 /// test that starts the loop gives it a client of its own, so that the connections
 /// of the other tests that use the lane's are not the loop's to close.
 fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
-    let _ = KEPT_DIR.set(store.data_dir().join("link").join("sealed-pending"));
+    let kept_dir = store.data_dir().join("link").join("sealed-pending");
+    let _ = KEPT_DIR.set(kept_dir.clone());
     std::thread::spawn(move || {
         let identity = match E2eIdentity::load_or_create(store.data_dir()) {
             Ok(identity) => identity,
@@ -303,6 +389,9 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
         };
         // Said once per reason, not every ten seconds while the provider is away.
         let mut last_warned: Option<String> = None;
+        // The same for what the kept completions say, which the polls beside them do not change.
+        let mut last_kept: Option<String> = None;
+        let mut next_late = std::time::Instant::now();
         loop {
             let Some(account) = store.account() else {
                 std::thread::sleep(Duration::from_secs(5));
@@ -326,10 +415,26 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
             // (completions kept from before, the provider away when they were made: told first)
             // A finished run is held at the provider until its completion lands. A claim now would
             // say this desktop had let go of it: the run would expire, and its result be refused.
-            if !resend_kept(&http, &account, Duration::from_secs(15)) {
+            let try_late = std::time::Instant::now() >= next_late;
+            let kept = resend_kept_in(&kept_dir, &http, &account, Duration::from_secs(15), try_late);
+            let asked = kept.asked.unwrap_or_default();
+            if try_late && kept.late {
+                next_late = std::time::Instant::now() + LATE_EVERY.max(asked);
+            }
+            let waiting = kept.held.clone().or_else(|| kept.late.then(|| LATE_NOTE.to_string()));
+            if waiting != last_kept {
+                if let Some(why) = &waiting {
+                    log::warn!("{why}");
+                }
+                last_kept = waiting;
+            }
+            if kept.held.is_some() {
+                if store.account().as_ref() == Some(&account) {
+                    store.note_sealed_flow(kept.held);
+                }
                 drop(http);
                 lane.start_afresh();
-                std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
+                std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds).max(asked));
                 continue;
             }
             let polled = std::time::Instant::now();
@@ -532,15 +637,239 @@ mod tests {
 
         let (url, away) = server(vec![(503, json!({}))]);
         keep(&url);
-        assert!(!resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5)));
+        assert!(resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5), true).held.is_some_and(|why| why.contains("503")));
         assert!(dir.join("run.json").exists(), "kept while the provider is away");
         away.join().unwrap();
 
         let (url, back) = server(vec![(200, json!({}))]);
         keep(&url);
-        assert!(resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5)));
+        assert!(resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5), true).held.is_none());
         assert!(!dir.join("run.json").exists(), "gone once taken");
         back.join().unwrap();
+    }
+
+    // --- what a kept completion does to the lane -------------------------------------
+
+    fn kept_body(base: &str) -> String {
+        json!({ "baseUrl": base, "url": format!("{base}/done"), "body": {"status": "done"} }).to_string()
+    }
+
+    /// A folder of its own holding `files`.
+    fn kept_folder(files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let dir = crate::test_dirs::temp_path("oaiy-sealed-kept");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        dir
+    }
+
+    fn dated(path: &std::path::Path, modified: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+    }
+
+    fn days_ago(days: u64) -> std::time::SystemTime {
+        std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600)
+    }
+
+    #[test]
+    fn a_completion_the_provider_cannot_take_for_now_is_kept_and_the_lane_waits_as_long_as_it_asked() {
+        // On a 429 as every lane came back, the file went: the run's work done, and nobody ever told the result.
+        for status in [408, 425, 429] {
+            let provider = Provider::start(move |_| Reply { status, headers: vec![("Retry-After".into(), "7".into())], body: "{}".into() });
+            let dir = kept_folder(&[("run.json", kept_body(&provider.base).as_bytes())]);
+            let kept = resend_kept_in(&dir, &client(), &account(provider.base.clone()), Duration::from_secs(5), true);
+            assert!(kept.held.is_some_and(|why| why.contains(&status.to_string())), "{status}");
+            assert_eq!(kept.asked, Some(Duration::from_secs(7)), "{status}");
+            assert!(dir.join("run.json").exists(), "{status}: the result is kept");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_completion_the_provider_refuses_for_good_goes() {
+        for status in [400, 401, 403, 404, 409, 410, 422] {
+            let provider = Provider::start(move |_| Reply::status(status, "{}"));
+            let dir = kept_folder(&[("run.json", kept_body(&provider.base).as_bytes())]);
+            let kept = resend_kept_in(&dir, &client(), &account(provider.base.clone()), Duration::from_secs(5), true);
+            assert!(kept.held.is_none() && !kept.late, "{status}");
+            assert!(!dir.join("run.json").exists(), "{status}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_first_send_of_a_completion_is_not_refused_by_a_provider_that_says_not_now() {
+        for status in [408, 425, 429] {
+            let identity = E2eIdentity::from_secret_bytes([17; 32]);
+            let sealed = request(&identity, "flow-one", json!({"v":1,"flowId":"flow-one","inputs":{}}));
+            let asked = AtomicBool::new(false);
+            let provider = Provider::start(move |req| {
+                if req.target.starts_with("/api/v1/desktop-flows/pending") {
+                    Reply::ok(&json!({"requests":[sealed.clone()]}).to_string())
+                } else if req.target.ends_with("/claim") {
+                    Reply::ok(&json!({"claimed":true,"request":sealed.clone()}).to_string())
+                } else if asked.swap(true, Ordering::SeqCst) {
+                    Reply::ok("{}")
+                } else {
+                    Reply { status, headers: vec![("Retry-After".into(), "2".into())], body: "{}".into() }
+                }
+            });
+            let ran = Cell::new(0);
+            let worked = poll_once(&client(), &account(provider.base.clone()), &spec(), "test-computer", &identity, &|| true, &|_, _| {
+                ran.set(ran.get() + 1);
+                Ok(json!("done"))
+            });
+            assert_eq!(worked, Ok(true), "{status}");
+            assert_eq!(ran.get(), 1, "{status}: the flow is not repeated");
+            let sent = provider.wait_for(&format!("/api/v1/desktop-flows/{ID}/complete"), 2, Duration::from_secs(5));
+            let gap = sent[1].at - sent[0].at;
+            assert!(gap >= Duration::from_millis(1_900), "{status}: sent again after {gap:?}, not the 2 s it asked for");
+        }
+    }
+
+    #[test]
+    fn a_kept_file_that_can_never_be_sent_goes_aside_with_the_lane_going_on_and_no_key_sent_anywhere() {
+        let provider = Provider::start(|_| Reply::ok("{}"));
+        let base = provider.base.clone();
+        let with_url = |url: &str| json!({ "baseUrl": base, "url": url, "body": {"status": "done"} }).to_string();
+        let bad = [
+            ("not-json.json", b"not json at all".to_vec()),
+            ("not-text.json", vec![0xff, 0xfe, 0x00, 0x7b]),
+            ("a-list.json", b"[1, 2]".to_vec()),
+            ("no-base.json", json!({ "url": format!("{base}/done"), "body": {} }).to_string().into_bytes()),
+            ("no-url.json", json!({ "baseUrl": base, "body": {} }).to_string().into_bytes()),
+            ("not-a-url.json", with_url("not a url at all").into_bytes()),
+            ("elsewhere.json", with_url("http://elsewhere.invalid/done").into_bytes()),
+            ("longer-host.json", with_url(&format!("{base}.elsewhere.invalid/done")).into_bytes()),
+            ("the-base-itself.json", with_url(&base).into_bytes()),
+        ];
+        let good = kept_body(&base);
+        let mut files: Vec<(&str, &[u8])> = bad.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
+        files.push(("good.json", good.as_bytes()));
+        let dir = kept_folder(&files);
+
+        let kept = resend_kept_in(&dir, &client(), &account(base.clone()), Duration::from_secs(5), true);
+        assert!(kept.held.is_none() && !kept.late, "{kept:?}");
+        for (name, _) in &bad {
+            assert!(!dir.join(name).exists(), "{name} is out of the way");
+            assert!(dir.join(format!("{name}.corrupt")).exists(), "{name} is kept aside");
+        }
+        assert_eq!(provider.lines(), ["POST /done"], "the good file went, and nothing else was tried");
+
+        // And what is aside is not read again.
+        assert!(resend_kept_in(&dir, &client(), &account(base), Duration::from_secs(5), true).held.is_none());
+        assert_eq!(provider.lines().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kept_file_of_another_provider_is_left_where_it_is() {
+        let provider = Provider::start(|_| Reply::status(500, "{}"));
+        let dir = kept_folder(&[("theirs.json", kept_body("http://other.invalid").as_bytes())]);
+        let kept = resend_kept_in(&dir, &client(), &account(provider.base.clone()), Duration::from_secs(5), true);
+        assert!(kept.held.is_none() && !kept.late);
+        assert!(dir.join("theirs.json").exists());
+        assert!(provider.requests().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kept_file_dated_in_the_future_counts_from_now() {
+        let provider = Provider::start(|_| Reply::status(500, "{}"));
+        let dir = kept_folder(&[("run.json", kept_body(&provider.base).as_bytes())]);
+        let file = dir.join("run.json");
+        dated(&file, std::time::SystemTime::now() + Duration::from_secs(365 * 24 * 3600));
+
+        let kept = resend_kept_in(&dir, &client(), &account(provider.base.clone()), Duration::from_secs(5), true);
+        assert!(kept.held.is_some(), "as new as the day it came: it holds the lane, for now");
+        let age = std::fs::metadata(&file).unwrap().modified().unwrap().elapsed();
+        assert!(age.as_ref().is_ok_and(|age| *age < Duration::from_secs(600)), "and is dated now, so that it ages: {age:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn after_a_day_a_kept_file_stops_holding_the_lane_and_is_still_sent() {
+        let answer = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let said = answer.clone();
+        let provider = Provider::start(move |_| Reply::status(said.load(Ordering::SeqCst), "{}"));
+        let dir = kept_folder(&[("run.json", kept_body(&provider.base).as_bytes())]);
+        let file = dir.join("run.json");
+        let linked = account(provider.base.clone());
+
+        dated(&file, days_ago(2));
+        let kept = resend_kept_in(&dir, &client(), &linked, Duration::from_secs(5), true);
+        assert!(kept.held.is_none(), "the lane goes back to claiming");
+        assert!(kept.late, "and it is said");
+        assert!(file.exists(), "a late result is better than none");
+        assert_eq!(provider.requests().len(), 1);
+
+        // Between its turns it is not sent, and it is still said.
+        assert!(resend_kept_in(&dir, &client(), &linked, Duration::from_secs(5), false).late);
+        assert_eq!(provider.requests().len(), 1);
+
+        // A file not a day old beside it still holds the lane.
+        std::fs::write(dir.join("newer.json"), kept_body(&provider.base)).unwrap();
+        assert!(resend_kept_in(&dir, &client(), &linked, Duration::from_secs(5), false).held.is_some());
+        std::fs::remove_file(dir.join("newer.json")).unwrap();
+
+        // And it lands the day the provider takes it.
+        answer.store(200, Ordering::SeqCst);
+        let kept = resend_kept_in(&dir, &client(), &linked, Duration::from_secs(5), true);
+        assert!(kept.held.is_none() && !kept.late);
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_week_on_a_kept_file_is_let_go_unsent() {
+        let provider = Provider::start(|_| Reply::status(500, "{}"));
+        let dir = kept_folder(&[("run.json", kept_body(&provider.base).as_bytes()), ("aside.json.corrupt", b"x")]);
+        dated(&dir.join("run.json"), days_ago(8));
+        dated(&dir.join("aside.json.corrupt"), days_ago(8));
+        let kept = resend_kept_in(&dir, &client(), &account(provider.base.clone()), Duration::from_secs(5), true);
+        assert!(kept.held.is_none() && !kept.late);
+        assert!(provider.requests().is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The lane's own loop on a folder with a kept file in it, until `done` has seen what it wants.
+    fn run_lane_on_a_kept_file(tag: &str, days: u64, provider: &Provider, done: impl FnOnce(&LinkHandle)) {
+        let (store, dir) = crate::link::testkit::linked_to(&provider.base, tag, |d| {
+            let lane = d.desktop_flows.as_mut().unwrap();
+            lane.wait_seconds = 1;
+            lane.error_backoff_seconds = 1;
+        });
+        let kept = dir.join("link").join("sealed-pending");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("run.json"), kept_body(&provider.base)).unwrap();
+        dated(&kept.join("run.json"), days_ago(days));
+        spawn_on(store.clone(), None, a_client_of_its_own());
+        done(&store);
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lane_held_back_by_a_kept_file_says_so() {
+        let provider = Provider::start(|req| if req.target == "/done" { Reply::status(503, "{}") } else { Reply::ok(&json!({"requests":[]}).to_string()) });
+        run_lane_on_a_kept_file("sealed-held", 0, &provider, |store| {
+            provider.wait_for("/done", 2, Duration::from_secs(30));
+            let why = store.status().sealed_flow_error;
+            assert!(why.as_deref().is_some_and(|why| why.contains("503") && why.contains("new flows wait")), "{why:?}");
+            assert!(provider.requests().iter().all(|r| r.target == "/done"), "no claim while it holds: {:?}", provider.lines());
+        });
+    }
+
+    #[test]
+    fn a_lane_goes_on_beside_a_kept_file_past_its_day() {
+        let provider = Provider::start(|req| if req.target == "/done" { Reply::status(500, "{}") } else { Reply::ok(&json!({"requests":[]}).to_string()) });
+        run_lane_on_a_kept_file("sealed-late", 2, &provider, |store| {
+            provider.wait_for("/api/v1/desktop-flows/pending", 3, Duration::from_secs(30));
+            assert_eq!(provider.wait_for("/done", 1, Duration::from_secs(1)).len(), 1, "sent again, but not at every poll: {:?}", provider.lines());
+            assert_eq!(store.status().sealed_flow_error, None, "the lane is working, and the panel is not told otherwise");
+        });
     }
 
     #[test]
