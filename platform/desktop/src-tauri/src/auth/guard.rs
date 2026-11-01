@@ -33,7 +33,8 @@
 //!
 //! Credentials that are not credentials here, and fail closed: the process-wide internal token and a
 //! legacy `oaiypat_<64 hex>` pairing token do not authenticate (`401 token_invalid`); the migration of the
-//! latter into the store is a later step, and the former is deleted by another.
+//! latter into the store is a later step. A flow's process is given a credential of its own in these
+//! modes in place of the former (`auth::runtime::run_credential`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
@@ -1236,6 +1237,22 @@ impl Guard {
         }
 
         // 10. authorize
+        //
+        // A flow's own credential stands in for the internal token `legacy` hands a flow, and that token was never a
+        // credential on a route the access model added (`Guard::claims`): a scope it holds does not reach further in
+        // these modes than the run reaches there.
+        if let (Some(p), Some(m)) = (&principal, &matched) {
+            if p.is_flow_run() && !pattern_existed_before(m) {
+                return Err(fail(
+                    Denial::new(
+                        StatusCode::FORBIDDEN,
+                        "insufficient_scope",
+                        "A flow's own credential does not reach this route.",
+                    )
+                    .counted("auth.denied"),
+                ));
+            }
+        }
         match authorize(&class, principal.as_ref(), self.mode) {
             Verdict::Allow => Ok(Admitted {
                 principal,

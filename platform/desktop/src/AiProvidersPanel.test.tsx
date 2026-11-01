@@ -260,6 +260,12 @@ describe('load failure', () => {
     await click(retry);
     expect(container.textContent).toContain('OpenAI');
   });
+
+  it('says why the saved providers are missing, where the list would be', async () => {
+    listMock.mockResolvedValue({ providers: [], problem: 'The saved providers could not be read: moved aside.' });
+    await mount();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('moved aside');
+  });
 });
 
 describe('save outcomes are reported honestly', () => {

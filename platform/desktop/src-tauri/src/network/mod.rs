@@ -517,6 +517,7 @@ impl Network {
             "pairingOpenUntilMs": self.pairing_open_until_ms(),
             "pairedByItself": lock(&self.inner.paired_by_itself).iter().map(|(name, at, code)| json!({ "name": name, "at": at, "code": code })).collect::<Vec<_>>(),
             "listenError": lock(&self.inner.listen_error).clone(),
+            "storeProblems": store::problems(&self.inner.dir),
             "settings": settings,
             "nodeId": id.as_ref().map(|i| i.node_id.clone()),
             "name": self.display_name(),

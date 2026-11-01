@@ -1227,6 +1227,37 @@ async fn t15_a_desk_or_run_credential_that_came_through_a_proxy_is_refused_howev
     );
 }
 
+/// A flow the server runs reaches what its AI, tool and engine calls take, and nothing the internal token of `legacy`
+/// could not: that token is no credential on a route the access model added, so a scope the run holds does not open
+/// one here (`PUT /api/services/:id/gpu` is `services.control`, as starting a service is).
+#[tokio::test]
+async fn a_flows_own_credential_reaches_no_more_than_the_internal_token_did() {
+    let run_scopes = Preset::Run.scopes();
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        let mut spec = MintSpec::new(Kind::Run, "flow run", run_scopes.clone(), 60_000);
+        spec.preset = Some(Preset::Run);
+        let run = e.store.mint(spec).unwrap().token;
+        for r in ROUTES.iter().filter(|r| r.class != Class::Public) {
+            for m in methods(r.method) {
+                let path = concrete(r.pattern);
+                let reply = go(&e, send(m.clone(), &path).bearer(&run)).await;
+                if !crate::auth::routes::pattern_existed_before(r.pattern) {
+                    assert_eq!(reply.status, 403, "{mode:?} {m} {path}: {}", reply.text);
+                } else if matches!(r.class, Class::Scope(s) if run_scopes.contains(s)) {
+                    assert_eq!(reply.status, 200, "{mode:?} {m} {path}: {}", reply.text);
+                } else if mode == AccessMode::Scoped {
+                    assert_eq!(reply.status, 403, "{mode:?} {m} {path}: {}", reply.text);
+                }
+            }
+        }
+        // A credential a caller derived is judged as it was: the rule is for a flow's own.
+        let derived = e.store.mint(MintSpec::new(Kind::Run, "derived", ScopeSet::of(&["services.control"]), 60_000)).unwrap().token;
+        let reply = go(&e, send(Method::PUT, "/api/services/x/gpu").bearer(&derived)).await;
+        assert_eq!(reply.status, 200, "{mode:?}: {}", reply.text);
+    }
+}
+
 // ================================= exposure: proxies, LAN, forwarded ==============================
 
 #[tokio::test]

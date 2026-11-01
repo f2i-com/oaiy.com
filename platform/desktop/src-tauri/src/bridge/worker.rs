@@ -93,6 +93,15 @@ pub fn outside_input(run: &RunRecord) -> bool {
 }
 /// How often a running child is checked for exit / cancellation.
 const CHILD_POLL: Duration = Duration::from_millis(250);
+/// How long past its timeout a CLI is left to report which node was stuck, before it is killed from here.
+const CLI_GRACE: Duration = Duration::from_secs(10);
+/// How long a run's credential outlasts that kill. It is ended as the run ends: this is for a process that dies with
+/// the credential not yet ended.
+const CREDENTIAL_GRACE: Duration = Duration::from_secs(30);
+/// What a run's scratch folder is named from, in the temp folder.
+const SCRATCH_PREFIX: &str = "oaiy-run-";
+/// The file in a scratch folder that its run holds locked for as long as it runs.
+const SCRATCH_LIVE: &str = ".live";
 /// Cap on captured child output kept for error reporting.
 const MAX_CAPTURE: usize = 16 * 1024;
 /// The most flows one run is handed (the flow, its subflows and theirs): far more than any flow runs, so a chain of
@@ -1010,19 +1019,18 @@ pub(crate) fn execute_run(
     // machine — inputs may hold user data.
     // (a name no one can know beforehand, and made new: a folder already there, which another user of this computer
     // could have made to read or change a run's inputs, is refused rather than used)
-    let scratch = std::env::temp_dir().join(format!("oaiy-run-{}-{}", run.run_id, uuid::Uuid::new_v4().simple()));
-    if let Err(e) = make_private_dir(&scratch) {
-        return fail(RunErrorCode::Internal, &format!("cannot create scratch dir: {e}"));
-    }
-    let inputs_path = scratch.join("inputs.json");
-    let out_path = scratch.join("result.json");
+    let scratch = match RunScratch::make(&std::env::temp_dir(), &run.run_id) {
+        Ok(scratch) => scratch,
+        Err(e) => return fail(RunErrorCode::Internal, &format!("cannot create scratch dir: {e}")),
+    };
+    let inputs_path = scratch.dir.join("inputs.json");
+    let out_path = scratch.dir.join("result.json");
     // A flow that runs others is handed with them, as one project file named for the flow (the CLI takes a flow's
     // id from its file's name).
-    let project_path = scratch.join(format!("{flow_id}.json"));
+    let project_path = scratch.dir.join(format!("{flow_id}.json"));
     let flow_path = match flows.project_of(flow_id) {
         Some(project) => {
             if let Err(e) = std::fs::write(&project_path, project.to_string()) {
-                let _ = std::fs::remove_dir_all(&scratch);
                 return fail(RunErrorCode::Internal, &format!("cannot write the flow and its subflows: {e}"));
             }
             project_path
@@ -1035,7 +1043,6 @@ pub(crate) fn execute_run(
         .unwrap_or_else(|| Value::Object(Default::default()));
     // A picture given inline (an app's, FormLogic's) reaches the flow as the engines' reference to it.
     if let Err(e) = super::pictures::by_reference(&mut inputs_body, &super::pictures::upload_local) {
-        let _ = std::fs::remove_dir_all(&scratch);
         return fail(RunErrorCode::InvalidRequest, &e);
     }
     if let Err(e) = std::fs::write(&inputs_path, inputs_body.to_string()) {
@@ -1077,8 +1084,97 @@ pub(crate) fn execute_run(
         },
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     bridge_outcome(outcome, timeout)
+}
+
+/// One run's folder in the temp folder, held for as long as the run and removed with it, whichever way it ends.
+struct RunScratch {
+    dir: PathBuf,
+    /// Locked: the operating system lets go of it however this process ends, so a folder nobody holds is a dead
+    /// run's ([`sweep_scratch`]).
+    live: Option<std::fs::File>,
+}
+
+impl RunScratch {
+    fn make(temp: &Path, run_id: &str) -> std::io::Result<RunScratch> {
+        let dir = temp.join(format!("{SCRATCH_PREFIX}{run_id}-{}", uuid::Uuid::new_v4().simple()));
+        make_private_dir(&dir)?;
+        // Made now, so that every return below removes the folder.
+        let mut scratch = RunScratch { dir, live: None };
+        let live = std::fs::File::create(scratch.dir.join(SCRATCH_LIVE))?;
+        fs2::FileExt::try_lock_exclusive(&live)?;
+        scratch.live = Some(live);
+        Ok(scratch)
+    }
+}
+
+impl Drop for RunScratch {
+    fn drop(&mut self) {
+        // (first: Windows removes no file that is open)
+        self.live = None;
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Remove what runs of this user left in the temp folder when a crash or a kill stopped them: a run removes its own
+/// folder as it ends, and nothing else would remove these, and a run's inputs may hold personal data. For the start of
+/// the process, on a thread of its own (the temp folder can be large).
+pub fn sweep_scratch() {
+    let swept = sweep_scratch_in(&std::env::temp_dir());
+    if swept > 0 {
+        log::info!("removed {swept} leftover run folder(s) from the temp folder");
+    }
+}
+
+/// [`sweep_scratch`] of the folder `temp`. How many it removed.
+fn sweep_scratch_in(temp: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(temp) else { return 0 };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(|name| name.starts_with(SCRATCH_PREFIX)) {
+            continue;
+        }
+        let dir = entry.path();
+        // (not followed: a link is not a run's folder, whatever it is called)
+        let Ok(found) = std::fs::symlink_metadata(&dir) else { continue };
+        if found.is_dir() && mine(&found) && !scratch_in_use(&dir, &found) && std::fs::remove_dir_all(&dir).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
+}
+
+/// Whether this user made what `found` describes. Another user's folder in a temp folder they share is theirs.
+#[cfg(unix)]
+fn mine(found: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` takes nothing and cannot fail.
+    found.uid() == unsafe { libc::geteuid() }
+}
+
+/// (The temp folder is the user's own here, and one that another account can use lets this one into nothing it made:
+/// such a folder fails [`scratch_in_use`] and the removal.)
+#[cfg(not(unix))]
+fn mine(_found: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Whether a live run could own the scratch folder `dir`: its run holds [`SCRATCH_LIVE`], in this process or any other,
+/// on any data folder of this user. A folder without that file was just made, or by a version from before it: then
+/// only its age says, and no run lasts longer than [`MAX_TIMEOUT_MS`] and its grace. Anything that cannot be told is
+/// left alone.
+fn scratch_in_use(dir: &Path, found: &std::fs::Metadata) -> bool {
+    match std::fs::File::open(dir.join(SCRATCH_LIVE)) {
+        Ok(live) => fs2::FileExt::try_lock_exclusive(&live).is_err(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => could_still_be_running(found.modified().ok()),
+        Err(_) => true,
+    }
+}
+
+/// Whether a folder last changed `at` could still be a live run's, as far as its age can say.
+fn could_still_be_running(at: Option<std::time::SystemTime>) -> bool {
+    let longest = Duration::from_millis(MAX_TIMEOUT_MS) + CLI_GRACE + CREDENTIAL_GRACE;
+    at.and_then(|at| at.elapsed().ok()).is_none_or(|age| age <= longest)
 }
 
 /// How the bridge lane reports what the CLI did. Pure, so every arm is pinned
@@ -1352,12 +1448,23 @@ pub fn run_flow_cli_with(
     // among them — fail closed on a missing Origin, and a spawned CLI has none,
     // so without this every chat node in a relayed flow was refused with
     // "origin not allowed" and failed the whole run. The child is this
-    // process's own, so it carries this process's credential.
-    let internal = crate::internal_token();
-    if internal.is_empty() {
+    // process's own: in `legacy` it carries this process's credential, and where
+    // that is no credential (`scoped`, `shadow`) one of its own, for this run, held
+    // until this returns.
+    let credential = match crate::auth::run_credential(req.timeout + CLI_GRACE + CREDENTIAL_GRACE) {
+        Ok(credential) => credential,
+        Err(e) => {
+            return CliOutcome::Unavailable {
+                message: format!("this run could not be given a credential: {e}"),
+                detail: None,
+                retryable: true,
+            }
+        }
+    };
+    if credential.bearer().is_empty() {
         cmd.env_remove("OAIY_SERVER_TOKEN");
     } else {
-        cmd.env("OAIY_SERVER_TOKEN", internal);
+        cmd.env("OAIY_SERVER_TOKEN", credential.bearer());
     }
     confine_child(
         &mut cmd,
@@ -1389,7 +1496,7 @@ pub fn run_flow_cli_with(
 
     // Grace over the CLI's own timeout so the CLI gets to time out FIRST and
     // report which node was stuck — killing from out here loses that.
-    let deadline = Instant::now() + req.timeout + Duration::from_secs(10);
+    let deadline = Instant::now() + req.timeout + CLI_GRACE;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -2436,6 +2543,65 @@ mod tests {
             false,
             &|| false,
         )
+    }
+
+    /// A kill leaves a run's folder in the temp folder for good, and its inputs may hold personal data. The sweep takes
+    /// that and nothing else: not a run going on now, on any data folder of this user, not another program's folder.
+    #[test]
+    fn the_sweep_takes_what_dead_runs_left_and_nothing_a_live_run_could_own() {
+        let temp = crate::secret_file::testing::TempDir::new("scratch-sweep");
+        let folder = |name: &str| {
+            let dir = temp.0.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("inputs.json"), "{}").unwrap();
+            dir
+        };
+        // Its process was killed: nobody holds the file that says the run is going.
+        let dead = folder("oaiy-run-dead-0123");
+        std::fs::write(dead.join(SCRATCH_LIVE), "").unwrap();
+        let going = RunScratch::make(&temp.0, "run_going").unwrap();
+        // From a version before that file, or a run a moment old: it could be running.
+        let unmarked = folder("oaiy-run-unmarked-0123");
+        // Dead by every other sign, and not run folders by their names.
+        let others = [folder("oaiy-flow-run-1"), folder("oaiy-runner"), folder("oaiy-run"), folder("not-oaiy-run-1")];
+        for dir in &others {
+            std::fs::write(dir.join(SCRATCH_LIVE), "").unwrap();
+        }
+        let a_file = temp.0.join("oaiy-run-a-file");
+        std::fs::write(&a_file, "x").unwrap();
+        #[cfg(unix)]
+        let (outside, link) = {
+            let outside = folder("outside");
+            let link = temp.0.join("oaiy-run-link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            (outside, link)
+        };
+
+        assert_eq!(sweep_scratch_in(&temp.0), 1);
+        assert!(!dead.exists());
+        assert!(going.dir.join(SCRATCH_LIVE).exists(), "a live run keeps its folder");
+        assert!(unmarked.join("inputs.json").exists());
+        assert!(others.iter().all(|dir| dir.exists()) && a_file.exists());
+        #[cfg(unix)]
+        assert!(link.exists() && outside.join("inputs.json").exists(), "a link is not followed");
+
+        // And when it ends the folder goes with it, by its own hand.
+        let dir = going.dir.clone();
+        drop(going);
+        assert!(!dir.exists());
+    }
+
+    /// A folder with no `.live` is left for as long as a run could last, whatever the clock says.
+    #[test]
+    fn a_folder_with_no_mark_is_a_dead_runs_only_past_the_longest_run() {
+        let longest = Duration::from_millis(MAX_TIMEOUT_MS) + CLI_GRACE + CREDENTIAL_GRACE;
+        let at = |ago: Duration| std::time::SystemTime::now().checked_sub(ago);
+        assert!(!could_still_be_running(at(longest + Duration::from_secs(60))));
+        assert!(could_still_be_running(at(longest - Duration::from_secs(60))));
+        assert!(could_still_be_running(at(Duration::ZERO)));
+        assert!(could_still_be_running(None), "an age that cannot be told is no age");
+        // (a time ahead of the clock's has no age either)
+        assert!(could_still_be_running(std::time::SystemTime::now().checked_add(Duration::from_secs(600))));
     }
 
     #[test]

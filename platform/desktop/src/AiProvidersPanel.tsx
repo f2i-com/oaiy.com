@@ -108,6 +108,8 @@ export default function AiProvidersPanel() {
    *  ServicesPanel's: an upstream provider error can be long, and a toast that
    *  vanishes after five seconds is not enough time to read or act on it. */
   const [actionError, setActionError] = useState<string | null>(null);
+  /** What the desktop could not do with the saved providers when it started: they are missing for a reason. */
+  const [storeProblem, setStoreProblem] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -122,6 +124,7 @@ export default function AiProvidersPanel() {
       const res = await aiProviders.list();
       setProviders(res.providers);
       put('providers', res.providers);
+      setStoreProblem(res.problem ?? null);
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -316,6 +319,11 @@ export default function AiProvidersPanel() {
         </div>
       )}
 
+      {storeProblem && (
+        <div className="banner banner-err" role="alert">
+          <span>{storeProblem}</span>
+        </div>
+      )}
       {actionError && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>⚠ {actionError}</span>

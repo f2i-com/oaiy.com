@@ -33,7 +33,7 @@ pub enum Preset {
     Readonly,
     /// The Aokie Companion on a LAN, interim.
     Companion,
-    /// The per-run credential of an approved flow's CLI child.
+    /// The per-run credential of a flow's CLI child: what its AI, tool and engine calls take, and no more.
     Run,
     /// The vault ceremony token.
     Ceremony,
@@ -202,7 +202,6 @@ impl Preset {
                 "services.read",
                 "services.control",
                 "agent.tasks",
-                "flows.read",
                 "speech.use",
             ]),
             Preset::Ceremony => ScopeSet::of(&["vault.kt"]),
@@ -368,7 +367,7 @@ mod tests {
                 ("mcp", 2),
                 ("readonly", 6),
                 ("companion", 4),
-                ("run", 8),
+                ("run", 7),
                 ("ceremony", 1),
             ]
         );
@@ -627,8 +626,8 @@ mod tests {
     /// `cli-admin`, which hold that scope. OAIY Network adds nineteen: its status, settings, pairing and unpairing
     /// (`auth.read`, `auth.manage`, `auth.revoke`: thirteen, with its pins, the owner's alone), a paired worker's models (`ai.use`:
     /// two, for the nine presets that use this desktop's own engines), and the flows a worker shares, run there (`flows.read`,
-    /// `runs.read`, `runs.write`: four for the presets that hold all three, two for `readonly`, which reads, and one for `run`,
-    /// which reads the flows alone).
+    /// `runs.read`, `runs.write`: four for the presets that hold all three, two for `readonly`, which reads). `run` gave up
+    /// `flows.read`, three of the routes the design counted and one of those: nothing a flow's process calls reads a flow.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -649,7 +648,7 @@ mod tests {
                 ("mcp", 7),
                 ("readonly", 28 + 1 + 1 + 2),
                 ("companion", 17 + 4),
-                ("run", 32 + 3 + 6 + 2 + 1),
+                ("run", 29 + 3 + 6 + 2),
                 ("ceremony", 4),
             ]
         );

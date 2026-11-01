@@ -338,6 +338,15 @@ one, move the two to `[Service]`, where they are `StartLimitInterval=` and `Star
 stops the managed services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
 
+`oaiy-server` with no arguments starts the server; `--help` and `--version` answer and exit; `auth`, `check` and `flows` are
+the console; anything else is usage, exit 2, and touches nothing. Of two servers on one data folder (the web build's, or
+any in `scoped` or `shadow`) the second is refused with exit 78 before it opens anything in the folder.
+
+A flow the server runs calls back on a credential of its own, in `scoped` and `shadow`: a `run` credential that lives in
+memory, works from this computer only, ends with the run, and holds `ai.read`, `ai.use`, `speech.use`, `connectors.use`,
+`services.read`, `services.control` and `agent.tasks`, on the routes that existed before the access model. (In `legacy`
+a flow's process gets the process's internal token, as it always did.)
+
 ### A token-only install on the web build
 
 The release builds the headless server with the web login. An install that has only `OAIY_SERVER_TOKEN` (no owner, no

@@ -15,6 +15,9 @@ use std::time::Duration;
 /// Where the engine's files are on this desktop.
 pub const FILES_PATH: &str = "/api/ai/engine/gateway/files/";
 
+/// How long a credential for one call to those files is good for (they are given a minute at most).
+const LOCAL_CALL: Duration = Duration::from_secs(90);
+
 /// Below this many bytes left, no picture is tried: a JPEG that small says little.
 const MIN_BYTES: usize = 8 * 1024;
 
@@ -259,9 +262,10 @@ pub fn inline_local(mut inputs: Value) -> Value {
 /// desktop's own address of it (as a picture the engines made is named).
 pub fn upload_local(bytes: &[u8], mime: &str) -> Result<String, String> {
     let base = format!("http://127.0.0.1:{}", crate::api_port());
+    let credential = crate::auth::run_credential(LOCAL_CALL).map_err(|e| e.to_string())?;
     let response = reqwest::blocking::Client::new()
         .post(format!("{base}{}", FILES_PATH.trim_end_matches('/')))
-        .bearer_auth(crate::internal_token())
+        .bearer_auth(credential.bearer())
         .header(reqwest::header::CONTENT_TYPE, mime)
         .body(bytes.to_vec())
         .timeout(Duration::from_secs(60))
@@ -287,9 +291,10 @@ pub fn fetch_local(reference: &str) -> Result<Vec<u8>, String> {
     if port != Some(crate::api_port()) {
         return Err("it is a picture at another address than this desktop's".into());
     }
+    let credential = crate::auth::run_credential(LOCAL_CALL).map_err(|e| e.to_string())?;
     let response = reqwest::blocking::Client::new()
         .get(format!("http://127.0.0.1:{}{path}", crate::api_port()))
-        .bearer_auth(crate::internal_token())
+        .bearer_auth(credential.bearer())
         .timeout(Duration::from_secs(30))
         .send()
         .map_err(|e| format!("it could not be read ({e})"))?;

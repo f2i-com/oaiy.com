@@ -1472,11 +1472,7 @@ mod tests {
     }
 
     fn store(tag: &str) -> (StorageStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "oaiy-app-logic-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dirs::temp_path(&format!("oaiy-app-logic-{tag}"));
         std::fs::create_dir_all(dir.join("link")).unwrap();
         (StorageStore::open(&dir), dir)
     }

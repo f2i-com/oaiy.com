@@ -436,8 +436,7 @@ mod tests {
     use crate::plugins::trust::{Publishers, TrustPolicy};
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("oaiy-inst-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+        let p = crate::test_dirs::temp_path(&format!("oaiy-inst-{name}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

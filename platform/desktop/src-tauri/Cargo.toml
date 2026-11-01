@@ -5,7 +5,7 @@ description = "Tray-resident OAIY Desktop for oaiy-web. Manages local AI service
 authors = ["OAIY"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 # The crate ships two binaries now (the GUI app + the headless oaiy-server),
 # so `cargo run` / `tauri dev` would be ambiguous without naming the default.
 default-run = "oaiy-desktop"

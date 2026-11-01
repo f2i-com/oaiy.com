@@ -167,9 +167,7 @@ fn pinned(body: &str, pin: bool) -> axum::response::Response {
 }
 
 fn temp(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oaiy-network-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    crate::test_dirs::temp_path(&format!("oaiy-network-{tag}"))
 }
 
 fn ai(engines: Option<String>) -> crate::ai::AiState {
@@ -440,7 +438,8 @@ async fn a_primarys_voice_copies_are_kept_under_its_certificate() {
     assert!(long.len() <= 48 && crate::voice::voices::clean_name(&long).as_deref() == Ok(long.as_str()), "{long}");
     assert_ne!(long, worker::copied_voice_name(&a, &format!("{}y", "x".repeat(39))));
     // a paired primary's copy, named so, and removed when it is unpaired
-    crate::voice::voices::init(&temp("voices-copies"));
+    // (the one folder of voices of the process, kept by whichever test comes first)
+    crate::voice::voices::init(&crate::test_dirs::process_path("oaiy-network-voices"));
     let worker = node("worker-copies", Role::Worker, None).await;
     let primary = node("primary-copies", Role::Primary, None).await;
     pair(&primary, &worker).await;
@@ -804,7 +803,7 @@ async fn a_primary_uses_oaiy_voice_on_a_worker() {
         registry.add_template(template).unwrap();
         port
     };
-    crate::voice::voices::init(&temp("voices-data"));
+    crate::voice::voices::init(&crate::test_dirs::process_path("oaiy-network-voices"));
     let worker = node("worker-voice", Role::Worker, Some(fake_engines().await)).await;
     let port = set_up(&worker);
     let primary = node("primary-voice", Role::Primary, None).await;

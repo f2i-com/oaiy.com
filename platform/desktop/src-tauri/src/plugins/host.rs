@@ -2818,18 +2818,9 @@ mod tests {
     struct Sandbox(PathBuf);
     impl Sandbox {
         fn new(tag: &str) -> Self {
-            use std::sync::atomic::AtomicU32;
-            static N: AtomicU32 = AtomicU32::new(0);
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!("oaiy-host-{tag}-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
+            let p = crate::test_dirs::temp_path(&format!("oaiy-host-{tag}"));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
-        }
-    }
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

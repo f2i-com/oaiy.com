@@ -60,8 +60,13 @@ impl Server {
 
     /// Start it on `port` and leave it to come up (or not) by itself.
     fn spawn(scratch: &Scratch, extra_env: &[(&str, String)], port: u16) -> Server {
+        Server::spawn_logging_to(scratch, extra_env, port, "server.stderr")
+    }
+
+    /// [`Server::spawn`], its stderr in the file `log` of the folder: a second server on one data folder has its own.
+    fn spawn_logging_to(scratch: &Scratch, extra_env: &[(&str, String)], port: u16, log: &str) -> Server {
         let data = scratch.0.join("data");
-        let stderr = scratch.0.join("server.stderr");
+        let stderr = scratch.0.join(log);
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_oaiy-server"));
         // Nothing of this environment but what a program needs to run: a developer's shell may
@@ -216,7 +221,7 @@ fn answer(mut stream: TcpStream, gateway: &str, chats: &Mutex<Vec<Value>>) {
         ("GET", "/gw/v1/discovery") => (
             200,
             json!({
-                "endpoints": [{ "name": "chat", "path": "/v1/chat/completions", "spec": "openai" }],
+                "endpoints": [{ "name": "chat", "path": "/v1/chat/completions", "spec": "openai" }, { "name": "files", "path": "/files" }],
                 "models": { "llm": [{ "id": "flash", "default": true, "files_present": true }] },
                 "defaults": { "llm": "flash" },
             }),
@@ -232,6 +237,7 @@ fn answer(mut stream: TcpStream, gateway: &str, chats: &Mutex<Vec<Value>>) {
                 }),
             )
         }
+        ("POST", "/gw/files") => (200, json!({ "url": "/files/inputs/stored.png" })),
         _ => (404, json!({ "error": "not here" })),
     };
     let text = answer.to_string();
@@ -273,6 +279,272 @@ fn a_headless_server_told_where_the_engines_are_answers_through_them() {
         sources["sources"].as_array().unwrap().iter().any(|s| s["providerId"] == "oaiy-engine"),
         "the engine is one of the sources a flow can pick: {sources}"
     );
+}
+
+/// The folder `node` is in, when this machine has one: what a flow's CLI runs under.
+fn node_dir() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "node.exe" } else { "node" };
+    std::env::split_paths(&std::env::var_os("PATH")?).find(|dir| dir.join(name).is_file())
+}
+
+/// A stand-in for the CLI: a ready ZIPP engine to the server, and for a run what a flow's nodes do with what the server
+/// gives its process. It writes a line to `runs.log` for each run, so a run that executes twice shows, and calls back
+/// on its credential: the AI gateway, as an AI node does, and two routes no flow calls.
+fn stub_cli(scratch: &Scratch) -> PathBuf {
+    let script = scratch.0.join("stub-cli.mjs");
+    let capabilities = json!({
+        "version": "0.2.0",
+        "protocols": { "run": 1, "script": 1, "profile": 1 },
+        "engine": {
+            "name": "zipp", "status": "ready",
+            "release": "vF.I.X", "version": "F.I.X", "revision": "0123abcd",
+            "wasmSha256": "ab".repeat(32), "languages": ["javascript"],
+        },
+        "run": { "languages": ["javascript"], "defaultInstructionSteps": 50, "maxInstructionSteps": 2000 },
+    });
+    let body = format!(
+        r#"import fs from 'node:fs';
+const a = process.argv.slice(2);
+if (a[0] === 'capabilities') {{ process.stdout.write({capabilities}); process.exit(0); }}
+if (a[0] !== 'run') process.exit(2);
+fs.appendFileSync({log}, 'ran\n');
+const inputs = fs.readFileSync(a[a.indexOf('--inputs') + 1], 'utf8');
+fs.writeFileSync({kept}, inputs);
+if (JSON.parse(inputs).hang) {{ await new Promise((go) => setTimeout(go, 60000)); process.exit(1); }}
+const token = process.env.OAIY_SERVER_TOKEN;
+const call = (method, path, body) => fetch(process.env.OAIY_SERVER_URL + path, {{
+  method, headers: {{ authorization: `Bearer ${{token}}`, 'content-type': 'application/json' }}, body: body && JSON.stringify(body),
+}});
+const chat = await call('POST', '/api/ai/providers/oaiy-engine/v1/chat/completions', {{ messages: [{{ role: 'user', content: 'hi' }}] }});
+const answer = await chat.json();
+fs.writeFileSync(a[a.indexOf('-o') + 1], JSON.stringify({{
+  success: chat.ok, engine: 'zipp', error: chat.ok ? undefined : JSON.stringify(answer), token, chat: chat.status,
+  config: (await call('GET', '/api/config')).status,
+  whoami: (await call('GET', '/api/auth/whoami')).status,
+}}));
+"#,
+        capabilities = serde_json::to_string(&capabilities.to_string()).unwrap(),
+        log = serde_json::to_string(&scratch.0.join("runs.log")).unwrap(),
+        kept = serde_json::to_string(&scratch.0.join("last-inputs.json")).unwrap(),
+    );
+    std::fs::write(&script, body).unwrap();
+    script
+}
+
+/// What a server needs to run flows on [`stub_cli`] in `scoped` mode (the web build's, and the one named for the build
+/// without the login, which defaults to `legacy`), with `engines` for its AI. `None` on a machine with no `node`.
+fn flow_env(scratch: &Scratch, engines: &FakeEngines) -> Option<Vec<(&'static str, String)>> {
+    let Some(node) = node_dir() else {
+        eprintln!("skipped: no node on this machine");
+        return None;
+    };
+    let path = if cfg!(windows) {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(r"{root}\System32;{root};{}", node.display())
+    } else {
+        format!("/usr/bin:/bin:{}", node.display())
+    };
+    Some(vec![
+        ("OAIY_ACCESS_MODE", "scoped".to_string()),
+        ("OAIY_CLI", stub_cli(scratch).display().to_string()),
+        ("OAIY_ENGINES_UI", engines.ui.clone()),
+        ("PATH", path),
+    ])
+}
+
+/// Store a flow for [`stub_cli`] to run.
+fn store_flow(server: &Server) {
+    let flow = json!({ "nodes": [{ "id": "n", "type": "logic_block", "position": { "x": 0, "y": 0 }, "data": { "code": "return 1;" } }], "edges": [] });
+    let (status, answered) = server.call(reqwest::Method::PUT, "/api/bridge/flows/stub", Some(flow), true);
+    assert!(status < 300, "{status} {answered}");
+}
+
+/// Reserve a run of that flow under `key`.
+fn run_flow(server: &Server, key: &str) -> Value {
+    run_flow_on(server, key, json!({}))
+}
+
+/// [`run_flow`], with inputs.
+fn run_flow_on(server: &Server, key: &str, input: Value) -> Value {
+    let request = json!({
+        "protocol": "oaiy-bridge/1", "caller": { "product": "headless-test" }, "flowId": "stub", "input": input,
+        "correlationId": key, "idempotencyKey": key, "timeoutMs": 60000, "mode": "async",
+    });
+    let (status, answered) = server.post("/api/bridge/runs", request);
+    assert!(status < 300, "{status} {answered}");
+    answered
+}
+
+/// Wait for a run to end, and answer what the ledger says of it.
+fn finished(server: &Server, run: &Value) -> Value {
+    let id = run["runId"].as_str().expect("a run id");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (_, now) = server.get(&format!("/api/bridge/runs/{id}"), true);
+        if matches!(now["status"].as_str(), Some("succeeded" | "failed" | "cancelled" | "timed_out")) {
+            return now;
+        }
+        assert!(Instant::now() < deadline, "the run did not end: {now} {}", server.stderr_tail());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `scoped` does not take the internal token, and a flow is a process the server starts: it used to be handed that
+/// token, so every flow with an AI node failed at its first call with "Check your API key". The release's mode.
+#[test]
+fn a_flow_the_server_runs_calls_back_on_a_credential_of_its_own_that_ends_with_it() {
+    let scratch = Scratch::new("flow-credential");
+    let engines = fake_engines();
+    let Some(env) = flow_env(&scratch, &engines) else { return };
+    let server = Server::start(&scratch, &env);
+    store_flow(&server);
+    let run = finished(&server, &run_flow(&server, "a"));
+
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(run["output"]["chat"], 200, "{run}");
+    assert_eq!(engines.chats.lock().unwrap().len(), 1, "the AI node reached the engines");
+    let token = run["output"]["token"].as_str().unwrap();
+    assert!(token.starts_with("oaiyrun_"), "{token}");
+
+    // It is what a flow's nodes need, no more: a route of a scope it does not hold, and one the access model added.
+    assert_eq!(run["output"]["config"], 403, "{run}");
+    assert_eq!(run["output"]["whoami"], 403, "{run}");
+
+    // And it ended with the run.
+    let refused = reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{}/api/ai/engine/services", server.port))
+        .bearer_auth(token)
+        .send()
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 401);
+    assert_eq!(refused.json::<Value>().unwrap()["error"]["code"], "token_revoked");
+    // Nothing of it is on the disk.
+    let credentials = std::fs::read_to_string(scratch.0.join("data").join("auth").join("credentials.json")).unwrap_or_default();
+    assert!(!credentials.contains("flow run"), "{credentials}");
+}
+
+/// A picture given inline goes to the engines before the run starts, from this process over loopback, on the same
+/// internal token: in `scoped` the run failed there, before the flow was given anything.
+#[test]
+fn a_run_with_a_picture_hands_it_to_the_engines_on_a_credential_of_its_own() {
+    let scratch = Scratch::new("flow-picture");
+    let engines = fake_engines();
+    let Some(env) = flow_env(&scratch, &engines) else { return };
+    let server = Server::start(&scratch, &env);
+    store_flow(&server);
+    let picture = format!("data:image/png;base64,{}", "AAAA".repeat(24 * 1024));
+    let run = finished(&server, &run_flow_on(&server, "picture", json!({ "picture": picture })));
+    assert_eq!(run["status"], "succeeded", "{}", run["error"]);
+    let inputs = std::fs::read_to_string(scratch.0.join("last-inputs.json")).unwrap();
+    let reference = format!("http://127.0.0.1:{}/api/ai/engine/gateway/files/inputs/stored.png", server.port);
+    assert_eq!(serde_json::from_str::<Value>(&inputs).unwrap()["picture"], reference.as_str());
+}
+
+/// A start that is refused used to do all that a start does first: its ledger replaced the running server's file by
+/// rename, every run after that lived in memory alone, and the same idempotency key ran the flow again after a restart.
+#[test]
+fn a_refused_second_start_leaves_the_running_servers_ledger_and_idempotency_alone() {
+    let scratch = Scratch::new("second-start");
+    let engines = fake_engines();
+    let Some(env) = flow_env(&scratch, &engines) else { return };
+    let first = Server::start(&scratch, &env);
+    store_flow(&first);
+    assert_eq!(finished(&first, &run_flow(&first, "before"))["status"], "succeeded");
+
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut second = Server::spawn_logging_to(&scratch, &env, port, "second.stderr");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let refused = loop {
+        if let Some(status) = second.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the second server was not refused");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(refused.code(), Some(78), "{}", second.stderr_tail());
+    let said = second.stderr_tail();
+    assert!(said.contains("in use by process") && !said.contains("oaiy-server starting"), "{said}");
+
+    // The run after it reaches the file, which the first server's handle still names.
+    let after = finished(&first, &run_flow(&first, "after"));
+    assert_eq!(after["status"], "succeeded");
+    let id = after["runId"].as_str().unwrap();
+    let ledger = std::fs::read_to_string(scratch.0.join("data").join("bridge").join("ledger.jsonl")).unwrap();
+    assert!(ledger.contains(id), "the run is not in the ledger's file");
+
+    // A restart still answers it, and the same key does not run the flow again.
+    drop(first);
+    let ran = || std::fs::read_to_string(scratch.0.join("runs.log")).unwrap().lines().count();
+    assert_eq!(ran(), 2);
+    let restarted = Server::start(&scratch, &env);
+    let (status, kept) = restarted.get(&format!("/api/bridge/runs/{id}"), true);
+    assert_eq!((status, kept["status"].as_str()), (200, Some("succeeded")), "{kept}");
+    let repeat = run_flow(&restarted, "after");
+    assert_eq!((repeat["runId"].as_str(), repeat["idempotent"].as_bool()), (Some(id), Some(true)), "{repeat}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(ran(), 2, "the flow ran again");
+}
+
+/// A run's folder was removed only by the run: the server killed in the middle of one left its inputs in the temp
+/// folder for good. A start sweeps them, and only them: a folder a run on this same temp folder is using stays.
+#[test]
+fn what_a_killed_run_left_in_the_temp_folder_goes_at_the_next_start() {
+    let scratch = Scratch::new("killed-run");
+    let engines = fake_engines();
+    let Some(mut env) = flow_env(&scratch, &engines) else { return };
+    let temp = scratch.0.join("temp");
+    std::fs::create_dir(&temp).unwrap();
+    for name in ["TEMP", "TMP", "TMPDIR"] {
+        env.push((name, temp.display().to_string()));
+    }
+    let leftovers = || std::fs::read_dir(&temp).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("oaiy-run-")).count();
+    {
+        let server = Server::start(&scratch, &env);
+        store_flow(&server);
+        run_flow_on(&server, "killed", json!({ "hang": true }));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !scratch.0.join("runs.log").exists() {
+            assert!(Instant::now() < deadline, "the run did not start: {}", server.stderr_tail());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert_eq!(leftovers(), 1, "the kill left the run's folder");
+    let server = Server::start(&scratch, &env);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while leftovers() != 0 {
+        assert!(Instant::now() < deadline, "the start did not sweep it: {}", server.stderr_tail());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--help`, `--version` and a mistyped word used to start a real server, on whatever folder the environment named.
+#[test]
+fn only_no_arguments_at_all_starts_the_server() {
+    let scratch = Scratch::new("arguments");
+    let data = scratch.0.join("data");
+    // (a port that is taken: a server this does start stops by itself, and the data folder says it ran)
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_oaiy-server"))
+            .args(args)
+            .env("OAIY_DATA_DIR", &data)
+            .env("OAIY_SERVER_PORT", taken.local_addr().unwrap().port().to_string())
+            .env("OAIY_VOICE_GATEWAY", "off")
+            .output()
+            .unwrap()
+    };
+    let help = run(&["--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("oaiy-server check"));
+    let version = run(&["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("oaiy-server {}", env!("CARGO_PKG_VERSION")));
+    for words in [&["status"][..], &["--helpp"], &["--version", "x"], &["-h"], &[""]] {
+        let used = run(words);
+        assert_eq!(used.status.code(), Some(2), "{words:?}");
+        assert!(String::from_utf8_lossy(&used.stderr).contains("usage:"), "{words:?}");
+    }
+    assert!(!data.exists(), "none of these touched the data folder");
 }
 
 /// Told nothing, the same server says the engines are not there, as it always did.

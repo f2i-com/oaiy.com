@@ -183,6 +183,9 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
           This computer cannot lend itself right now: {status.listenError}
         </div>
       )}
+      {(status.storeProblems ?? []).map((problem) => (
+        <div className="banner banner-err" role="alert" key={problem}>{problem}</div>
+      ))}
       {(status.pairedByItself ?? [])
         .filter((p) => !seenByItself.includes(`${p.name}:${p.at}`))
         .map((p: { name: string; at: number; code?: string }) => (

@@ -309,7 +309,9 @@ pub async fn execute(
     };
     let status = resp.status();
     // Past the cap the tool ran and its answer cannot be read: a failure the model is told of, not an empty success.
-    let value: Value = match crate::link::net::read_body_async(resp, crate::link::net::MAX_REPLY_BYTES).await {
+    // The cap is the one a list has: a legal answer can run to megabytes (a custom screen's images, a page of 200
+    // responses), and the model reads no more than `MAX_RESULT_MODEL_BYTES` of it, so this only guards the memory.
+    let value: Value = match crate::link::net::read_body_async(resp, crate::link::net::MAX_LIST_BYTES).await {
         Ok(body) => serde_json::from_slice(&body).unwrap_or(Value::Null),
         Err(error) => return Executed::Failed { error, terminal: false },
     };
@@ -685,10 +687,24 @@ mod tests {
     #[tokio::test]
     async fn a_tool_answer_past_the_cap_is_a_failed_result() {
         use crate::link::testkit::{Provider, Reply};
-        let server = Provider::start(|_| Reply::ok(&"x".repeat(crate::link::net::MAX_REPLY_BYTES as usize + 1)));
+        let server = Provider::start(|_| Reply::ok(&"x".repeat(crate::link::net::MAX_LIST_BYTES as usize + 1)));
         let call = ToolCall { id: "c".into(), provider_id: "c".into(), name: "list_apps".into(), input: json!({}) };
         let outcome = execute(&reqwest::Client::new(), &server.base, "key", "/tools", "grant", &call).await;
         assert!(matches!(&outcome, Executed::Failed { error, terminal: false } if error.contains("larger than")), "{:?}", result_frame(&call, &outcome));
+    }
+
+    /// A FormLogic app's custom screen is legal up to 2 MiB of JSON, and the reply is that and the app's other fields:
+    /// the model gets the first 32 KiB of it, as it always did, and carries on.
+    #[tokio::test]
+    async fn a_large_tool_answer_reaches_the_model_cut_short() {
+        use crate::link::testkit::{Provider, Reply};
+        let size = crate::link::net::MAX_REPLY_BYTES as usize + 1024;
+        let server = Provider::start(move |_| Reply::ok(&json!({ "data": { "screen": "x".repeat(size) } }).to_string()));
+        let call = ToolCall { id: "c".into(), provider_id: "c".into(), name: "get_app".into(), input: json!({}) };
+        let outcome = execute(&reqwest::Client::new(), &server.base, "key", "/tools", "grant", &call).await;
+        assert!(matches!(&outcome, Executed::Ok(_)), "{:?}", result_frame(&call, &outcome));
+        let line = result_for_model(&call, &outcome);
+        assert!(line.len() < MAX_RESULT_MODEL_BYTES + 100 && line.ends_with(" … [truncated]"), "{}", line.len());
     }
 
     #[test]

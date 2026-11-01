@@ -266,7 +266,8 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   (the `agent` preset, among others) can store a flow and run it in `scoped` mode, and a flow is code that runs on this
   computer and could write the settings file directly. `scoped` mode is therefore hardening, not isolation, until
   flow approval (ACC-05) exists, and it must not be offered as a security boundary before then (`auth/mode.rs` says
-  the same). The internal token a flow's process is given is not a credential in `scoped` mode. `shadow` mode enforces
+  the same). The internal token is not a credential in `scoped` mode: a flow's process is given a `run` credential of
+  its own there, for that run, which holds what a flow's AI, tool and engine calls take and none of these scopes. `shadow` mode enforces
   only authentication and the dangerous scopes, so `calls.settings` and `calls.manage` are enforced in `scoped` only. The Transfers page's warning that a paired program can change these settings is the `legacy` mode's,
   and does not yet know the mode. No scope of these is dangerous, and none takes a call to the owner, which only the
   Companion does. Who marked a message

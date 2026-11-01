@@ -953,7 +953,7 @@ mod tests {
     #[tokio::test]
     async fn the_calendars_writes_answer_module_disabled_while_it_is_off() {
         // The desktop's one calendar (another test may have opened it first: either will do).
-        init(&std::env::temp_dir().join(format!("oaiy-calendar-gate-{}", std::process::id())));
+        init(&crate::test_dirs::process_path("oaiy-calendar-gate"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, routes::router()).await.unwrap() });

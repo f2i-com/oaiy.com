@@ -154,6 +154,10 @@ pub struct ProviderStore {
     providers: Vec<AiProvider>,
     /// None == in-memory (persist is a no-op), mirroring `PairingManager`.
     path: Option<PathBuf>,
+    /// What went wrong with the file at start, in words for the person: said where the providers are listed.
+    problem: Option<String>,
+    /// The file is still at `path` and was not read, so saving would write over keys nobody has seen.
+    keep_out: bool,
 }
 
 pub type ProviderStoreHandle = Arc<Mutex<ProviderStore>>;
@@ -172,41 +176,74 @@ const MAX_BASE_URL_BYTES: usize = 4096;
 
 impl ProviderStore {
     pub fn new() -> Self {
-        Self { providers: Vec::new(), path: None }
+        Self { providers: Vec::new(), path: None, problem: None, keep_out: false }
     }
 
     /// Load + harden from `path`. Persisted data is untrusted (old / hand-edited
     /// files bypass `upsert`'s validator): drop invalid ids and de-dup by id.
     ///
-    /// A file that EXISTS but fails to parse is preserved (renamed to
-    /// `providers.json.corrupt`) before we start empty — this store holds API
-    /// keys, so silently discarding a hand-repairable file and then overwriting
-    /// it on the next `persist()` would destroy the user's credentials. An absent
-    /// or unreadable file simply starts empty.
+    /// This store holds API keys, so only an absent file is an empty store. A
+    /// file that EXISTS but fails to parse (one byte that is not UTF-8 does) is
+    /// preserved, renamed to `providers.json.corrupt`, before we start empty:
+    /// discarding a hand-repairable file and overwriting it on the next
+    /// `persist()` would destroy the user's credentials. One that cannot be read
+    /// at all (a backup tool holding it, say) may be perfectly good, so it stays
+    /// where it is and nothing is saved over it until a restart reads it. Either
+    /// way the person is told, in the log and where the providers are listed.
     pub fn open(path: PathBuf) -> Self {
-        let raw: Vec<AiProvider> = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<PersistShape>(&contents) {
+        let mut problem = None;
+        let mut keep_out = false;
+        let raw: Vec<AiProvider> = match std::fs::read(&path) {
+            Ok(contents) => match serde_json::from_slice::<PersistShape>(&contents) {
                 Ok(doc) => doc.providers,
-                Err(_) => {
+                Err(e) => {
                     let backup = path.with_extension("json.corrupt");
-                    let _ = std::fs::rename(&path, &backup);
+                    problem = Some(match std::fs::rename(&path, &backup) {
+                        Ok(()) => format!(
+                            "The saved providers could not be read ({e}), so they are missing here. Nothing is lost: the file was moved to {}, to repair by hand or restore from a backup.",
+                            backup.display()
+                        ),
+                        Err(moved) => {
+                            keep_out = true;
+                            format!(
+                                "The saved providers could not be read ({e}), and {} could not be moved aside ({moved}). Nothing will be saved over it: repair it, or move it aside yourself, and restart OAIY.",
+                                path.display()
+                            )
+                        }
+                    });
                     Vec::new()
                 }
             },
-            Err(_) => Vec::new(), // absent or unreadable → empty
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                keep_out = true;
+                problem = Some(format!(
+                    "The saved providers could not be read ({e}), so they are missing here. Nothing will be saved over {}: restart OAIY once whatever holds it has let go.",
+                    path.display()
+                ));
+                Vec::new()
+            }
         };
+        if let Some(problem) = &problem {
+            log::error!("ai: {problem}");
+        }
         let mut seen = HashSet::new();
         let providers = raw
             .into_iter()
             .filter(|p| valid_id(&p.id))
             .filter(|p| seen.insert(p.id.clone()))
             .collect();
-        Self { providers, path: Some(path) }
+        Self { providers, path: Some(path), problem, keep_out }
     }
 
     /// Public snapshot of every provider — never the key.
     pub fn list(&self) -> Vec<AiProviderPublic> {
         self.providers.iter().map(AiProvider::public).collect()
+    }
+
+    /// What went wrong with the saved providers at start, for the page that lists them.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
 
     /// Create or replace a provider by id. Validates id + base_url; PRESERVES an
@@ -313,6 +350,9 @@ impl ProviderStore {
     /// carries the missed edits with it and a transient failure heals itself.
     fn persist(&self) -> Result<(), String> {
         let Some(path) = &self.path else { return Ok(()) };
+        if self.keep_out {
+            return Err(self.problem.clone().unwrap_or_else(|| "providers.json could not be read".to_string()));
+        }
         let fail = |e: &dyn std::fmt::Display| {
             format!("could not save providers.json ({e}) — the change applies to this session only and is lost on restart")
         };
@@ -456,6 +496,47 @@ mod tests {
         s.upsert(input("openai")).unwrap();
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One byte a tool saved in Windows-1252 used to read as "no file": every provider gone with nothing said, and the
+    /// next save wrote the store back without them, keys and all, with no copy.
+    #[test]
+    fn a_store_that_is_not_text_keeps_its_keys_and_says_so() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-bytes");
+        let path = dir.0.join("providers.json");
+        let mut body = serde_json::to_vec(&serde_json::json!({ "providers": [{
+            "id": "openai", "name": "Caf_", "protocol": "openai", "baseUrl": "https://api.openai.com",
+            "enabled": true, "capabilities": [], "apiKey": "sk-precious",
+        }] })).unwrap();
+        let at = body.iter().position(|b| *b == b'_').unwrap();
+        body[at] = 0xE9;
+        std::fs::write(&path, &body).unwrap();
+
+        let mut s = ProviderStore::open(path.clone());
+        assert!(s.list().is_empty());
+        assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), body, "the keys are all there, aside");
+        let said = s.problem().expect("the page that lists the providers says why they are missing");
+        assert!(said.contains("providers.json.corrupt"), "{said}");
+        // A save is a new file, beside the copy.
+        s.upsert(input("anthropic")).unwrap();
+        assert!(path.with_extension("json.corrupt").exists());
+        assert!(ProviderStore::open(path).problem().is_none(), "a file that reads has nothing to say");
+    }
+
+    /// A read that fails for another reason (a backup tool holding the file at start) says nothing about the file.
+    #[test]
+    fn a_store_that_cannot_be_read_is_not_saved_over() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-held");
+        let path = dir.0.join("providers.json");
+        // (a folder where the file belongs: a read that fails as a held file's does, on every system)
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("still-here"), b"x").unwrap();
+        let mut s = ProviderStore::open(path.clone());
+        assert!(s.list().is_empty());
+        assert!(s.problem().is_some_and(|p| p.contains("Nothing will be saved over")));
+        let err = s.upsert(input("openai")).unwrap_err();
+        assert!(err.contains("Nothing will be saved over"), "{err}");
+        assert!(path.join("still-here").exists());
     }
 
     #[test]

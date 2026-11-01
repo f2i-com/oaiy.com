@@ -1,5 +1,6 @@
 // Execute the extracted headless distribution with no system Node/npm on PATH.
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
@@ -37,7 +38,34 @@ const baseEnv = {
 const token = drawAcceptedToken((candidate) => spawnSync(server, ['check'], {
   cwd: root, env: { ...baseEnv, OAIY_SERVER_TOKEN: candidate }, encoding: 'utf8', windowsHide: true, timeout: 30000,
 }));
-const env = { ...baseEnv, OAIY_SERVER_TOKEN: token };
+// A stand-in for the engines (their control page, and a gateway with one model), no model behind it: a flow's AI call
+// comes back through this server on the run's own credential, the one thing a logic block never shows.
+const asked = [];
+const engines = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', chunk => { body += chunk; });
+  req.on('end', () => {
+    const answer = (status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(value));
+    };
+    if (req.url === '/api/state') return answer(200, { gateway_url: `http://127.0.0.1:${engines.address().port}/gw` });
+    if (req.url === '/gw/v1/discovery') {
+      return answer(200, {
+        endpoints: [{ name: 'chat', path: '/v1/chat/completions', spec: 'openai' }],
+        models: { llm: [{ id: 'stand-in', default: true, files_present: true }] }, defaults: { llm: 'stand-in' },
+      });
+    }
+    if (req.url === '/gw/v1/chat/completions') {
+      asked.push(JSON.parse(body));
+      return answer(200, { id: 'c', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'stand-in answer' }, finish_reason: 'stop' }] });
+    }
+    answer(404, { error: 'not here' });
+  });
+});
+engines.listen(0, '127.0.0.1');
+await once(engines, 'listening');
+const env = { ...baseEnv, OAIY_SERVER_TOKEN: token, OAIY_ENGINES_UI: `http://127.0.0.1:${engines.address().port}` };
 const child = spawn(server, [], { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
 let logs = '';
 child.stdout.on('data', chunk => { logs = (logs + chunk).slice(-12000); });
@@ -91,11 +119,32 @@ try {
   const duplicate = await request('/api/bridge/runs', input);
   assert.equal(duplicate.runId, run.runId);
   assert.equal(duplicate.idempotent, true);
-  console.log('PASS: packaged Node discovery, authenticated HTTP, real CLI flow output on ZIPP (no process object), duplicate run recovery');
+  // A flow with an AI node, which the server runs and whose process calls back. The release's mode is `scoped`, where the
+  // internal token of `legacy` is no credential: this answered 401 and the run failed, with no model involved.
+  await request('/api/bridge/flows/audit-smoke-ai', {
+    nodes: [
+      { id: 'prompt', type: 'input_text', position: { x: 0, y: 0 }, data: { value: 'Say something.' } },
+      { id: 'ask', type: 'ai_llm', position: { x: 200, y: 0 }, data: { service: 'engine:llm', model: '', maxTokens: 16, enableThinking: false } },
+      { id: 'out', type: 'output', position: { x: 400, y: 0 }, data: { value: '$nodes.ask' } },
+    ], edges: [
+      { id: 'in', source: 'prompt', target: 'ask', sourceHandle: 'text', targetHandle: 'prompt' },
+      { id: 'edge', source: 'ask', target: 'out', sourceHandle: 'response' },
+    ],
+  }, 'PUT');
+  let chat = await request('/api/bridge/runs', { ...input, flowId: 'audit-smoke-ai', correlationId: 'audit-smoke-ai', idempotencyKey: 'audit-smoke-ai' });
+  for (let i = 0; i < 300 && !['succeeded', 'failed', 'cancelled', 'timed_out'].includes(chat.status); i++) {
+    await delay(100);
+    chat = await request(`/api/bridge/runs/${chat.runId}`);
+  }
+  assert.equal(chat.status, 'succeeded', JSON.stringify(chat));
+  assert.equal(asked.length, 1, `the AI call reached the engines once: ${JSON.stringify(asked)}`);
+  assert.match(JSON.stringify(chat.output), /stand-in answer/, JSON.stringify(chat.output));
+  console.log('PASS: packaged Node discovery, authenticated HTTP, real CLI flow output on ZIPP (no process object), duplicate run recovery, an AI node through the server on the run\'s own credential');
 } finally {
   const exited = once(child, 'exit');
   child.kill();
   if (child.exitCode === null) await exited;
+  await new Promise(resolve => engines.close(resolve));
   // Only this invocation's unique directory under the system temp root is removable.
   assert.equal(path.dirname(data), path.resolve(os.tmpdir()));
   assert.ok(path.basename(data).startsWith('oaiy-smoke-'));

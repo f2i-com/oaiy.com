@@ -305,7 +305,11 @@ fn gateway_err(e: GatewayError) -> Response {
 
 async fn list_ai_providers(State(st): State<AiState>) -> Response {
     let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
-    (StatusCode::OK, Json(json!({ "providers": store.list() }))).into_response()
+    let mut answer = json!({ "providers": store.list() });
+    if let Some(problem) = store.problem() {
+        answer["problem"] = json!(problem);
+    }
+    (StatusCode::OK, Json(answer)).into_response()
 }
 
 async fn upsert_ai_provider(State(st): State<AiState>, Json(input): Json<AiProviderInput>) -> Response {

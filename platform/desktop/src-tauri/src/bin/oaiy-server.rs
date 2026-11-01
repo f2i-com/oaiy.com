@@ -62,8 +62,8 @@
 //! a caller WITH one (the token) only. With no OAIY_SERVER_TOKEN set that is ALL the
 //! server answers: everything else, reads included, is refused. Set a token to
 //! administer the server — the CLI sends `Authorization: Bearer <token>`. (A token
-//! that pairing minted, or the one this process hands the flow runs it starts, is
-//! accepted too; approving a pairing needs a bearer to begin with.)
+//! that pairing minted, or the credential this process hands each flow run it starts
+//! for that run, is accepted too; approving a pairing needs a bearer to begin with.)
 //!
 //! SIGTERM / Ctrl-C stops every managed service before exiting, and on unix the plugins
 //! first (on Windows a plugin ends with the server's job object).
@@ -150,13 +150,34 @@ fn env_text(name: &str) -> Option<String> {
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
-/// `oaiy-server auth ...`, `oaiy-server check` and `oaiy-server flows ...`: the console (design 4.7.9). They run
+const USAGE: &str = "usage:
+  oaiy-server                 start the server, as the environment says (OAIY_DATA_DIR, OAIY_SERVER_PORT, ...)
+  oaiy-server check           validate the configuration and the data folder
+  oaiy-server auth ...        the console: setup, passwords, tokens, sessions
+  oaiy-server flows ...       the flows the console can list and approve
+  oaiy-server --help | --version";
+
+/// What the arguments ask for: the server only when there are none, so that a mistyped word (`oaiyctl status`, with
+/// the service's own data folder) never starts a server, or anything else, beside the running one.
+///
+/// `oaiy-server auth ...`, `oaiy-server check` and `oaiy-server flows ...` are the console (design 4.7.9). They run
 /// before the server's runtime exists, and never start the server.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(first) = args.first().map(String::as_str) {
-        if matches!(first, "auth" | "check" | "flows") {
-            std::process::exit(console(&args));
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("auth" | "check" | "flows") => std::process::exit(console(&args)),
+        Some("--help") if args.len() == 1 => {
+            println!("{USAGE}");
+            return;
+        }
+        Some("--version") if args.len() == 1 => {
+            println!("oaiy-server {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some(_) => {
+            eprintln!("oaiy-server: unknown arguments {args:?}\n{USAGE}");
+            std::process::exit(2);
         }
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -262,6 +283,21 @@ async fn server_main() {
         );
         std::process::exit(1);
     }
+    // One process on a data folder, and that is settled before anything in it is opened: the ledger below is rewritten
+    // by rename as it opens, which cuts a running server off its own file, and a refused start must have touched
+    // nothing. (`legacy` keeps nothing of the access model on disk, so no lock: the release has no such mode.)
+    let data_lock = if config.mode.is_enforcing() {
+        oaiy_desktop_lib::auth::will_enforce();
+        match oaiy_desktop_lib::auth::lock::AuthLock::acquire(&data_dir.join("auth")) {
+            Ok(lock) => Some(Arc::new(lock)),
+            Err(e) => {
+                eprintln!("oaiy-server: {e}");
+                std::process::exit(oaiy_desktop_lib::auth::mode::EX_CONFIG);
+            }
+        }
+    } else {
+        None
+    };
     let _ = std::fs::create_dir_all(&models_dir);
 
     let registry: RegistryHandle =
@@ -503,7 +539,7 @@ async fn server_main() {
         port,
         bind, env_config, auth_token, false, registry, downloads, python, catalog, bridge,
         companion, companion_upstream, link, ai_providers, ai_codex, node_runtime, updater,
-        oaiy_desktop_lib::auth::AccessSettings::for_server(config),
+        oaiy_desktop_lib::auth::AccessSettings::for_server(config).holding(data_lock),
     )
     .await
     {

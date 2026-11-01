@@ -455,6 +455,9 @@ impl AiTunnel {
         spec: &DesktopAiSpec,
         instance: &str,
     ) -> Result<usize, String> {
+        // A process that cannot hold the spent list cannot open what it claims, so it claims nothing: the row stays
+        // for the process that can. (An error, for the loop's one line and its back-off.)
+        self.identity.may_open_requests()?;
         // `instanceId` is not optional: without it the provider only offers rows
         // addressed to NO desktop, and its web app always pins a target when one
         // resolves — so the lane would poll happily and stay empty forever.
@@ -1537,27 +1540,51 @@ mod tests {
         assert!(!probe.connected.load(Ordering::Acquire));
     }
 
+    /// A tunnel's data folder, gone when it is dropped. A poll holds the folder's spent list for the life of the
+    /// process, and Windows removes no open file, so that goes first.
+    struct TunnelDir(std::path::PathBuf);
+
+    impl std::ops::Deref for TunnelDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TunnelDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TunnelDir {
+        fn drop(&mut self) {
+            crate::ai::e2e::let_go_of_spent_list(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A tunnel over a fresh data folder, with nothing to answer a turn with: these
     /// tests are about what it does on the wire.
-    fn tunnel_in(tag: &str) -> (Arc<AiTunnel>, std::path::PathBuf) {
+    fn tunnel_in(tag: &str) -> (Arc<AiTunnel>, TunnelDir) {
         let dir = std::env::temp_dir().join(format!("oaiy-tunnel-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let sources = AiSources {
             providers: crate::ai::providers::new_handle(),
             codex: crate::ai::codex::new_handle(&dir),
         };
-        (AiTunnel::new(&dir, sources).unwrap(), dir)
+        (AiTunnel::new(&dir, sources).unwrap(), TunnelDir(dir))
     }
 
     /// A tunnel told where OAIY's engines are (none: nowhere), whatever `http` says.
-    fn tunnel_with_engines(tag: &str, engines: Option<String>) -> (Arc<AiTunnel>, std::path::PathBuf) {
+    fn tunnel_with_engines(tag: &str, engines: Option<String>) -> (Arc<AiTunnel>, TunnelDir) {
         let dir = std::env::temp_dir().join(format!("oaiy-tunnel-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let sources = AiSources {
             providers: crate::ai::providers::new_handle(),
             codex: crate::ai::codex::new_handle(&dir),
         };
-        (AiTunnel::with_engines(&dir, sources, Some(engines)).unwrap(), dir)
+        (AiTunnel::with_engines(&dir, sources, Some(engines)).unwrap(), TunnelDir(dir))
     }
 
     #[tokio::test]
@@ -1627,6 +1654,27 @@ mod tests {
             linked_at: chrono::Utc::now(),
             instance_id: Some("oaiy-test".into()),
         }
+    }
+
+    /// Another process on the folder holds the spent list. This one used to claim the turn and then fail it, a lost
+    /// turn for the person, where the holder would have answered: it now asks the provider for nothing at all.
+    #[tokio::test]
+    async fn a_lane_that_cannot_hold_the_spent_list_asks_the_provider_for_nothing() {
+        use crate::link::testkit::{Provider, Reply};
+        let (tunnel, dir) = tunnel_in("held");
+        let holder = std::fs::File::create(dir.join("desktop-e2e-spent.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).unwrap();
+        let server = Provider::start(|_| Reply::ok(r#"{"requests":[]}"#));
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        let refused = tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap_err();
+        assert!(refused.contains("another OAIY process"), "{refused}");
+        assert!(server.lines().is_empty(), "{:?}", server.lines());
+
+        // The holder gone, the lane polls again by itself.
+        drop(holder);
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0);
+        assert_eq!(server.lines().len(), 1);
     }
 
     #[tokio::test]

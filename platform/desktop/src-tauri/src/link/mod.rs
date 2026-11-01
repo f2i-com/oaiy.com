@@ -1316,8 +1316,7 @@ mod tests {
     use super::*;
 
     fn store(tag: &str) -> (std::path::PathBuf, LinkHandle) {
-        let p = std::env::temp_dir().join(format!("oaiy-link-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+        let p = crate::test_dirs::temp_path(&format!("oaiy-link-{tag}"));
         std::fs::create_dir_all(&p).unwrap();
         let h = open_handle_without_workers(p.clone());
         (p, h)
@@ -1602,8 +1601,7 @@ mod tests {
 
     /// An empty data folder with its `link` folder made.
     fn data_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("oaiy-link-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dirs::temp_path(&format!("oaiy-link-{tag}"));
         std::fs::create_dir_all(dir.join("link")).unwrap();
         dir
     }

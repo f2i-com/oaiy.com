@@ -69,7 +69,7 @@ pub mod wordlist;
 
 pub use guard::{Guard, GuardConfig, HealthExtras};
 pub use mode::{AccessMode, ConfigRefusal, Exposure};
-pub use runtime::{build_guard, flush_installed, AccessSettings};
+pub use runtime::{build_guard, flush_installed, run_credential, will_enforce, AccessSettings, RunCredential};
 
 #[cfg(test)]
 mod clientip_crosscheck;

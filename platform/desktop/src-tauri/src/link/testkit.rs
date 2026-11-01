@@ -218,6 +218,8 @@ pub fn stop_lane(store: &super::LinkHandle) {
     // The last poll it made was answered at once, so this is time enough for the
     // loop to be out of its request and into its wait.
     std::thread::sleep(Duration::from_millis(300));
+    // (a sealed lane holds this for the life of the process, and Windows removes no open file)
+    crate::ai::e2e::let_go_of_spent_list(store.data_dir());
 }
 
 /// A store linked to `base` with the shipped connector, changed by `edit`, in a

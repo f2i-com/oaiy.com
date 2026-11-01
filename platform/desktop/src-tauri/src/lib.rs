@@ -21,6 +21,8 @@ pub mod relay;
 /// Reading the crate's sources in a test without reading its test code (the guards that scan them use it).
 #[cfg(test)]
 mod source_scan;
+#[cfg(test)]
+pub(crate) mod test_dirs;
 pub mod ai;
 pub mod http;
 pub mod services;
@@ -1071,8 +1073,6 @@ async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
         app.exit(1);
         return;
     }
-    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-
     // (the port this desktop tried: its `serverPort` when one is set, not always the default)
     let port = crate::api_port();
     let ours = port_holder_is_oaiy(port).await;
@@ -1096,16 +1096,23 @@ async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
             ),
         )
     };
+    tell_and_quit(app, title, body).await;
+}
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .message(body)
-        .title(title)
-        .kind(MessageDialogKind::Error)
-        .show(move |_| {
-            let _ = tx.send(());
-        });
-    let _ = rx.await;
+/// One error dialog, then quit. (An isolated launch has no dialog plugin: it quits.)
+async fn tell_and_quit(app: &tauri::AppHandle, title: &str, body: String) {
+    if !crate::isolated::active() {
+        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .message(body)
+            .title(title)
+            .kind(MessageDialogKind::Error)
+            .show(move |_| {
+                let _ = tx.send(());
+            });
+        let _ = rx.await;
+    }
     app.exit(1);
 }
 
@@ -1497,6 +1504,33 @@ pub fn run() {
                 crate::backup::restore::ApplyOutcome::Failed(done) | crate::backup::restore::ApplyOutcome::Expired(done) => log::warn!("backup: the staged {} was not applied: {}", done.kind, done.error.unwrap_or_default()),
             }
             }
+            // How the API judges requests: `legacy` (the default) keeps every route that existed before the
+            // access model exactly as it was; `scoped` and `shadow` are the new guard. Read once, like the
+            // port: a typo keeps the default and says so.
+            let (access_mode, access_warning) =
+                crate::auth::AccessMode::from_config(read_config_str(app.handle(), "accessMode").as_deref());
+            if let Some(warning) = access_warning {
+                log::warn!("{warning}");
+            }
+            // A mode that keeps its store on disk has this data folder to itself, and that is settled before anything
+            // below opens the ledger: another process's run ledger is rewritten as this one opens it. (After the restore,
+            // which moves `auth` itself, and which a lock in there would stop. `legacy` keeps nothing on disk and takes
+            // no lock; a second desktop is stopped by the single-instance plugin, whatever the mode.)
+            let data_lock = if access_mode.is_enforcing() {
+                crate::auth::will_enforce();
+                match crate::auth::lock::AuthLock::acquire(&data_dir.join("auth")) {
+                    Ok(lock) => Some(Arc::new(lock)),
+                    Err(e) => {
+                        log::error!("not starting: {e}");
+                        let app = app.handle().clone();
+                        let body = format!("OAIY cannot use its data folder {}: {e}.", data_dir.display());
+                        tauri::async_runtime::spawn(async move { tell_and_quit(&app, "OAIY could not start", body).await });
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
             // The Agent's control tools show a page in the dashboard (a plugin's
             // setup step, say) with this event; the dashboard listens for it.
             {
@@ -1702,14 +1736,6 @@ pub fn run() {
             if let Some(note) = lan_access_note {
                 log::warn!("{note}");
             }
-            // How the API judges requests: `legacy` (the default) keeps every route that existed before the
-            // access model exactly as it was; `scoped` and `shadow` are the new guard. Read once, like the
-            // port: a typo keeps the default and says so.
-            let (access_mode, access_warning) =
-                crate::auth::AccessMode::from_config(read_config_str(&app_for_dialog, "accessMode").as_deref());
-            if let Some(warning) = access_warning {
-                log::warn!("{warning}");
-            }
             // What is known of newer releases, shared by the local API's routes, the window's commands and the tray.
             let feed = crate::update::FeedSource::from_env();
             let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed.clone(), std::time::Instant::now());
@@ -1863,7 +1889,7 @@ pub fn run() {
                     ai_codex_for_http,
                     node_for_http,
                     updater,
-                    crate::auth::AccessSettings::new(access_mode),
+                    crate::auth::AccessSettings::new(access_mode).holding(data_lock),
                 )
                 .await
                 {
@@ -2086,6 +2112,7 @@ pub fn build_bridge_state(
     // deliberately — it runs for the process lifetime, and the ledger being
     // in-memory means there is nothing to hand over on exit.
     if !crate::isolated::active() {
+        std::thread::spawn(bridge::worker::sweep_scratch);
         let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone(), node.clone());
     }
     bridge::BridgeState {

@@ -287,11 +287,16 @@ impl RosterFault {
 /// The roster at `path`: none yet (a new, empty one), or what is wrong with the file.
 fn read_roster(path: &std::path::Path) -> (PersistedRoster, Option<RosterFault>) {
     let corrupt = |why: String| {
-        let fault = RosterFault::Corrupt(format!("the companion roster {} is damaged ({why}), so nobody can be approved or told from a revoked device: rotate this desktop's key to start again", path.display()));
+        // (not "rotate the key": the page's button for that is off while the identity is unavailable, in plugins already
+        // installed too, so this says the one way out that the person has)
+        let fault = RosterFault::Corrupt(format!("the companion roster {} is damaged ({why}), so nobody can be approved or told from a revoked device. To start again, quit OAIY, move that file out of its folder and start OAIY: every phone will have to pair again, and the record of which phones were revoked is lost with it", path.display()));
         (PersistedRoster::default(), Some(fault))
     };
     match crate::secret_file::read_text_patiently(path, &crate::secret_file::Patience::default().start) {
         crate::secret_file::Text::Missing => (PersistedRoster::default(), None),
+        // What a power cut leaves of a save from before saves were synced (v0.1.11 and earlier). It holds no revocations
+        // to protect, so it is what no file is.
+        crate::secret_file::Text::Text(text) if text.is_empty() => (PersistedRoster::default(), None),
         crate::secret_file::Text::Text(text) => match serde_json::from_str(&text) {
             Ok(roster) => (roster, None),
             Err(e) => corrupt(e.to_string()),
@@ -1064,18 +1069,51 @@ mod tests {
             id.approve_for_tests(&phone);
             id.revoke(&phone.thumbprint).unwrap();
         }
-        for damaged in [&b""[..], b"{ half a ros", &[0xC3, 0x28]] {
+        for damaged in [&b"{ half a ros"[..], &[0xC3, 0x28]] {
             std::fs::write(roster_file(&dir), damaged).unwrap();
             let id = EndpointIdentity::open(dir.0.clone(), "aokie");
             let status = id.status();
             assert!(!status.available && !status.remote_access_ready, "{damaged:?}");
-            assert!(status.warning.as_deref().unwrap_or("").contains("roster"), "{:?}", status.warning);
+            let warning = status.warning.as_deref().unwrap_or("");
+            assert!(warning.contains("roster"), "{warning}");
+            // What it tells the owner to do is what the owner can do: Aokie's page greys out its key button while the
+            // identity is unavailable, so the words name the file, and what moving it costs.
+            assert!(warning.contains("move that file") && warning.contains("pair again") && !warning.contains("rotate"), "{warning}");
             assert!(id.private_bootstrap(1).is_none(), "{damaged:?}: nobody is handed to a plugin");
             assert!(id.create_offer("app", None, "local").is_err(), "{damaged:?}: no new pairing");
             id.inner.lock().unwrap().pending.push(pending("p1", &a_key(2)));
             assert!(matches!(id.approve("p1"), Err(RosterError::NotSaved(_))), "{damaged:?}");
             assert_eq!(std::fs::read(roster_file(&dir)).unwrap(), damaged, "the file is left as it was");
         }
+    }
+
+    /// An empty file is what a power cut left of a save from before saves were synced. It holds no revocations, and
+    /// refusing it left an owner upgrading from v0.1.11 with no way to pair a phone.
+    #[test]
+    fn a_roster_left_empty_is_a_new_one() {
+        let dir = Dir::new("empty-roster");
+        EndpointIdentity::open(dir.0.clone(), "aokie");
+        std::fs::create_dir_all(roster_file(&dir).parent().unwrap()).unwrap();
+        std::fs::write(roster_file(&dir), b"").unwrap();
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let status = id.status();
+        assert!(status.available && status.warning.is_none(), "{status:?}");
+        assert!(id.create_offer("app", None, "local").is_ok(), "a phone can pair");
+        id.approve_for_tests(&a_key(4));
+        assert_eq!(EndpointIdentity::open(dir.0.clone(), "aokie").status().approved_mobiles.len(), 1, "and the roster is saved over it");
+    }
+
+    /// A garbled file is moved aside by hand, as the warning says, and the next start is a new roster.
+    #[test]
+    fn a_damaged_roster_moved_aside_starts_a_new_one() {
+        let dir = Dir::new("moved-roster");
+        EndpointIdentity::open(dir.0.clone(), "aokie");
+        std::fs::create_dir_all(roster_file(&dir).parent().unwrap()).unwrap();
+        std::fs::write(roster_file(&dir), b"{ half a ros").unwrap();
+        assert!(!EndpointIdentity::open(dir.0.clone(), "aokie").status().available);
+        std::fs::rename(roster_file(&dir), roster_file(&dir).with_file_name("kept.json")).unwrap();
+        let status = EndpointIdentity::open(dir.0.clone(), "aokie").status();
+        assert!(status.available && status.warning.is_none(), "{status:?}");
     }
 
     /// The way out of a damaged roster is the owner's rotation, which ends every pairing anyway: the file is kept aside.

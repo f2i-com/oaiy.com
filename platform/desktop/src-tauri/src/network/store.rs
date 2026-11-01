@@ -1,14 +1,70 @@
 //! What OAIY Network keeps in the data folder (`network/`): its settings (`settings.json`) and the paired computers
 //! (`peers.json`, owner-only: a peer's certificate fingerprint is what lets it in).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const PEERS_FILE: &str = "peers.json";
 pub const DEFAULTS_FILE: &str = "defaults.json";
 pub const SERVICES_FILE: &str = "remote-services.json";
+
+/// What went wrong reading each file of this store at start.
+#[derive(Clone)]
+struct Trouble {
+    /// In words for the person, for the log and the Networking page.
+    said: String,
+    /// The file is still there and was not read: saving would write over what nobody has seen.
+    keep_out: bool,
+}
+
+fn troubles() -> MutexGuard<'static, BTreeMap<PathBuf, Trouble>> {
+    static TROUBLES: OnceLock<Mutex<BTreeMap<PathBuf, Trouble>>> = OnceLock::new();
+    TROUBLES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A file of this store as it was left. Only a file that is not there is an empty store: paired computers read as none
+/// would be written over at the next save. One that was read and is not what it should be (cut short, or not text)
+/// is moved aside as `<name>.corrupt`, to repair; one that could not be read may be perfectly good (a backup tool
+/// holding it), so it stays where it is, and neither it nor one that would not move is saved over until a restart.
+fn read_kept<T: DeserializeOwned + Default>(path: &Path) -> T {
+    troubles().remove(path);
+    let (said, keep_out) = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Ok(bytes) => {
+            let e = match serde_json::from_slice(&bytes) {
+                Ok(kept) => return kept,
+                Err(e) => e,
+            };
+            let aside = path.with_extension("json.corrupt");
+            match std::fs::rename(path, &aside) {
+                Ok(()) => (format!("{} could not be read ({e}): it was moved to {}, to repair or restore from a backup", path.display(), aside.display()), false),
+                Err(moved) => (format!("{} could not be read ({e}) or moved aside ({moved}): nothing will be saved over it, so repair it or move it aside and restart OAIY", path.display()), true),
+            }
+        }
+        Err(e) => (format!("{} could not be read ({e}): nothing will be saved over it, so restart OAIY once whatever holds it has let go", path.display()), true),
+    };
+    log::error!("network: {said}");
+    troubles().insert(path.to_path_buf(), Trouble { said, keep_out });
+    T::default()
+}
+
+/// Save a file of this store, unless [`read_kept`] left it to be read yet.
+fn write_kept(path: &Path, body: Vec<u8>) -> Result<(), String> {
+    if let Some(trouble) = troubles().get(path).filter(|t| t.keep_out) {
+        return Err(trouble.said.clone());
+    }
+    crate::secret_file::write(path, body).map_err(|e| e.to_string())
+}
+
+/// What went wrong with the files in `dir` at start, for the Networking page.
+pub fn problems(dir: &Path) -> Vec<String> {
+    troubles().iter().filter(|(path, _)| path.starts_with(dir)).map(|(_, t)| t.said.clone()).collect()
+}
 
 /// The port a worker listens on unless set (the desktop's API is 17972, its voice gateway 17872).
 pub const DEFAULT_PORT: u16 = 17975;
@@ -68,12 +124,12 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(dir: &Path) -> Settings {
-        std::fs::read_to_string(dir.join(SETTINGS_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        read_kept(&dir.join(SETTINGS_FILE))
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
         crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
-        crate::secret_file::write(&dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        write_kept(&dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?)
     }
 
     /// It uses other computers now (Network on, and set so).
@@ -132,7 +188,7 @@ pub struct Peers {
 impl Peers {
     pub fn open(dir: &Path) -> Peers {
         let path = dir.join(PEERS_FILE);
-        let list = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let list = read_kept(&path);
         Peers { path, list }
     }
 
@@ -221,7 +277,7 @@ fn save(path: &Path, list: &[Peer]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
     }
-    crate::secret_file::write(path, serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    write_kept(path, serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?)
 }
 
 /// A paired worker's model chosen as this computer's engine default for its kind (a primary's), with this computer's
@@ -252,7 +308,7 @@ pub struct Defaults {
 impl Defaults {
     pub fn open(dir: &Path) -> Defaults {
         let path = dir.join(DEFAULTS_FILE);
-        let map = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let map = read_kept(&path);
         Defaults { path, map }
     }
 
@@ -277,7 +333,7 @@ impl Defaults {
         if let Some(dir) = self.path.parent() {
             crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
         }
-        crate::secret_file::write(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        write_kept(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?)?;
         self.map = next;
         Ok(())
     }
@@ -302,7 +358,7 @@ pub struct ServiceChoices {
 impl ServiceChoices {
     pub fn open(dir: &Path) -> ServiceChoices {
         let path = dir.join(SERVICES_FILE);
-        let map = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let map = read_kept(&path);
         ServiceChoices { path, map }
     }
 
@@ -327,7 +383,7 @@ impl ServiceChoices {
         if let Some(dir) = self.path.parent() {
             crate::secret_file::create_private_dir(dir).map_err(|e| e.to_string())?;
         }
-        crate::secret_file::write(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        write_kept(&self.path, serde_json::to_vec_pretty(&next).map_err(|e| e.to_string())?)?;
         self.map = next;
         Ok(())
     }
@@ -373,6 +429,50 @@ mod tests {
         let neither = Settings { uses: Some(false), lends: Some(false), ..both };
         assert_eq!(neither.active_role(), Role::Standalone);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A byte that is not text used to read as "no file": the paired computers were gone, and the next save wrote the
+    /// store back without them.
+    #[test]
+    fn a_damaged_file_is_moved_aside_and_said_and_a_good_one_is_never_written_over() {
+        let dir = crate::secret_file::testing::TempDir::new("network-damaged");
+        for (file, open) in [
+            (PEERS_FILE, &(|d: &Path| Peers::open(d).list().len()) as &dyn Fn(&Path) -> usize),
+            (DEFAULTS_FILE, &|d: &Path| Defaults::open(d).all().len()),
+            (SERVICES_FILE, &|d: &Path| ServiceChoices::open(d).all().len()),
+        ] {
+            let path = dir.0.join(file);
+            std::fs::write(&path, b"[{\"nodeId\":\"caf\xE9\"}]").unwrap();
+            assert_eq!(open(&dir.0), 0, "{file}");
+            assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), b"[{\"nodeId\":\"caf\xE9\"}]", "{file}");
+            assert!(!path.exists(), "{file}");
+            assert!(problems(&dir.0).iter().any(|p| p.contains(file)), "{file}: {:?}", problems(&dir.0));
+        }
+        // Saved again, and the next start is a good one: nothing is said any more of a file that reads.
+        let mut peers = Peers::open(&dir.0);
+        peers.add(peer("a", "fa", Role::Worker)).unwrap();
+        assert_eq!(Peers::open(&dir.0).list().len(), 1);
+        assert!(!problems(&dir.0).iter().any(|p| p.contains(PEERS_FILE)));
+    }
+
+    /// A read that fails for another reason says nothing about the file: it is there, and may be perfectly good.
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_saved_over() {
+        let dir = crate::secret_file::testing::TempDir::new("network-unreadable");
+        // (a folder where the file belongs: a read that fails as a held file's does, on every system)
+        std::fs::create_dir(dir.0.join(PEERS_FILE)).unwrap();
+        std::fs::write(dir.0.join(PEERS_FILE).join("still-here"), b"x").unwrap();
+        let mut peers = Peers::open(&dir.0);
+        assert!(peers.list().is_empty());
+        let refused = peers.add(peer("a", "fa", Role::Worker)).unwrap_err();
+        assert!(refused.contains("nothing will be saved over it"), "{refused}");
+        assert!(peers.list().is_empty(), "it is not kept in memory as if it were saved");
+        assert!(dir.0.join(PEERS_FILE).join("still-here").exists());
+        assert_eq!(problems(&dir.0).len(), 1);
+        // The same for the settings, which live in a plain value.
+        std::fs::create_dir(dir.0.join(SETTINGS_FILE)).unwrap();
+        assert_eq!(Settings::load(&dir.0), Settings::default());
+        assert!(Settings::default().save(&dir.0).unwrap_err().contains("nothing will be saved over it"));
     }
 
     #[test]

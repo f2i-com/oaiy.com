@@ -1277,7 +1277,7 @@ export const codex = {
 };
 
 export const aiProviders = {
-  list: () => request<{ providers: AiProviderPublic[] }>('/api/ai/providers'),
+  list: () => request<{ providers: AiProviderPublic[]; problem?: string }>('/api/ai/providers'),
   upsert: (input: AiProviderInput) =>
     request<{ id: string }>('/api/ai/providers', { method: 'POST', body: JSON.stringify(input) }),
   delete: (id: string) =>
@@ -2327,6 +2327,8 @@ export interface NetworkStatus {
   pairedByItself?: { name: string; at: number }[];
   /** Why this computer cannot lend itself now (its port taken), where it cannot. */
   listenError?: string | null;
+  /** What could not be read of OAIY Network's files at start: paired computers or settings missing for a reason. */
+  storeProblems?: string[];
   settings: NetworkSettings;
   nodeId: string | null;
   name: string;

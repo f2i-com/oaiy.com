@@ -244,6 +244,12 @@ describe('NetworkPanel', () => {
     expect(container.querySelectorAll('[data-testid="network-steps"] li')).toHaveLength(3);
   });
 
+  it('says what could not be read of its files at start', async () => {
+    api.status.mockResolvedValue({ ...off, storeProblems: ['peers.json could not be read: moved aside'] });
+    await mount();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('peers.json could not be read');
+  });
+
   it('uses other computers and lends itself at once, either switched on or both', async () => {
     api.status.mockResolvedValue(primary);
     api.setSettings.mockResolvedValue({ ...primary, uses: true, lends: true, role: 'both' });

@@ -1,15 +1,20 @@
 //! Putting the guard together for a running server or desktop.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::audit::{self, AuditLog};
 use super::bearer_throttle::ThrottleFile;
 use super::clock::{Clock, SystemClock};
 use super::exposure::Config;
 use super::guard::{Guard, GuardConfig};
+use super::lock::AuthLock;
 use super::mode::{validate_mode, AccessMode};
-use super::store::{AuthStore, Host, SecureWriter, StoreError};
+use super::presets::Preset;
+use super::store::{AuthStore, Host, MintFailure, MintSpec, SecureWriter, StoreError};
+use super::token::Kind;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -20,11 +25,13 @@ pub struct AccessSettings {
     /// A server that passed the startup rules (`auth::exposure`): what the guard, the login and the control
     /// switch are built from. The desktop has none, and reads its settings leniently.
     pub config: Option<Arc<Config>>,
+    /// The lock on `<data>/auth`, when the process took it before it touched the data folder.
+    pub lock: Option<Arc<AuthLock>>,
 }
 
 impl AccessSettings {
     pub fn new(mode: AccessMode) -> Self {
-        AccessSettings { mode, config: None }
+        AccessSettings { mode, config: None, lock: None }
     }
 
     /// Today's behaviour: the default until the flip.
@@ -37,7 +44,14 @@ impl AccessSettings {
         AccessSettings {
             mode: config.mode,
             config: Some(Arc::new(config)),
+            lock: None,
         }
+    }
+
+    /// The same, for a process that took the lock itself, first: the store it opens uses this one.
+    pub fn holding(mut self, lock: Option<Arc<AuthLock>>) -> Self {
+        self.lock = lock;
+        self
     }
 }
 
@@ -79,13 +93,11 @@ pub fn build_guard(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let (store, audit_log) = if settings.mode.is_enforcing() {
         let log = Arc::new(AuditLog::open(&auth_dir, clock.clone(), !gui));
-        let store = AuthStore::open(
-            &auth_dir,
-            if gui { Host::Gui } else { Host::Server },
-            clock.clone(),
-            Arc::new(SecureWriter),
-            Some(log.clone()),
-        )
+        let host = if gui { Host::Gui } else { Host::Server };
+        let store = match &settings.lock {
+            Some(lock) => AuthStore::open_holding(lock.clone(), host, clock.clone(), Arc::new(SecureWriter), Some(log.clone())),
+            None => AuthStore::open(&auth_dir, host, clock.clone(), Arc::new(SecureWriter), Some(log.clone())),
+        }
         .map_err(|e: StoreError| -> BoxError { Box::new(e) })?;
         audit::use_log(log.clone());
         (store, Some(log))
@@ -150,6 +162,75 @@ pub fn flush_installed() {
     if let Some(guard) = guard {
         flush_guard(&guard);
     }
+}
+
+/// What a flow's run shows this server when it calls back over loopback, ended when this is dropped.
+///
+/// In `legacy` that is the internal token, as it always was. In `scoped` and `shadow` the internal token is not a
+/// credential, so a run needs one of its own or its first AI call is refused: a `run` credential of the [`Preset::Run`]
+/// scopes, in memory only, for this computer alone, and no longer than the run. The guard keeps it from the routes the
+/// internal token never reached (`Guard::admit`), so a run does nothing here that it could not do in `legacy`.
+pub struct RunCredential {
+    bearer: String,
+    /// The guard that made it and its id; none for the internal token, which is not this run's to end.
+    made: Option<(Arc<Guard>, String)>,
+}
+
+impl RunCredential {
+    /// The bearer. Empty when this process has none to give (no OS randomness for the internal token).
+    pub fn bearer(&self) -> &str {
+        &self.bearer
+    }
+}
+
+impl Drop for RunCredential {
+    fn drop(&mut self) {
+        if let Some((guard, id)) = self.made.take() {
+            guard.store().revoke(&id, "revoked");
+        }
+    }
+}
+
+/// [`RunCredential`] from `guard`, for a run of at most `ttl`. A run longer than a credential may live (a day) keeps
+/// its credential for that day.
+fn run_credential_of(guard: Option<Arc<Guard>>, ttl: Duration) -> Result<RunCredential, MintFailure> {
+    let Some(guard) = guard.filter(|g| g.mode().is_enforcing()) else {
+        return Ok(RunCredential { bearer: crate::internal_token().to_string(), made: None });
+    };
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).min(RUN_TTL_MAX_MS);
+    let mut spec = MintSpec::new(Kind::Run, "flow run", Preset::Run.scopes(), ttl_ms);
+    spec.preset = Some(Preset::Run);
+    let minted = guard.store().mint(spec)?;
+    Ok(RunCredential { bearer: minted.token, made: Some((guard, minted.id)) })
+}
+
+/// The most a `run` credential may live (`store::check_grant`).
+const RUN_TTL_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether this process has said its guard will be an enforcing one ([`will_enforce`]).
+static WILL_ENFORCE: AtomicBool = AtomicBool::new(false);
+
+/// For a process that has settled on an enforcing mode, before anything can start a run: the worker takes up a run left
+/// queued as soon as the process starts, which can be before `http::serve` has made the guard.
+pub fn will_enforce() {
+    WILL_ENFORCE.store(true, Ordering::Relaxed);
+}
+
+/// The guard, given `wait` to come if `expected` says one will: a process up as far as that has it in moments.
+fn guard_in_time(expected: bool, wait: Duration, installed: &dyn Fn() -> Option<Arc<Guard>>) -> Option<Arc<Guard>> {
+    let began = Instant::now();
+    loop {
+        match installed() {
+            None if expected && began.elapsed() < wait => std::thread::sleep(Duration::from_millis(20)),
+            guard => return guard,
+        }
+    }
+}
+
+/// The running guard's [`RunCredential`] for a run of at most `ttl`.
+pub fn run_credential(ttl: Duration) -> Result<RunCredential, MintFailure> {
+    let installed = || installed_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    run_credential_of(guard_in_time(WILL_ENFORCE.load(Ordering::Relaxed), Duration::from_secs(30), &installed), ttl)
 }
 
 /// What shutdown does to a guard: write the credential store, the throttle and the audit counts that are
@@ -254,6 +335,77 @@ mod tests {
             0,
             "the upkeep of a legacy guard writes nothing either"
         );
+    }
+
+    /// `scoped` does not take the internal token, so a flow the server runs needs a credential of its own.
+    #[test]
+    fn a_run_in_an_enforcing_mode_has_a_credential_of_its_own_that_ends_with_it() {
+        use super::super::principal::PrincipalKind;
+        for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+            let dir = TempDir::new("runtime-run");
+            let guard = build_guard(&AccessSettings::new(mode), &dir.0, 17972, false, false, None, &no_env).unwrap();
+            let run = run_credential_of(Some(guard.clone()), Duration::from_secs(60)).unwrap();
+            let bearer = run.bearer().to_string();
+            assert!(bearer.starts_with("oaiyrun_"), "{mode:?}");
+            let who = guard.store().authenticate(&bearer, None).unwrap();
+            assert!(who.is_flow_run() && who.kind == PrincipalKind::Run && who.kind.needs_direct_loopback());
+            assert_eq!(who.scopes, Preset::Run.scopes());
+            assert!(!who.persisted, "it is never written down");
+            assert!(who.expires_ms.unwrap() <= SystemClock.now_ms() + 60_000);
+            drop(run);
+            assert_eq!(guard.store().authenticate(&bearer, None).unwrap_err().code(), "token_revoked", "{mode:?}");
+        }
+    }
+
+    /// (`legacy`'s guard takes the internal token, and nothing about that mode changes.)
+    #[test]
+    fn a_run_in_legacy_mode_keeps_the_internal_token() {
+        let dir = TempDir::new("runtime-run-legacy");
+        let guard = build_guard(&AccessSettings::legacy(), &dir.0, 17972, false, true, None, &no_env).unwrap();
+        for g in [Some(guard), None] {
+            let run = run_credential_of(g, Duration::from_secs(60)).unwrap();
+            assert_eq!(run.bearer(), crate::internal_token());
+        }
+    }
+
+    /// A run may be given a day; a `run` credential may not be given more, whatever the grace beyond it.
+    #[test]
+    fn the_longest_run_still_gets_a_credential() {
+        let dir = TempDir::new("runtime-run-long");
+        let guard = build_guard(&AccessSettings::new(AccessMode::Scoped), &dir.0, 17972, false, false, None, &no_env).unwrap();
+        let run = run_credential_of(Some(guard), Duration::from_secs(2 * 24 * 60 * 60)).unwrap();
+        assert!(run.bearer().starts_with("oaiyrun_"));
+    }
+
+    /// A run left queued is taken up as the process starts: it waits the moment there is for the guard it was told of.
+    #[test]
+    fn a_run_at_the_very_start_waits_for_the_guard_it_was_told_of() {
+        let dir = TempDir::new("runtime-run-early");
+        let guard = build_guard(&AccessSettings::new(AccessMode::Scoped), &dir.0, 17972, false, false, None, &no_env).unwrap();
+        let asked = std::cell::Cell::new(0);
+        let comes_on_the_third_look = || {
+            asked.set(asked.get() + 1);
+            (asked.get() >= 3).then(|| guard.clone())
+        };
+        assert!(guard_in_time(true, Duration::from_secs(30), &comes_on_the_third_look).is_some());
+        assert_eq!(asked.get(), 3);
+        // Not told of one, nothing waits: `legacy`, and a test's process.
+        assert!(guard_in_time(false, Duration::from_secs(30), &|| None).is_none());
+        // Told, and it never came (the server failed to start): the run is not held for ever.
+        assert!(guard_in_time(true, Duration::from_millis(50), &|| None).is_none());
+    }
+
+    /// The lock taken first is the store's: a second lock in this process would be refused.
+    #[test]
+    fn a_guard_uses_the_lock_the_process_took_first() {
+        let dir = TempDir::new("runtime-lock");
+        let lock = Arc::new(AuthLock::acquire(&dir.0.join("auth")).unwrap());
+        let settings = AccessSettings::new(AccessMode::Scoped).holding(Some(lock.clone()));
+        let guard = build_guard(&settings, &dir.0, 17972, false, false, None, &no_env).unwrap();
+        assert!(guard.store().is_persistent());
+        drop(settings);
+        drop(lock);
+        assert!(AuthLock::acquire(&dir.0.join("auth")).is_err(), "the store holds it for as long as it lives");
     }
 
     #[test]

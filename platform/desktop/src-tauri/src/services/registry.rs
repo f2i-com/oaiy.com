@@ -659,6 +659,24 @@ fn seed_builtin_script(target: &Path, snapshot: &Path, body: &str) -> std::io::R
     Ok(())
 }
 
+/// Move a built-in template that no longer parses to `<name>.corrupt`, so that the seed below writes the shipped one
+/// in its place. Left where it is, it cost the service (OAIY Voice, and with it the voice of every call) until
+/// someone repaired the file by hand, and a hand-edit is not the seed's to overwrite: a file that still parses is one.
+fn set_aside_broken_template(target: &Path) {
+    let why = match std::fs::read(target) {
+        Ok(bytes) => match serde_json::from_slice::<ServiceTemplate>(&bytes) {
+            Ok(_) => return,
+            Err(e) => e,
+        },
+        Err(_) => return,
+    };
+    let aside = target.with_extension("json.corrupt");
+    match std::fs::rename(target, &aside) {
+        Ok(()) => log::warn!("built-in template {} could not be read ({why}): it is at {}, and the shipped one is back", target.display(), aside.display()),
+        Err(e) => log::warn!("built-in template {} could not be read ({why}) or moved aside: {e}", target.display()),
+    }
+}
+
 /// A package-file name is safe iff it's a bare filename (no path separator / `..` /
 /// drive prefix) and not hidden — package files live directly in `scripts/`.
 fn is_safe_script_name(name: &str) -> bool {
@@ -896,6 +914,7 @@ impl Registry {
         for (name, body) in BUILTIN_TEMPLATES {
             let p = data_dir.join("templates").join(name);
             let snap = data_dir.join("templates").join(format!(".{name}.seed"));
+            set_aside_broken_template(&p);
             if let Err(e) = seed_builtin_script(&p, &snap, body) {
                 log::warn!("could not seed built-in template {name}: {e}");
             }
@@ -3753,6 +3772,32 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         assert!(reg.template_probes.is_empty(), "probes for deleted files are dropped");
 
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Cut short or emptied, a built-in template used to cost its service for good: it was a file the seed took for a
+    /// person's edit, and the service was gone from the list with one line in the log.
+    #[test]
+    fn a_builtin_template_that_does_not_parse_comes_back_and_the_bad_file_is_kept() {
+        let dir = crate::secret_file::testing::TempDir::new("template-restored");
+        let init = || super::Registry::init(dir.0.clone(), dir.0.join("models"), Vec::new()).unwrap();
+        let (name, body) = super::BUILTIN_TEMPLATES[0];
+        let file = dir.0.join("templates").join(name);
+        let id = serde_json::from_str::<super::ServiceTemplate>(body).unwrap().id;
+        drop(init());
+        for bad in [&b""[..], &body.as_bytes()[..body.len() / 2], b"\xff\xfe not text"] {
+            std::fs::write(&file, bad).unwrap();
+            let reg = init();
+            assert!(reg.services.contains_key(&id), "the service is back");
+            assert!(reg.snapshot().template_errors.is_empty());
+            assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), body.trim());
+            assert_eq!(std::fs::read(file.with_extension("json.corrupt")).unwrap(), bad, "and the bad file is kept");
+        }
+        // A person's own edit parses, and stays theirs.
+        let mut edited: serde_json::Value = serde_json::from_str(body).unwrap();
+        edited["name"] = "Mine".into();
+        std::fs::write(&file, edited.to_string()).unwrap();
+        drop(init());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited.to_string());
     }
 
     #[test]

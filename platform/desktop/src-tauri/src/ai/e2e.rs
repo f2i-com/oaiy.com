@@ -206,6 +206,12 @@ impl SpentBoxes {
         Ok(())
     }
 
+    /// Have the list in this process's hands, or say why it cannot be.
+    fn hold_now(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.file.as_ref().map_or(Ok(()), |path| Self::ready(path, &mut state))
+    }
+
     /// Mark a box used, durably, before anything is sealed with it. False: it was used before.
     fn spend(&self, entry: [u8; SPENT_BOX_BYTES]) -> Result<bool, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -250,6 +256,14 @@ impl SpentBoxes {
     }
 }
 
+/// Let go of the spent list of the folder `dir`, as a process does by ending: it is held for the life of the process,
+/// and Windows removes no open file, so a test's folder would stay.
+#[cfg(test)]
+pub(crate) fn let_go_of_spent_list(dir: &Path) {
+    let spent = SpentBoxes::for_dir(dir);
+    *spent.state.lock().unwrap_or_else(|e| e.into_inner()) = SpentState::default();
+}
+
 /// This desktop's long-term X25519 identity.
 pub struct E2eIdentity {
     secret: SecretKey,
@@ -263,6 +277,13 @@ impl E2eIdentity {
         let secret = SecretKey::from(bytes);
         let public = secret.public_key();
         Self { secret, public, spent: Arc::new(SpentBoxes::in_memory()) }
+    }
+
+    /// Whether this process can open sealed requests now, for a lane to ask before it polls: a row
+    /// it claims and cannot open ends as failed, where the process that holds the list would have
+    /// answered it. The lock is taken here if it is free, so the question settles who serves.
+    pub fn may_open_requests(&self) -> Result<(), String> {
+        self.spent.hold_now()
     }
 
     /// Mark the box a request key makes as used, before anything is sealed with it. False means it
@@ -947,7 +968,9 @@ mod tests {
         let second = SpentBoxes::load(path);
         assert!(first.spend([1u8; 16]).unwrap());
         assert!(second.spend([1u8; 16]).unwrap_err().contains("another OAIY process"));
+        assert!(second.hold_now().unwrap_err().contains("another OAIY process"), "a lane asks this before it claims");
         drop(first);
+        second.hold_now().unwrap();
         assert!(!second.spend([1u8; 16]).unwrap(), "and it reads what the first spent");
     }
 

@@ -754,7 +754,7 @@ pub struct AuthStore {
     elevation_clock: Mutex<Option<Arc<dyn Clock>>>,
     writer: Arc<dyn FileWriter>,
     random: Mutex<Random>,
-    _lock: Option<AuthLock>,
+    _lock: Option<Arc<AuthLock>>,
 }
 
 /// Read a file: `Ok(None)` for "not there", and every other failure an error naming the file.
@@ -826,6 +826,20 @@ impl AuthStore {
         audit: Option<Arc<AuditLog>>,
     ) -> Result<AuthStore, StoreError> {
         let lock = AuthLock::acquire(dir).map_err(StoreError::Lock)?;
+        Self::open_holding(Arc::new(lock), host, clock, writer, audit)
+    }
+
+    /// [`AuthStore::open`] of the folder `lock` holds, for a process that took the lock before it touched anything
+    /// else in its data folder: a second start must be refused while the first has its ledger open.
+    pub fn open_holding(
+        lock: Arc<AuthLock>,
+        host: Host,
+        clock: Arc<dyn Clock>,
+        writer: Arc<dyn FileWriter>,
+        audit: Option<Arc<AuditLog>>,
+    ) -> Result<AuthStore, StoreError> {
+        let dir = lock.dir().to_path_buf();
+        let dir = dir.as_path();
         let mut inner = Inner::new(Some(dir.to_path_buf()));
         let now = clock.now_ms();
         inner.owner = read_owner(dir)?;
@@ -1293,15 +1307,18 @@ impl AuthStore {
     }
 
     /// Revoke a credential. Its children end with it (their chain is checked at every use). A
-    /// revocation is written at once, and never resurrected by a later flush.
+    /// revocation is written at once, and never resurrected by a later flush. (A credential that lives
+    /// only in memory has nothing to write: each flow run ends one.)
     pub fn revoke(&self, id: &str, reason: &str) -> bool {
         let now = self.clock.now_ms();
         let mut g = self.lock();
-        if !g.records.get(id).is_some_and(|r| r.revoked_ms.is_none()) {
+        let Some(on_disk) = g.records.get(id).filter(|r| r.revoked_ms.is_none()).map(Record::on_disk) else {
             return false;
-        }
+        };
         g.revoke_in_memory(id, reason, now);
-        g.persist_quietly(self.writer.as_ref(), now);
+        if on_disk {
+            g.persist_quietly(self.writer.as_ref(), now);
+        }
         true
     }
 

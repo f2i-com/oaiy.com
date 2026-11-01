@@ -111,6 +111,9 @@ fn poll_once(
     still_linked: &impl Fn() -> bool,
     execute: &impl Fn(&str, Value) -> Result<Value, String>,
 ) -> Result<bool, String> {
+    // A process that cannot hold the spent list cannot open what it claims, so it claims nothing: the row stays for
+    // the process that can. (An error, for the loop's one line and its back-off.)
+    identity.may_open_requests()?;
     // The same for all three requests of a run, as the one timeout of the
     // client this lane used to build for each poll was: over the server's wait,
     // so a poll that comes back on time is not cut off by this side.
@@ -549,6 +552,27 @@ mod tests {
                 ["answer"],
             "private-result"
         );
+    }
+
+    /// Another process on the folder holds the spent list. This one used to claim the row and then fail it, a lost turn
+    /// for the person, where the holder would have answered.
+    #[test]
+    fn a_lane_that_cannot_hold_the_spent_list_asks_the_provider_for_nothing() {
+        let dir = crate::secret_file::testing::TempDir::new("sealed-flows-held");
+        let identity = E2eIdentity::load_or_create(&dir.0).unwrap();
+        let holder = std::fs::File::create(dir.0.join("desktop-e2e-spent.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).unwrap();
+        let (url, silent) = server(vec![]);
+        let refused = poll_once(&client(), &account(url), &spec(), "test-computer", &identity, &|| true, &|_, _| panic!("nothing was claimed"));
+        assert!(refused.unwrap_err().contains("another OAIY process"));
+        assert!(silent.join().unwrap().is_empty());
+
+        // The holder gone, the lane polls again by itself.
+        drop(holder);
+        let (url, asked) = server(vec![(200, json!({"requests":[]}))]);
+        assert!(!poll_once(&client(), &account(url), &spec(), "test-computer", &identity, &|| true, &|_, _| panic!("nothing is pending")).unwrap());
+        assert_eq!(asked.join().unwrap().len(), 1);
+        crate::ai::e2e::let_go_of_spent_list(&dir.0);
     }
 
     #[test]

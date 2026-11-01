@@ -109,6 +109,12 @@ impl Principal {
         !self.origins.is_empty()
     }
 
+    /// Whether this is the credential of a flow's own run (`auth::runtime::run_credential`), and not one derived by
+    /// a caller. Where it is judged, it stands in for the internal token `legacy` hands a flow.
+    pub fn is_flow_run(&self) -> bool {
+        self.kind == PrincipalKind::Run && self.preset.as_deref() == Some(super::presets::Preset::Run.name())
+    }
+
     /// The owner as the old guard sees them. The old guard inserts it so that a handler that reads
     /// `Extension<Principal>` works in the `legacy` access mode; it carries every scope and is
     /// elevated, because in that mode any accepted credential is admin.
