@@ -63,18 +63,9 @@ export const looksLikeSecret = (value: unknown): boolean => {
 };
 
 /**
- * A node's fields that hold a secret by their name: these names, whole, in any case. `maxTokens`, a memory node's `key`
- * and `apiKeyConstant` (the name of a constant, which an imported flow needs to find its key) only sound like them, and
- * matched as parts of a name they went from every export with no word said.
- */
-const SENSITIVE_FIELDS = [
-  'apikey', 'apitoken', 'authtoken', 'accesstoken', 'bearertoken', 'clientsecret', 'secretkey', 'privatekey',
-  'password', 'token', 'secret', 'credential', 'credentials', 'auth', 'authorization',
-];
-
-/**
- * Inside an object a node holds (its Custom Headers) the names are no schema's, and `X-Api-Key` or `Authorization` are
- * all there is to go on: a name with one of these in it goes.
+ * A name with one of these in it goes from an export, in any case and at any depth. For a node with no `secret` type to
+ * go by (a package's that is not loaded, a flow from elsewhere), and for what is inside a node's object (`X-Api-Key` in
+ * its Custom Headers), the name is all there is. Whole names let `botToken` and `smtpPassword` through.
  */
 const SENSITIVE_NAME_PARTS = ['password', 'token', 'secret', 'key', 'credential', 'auth'];
 
@@ -86,13 +77,25 @@ const holdsLiteralKey = (field: string, value: string): boolean =>
   field.endsWith('Constant') && !/^[A-Z0-9_]{0,40}$/.test(value);
 
 /**
+ * A node's own field that only sounds like a secret, and went from every export with no word said: a count of tokens
+ * (`maxTokens`), the name of a constant (`apiKeyConstant`, which an imported flow needs to find its key, and which
+ * `holdsLiteralKey` holds to being one), and a field called `key` on a node whose schema says what it is (a memory's).
+ */
+const onlySoundsSecret = (field: string, value: unknown, schemaPlainFields?: Set<string>): boolean =>
+  (/tokens$/i.test(field) && /^\d+$/.test(String(value))) ||
+  field.endsWith('Constant') ||
+  (field === 'key' && schemaPlainFields?.has(field) === true);
+
+/**
  * Sanitize node data by removing sensitive fields and secret-looking values.
- * Accepts schema-defined secret fields from node definitions.
+ * Accepts schema-defined secret fields from node definitions, and the fields the
+ * schema declares as anything else. `nested`: this is an object inside a node.
  */
 export const sanitizeNodeData = (
   data: Record<string, unknown>,
   knownSecrets: Set<string>,
   schemaSecretFields?: Set<string>,
+  schemaPlainFields?: Set<string>,
   nested = false
 ): Record<string, unknown> => {
   const result: Record<string, unknown> = {};
@@ -108,7 +111,7 @@ export const sanitizeNodeData = (
 
     // Skip fields with sensitive names (case-insensitive)
     const name = key.toLowerCase();
-    if (nested ? SENSITIVE_NAME_PARTS.some(part => name.includes(part)) : SENSITIVE_FIELDS.includes(name)) {
+    if (SENSITIVE_NAME_PARTS.some(part => name.includes(part)) && (nested || !onlySoundsSecret(key, value, schemaPlainFields))) {
       continue;
     }
 
@@ -119,7 +122,7 @@ export const sanitizeNodeData = (
 
     // Recursively sanitize nested objects
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      result[key] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, schemaSecretFields, true);
+      result[key] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, schemaSecretFields, undefined, true);
     } else if (typeof value === 'string') {
       // Scrub a secret embedded MID-STRING — e.g. a literal key pasted inside the
       // ai_llm endpoint / customHeaders / customBodyTemplate (`{"Authorization":
@@ -136,20 +139,18 @@ export const sanitizeNodeData = (
 };
 
 /**
- * Get secret field names from node definition schema
+ * Get a node definition's field names: the ones its schema calls secret, and the rest
  */
-const getSchemaSecretFields = (nodeType: string): Set<string> => {
-  const secretFields = new Set<string>();
+const getSchemaFields = (nodeType: string): { secret: Set<string>; plain: Set<string> } => {
+  const fields = { secret: new Set<string>(), plain: new Set<string>() };
   const loader = getModuleLoader();
   const def = loader.getNodeDefinition(nodeType);
   if (def?.properties) {
     for (const prop of def.properties) {
-      if (prop.type === 'secret') {
-        secretFields.add(prop.id);
-      }
+      (prop.type === 'secret' ? fields.secret : fields.plain).add(prop.id);
     }
   }
-  return secretFields;
+  return fields;
 };
 
 /**
@@ -162,13 +163,14 @@ export const sanitizeWorkflowGraph = (
   return {
     ...graph,
     nodes: graph.nodes.map(node => {
-      const schemaSecretFields = getSchemaSecretFields(node.type);
+      const schema = getSchemaFields(node.type);
       return {
         ...node,
         data: sanitizeNodeData(
           node.data as Record<string, unknown>,
           knownSecrets,
-          schemaSecretFields
+          schema.secret,
+          schema.plain
         ),
       };
     }),

@@ -142,8 +142,8 @@
     {
       "id": "rollback",
       "class": "excluded",
-      "paths": ["**/*.bak", "**/*.tmp", "**/*.corrupt", "**/*.part", "**/.backup-*/**"],
-      "pattern": "*.bak, *.tmp, *.corrupt, *.part, plugins/.backup-*",
+      "paths": ["**/*.bak", "**/*.tmp", "**/*.corrupt", "**/*.corrupt.*", "**/*.part", "**/.backup-*/**"],
+      "pattern": "*.bak, *.tmp, *.corrupt, *.corrupt.*, *.part, plugins/.backup-*",
       "what": "Rollback copies and half-written files",
       "reason": "Rollback copies and half-written files: they can hold older plaintext."
     },

@@ -64,6 +64,9 @@ export async function loadConnectorModule(filePath: string): Promise<ConnectorMo
       // uses to reach OAIY Desktop / oaiy-server.
       loopbackBaseUrl: process.env.OAIY_SERVER_URL,
       loopbackToken: process.env.OAIY_SERVER_TOKEN,
+      // The provider's id for this run, which its writes name: set by whoever
+      // claimed the run, for that run alone.
+      runId: process.env.OAIY_FLOW_RUN_ID,
     },
     abs,
   );

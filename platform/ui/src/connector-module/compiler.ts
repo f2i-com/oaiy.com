@@ -81,6 +81,7 @@ export function createConnectorCompiler(config: ConnectorConfig): ModuleCompiler
       if (spec.filters) call.filters = spec.filters;
       if (spec.recordField) call.recordField = spec.recordField;
       if (spec.replyField) call.replyField = spec.replyField;
+      if (spec.runField) call.runField = spec.runField;
       if (spec.limit) call.limit = spec.limit;
 
       let callLiteral: string;

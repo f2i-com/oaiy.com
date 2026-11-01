@@ -115,7 +115,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `*.key, *.pem, *.dpapi, auth.json, and in plugin data anything named *token*, *secret*, *credential*, *password*, *pairing*, *outbox*` | excluded | Never | Anything that looks like a key, a sign-in or something a plugin ties to this computer: Looks like a key, a sign-in or something a plugin ties to this computer: those cannot be restored on another, and a backup never holds a credential. To do again: Sign in or pair again in each plugin that asks. |
 | `models/**, python/**, venvs/**, node/**, bin/**` | excluded | Never | Programs and downloaded models: large, and installed or downloaded again. |
 | `logs/**, tmp/**, cache/**, *.log` | excluded | Never | Logs, caches and temporary files. |
-| `*.bak, *.tmp, *.corrupt, *.part, plugins/.backup-*` | excluded | Never | Rollback copies and half-written files: they can hold older plaintext. |
+| `*.bak, *.tmp, *.corrupt, *.corrupt.*, *.part, plugins/.backup-*` | excluded | Never | Rollback copies and half-written files: they can hold older plaintext. |
 | `plugins/**` | excluded | Never | Installed plugin programs, their trust decisions and switches: install and trust the plugins again on the new computer. To do again: Install your plugins again and accept what they may do. |
 | `plugin-backups/**` | excluded | Never | Rollback copies of installed plugins: Copies of plugin programs and their data that OAIY keeps to roll an update back: programs are installed again, and the data in them is the plugin's own state. |
 | `scripts/**, model-catalog.json, services-running.json, .*.seed` | excluded | Never | What OAIY rebuilds itself: Rebuilt by OAIY from what it ships or from your templates. |

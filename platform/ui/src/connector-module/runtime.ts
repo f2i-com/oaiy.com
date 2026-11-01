@@ -448,6 +448,15 @@ export function createConnectorRuntime(
       );
     };
 
+    /**
+     * What a write sends: `payload`, and the run making it where the provider's
+     * node asks for that and the host has one. Without it a provider counts the
+     * write as a person's, and a flow that writes into the form it is bound to
+     * starts itself again with nothing to end it.
+     */
+    const asThisRun = (call: ConnectorCall, payload: Record<string, unknown>): Record<string, unknown> =>
+      call.runField && host.runId ? { ...payload, [call.runField]: host.runId } : payload;
+
     const recordUrl = (call: ConnectorCall, input: unknown, withQuery: boolean): string => {
       if (!call.path) {
         // Unreachable via parseConnectorConfig, which requires a path for the
@@ -591,7 +600,7 @@ export function createConnectorRuntime(
           url,
           method: call.method || 'POST',
           headers: providerHeaders(true),
-          body: JSON.stringify(payload),
+          body: JSON.stringify(asThisRun(call, payload)),
           call,
           what: 'creating a record',
         }));
@@ -606,7 +615,7 @@ export function createConnectorRuntime(
           url,
           method: call.method || 'PATCH',
           headers: providerHeaders(true),
-          body: JSON.stringify(payload),
+          body: JSON.stringify(asThisRun(call, payload)),
           call,
           what: 'updating a record',
         }));

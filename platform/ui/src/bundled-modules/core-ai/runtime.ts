@@ -446,14 +446,51 @@ function answerOf(text: string): string {
   return answer;
 }
 
-/** The `error` a provider's 200 carries, if it does: of the reply, or of its first choice as some gateways put it. */
+/**
+ * The `error` a provider's 200 carries, if it does: of the reply, or of its first choice as some gateways put it. An
+ * empty one says nothing: a gateway's `error: {}` beside a good answer is no error.
+ */
 function errorIn(data: any): unknown {
-  return data?.error || data?.choices?.[0]?.error;
+  const said = (error: unknown) => (error && typeof error === 'object' ? Object.keys(error).length > 0 : !!error);
+  return [data?.error, data?.choices?.[0]?.error].find(said);
+}
+
+/**
+ * A reply that is the answer without being text: a turn that calls tools (no text, `tool_calls`), or an image (no text,
+ * `images`). The flow reads its JSON. Text it does not have is not a missing answer.
+ */
+function holdsOtherThanText(data: any): boolean {
+  const choice = data?.choices?.[0];
+  const some = (list: unknown) => Array.isArray(list) && list.length > 0;
+  return some(choice?.message?.tool_calls) || choice?.finish_reason === 'tool_calls' || data?.stop_reason === 'tool_use' || some(choice?.message?.images);
+}
+
+/** A list of `choices` that is a reply's choices. A custom endpoint may have a `choices` of its own, of words or numbers. */
+function holdsChoices(data: any): boolean {
+  return Array.isArray(data?.choices) && (data.choices.length === 0 || (typeof data.choices[0] === 'object' && data.choices[0] !== null));
+}
+
+/** The reply's text, whatever the shape: by what it is, since the address says nothing (a proxy with `claude` in its URL speaks OpenAI). */
+function replyText(data: any): string {
+  const said = data?.choices?.[0]?.message?.content || data?.message?.content || data?.response;
+  if (said) return said;
+  // (every text block, in order: the answer can come in several, after a thinking block that has no text)
+  const texts: string[] = Array.isArray(data?.content)
+    ? data.content.filter((b: { type?: unknown; text?: unknown }) => b?.type === 'text' && typeof b.text === 'string').map((b: { text: string }) => b.text)
+    : [];
+  return texts.join('');
+}
+
+/** `NO_MESSAGE`, with how the reply says it ended where it does. */
+function noMessage(data: any): string {
+  const finish = data?.choices?.[0]?.finish_reason;
+  if (finish) return `The AI service answered without a message (finish_reason: ${finish}).`;
+  return data?.stop_reason ? `The AI service answered without a message (stop_reason: ${data.stop_reason}).` : NO_MESSAGE;
 }
 
 /**
  * What a provider's 200 says about why it holds no answer, where it says. A status of 200 is not an answer: a body with
- * an `error` in it, or a reasoning model's that used its tokens thinking, otherwise reached the flow as text.
+ * an `error` in it, a refusal, or a reasoning model's that used its tokens thinking, otherwise reached the flow as text.
  */
 function whyNoAnswer(data: any): string | null {
   const failure: any = errorIn(data);
@@ -461,7 +498,17 @@ function whyNoAnswer(data: any): string | null {
     const said = typeof failure === 'string' ? failure : typeof failure.message === 'string' ? failure.message : JSON.stringify(failure);
     return `The AI service answered with an error: ${said}`;
   }
-  return data?.choices?.[0]?.finish_reason === 'length' || data?.stop_reason === 'max_tokens' ? LIMIT_SPENT_THINKING : null;
+  const choice = data?.choices?.[0];
+  if (typeof choice?.message?.refusal === 'string' && choice.message.refusal) {
+    return `The model refused: ${choice.message.refusal}${choice.finish_reason ? ` (finish_reason: ${choice.finish_reason})` : ''}`;
+  }
+  if (choice?.finish_reason === 'content_filter' || data?.stop_reason === 'refusal') return noMessage(data);
+  return choice?.finish_reason === 'length' || data?.stop_reason === 'max_tokens' ? LIMIT_SPENT_THINKING : null;
+}
+
+/** A reply that holds the start of an answer and says it failed there is a failure, not that start. */
+function endedInError(data: any): boolean {
+  return !!errorIn(data) && data?.choices?.[0]?.finish_reason === 'error';
 }
 
 async function tryEagerLlmUnload(modelId: string): Promise<void> {
@@ -1521,34 +1568,34 @@ async function chat(
         content = responseText;
       } else if (typeof customResponsePath === 'string' && customResponsePath.trim() !== '') {
         const extracted = extractJsonPath(data, customResponsePath);
-        if (extracted === null || extracted === undefined) {
+        if (extracted !== null && extracted !== undefined) {
+          content = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+        } else if (holdsOtherThanText(data)) {
+          content = JSON.stringify(data);
+        } else {
           throw new Error(whyNoAnswer(data) ?? `The response has nothing at ${customResponsePath}.`);
         }
-        content = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
       } else {
         // Custom template, no explicit path — try common shapes, else raw JSON: an endpoint's shape of its own, for the
         // flow to read. Not an error body, or an OpenAI reply with no choice in it.
         const shaped = data?.choices?.[0]?.message?.content ?? data?.response ?? data?.text;
-        if ((shaped === null || shaped === undefined) && (errorIn(data) || Array.isArray(data?.choices))) {
-          throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
+        if (!shaped && holdsOtherThanText(data)) {
+          content = JSON.stringify(data);
+        } else if ((shaped === null || shaped === undefined) && (errorIn(data) || holdsChoices(data))) {
+          throw new Error(whyNoAnswer(data) ?? noMessage(data));
+        } else {
+          content = shaped ?? JSON.stringify(data);
         }
-        content = shaped ?? JSON.stringify(data);
       }
       // (a template's endpoint may answer with nothing, as long as the reply does not say it was cut off or failed)
       if (jsonOk && content === '') {
         const why = whyNoAnswer(data);
         if (why) throw new Error(why);
       }
-    } else if (isAnthropic) {
-      // (every text block, in order: the answer can come in several, after a thinking block that has no text)
-      const texts: string[] = Array.isArray(data?.content)
-        ? data.content.filter((b: { type?: unknown; text?: unknown }) => b?.type === 'text' && typeof b.text === 'string').map((b: { text: string }) => b.text)
-        : [];
-      content = texts.join('');
-      if (!content || errorIn(data)) throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
     } else {
-      content = data?.choices?.[0]?.message?.content || data?.response;
-      if (!content || errorIn(data)) throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
+      content = replyText(data);
+      if (!content && holdsOtherThanText(data)) content = JSON.stringify(data);
+      if (!content || endedInError(data)) throw new Error(whyNoAnswer(data) ?? noMessage(data));
     }
 
     ctx.log('info', `[AI] Response received (${content.length} chars)`);
@@ -1559,7 +1606,7 @@ async function chat(
     // reach the user-facing output. Cloud + local paths both go through
     // this so the behaviour is provider-agnostic.
     const cleaned = answerOf(content);
-    if (!cleaned && !useCustomTemplate) throw new Error(NO_MESSAGE);
+    if (!cleaned && !useCustomTemplate) throw new Error(whyNoAnswer(data) ?? noMessage(data));
 
     // Stream the response if callback available
     if (ctx.onStreamToken && streaming) {

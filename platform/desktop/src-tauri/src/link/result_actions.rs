@@ -595,6 +595,8 @@ pub struct Live<'a> {
     /// Absent on a runtime with no plugin host — a connector action then fails
     /// and says so, rather than being quietly dropped.
     pub connector: Option<&'a super::relay::Dispatcher>,
+    /// The provider's id for the run these actions follow.
+    pub run_id: &'a str,
 }
 
 impl Live<'_> {
@@ -623,11 +625,17 @@ impl Perform for Live<'_> {
             &self.account.base_url,
             &self.spec.submit_path.replace("{formId}", form_id),
         );
+        let mut body = json!({ &self.spec.fields.record: record });
+        // A binding writing into the form it is bound to is the same loop as a
+        // node doing it: the write names the run, or nothing can end the chain.
+        if let Some(run) = &self.spec.fields.run {
+            body[run] = json!(self.run_id);
+        }
         let resp = Self::client()?
             .post(&url)
             .bearer_auth(&self.account.credential)
             .header("Idempotency-Key", idempotency_key)
-            .json(&json!({ &self.spec.fields.record: record }))
+            .json(&body)
             .send()
             .map_err(|e| format!("could not reach the provider to write the record: {e}"))?;
         let status = resp.status();
@@ -706,6 +714,35 @@ mod tests {
             .into_iter()
             .find_map(|c| c.flows.and_then(|f| f.selectors))
             .expect("the built-in connector describes how a reference is spelled")
+    }
+
+    /// A binding that writes into the form it is bound to starts its own flow again. FormLogic ends that chain by the
+    /// run a write names, and only by that: a submission from here named none, so the chain had no end. Its PUT reads
+    /// no run and starts none, so an update names none.
+    #[test]
+    fn a_bindings_submission_names_the_run_and_its_update_does_not() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"response":{"id":"r1"}}"#));
+        let account = crate::link::LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: server.base.clone(),
+            credential: "flk_secret".into(),
+            account_id: None,
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        };
+        let spec = spec();
+        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-7f3a" };
+        let record = serde_json::json!({ "f_name": "written by the binding" });
+        assert_eq!(live.submit("form-a", &record, "k1").unwrap().as_deref(), Some("r1"));
+        live.update("form-a", "r1", &record, "k2").unwrap();
+
+        let seen = server.requests();
+        let bodies: Vec<Value> = seen.iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
+        assert_eq!(bodies[0], serde_json::json!({ "answers": record, "flowRunId": "run-7f3a" }));
+        assert_eq!(bodies[1], serde_json::json!({ "answers": record }));
     }
 
     fn result_scope(v: &Value) -> Scope<'_> {

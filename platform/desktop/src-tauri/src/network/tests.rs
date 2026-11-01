@@ -1293,6 +1293,43 @@ async fn unpairing_at_the_primary_tells_the_worker_and_forgets_its_models() {
     primary.stop();
 }
 
+/// Files held at start (an antivirus scan, a backup) left Network off and without its paired computers until a restart.
+/// They come back by themselves, and the computer comes up as its settings say.
+#[tokio::test]
+async fn files_that_could_not_be_read_at_start_come_back_by_themselves() {
+    let data = temp("held-at-start");
+    let dir = data.join("network");
+    let (settings, peers) = (dir.join(super::store::SETTINGS_FILE), dir.join(super::store::PEERS_FILE));
+    // (folders where the files belong: reads that fail as a held file's do, on every system)
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::create_dir_all(&peers).unwrap();
+    let net = Network::open_with(&data, ai(None), false);
+    let (_, status) = call(&router(net.clone()), "GET", "/api/network/status", None).await;
+    assert_eq!(status["storeProblems"].as_array().unwrap().len(), 2, "{status}");
+    assert!(!net.settings().enabled);
+    net.read_again_later();
+
+    std::fs::remove_dir_all(&settings).unwrap();
+    std::fs::remove_dir_all(&peers).unwrap();
+    let kept = Settings { enabled: true, role: Role::Worker, name: "back again".into(), port: 0, bind: "127.0.0.1".into(), ..Settings::default() };
+    std::fs::write(&settings, serde_json::to_vec(&kept).unwrap()).unwrap();
+    let peer = super::store::Peer { node_id: "a".into(), name: "A".into(), role: Role::Primary, fingerprint: "fa".into(), address: String::new(), paired_at_ms: 1, by_itself: false };
+    std::fs::write(&peers, serde_json::to_vec(&[peer]).unwrap()).unwrap();
+    super::store::due_now(&settings);
+    super::store::due_now(&peers);
+
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while net.listening().is_none() {
+        assert!(std::time::Instant::now() < until, "it did not come up: {:?}", super::store::problems(&dir));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(net.settings().name, "back again");
+    assert_eq!(net.inner.peers().list().len(), 1);
+    let (_, status) = call(&router(net.clone()), "GET", "/api/network/status", None).await;
+    assert_eq!(status["storeProblems"], json!([]), "{status}");
+    net.stop();
+}
+
 #[tokio::test]
 async fn off_nothing_listens_and_a_worker_is_never_reached_off_the_lan() {
     let net = Network::open_with(&temp("off"), ai(None), false);

@@ -655,6 +655,7 @@ fn apply_result_actions(
         account,
         spec: actions_spec,
         connector,
+        run_id: &run.id,
     };
     let errors =
         result_actions::perform_all(actions_spec, selectors, &actions, &scope, run_key, &doer);
@@ -694,6 +695,11 @@ fn release_if_claimed(
     }
 }
 
+/// What a sealed run has of a claim lane: the graph, and nothing of the queue.
+fn sealed_lane(graph: &str) -> Lane<'_> {
+    Lane { queued: "", claim: "", complete: "", graph }
+}
+
 /// Fetch the graph, hand it to the CLI, and turn the result into an outcome.
 pub(super) fn execute_sealed(
     account: &LinkedAccount,
@@ -704,7 +710,7 @@ pub(super) fn execute_sealed(
     data_dir: &Path,
 ) -> Result<Value, String> {
     let graph = spec.graph_path.as_deref().ok_or("this provider has no flow graph endpoint")?;
-    let lane = Lane { queued: "", claim: "", complete: "", graph };
+    let lane = sealed_lane(graph);
     let run = QueuedRun {
         // A fresh local name avoids sharing credential files across execution lanes.
         id: format!("sealed-{}", uuid::Uuid::new_v4()),
@@ -749,7 +755,7 @@ fn execute(
         )
     })?;
 
-    let result = run_in(&scratch, account, spec, node, run, &graph, held);
+    let result = run_in(&scratch, account, spec, lane, node, run, &graph, held);
     // Removed on every path: the connector config in here holds the credential.
     let _ = std::fs::remove_dir_all(&scratch);
     result
@@ -816,10 +822,22 @@ fn profile_legs(
     Ok((Some(path), instruction_budget_for(descriptor_budget, profile.instruction_steps())))
 }
 
+/// The provider's own id for this run, for the writes it makes to name: only a run
+/// claimed from its queue has one. A sealed run was never in that queue (it is a
+/// request, kept elsewhere) and its `id` is a name made up here, so a write naming
+/// it is refused and the record lost. It needs none either: nothing the provider
+/// queues starts a sealed run, so what its write starts is a chain of its own,
+/// and the runs of that chain name themselves.
+fn provider_run<'a>(lane: &Lane, run: &'a QueuedRun) -> Option<&'a str> {
+    (!lane.claim.is_empty()).then_some(run.id.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_in(
     scratch: &Path,
     account: &LinkedAccount,
     spec: &FlowsSpec,
+    lane: &Lane,
     node: Option<&crate::services::node_runtime::NodeHandle>,
     run: &QueuedRun,
     graph: &Value,
@@ -858,6 +876,7 @@ fn run_in(
             inputs_path: &inputs_path,
             out_path: &out_path,
             connector_path: Some(&connector_path),
+            flow_run_id: provider_run(lane, run),
             timeout: RUN_TIMEOUT,
             instruction_budget,
             profile_path: profile_path.as_deref(),
@@ -1449,6 +1468,10 @@ mod tests {
         let submit = nodes.iter().find(|n| n["nodeType"] == "formlogic_submit_response").unwrap();
         assert_eq!((&submit["recordField"], &update["recordField"]), (&json!("answers"), &json!("answers")));
         assert_eq!((&submit["replyField"], &update["replyField"]), (&json!("response"), &json!("response")));
+        // A submission starts runs and FormLogic reads the run that made it there. Its PUT reads no such
+        // field and starts none, so an update says nothing of its run.
+        assert_eq!(submit["runField"], "flowRunId");
+        assert!(update.get("runField").is_none());
         let list = nodes.iter().find(|n| n["nodeType"] == "formlogic_list_responses").unwrap();
         assert_eq!(list["limit"]["field"], "limit");
 
@@ -1470,6 +1493,18 @@ mod tests {
                 "unknown operation {op}"
             );
         }
+    }
+
+    /// A run from the provider's queue names itself on a write. A sealed one must not: its id is a name made up here,
+    /// which the provider has no run of, and a write that gives it is refused and its record lost.
+    #[test]
+    fn only_a_run_claimed_from_the_queue_is_named_to_the_provider() {
+        let flows = spec();
+        let run = |id: &str| QueuedRun { id: id.into(), flow: None, flow_definition_id: None, app_id: None, binding_id: None, idempotency_key: None, input_snapshot: Value::Null };
+        let claimed = run("run-7f3a");
+        assert_eq!(provider_run(&Lane::of(&flows).unwrap(), &claimed), Some("run-7f3a"));
+        let sealed = run("sealed-1");
+        assert_eq!(provider_run(&sealed_lane("/flows"), &sealed), None);
     }
 
     #[test]

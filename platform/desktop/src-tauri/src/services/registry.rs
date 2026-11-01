@@ -315,7 +315,7 @@ pub struct EnsureByPortResult {
 /// wondering where their card went. The surface is one the app tells users to edit,
 /// and `seed_builtin_script` deliberately never re-seeds over a hand-edited
 /// file, so a stray comma is permanent and unexplained.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateLoadError {
     /// File name only — it lives in `<dataDir>/templates`, which the snapshot
@@ -638,7 +638,12 @@ fn seed_builtin_script(target: &Path, snapshot: &Path, body: &str) -> std::io::R
     } else {
         body
     };
-    match std::fs::read_to_string(target).ok() {
+    // (a hand-edit saved as UTF-16 is still a hand-edit: read as text, not left to look like no file)
+    let current = match crate::secret_file::read_text(target) {
+        crate::secret_file::Text::Text(current) => Some(current),
+        _ => None,
+    };
+    match current {
         None => {
             std::fs::write(target, body)?;
             let _ = std::fs::write(snapshot, body);
@@ -659,22 +664,77 @@ fn seed_builtin_script(target: &Path, snapshot: &Path, body: &str) -> std::io::R
     Ok(())
 }
 
-/// Move a built-in template that no longer parses to `<name>.corrupt`, so that the seed below writes the shipped one
-/// in its place. Left where it is, it cost the service (OAIY Voice, and with it the voice of every call) until
-/// someone repaired the file by hand, and a hand-edit is not the seed's to overwrite: a file that still parses is one.
-fn set_aside_broken_template(target: &Path) {
-    let why = match std::fs::read(target) {
-        Ok(bytes) => match serde_json::from_slice::<ServiceTemplate>(&bytes) {
-            Ok(_) => return,
-            Err(e) => e,
+/// Keep a built-in template that no longer parses as `<name>.corrupt` (`.corrupt.1`, and so on: no earlier one is
+/// replaced), so that the seed below writes the shipped one in its place. Left where it is, it cost the service (OAIY
+/// Voice, and with it the voice of every call) until someone repaired the file by hand, and a hand-edit is not the
+/// seed's to overwrite: a file that still parses is one. One with a typo is one too, and nothing tells it from damage,
+/// so what is kept is told in `template_errors` for as long as it is there ([`kept_template_errors`]).
+///
+/// Answers whether the seed may go on: not over a file that is there and could not be read or kept, which may be a
+/// good one. It is left to the load below to report.
+fn set_aside_broken_template(target: &Path) -> bool {
+    use crate::secret_file::{keep_aside, read_text_patiently, Patience, Text};
+    let why = match read_text_patiently(target, &Patience::default().start) {
+        Text::Missing => return true,
+        Text::Text(raw) => match serde_json::from_str::<ServiceTemplate>(&raw) {
+            Ok(_) => return true,
+            Err(e) => e.to_string(),
         },
-        Err(_) => return,
+        Text::Undecodable(why) => why,
+        Text::Unreadable(e) => {
+            log::warn!("built-in template {} could not be read ({e}), and is left as it is", target.display());
+            return false;
+        }
     };
-    let aside = target.with_extension("json.corrupt");
-    match std::fs::rename(target, &aside) {
-        Ok(()) => log::warn!("built-in template {} could not be read ({why}): it is at {}, and the shipped one is back", target.display(), aside.display()),
-        Err(e) => log::warn!("built-in template {} could not be read ({why}) or moved aside: {e}", target.display()),
+    match keep_aside(target) {
+        Ok(aside) => {
+            log::warn!("built-in template {} could not be read ({why}): it is kept as {}, and the shipped one is back", target.display(), aside.display());
+            // (it could only be copied: gone or not, the seed below leaves what is there, and the load reports it)
+            let _ = std::fs::remove_file(target);
+            true
+        }
+        Err(e) => {
+            log::warn!("built-in template {} could not be read ({why}) or kept aside: {e}", target.display());
+            false
+        }
     }
+}
+
+/// A template's text, or why there is none to go on; `None` for a file that is not there (any more). A busy file is
+/// waited for as `pauses` say, and a file in another encoding read: a person's own, saved by PowerShell 5.1 as UTF-16,
+/// stopped the registry from starting at all.
+fn template_text(path: &Path, pauses: &[std::time::Duration]) -> Option<Result<String, String>> {
+    use crate::secret_file::{read_text_patiently, Text};
+    match read_text_patiently(path, pauses) {
+        Text::Missing => None,
+        Text::Text(raw) => Some(Ok(raw)),
+        Text::Undecodable(why) => Some(Err(format!("it is not text ({why})"))),
+        Text::Unreadable(e) => Some(Err(format!("it could not be read ({e}): another program may have it open, or its permissions may not let OAIY read it, and it is read again"))),
+    }
+}
+
+/// What is kept of the built-in templates that were set aside: one entry each, for as long as the file is there, so that
+/// a person's edit is found where it went and they know why the shipped template is back.
+fn kept_template_errors(templates_dir: &Path) -> Vec<TemplateLoadError> {
+    let mut kept = Vec::new();
+    for (name, _) in BUILTIN_TEMPLATES {
+        for aside in crate::secret_file::kept_aside(&templates_dir.join(name)) {
+            let why = match template_text(&aside, &[]) {
+                Some(Ok(raw)) => serde_json::from_str::<ServiceTemplate>(&raw).err().map(|e| e.to_string()),
+                Some(Err(why)) => Some(why),
+                None => None,
+            };
+            let file = file_label(&aside);
+            kept.push(TemplateLoadError {
+                error: format!(
+                    "{name} did not load ({}), so the template OAIY ships was put back in its place and the service still works. What was in the file is kept as {file} in the same folder: if that was your edit, repair it there and copy it over {name}. This message goes when {file} is removed.",
+                    why.as_deref().unwrap_or("it could not be parsed"),
+                ),
+                file,
+            });
+        }
+    }
+    kept
 }
 
 /// A package-file name is safe iff it's a bare filename (no path separator / `..` /
@@ -914,7 +974,9 @@ impl Registry {
         for (name, body) in BUILTIN_TEMPLATES {
             let p = data_dir.join("templates").join(name);
             let snap = data_dir.join("templates").join(format!(".{name}.seed"));
-            set_aside_broken_template(&p);
+            if !set_aside_broken_template(&p) {
+                continue;
+            }
             if let Err(e) = seed_builtin_script(&p, &snap, body) {
                 log::warn!("could not seed built-in template {name}: {e}");
             }
@@ -944,14 +1006,22 @@ impl Registry {
         retire_seeded_templates(&data_dir.join("templates"));
 
         let mut services = HashMap::new();
-        let mut template_errors: Vec<TemplateLoadError> = Vec::new();
+        let mut template_errors = kept_template_errors(&data_dir.join("templates"));
         for entry in std::fs::read_dir(data_dir.join("templates"))? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path)?;
+            let raw = match template_text(&path, &crate::secret_file::Patience::default().start) {
+                None => continue,
+                Some(Ok(raw)) => raw,
+                Some(Err(error)) => {
+                    log::warn!("skipping template {}: {error}", path.display());
+                    template_errors.push(TemplateLoadError { file: file_label(&path), error });
+                    continue;
+                }
+            };
             match serde_json::from_str::<ServiceTemplate>(&raw) {
                 Ok(t) => {
                     // Self-contained packages carry their scripts inline; lay
@@ -2528,7 +2598,7 @@ impl Registry {
         let mut added = 0usize;
         // Rebuilt from scratch on every scan (i.e. every /api/services poll) so a
         // fixed file stops being reported without anything having to invalidate.
-        let mut errors: Vec<TemplateLoadError> = Vec::new();
+        let mut errors = kept_template_errors(&dir);
         // Rebuilt rather than mutated, so a template file that has been DELETED
         // drops out instead of lingering in the cache forever.
         let mut probes: HashMap<PathBuf, TemplateProbe> = HashMap::new();
@@ -2572,8 +2642,14 @@ impl Registry {
                 }
             }
 
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                continue;
+            // (not kept as a probe: a file that cannot be read now may be read at the next poll)
+            let raw = match template_text(&path, &[]) {
+                None => continue,
+                Some(Ok(raw)) => raw,
+                Some(Err(error)) => {
+                    errors.push(TemplateLoadError { file: file_label(&path), error });
+                    continue;
+                }
             };
             let t: ServiceTemplate = match serde_json::from_str(&raw) {
                 Ok(t) => t,
@@ -3784,13 +3860,16 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         let file = dir.0.join("templates").join(name);
         let id = serde_json::from_str::<super::ServiceTemplate>(body).unwrap().id;
         drop(init());
-        for bad in [&b""[..], &body.as_bytes()[..body.len() / 2], b"\xff\xfe not text"] {
+        let bad: [&[u8]; 3] = [b"", &body.as_bytes()[..body.len() / 2], b"\xff\xfe not text"];
+        for (n, bad) in bad.into_iter().enumerate() {
             std::fs::write(&file, bad).unwrap();
             let reg = init();
             assert!(reg.services.contains_key(&id), "the service is back");
-            assert!(reg.snapshot().template_errors.is_empty());
             assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), body.trim());
-            assert_eq!(std::fs::read(file.with_extension("json.corrupt")).unwrap(), bad, "and the bad file is kept");
+            let kept = crate::secret_file::kept_aside(&file);
+            assert_eq!(kept.len(), n + 1, "none replaces another");
+            assert_eq!(std::fs::read(&kept[n]).unwrap(), bad, "and the bad file is kept");
+            assert_eq!(reg.snapshot().template_errors.len(), n + 1, "each is told");
         }
         // A person's own edit parses, and stays theirs.
         let mut edited: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -3798,6 +3877,106 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         std::fs::write(&file, edited.to_string()).unwrap();
         drop(init());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), edited.to_string());
+    }
+
+    /// An edit with a typo went with one line in the log: the person had the shipped template back, and no way to
+    /// learn where their work was. It is told where they look, on every poll, for as long as the file is there.
+    #[test]
+    fn an_edit_that_does_not_parse_is_told_with_where_it_went_until_that_file_is_gone() {
+        let dir = crate::secret_file::testing::TempDir::new("template-told");
+        let init = || super::Registry::init(dir.0.clone(), dir.0.join("models"), Vec::new()).unwrap();
+        let (name, body) = super::BUILTIN_TEMPLATES[0];
+        let file = dir.0.join("templates").join(name);
+        drop(init());
+        let typo = body.replacen('{', "{ oops", 1);
+        std::fs::write(&file, &typo).unwrap();
+
+        let mut reg = init();
+        let aside = format!("{name}.corrupt");
+        assert_eq!(std::fs::read_to_string(dir.0.join("templates").join(&aside)).unwrap(), typo, "where it says");
+        let told = |reg: &super::Registry| {
+            let errors = reg.snapshot().template_errors;
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].file, aside);
+            assert!(errors[0].error.contains(&aside) && errors[0].error.contains("line 1"), "where, and the typo's place: {}", errors[0].error);
+        };
+        told(&reg);
+        // A poll rebuilds the list from what is on disk, and an unchanged folder is served from the cache of probes.
+        reg.reload_new_templates();
+        told(&reg);
+        reg.reload_new_templates();
+        told(&reg);
+
+        // A restart says it again.
+        told(&init());
+
+        std::fs::remove_file(dir.0.join("templates").join(&aside)).unwrap();
+        reg.reload_new_templates();
+        assert!(reg.snapshot().template_errors.is_empty());
+    }
+
+    /// PowerShell 5.1's `Out-File` writes UTF-16: an edit saved that way is no damage, and is not to be replaced. Read
+    /// as bytes it went aside; and a person's own template in that encoding stopped the registry from starting.
+    #[test]
+    fn a_template_in_another_encoding_is_read_where_it_is() {
+        let dir = crate::secret_file::testing::TempDir::new("template-encodings");
+        let init = || super::Registry::init(dir.0.clone(), dir.0.join("models"), Vec::new()).unwrap();
+        let (name, body) = super::BUILTIN_TEMPLATES[0];
+        let file = dir.0.join("templates").join(name);
+        let id = serde_json::from_str::<super::ServiceTemplate>(body).unwrap().id;
+        drop(init());
+
+        let mut edited: serde_json::Value = serde_json::from_str(body).unwrap();
+        edited["name"] = "Mine".into();
+        let utf16 = |text: &str| -> Vec<u8> { [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect() };
+        let bom = |text: &str| -> Vec<u8> { [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat() };
+        for saved in [utf16(&edited.to_string()), bom(&edited.to_string())] {
+            std::fs::write(&file, &saved).unwrap();
+            let reg = init();
+            assert_eq!(reg.services[&id].template.name, "Mine");
+            assert!(reg.snapshot().template_errors.is_empty(), "{:?}", reg.snapshot().template_errors);
+            assert!(crate::secret_file::kept_aside(&file).is_empty());
+            assert_eq!(std::fs::read(&file).unwrap(), saved, "their file, as they saved it");
+        }
+
+        let own = dir.0.join("templates").join("my-rig.json");
+        std::fs::write(&own, utf16(r#"{ "id": "my-rig", "name": "My rig", "description": "", "category": "test", "defaultPort": 9998, "run": { "command": "rig.exe", "args": [] } }"#)).unwrap();
+        let mut reg = init();
+        assert!(reg.services.contains_key("my-rig"));
+        std::fs::remove_file(&own).unwrap();
+        std::fs::write(&own, utf16(r#"{ "id": "my-rig-2", "name": "Mine", "description": "", "category": "test", "defaultPort": 9998, "run": { "command": "rig.exe", "args": [] } }"#)).unwrap();
+        assert_eq!(reg.reload_new_templates(), 1, "and on a poll");
+        std::fs::write(&own, b"\xff\xfe\x00").unwrap();
+        assert_eq!(reg.reload_new_templates(), 0);
+        assert!(reg.snapshot().template_errors.iter().any(|e| e.file == "my-rig.json" && e.error.contains("not text")), "{:?}", reg.snapshot().template_errors);
+    }
+
+    /// A file a scanner holds at start is not known to be anything: it is not replaced or put aside, and the registry
+    /// starts all the same (a read of it used to end the start).
+    #[test]
+    fn a_template_that_cannot_be_read_stays_and_is_read_at_the_next_poll() {
+        let dir = crate::secret_file::testing::TempDir::new("template-held");
+        let init = || super::Registry::init(dir.0.clone(), dir.0.join("models"), Vec::new()).unwrap();
+        let (name, body) = super::BUILTIN_TEMPLATES[0];
+        let file = dir.0.join("templates").join(name);
+        let id = serde_json::from_str::<super::ServiceTemplate>(body).unwrap().id;
+        drop(init());
+        // (a folder where the file belongs: a read that fails as a held file's does, on every system)
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("still-here"), b"x").unwrap();
+
+        let mut reg = init();
+        assert!(file.join("still-here").exists() && crate::secret_file::kept_aside(&file).is_empty());
+        assert!(!reg.services.contains_key(&id));
+        let errors = reg.snapshot().template_errors;
+        assert!(errors.iter().any(|e| e.file == name && e.error.contains("could not be read")), "{errors:?}");
+
+        std::fs::remove_dir_all(&file).unwrap();
+        std::fs::write(&file, body).unwrap();
+        assert_eq!(reg.reload_new_templates(), 1, "it is there at the next poll");
+        assert!(reg.services.contains_key(&id));
+        assert!(reg.snapshot().template_errors.is_empty());
     }
 
     #[test]

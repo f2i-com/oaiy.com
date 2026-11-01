@@ -12,7 +12,9 @@
  *   it was sent and answers as Anthropic does.
  * - AI Chat when a provider's 200 holds no answer (no choice, an empty answer cut
  *   off at the limit, an error body, a thought that never closes): the step
- *   fails. It passed, the provider's JSON as its answer, or nothing.
+ *   fails. It passed, the provider's JSON as its answer, or nothing. A reply that
+ *   holds an answer of another shape does not fail: the table of reply shapes
+ *   below is each one, what the step gives now and what it gave before.
  * - Image View (core-image/ui/ImageViewNode.tsx): its Max Height is the
  *   preview's height. The property was in the node's settings and changed
  *   nothing. Rendered with react-dom/server.
@@ -269,6 +271,86 @@ await fails('a template with an error body at a path', { error: { message: 'quot
 await fails('a template with an error body and no path', { error: 'quota spent' }, /quota spent/, CUSTOM);
 await fails('a template with no choice and no path', { choices: [] }, /without a message/, CUSTOM);
 await fails("a template's thought that never closes", { text: '<think>Still going' }, SPENT, CUSTOM);
+
+// Every shape of reply, what the step gives for it, and what it gave before a 200 was checked for an answer (4000bd22).
+// A string is the answer, JSON is the reply's own JSON handed to the flow to read, and a pattern is a failure's words.
+const JSON_REPLY = Symbol('the reply as JSON');
+const STRUCTURED = /text\.replace is not a function/;
+const openai = (message, finish_reason = 'stop', extra = {}) => ({ choices: [{ message, finish_reason }], ...extra });
+const CALL = { id: 'call_1', type: 'function', function: { name: 'look_up', arguments: '{}' } };
+const TOOL_TURN = openai({ content: null, tool_calls: [CALL] }, 'tool_calls');
+const TOOL_TURN_BLANK = openai({ content: '', tool_calls: [CALL] }, 'tool_calls');
+const PICTURES = [{ type: 'image_url', image_url: { url: PICTURE } }];
+const OWN_LIST = { choices: ['yes', 'no'], picked: 'yes' };
+const AT_CLAUDE = { endpoint: ENDPOINT.replace('/anthropic/v1/messages', '/claude/v1/chat/completions') };
+const AT_ANTHROPIC = { endpoint: ENDPOINT };
+const AT_TOOL_CALLS = { template: TEMPLATE, path: 'choices.0.message.tool_calls' };
+
+const SHAPES = [
+  // A plain OpenAI endpoint.
+  ['an answer', {}, openai({ content: 'Paris' }), 'Paris', 'Paris'],
+  ['an answer cut off', {}, openai({ content: 'Par' }, 'length'), 'Par', 'Par'],
+  ['the older local shape', {}, { response: 'Paris' }, 'Paris', 'Paris'],
+  ["Ollama's own chat", {}, { model: 'm', message: { role: 'assistant', content: 'Paris' }, done: true }, 'Paris', JSON_REPLY],
+  ['a turn that only calls tools', {}, TOOL_TURN, JSON_REPLY, JSON_REPLY],
+  ['a turn that only calls tools, its text blank', {}, TOOL_TURN_BLANK, JSON_REPLY, JSON_REPLY],
+  ['pictures and no text', {}, openai({ content: '', images: PICTURES }), JSON_REPLY, JSON_REPLY],
+  ['an empty error beside an answer', {}, openai({ content: 'Paris' }, 'stop', { error: {} }), 'Paris', 'Paris'],
+  ['an empty error beside nothing', {}, openai({ content: '' }, 'stop', { error: {} }), /without a message \(finish_reason: stop\)/, JSON_REPLY],
+  ['an error beside a whole answer', {}, openai({ content: 'Paris' }, 'stop', { error: { code: 0, message: 'none' } }), 'Paris', 'Paris'],
+  ['a refusal', {}, openai({ content: null, refusal: 'I cannot help with that.' }), /The model refused: I cannot help with that\. \(finish_reason: stop\)/, JSON_REPLY],
+  ['a content filter', {}, openai({ content: null }, 'content_filter'), /without a message \(finish_reason: content_filter\)/, JSON_REPLY],
+  ['nothing, cut off at the limit', {}, cutOff, SPENT, JSON_REPLY],
+  ['nothing but reasoning', {}, openai({ content: '', reasoning_content: 'Let me think.' }), /without a message \(finish_reason: stop\)/, JSON_REPLY],
+  ['no choice', {}, { choices: [], id: 'x' }, /without a message/, JSON_REPLY],
+  ['an empty answer', {}, openai({ content: '' }), /without a message \(finish_reason: stop\)/, JSON_REPLY],
+  ['an error body', {}, { error: { message: 'model overloaded' } }, /model overloaded/, JSON_REPLY],
+  ['an error beside the start of an answer', {}, { choices: [{ error: { message: 'upstream gone' }, message: { content: 'Par' }, finish_reason: 'error' }] }, /upstream gone/, 'Par'],
+  ['an answer in parts (not read, then or now)', {}, openai({ content: [{ type: 'text', text: 'Paris' }] }), STRUCTURED, STRUCTURED],
+
+  // An address with Anthropic in it, or `claude`.
+  ['text blocks', AT_ANTHROPIC, { content: [{ type: 'thinking', thinking: 'hm' }, { type: 'text', text: 'Par' }, { type: 'text', text: 'is' }], stop_reason: 'end_turn' }, 'Paris', 'Paris'],
+  ['an OpenAI reply at a proxy with claude in its URL', AT_CLAUDE, openai({ content: 'Paris' }), 'Paris', JSON_REPLY],
+  ['no text at the end of a turn', AT_ANTHROPIC, { content: [], stop_reason: 'end_turn' }, /without a message \(stop_reason: end_turn\)/, JSON_REPLY],
+  ['a refusal by its stop reason', AT_ANTHROPIC, { content: [], stop_reason: 'refusal' }, /without a message \(stop_reason: refusal\)/, JSON_REPLY],
+  ['thinking to the limit', AT_ANTHROPIC, { content: [{ type: 'thinking', thinking: 'hm' }], stop_reason: 'max_tokens' }, SPENT, JSON_REPLY],
+  ['a turn that only calls a tool', AT_ANTHROPIC, { content: [{ type: 'tool_use', id: 't', name: 'look_up', input: {} }], stop_reason: 'tool_use' }, JSON_REPLY, JSON_REPLY],
+  ["Anthropic's error body", AT_ANTHROPIC, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }, /Overloaded/, JSON_REPLY],
+
+  // A service's own template with no response path.
+  ['a template: a turn that only calls tools', CUSTOM, TOOL_TURN, JSON_REPLY, JSON_REPLY],
+  ['a template: a turn that only calls tools, its text blank', CUSTOM, TOOL_TURN_BLANK, JSON_REPLY, ''],
+  ['a template: pictures and no text', CUSTOM, openai({ content: '', images: PICTURES }), JSON_REPLY, ''],
+  ["a template: an endpoint's own `choices` list", CUSTOM, OWN_LIST, JSON_REPLY, JSON_REPLY],
+  ['a template: no choice', CUSTOM, { choices: [] }, /without a message/, JSON_REPLY],
+  ['a template: an error body', CUSTOM, { error: 'quota spent' }, /quota spent/, JSON_REPLY],
+  ['a template: an empty error beside a shape of its own', CUSTOM, { error: {}, result: 1 }, JSON_REPLY, JSON_REPLY],
+  ['a template: a refusal', CUSTOM, openai({ content: null, refusal: 'No.' }), /The model refused: No\. \(finish_reason: stop\)/, JSON_REPLY],
+  ['a template: a content filter, blank', CUSTOM, openai({ content: '' }, 'content_filter'), /finish_reason: content_filter/, ''],
+  ['a template: a shape of its own', CUSTOM, { result: { a: 1 } }, JSON_REPLY, JSON_REPLY],
+  ['a template: plain text', CUSTOM, 'Paris', 'Paris', 'Paris'],
+
+  // The same with a response path.
+  ['at a path: a turn that only calls tools', AT_PATH, TOOL_TURN, JSON_REPLY, JSON_REPLY],
+  ['at a path: the tool calls themselves', AT_TOOL_CALLS, TOOL_TURN, JSON.stringify([CALL]), JSON.stringify([CALL])],
+  ['at a path: nothing there', AT_PATH, { choices: [] }, /nothing at choices\.0\.message\.content/, JSON_REPLY],
+  ['at a path: an empty answer', AT_PATH, openai({ content: '' }), '', ''],
+  ["at a path: an endpoint's own `choices` list", { template: TEMPLATE, path: 'picked' }, OWN_LIST, 'yes', 'yes'],
+];
+
+for (const [name, where, body, now] of SHAPES) {
+  await check(`reply shape: ${name}`, async () => {
+    const r = await asked(body, where);
+    if (now instanceof RegExp) {
+      assert.match(r.failed ?? `no failure, the answer was ${JSON.stringify(r.answer)}`, now);
+      assert.equal(r.status, 'error');
+      return;
+    }
+    assert.equal(r.failed, undefined);
+    assert.equal(r.answer, now === JSON_REPLY ? JSON.stringify(body) : now);
+    assert.equal(r.status, 'completed');
+  });
+}
 
 // The two answers that come by no provider.
 const localModel = (text) => ({ endpoint: 'oaiy-llm://local', host: { tauri: { invoke: async (command) => (command.endsWith('|llm_chat') ? { text, modelId: 'm', backend: 'cpu', promptTokens: 1, generatedTokens: 1 } : 0) } } });

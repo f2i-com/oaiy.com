@@ -623,6 +623,10 @@ pub struct ResultActionFields {
     /// The record's values, and the id of the one being updated.
     pub record: String,
     pub record_id: String,
+    /// In a record write's body: the run making it, where the provider reads one
+    /// (as [`FlowNodeSpec::run_field`]; a binding's write goes the same way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// On a notify action: what to say.
     pub message: String,
     /// On a connector action: whose command, which command, and its body.
@@ -672,6 +676,11 @@ pub struct FlowNodeSpec {
     /// The part of a write's reply that is the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_field: Option<String>,
+    /// The body field a write names its run in, where the provider reads one.
+    /// Omitted, a write says nothing of its run, and a provider that counts how
+    /// deep a chain of runs has gone sees each write as the start of a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_field: Option<String>,
     /// How many rows a listing asks for. Omitted, it gets the provider's own
     /// default page, and whatever is past that page is silently not there.
     #[serde(default, skip_serializing_if = "Option::is_none")]

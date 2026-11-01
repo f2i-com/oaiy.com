@@ -2024,6 +2024,7 @@ pub async fn serve(
                 log::warn!("network: not started: {e}");
             }
         });
+        network.read_again_later();
     }
     let network_routes = crate::network::router(network);
     let plugin_ai_routes = crate::ai::plugin_completion::router(ai_state.clone(), plugin_ai_host, isolated);

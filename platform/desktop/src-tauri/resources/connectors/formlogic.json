@@ -127,7 +127,8 @@
         "operation": "createRecord",
         "path": "/api/v1/forms/{form}/responses",
         "recordField": "answers",
-        "replyField": "response"
+        "replyField": "response",
+        "runField": "flowRunId"
       },
       {
         "nodeType": "formlogic_update_response",
@@ -196,6 +197,7 @@
         "formId": "form",
         "record": "answers",
         "recordId": "responseId",
+        "run": "flowRunId",
         "message": "message",
         "connectorId": "connectorId",
         "command": "command",

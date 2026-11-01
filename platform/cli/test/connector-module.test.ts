@@ -365,6 +365,41 @@ async function main(): Promise<void> {
     await rejectsWith('createRecord: a record that did not resolve fails, with nothing sent', '"fields" field did not resolve', async () => wm.createRecord({ noise: 1 }, callFor(modC, 'add_row')));
     check('createRecord: nothing was sent for it', write.sent.length === 2);
   }
+  {
+    // A write names the run making it, under the name the provider gave, when both are there.
+    const nodes = [
+      { nodeType: 'add_row', operation: 'createRecord', path: '/rows', recordField: 'fields', runField: 'madeBy' },
+      { nodeType: 'add_plain', operation: 'createRecord', path: '/plain' },
+      { nodeType: 'set_row', operation: 'updateRecord', path: '/rows/{rowId}', recordField: 'fields', runField: 'madeBy' },
+      { nodeType: 'set_silent', operation: 'updateRecord', path: '/rows/{rowId}', recordField: 'fields' },
+    ];
+    const raw = { baseUrl: 'http://provider-d.local', credential: 'cred_ddd', nodes };
+    const running = createConnectorModule(parseConnectorConfig(raw), { runId: 'run-7f3a' });
+    const out = mkCtx(() => ({ body: {} }));
+    const m = running.runtime.createMethods!(out.ctx);
+    await m.createRecord(null, callFor(running, 'add_row', { fields: { a: 1 } }));
+    await m.updateRecord(null, callFor(running, 'set_row', { rowId: 'r1', fields: { a: 2 } }));
+    await m.updateRecord(null, callFor(running, 'set_silent', { rowId: 'r1', fields: { a: 3 } }));
+    const input = { madeBy: 'the graph says so', a: 1 };
+    await m.createRecord(input, callFor(running, 'add_plain'));
+    check('createRecord: the body names the run under the field the node gave', out.sent[0].body === '{"fields":{"a":1},"madeBy":"run-7f3a"}');
+    check('updateRecord: so does an update whose node gives the field', out.sent[1].body === '{"fields":{"a":2},"madeBy":"run-7f3a"}');
+    check('updateRecord: a node that gives no field says nothing of the run', out.sent[2].body === '{"fields":{"a":3}}');
+    check('createRecord: a node that gives no field sends its input as it is', out.sent[3].body === JSON.stringify(input));
+
+    const noRun = createConnectorModule(parseConnectorConfig(raw));
+    const none = mkCtx(() => ({ body: {} }));
+    await noRun.runtime.createMethods!(none.ctx).createRecord(null, callFor(noRun, 'add_row', { fields: { a: 1 } }));
+    check('createRecord: with no run to name, the field is left out', none.sent[0].body === '{"fields":{"a":1}}');
+
+    let refused = '';
+    try {
+      parseConnectorConfig({ ...raw, nodes: [{ nodeType: 'pull', operation: 'listRecords', path: '/rows', runField: 'madeBy' }] });
+    } catch (e) {
+      refused = (e as Error).message;
+    }
+    check('config: a run field on anything but a write is refused', refused.includes('"runField" only applies to createRecord / updateRecord'));
+  }
   await rejectsWith('listRecords: a missing placeholder fails loudly', 'needs a value for {book}', async () => {
     const { ctx } = mkCtx(() => ({ body: [] }));
     const m = modA.runtime.createMethods!(ctx);

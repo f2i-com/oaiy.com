@@ -214,7 +214,7 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
         max: count(l.max, 'max'),
       };
     }
-    for (const name of ['recordField', 'replyField'] as const) {
+    for (const name of ['recordField', 'replyField', 'runField'] as const) {
       if (entry[name] === undefined) continue;
       if (operation !== 'createRecord' && operation !== 'updateRecord') {
         throw new Error(`${where}: "${name}" only applies to createRecord / updateRecord (this is ${operation}).`);

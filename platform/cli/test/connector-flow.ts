@@ -448,6 +448,41 @@ async function main(): Promise<void> {
   check('listing: an unsupported filter fails the flow rather than widening it', badFilterJob?.status === 'failed');
   check('listing: and names the filter it cannot apply', String(badFilterJob?.error ?? '').includes('starts_with'), `error=${badFilterJob?.error ?? ''}`);
 
+  // --- a write names the run making it ------------------------------------
+  //
+  // A provider that starts runs from its records counts how deep a chain has
+  // gone by the run a write names. A write that names none starts a new chain,
+  // so a flow writing into the form it is bound to has no end. The id comes from
+  // the host, and a graph has no way to read it or to stand in for it.
+  sent.length = 0;
+  process.env.OAIY_FLOW_RUN_ID = 'run-7f3a';
+  await loadConnectorModule(
+    writeConfig('writes.json', {
+      ...CONFIG,
+      nodes: [{ nodeType: 'shelf_write', operation: 'createRecord', path: '/api/v1/shelves/{shelf}/items', recordField: 'fields', runField: 'madeBy' }],
+    }),
+  );
+  delete process.env.OAIY_FLOW_RUN_ID;
+  const writeId = engine.submit(
+    'test',
+    'connector-run-on-a-write',
+    graph(
+      [
+        { id: 'write', type: 'shelf_write', position: { x: 0, y: 0 }, data: { shelf: 'fixed', fields: { name: '$inputs.name', seen: '$inputs.__flowRunId' } } },
+        { id: 'look', type: 'logic_block', position: { x: 100, y: 0 }, data: { code: 'return { env: typeof process, inputs: Object.keys(inputs) };' } },
+      ],
+      [{ source: 'write', target: 'look' }],
+    ),
+    { name: 'kettle', madeBy: 'the graph says so' },
+  );
+  const writeJob = await runToEnd(engine, writeId);
+  check('write: the flow completed', writeJob?.status === 'completed', `error=${writeJob?.error ?? ''}`);
+  const written = JSON.parse(sent.find((s) => s.method === 'POST')?.body ?? '{}');
+  check('write: the body names the run', written.madeBy === 'run-7f3a', `body=${JSON.stringify(written)}`);
+  check('write: and holds the record', written.fields?.name === 'kettle');
+  check('write: nothing in the inputs stands in for it, and a graph that asks for it finds nothing', !written.fields?.seen, `body=${JSON.stringify(written)}`);
+  check('write: the run is not among what the graph can read', !JSON.stringify(writeJob?.nodeOutputs ?? {}).includes('run-7f3a'), JSON.stringify(writeJob?.nodeOutputs));
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

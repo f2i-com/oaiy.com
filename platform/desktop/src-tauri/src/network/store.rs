@@ -4,22 +4,26 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::secret_file::{keep_aside, kept_aside, read_text_patiently, Patience, Retry, Text};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const PEERS_FILE: &str = "peers.json";
 pub const DEFAULTS_FILE: &str = "defaults.json";
 pub const SERVICES_FILE: &str = "remote-services.json";
 
-/// What went wrong reading each file of this store at start.
-#[derive(Clone)]
+/// What went wrong reading each file of this store.
 struct Trouble {
     /// In words for the person, for the log and the Networking page.
     said: String,
     /// The file is still there and was not read: saving would write over what nobody has seen.
     keep_out: bool,
+    /// Set while saving is kept out: when the file is read again.
+    retry: Option<Retry>,
 }
 
 fn troubles() -> MutexGuard<'static, BTreeMap<PathBuf, Trouble>> {
@@ -29,28 +33,89 @@ fn troubles() -> MutexGuard<'static, BTreeMap<PathBuf, Trouble>> {
 
 /// A file of this store as it was left. Only a file that is not there is an empty store: paired computers read as none
 /// would be written over at the next save. One that was read and is not what it should be (cut short, or not text)
-/// is moved aside as `<name>.corrupt`, to repair; one that could not be read may be perfectly good (a backup tool
-/// holding it), so it stays where it is, and neither it nor one that would not move is saved over until a restart.
+/// is kept aside as `<name>.corrupt` (`.corrupt.1`, and so on: no earlier one is replaced), to repair; one that could
+/// not be read may be perfectly good (a backup tool holding it), so it stays where it is, and neither it nor one that
+/// would not move is saved over: each is read again ([`read_kept_again`]) until it can be.
 fn read_kept<T: DeserializeOwned + Default>(path: &Path) -> T {
     troubles().remove(path);
-    let (said, keep_out) = match std::fs::read(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
-        Ok(bytes) => {
-            let e = match serde_json::from_slice(&bytes) {
-                Ok(kept) => return kept,
-                Err(e) => e,
-            };
-            let aside = path.with_extension("json.corrupt");
-            match std::fs::rename(path, &aside) {
-                Ok(()) => (format!("{} could not be read ({e}): it was moved to {}, to repair or restore from a backup", path.display(), aside.display()), false),
-                Err(moved) => (format!("{} could not be read ({e}) or moved aside ({moved}): nothing will be saved over it, so repair it or move it aside and restart OAIY", path.display()), true),
-            }
+    read_file(path, &Patience::default().start).unwrap_or_default()
+}
+
+/// A file that was left to be read yet ([`read_kept`]), if it is time to: what it holds once that is known, and it is
+/// then no longer kept out.
+fn read_kept_again<T: DeserializeOwned + Default>(path: &Path) -> Option<T> {
+    if !troubles().get(path).is_some_and(|t| t.retry.as_ref().is_some_and(Retry::due)) {
+        return None;
+    }
+    read_file(path, &[])
+}
+
+/// What the file at `path` holds, or `None` for one that is not known yet, with what went wrong noted down.
+fn read_file<T: DeserializeOwned + Default>(path: &Path, pauses: &[Duration]) -> Option<T> {
+    let why = match read_text_patiently(path, pauses) {
+        Text::Missing => {
+            note_copy_of(path);
+            return Some(T::default());
         }
-        Err(e) => (format!("{} could not be read ({e}): nothing will be saved over it, so restart OAIY once whatever holds it has let go", path.display()), true),
+        Text::Text(text) => match serde_json::from_str(&text) {
+            Ok(kept) => {
+                if holds_nothing(text.as_bytes()) {
+                    note_copy_of(path);
+                } else {
+                    troubles().remove(path);
+                }
+                return Some(kept);
+            }
+            Err(e) => e.to_string(),
+        },
+        Text::Undecodable(why) => why,
+        Text::Unreadable(e) => {
+            not_read(path, format!("{} could not be read ({e}), since another program may have it open or its permissions may not let OAIY read it: nothing will be saved over it, and it is read again until it can be", path.display()));
+            return None;
+        }
     };
-    log::error!("network: {said}");
-    troubles().insert(path.to_path_buf(), Trouble { said, keep_out });
-    T::default()
+    match keep_aside(path) {
+        Ok(aside) => {
+            let said = format!("{} could not be read ({why}): it is kept as {}, to repair or restore from a backup", path.display(), aside.display());
+            log::error!("network: {said}");
+            troubles().insert(path.to_path_buf(), Trouble { said, keep_out: false, retry: None });
+            Some(T::default())
+        }
+        Err(moved) => {
+            not_read(path, format!("{} could not be read ({why}) or moved aside ({moved}): nothing will be saved over it, so repair it or move it aside, and it is read again until that is done", path.display()));
+            None
+        }
+    }
+}
+
+/// The file stays where it is, not known, and nothing is saved over it until it is.
+fn not_read(path: &Path, said: String) {
+    let mut all = troubles();
+    match all.get_mut(path) {
+        Some(Trouble { said: was, retry: Some(retry), .. }) => {
+            retry.failed();
+            *was = said;
+        }
+        _ => {
+            log::error!("network: {said}");
+            all.insert(path.to_path_buf(), Trouble { said, keep_out: true, retry: Some(Retry::began(&Patience::default())) });
+        }
+    }
+}
+
+/// A store with nothing in it (no file, or an empty one) beside a copy kept aside: that copy is why, and a page with no
+/// computers on it says so for as long as that is the case, restarts included.
+fn note_copy_of(path: &Path) {
+    let said = kept_aside(path).pop().map(|aside| format!("{} could not be read when OAIY last tried: it is kept as {}, to repair or restore from a backup", path.display(), aside.display()));
+    match said {
+        Some(said) => troubles().insert(path.to_path_buf(), Trouble { said, keep_out: false, retry: None }),
+        None => troubles().remove(path),
+    };
+}
+
+/// Whether what a file says is nothing at all: `[]` or `{}`, as a list or a map with nothing in it is saved.
+fn holds_nothing(saved: &[u8]) -> bool {
+    matches!(String::from_utf8_lossy(saved).trim(), "[]" | "{}")
 }
 
 /// Save a file of this store, unless [`read_kept`] left it to be read yet.
@@ -58,12 +123,29 @@ fn write_kept(path: &Path, body: Vec<u8>) -> Result<(), String> {
     if let Some(trouble) = troubles().get(path).filter(|t| t.keep_out) {
         return Err(trouble.said.clone());
     }
-    crate::secret_file::write(path, body).map_err(|e| e.to_string())
+    let something = !holds_nothing(&body);
+    crate::secret_file::write(path, body).map_err(|e| e.to_string())?;
+    if something {
+        troubles().remove(path);
+    }
+    Ok(())
 }
 
-/// What went wrong with the files in `dir` at start, for the Networking page.
+/// What went wrong with the files in `dir`, for the Networking page.
 pub fn problems(dir: &Path) -> Vec<String> {
     troubles().iter().filter(|(path, _)| path.starts_with(dir)).map(|(_, t)| t.said.clone()).collect()
+}
+
+/// Whether a file in `dir` is still to be read.
+pub fn unread(dir: &Path) -> bool {
+    troubles().iter().any(|(path, t)| path.starts_with(dir) && t.retry.is_some())
+}
+
+/// Time to read the file at `path` again, now (a test has no use for the pauses it would wait out).
+#[cfg(test)]
+pub(crate) fn due_now(path: &Path) {
+    let now = Patience { start: vec![], later: vec![Duration::ZERO], window: Duration::ZERO };
+    troubles().get_mut(path).unwrap().retry = Some(Retry::began(&now));
 }
 
 /// The port a worker listens on unless set (the desktop's API is 17972, its voice gateway 17872).
@@ -125,6 +207,11 @@ impl Default for Settings {
 impl Settings {
     pub fn load(dir: &Path) -> Settings {
         read_kept(&dir.join(SETTINGS_FILE))
+    }
+
+    /// The settings, once a file that could not be read can be.
+    pub fn read_again(dir: &Path) -> Option<Settings> {
+        read_kept_again(&dir.join(SETTINGS_FILE))
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), String> {
@@ -190,6 +277,13 @@ impl Peers {
         let path = dir.join(PEERS_FILE);
         let list = read_kept(&path);
         Peers { path, list }
+    }
+
+    /// Read a file that could not be read, if it is time to.
+    pub fn read_again(&mut self) {
+        if let Some(list) = read_kept_again(&self.path) {
+            self.list = list;
+        }
     }
 
     pub fn list(&self) -> &[Peer] {
@@ -312,6 +406,13 @@ impl Defaults {
         Defaults { path, map }
     }
 
+    /// Read a file that could not be read, if it is time to.
+    pub fn read_again(&mut self) {
+        if let Some(map) = read_kept_again(&self.path) {
+            self.map = map;
+        }
+    }
+
     pub fn all(&self) -> &std::collections::BTreeMap<String, WorkerDefault> {
         &self.map
     }
@@ -360,6 +461,13 @@ impl ServiceChoices {
         let path = dir.join(SERVICES_FILE);
         let map = read_kept(&path);
         ServiceChoices { path, map }
+    }
+
+    /// Read a file that could not be read, if it is time to.
+    pub fn read_again(&mut self) {
+        if let Some(map) = read_kept_again(&self.path) {
+            self.map = map;
+        }
     }
 
     pub fn all(&self) -> &std::collections::BTreeMap<String, String> {
@@ -473,6 +581,116 @@ mod tests {
         std::fs::create_dir(dir.0.join(SETTINGS_FILE)).unwrap();
         assert_eq!(Settings::load(&dir.0), Settings::default());
         assert!(Settings::default().save(&dir.0).unwrap_err().contains("nothing will be saved over it"));
+    }
+
+    /// A file held at start (an antivirus scan, a backup) cost the paired computers and every save, until a restart.
+    #[test]
+    fn a_file_that_could_not_be_read_is_read_again_and_saving_comes_back() {
+        let dir = crate::secret_file::testing::TempDir::new("network-later");
+        let path = dir.0.join(PEERS_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let mut peers = Peers::open(&dir.0);
+        assert!(unread(&dir.0));
+        // Not time yet: nothing is read, and nothing changes.
+        peers.read_again();
+        assert!(peers.add(peer("b", "fb", Role::Worker)).is_err());
+        // Time, and still held.
+        due_now(&path);
+        peers.read_again();
+        assert!(peers.add(peer("b", "fb", Role::Worker)).is_err());
+        assert_eq!(problems(&dir.0).len(), 1, "said once");
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&[peer("a", "fa", Role::Worker)]).unwrap()).unwrap();
+        due_now(&path);
+        peers.read_again();
+        assert_eq!(peers.list().len(), 1, "they are back with nobody restarting");
+        assert!(problems(&dir.0).is_empty() && !unread(&dir.0), "{:?}", problems(&dir.0));
+        peers.add(peer("b", "fb", Role::Worker)).unwrap();
+        assert_eq!(Peers::open(&dir.0).list().len(), 2, "and what was saved went beside them");
+    }
+
+    /// The other three, through the one read they share, and the settings, which come back as a value.
+    #[test]
+    fn every_file_of_the_store_is_read_again() {
+        let dir = crate::secret_file::testing::TempDir::new("network-later-all");
+        for file in [SETTINGS_FILE, DEFAULTS_FILE, SERVICES_FILE] {
+            std::fs::create_dir(dir.0.join(file)).unwrap();
+        }
+        let mut defaults = Defaults::open(&dir.0);
+        let mut services = ServiceChoices::open(&dir.0);
+        let settings = Settings::load(&dir.0);
+        assert_eq!(settings, Settings::default());
+        assert_eq!(problems(&dir.0).len(), 3);
+
+        let chosen = WorkerDefault { id: "engine:llm:node.a/m".into(), instead_of: None };
+        for (file, body) in [
+            (SETTINGS_FILE, serde_json::to_vec(&Settings { enabled: true, ..Settings::default() }).unwrap()),
+            (DEFAULTS_FILE, serde_json::to_vec(&BTreeMap::from([("llm", &chosen)])).unwrap()),
+            (SERVICES_FILE, serde_json::to_vec(&BTreeMap::from([("voice", "a")])).unwrap()),
+        ] {
+            let path = dir.0.join(file);
+            std::fs::remove_dir_all(&path).unwrap();
+            std::fs::write(&path, body).unwrap();
+            due_now(&path);
+        }
+        assert!(Settings::read_again(&dir.0).is_some_and(|s| s.enabled));
+        defaults.read_again();
+        services.read_again();
+        assert_eq!(defaults.get("llm"), Some(&chosen));
+        assert_eq!(services.get("voice"), Some("a"));
+        assert!(problems(&dir.0).is_empty() && !unread(&dir.0));
+        assert!(Settings::read_again(&dir.0).is_none(), "nothing to read any more");
+    }
+
+    /// PowerShell 5.1's `Out-File` writes UTF-16, and some editors put a mark on UTF-8. Neither is damage.
+    #[test]
+    fn a_file_in_another_encoding_is_read_and_stays_where_it_is() {
+        let dir = crate::secret_file::testing::TempDir::new("network-encodings");
+        let path = dir.0.join(PEERS_FILE);
+        let text = serde_json::to_string(&[peer("a", "fa", Role::Worker)]).unwrap();
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        for body in [[&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(), utf16] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(Peers::open(&dir.0).list().len(), 1);
+            assert!(problems(&dir.0).is_empty() && kept_aside(&path).is_empty(), "{:?}", problems(&dir.0));
+        }
+    }
+
+    /// A second damaged file replaced the copy of the first, and a restart ended the only word of it.
+    #[test]
+    fn every_damaged_file_is_kept_and_the_notice_lasts_while_the_store_is_empty() {
+        let dir = crate::secret_file::testing::TempDir::new("network-damaged-twice");
+        let path = dir.0.join(PEERS_FILE);
+        std::fs::write(&path, b"[first").unwrap();
+        let mut peers = Peers::open(&dir.0);
+        assert!(problems(&dir.0)[0].contains("peers.json.corrupt"));
+
+        // A restart with nothing done: the same, with the copy named.
+        drop(Peers::open(&dir.0));
+        assert!(problems(&dir.0)[0].contains("peers.json.corrupt"), "{:?}", problems(&dir.0));
+
+        // Paired again, and it is a store like any other.
+        peers.add(peer("a", "fa", Role::Worker)).unwrap();
+        assert!(problems(&dir.0).is_empty(), "{:?}", problems(&dir.0));
+
+        // Unpaired, and the list is empty again with the copy still there.
+        peers.remove("a").unwrap();
+        drop(Peers::open(&dir.0));
+        assert!(problems(&dir.0)[0].contains("peers.json.corrupt"), "{:?}", problems(&dir.0));
+
+        std::fs::write(&path, b"[second").unwrap();
+        drop(Peers::open(&dir.0));
+        assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), b"[first", "the first copy stands");
+        assert_eq!(std::fs::read(path.with_extension("json.corrupt.1")).unwrap(), b"[second");
+        assert!(problems(&dir.0)[0].contains("peers.json.corrupt.1"), "the newest is named: {:?}", problems(&dir.0));
+
+        // With the copies gone there is nothing to say.
+        for aside in kept_aside(&path) {
+            std::fs::remove_file(aside).unwrap();
+        }
+        drop(Peers::open(&dir.0));
+        assert!(problems(&dir.0).is_empty(), "{:?}", problems(&dir.0));
     }
 
     #[test]

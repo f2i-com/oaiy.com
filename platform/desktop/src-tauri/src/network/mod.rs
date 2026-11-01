@@ -174,6 +174,40 @@ impl Network {
         }
     }
 
+    /// The files that could not be read when this was opened, read again until they can be, each as its `Retry` says:
+    /// what kept them out is usually gone in a moment, and until then this computer knows no paired computers, is off if
+    /// its settings are what could not be read, and saves nothing. Started once, where a runtime is there to do it.
+    pub fn read_again_later(&self) {
+        if !store::unread(&self.inner.dir) {
+            return;
+        }
+        let network = self.clone();
+        tokio::spawn(async move {
+            while store::unread(&network.inner.dir) {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if network.read_again() {
+                    if let Err(e) = network.apply().await {
+                        log::warn!("network: not started: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// One look at the files still to be read: whether the settings came back, and Network has to be started as they say.
+    fn read_again(&self) -> bool {
+        self.inner.peers().read_again();
+        self.inner.defaults().read_again();
+        self.inner.services().read_again();
+        match Settings::read_again(&self.inner.dir) {
+            Some(settings) => {
+                *lock(&self.inner.settings) = settings;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// This computer's flows and run ledger, for the flows a worker shares with its primary.
     pub fn set_bridge(&self, ledger: crate::bridge::ledger::LedgerHandle, flows: Arc<crate::bridge::worker::FlowStore>) {
         *lock(&self.inner.bridge) = Some(Bridge { ledger, flows });

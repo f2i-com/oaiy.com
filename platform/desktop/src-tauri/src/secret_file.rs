@@ -327,6 +327,12 @@ fn make_room_aside(path: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// What [`keep_aside`] has kept of `path` and is still there, the first first: the last is the newest.
+pub fn kept_aside(path: &Path) -> Vec<PathBuf> {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Vec::new() };
+    (0..ASIDE_NAMES).map(|n| path.with_file_name(aside_name(&name, n))).filter(|aside| aside.is_file()).collect()
+}
+
 /// Put the file at `path` aside as `<name>.corrupt` (`.corrupt.1`, `.corrupt.2` ... when that is taken: an earlier bad
 /// file is never replaced by a later one), so that what is in it is kept while the store starts a new file at `path`.
 /// Answers where it went. If the file cannot be moved, its bytes are copied there (the original stays, and is safe to

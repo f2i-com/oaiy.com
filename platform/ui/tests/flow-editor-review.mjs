@@ -369,6 +369,31 @@ await check("a shipped flow's secrets stay out of its export, wherever they were
   assert.equal(node.data.endpoint, 'https://example.com/v1?key=__REDACTED__');
 });
 
+await check('a name with a secret in it goes from a node with no schema to say otherwise, and only a count, a constant or a known key stay', () => {
+  // Each of these went out in plain text with no vendor shape to catch it, on a package's node that is not loaded.
+  const secrets = Object.fromEntries(['api_key', 'access_token', 'refresh_token', 'botToken', 'webhookSecret', 'signingSecret', 'smtpPassword', 'dbPassword', 'password2', 'hfToken', 'sessionToken', 'xApiKey', 'openaiKey', 'authHeader'].map((name) => [name, `value-of-${name}`]));
+  const stay = { maxTokens: 800, max_tokens: 800, maxOutputTokens: '4096', apiKeyConstant: 'OPENAI_API_KEY', label: 'Mine' };
+  const node = (type, data) => ({ id: 'n', type, position: { x: 0, y: 0 }, data });
+  const one = (type, data) => roundTrip({ name: 'Mine', flows: [{ id: 'f', name: 'F', graph: { nodes: [node(type, data)], edges: [] } }] }).flows[0].graph.nodes[0].data;
+  assert.deepEqual(one('a_package_not_here', { ...secrets, ...stay }), stay);
+  assert.deepEqual(one('ai_llm', { ...secrets, ...stay }), stay, "a node with a schema that does not list them: the same");
+  // A plural that holds tokens rather than counts them.
+  assert.deepEqual(one('a_package_not_here', { accessTokens: 'abc', refreshTokens: ['abc'], maxTokens: 5 }), { maxTokens: 5 });
+  // `key` is a secret until a schema says what it is.
+  assert.deepEqual(one('a_package_not_here', { key: 'typed' }), {}, 'no schema');
+  assert.deepEqual(one('ai_llm', { key: 'typed' }), {}, "a schema with no such field");
+  assert.deepEqual(one('memory', { key: 'last-reply' }), { key: 'last-reply' }, "the memory node's schema has it");
+  const real = loader.getNodeDefinition;
+  loader.getNodeDefinition = (type) => (type === 'a_plugins_node' ? { properties: [{ id: 'key', type: 'secret' }] } : real.call(loader, type));
+  try {
+    assert.deepEqual(one('a_plugins_node', { key: 'typed' }), {}, 'a schema that calls it secret');
+  } finally {
+    loader.getNodeDefinition = real;
+  }
+  // What is inside a node's object is no schema's: none of this is spared there.
+  assert.deepEqual(one('memory', { options: { key: 'typed', maxTokens: 5, apiKeyConstant: 'X', kept: 1 } }), { options: { kept: 1 } });
+});
+
 await check('a key pasted into a field that should name a constant goes, whatever its shape', () => {
   const keys = ['gsk_pastedHereByMistakeForTheName', 'anthropic-pasted-here', 'sk-pasted', `hf_${'a'.repeat(34)}`, `r8_${'b'.repeat(37)}`, 'k'.repeat(41), 'K_'.repeat(21)];
   for (const apiKeyConstant of keys) {

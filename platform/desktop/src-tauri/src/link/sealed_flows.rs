@@ -249,10 +249,13 @@ fn keep_completion(id: &str, base_url: &str, url: &str, body: &Value) {
 }
 
 /// Send the kept completions again: each goes once it is taken or refused for good; while the provider is away the
-/// rest wait. A week unsent, one is let go.
-fn resend_kept(http: &Client, account: &LinkedAccount, timeout: Duration) {
-    let Some(dir) = KEPT_DIR.get() else { return };
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+/// rest wait. A week unsent, one is let go. Whether none is left for this account.
+fn resend_kept(http: &Client, account: &LinkedAccount, timeout: Duration) -> bool {
+    KEPT_DIR.get().is_none_or(|dir| resend_kept_in(dir, http, account, timeout))
+}
+
+fn resend_kept_in(dir: &std::path::Path, http: &Client, account: &LinkedAccount, timeout: Duration) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return true };
     for entry in entries.flatten() {
         let path = entry.path();
         if entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(7 * 24 * 3600)) {
@@ -271,12 +274,13 @@ fn resend_kept(http: &Client, account: &LinkedAccount, timeout: Duration) {
                 if status.is_success() || status.is_client_error() {
                     let _ = std::fs::remove_file(&path);
                 } else {
-                    return;
+                    return false;
                 }
             }
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
+    true
 }
 
 pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
@@ -320,7 +324,14 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                 }
             };
             // (completions kept from before, the provider away when they were made: told first)
-            resend_kept(&http, &account, Duration::from_secs(15));
+            // A finished run is held at the provider until its completion lands. A claim now would
+            // say this desktop had let go of it: the run would expire, and its result be refused.
+            if !resend_kept(&http, &account, Duration::from_secs(15)) {
+                drop(http);
+                lane.start_afresh();
+                std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
+                continue;
+            }
             let polled = std::time::Instant::now();
             let result = poll_once(
                 &http,
@@ -506,6 +517,30 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn a_completion_still_kept_says_so_until_it_lands() {
+        // What holds the next claim back: a finished run is the provider's to expire once this
+        // desktop claims another, and its result would then be refused.
+        let dir = crate::test_dirs::temp_path("oaiy-sealed-kept");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = |url: &str| {
+            let kept = json!({ "baseUrl": url, "url": format!("{url}/done"), "body": {"status": "done"} });
+            std::fs::write(dir.join("run.json"), kept.to_string()).unwrap();
+        };
+
+        let (url, away) = server(vec![(503, json!({}))]);
+        keep(&url);
+        assert!(!resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5)));
+        assert!(dir.join("run.json").exists(), "kept while the provider is away");
+        away.join().unwrap();
+
+        let (url, back) = server(vec![(200, json!({}))]);
+        keep(&url);
+        assert!(resend_kept_in(&dir, &client(), &account(url), Duration::from_secs(5)));
+        assert!(!dir.join("run.json").exists(), "gone once taken");
+        back.join().unwrap();
     }
 
     #[test]

@@ -1061,6 +1061,7 @@ pub(crate) fn execute_run(
             out_path: &out_path,
             // A locally stored flow talks to nothing on anyone's behalf.
             connector_path: None,
+            flow_run_id: None,
             timeout,
             // The engine's own default: a flow stored here was written
             // against no provider's policy, and the desktop sets none.
@@ -1271,6 +1272,10 @@ pub struct CliRequest<'a> {
     /// linked provider's and its nodes must be able to reach that provider.
     /// `None` for a flow stored on this desktop, which speaks for nobody.
     pub connector_path: Option<&'a Path>,
+    /// The provider's id for this run, which its connector nodes name on a write
+    /// (`OAIY_FLOW_RUN_ID`). In the child's environment and not its inputs, where
+    /// the graph would read it and a provider's own keys could stand in for it.
+    pub flow_run_id: Option<&'a str>,
     pub timeout: Duration,
     /// ZIPP instruction steps per script entry (`--instruction-budget`), the
     /// provider's policy from its descriptor. `None` leaves the engine's own
@@ -1466,6 +1471,10 @@ pub fn run_flow_cli_with(
     } else {
         cmd.env("OAIY_SERVER_TOKEN", credential.bearer());
     }
+    match req.flow_run_id {
+        Some(id) => cmd.env("OAIY_FLOW_RUN_ID", id),
+        None => cmd.env_remove("OAIY_FLOW_RUN_ID"),
+    };
     confine_child(
         &mut cmd,
         confined,
@@ -2390,6 +2399,7 @@ mod tests {
                 inputs_path: &paths.1,
                 out_path: &paths.2,
                 connector_path: connector,
+                flow_run_id: None,
                 timeout: Duration::from_secs(300),
                 instruction_budget: budget,
                 profile_path: profile,
@@ -2442,6 +2452,7 @@ mod tests {
                 inputs_path: &paths.1,
                 out_path: &paths.2,
                 connector_path: connector,
+                flow_run_id: None,
                 timeout: Duration::from_secs(300),
                 instruction_budget: budget,
                 profile_path: profile,
@@ -2522,6 +2533,10 @@ mod tests {
     }
 
     fn run_stub(dir: &Path, script: PathBuf, node: &Path) -> CliOutcome {
+        run_stub_as(dir, script, node, None)
+    }
+
+    fn run_stub_as(dir: &Path, script: PathBuf, node: &Path, flow_run_id: Option<&str>) -> CliOutcome {
         let flow = dir.join("flow.json");
         let inputs = dir.join("inputs.json");
         let out = dir.join("result.json");
@@ -2535,6 +2550,7 @@ mod tests {
                 inputs_path: &inputs,
                 out_path: &out,
                 connector_path: None,
+                flow_run_id,
                 timeout: Duration::from_secs(20),
                 instruction_budget: None,
                 profile_path: None,
@@ -2543,6 +2559,34 @@ mod tests {
             false,
             &|| false,
         )
+    }
+
+    /// What a connector node reads to name its run on a write: this child's alone, and nothing where there is no run.
+    #[test]
+    fn the_providers_id_for_a_run_reaches_the_cli_it_is_for_and_no_other() {
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let dir = crate::secret_file::testing::TempDir::new("flow-run-id");
+        let script = dir.0.join("stub.mjs");
+        std::fs::write(
+            &script,
+            format!(
+                "import fs from 'node:fs';\n\
+                 const a = process.argv.slice(2);\n\
+                 if (a[0] === 'capabilities') {{ process.stdout.write({caps}); process.exit(0); }}\n\
+                 fs.writeFileSync(a[a.indexOf('-o') + 1], JSON.stringify({{ success: true, engine: 'zipp', output: process.env.OAIY_FLOW_RUN_ID ?? null }}));\n",
+                caps = serde_json::to_string(&good_capabilities().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let answer = |id| match run_stub_as(&dir.0, script.clone(), &node, id) {
+            CliOutcome::Succeeded(v) => v["output"].clone(),
+            other => panic!("the stand-in ran: {other:?}"),
+        };
+        assert_eq!(answer(Some("run-7f3a")), json!("run-7f3a"));
+        assert_eq!(answer(None), Value::Null);
     }
 
     /// A kill leaves a run's folder in the temp folder for good, and its inputs may hold personal data. The sweep takes

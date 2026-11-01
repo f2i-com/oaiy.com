@@ -313,6 +313,7 @@ completion with progress on stderr; the result line goes to stdout.
 | `OAIY_FFMPEG` / `OAIY_FFPROBE` | `ffmpeg` / `ffprobe` | media binaries (PATH) |
 | `OAIY_SERVER_URL` | `http://127.0.0.1:17972` | oaiy-server for managed services |
 | `OAIY_SERVER_TOKEN` | — | bearer token for oaiy-server privileged calls |
+| `OAIY_FLOW_RUN_ID` | — | set by the Desktop for a run it claimed from a linked provider's queue: the provider's id for it, which a `--connector` node with a `runField` names on a write |
 | `OAIY_FS_CONFINE` | `1` in `worker` mode, for a `.oaiy` package, and for the Desktop's runs with outside input; else off | confine absolute fs paths to the data/tmp/downloads roots (never the secret store, by any of its names or streams), ffmpeg to local files, and requests to this computer and its network to `OAIY_SERVER_URL` alone, and there to its AI, engine, speech, connector and Agent routes; no service is started by id or port (for untrusted inputs) |
 | `OAIY_HTTP_ALLOW_LOCAL` | — | set `1` to let a confined run reach this computer's and its network's other addresses, and all of `OAIY_SERVER_URL` |
 | `OAIY_FS_ALLOW_ABSOLUTE` | — | set `1` to opt out of fs confinement on a trusted single-tenant box |

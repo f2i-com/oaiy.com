@@ -299,6 +299,8 @@ left_out!(temp_files_are_left_out, "tmp/scratch", "tmp/**", false);
 left_out!(bak_copies_are_left_out, "callers.json.bak", "*.bak", false);
 left_out!(half_written_files_are_left_out, "flows/x.json.tmp", "*.tmp", false);
 left_out!(corrupt_copies_are_left_out, "ai/providers.json.corrupt", "*.corrupt", false);
+left_out!(numbered_corrupt_copies_are_left_out, "ai/providers.json.corrupt.1", "*.corrupt.*", false);
+left_out!(numbered_corrupt_templates_are_left_out, "templates/oaiy-voice.json.corrupt.1", "*.corrupt.*", false);
 left_out!(plugin_rollback_folders_are_left_out, "plugins/.backup-aokie-1f/manifest.json", "plugins/**", true);
 left_out!(the_formlogic_link_credential_and_instance_id_are_left_out, "link/account.json", "link/account.json", true);
 left_out!(the_links_events_and_markers_are_left_out, "link/outbox/1.json", "link/**", false);

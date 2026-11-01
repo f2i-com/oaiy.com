@@ -101,6 +101,13 @@ export interface ConnectorNodeSpec {
   /** For a write: the part of the reply that is the record. Absent, the whole reply. */
   replyField?: string;
   /**
+   * For a write: the body field that names the run making it, where the host
+   * has one ({@link ConnectorHostOptions.runId}). A provider that starts runs
+   * from its records goes by this to end a run that keeps starting itself.
+   * Absent, a write says nothing of its run.
+   */
+  runField?: string;
+  /**
    * For a listing: how many rows a node asks for. Absent, it gets the provider's
    * own default page, and everything past that page is silently not there.
    */
@@ -188,6 +195,7 @@ export interface ConnectorCall {
   /** Copied from the node spec: what a write sends, what comes back, how many rows a listing asks for. */
   recordField?: string;
   replyField?: string;
+  runField?: string;
   limit?: ConnectorLimitSpec;
 }
 
@@ -201,6 +209,12 @@ export interface ConnectorHostOptions {
   loopbackBaseUrl?: string;
   /** Bearer for OAIY's privileged loopback routes (connector relay, services). */
   loopbackToken?: string;
+  /**
+   * The provider's id for the run being performed, from `OAIY_FLOW_RUN_ID`.
+   * Beside the module and not among the run's inputs, which the graph can read
+   * and the provider writes. Absent for a run that is no run of the provider's.
+   */
+  runId?: string;
 }
 
 export const DEFAULT_LOOPBACK_BASE_URL = 'http://127.0.0.1:17972';

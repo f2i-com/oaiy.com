@@ -13,10 +13,12 @@
 //! indirection (a provider holds its own key), no OS keyring, no Codex virtual
 //! providers, no `custom` protocol. Only `openai` and `anthropic`.
 
+use crate::secret_file::{keep_aside, kept_aside, read_text_patiently, Patience, Retry, Text};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The wire dialect the chat proxy speaks to a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -154,10 +156,13 @@ pub struct ProviderStore {
     providers: Vec<AiProvider>,
     /// None == in-memory (persist is a no-op), mirroring `PairingManager`.
     path: Option<PathBuf>,
-    /// What went wrong with the file at start, in words for the person: said where the providers are listed.
+    /// What went wrong with the file, in words for the person: said where the providers are listed.
     problem: Option<String>,
     /// The file is still at `path` and was not read, so saving would write over keys nobody has seen.
     keep_out: bool,
+    patience: Patience,
+    /// Set while saving is kept out: when the file is read again.
+    retry: Option<Retry>,
 }
 
 pub type ProviderStoreHandle = Arc<Mutex<ProviderStore>>;
@@ -167,7 +172,27 @@ pub fn new_handle() -> ProviderStoreHandle {
 }
 
 pub fn open_handle(path: PathBuf) -> ProviderStoreHandle {
-    Arc::new(Mutex::new(ProviderStore::open(path)))
+    handle_of(ProviderStore::open(path))
+}
+
+/// `store` to share, and a file it could not read is read again until it can be. On a thread of its own, since a flow
+/// that needs a provider should not wait for someone to open the page, and the gateway's reads take no `&mut`.
+fn handle_of(store: ProviderStore) -> ProviderStoreHandle {
+    let unread = store.retry.is_some();
+    let handle = Arc::new(Mutex::new(store));
+    if unread {
+        let store = Arc::downgrade(&handle);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let Some(store) = store.upgrade() else { return };
+            let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+            store.read_again();
+            if store.retry.is_none() {
+                return;
+            }
+        });
+    }
+    handle
 }
 
 /// Max plaintext key length — a header-safety bound.
@@ -176,7 +201,7 @@ const MAX_BASE_URL_BYTES: usize = 4096;
 
 impl ProviderStore {
     pub fn new() -> Self {
-        Self { providers: Vec::new(), path: None, problem: None, keep_out: false }
+        Self { providers: Vec::new(), path: None, problem: None, keep_out: false, patience: Patience::default(), retry: None }
     }
 
     /// Load + harden from `path`. Persisted data is untrusted (old / hand-edited
@@ -184,56 +209,93 @@ impl ProviderStore {
     ///
     /// This store holds API keys, so only an absent file is an empty store. A
     /// file that EXISTS but fails to parse (one byte that is not UTF-8 does) is
-    /// preserved, renamed to `providers.json.corrupt`, before we start empty:
-    /// discarding a hand-repairable file and overwriting it on the next
-    /// `persist()` would destroy the user's credentials. One that cannot be read
-    /// at all (a backup tool holding it, say) may be perfectly good, so it stays
-    /// where it is and nothing is saved over it until a restart reads it. Either
-    /// way the person is told, in the log and where the providers are listed.
+    /// preserved, as `providers.json.corrupt` (`.corrupt.1`, and so on: no earlier
+    /// one is replaced), before we start empty: discarding a hand-repairable file
+    /// and overwriting it on the next `persist()` would destroy the user's
+    /// credentials. One that cannot be read at all (a backup tool holding it, say)
+    /// may be perfectly good, so it stays where it is, nothing is saved over it,
+    /// and it is read again until it can be. Either way the person is told, in
+    /// the log and where the providers are listed.
     pub fn open(path: PathBuf) -> Self {
-        let mut problem = None;
-        let mut keep_out = false;
-        let raw: Vec<AiProvider> = match std::fs::read(&path) {
-            Ok(contents) => match serde_json::from_slice::<PersistShape>(&contents) {
-                Ok(doc) => doc.providers,
-                Err(e) => {
-                    let backup = path.with_extension("json.corrupt");
-                    problem = Some(match std::fs::rename(&path, &backup) {
-                        Ok(()) => format!(
-                            "The saved providers could not be read ({e}), so they are missing here. Nothing is lost: the file was moved to {}, to repair by hand or restore from a backup.",
-                            backup.display()
-                        ),
-                        Err(moved) => {
-                            keep_out = true;
-                            format!(
-                                "The saved providers could not be read ({e}), and {} could not be moved aside ({moved}). Nothing will be saved over it: repair it, or move it aside yourself, and restart OAIY.",
-                                path.display()
-                            )
-                        }
-                    });
-                    Vec::new()
-                }
+        Self::open_patiently(path, Patience::default())
+    }
+
+    /// [`ProviderStore::open`], waiting for a file that is busy as `patience` says.
+    pub fn open_patiently(path: PathBuf, patience: Patience) -> Self {
+        let pauses = patience.start.clone();
+        let mut store = Self { providers: Vec::new(), path: Some(path), problem: None, keep_out: false, patience, retry: None };
+        store.load(&pauses);
+        store
+    }
+
+    /// Read the file into the store, waiting as `pauses` say for one that is busy. What it holds takes the place of
+    /// what is in memory: an edit made while it could not be read was refused, and the person was told.
+    fn load(&mut self, pauses: &[Duration]) {
+        let Some(path) = self.path.clone() else { return };
+        let (raw, damage) = match read_text_patiently(&path, pauses) {
+            Text::Missing => (Vec::new(), None),
+            Text::Text(text) => match serde_json::from_str::<PersistShape>(&text) {
+                Ok(doc) => (doc.providers, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                keep_out = true;
-                problem = Some(format!(
-                    "The saved providers could not be read ({e}), so they are missing here. Nothing will be saved over {}: restart OAIY once whatever holds it has let go.",
+            Text::Undecodable(why) => (Vec::new(), Some(why)),
+            Text::Unreadable(e) => {
+                return self.kept_out(format!(
+                    "The saved providers could not be read ({e}), so they are missing here: another program may have the file open, or its permissions may not let OAIY read it. Nothing will be saved over {}, and it is read again until it can be.",
                     path.display()
                 ));
-                Vec::new()
             }
         };
-        if let Some(problem) = &problem {
-            log::error!("ai: {problem}");
-        }
         let mut seen = HashSet::new();
-        let providers = raw
+        self.providers = raw
             .into_iter()
             .filter(|p| valid_id(&p.id))
             .filter(|p| seen.insert(p.id.clone()))
             .collect();
-        Self { providers, path: Some(path), problem, keep_out }
+        match damage.map(|why| (keep_aside(&path), why)) {
+            None => {
+                self.problem = None;
+                if self.keep_out {
+                    log::info!("ai: {} could be read again", path.display());
+                }
+            }
+            Some((Ok(aside), why)) => {
+                let moved = format!(
+                    "The saved providers could not be read ({why}), so they are missing here. Nothing is lost: the file is kept as {}, to repair by hand or restore from a backup.",
+                    aside.display()
+                );
+                log::error!("ai: {moved}");
+                self.problem = Some(moved);
+            }
+            Some((Err(moved), why)) => {
+                return self.kept_out(format!(
+                    "The saved providers could not be read ({why}), and {} could not be moved aside ({moved}). Nothing will be saved over it: repair it, or move it aside yourself, and it is read again until that is done.",
+                    path.display()
+                ));
+            }
+        }
+        self.keep_out = false;
+        self.retry = None;
+    }
+
+    /// The file is still there and nothing is known of it: `said` is why, and it is read again as `patience` says.
+    fn kept_out(&mut self, said: String) {
+        match &mut self.retry {
+            Some(retry) => retry.failed(),
+            None => {
+                log::error!("ai: {said}");
+                self.retry = Some(Retry::began(&self.patience));
+            }
+        }
+        self.keep_out = true;
+        self.problem = Some(said);
+    }
+
+    /// The file could not be read at the last try: read it again if it is time to.
+    fn read_again(&mut self) {
+        if self.retry.as_ref().is_some_and(Retry::due) {
+            self.load(&[]);
+        }
     }
 
     /// Public snapshot of every provider — never the key.
@@ -241,9 +303,20 @@ impl ProviderStore {
         self.providers.iter().map(AiProvider::public).collect()
     }
 
-    /// What went wrong with the saved providers at start, for the page that lists them.
-    pub fn problem(&self) -> Option<&str> {
-        self.problem.as_deref()
+    /// What the page that lists the providers says of why there are none: a file that cannot be read for now, or one
+    /// kept aside, for as long as it is there and nothing has taken its place. A restart does not end that: a desktop
+    /// that came back up after the move has no reason of its own to give, and the page would be empty with nothing said.
+    pub fn problem(&self) -> Option<String> {
+        if self.keep_out {
+            return self.problem.clone();
+        }
+        if !self.providers.is_empty() {
+            return None;
+        }
+        let aside = kept_aside(self.path.as_ref()?).pop()?;
+        Some(self.problem.clone().unwrap_or_else(|| {
+            format!("The saved providers could not be read when OAIY last tried, so they are missing here. Nothing is lost: the file is kept as {}, to repair by hand or restore from a backup.", aside.display())
+        }))
     }
 
     /// Create or replace a provider by id. Validates id + base_url; PRESERVES an
@@ -537,6 +610,125 @@ mod tests {
         let err = s.upsert(input("openai")).unwrap_err();
         assert!(err.contains("Nothing will be saved over"), "{err}");
         assert!(path.join("still-here").exists());
+    }
+
+    const SAVED: &str = r#"{ "providers": [{ "id": "openai", "name": "OpenAI", "protocol": "openai", "baseUrl": "https://api.openai.com", "enabled": true, "capabilities": [], "apiKey": "sk-precious" }] }"#;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A file held at start (an antivirus scan, a backup) cost every provider for the session, and every save, until
+    /// a restart. Read again by itself: the keys are back and saving is allowed, with no one having to do anything.
+    #[test]
+    fn a_file_that_could_not_be_read_is_read_again_and_saving_comes_back() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-later");
+        let path = dir.0.join("providers.json");
+        std::fs::create_dir(&path).unwrap();
+        // (read again every 20 ms from the first failure)
+        let mut s = ProviderStore::open_patiently(path.clone(), Patience { start: vec![], later: vec![ms(20)], window: Duration::ZERO });
+        assert!(s.upsert(input("anthropic")).is_err(), "refused while it cannot be read");
+        // Not time yet, or still held: nothing changes.
+        s.read_again();
+        std::thread::sleep(ms(40));
+        s.read_again();
+        assert!(s.problem().is_some_and(|p| p.contains("read again")), "{:?}", s.problem());
+        assert!(s.upsert(input("anthropic")).is_err(), "still refused");
+
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, SAVED).unwrap();
+        std::thread::sleep(ms(40));
+        s.read_again();
+        assert!(s.problem().is_none(), "{:?}", s.problem());
+        assert_eq!(s.get_full("openai").unwrap().api_key.as_deref(), Some("sk-precious"));
+        assert!(s.get_full("anthropic").is_none(), "what was refused is not kept: the file is what there is");
+        s.upsert(input("groq")).unwrap();
+        let again = ProviderStore::open(path);
+        assert_eq!(again.get_full("openai").unwrap().api_key.as_deref(), Some("sk-precious"));
+        assert!(again.get_full("groq").is_some());
+    }
+
+    /// Nobody has to open the page or start a flow for it to happen.
+    #[test]
+    fn the_handle_reads_a_file_again_by_itself() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-handle");
+        let path = dir.0.join("providers.json");
+        std::fs::create_dir(&path).unwrap();
+        let handle = handle_of(ProviderStore::open_patiently(path.clone(), Patience { start: vec![], later: vec![ms(20)], window: Duration::ZERO }));
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, SAVED).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.lock().unwrap().list().is_empty() {
+            assert!(std::time::Instant::now() < until, "not read again: {:?}", handle.lock().unwrap().problem());
+            std::thread::sleep(ms(20));
+        }
+    }
+
+    /// A lock that lasts a moment costs nothing at all: it is waited for.
+    #[test]
+    fn a_file_held_for_a_moment_at_start_is_waited_for() {
+        use crate::secret_file::testing::{make_unreadable, TempDir};
+        let dir = TempDir::new("ai-providers-held-a-moment");
+        let path = dir.0.join("providers.json");
+        std::fs::write(&path, SAVED).unwrap();
+        let Some(held) = make_unreadable(&path) else { return };
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(ms(60));
+            drop(held);
+        });
+        let s = ProviderStore::open_patiently(path, Patience { start: vec![ms(40); 20], later: vec![Duration::from_secs(3_600)], window: Duration::ZERO });
+        letting_go.join().unwrap();
+        assert!(s.problem().is_none(), "{:?}", s.problem());
+        assert_eq!(s.list().len(), 1);
+    }
+
+    /// PowerShell 5.1's `Out-File` writes UTF-16, and some editors put a mark on UTF-8. Neither is damage: they were
+    /// moved aside and the keys went with them.
+    #[test]
+    fn a_file_in_another_encoding_is_read_and_stays_where_it_is() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-encodings");
+        let path = dir.0.join("providers.json");
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain(SAVED.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        for body in [[&[0xEF, 0xBB, 0xBF][..], SAVED.as_bytes()].concat(), utf16] {
+            std::fs::write(&path, &body).unwrap();
+            let s = ProviderStore::open(path.clone());
+            assert_eq!(s.get_full("openai").unwrap().api_key.as_deref(), Some("sk-precious"));
+            assert!(s.problem().is_none(), "{:?}", s.problem());
+            assert!(path.exists() && kept_aside(&path).is_empty());
+        }
+    }
+
+    /// A second damaged file used to replace the copy of the first, which held the keys of the first; backups leave
+    /// `*.corrupt` out, so nothing else did. And the page said nothing after a restart.
+    #[test]
+    fn every_damaged_file_is_kept_and_the_notice_lasts_while_the_store_is_empty() {
+        let dir = crate::secret_file::testing::TempDir::new("ai-providers-damaged-twice");
+        let path = dir.0.join("providers.json");
+        std::fs::write(&path, b"{ first").unwrap();
+        let mut s = ProviderStore::open(path.clone());
+        assert!(s.problem().is_some_and(|p| p.contains("providers.json.corrupt")));
+
+        // A restart with nothing done: the same page, with the copy named.
+        let s2 = ProviderStore::open(path.clone());
+        let said = s2.problem().expect("an empty page says why");
+        assert!(said.contains("providers.json.corrupt") && said.contains("Nothing is lost"), "{said}");
+
+        // A provider added, and the page has something to show.
+        s.upsert(input("anthropic")).unwrap();
+        assert!(s.problem().is_none(), "{:?}", s.problem());
+
+        // The same tool damages the new file.
+        std::fs::write(&path, b"{ second").unwrap();
+        let s3 = ProviderStore::open(path.clone());
+        assert_eq!(std::fs::read(path.with_extension("json.corrupt")).unwrap(), b"{ first", "the first copy stands");
+        assert_eq!(std::fs::read(path.with_extension("json.corrupt.1")).unwrap(), b"{ second");
+        assert!(s3.problem().is_some_and(|p| p.contains("providers.json.corrupt.1")), "the newest is named: {:?}", s3.problem());
+
+        // With the copies gone there is nothing to say.
+        for aside in kept_aside(&path) {
+            std::fs::remove_file(aside).unwrap();
+        }
+        assert!(s3.problem().is_none(), "{:?}", s3.problem());
     }
 
     #[test]
