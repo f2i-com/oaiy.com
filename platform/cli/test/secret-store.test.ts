@@ -35,6 +35,16 @@ try {
   assert.equal(getSecret('OAIY_OTHER'), 'second');
   if (posix) assert.equal(mode(file), 0o600);
 
+  // One that is only ever read is narrowed all the same: an install that is set up may never store again.
+  if (posix) {
+    fs.chmodSync(file, 0o644);
+    assert.equal(getSecret('OAIY_TEST_SECRET'), 'first');
+    assert.equal(mode(file), 0o600, 'a read leaves it the owner\'s alone');
+    const group = fs.statSync(data).mode;
+    assert.equal(getSecret('OAIY_NOT_THERE'), undefined);
+    assert.equal(fs.statSync(data).mode, group, 'and the folder as it was');
+  }
+
   // A crash before the new file is in place leaves the old one whole, and no copy of the secrets.
   const whole = fs.readFileSync(file, 'utf-8');
   const rename = fs.renameSync;

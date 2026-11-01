@@ -16,6 +16,10 @@
  * - ⌘A and ⌘V after a click on an empty part of the canvas (lib/canvasTarget.ts).
  * - "Import a project…" says what a file is not before asking to replace the
  *   project (utils/ProjectIO.ts).
+ * - A project's export takes out its secrets and nothing that only sounds like
+ *   one: a name matched as part of a name took `maxTokens`, a memory node's
+ *   `key` and the names of API key constants too (utils/ProjectIO.ts). Run on
+ *   the two flows OAIY ships.
  * - A toast says a step's error without its HTTP status (lib/readableError.ts).
  * - An example on the models this computer has (lib/exampleFlows.ts), and cards
  *   kept clear of one a run made taller (lib/respace.ts).
@@ -92,14 +96,14 @@ const aliases = {
     });
   },
 };
-const MODS = ['core-input', 'core-utility', 'core-flow-control'];
+const MODS = ['core-input', 'core-utility', 'core-flow-control', 'core-ai'];
 const bundlePath = path.join(os.tmpdir(), `oaiy-review-${process.pid}.mjs`);
 await esbuild.build({
   stdin: {
     contents: `export { getDefaultNodeData, withoutProviderSeeds } from './src/utils/NodeDefaults.ts';
 export { beforeRun, afterUnfinishedRun } from './src/lib/runResults.ts';
 export { isCanvasTarget } from './src/lib/canvasTarget.ts';
-export { parseImportedProject, parseJsonFile } from './src/utils/ProjectIO.ts';
+export { parseImportedProject, parseJsonFile, sanitizeProjectForExport } from './src/utils/ProjectIO.ts';
 export { toastError, readableError } from './src/lib/readableError.ts';
 export { withModelsHere, exampleFrom, flowFromExample } from './src/lib/exampleFlows.ts';
 export { clearBelow, clearGrown, Respacer } from './src/lib/respace.ts';
@@ -296,6 +300,95 @@ await check("a file that is not a project is said so in words, not the parser's"
   const p = M.parseImportedProject(JSON.stringify({ name: 'Mine', flows: [{ id: 'f', name: 'F', graph: { nodes: [{ id: 'l', type: 'ai_llm', data: { service: 'engine:llm', ...OLLAMA } }], edges: [] } }] }));
   assert.equal(p.name, 'Mine');
   assert.deepEqual(p.flows[0].graph.nodes[0].data, { service: 'engine:llm' }, "and an imported AI LLM node's Ollama fields under its service are left out");
+});
+
+// ---------------------------------------------------------------------------
+// A project's export: its secrets go, and nothing else does.
+// ---------------------------------------------------------------------------
+
+/** A flow OAIY ships, as a project holds it. */
+const shipped = (name) => {
+  const { nodes, edges } = JSON.parse(fs.readFileSync(path.join(UI, '..', 'examples', 'flows', `${name}.flow.json`), 'utf8'));
+  return { id: name, name, graph: { nodes, edges } };
+};
+const SHIPPED = ['text-to-image', 'image-to-image'];
+const roundTrip = (project) => M.parseImportedProject(JSON.stringify(M.sanitizeProjectForExport(project)));
+const aiNodes = (project) => project.flows.flatMap((f) => f.graph.nodes.filter((n) => n.type === 'ai_llm'));
+
+await check('the flows OAIY ships come back from an export as they went, their AI limits with them', () => {
+  const project = { name: 'Mine', flows: SHIPPED.map(shipped) };
+  const back = roundTrip(project);
+  assert.deepEqual(back.flows, M.parseImportedProject(JSON.stringify(project)).flows);
+  assert.deepEqual(aiNodes(back).map((n) => n.data.maxTokens), [1400, 800, 600, 800]);
+});
+
+await check('what only sounds like a secret comes back from an export: a memory key, the names of key constants', () => {
+  const fields = {
+    memory: { key: 'last-reply' },
+    ai_llm: { maxTokens: 800, apiKeyConstant: 'OPENAI_API_KEY' },
+    image_gen: { apiKeyConstant: 'IMAGE_API_KEY' },
+    service_call: { apiKeyConstant: 'SERVICE_API_KEY' },
+    text_to_speech: { externalApiKeyConstant: 'VOICE_API_KEY' },
+    speech_to_text: { hfTokenConstant: 'HF_TOKEN' },
+  };
+  const nodes = Object.entries(fields).map(([type, data], i) => ({ id: `n${i}`, type, position: { x: 0, y: 0 }, data }));
+  const back = roundTrip({ name: 'Mine', flows: [{ id: 'f', name: 'F', graph: { nodes, edges: [] } }] });
+  assert.deepEqual(Object.fromEntries(back.flows[0].graph.nodes.map((n) => [n.type, n.data])), fields);
+});
+
+await check("a shipped flow's secrets stay out of its export, wherever they were put", () => {
+  const known = 'the-value-of-a-secret-constant';
+  const google = `AIza${'a'.repeat(35)}`;
+  const bearer = 'b'.repeat(30);
+  const planted = {
+    apiKey: 'typed-into-the-key-field',
+    token: 'a-token',
+    Password: 'hunter2',
+    secret: 'a-secret',
+    credential: 'a-credential',
+    auth: 'an-auth',
+    accessToken: 'an-access-token',
+    clientSecret: 'a-client-secret',
+    endpoint: `https://example.com/v1?key=${google}`,
+    customHeaders: `{"Authorization": "Bearer ${bearer}"}`,
+    customBodyTemplate: `{"key": "${known}", "model": {{model}}}`,
+    headers: { Authorization: 'Basic dXNlcjpwYXNz', 'X-Api-Key': 'a-header-key', 'x-auth-token': 'a-header-token', Accept: 'application/json' },
+    systemPrompt: known,
+  };
+  const flows = SHIPPED.map(shipped);
+  for (const node of aiNodes({ flows })) Object.assign(node.data, planted);
+  const project = { name: 'Mine', flows, constants: [{ key: 'MINE', value: known, isSecret: true }, { key: 'PLAIN', value: 'to-be-seen', isSecret: false }] };
+  const text = JSON.stringify(M.sanitizeProjectForExport(project));
+  for (const value of ['typed-into-the-key-field', 'a-token', 'hunter2', 'a-secret', 'a-credential', 'an-auth', 'an-access-token', 'a-client-secret', google, bearer, known, 'dXNlcjpwYXNz', 'a-header-key', 'a-header-token']) {
+    assert.equal(text.includes(value), false, `${value} is in the export`);
+  }
+  assert.ok(text.includes('to-be-seen'), 'a plain constant stays');
+  const [node] = aiNodes(JSON.parse(text));
+  assert.deepEqual(node.data.headers, { Accept: 'application/json' }, 'of a header map, what is no secret stays');
+  assert.equal(node.data.maxTokens, 1400, 'and so do the fields around them');
+  assert.equal(node.data.endpoint, 'https://example.com/v1?key=__REDACTED__');
+});
+
+await check('a key pasted into a field that should name a constant goes, whatever its shape', () => {
+  const keys = ['gsk_pastedHereByMistakeForTheName', 'anthropic-pasted-here', 'sk-pasted', `hf_${'a'.repeat(34)}`, `r8_${'b'.repeat(37)}`, 'k'.repeat(41), 'K_'.repeat(21)];
+  for (const apiKeyConstant of keys) {
+    const node = { id: 'n', type: 'ai_llm', position: { x: 0, y: 0 }, data: { apiKeyConstant, maxTokens: 5 } };
+    const [back] = aiNodes(roundTrip({ name: 'Mine', flows: [{ id: 'f', name: 'F', graph: { nodes: [node], edges: [] } }] }));
+    assert.deepEqual(back.data, { maxTokens: 5 }, apiKeyConstant);
+  }
+});
+
+await check("a field the node's schema calls a secret goes, whatever its name", () => {
+  assert.equal(loader.getNodeDefinition('ai_llm').properties.find((p) => p.id === 'apiKey').type, 'secret', 'the real one');
+  const real = loader.getNodeDefinition;
+  loader.getNodeDefinition = (type) => (type === 'a_plugins_node' ? { properties: [{ id: 'signing', type: 'secret' }, { id: 'label', type: 'string' }] } : real.call(loader, type));
+  try {
+    const node = { id: 'n', type: 'a_plugins_node', position: { x: 0, y: 0 }, data: { signing: 'by-schema', label: 'Mine' } };
+    const back = roundTrip({ name: 'Mine', flows: [{ id: 'f', name: 'F', graph: { nodes: [node], edges: [] } }] });
+    assert.deepEqual(back.flows[0].graph.nodes[0].data, { label: 'Mine' });
+  } finally {
+    loader.getNodeDefinition = real;
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -120,16 +120,22 @@ async function waitDownload(id: string): Promise<void> {
   throw new ServerError('download timed out');
 }
 
-/** Wrap an action so ServerError prints cleanly and sets exit 1. */
+/**
+ * Wrap an action so ServerError prints cleanly and sets exit 1. It sets the exit code and lets the process end, as `oaiy
+ * run` does: a forced exit straight after a fetch tears down libuv with the socket still closing, and Node can abort on
+ * Windows after a command has done its work (`!(handle->flags & UV_HANDLE_CLOSING)`). No longer than a few seconds, for
+ * a connection left open.
+ */
 const action = (fn: (...a: any[]) => Promise<void>) =>
   async (...args: any[]) => {
     try {
       await fn(...args);
-      process.exit(0);
+      process.exitCode = 0;
     } catch (e) {
       note(`oaiy: ${e instanceof Error ? e.message : String(e)}`);
-      process.exit(1);
+      process.exitCode = 1;
     }
+    setTimeout(() => process.exit(), 5000).unref();
   };
 
 export function registerManageCommands(program: Command): void {

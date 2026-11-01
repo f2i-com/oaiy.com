@@ -40,21 +40,19 @@ async function api(method: string, path: string, body?: unknown): Promise<any> {
   } catch {
     parsed = text;
   }
-  if (!resp.ok) {
-    if (resp.status === 403) {
-      throw new ServerError(
-        `forbidden (${path}) — this is a privileged route; set OAIY_SERVER_TOKEN to match the server's token`,
-      );
-    }
-    const msg =
-      parsed && typeof parsed === 'object' && parsed.error
-        ? typeof parsed.error === 'string'
-          ? parsed.error
-          : JSON.stringify(parsed.error)
-        : text || `HTTP ${resp.status}`;
-    throw new ServerError(`oaiy-server ${method} ${path} → ${resp.status}: ${msg}`);
-  }
+  if (!resp.ok) throw new ServerError(`oaiy-server ${method} ${path} → ${resp.status}: ${refusal(parsed, text)}`);
   return parsed;
+}
+
+/**
+ * What the server said a request was refused for: its `{error: {code, message}}` where it sent one. A 403 needs no
+ * guess at the cause: with the right token it is most often a token that lacks a scope, which the code and message say.
+ */
+function refusal(parsed: any, text: string): string {
+  const error = parsed && typeof parsed === 'object' ? parsed.error : null;
+  if (!error) return text || 'no reason given';
+  if (typeof error === 'string') return error;
+  return error.code || error.message ? [error.code, error.message].filter(Boolean).join(': ') : JSON.stringify(error);
 }
 
 export const server = {

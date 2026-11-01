@@ -10,6 +10,9 @@
  *   with pictures in OpenAI's `image_url` shape, which Anthropic refuses. Here
  *   the chat is sent to a stand-in server on this computer, which records what
  *   it was sent and answers as Anthropic does.
+ * - AI Chat when a provider's 200 holds no answer (no choice, an empty answer cut
+ *   off at the limit, an error body, a thought that never closes): the step
+ *   fails. It passed, the provider's JSON as its answer, or nothing.
  * - Image View (core-image/ui/ImageViewNode.tsx): its Max Height is the
  *   preview's height. The property was in the node's settings and changed
  *   nothing. Rendered with react-dom/server.
@@ -117,14 +120,16 @@ fs.rmSync(bundlePath, { force: true });
 // AI Chat to Anthropic
 // ---------------------------------------------------------------------------
 
-/** A stand-in for Anthropic's Messages API: what it is sent is kept, and it answers in two text blocks. */
+/** A stand-in for Anthropic's Messages API: what it is sent is kept, and it answers in two text blocks, or with `answerWith`. */
 const received = [];
+let answerWith = null;
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     received.push({ url: req.url, headers: req.headers, body: JSON.parse(body || '{}') });
     res.writeHead(200, { 'content-type': 'application/json' });
+    if (answerWith !== null) return res.end(typeof answerWith === 'string' ? answerWith : JSON.stringify(answerWith));
     res.end(JSON.stringify({ content: [{ type: 'thinking', thinking: 'hm' }, { type: 'text', text: 'A red ' }, { type: 'text', text: 'square.' }] }));
   });
 });
@@ -191,7 +196,114 @@ await check("a picture in a history's turn given in OpenAI's shape by its addres
   assert.deepEqual(sent.messages[0].content, [{ type: 'text', text: 'Earlier:' }, { type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } }]);
 });
 
+// ---------------------------------------------------------------------------
+// A 200 that holds no answer
+// ---------------------------------------------------------------------------
+
+/** chat() against a stand-in that answers `body` (an object as JSON, a string as it is); what it gave, or what it threw. */
+const asked = async (body, { endpoint = OPENAI, template = '', path = '', host = {} } = {}) => {
+  answerWith = body;
+  const statuses = [];
+  const args = chatArgs({});
+  args[3] = endpoint;
+  try {
+    const methods = M.AIRuntime.createMethods({ ...ctx, ...host, onNodeStatus: (_id, status) => statuses.push(status) });
+    const answer = await methods.chat(...args, 0, 0, false, '', null, 8, template, path, '');
+    return { answer, status: statuses.at(-1) };
+  } catch (e) {
+    return { failed: e.message, status: statuses.at(-1) };
+  } finally {
+    answerWith = null;
+  }
+};
+const OPENAI = ENDPOINT.replace('/anthropic/v1/messages', '/v1/chat/completions');
+const TEMPLATE = '{"messages": {{messagesJsonRaw}}}';
+const fails = async (name, body, words, where) => {
+  await check(`${name} fails the step`, async () => {
+    const r = await asked(body, where);
+    assert.match(r.failed ?? `no failure, the answer was ${JSON.stringify(r.answer)}`, words);
+    assert.equal(r.status, 'error');
+  });
+};
+const answers = async (name, body, answer, where) => {
+  await check(name, async () => {
+    const r = await asked(body, where);
+    assert.equal(r.failed, undefined);
+    assert.equal(r.answer, answer);
+    assert.equal(r.status, 'completed');
+  });
+};
+const SPENT = /token limit.*Raise Max Tokens/;
+const cutOff = { choices: [{ message: { content: '', reasoning_content: 'Let me think.' }, finish_reason: 'length' }] };
+
+await fails('an OpenAI reply with no choice', { choices: [], id: 'x' }, /without a message/);
+await fails('an empty answer cut off at the limit', cutOff, SPENT);
+await fails('an error body with a status of 200', { error: { message: 'model overloaded' } }, /model overloaded/);
+await fails('an error named in its choice', { choices: [{ error: { message: 'upstream gone' }, message: { content: '' } }] }, /upstream gone/);
+await fails('an error beside the start of an answer', { choices: [{ error: { message: 'upstream gone' }, message: { content: 'Par' }, finish_reason: 'error' }] }, /upstream gone/);
+await fails('a thought that never closes', { choices: [{ message: { content: '<think>Still going' }, finish_reason: 'length' }] }, SPENT);
+await fails('a thought that never closes, with no reason given', { choices: [{ message: { content: '<think>Still going' } }] }, SPENT);
+await fails('a thought that closes on nothing', { choices: [{ message: { content: '<think>Hm.</think>' }, finish_reason: 'stop' }] }, /without a message/);
+await fails('an empty answer', { choices: [{ message: { content: '' }, finish_reason: 'stop' }] }, /without a message/);
+await fails('an answer of white space', { choices: [{ message: { content: ' \n' }, finish_reason: 'stop' }] }, /without a message/);
+await answers('an answer after its thought is the answer', { choices: [{ message: { content: '<think>Hm.</think>\nParis' } }] }, 'Paris');
+await answers("a reply cut off after its answer began is that answer", { choices: [{ message: { content: 'Par' }, finish_reason: 'length' }] }, 'Par');
+await answers('the older local shape is an answer', { response: 'Paris' }, 'Paris');
+
+await fails("Anthropic's reply cut off in its thinking", { content: [{ type: 'thinking', thinking: 'hm' }], stop_reason: 'max_tokens' }, SPENT, { endpoint: ENDPOINT });
+await fails("Anthropic's error body", { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }, /Overloaded/, { endpoint: ENDPOINT });
+await fails("Anthropic's reply with no text", { content: [], stop_reason: 'end_turn' }, /without a message/, { endpoint: ENDPOINT });
+
+// A service's own template: what it answers is its own, and an empty text may be its answer.
+const CUSTOM = { template: TEMPLATE };
+const AT_PATH = { template: TEMPLATE, path: 'choices.0.message.content' };
+await answers("a template's empty answer at its path is its answer", { choices: [{ message: { content: '' }, finish_reason: 'stop' }] }, '', AT_PATH);
+await answers("a template's empty text is its answer", { text: '' }, '', CUSTOM);
+await answers("a template's endpoint of a shape of its own is read by the flow", { result: { a: 1 } }, '{"result":{"a":1}}', CUSTOM);
+await answers("a template's endpoint that answers in plain text", 'Paris', 'Paris', CUSTOM);
+await answers('an answer at its path stands beside an error member', { text: 'Paris', error: 'none' }, 'Paris', { template: TEMPLATE, path: 'text' });
+await fails('a template with no choice at its path', { choices: [] }, /nothing at choices\.0\.message\.content/, AT_PATH);
+await fails('a template cut off at the limit', cutOff, SPENT, AT_PATH);
+await fails('a template with no path cut off at the limit', cutOff, SPENT, CUSTOM);
+await fails('a template with an error body at a path', { error: { message: 'quota spent' } }, /quota spent/, AT_PATH);
+await fails('a template with an error body and no path', { error: 'quota spent' }, /quota spent/, CUSTOM);
+await fails('a template with no choice and no path', { choices: [] }, /without a message/, CUSTOM);
+await fails("a template's thought that never closes", { text: '<think>Still going' }, SPENT, CUSTOM);
+
+// The two answers that come by no provider.
+const localModel = (text) => ({ endpoint: 'oaiy-llm://local', host: { tauri: { invoke: async (command) => (command.endsWith('|llm_chat') ? { text, modelId: 'm', backend: 'cpu', promptTokens: 1, generatedTokens: 1 } : 0) } } });
+await fails('a local model that only thought', null, SPENT, localModel('<think>Still going'));
+await answers("a local model's answer after its thought", null, 'Paris', localModel('<think>Hm.</think>Paris'));
+await fails('an external AI that only thought', null, SPENT, { host: { useClaudeForAI: true, yieldForAI: async () => '<think>Still going' } });
+
 await new Promise((resolve) => server.close(resolve));
+
+// ---------------------------------------------------------------------------
+// A 401, and whose it is
+// ---------------------------------------------------------------------------
+
+await check("a 401 from the run's own OAIY is not put down to an API key, and a provider's still is", async () => {
+  const refuses = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end('{"error":{"code":"token_invalid","message":"The credential is not valid."}}');
+  });
+  await new Promise((resolve) => refuses.listen(0, '127.0.0.1', resolve));
+  const base = `http://localhost:${refuses.address().port}`;
+  const endpoint = `${base}/api/ai/providers/oaiy-engine/v1/chat/completions`;
+  try {
+    Object.assign(process.env, { OAIY_SERVER_URL: base, OAIY_SERVER_TOKEN: 'oaiyrun_x' });
+    const own = await asked('', { endpoint });
+    assert.doesNotMatch(own.failed, /Check your API key/);
+    assert.match(own.failed, /This OAIY refused the run's own credential for AI chat.*token_invalid/);
+    process.env.OAIY_SERVER_URL = 'http://localhost:1';
+    assert.match((await asked('', { endpoint })).failed, /Check your API key/, "another address is a provider's");
+  } finally {
+    delete process.env.OAIY_SERVER_URL;
+    delete process.env.OAIY_SERVER_TOKEN;
+    await new Promise((resolve) => refuses.close(resolve));
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Image View's Max Height

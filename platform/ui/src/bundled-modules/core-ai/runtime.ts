@@ -48,6 +48,17 @@ function localServerBearer(endpoint: string): string | null {
   }
 }
 
+/** Whether `endpoint` is the OAIY this run belongs to, not a provider. */
+function isOwnServer(endpoint: string): boolean {
+  if (localServerBearer(endpoint)) return true;
+  const base = typeof process === 'undefined' || !process.env ? undefined : process.env.OAIY_SERVER_URL;
+  try {
+    return !!base && new URL(endpoint).origin === new URL(base).origin;
+  } catch {
+    return false;
+  }
+}
+
 // Maximum prompt/body length (10MB - allows for base64 images)
 const MAX_CONTENT_LENGTH = 10 * 1024 * 1024;
 
@@ -327,11 +338,15 @@ async function resizeImageIfNeeded(
 /**
  * Get user-friendly error message
  */
-function getUserFriendlyError(error: string, context: string): string {
+function getUserFriendlyError(error: string, context: string, endpoint?: string): string {
   if (error.includes('Failed to fetch') || error.includes('NetworkError')) {
     return `Network error during ${context}. Check your internet connection and endpoint URL.`;
   }
   if (error.includes('401') || error.includes('Unauthorized')) {
+    // No key of the person's is in play on OAIY's own API: what was refused is the run's credential.
+    if (endpoint !== undefined && isOwnServer(endpoint)) {
+      return `This OAIY refused the run's own credential for ${context}, which is not about any API key: a flow OAIY starts is given one for that run, and a flow run by hand needs OAIY_SERVER_TOKEN. (${error})`;
+    }
     return `Authentication failed for ${context}. Check your API key.`;
   }
   if (error.includes('429') || error.includes('rate limit')) {
@@ -414,6 +429,39 @@ function stripThinkTags(text: string): string {
     out = out.slice(0, openTail.index);
   }
   return out.replace(/^\s+/, '');
+}
+
+const NO_MESSAGE = 'The AI service answered without a message.';
+const LIMIT_SPENT_THINKING = 'The model reached its token limit before it answered: its thinking used it up. Raise Max Tokens.';
+
+/**
+ * `stripThinkTags`, for a reply that has to hold an answer: one that was thought and nothing else fails the step. Empty
+ * text would go on as the step's answer, into whatever the flow does with it next.
+ */
+function answerOf(text: string): string {
+  const answer = stripThinkTags(text);
+  if (!answer && /<think(?:ing)?>/i.test(text)) {
+    throw new Error(/<\/think(?:ing)?>/i.test(text) ? NO_MESSAGE : LIMIT_SPENT_THINKING);
+  }
+  return answer;
+}
+
+/** The `error` a provider's 200 carries, if it does: of the reply, or of its first choice as some gateways put it. */
+function errorIn(data: any): unknown {
+  return data?.error || data?.choices?.[0]?.error;
+}
+
+/**
+ * What a provider's 200 says about why it holds no answer, where it says. A status of 200 is not an answer: a body with
+ * an `error` in it, or a reasoning model's that used its tokens thinking, otherwise reached the flow as text.
+ */
+function whyNoAnswer(data: any): string | null {
+  const failure: any = errorIn(data);
+  if (failure) {
+    const said = typeof failure === 'string' ? failure : typeof failure.message === 'string' ? failure.message : JSON.stringify(failure);
+    return `The AI service answered with an error: ${said}`;
+  }
+  return data?.choices?.[0]?.finish_reason === 'length' || data?.stop_reason === 'max_tokens' ? LIMIT_SPENT_THINKING : null;
 }
 
 async function tryEagerLlmUnload(modelId: string): Promise<void> {
@@ -920,8 +968,9 @@ async function chat(
         `[AI] oaiy-local ${model} (${result.backend}): ${result.promptTokens} prompt → ${result.generatedTokens} new tokens` +
           (hasImages ? ` [+${imagePaths.length} image(s) via mmproj]` : ''),
       );
+      const answer = answerOf(result.text);
       ctx.onNodeStatus?.(nodeId, 'completed');
-      return stripThinkTags(result.text);
+      return answer;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       ctx.log('error', `[AI] oaiy-local chat failed: ${msg}`);
@@ -1400,7 +1449,7 @@ async function chat(
       // Same think-tag strip as the cloud path — Claude-as-AI relays
       // through this branch and a downstream Reasoner-style fallback
       // shouldn't leak its scratchpad either.
-      const cleaned = stripThinkTags(externalResponse);
+      const cleaned = answerOf(externalResponse);
 
       // Stream the response if callback available
       if (ctx.onStreamToken && streaming) {
@@ -1472,21 +1521,34 @@ async function chat(
         content = responseText;
       } else if (typeof customResponsePath === 'string' && customResponsePath.trim() !== '') {
         const extracted = extractJsonPath(data, customResponsePath);
-        content = typeof extracted === 'string'
-          ? extracted
-          : (extracted === null || extracted === undefined ? JSON.stringify(data) : JSON.stringify(extracted));
+        if (extracted === null || extracted === undefined) {
+          throw new Error(whyNoAnswer(data) ?? `The response has nothing at ${customResponsePath}.`);
+        }
+        content = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
       } else {
-        // Custom template, no explicit path — try common shapes, else raw JSON.
-        content = data?.choices?.[0]?.message?.content ?? data?.response ?? data?.text ?? JSON.stringify(data);
+        // Custom template, no explicit path — try common shapes, else raw JSON: an endpoint's shape of its own, for the
+        // flow to read. Not an error body, or an OpenAI reply with no choice in it.
+        const shaped = data?.choices?.[0]?.message?.content ?? data?.response ?? data?.text;
+        if ((shaped === null || shaped === undefined) && (errorIn(data) || Array.isArray(data?.choices))) {
+          throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
+        }
+        content = shaped ?? JSON.stringify(data);
+      }
+      // (a template's endpoint may answer with nothing, as long as the reply does not say it was cut off or failed)
+      if (jsonOk && content === '') {
+        const why = whyNoAnswer(data);
+        if (why) throw new Error(why);
       }
     } else if (isAnthropic) {
       // (every text block, in order: the answer can come in several, after a thinking block that has no text)
       const texts: string[] = Array.isArray(data?.content)
         ? data.content.filter((b: { type?: unknown; text?: unknown }) => b?.type === 'text' && typeof b.text === 'string').map((b: { text: string }) => b.text)
         : [];
-      content = texts.join('') || JSON.stringify(data);
+      content = texts.join('');
+      if (!content || errorIn(data)) throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
     } else {
-      content = data.choices?.[0]?.message?.content || data.response || JSON.stringify(data);
+      content = data?.choices?.[0]?.message?.content || data?.response;
+      if (!content || errorIn(data)) throw new Error(whyNoAnswer(data) ?? NO_MESSAGE);
     }
 
     ctx.log('info', `[AI] Response received (${content.length} chars)`);
@@ -1496,7 +1558,8 @@ async function chat(
     // cousins all interleave scratchpad reasoning that should never
     // reach the user-facing output. Cloud + local paths both go through
     // this so the behaviour is provider-agnostic.
-    const cleaned = stripThinkTags(content);
+    const cleaned = answerOf(content);
+    if (!cleaned && !useCustomTemplate) throw new Error(NO_MESSAGE);
 
     // Stream the response if callback available
     if (ctx.onStreamToken && streaming) {
@@ -1517,7 +1580,7 @@ async function chat(
       return '__ABORT__';
     }
 
-    const userMessage = getUserFriendlyError(errMsg, 'AI chat');
+    const userMessage = getUserFriendlyError(errMsg, 'AI chat', endpoint);
     ctx.log('error', `[AI] ${userMessage}`);
     throw new Error(userMessage);
   }
@@ -1785,7 +1848,7 @@ async function request(
       return '__ABORT__';
     }
 
-    const userMessage = getUserFriendlyError(errMsg, 'custom request');
+    const userMessage = getUserFriendlyError(errMsg, 'custom request', endpoint);
     ctx.log('error', `[AI] ${userMessage}`);
     throw new Error(userMessage);
   }

@@ -240,11 +240,34 @@ export function resolvePath(p: string): string {
 
 const SECRETS_FILE = path.join(DATA_DIR, 'secrets.json');
 
-function readSecretsFile(): Record<string, string> {
+/**
+ * A store an older CLI left readable by others is narrowed as it is read, where it is this account's: only `storeSecret`
+ * makes a private one, and an install that is already set up may never store again. By the handle it reads, so what is
+ * narrowed is what holds the secrets. (Windows has no such modes, and no uid: nothing happens there.)
+ */
+function narrow(file: number): void {
   try {
-    return JSON.parse(fs.readFileSync(SECRETS_FILE, 'utf-8')) as Record<string, string>;
+    const { uid, mode } = fs.fstatSync(file);
+    if (uid === process.getuid?.() && mode & 0o077) fs.fchmodSync(file, 0o600);
+  } catch {
+    // (a file that cannot be narrowed can still be read: a read-only disk, a folder of another kind)
+  }
+}
+
+function readSecretsFile(): Record<string, string> {
+  let file: number;
+  try {
+    file = fs.openSync(SECRETS_FILE, 'r');
   } catch {
     return {};
+  }
+  try {
+    narrow(file);
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, string>;
+  } catch {
+    return {};
+  } finally {
+    fs.closeSync(file);
   }
 }
 

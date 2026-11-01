@@ -268,11 +268,17 @@ oaiy worker --backend http://localhost:8080 --flow <hash_edit> --once   # one ru
 Drive the same service/model/Python management the desktop dashboard does, from
 the CLI — install AI services, create Python venvs, download models, all against
 a running `oaiy-server` (`OAIY_SERVER_URL`, default `http://127.0.0.1:17972`).
-Privileged ops (install / define / delete) need the server's bearer token in
-`OAIY_SERVER_TOKEN`. To drive the **OAIY Desktop** (not just a headless
-`oaiy-server`) this way, launch OAIY Desktop with `OAIY_SERVER_TOKEN` set and use
-the same value here — OAIY Desktop accepts the token *and* still serves its own
-webview, so the GUI keeps working.
+Give it a token in `OAIY_SERVER_TOKEN`; a refused command prints the server's own
+code and message. Privileged ops (install / define / delete) need more than a
+server's own token on a server built with `--features web`, the build the releases
+ship: it reads as the `cli` preset, and they answer
+`403 insufficient_scope: This credential does not hold …`. Run `oaiy-server auth
+init`, then `oaiy-server auth token create --preset cli-admin` (a 24-hour token that
+adds them), and use that token here. On a server built without `web` the server's
+token reaches them. To drive the **OAIY Desktop** (not just a headless `oaiy-server`)
+this way, launch OAIY Desktop with `OAIY_SERVER_TOKEN` set and use the same value
+here — OAIY Desktop accepts the token *and* still serves its own webview, so the GUI
+keeps working.
 
 ```bash
 oaiy python install                         # install the portable Python runtime

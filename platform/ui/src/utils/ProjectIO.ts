@@ -63,15 +63,38 @@ export const looksLikeSecret = (value: unknown): boolean => {
 };
 
 /**
+ * A node's fields that hold a secret by their name: these names, whole, in any case. `maxTokens`, a memory node's `key`
+ * and `apiKeyConstant` (the name of a constant, which an imported flow needs to find its key) only sound like them, and
+ * matched as parts of a name they went from every export with no word said.
+ */
+const SENSITIVE_FIELDS = [
+  'apikey', 'apitoken', 'authtoken', 'accesstoken', 'bearertoken', 'clientsecret', 'secretkey', 'privatekey',
+  'password', 'token', 'secret', 'credential', 'credentials', 'auth', 'authorization',
+];
+
+/**
+ * Inside an object a node holds (its Custom Headers) the names are no schema's, and `X-Api-Key` or `Authorization` are
+ * all there is to go on: a name with one of these in it goes.
+ */
+const SENSITIVE_NAME_PARTS = ['password', 'token', 'secret', 'key', 'credential', 'auth'];
+
+/**
+ * A field that should name a constant and holds something else: a key pasted there, of whatever shape. A constant's name
+ * is as Settings makes it (`OPENAI_API_KEY`), and no longer than the runtime takes a name to be (`resolveApiKey`).
+ */
+const holdsLiteralKey = (field: string, value: string): boolean =>
+  field.endsWith('Constant') && !/^[A-Z0-9_]{0,40}$/.test(value);
+
+/**
  * Sanitize node data by removing sensitive fields and secret-looking values.
  * Accepts schema-defined secret fields from node definitions.
  */
 export const sanitizeNodeData = (
   data: Record<string, unknown>,
   knownSecrets: Set<string>,
-  schemaSecretFields?: Set<string>
+  schemaSecretFields?: Set<string>,
+  nested = false
 ): Record<string, unknown> => {
-  const sensitiveFields = ['apiKey', 'password', 'token', 'secret', 'key', 'credential', 'auth'];
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(data)) {
@@ -84,18 +107,19 @@ export const sanitizeNodeData = (
     }
 
     // Skip fields with sensitive names (case-insensitive)
-    if (sensitiveFields.some(sf => key.toLowerCase().includes(sf))) {
+    const name = key.toLowerCase();
+    if (nested ? SENSITIVE_NAME_PARTS.some(part => name.includes(part)) : SENSITIVE_FIELDS.includes(name)) {
       continue;
     }
 
     // Skip values that look like secrets
-    if (typeof value === 'string' && (looksLikeSecret(value) || knownSecrets.has(value))) {
+    if (typeof value === 'string' && (looksLikeSecret(value) || knownSecrets.has(value) || holdsLiteralKey(key, value))) {
       continue;
     }
 
     // Recursively sanitize nested objects
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      result[key] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, schemaSecretFields);
+      result[key] = sanitizeNodeData(value as Record<string, unknown>, knownSecrets, schemaSecretFields, true);
     } else if (typeof value === 'string') {
       // Scrub a secret embedded MID-STRING — e.g. a literal key pasted inside the
       // ai_llm endpoint / customHeaders / customBodyTemplate (`{"Authorization":
