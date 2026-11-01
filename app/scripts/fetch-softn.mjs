@@ -20,9 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { installBridge } from './softn-bridge/install.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.30';
+const RELEASE = 'v0.0.31';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '0e1ae643706ac4898b5505ea58f403637c2cef2be20994393f8419a98e2a939d';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '6630e099b01850fc0fed915c724380f7a32c4dffb2de1cfd74628f44a22ec443';
 const PREFIX = 'hosted-runtime/';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -50,7 +50,7 @@ async function main() {
     zip = readFileSync(join(process.env.SOFTN_RELEASE_DIR, ZIP));
   } else {
     const url = `https://github.com/f2i-com/softn.com/releases/download/${RELEASE}/${ZIP}`;
-    console.log(`fetching ${url} (about 47 MB) ...`);
+    console.log(`fetching ${url} (about 40 MB) ...`);
     const response = await fetch(url, { redirect: 'follow' });
     if (!response.ok) throw new Error(`GET ${url}: HTTP ${response.status}`);
     zip = new Uint8Array(await response.arrayBuffer());
