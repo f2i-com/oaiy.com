@@ -32,6 +32,11 @@ const NATURAL: [usize; 80] = [
 
 const FAST_BITS: u32 = 9;
 
+/// The most scans a file may have. A progressive file has ten or so (libjpeg's own script), an optimizer's a few dozen,
+/// and each walks every MCU of the frame even with no data left to read: ten bytes of SOS over and over held a request's
+/// thread for hours, on a file that libjpeg would have read to its end.
+const MAX_SCANS: usize = 100;
+
 /// A DHT table, decoded the way libjpeg's `jpeg_huff_decode` does, with a
 /// lookup for codes of up to [`FAST_BITS`] bits.
 #[derive(Clone)]
@@ -322,6 +327,9 @@ pub fn decode(data: &[u8]) -> Result<Image> {
                 }
             }
             0xDA => {
+                if scans == MAX_SCANS {
+                    return Err(bad(format!("more than {MAX_SCANS} scans")));
+                }
                 let f = frame.as_mut().ok_or_else(|| bad("scan before frame"))?;
                 let scan = read_scan(seg, f)?;
                 for &(ci, _, _) in &scan.comps {
@@ -360,7 +368,7 @@ fn read_frame(s: &[u8], progressive: bool) -> Result<Frame> {
         return Err(Error::Unsupported("jpeg: height defined by DNL".into()));
     }
     if width == 0 || width * height > MAX_PIXELS {
-        return Err(bad(format!("image size {width}x{height}")));
+        return Err(bad(format!("image size {width}x{height} (at most {MAX_PIXELS} pixels are read)")));
     }
     if !matches!(n, 1 | 3 | 4) || s.len() < 6 + 3 * n {
         return Err(Error::Unsupported(format!("jpeg: {n} components")));

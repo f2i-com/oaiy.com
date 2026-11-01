@@ -18,6 +18,8 @@
 //!   reference's tensors are bf16
 
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use oaiy_engine::{Error, Result};
 use oaiy_image::Image;
@@ -170,6 +172,57 @@ pub fn prepare(img: &Image, cfg: &VisionConfig) -> Prepared {
 /// Decode (PNG or JPEG) and [`prepare`] an encoded image.
 pub fn load_image(bytes: &[u8], cfg: &VisionConfig) -> Result<Prepared> {
     Ok(prepare(&oaiy_image::decode(bytes)?, cfg))
+}
+
+/// Pictures decoded at once: at [`oaiy_image::MAX_PIXELS`] one takes the better part of a gigabyte and seconds of a core,
+/// on a request's thread, before there is a job to queue, and a failed allocation aborts the server. 128 connections
+/// must not all do that together.
+const DECODING: usize = 2;
+/// How long a picture waits for its turn, past which its request is told the server is busy.
+const TURN_WAIT: Duration = Duration::from_secs(60);
+
+/// A count of turns, waited for.
+struct Turns {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+/// A turn taken from [`Turns`], given back when dropped.
+pub struct Turn<'a>(&'a Turns);
+
+static TURNS: Turns = Turns::new(DECODING);
+
+impl Turns {
+    const fn new(n: usize) -> Turns {
+        Turns { free: Mutex::new(n), freed: Condvar::new() }
+    }
+
+    /// A turn, waited for up to `within`; none if none came free by then.
+    fn take(&self, within: Duration) -> Option<Turn<'_>> {
+        let until = Instant::now() + within;
+        let mut free = self.free.lock().unwrap_or_else(|p| p.into_inner());
+        while *free == 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            free = self.freed.wait_timeout(free, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        *free -= 1;
+        Some(Turn(self))
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// A turn at decoding a picture from a request (hold it across [`load_image`]); none if the server stayed too busy.
+pub fn decoding_turn() -> Option<Turn<'static>> {
+    TURNS.take(TURN_WAIT)
 }
 
 /// The bytes of an image record (the reference `load_image_bytes`): `data`
@@ -694,6 +747,23 @@ pub fn from_bf16_bits(x: &[u16]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_waits_its_turn_and_gives_up_on_one_that_does_not_come() {
+        let turns = Turns::new(2);
+        let (first, second) = (turns.take(Duration::ZERO).expect("free"), turns.take(Duration::ZERO).expect("free"));
+        assert!(turns.take(Duration::from_millis(20)).is_none(), "both are held");
+        drop(first);
+        let third = turns.take(Duration::ZERO).expect("one came free");
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| turns.take(Duration::from_secs(10)).is_some());
+            std::thread::sleep(Duration::from_millis(20));
+            drop(second);
+            assert!(waiting.join().unwrap(), "a turn given back wakes one waiting");
+        });
+        drop(third);
+        assert_eq!(*turns.free.lock().unwrap(), 2, "all given back");
+    }
 
     #[test]
     fn erf_matches_known_values() {

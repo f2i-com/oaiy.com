@@ -26,9 +26,11 @@
 pub mod bpe;
 pub mod byte_encoder;
 pub mod error;
+pub mod literal;
 pub mod pretokenizer;
 pub mod spm;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -107,6 +109,30 @@ pub struct Tokenizer {
     ///
     /// Sorted by length descending — see [`Tokenizer::special_tokens`].
     special_tokens: Vec<(String, u32)>,
+
+    /// The spellings a message's text may not write ([`Tokenizer::literal`]), and those tokens by id. Control tokens:
+    /// a USER_DEFINED token is written to be matched in text, as llama.cpp's `parse_special = false` keeps matching it
+    /// (Gemma's newlines and HTML tags, Qwen3's `<think>`), but for one that is a chat marker ([`chat_marker`]).
+    control: literal::Spellings,
+    control_ids: Vec<bool>,
+}
+
+/// Whether an added token is a chat marker, whatever its type says: the test llama.cpp's converter makes for tokens
+/// marked "not special" that ought to be (`<|…|>`, `<｜…｜>`), each side alone for Gemma 4's `<|turn>` and `<turn|>`, and
+/// Gemma's own two. A vocabulary's turn markers are what a stranger's text must not spell, and a converter or a
+/// checkpoint that left one USER_DEFINED must not leave the door open.
+fn chat_marker(s: &str) -> bool {
+    s.starts_with("<|") || s.ends_with("|>") || s.starts_with("<｜") || s.ends_with("｜>") || matches!(s, "<start_of_turn>" | "<end_of_turn>")
+}
+
+/// The [`Tokenizer`] fields for the `control` tokens among `n` ids.
+fn control_tokens<'a>(n: usize, control: impl Iterator<Item = (&'a str, u32)>) -> (literal::Spellings, Vec<bool>) {
+    let (mut spellings, mut ids) = (literal::Spellings::default(), vec![false; n]);
+    for (s, id) in control {
+        spellings.insert(s);
+        ids[id as usize] = true;
+    }
+    (spellings, ids)
 }
 
 impl Tokenizer {
@@ -118,10 +144,12 @@ impl Tokenizer {
         }
         let token_to_id=tokens.iter().enumerate().map(|(i,t)|(t.clone(),i as u32)).collect();
         let merges_rank=merges.into_iter().enumerate().map(|(i,m)|(m,i as u32)).collect();
-        let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).collect();
+        let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).filter(|t|!t.0.is_empty()).collect();
         special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
+        // (a checkpoint's added tokens are all here, `special` or not, so their spelling is all there is to go on)
+        let (control,control_ids)=control_tokens(tokens.len(),special_tokens.iter().filter(|t|chat_marker(&t.0)).map(|t|(t.0.as_str(),t.1)));
         Ok(Self{qwen3_pre:true,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,space_first_only:false,spm_by_merge_rank:false,token_types:None,
-            merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens})
+            merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens,control,control_ids})
     }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let model_name = gguf.get_str("tokenizer.ggml.model").unwrap_or("llama");
@@ -197,6 +225,13 @@ impl Tokenizer {
         // Longest-first so prefix-matching the wrong (shorter) token doesn't
         // win when a longer special is also a prefix.
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let (control, control_ids) = control_tokens(
+            tokens.len(),
+            special_tokens
+                .iter()
+                .filter(|(s, id)| token_types.as_ref().is_some_and(|t| t[*id as usize] == 3) || chat_marker(s))
+                .map(|(s, id)| (s.as_str(), *id)),
+        );
 
         // (a Qwen GGUF's own pre-tokenizer, `tokenizer.ggml.pre` qwen2 or qwen35: its letters with their marks, its
         // digits one by one and NFC first, as its Hugging Face tokenizer has them; Llama's splitter otherwise)
@@ -219,6 +254,8 @@ impl Tokenizer {
             unk,
             pad,
             special_tokens,
+            control,
+            control_ids,
         })
     }
 
@@ -240,8 +277,15 @@ impl Tokenizer {
         self.token_to_id.get(s).copied()
     }
 
+    /// `text` as a message's words inside a prompt: what it spells of this vocabulary's control tokens stays text when
+    /// the prompt is encoded, and reads as what was written ([`literal`]). `keep` is a spelling to leave whole.
+    pub fn literal<'a>(&self, text: &'a str, keep: Option<&str>) -> Cow<'a, str> {
+        literal::mark(text, keep, |bytes| self.control.opens(bytes))
+    }
+
     /// Encode `text` into token ids. If `add_bos` and a BOS token is defined,
-    /// it's prepended.
+    /// it's prepended. Special tokens are matched wherever they are spelled;
+    /// text from anyone but the caller goes through [`Self::literal`] first.
     pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
         if add_bos {
@@ -270,6 +314,13 @@ impl Tokenizer {
 
     pub(crate) fn id_of(&self, s: &str) -> Option<u32> {
         self.token_to_id.get(s).copied()
+    }
+
+    /// Whether `id` is a token plain text never gives: [`Self::literal`]'s, for the encoders' merging, which must not
+    /// put back together a piece by piece what the specials pass let through. (A spelling that is not marked never gets
+    /// that far: it was cut out as a special.)
+    pub(crate) fn is_control(&self, id: u32) -> bool {
+        self.control_ids.get(id as usize).copied().unwrap_or(false)
     }
 
     /// Special tokens (CONTROL/USER_DEFINED), sorted longest-first.

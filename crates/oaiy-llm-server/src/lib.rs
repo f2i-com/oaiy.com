@@ -321,7 +321,8 @@ impl Options {
     }
 }
 
-/// Connections served at once (each is a thread); one more is answered 503 and closed.
+/// Connections served at once (each is a thread). Past them a few for a probe's one request
+/// ([`oaiy_engine::http::PROBE_SLOTS`]); one more is answered 503 and closed.
 const MAX_CONNECTIONS: usize = 128;
 
 /// A connection counted in a total until it is dropped (its thread ended, or never started).
@@ -501,20 +502,20 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
                 };
                 pause = Duration::from_millis(5);
                 let counted = Counted(Arc::clone(&open));
-                if open.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+                let Some(probe_only) = oaiy_engine::http::slot(open.fetch_add(1, Ordering::Relaxed), MAX_CONNECTIONS) else {
                     drop(counted);
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                     let body = br#"{"error":{"message":"too many connections: try again shortly","type":"server_error","code":"busy"}}"#;
                     let _ = oaiy_engine::http::respond(&mut stream, 503, "application/json", body, false);
                     continue;
-                }
+                };
                 let server = Arc::clone(&server);
                 let requests = Arc::clone(&requests);
                 let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_default();
                 // (a thread that cannot start drops its connection with it, rather than taking the accept loop down)
                 let started = std::thread::Builder::new().name("request".into()).spawn(move || {
                     let _counted = counted;
-                    oaiy_engine::http::serve_gated(stream, |req| server.gate(req), |req, w| {
+                    oaiy_engine::http::serve_gated(stream, |req| server.gate(req, probe_only), |req, w| {
                         let t = Instant::now();
                         requests.active.fetch_add(1, Ordering::Relaxed);
                         let underway = Underway(&requests);
@@ -527,7 +528,7 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oa
                         if request_log && req.path != "/health" && !private {
                             eprintln!("{peer} {} {} ({:.1}s)", req.method, req.path, t.elapsed().as_secs_f64());
                         }
-                        keep
+                        keep.map(|keep| keep && !probe_only)
                     });
                 });
                 if let (Err(e), false) = (started, silent) {

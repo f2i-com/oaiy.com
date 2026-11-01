@@ -46,17 +46,22 @@ impl TensorBytes for GgufSource {
     }
 
     fn read_range(&self, data_offset: u64, dst: &mut [u8]) -> Result<()> {
-        let start = self.0.tensor_data_start() + data_offset;
-        let end = start + dst.len() as u64;
-        let file_len = self.0.raw_len() as u64;
-        if end > file_len {
-            return Err(GgufError::Truncated {
-                offset: file_len,
-                needed: end - file_len,
-            });
-        }
+        let start = self.0.tensor_data_start().saturating_add(data_offset);
+        within(start, dst.len() as u64, self.0.raw_len() as u64)?;
         dst.copy_from_slice(self.0.raw_slice(start as usize, dst.len()));
         Ok(())
+    }
+}
+
+/// `Truncated` unless `len` bytes at `start` are all in a file of `file_len` bytes. Both may come from a file, and added
+/// unchecked they wrap and pass; a `start` that overflowed saturates, which is past any file.
+fn within(start: u64, len: u64, file_len: u64) -> Result<()> {
+    match start.checked_add(len) {
+        Some(end) if end <= file_len => Ok(()),
+        end => Err(GgufError::Truncated {
+            offset: file_len,
+            needed: end.unwrap_or(u64::MAX).saturating_sub(file_len),
+        }),
     }
 }
 
@@ -83,13 +88,7 @@ impl FileSource {
     }
 
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
-        let end = offset + dst.len() as u64;
-        if end > self.len {
-            return Err(GgufError::Truncated {
-                offset: self.len,
-                needed: end - self.len,
-            });
-        }
+        within(offset, dst.len() as u64, self.len)?;
         read_exact_at(&self.file, dst, offset)?;
         Ok(())
     }
@@ -97,13 +96,18 @@ impl FileSource {
 
 impl TensorBytes for FileSource {
     fn read_tensor(&self, info: &TensorInfo) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; info.nbytes() as usize];
-        self.read_at(self.data_start + info.offset, &mut out)?;
+        // Checked before the buffer exists: a bad tensor's size would otherwise be the abort of a failed allocation,
+        // not the error this gives.
+        let offset = self.data_start.saturating_add(info.offset);
+        let len = info.checked_nbytes().unwrap_or(u64::MAX);
+        within(offset, len, self.len)?;
+        let mut out = vec![0u8; len as usize];
+        self.read_at(offset, &mut out)?;
         Ok(out)
     }
 
     fn read_range(&self, data_offset: u64, dst: &mut [u8]) -> Result<()> {
-        self.read_at(self.data_start + data_offset, dst)
+        self.read_at(self.data_start.saturating_add(data_offset), dst)
     }
 }
 

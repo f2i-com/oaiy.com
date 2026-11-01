@@ -24,9 +24,11 @@ pub mod resize;
 
 use oaiy_engine::{Error, Result};
 
-/// Pillow's decompression-bomb limit (twice `Image.MAX_IMAGE_PIXELS`, past
-/// which it refuses to open an image).
-pub const MAX_PIXELS: usize = 178_956_970;
+/// The most pixels a file may say it has. Pillow's decompression-bomb limit was here (twice `Image.MAX_IMAGE_PIXELS`,
+/// 178,956,970), but this is a decoder a request reaches, and a 200-byte JPEG at that size asks for 2.7 GB, while a
+/// vision tower shrinks whatever it gets to a few megapixels. This is near what a camera makes; past it a picture is
+/// refused on its header, before anything is reserved for it.
+pub const MAX_PIXELS: usize = 64_000_000;
 
 /// An 8-bit RGB image, rows top to bottom, pixels packed `rgbrgb…`.
 #[derive(Clone, Debug, PartialEq, Eq)]

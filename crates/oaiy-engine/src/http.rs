@@ -290,8 +290,9 @@ pub fn read_request(r: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Res
 }
 
 /// [`read_request`], `gate` asked about the request's head (its body still empty) before a `100 Continue` is sent or
-/// a byte of the body read. The socket's read timeout waits for the request to begin (the idle time between requests);
-/// once it has, the rest has [`HEAD_WITHIN`] and its body's time at [`BODY_RATE`], and the timeout is as it was after.
+/// a byte of the body read. The socket's read timeout waits for the request to begin (the idle time between requests, or
+/// [`FIRST_BYTE`] on a new connection); once it has, the rest has [`HEAD_WITHIN`] and its body's time at [`BODY_RATE`],
+/// and the timeout is as it was after.
 fn read_gated(r: &mut BufReader<TcpStream>, writer: &mut TcpStream, gate: &mut dyn FnMut(&Request) -> Option<Refusal>) -> Result<Request, ReadError> {
     if r.fill_buf()?.is_empty() {
         return Err(ReadError::Closed);
@@ -460,6 +461,21 @@ impl<'a> Stream<'a> {
 const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
 const WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a new connection may say nothing. Every server here counts its connections before anything can be asked of
+/// them (a gate needs a head, and [`HEAD_WITHIN`] starts at the first byte), so a client with no key that opened them
+/// and sent nothing held each slot for [`IDLE`], and the server's limit was everyone else's 503.
+const FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connections a server takes past its limit for a probe, each for one request: those holding the rest would otherwise
+/// have a supervisor whose probe went unanswered start it again in the middle of its work.
+pub const PROBE_SLOTS: usize = 4;
+
+/// What a connection that finds `open` others is let do, on a server of `limit`: anything (`Some(false)`), one
+/// probe's request (`Some(true)`, the [`PROBE_SLOTS`] past the limit), or nothing (`None`).
+pub fn slot(open: usize, limit: usize) -> Option<bool> {
+    (open < limit + PROBE_SLOTS).then_some(open >= limit)
+}
+
 /// Serve one connection: read requests and hand each to `handle` until the
 /// client closes or asks to. `handle` returns whether the connection may be
 /// kept open.
@@ -475,13 +491,15 @@ pub fn serve_gated(
     mut handle: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
 ) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(IDLE));
+    let _ = stream.set_read_timeout(Some(FIRST_BYTE));
     let _ = stream.set_write_timeout(Some(WRITE_STALL));
     let Ok(mut writer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
     loop {
         match read_gated(&mut reader, &mut writer, &mut gate) {
             Ok(req) => {
+                // (a client's now, that may keep it for its next request)
+                let _ = reader.get_ref().set_read_timeout(Some(IDLE));
                 let keep = req.keep_alive();
                 match handle(&req, &mut writer) {
                     Ok(true) if keep => continue,
@@ -761,6 +779,61 @@ mod tests {
         assert_eq!(status(loopback_gate(Some("k2"), true, &keyed, &[])), Some(401));
         assert_eq!(status(loopback_gate(Some(""), true, &req("GET", "/x", &[("Host", "127.0.0.1")]), &[])), None, "an empty key is none");
         assert!(!key_matches(Some("Basic k"), "k") && !key_matches(None, "k") && key_matches(Some(" Bearer  k "), "k"));
+    }
+
+    /// A connection that said nothing held its slot for [`IDLE`], before any gate could look at it: 128 of them, opened
+    /// again as they closed, were a server that told everyone else 503.
+    #[test]
+    fn a_connection_that_never_speaks_is_let_go_soon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = TcpStream::connect(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            serve(stream, |_, _| Ok(true));
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(20)).expect("the connection is still held");
+    }
+
+    /// The wait for a first byte is a first request's alone: a client's connection, kept for its next, has [`IDLE`].
+    #[test]
+    fn a_connection_that_has_spoken_waits_out_longer_silences_between_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve(stream, |_, w| respond(w, 200, "text/plain", b"ok", true).map(|_| true));
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ask = || {
+            c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let (mut got, mut buf) = (Vec::new(), [0u8; 256]);
+            while !got.ends_with(b"\r\n\r\nok") {
+                let n = c.read(&mut buf).expect("an answer");
+                assert!(n > 0, "closed: {:?}", String::from_utf8_lossy(&got));
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert!(got.starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&got));
+        };
+        ask();
+        std::thread::sleep(FIRST_BYTE + Duration::from_secs(1));
+        ask();
+        drop(c);
+        server.join().unwrap();
+    }
+
+    /// Past the limit a few connections are still taken, for one request each, for a probe's sake: connections holding
+    /// the rest must not make a supervisor think the server has died.
+    #[test]
+    fn a_connection_past_the_limit_is_for_a_probe_and_past_the_slots_is_refused() {
+        assert_eq!(slot(0, 10), Some(false));
+        assert_eq!(slot(9, 10), Some(false));
+        assert_eq!(slot(10, 10), Some(true), "the first slot past the limit");
+        assert_eq!(slot(10 + PROBE_SLOTS - 1, 10), Some(true), "the last");
+        assert_eq!(slot(10 + PROBE_SLOTS, 10), None);
     }
 
     #[test]

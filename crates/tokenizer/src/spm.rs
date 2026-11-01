@@ -23,6 +23,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::error::{Result, TokenizerError};
+use crate::literal;
 use crate::Tokenizer;
 
 const SPM_SPACE: char = '▁';
@@ -39,6 +40,10 @@ pub fn encode(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
                 prev_special = true;
             }
             Frag::Text(piece) => {
+                let piece = literal::unmark(piece);
+                if piece.is_empty() {
+                    continue;
+                }
                 let mut escaped = String::with_capacity(piece.len() + 3);
                 if tok.add_space_prefix() && prev_special && (n == 0 || !tok.space_first_only()) {
                     escaped.push(SPM_SPACE);
@@ -174,7 +179,8 @@ fn merge(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
             let pair = (text[l.start..l.start + l.len].to_string(), text[r.start..r.start + r.len].to_string());
             tok.merges_rank().get(&pair).map(|&rank| -(rank as f32))
         } else {
-            tok.id_of(&text[l.start..l.start + len]).map(score)
+            // (a pair merges into any piece of the vocabulary, and `<`, `s`, `>` would make `<s>` of a message's text)
+            tok.id_of(&text[l.start..l.start + len]).filter(|&id| !tok.is_control(id)).map(score)
         };
         if let Some(score) = priority {
             heap.push(Bigram { score, left, right, len });

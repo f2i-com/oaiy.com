@@ -261,10 +261,17 @@ fn gate(key: Option<&str>, loopback: bool, req: &Request) -> Option<Refusal> {
     }
 }
 
+/// What a connection past the limit is for ([`oaiy_engine::http::slot`]): a host's look at `/health`, which is how it
+/// tells a server that is busy from one to start again. All else is told it is busy.
+fn past_the_limit(req: &Request) -> Option<Refusal> {
+    let probe = req.method == "GET" && matches!(req.route(), "/health" | "/");
+    (!probe).then(|| Refusal::new(503, "too many connections: try again shortly", "busy"))
+}
+
 impl Server {
-    /// [`gate`]'s answer for this server.
-    pub fn gate(&self, req: &Request) -> Option<Refusal> {
-        gate(self.api_key.as_deref(), self.loopback, req)
+    /// [`gate`]'s answer for this server, on a connection that is or is not one for a probe alone.
+    pub fn gate(&self, req: &Request, probe_only: bool) -> Option<Refusal> {
+        gate(self.api_key.as_deref(), self.loopback, req).or_else(|| if probe_only { past_the_limit(req) } else { None })
     }
 
     /// One request; returns whether the connection may stay open.
@@ -505,7 +512,9 @@ impl Server {
         let mut hashes = Vec::with_capacity(records.len());
         for (i, rec) in records.iter().enumerate() {
             let bytes = vision::image_bytes(rec, self.local_images).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
+            let turn = vision::decoding_turn().ok_or_else(|| ApiError { status: 503, message: "the server is busy decoding other pictures: try again shortly".into(), code: "busy" })?;
             let prep = vision::load_image(&bytes, vc).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
+            drop(turn);
             let mut h = std::hash::DefaultHasher::new();
             std::hash::Hasher::write(&mut h, &bytes);
             hashes.push(std::hash::Hasher::finish(&h));
@@ -1313,6 +1322,16 @@ mod gate_tests {
         assert!(gate(Some("k"), true, &keyed).is_none());
         assert!(gate(Some("k"), true, &preflight).is_none());
         assert!(gate(Some("k"), true, &req("GET", "/health", &[])).is_none());
+    }
+
+    #[test]
+    fn a_connection_past_the_limit_is_for_a_look_at_health_alone() {
+        for probe in [req("GET", "/health", &[]), req("GET", "/health?x=1", &[]), req("GET", "/", &[])] {
+            assert!(past_the_limit(&probe).is_none(), "{}", probe.path);
+        }
+        for other in [req("POST", "/v1/chat/completions", &[]), req("GET", "/v1/models", &[]), req("POST", "/health", &[])] {
+            assert_eq!(past_the_limit(&other).map(|r| r.status), Some(503), "{} {}", other.method, other.path);
+        }
     }
 }
 

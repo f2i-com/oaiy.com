@@ -51,6 +51,9 @@ pub enum GgufError {
     #[error("tensor `{name}` has unsupported {n_dims} dimensions (max 4)")]
     TooManyDims { name: String, n_dims: u32 },
 
+    #[error("tensor `{name}` has a shape too large to hold: {shape:?}")]
+    TensorSize { name: String, shape: Vec<u64> },
+
     #[error("tensor `{name}` length not a multiple of block size {block} (numel = {numel})")]
     NotBlockAligned {
         name: String,

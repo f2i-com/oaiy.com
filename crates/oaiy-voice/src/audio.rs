@@ -232,7 +232,8 @@ fn linear(x: &[f32], from: usize, to: usize) -> Vec<f32> {
 /// `data:...;base64,` URL is accepted too.
 pub fn decode_base64_field(value: &str) -> Result<Vec<u8>, String> {
     let v = value.trim();
-    let payload = if v.len() >= 5 && v[..5].eq_ignore_ascii_case("data:") {
+    // (as bytes: the field is whatever a client sent, and its fifth byte may be inside a character)
+    let payload = if v.as_bytes().get(..5).is_some_and(|b| b.eq_ignore_ascii_case(b"data:")) {
         let comma = v.find(',').ok_or("data URL has no comma")?;
         if !v[..comma].to_ascii_lowercase().contains(";base64") {
             return Err("data URL is not base64".into());
@@ -455,6 +456,15 @@ mod tests {
         assert!(decode_base64_field("aGk=aGk=").is_err());
         assert!(decode_base64_field("a").is_err());
         assert!(decode_base64_field("data:audio/wav,abc").is_err());
+    }
+
+    /// Five bytes in is inside a character here, and slicing a `str` there panics: the connection's thread ended with
+    /// no answer.
+    #[test]
+    fn a_character_across_the_end_of_the_data_prefix_is_bad_base64_not_a_panic() {
+        assert!(decode_base64_field("aaaa€").is_err());
+        assert!(decode_base64_field("日本").is_err());
+        assert_eq!(decode_base64_field("DATA:audio/wav;BASE64,aGk=").unwrap(), b"hi", "the prefix in any case");
     }
 
     #[test]

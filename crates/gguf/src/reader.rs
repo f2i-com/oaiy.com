@@ -99,17 +99,20 @@ impl GgufFile {
         // Safety: GGUF files we read are not concurrently mutated.
         let mmap = unsafe { Mmap::map(&file)? };
         if !streaming {
-            return parse(Backing::Mmap(mmap));
+            return parse(Backing::Mmap(mmap), Bodies::Here);
         }
         // Streaming: keep only the header resident and serve bodies by
         // positioned reads. Each shard gets its own source, whose offsets are
         // relative to that shard own data start.
-        let probe = parse(Backing::Mmap(mmap))?;
+        let probe = parse(Backing::Mmap(mmap), Bodies::Here)?;
         let start = probe.tensor_data_start;
-        let header = probe.backing.as_slice()[..start as usize].to_vec();
+        // (past the end of a file that stops at its table, or whose alignment is larger than it is: parse has held every
+        // tensor to the file, so such a file has no bytes of body to lose)
+        let bytes = probe.backing.as_slice();
+        let header = bytes[..start.min(bytes.len() as u64) as usize].to_vec();
         drop(probe);
         let source = crate::source::FileSource::open(path, start)?;
-        let mut inner = parse(Backing::Bytes(header))?;
+        let mut inner = parse(Backing::Bytes(header), Bodies::Elsewhere)?;
         inner.source = Some(Arc::new(source));
         Ok(inner)
     }
@@ -184,7 +187,7 @@ impl GgufFile {
         header_bytes: Vec<u8>,
         source: Arc<dyn TensorBytes>,
     ) -> Result<Self> {
-        let mut inner = parse(Backing::Bytes(header_bytes))?;
+        let mut inner = parse(Backing::Bytes(header_bytes), Bodies::Elsewhere)?;
         inner.source = Some(source);
         Ok(Self { inner: Arc::new(inner) })
     }
@@ -302,7 +305,7 @@ impl GgufFile {
     }
 
     fn from_backing(backing: Backing) -> Result<Self> {
-        let inner = parse(backing)?;
+        let inner = parse(backing, Bodies::Here)?;
         Ok(Self { inner: Arc::new(inner) })
     }
 
@@ -416,16 +419,33 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
 
+    /// `n` is compared with what is left, not added to `pos`: a length comes from the file, and one near the top of the
+    /// address space wraps past the end and passes.
     #[inline]
     fn ensure(&self, n: usize) -> Result<()> {
-        if self.pos + n > self.bytes.len() {
+        let left = self.bytes.len() - self.pos;
+        if n > left {
             Err(GgufError::Truncated {
                 offset: self.pos as u64,
-                needed: (self.pos + n - self.bytes.len()) as u64,
+                needed: (n - left) as u64,
             })
         } else {
             Ok(())
         }
+    }
+
+    /// A count from the file, of things that each take `each` bytes at the least, checked against what is left of it.
+    /// Call before reserving for them: `Vec::with_capacity` with a count no file could hold does not fail with an
+    /// error, it aborts the process.
+    fn ensure_count(&self, count: u64, each: usize) -> Result<usize> {
+        let left = self.bytes.len() - self.pos;
+        if count > (left / each) as u64 {
+            return Err(GgufError::Truncated {
+                offset: self.pos as u64,
+                needed: count.saturating_mul(each as u64).saturating_sub(left as u64),
+            });
+        }
+        Ok(count as usize)
     }
 
     #[inline]
@@ -482,8 +502,8 @@ impl<'a> Cursor<'a> {
     fn read_bool(&mut self) -> Result<bool> { Ok(self.read_u8()? != 0) }
 
     fn read_string(&mut self) -> Result<String> {
-        let len = self.read_u64()? as usize;
-        self.ensure(len)?;
+        let len = self.read_u64()?;
+        let len = self.ensure_count(len, 1)?;
         let s = String::from_utf8(self.bytes[self.pos..self.pos + len].to_vec())?;
         self.pos += len;
         Ok(s)
@@ -509,7 +529,15 @@ impl<'a> Cursor<'a> {
 
     fn read_array(&mut self, key: &str) -> Result<Array> {
         let elem_ty = ValueType::from_u32(self.read_u32()?)?;
-        let len = self.read_u64()? as usize;
+        let len = self.read_u64()?;
+        // The fewest bytes one element takes (a string's, its length alone; a nested array is refused below).
+        let each = match elem_ty {
+            ValueType::U8 | ValueType::I8 | ValueType::Bool | ValueType::Array => 1,
+            ValueType::U16 | ValueType::I16 => 2,
+            ValueType::U32 | ValueType::I32 | ValueType::F32 => 4,
+            ValueType::U64 | ValueType::I64 | ValueType::F64 | ValueType::String => 8,
+        };
+        let len = self.ensure_count(len, each)?;
 
         macro_rules! collect {
             ($variant:ident, $reader:ident) => {{
@@ -541,7 +569,19 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn parse(backing: Backing) -> Result<GgufInner> {
+/// Where a file's tensor bodies are, so whether [`parse`] can hold its tensors to them.
+#[derive(Clone, Copy, PartialEq)]
+enum Bodies {
+    /// In the backing, after the header: a whole file.
+    Here,
+    /// Behind a source, the backing being the header alone (which a streaming open has checked as a whole file first).
+    Elsewhere,
+}
+
+/// The fewest bytes a tensor's entry in the table takes: a name's length, `n_dims`, the dtype and the offset.
+const SMALLEST_TENSOR_ENTRY: usize = 8 + 4 + 4 + 8;
+
+fn parse(backing: Backing, bodies: Bodies) -> Result<GgufInner> {
     let bytes = backing.as_slice();
     let mut c = Cursor::new(bytes);
 
@@ -574,7 +614,7 @@ fn parse(backing: Backing) -> Result<GgufInner> {
     };
 
     // Tensor info table.
-    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    let mut tensors = Vec::with_capacity(c.ensure_count(tensor_count, SMALLEST_TENSOR_ENTRY)?);
     let mut tensors_by_name = BTreeMap::new();
     for i in 0..tensor_count {
         let name = c.read_string()?;
@@ -589,24 +629,48 @@ fn parse(backing: Backing) -> Result<GgufInner> {
         let dtype = GgmlType::from_u32(c.read_u32()?)?;
         let offset = c.read_u64()?;
 
+        // A shape's size must be a number: callers take `shape` as real, and one whose product wrapped (or a zero
+        // dimension among others no tensor could have) sized their buffers by it.
+        let info = TensorInfo { name, shape, dtype, offset };
+        let numel = match info.checked_nbytes() {
+            Some(_) => info.numel(),
+            None => return Err(GgufError::TensorSize { name: info.name, shape: info.shape }),
+        };
+
         // Verify block alignment.
-        let numel: u64 = shape.iter().product();
         let block = dtype.block_size();
         if block > 1 && numel % (block as u64) != 0 {
             return Err(GgufError::NotBlockAligned {
-                name: name.clone(),
+                name: info.name,
                 block,
                 numel,
             });
         }
 
-        tensors_by_name.insert(name.clone(), i as usize);
-        tensors.push(TensorInfo { name, shape, dtype, offset });
+        tensors_by_name.insert(info.name.clone(), i as usize);
+        tensors.push(info);
     }
 
     // Pad to alignment.
     let unaligned = c.pos as u64;
     let tensor_data_start = align_up(unaligned, alignment);
+
+    // Every tensor inside the file: what this says here is what makes `tensor_data` and the other accessors that slice
+    // an invariant. Mappings are lazy, so a file cut short used to load and then panic in whichever kernel first
+    // touched the missing tensor, in the middle of a request. (A split file comes here a shard at a time, each against
+    // its own file.)
+    if bodies == Bodies::Here {
+        let file_len = bytes.len() as u64;
+        for t in &tensors {
+            let end = t.checked_nbytes().and_then(|n| t.offset.checked_add(n)).and_then(|n| n.checked_add(tensor_data_start));
+            if end.is_none_or(|end| end > file_len) {
+                return Err(GgufError::Truncated {
+                    offset: file_len,
+                    needed: end.unwrap_or(u64::MAX).saturating_sub(file_len),
+                });
+            }
+        }
+    }
 
     // a freshly parsed file is one shard, so every tensor is 0.
     let tensor_shard = vec![0u32; tensors.len()];
@@ -693,7 +757,6 @@ pub fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
 
 #[inline]
 fn align_up(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two() || align != 0);
     if align == 0 { return value; }
     let r = value % align;
     if r == 0 { value } else { value + (align - r) }
@@ -1072,5 +1135,221 @@ mod tests {
         let bytes = make_simple_gguf();
         let f = GgufFile::from_bytes(bytes).unwrap();
         assert_eq!(f.tensor_data_start() % f.alignment(), 0);
+    }
+
+    // crafted files: what a count, a length, an offset or a shape says is only a claim.
+
+    /// A file's first bytes: magic, version 3, and its counts of tensors and of metadata keys.
+    fn head(tensors: u64, keys: u64) -> Vec<u8> {
+        let mut out = GGUF_MAGIC.to_le_bytes().to_vec();
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&tensors.to_le_bytes());
+        out.extend_from_slice(&keys.to_le_bytes());
+        out
+    }
+
+    /// A tensor's entry in the table, as a file writes it.
+    fn entry(out: &mut Vec<u8>, name: &str, shape: &[u64], dtype: GgmlType, offset: u64) {
+        write_string(out, name);
+        out.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for d in shape {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out.extend_from_slice(&(dtype as u32).to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    /// A metadata key that is an array of `ty` claiming `len` elements, and none of them there.
+    fn claimed_array(ty: ValueType, len: u64) -> Vec<u8> {
+        let mut out = head(0, 1);
+        write_string(&mut out, "last.key");
+        out.extend_from_slice(&(ValueType::Array as u32).to_le_bytes());
+        out.extend_from_slice(&(ty as u32).to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn truncated(got: Result<GgufFile>, what: &str) {
+        assert!(matches!(got, Err(GgufError::Truncated { .. })), "{what}: {:?}", got.map(|_| "parsed"));
+    }
+
+    /// `Vec::with_capacity` of 2^40 bytes aborts the process, and of 2^61 `u64`s panics: the claim is compared with what
+    /// is left of the file before anything is reserved.
+    #[test]
+    fn an_array_longer_than_the_file_is_refused_before_it_is_reserved() {
+        truncated(GgufFile::from_bytes(claimed_array(ValueType::U8, 1 << 40)), "u8");
+        truncated(GgufFile::from_bytes(claimed_array(ValueType::String, 1 << 40)), "string");
+        truncated(GgufFile::from_bytes(claimed_array(ValueType::U64, 1 << 61)), "u64");
+        truncated(GgufFile::from_bytes(claimed_array(ValueType::U32, u64::MAX)), "u32");
+    }
+
+    /// Every element of a string array takes eight bytes at the least, its length: a list that could fit no more is
+    /// refused as a whole, and one that fits is read.
+    #[test]
+    fn an_array_that_fits_the_file_is_still_read() {
+        let mut bytes = claimed_array(ValueType::U16, 2);
+        bytes.extend_from_slice(&[1, 0, 2, 0]);
+        let f = GgufFile::from_bytes(bytes).expect("two u16s are there");
+        assert!(matches!(f.get("last.key").unwrap().as_array(), Some(Array::U16(v)) if v == &vec![1, 2]));
+        truncated(GgufFile::from_bytes(claimed_array(ValueType::U16, 1)), "a u16 with no bytes");
+        let f = GgufFile::from_bytes(claimed_array(ValueType::F64, 0)).expect("an empty array asks for nothing");
+        assert_eq!(f.get("last.key").unwrap().as_array().map(Array::len), Some(0));
+    }
+
+    #[test]
+    fn a_tensor_count_past_the_file_is_refused_before_it_is_reserved() {
+        truncated(GgufFile::from_bytes(head(1 << 36, 0)), "2^36 tensors");
+        truncated(GgufFile::from_bytes(head(u64::MAX, 0)), "u64::MAX tensors");
+    }
+
+    /// `pos + n` wrapped past the end of the address space, so a length near `u64::MAX` passed the check and the slice
+    /// after it panicked.
+    #[test]
+    fn a_string_length_near_the_top_of_u64_is_truncated_not_a_panic() {
+        let mut bytes = head(0, 1);
+        bytes.extend_from_slice(&(u64::MAX - 7).to_le_bytes());
+        bytes.extend_from_slice(b"not that long");
+        truncated(GgufFile::from_bytes(bytes), "a key");
+    }
+
+    /// One F32 tensor at `offset`, `body` after the padding.
+    fn one_tensor(shape: &[u64], offset: u64, body: &[u8]) -> Vec<u8> {
+        let mut out = head(1, 0);
+        entry(&mut out, "t", shape, GgmlType::F32, offset);
+        out.resize(align_up(out.len() as u64, DEFAULT_ALIGNMENT) as usize, 0);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Nothing compared a tensor with the file, so a file cut short loaded and then panicked in the first kernel to
+    /// touch that tensor, in the middle of a request.
+    #[test]
+    fn a_tensor_past_the_end_of_the_file_is_refused_at_open() {
+        assert_eq!(GgufFile::from_bytes(one_tensor(&[2], 0, &[0; 8])).unwrap().tensors().len(), 1, "a whole tensor");
+        assert_eq!(GgufFile::from_bytes(one_tensor(&[2], 4, &[0; 12])).unwrap().tensors().len(), 1, "one that ends the file");
+        truncated(GgufFile::from_bytes(one_tensor(&[2], 0, &[0; 7])), "a byte short");
+        truncated(GgufFile::from_bytes(one_tensor(&[2], 4, &[0; 8])), "an offset past its room");
+        truncated(GgufFile::from_bytes(one_tensor(&[2], 1 << 40, &[0; 8])), "an offset past the file");
+        truncated(GgufFile::from_bytes(one_tensor(&[2], u64::MAX - 3, &[0; 8])), "an offset that wraps");
+        truncated(GgufFile::from_bytes(one_tensor(&[1 << 40], 0, &[0; 8])), "a shape past the file");
+    }
+
+    /// A shape's product wrapped: `[2^33, 2^33]` was a tensor of no bytes that every caller took for sixteen billion
+    /// billion elements.
+    #[test]
+    fn a_shape_whose_size_does_not_fit_is_refused() {
+        for shape in [&[1u64 << 33, 1 << 33][..], &[1 << 62, 4], &[1 << 63, 0, 1 << 63], &[u64::MAX, u64::MAX, u64::MAX, u64::MAX]] {
+            let got = GgufFile::from_bytes(one_tensor(shape, 0, &[0; 8]));
+            assert!(matches!(got, Err(GgufError::TensorSize { .. })), "{shape:?}: {:?}", got.map(|_| "parsed"));
+        }
+        assert_eq!(GgufFile::from_bytes(one_tensor(&[0, 3], 0, &[])).unwrap().tensors()[0].nbytes(), 0, "an empty tensor is one");
+    }
+
+    #[test]
+    fn a_zero_alignment_is_no_alignment() {
+        let mut md = BTreeMap::new();
+        md.insert("general.alignment".to_string(), Value::U32(0));
+        let bytes = write_to_vec(&md, &[], 1).unwrap();
+        let len = bytes.len() as u64;
+        assert_eq!(GgufFile::from_bytes(bytes).unwrap().tensor_data_start(), len);
+    }
+
+    /// A scratch folder of this test's, gone when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("gguf_{name}_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            Scratch(dir)
+        }
+
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A streaming open kept `..tensor_data_start` of the file, a start that may lie past its end: a file that stops at
+    /// its table, or whose `general.alignment` is larger than it is.
+    #[test]
+    fn a_streaming_open_keeps_the_header_a_file_has() {
+        let dir = Scratch::new("streaming_header");
+        let mut key = BTreeMap::new();
+        key.insert("general.architecture".to_string(), Value::String("llama".into()));
+        let no_padding = write_to_vec(&key, &[], 1).unwrap();
+        assert_ne!(no_padding.len() % DEFAULT_ALIGNMENT as usize, 0, "a table that padding would have followed");
+        let f = GgufFile::open_streaming(dir.file("no-padding.gguf", &no_padding)).expect("no tensors, no padding");
+        assert_eq!(f.architecture().unwrap(), "llama");
+
+        key.insert("general.alignment".to_string(), Value::U64(1 << 40));
+        let f = GgufFile::open_streaming(dir.file("alignment.gguf", &write_to_vec(&key, &[], 1).unwrap())).expect("an alignment past the end");
+        assert_eq!(f.tensors().len(), 0);
+
+        let mut cut = head(1, 0);
+        entry(&mut cut, "t", &[2], GgmlType::F32, 0);
+        truncated(GgufFile::open_streaming(dir.file("cut.gguf", &cut)), "streaming, a tensor with no body");
+        truncated(GgufFile::open(dir.file("cut2.gguf", &cut)), "mapped, a tensor with no body");
+        let mut empty = head(1, 0);
+        entry(&mut empty, "t", &[0], GgmlType::F32, 0);
+        truncated(GgufFile::open(dir.file("empty.gguf", &empty)), "a tensor whose data section is past the end");
+    }
+
+    #[test]
+    fn a_bad_tensor_is_refused_by_a_streaming_open_too() {
+        let dir = Scratch::new("streaming_tensor");
+        truncated(GgufFile::open_streaming(dir.file("short.gguf", &one_tensor(&[2], 0, &[0; 7]))), "a byte short");
+        truncated(GgufFile::open_streaming(dir.file("far.gguf", &one_tensor(&[2], 1 << 40, &[0; 8]))), "an offset past the file");
+    }
+
+    /// Each shard is held to its own file, the second as much as the first.
+    #[test]
+    fn a_later_shard_cut_short_is_refused() {
+        let dir = Scratch::new("split_short");
+        let shard = |no: u16, name: &str| {
+            let mut md = BTreeMap::new();
+            md.insert("split.no".to_string(), Value::U16(no));
+            md.insert("split.count".to_string(), Value::U16(2));
+            let t = TensorInfo { name: name.into(), shape: vec![4], dtype: GgmlType::F32, offset: 0 };
+            write_to_vec(&md, &[(t, vec![0u8; 16])], 32).unwrap()
+        };
+        let first = dir.file("m-00001-of-00002.gguf", &shard(0, "a"));
+        let mut second = shard(1, "b");
+        second.truncate(second.len() - 1);
+        dir.file("m-00002-of-00002.gguf", &second);
+        truncated(GgufFile::open(&first), "mapped");
+        truncated(GgufFile::open_streaming(&first), "streaming");
+    }
+
+    /// A bad tensor's bytes were allocated before they were checked: the abort of a count past the file, not the
+    /// `Truncated` two lines on.
+    #[test]
+    fn a_source_refuses_a_read_past_the_file_before_allocating_it() {
+        use crate::source::FileSource;
+        let dir = Scratch::new("source_read");
+        let src = FileSource::open(dir.file("body.bin", &[7u8; 64]), 32).unwrap();
+        let huge = TensorInfo { name: "t".into(), shape: vec![1 << 42], dtype: GgmlType::F32, offset: 0 };
+        assert!(matches!(src.read_tensor(&huge), Err(GgufError::Truncated { .. })));
+        let wrapped = TensorInfo { name: "t".into(), shape: vec![1 << 33, 1 << 33], dtype: GgmlType::F32, offset: 0 };
+        assert!(matches!(src.read_tensor(&wrapped), Err(GgufError::Truncated { .. })));
+        let far = TensorInfo { name: "t".into(), shape: vec![2], dtype: GgmlType::F32, offset: u64::MAX - 3 };
+        assert!(matches!(src.read_tensor(&far), Err(GgufError::Truncated { .. })));
+        assert!(matches!(src.read_range(u64::MAX - 3, &mut [0u8; 8]), Err(GgufError::Truncated { .. })));
+        let fits = TensorInfo { name: "t".into(), shape: vec![2], dtype: GgmlType::F32, offset: 24 };
+        assert_eq!(src.read_tensor(&fits).unwrap(), vec![7u8; 8]);
+    }
+
+    #[test]
+    fn a_mapped_source_refuses_a_range_that_wraps() {
+        use crate::source::GgufSource;
+        let src = GgufSource(GgufFile::from_bytes(make_simple_gguf()).unwrap());
+        assert!(matches!(src.read_range(u64::MAX - 3, &mut [0u8; 8]), Err(GgufError::Truncated { .. })));
     }
 }

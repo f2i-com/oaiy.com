@@ -110,7 +110,10 @@ pub fn chat_prompt(msgs: &[Json], opts: &Options) -> Result<Encoded, String> {
             if let (true, Some(t)) = (keep, thinking) {
                 prompt.push_str(&format!("<think>{t}</think>"));
             }
-            let content = match content.rsplit_once("</think>") {
+            // (the second as a message's text comes here, where this vocabulary's `</think>` is a control token: its
+            // reasoning goes all the same, what is left of the answer still held to being text)
+            let close = format!("<{}/think>", tokenizer::literal::MARK);
+            let content = match content.rsplit_once("</think>").or_else(|| content.rsplit_once(&close)) {
                 Some((_, answer)) if !keep => answer.trim().to_owned(),
                 _ => content,
             };

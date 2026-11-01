@@ -157,6 +157,8 @@ impl Observer {
     }
     fn evaluate_input<T>(&mut self, context: &str, draft: &str, cancel: &AtomicBool, instructions: &str, parse: fn(&str)->Result<T>, deadline: Instant) -> Result<T> {
         let input = Json::obj([("context", Json::str(context)), ("draft", Json::str(draft))]).to_json();
+        // (the conversation and the draft are evidence a stranger may have written: its words, not this review's turns)
+        let input = self.model.tokenizer().literal(&input, None).into_owned();
         let mut prompt = crate::llm::apply_chat_template(&self.model.config().arch,
             &[ChatMessage::system(instructions.to_owned()), ChatMessage::user(input)], true);
         // Qwen gets a small, explicit reasoning phase. Other architectures retain

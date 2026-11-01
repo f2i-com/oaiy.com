@@ -309,6 +309,13 @@ impl Tokenizer {
         String::from_utf8_lossy(&b).into_owned()
     }
 
+    /// `text` as a message's words inside a prompt: what it spells of the added tokens stays text when the prompt is
+    /// encoded ([`tokenizer::literal`]). All of them: in this format's prompts every one is the template's to write.
+    /// `keep` is a spelling to leave whole.
+    pub fn literal<'a>(&self, text: &'a str, keep: Option<&str>) -> std::borrow::Cow<'a, str> {
+        tokenizer::literal::mark(text, keep, |bytes| self.raw_added.longest(bytes).is_some() || self.normalized_added.longest(bytes).is_some())
+    }
+
     /// Token ids for `text`. No BOS is added: the chat encoding writes it
     /// out as text.
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -322,14 +329,14 @@ impl Tokenizer {
             }
         }
         let mut out = Vec::with_capacity(text.len() / 3);
-        let mut pieces = Vec::new();
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         for span in spans {
             match span {
                 Span::Token(id) => out.push(id),
                 Span::Text(t) => {
-                    pieces.clear();
-                    pretokenize(t, &mut pieces);
+                    let t = tokenizer::literal::unmark(t);
+                    let mut pieces = Vec::new();
+                    pretokenize(&t, &mut pieces);
                     for &p in &pieces {
                         if let Some(ids) = cache.get(p) {
                             out.extend_from_slice(ids);

@@ -83,8 +83,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
                 if body[10] != 0 || body[11] != 0 || body[12] > 1 {
                     return Err(bad("unknown compression, filter or interlace method"));
                 }
-                if h.width == 0 || h.height == 0 || h.width * h.height > MAX_PIXELS {
-                    return Err(bad(format!("image size {}x{}", h.width, h.height)));
+                if h.width == 0 || h.height == 0 || h.width.saturating_mul(h.height) > MAX_PIXELS {
+                    return Err(bad(format!("image size {}x{} (at most {MAX_PIXELS} pixels are read)", h.width, h.height)));
                 }
                 hdr = Some(h);
             }

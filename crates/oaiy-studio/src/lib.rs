@@ -626,8 +626,15 @@ fn listen(host: &str, port: u16, what: &str) -> Result<(TcpListener, Option<Stri
     Err(format!("{what}: cannot listen on {host}:{port} ({first}), nor on any other port"))
 }
 
-/// Connections served at once on each listener (each is a thread); one more is answered 503 and closed.
+/// Connections served at once on each listener (each is a thread). Past them a few for a probe's one request
+/// ([`oaiy_engine::http::PROBE_SLOTS`]); one more is answered 503 and closed.
 const MAX_CONNECTIONS: usize = 128;
+
+/// Whether a request is what a connection past the limit is kept for: on the control port a second launch looking for
+/// this one ([`running_at`]), on the gateway its health check.
+fn probe(req: &oaiy_engine::http::Request, admin: bool) -> bool {
+    req.method == "GET" && req.route() == if admin { "/api/state" } else { "/health" }
+}
 
 /// A connection counted in a total until it is dropped (its thread ended, or never started).
 struct Counted(Arc<std::sync::atomic::AtomicUsize>);
@@ -668,13 +675,13 @@ fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
             };
             pause = Duration::from_millis(5);
             let counted = Counted(Arc::clone(&open));
-            if open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTIONS {
+            let busy = || util::error_json("too many connections: try again shortly", "server_error", "busy").to_json();
+            let Some(probe_only) = oaiy_engine::http::slot(open.fetch_add(1, std::sync::atomic::Ordering::SeqCst), MAX_CONNECTIONS) else {
                 drop(counted);
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                let body = util::error_json("too many connections: try again shortly", "server_error", "busy").to_json();
-                let _ = oaiy_engine::http::respond(&mut stream, 503, "application/json", body.as_bytes(), false);
+                let _ = oaiy_engine::http::respond(&mut stream, 503, "application/json", busy().as_bytes(), false);
                 continue;
-            }
+            };
             // (who is at the other end, for the control port: this computer's own clients connect over loopback)
             let peer_loopback = stream.peer_addr().is_ok_and(|a| a.ip().to_canonical().is_loopback());
             let studio = Arc::clone(&studio);
@@ -688,13 +695,12 @@ fn serve(listener: TcpListener, studio: Arc<Studio>, admin: bool) {
                         if studio.closed() {
                             return Some(oaiy_engine::http::Refusal { status: 503, body: util::error_json("the studio has stopped", "server_error", "stopped").to_json() });
                         }
-                        if admin { admin::gate(&studio, req, port, peer_loopback) } else { gateway_gate(&studio, req) }
+                        let refused = if admin { admin::gate(&studio, req, port, peer_loopback) } else { gateway_gate(&studio, req) };
+                        refused.or_else(|| (probe_only && !probe(req, admin)).then(|| oaiy_engine::http::Refusal { status: 503, body: busy() }))
                     },
                     |req, w| {
-                        if admin {
-                            return admin::handle(&studio, req, w);
-                        }
-                        public(&studio, req, w)
+                        let keep = if admin { admin::handle(&studio, req, w) } else { public(&studio, req, w) }?;
+                        Ok(keep && !probe_only)
                     },
                 );
             });
@@ -1363,6 +1369,83 @@ mod tests {
         assert!(ask(&mut idle).contains(" 503 "), "the old one's connection is still the old one's, and refused");
         assert!(!second.studio.closed() && !second.studio.media.closed());
         second.studio.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener full of connections that say nothing still answers a second launch looking for this one, and the
+    /// gateway's health check, a request each; anything else past the limit is told it is busy, and past the slots kept
+    /// for them so is everyone.
+    #[test]
+    fn a_full_listener_still_answers_a_probe() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // (both held until both are known: one let go at once can be given out again as the other)
+        let free = || TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (a, b) = (free(), free());
+        let (ui, gw) = (a.local_addr().unwrap().port(), b.local_addr().unwrap().port());
+        drop((a, b));
+        let mut cfg = config::default_json();
+        for (section, port) in [("ui", ui), ("gateway", gw)] {
+            let mut s = cfg.get(section).cloned().unwrap();
+            util::set(&mut s, "port", Json::Int(port as i64));
+            util::set(&mut cfg, section, s);
+        }
+        // (nothing real is started: names no program has)
+        let mut media = cfg.get("media").cloned().unwrap();
+        util::set(&mut media, "worker", Json::str("no-such-worker-here"));
+        util::set(&mut cfg, "media", media);
+        let mut llm = cfg.get("llm").cloned().unwrap();
+        util::set(&mut llm, "server", Json::str(dir.join("no-such-llm-server").to_string_lossy()));
+        util::set(&mut llm, "server_webgpu", Json::str(dir.join("no-such-llm-server").to_string_lossy()));
+        util::set(&mut cfg, "llm", llm);
+        let path = dir.join(config::FILE_NAME);
+        config::save(&path, &cfg).unwrap();
+        let args = Args { config: path, open: Some("none".into()), ui_port: None, port: None, start_llm: false };
+        let running = launch(&args, true).unwrap();
+        // (a byte each, a head that never ends: it holds its slot for a head's time, where nothing at all would be let go
+        // while a slow machine is still at this test)
+        let silent = |port: u16, n: usize| {
+            let open = |_| {
+                let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                c.write_all(b"G").unwrap();
+                c
+            };
+            (0..n).map(open).collect::<Vec<_>>()
+        };
+        let ask = |port: u16, request: &str| -> String {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "{request}\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+            let (mut got, mut buf) = (Vec::new(), [0u8; 8192]);
+            // (to the connection's end: a probe's is closed after its answer)
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&got).to_string()
+        };
+        // (the slots first: a probe answered goes on counting for a moment after, and would leave one of them free)
+        let (held, more) = (silent(ui, MAX_CONNECTIONS), silent(ui, oaiy_engine::http::PROBE_SLOTS));
+        assert!(ask(ui, "GET /api/state HTTP/1.1").contains("too many connections"), "past the slots");
+        drop(more);
+        assert!((0..500).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            ask(ui, "GET /api/state HTTP/1.1").contains(" 200 ")
+        }), "a slot given back");
+        assert!(running_instance(&args).is_some(), "a second launch finds this one");
+        assert!(ask(ui, "POST /api/state HTTP/1.1").contains(" 503 "), "a probe's slot is for a probe");
+        assert!(ask(ui, "GET / HTTP/1.1").contains(" 503 "));
+        drop(held);
+
+        let held = silent(gw, MAX_CONNECTIONS);
+        assert!(!ask(gw, "GET /health HTTP/1.1").contains("too many connections"));
+        assert!(ask(gw, "POST /v1/chat/completions HTTP/1.1").contains("too many connections"));
+        drop(held);
+        running.studio.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
