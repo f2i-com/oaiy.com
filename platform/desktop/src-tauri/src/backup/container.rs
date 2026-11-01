@@ -335,7 +335,7 @@ pub(crate) fn verify_zip(plain: &Path, limits: &Limits, budget: &Budget) -> Resu
     }
     let manifest: Manifest = {
         let entry = archive.by_index(0).map_err(|_| damaged())?;
-        if entry.name() != MANIFEST_NAME || entry.is_dir() {
+        if entry.name().map_err(|_| damaged())? != MANIFEST_NAME || entry.is_dir() {
             return Err(BackupError::new(ErrorKind::Damaged, "This backup does not start with its record."));
         }
         if entry.size() > limits.max_manifest_bytes {
@@ -358,7 +358,7 @@ pub(crate) fn verify_zip(plain: &Path, limits: &Limits, budget: &Budget) -> Resu
         if entry.is_dir() {
             return Err(BackupError::new(ErrorKind::Unsafe, "This backup is refused: it holds a folder entry."));
         }
-        let name = entry.name().to_string();
+        let name = entry.name().map_err(|_| damaged())?.into_owned();
         let Some(wanted) = expected.remove(name.as_str()) else {
             return Err(BackupError::new(ErrorKind::Unsafe, "This backup is refused: it holds an item its record does not list, or one twice."));
         };
@@ -408,7 +408,7 @@ pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) 
     for i in 1..archive.len() {
         budget.check()?;
         let entry = archive.by_index(i).map_err(|_| damaged())?;
-        let name = entry.name().to_string();
+        let name = entry.name().map_err(|_| damaged())?.into_owned();
         let Some(wanted) = listed.get(name.as_str()).copied() else {
             return Err(damaged());
         };

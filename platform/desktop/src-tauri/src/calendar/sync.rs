@@ -598,7 +598,7 @@ impl Api {
         let status = resp.status().as_u16();
         // Read before the body is: how long FormLogic asks to be left, on a 429.
         let asked = if status == 429 { crate::link::net::retry_after(resp.headers()) } else { None };
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = crate::link::net::read_json_up_to(resp, crate::link::net::MAX_LIST_BYTES).unwrap_or(Value::Null);
         match status {
             401 | 403 => Err(Failure::Refused(format!("FormLogic no longer accepts this desktop's key ({}): link it again", said(&body, status)))),
             429 => Err(Failure::Busy("FormLogic asked for fewer requests: syncing again shortly".into(), asked)),

@@ -403,7 +403,7 @@ fn fetch(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Vec<AppEntry>, 
         .map_err(|e| format!("could not reach the app-logic lane: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         let message = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -416,8 +416,7 @@ fn fetch(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Vec<AppEntry>, 
         }
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    let reply: Value = resp
-        .json()
+    let reply: Value = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
         .map_err(|e| format!("the app-logic lane returned an unreadable app list: {e}"))?;
     // A missing array is NOT an account with no apps: it is a reply this
     // descriptor does not describe, and treating the two the same would leave
@@ -1190,7 +1189,7 @@ fn submit(
         .send()
         .map_err(|e| Failed::unreachable("create the record", &e))?;
     let status = resp.status();
-    let payload: Value = resp.json().unwrap_or(Value::Null);
+    let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
     if status.as_u16() == 409 && payload.get("conflict").and_then(Value::as_bool) == Some(true) {
         // Made already, under this key, from values the script has since
         // built differently: the record is there.
@@ -1304,7 +1303,7 @@ fn update(
         .map_err(|e| Failed::unreachable("update the record", &e))?;
     let status = resp.status();
     if !status.is_success() {
-        let payload: Value = resp.json().unwrap_or(Value::Null);
+        let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         return Err(Failed::refused(
             status,
             format!("the provider refused the update to {id}: HTTP {}: {}", status.as_u16(), refusal(&payload)),
@@ -1340,7 +1339,7 @@ fn find_record(
         .send()
         .map_err(|e| Failed::unreachable("find the record", &e))?;
     let status = resp.status();
-    let payload: Value = resp.json().unwrap_or(Value::Null);
+    let payload: Value = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES).unwrap_or(Value::Null);
     if !status.is_success() {
         return Err(Failed::refused(
             status,

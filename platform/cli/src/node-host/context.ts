@@ -10,6 +10,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 /** Root for app data (databases, app-state). `OAIY_DATA_DIR` overrides. */
 export const DATA_DIR = path.resolve(
@@ -252,10 +253,29 @@ export function getSecret(key: string): string | undefined {
   return readSecretsFile()[key];
 }
 
+/**
+ * As the desktop's stores are written (`secret_file.rs`): to a new file beside the store, owner-only from the call that
+ * creates it (`wx` also refuses a name that is there, a planted link included), then renamed over it, so a crash leaves
+ * the old file or the new one, never half of either, which `readSecretsFile` would take for no secrets at all. A folder
+ * made for it is owner-only too; one that is there already is left as it is: `OAIY_DATA_DIR` can be the person's.
+ */
 export function storeSecret(key: string, value: string): void {
   const all = readSecretsFile();
   if (value) all[key] = value;
   else delete all[key];
-  ensureDir(DATA_DIR);
-  fs.writeFileSync(SECRETS_FILE, JSON.stringify(all, null, 2), 'utf-8');
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  const staging = `${SECRETS_FILE}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    const file = fs.openSync(staging, 'wx', 0o600);
+    try {
+      fs.writeFileSync(file, JSON.stringify(all, null, 2), 'utf-8');
+      fs.fsyncSync(file);
+    } finally {
+      fs.closeSync(file);
+    }
+    fs.renameSync(staging, SECRETS_FILE);
+  } catch (error) {
+    fs.rmSync(staging, { force: true });
+    throw error;
+  }
 }

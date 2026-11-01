@@ -274,7 +274,7 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
         .map_err(|e| format!("could not reach the flows lane: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         let message = body
             .get("message")
             .and_then(Value::as_str)
@@ -286,8 +286,7 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
         }
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    let reply: BindingsReply = resp
-        .json()
+    let reply: BindingsReply = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
         .map_err(|e| format!("the flows lane returned an unreadable binding list: {e}"))?;
     Ok(reply.bindings)
 }
@@ -582,7 +581,7 @@ pub fn reserve(
         .send()
         .map_err(|e| NotReserved { message: format!("could not reserve the run: {}", super::net::unreachable(&e)), later: true })?;
     let status = resp.status();
-    let payload: Value = resp.json().unwrap_or(Value::Null);
+    let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
     if !status.is_success() {
         let message = payload
             .get("message")

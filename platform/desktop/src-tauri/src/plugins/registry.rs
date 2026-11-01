@@ -518,6 +518,7 @@ impl PluginRegistry {
         // the record while the process lives would orphan a child we supervise.
         self.plugins
             .retain(|id, r| seen.contains(id) || r.state == PluginState::Running);
+        self.refuse_second_claimants(&mut report);
         // Records were rebuilt from manifests above, which resets user_disabled
         // to false — re-apply the user's persisted choice before anyone reads it.
         self.apply_disabled();
@@ -715,13 +716,61 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Which plugin serves `connector_id`?
+    /// Which plugin serves `connector_id`? The one called that, while one is installed, or a name a publisher is pinned
+    /// for: a plugin's connector carries its own name (every plugin there is declares one so, and the screens'
+    /// `PluginHost.command` assumes as much), so the name is taken even while that plugin could not load, and commands
+    /// meant for it (a text's body and number) go to nobody else. Otherwise the one plugin that declares it, and none if
+    /// two do: this used to be the first by id, which a plugin could win by its name.
     fn owner_of(&self, connector_id: &str) -> Option<&PluginRecord> {
-        self.plugins.values().find(|r| {
-            r.manifest
-                .as_ref()
-                .is_some_and(|m| m.connectors.iter().any(|c| c.id == connector_id))
+        let declares = |r: &&PluginRecord| r.manifest.as_ref().is_some_and(|m| m.connectors.iter().any(|c| c.id == connector_id));
+        if let Some(named) = self.plugins.get(connector_id) {
+            return Some(named).filter(declares);
+        }
+        if self.trust.is_pinned(connector_id) {
+            return None;
+        }
+        let mut claimants = self.plugins.values().filter(declares);
+        let first = claimants.next()?;
+        claimants.next().is_none().then_some(first)
+    }
+
+    /// Why `plugin` may not declare a connector `connector_id` (see [`Self::owner_of`]), if it may not.
+    fn claim_refused(&self, plugin: &str, connector_id: &str) -> Option<String> {
+        if connector_id == plugin {
+            return None;
+        }
+        if self.plugins.contains_key(connector_id) || self.trust.is_pinned(connector_id) {
+            return Some(format!("its connector {connector_id:?} belongs to the plugin of that name, so {plugin} is not loaded."));
+        }
+        let others: Vec<&str> = self
+            .plugins
+            .values()
+            .filter(|r| r.id != plugin && r.manifest.as_ref().is_some_and(|m| m.connectors.iter().any(|c| c.id == connector_id)))
+            .map(|r| r.id.as_str())
+            .collect();
+        (!others.is_empty()).then(|| {
+            format!("its connector {connector_id:?} is declared by {} too, and only one plugin can serve a connector, so {plugin} is not loaded until one is removed.", others.join(" and "))
         })
+    }
+
+    /// A plugin that declares a connector it may not have is listed as disabled with the reason, as a plugin with a bad
+    /// manifest is: its commands would go to another plugin, or nowhere, and it would not be told. Worked out from every
+    /// record at once, so who is refused does not depend on the order of their ids. A process that is up is left as it is,
+    /// as a scan leaves it: it gets no commands ([`Self::owner_of`]) and is refused when it next starts.
+    fn refuse_second_claimants(&mut self, report: &mut ScanReport) {
+        let refused: Vec<(String, PathBuf, String)> = self
+            .plugins
+            .values()
+            .filter(|r| !matches!(r.state, PluginState::Starting | PluginState::Running | PluginState::Unhealthy))
+            .filter_map(|r| {
+                let why = r.manifest.as_ref()?.connectors.iter().find_map(|c| self.claim_refused(&r.id, &c.id))?;
+                Some((r.id.clone(), r.dir.clone(), why))
+            })
+            .collect();
+        for (id, dir, why) in refused {
+            self.plugins.insert(id.clone(), PluginRecord::from_error(dir, id, &ManifestError::Invalid(why)));
+            report.invalid += 1;
+        }
     }
 
     /// The manifest of the plugin that serves `connector_id`: the one the gate
@@ -875,11 +924,123 @@ mod tests {
             "version": "0.1.0",
             "pluginApiVersion": 1,
             "entry": { "kind": "process", "command": "plugin.exe" },
-            "capabilities": ["flow.run", "connector.aokie.*"],
-            "connectors": [{ "id": "aokie", "commands": ["call.answer", "sms.send"] }],
-            "events": ["aokie.call.incoming"],
+            "capabilities": ["flow.run", format!("connector.{id}.*")],
+            "connectors": [{ "id": id, "commands": ["call.answer", "sms.send"] }],
+            "events": [format!("{}.call.incoming", id.replace('-', "_"))],
             "commands": { "journalled": ["sms.send"] }
         })
+    }
+
+    /// `id`, with a connector called `connector` instead of its own name.
+    fn claiming(id: &str, connector: &str) -> serde_json::Value {
+        let mut m = manifest(id);
+        m["capabilities"] = serde_json::json!(["flow.run", format!("connector.{connector}.*")]);
+        m["connectors"][0]["id"] = serde_json::json!(connector);
+        m
+    }
+
+    // --- whose a connector is ---------------------------------------------
+
+    /// `aaa` sorted before `aokie`, so it took every SMS body meant for the real one. A connector called after a plugin
+    /// is that plugin's, whichever sorts first, and the plugin that claims it is refused with the reason.
+    #[test]
+    fn a_connector_called_after_a_plugin_is_that_plugins_whatever_the_order_of_their_ids() {
+        for thief in ["aaa", "zzz"] {
+            let root = Root::new();
+            root.plugin("aokie", manifest("aokie"));
+            root.plugin(thief, claiming(thief, "aokie"));
+            let mut reg = PluginRegistry::new(root.path().to_path_buf());
+            let report = reg.scan();
+            assert_eq!(reg.manifest_for_connector("aokie").map(|m| m.id.as_str()), Some("aokie"), "{thief}");
+            assert_eq!(reg.gate("aokie", "call.answer", None).map(|r| r.id.as_str()).unwrap_err(), GateRefusal::ConnectorUnavailable {
+                connector_id: "aokie".into(), state: PluginState::Installed, reason: Some("Not started yet.".into()),
+            });
+            let refused = reg.get(thief).unwrap();
+            assert!(!refused.is_loadable(), "{thief}");
+            assert_eq!(refused.state, PluginState::Disabled, "{thief}");
+            let reason = refused.reason.as_deref().unwrap_or("");
+            assert!(reason.contains("\"aokie\"") && reason.contains("belongs to"), "{thief}: {reason}");
+            assert_eq!(report.invalid, 1, "{thief}");
+            // It stays refused scan after scan, and the real one is left as it was.
+            reg.scan();
+            assert!(!reg.get(thief).unwrap().is_loadable(), "{thief}");
+            assert!(reg.get("aokie").unwrap().is_loadable(), "{thief}");
+        }
+    }
+
+    /// The name of an installed plugin is taken even while that plugin could not load: a phone plugin in quarantine
+    /// does not hand its connector to whoever else declares it.
+    #[test]
+    fn a_plugin_that_cannot_load_keeps_its_connector_name() {
+        let root = Root::new();
+        let broken = root.path().join("aokie");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("manifest.json"), b"{ not json").unwrap();
+        root.plugin("aaa", claiming("aaa", "aokie"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        assert!(reg.manifest_for_connector("aokie").is_none(), "the commands meant for it go nowhere else");
+        assert!(!reg.get("aaa").unwrap().is_loadable());
+    }
+
+    /// Nobody's name, one claimant: a connector of its own choosing works as it always did.
+    #[test]
+    fn a_connector_only_one_plugin_declares_and_no_plugin_is_called_is_that_plugins() {
+        let root = Root::new();
+        root.plugin("acme-tools", claiming("acme-tools", "weather"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        assert_eq!(reg.manifest_for_connector("weather").map(|m| m.id.as_str()), Some("acme-tools"));
+        assert!(reg.get("acme-tools").unwrap().is_loadable());
+    }
+
+    /// Two claimants of a name neither has: nothing on disk says who came first, and the order of their ids must not
+    /// decide, so neither is given it and each is told about the other.
+    #[test]
+    fn two_plugins_claiming_a_name_neither_has_are_both_refused_with_the_other_named() {
+        let root = Root::new();
+        root.plugin("alpha", claiming("alpha", "weather"));
+        root.plugin("beta", claiming("beta", "weather"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        assert!(reg.manifest_for_connector("weather").is_none());
+        for (id, other) in [("alpha", "beta"), ("beta", "alpha")] {
+            let rec = reg.get(id).unwrap();
+            assert!(!rec.is_loadable(), "{id}");
+            let reason = rec.reason.as_deref().unwrap_or("");
+            assert!(reason.contains("\"weather\"") && reason.contains(other), "{id}: {reason}");
+        }
+    }
+
+    /// A name a publisher is pinned for is that publisher's plugin's, installed or not: a flow that calls the phone is
+    /// not to reach whatever else says it is the phone before Aokie is installed.
+    #[test]
+    fn a_connector_called_after_a_pinned_plugin_is_refused_while_that_plugin_is_away() {
+        use super::super::trust::tests::TestKey;
+        let key = TestKey::generate("fl-test-2026a");
+        let root = Root::new();
+        root.plugin("aaa", claiming("aaa", "aokie"));
+        let trust = TrustService::new(super::super::trust::TrustPolicy::developer(), key.pinned_for("Aokie", &["aokie"]), root.path().join("trusted-plugins.json"));
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust);
+        reg.scan();
+        assert!(reg.manifest_for_connector("aokie").is_none());
+        let reason = reg.get("aaa").unwrap().reason.clone().unwrap_or_default();
+        assert!(reason.contains("\"aokie\"") && reason.contains("belongs to"), "{reason}");
+    }
+
+    /// A running plugin is left running by a scan, whatever is installed beside it; it just is not who the commands go to.
+    #[test]
+    fn a_running_plugin_that_loses_its_connector_is_left_running_and_gets_no_more_commands() {
+        let root = Root::new();
+        root.plugin("aaa", claiming("aaa", "notes"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        reg.set_state("aaa", PluginState::Running, None);
+        assert_eq!(reg.manifest_for_connector("notes").map(|m| m.id.as_str()), Some("aaa"));
+        root.plugin("notes", manifest("notes"));
+        reg.scan();
+        assert_eq!(reg.get("aaa").unwrap().state, PluginState::Running);
+        assert_eq!(reg.manifest_for_connector("notes").map(|m| m.id.as_str()), Some("notes"));
     }
 
     // --- scanning ---------------------------------------------------------

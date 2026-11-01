@@ -152,6 +152,10 @@ pub struct PairingRequest {
     pub access: PairingAccess,
     pub status: PairingStatus,
     pub created_at_ms: u64,
+    /// When the person approved it: its requester has a full [`REQUEST_TTL_MS`] from then to
+    /// collect the token, however late in the request's own time that was.
+    #[serde(skip)]
+    pub approved_at_ms: Option<u64>,
     /// The minted token — only ever present in the approve response / poll to the
     /// requester, never in the pending-list shown to the UI.
     #[serde(skip)]
@@ -297,6 +301,7 @@ impl PairingManager {
             access,
             status: PairingStatus::Pending,
             created_at_ms: now_ms(),
+            approved_at_ms: None,
             token: None,
         };
         self.pending.push(req.clone());
@@ -345,6 +350,7 @@ impl PairingManager {
             secret: secret.clone(),
         };
         req.status = PairingStatus::Approved;
+        req.approved_at_ms = Some(now_ms());
         req.token = Some(secret);
         let out = req.clone();
         self.tokens.push(paired);
@@ -434,9 +440,11 @@ impl PairingManager {
                 r.token = None;
             }
         }
-        // Drop anything terminal AND old, so the list does not accrete.
+        // Drop anything terminal AND old, so the list does not accrete. An approved request's age is
+        // from its approval: one approved in its last moment would otherwise go at the next poll, with
+        // the token granted and listed and its app told it failed.
         self.pending
-            .retain(|r| r.status == PairingStatus::Pending || now.saturating_sub(r.created_at_ms) <= REQUEST_TTL_MS);
+            .retain(|r| r.status == PairingStatus::Pending || now.saturating_sub(r.approved_at_ms.unwrap_or(r.created_at_ms)) <= REQUEST_TTL_MS);
     }
 
     /// The file holds every granted token in the clear, so it is written owner-only
@@ -810,6 +818,21 @@ mod tests {
             assert!(m.poll(id).unwrap().token.is_some(), "{id} can still be collected");
         }
         assert!(m.deny(&approved[0]).is_err(), "an approved request is not denied after the fact (its grant is revoked instead)");
+    }
+
+    /// Approved at 4 minutes 59 of a request's five, and swept a moment later by its age from when it was raised: the app
+    /// polled 404, and showed as failed, with a token granted that it never received.
+    #[test]
+    fn a_request_approved_late_stays_a_full_ttl_for_its_token_to_be_collected() {
+        let mut m = PairingManager::new();
+        let id = m.request("late", None, None).pairing_id;
+        m.pending[0].created_at_ms -= REQUEST_TTL_MS - 1_000;
+        m.approve(&id).unwrap();
+        m.pending[0].created_at_ms -= 2_000;
+        assert!(m.poll(&id).expect("still there").token.is_some(), "the token is still to be collected");
+        // A full TTL from the approval, and no longer.
+        m.pending[0].approved_at_ms = Some(now_ms() - REQUEST_TTL_MS - 1_000);
+        assert!(m.poll(&id).is_none(), "a token nobody came for does not stay in the list");
     }
 
     #[test]

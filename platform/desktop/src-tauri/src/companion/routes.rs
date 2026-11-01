@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::identity::{EndpointIdentity, EndpointIdentityHandle};
+use super::identity::{EndpointIdentity, EndpointIdentityHandle, RosterError};
 use super::pairing::MobilePairingResponse;
 use super::upstream::{UpstreamConfig, UpstreamHandle};
 use crate::plugins::registry::PluginRegistryHandle;
@@ -95,6 +95,15 @@ impl CompanionRegistry {
 
 fn fail(status: StatusCode, message: String) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// A change to the roster that was not made: 404 for what the caller named, 500 for a roster that could not be saved, which
+/// the caller must not take for done (a revocation that is not on disk is undone by the next start).
+fn not_changed(error: RosterError) -> axum::response::Response {
+    match error {
+        RosterError::Refused(why) => fail(StatusCode::NOT_FOUND, why),
+        RosterError::NotSaved(why) => fail(StatusCode::INTERNAL_SERVER_ERROR, why),
+    }
 }
 
 fn resolve(
@@ -183,7 +192,7 @@ async fn approve(
     };
     match id.approve(&approval_id) {
         Ok(m) => (StatusCode::OK, Json(m)).into_response(),
-        Err(e) => fail(StatusCode::NOT_FOUND, e),
+        Err(e) => not_changed(e),
     }
 }
 
@@ -211,7 +220,7 @@ async fn revoke(
     };
     match id.revoke(&thumbprint) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => fail(StatusCode::NOT_FOUND, e),
+        Err(e) => not_changed(e),
     }
 }
 
@@ -286,4 +295,41 @@ pub fn router(state: CompanionHandle, upstream: UpstreamHandle) -> Router {
         .route("/api/companion/:plugin/identity/rotate", post(rotate))
         .with_state(state)
         .merge(relay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::identity::testing::phone_key;
+    use super::*;
+
+    /// A failed save answered 204 here, and the phone was approved again at the next start. A thumbprint nobody knows stays a 404.
+    #[tokio::test]
+    async fn a_revocation_that_could_not_be_saved_is_not_answered_as_done() {
+        let dir = std::env::temp_dir().join(format!("oaiy-companion-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugin = dir.join("plugins").join("aokie");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 3, "id": "aokie", "name": "Aokie", "version": "0.1.0", "pluginApiVersion": 1,
+            "entry": { "kind": "process", "command": "plugin.exe" },
+            "capabilities": ["oaiy.companion.admission"],
+        });
+        std::fs::write(plugin.join("manifest.json"), manifest.to_string()).unwrap();
+        std::fs::write(plugin.join("plugin.exe"), b"stub").unwrap();
+        let state = new_handle(dir.clone(), crate::plugins::registry::new_handle(dir.join("plugins")));
+        let identity = state.identity_for("aokie").map_err(|(_, why)| why).unwrap();
+        let phone = phone_key(1);
+        identity.approve_for_tests(&phone);
+
+        let roster = dir.join("companion").join("aokie").join("roster.json");
+        std::fs::remove_file(&roster).unwrap();
+        std::fs::create_dir_all(roster.join("in-the-way")).unwrap();
+        let asked = |thumbprint: &str| revoke(State(state.clone()), Path(("aokie".to_string(), thumbprint.to_string())));
+        assert_eq!(asked(&phone.thumbprint).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        std::fs::remove_dir_all(&roster).unwrap();
+        assert_eq!(asked("nobody-knows-this-one").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&phone.thumbprint).await.status(), StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

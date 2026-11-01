@@ -5,7 +5,7 @@ description = "Tray-resident OAIY Desktop for oaiy-web. Manages local AI service
 authors = ["OAIY"]
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 # The crate ships two binaries now (the GUI app + the headless oaiy-server),
 # so `cargo run` / `tauri dev` would be ambiguous without naming the default.
 default-run = "oaiy-desktop"
@@ -114,7 +114,7 @@ futures-util = "0.3"
 flate2 = "1"
 tar = "0.4"
 # Node ships a .zip for Windows (tar.gz elsewhere); deflate-only keeps it small.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.2", default-features = false, features = ["deflate"] }
 
 # UUIDs for download / install job IDs. v4 only — no need for the
 # timestamp/MAC variants.

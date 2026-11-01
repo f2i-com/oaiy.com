@@ -182,11 +182,11 @@ the machine first, and signing does not make a download safe to fetch and run.
 | `minDesktopVersion` | Refused only when it is newer than this OAIY; a value that cannot be read is a warning. |
 | `entry` | `{kind: "process", command, args}`: what to run. |
 | `capabilities` | What it may do, wildcards expanded at load (at most 512). |
-| `connectors` | Its command namespaces, each with its commands. |
-| `events` | The events it may emit; others are dropped. |
+| `connectors` | Its command namespaces, each with its commands. A connector called after a plugin is that plugin's (the screens' `PluginHost.command` sends to the plugin's own id), and so is one a publisher is pinned for, installed or not: another plugin declaring it is refused, with the reason, as is each of two plugins declaring a name neither has. |
+| `events` | The events it may emit, named under its own id (`aokie.call.incoming`; a `-` in the id is `_` in an event's name, so `acme-tools` emits `acme_tools.…`); others are dropped. A screen hears only its own plugin's events, and may subscribe only to the ones declared here. |
 | `commands.journalled` | Commands with effects in the world (a dial, a text), which the host journals. |
 | `serviceDefinitions` | Actions a flow can use as a service (the phone's `call.dial`, `sms.send`, …). |
-| `ui` | Dashboard pages (`nav`, `sections`, `screens`: HTML the host shows with a `PluginHost` API), Overview cards (`overview`) and the polls they read (`statusCards`). |
+| `ui` | Dashboard pages (`nav`, `sections`, `screens`: HTML the host shows with a `PluginHost` API), Overview cards (`overview`) and the polls they read (`statusCards`). A screen's `entry` and `files` are plain paths inside the plugin's folder, by the rule a signature's are (`/`-separated, relative, no `:`, `\`, `..` or trailing dot): a screen that lists anything else is left out with a warning. |
 | `data` | What it keeps outside its own folder (`externalInventory`), for the person to see. |
 
 ### `modules`

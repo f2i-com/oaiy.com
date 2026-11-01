@@ -803,17 +803,17 @@ mod process_tests {
         }
         let sb = Sandbox::new("shared-connector");
         let host = host(&sb);
-        // Both claim the phone through a connector called "shared": a request for it reaches only one of them.
-        let a = install_with_connector(&sb, "a-line", "shared", &["call.switchboard"], idle_board(), Some(claim("shared")));
-        let b = install_with_connector(&sb, "b-line", "shared", &["call.switchboard"], board(Some(call())), Some(claim("shared")));
+        // Both claim the phone through a connector called "b-line": `a-line`, first and alone, and running when the plugin of
+        // that name comes. A scan does not stop a process, and a request for the connector now reaches only `b-line`.
+        let a = install_with_connector(&sb, "a-line", "b-line", &["call.switchboard"], idle_board(), Some(claim("b-line")));
         start_as(&host, "a-line");
+        let b = install_with_connector(&sb, "b-line", "b-line", &["call.switchboard"], board(Some(call())), Some(claim("b-line")));
         start_as(&host, "b-line");
         let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
         let state = line.ask(true);
-        // Whichever one the registry routes to answers; the other cannot be asked and says so. Either way the answer is not "quiet".
+        // The one the registry routes to answers; the other cannot be asked and says so. Either way the answer is not "quiet".
         match &state {
             LineState::Live { plugin, .. } => assert_eq!(plugin, "B-line Test Plugin", "{state:?}"),
-            LineState::Unknown { plugin, why } => assert!(why.contains("served by another plugin") && plugin.ends_with("-line Test Plugin"), "{state:?}"),
             other => panic!("{other:?}"),
         }
         // Between them exactly one was asked, and the other's call cannot have gone unseen.

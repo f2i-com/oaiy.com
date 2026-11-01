@@ -840,6 +840,12 @@ mod tests {
         std::fs::create_dir_all(dir.join("definitions")).unwrap();
         let mut m: Value = serde_json::from_str(AOKIE_V4).unwrap();
         m["id"] = json!(id);
+        // Under its own name: a connector called after Aokie is Aokie's, and so is an event.
+        m["connectors"][0]["id"] = json!(id);
+        m["events"] = json!([]);
+        for capability in m["capabilities"].as_array_mut().unwrap() {
+            *capability = json!(capability.as_str().unwrap().replace("connector.aokie.", &format!("connector.{id}.")));
+        }
         match setup {
             Some(s) => m["setup"] = s,
             None => {

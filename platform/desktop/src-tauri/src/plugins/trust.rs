@@ -473,24 +473,34 @@ fn read_envelope(dir: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{PACKAGE_MANIFEST_FILE} is not text"))
 }
 
-/// A path the signer could have written and that stays inside the bundle.
+/// A path that stays inside a plugin's folder on every system: what a signature's list and a
+/// screen's `files` are both held to, so the path the signer could have written and the path
+/// a screen may be served from are one rule.
 ///
 /// Stricter than the signer's own `..` test: it also refuses what Windows would resolve
 /// somewhere else (a drive or a stream after a colon, a backslash, a trailing dot or
 /// space), and the environment-variable-shaped names Aokie's signer refuses to sign
 /// because something once parked files under a literal `%SystemDrive%`.
-fn safe_listed_path(rel: &str) -> Result<(), String> {
-    let bad = |why: &str| Err(format!("the signature lists an unusable path {rel:?} ({why})"));
+pub(crate) fn plain_package_path(rel: &str) -> Result<(), &'static str> {
     if rel.is_empty() || rel.len() > 1024 {
-        return bad("empty or too long");
+        return Err("empty or too long");
     }
     if rel.starts_with('/') || rel.contains('\\') || rel.contains(':') || rel.contains("..") || rel.chars().any(|c| c.is_control()) {
-        return bad("it does not stay inside the package");
+        return Err("it does not stay inside the package");
     }
     for part in rel.split('/') {
         if part.is_empty() || part == "." || part.starts_with('%') || part.ends_with('.') || part.ends_with(' ') {
-            return bad("a component the package cannot have");
+            return Err("a component the package cannot have");
         }
+    }
+    Ok(())
+}
+
+/// A path the signer could have written and that stays inside the bundle.
+fn safe_listed_path(rel: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("the signature lists an unusable path {rel:?} ({why})"));
+    if let Err(why) = plain_package_path(rel) {
+        return bad(why);
     }
     if rel == PACKAGE_MANIFEST_FILE {
         return bad("the envelope cannot list itself");
@@ -975,6 +985,11 @@ impl TrustService {
     /// the policy of the build and environment, the person's decisions in `root`.
     pub fn for_root(root: &Path) -> Arc<Self> {
         Self::new(TrustPolicy::for_build(), Publishers::embedded().clone(), root.join(LOCAL_TRUST_FILE))
+    }
+
+    /// Is `id` a plugin a pinned publisher signs? Its name is that publisher's, whether or not it is installed.
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.publishers.0.iter().any(|p| p.plugins.contains(id))
     }
 
     fn remembered(&self) -> std::sync::MutexGuard<'_, HashMap<String, Remembered>> {

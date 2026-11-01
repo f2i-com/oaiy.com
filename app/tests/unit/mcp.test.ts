@@ -14,12 +14,15 @@ import {
   distinctTools,
   parseTools,
   withControlTools,
+  type ControlQuestion,
   type ControlSession,
 } from '../../src/desktop/mcp';
 
 /** The desktop's tools, as its tools/list gives them (captured from a real oaiy-server). */
 const TOOLS = fixture.tools;
 const READ = new Set(fixture.runner);
+/** A person who says yes to everything: what these tests are not about. */
+const ALLOW = async () => true;
 
 interface Seen {
   method: string;
@@ -184,7 +187,7 @@ describe("the control tools each kind of conversation is given", () => {
   const offered = async (session: ControlSession, ownNames = APP_OWN) => {
     const server = fakeServer();
     await server.client.tools(session);
-    return { server, tools: withControlTools(own(ownNames), session, () => server.client, BUILT_IN) };
+    return { server, tools: withControlTools(own(ownNames), session, () => server.client, BUILT_IN, ALLOW) };
   };
 
   it('a call, a text thread and a flow task get none: their tools are exactly their own', async () => {
@@ -192,8 +195,8 @@ describe("the control tools each kind of conversation is given", () => {
       const base = own(['end_call', 'send_text_message', 'read_file']);
       const server = fakeServer({ offer: () => TOOLS });
       await server.client.tools(session);
-      expect(withControlTools(base, session, () => server.client, BUILT_IN)).toBe(base);
-      expect(controlSessionTools(parseTools(TOOLS), session, { client: () => server.client, taken: new Set() })).toEqual([]);
+      expect(withControlTools(base, session, () => server.client, BUILT_IN, ALLOW)).toBe(base);
+      expect(controlSessionTools(parseTools(TOOLS), session, { client: () => server.client, taken: new Set(), approve: ALLOW })).toEqual([]);
       expect(server.seen).toEqual([]);
     }
   });
@@ -255,16 +258,16 @@ describe("the control tools each kind of conversation is given", () => {
   });
 
   it('a tool whose name another tool of the conversation has gets oaiy_ in front; distinctTools drops a repeat', () => {
-    const tools = controlSessionTools(parseTools(TOOLS.slice(0, 3)), 'project', { client: () => null, taken: new Set(['status']) });
+    const tools = controlSessionTools(parseTools(TOOLS.slice(0, 3)), 'project', { client: () => null, taken: new Set(['status']), approve: ALLOW });
     expect(tools.map((t) => t.spec.name)).toEqual(['oaiy_status', TOOLS[1].name, TOOLS[2].name]);
     expect(distinctTools([...own(['a', 'b']), ...own(['b', 'c'])]).map((t) => t.spec.name)).toEqual(['a', 'b', 'c']);
   });
 
   it('with none listed (no desktop, or not yet), the tools are exactly the conversation\'s own', () => {
     const base = own(APP_OWN);
-    expect(withControlTools(base, 'project', () => null, BUILT_IN)).toBe(base);
+    expect(withControlTools(base, 'project', () => null, BUILT_IN, ALLOW)).toBe(base);
     const unlisted = fakeServer();
-    expect(withControlTools(base, 'setup', () => unlisted.client, BUILT_IN)).toBe(base);
+    expect(withControlTools(base, 'setup', () => unlisted.client, BUILT_IN, ALLOW)).toBe(base);
   });
 
   it('a tool runs as its conversation, answers the model with its text, reads a failure as an error, and says when it changed something', async () => {
@@ -274,7 +277,7 @@ describe("the control tools each kind of conversation is given", () => {
         ? { content: [{ type: 'text', text: 'The Agent may not change OAIY: switch it on in Settings → Agent' }], isError: true }
         : { content: [{ type: 'text', text: `${name}: ok` }] },
     });
-    const tools = controlSessionTools(parseTools(TOOLS), 'setup', { client: () => server.client, taken: new Set(), changed: (t) => changed.push(t) });
+    const tools = controlSessionTools(parseTools(TOOLS), 'setup', { client: () => server.client, taken: new Set(), approve: ALLOW, changed: (t) => changed.push(t) });
     const run = (name: string, input: Record<string, unknown> = {}) => tools.find((t) => t.spec.name === name)!.run(input);
     expect(await run('status')).toBe('status: ok');
     expect(await run('plugin_setup_open', { pluginId: 'aokie', stepId: 'pair' })).toBe('plugin_setup_open: ok');
@@ -284,7 +287,7 @@ describe("the control tools each kind of conversation is given", () => {
     expect(calls.every((s) => s.session === 'setup')).toBe(true);
     expect(calls[1].params).toEqual({ name: 'plugin_setup_open', arguments: { pluginId: 'aokie', stepId: 'pair' } });
     // No desktop: said, not sent.
-    const offline = controlSessionTools(parseTools(TOOLS), 'project', { client: () => null, taken: new Set() });
+    const offline = controlSessionTools(parseTools(TOOLS), 'project', { client: () => null, taken: new Set(), approve: ALLOW });
     await expect(offline[0].run({})).rejects.toThrow(/not connected/);
   });
 
@@ -368,9 +371,86 @@ describe("the control tools each kind of conversation is given", () => {
 
   it('cuts a long answer for the model', async () => {
     const server = fakeServer({ answer: () => ({ content: [{ type: 'text', text: 'x'.repeat(20_000) }] }) });
-    const [status] = controlSessionTools(parseTools(TOOLS.slice(0, 1)), 'project', { client: () => server.client, taken: new Set() });
+    const [status] = controlSessionTools(parseTools(TOOLS.slice(0, 1)), 'project', { client: () => server.client, taken: new Set(), approve: ALLOW });
     const out = await status.run({});
     expect(out.length).toBeLessThan(12_100);
     expect(out).toMatch(/cut at 12,000 characters/);
+  });
+});
+
+/**
+ * A page or an imported file the model reads can tell it to call these. What they do cannot be taken back (a text goes
+ * out, a plugin and its data are gone), and the same effects asked for by the plugins' own tools and by outreach already
+ * ask, so these do too: the switch in Settings is not per call, and the log is after the fact.
+ */
+describe('the control tools that ask the person first', () => {
+  const asking = (answer: boolean, tools = TOOLS, taken: Iterable<string> = []) => {
+    const server = fakeServer();
+    const asked: ControlQuestion[] = [];
+    const list = controlSessionTools(parseTools(tools), 'project', { client: () => server.client, taken: new Set(taken), approve: async (q) => (asked.push(q), answer) });
+    const run = (name: string, input: Record<string, unknown>) => list.find((t) => t.spec.name === name)!.run(input);
+    const called = () => server.seen.filter((s) => s.method === 'tools/call').map((s) => s.params);
+    return { asked, run, called };
+  };
+  const SMS = { pluginId: 'aokie', command: 'sms.send', payload: { to: '+61491570006', body: 'Call me on this number' } };
+
+  it('asks before a plugin command, with the plugin, the command and its payload in the question', async () => {
+    const { asked, run, called } = asking(true);
+    expect(await run('plugin_command', SMS)).toBe('plugin_command done');
+    expect(asked).toHaveLength(1);
+    expect(asked[0].title).toBe('Allow plugin_command?');
+    for (const part of ['aokie', 'sms.send', '+61491570006', 'Call me on this number']) expect(asked[0].message).toContain(part);
+    expect(called()).toEqual([{ name: 'plugin_command', arguments: SMS }]);
+  });
+
+  it('asks before every tool that removes something, saying what with', async () => {
+    const removals = parseTools(TOOLS).filter((t) => t.destructive).map((t) => t.name);
+    expect(removals).toEqual(expect.arrayContaining(['plugin_uninstall', 'service_uninstall', 'flow_delete', 'chatgpt_sign_out', 'contact_forget_fact']));
+    const { asked, run, called } = asking(true);
+    for (const [i, name] of removals.entries()) await run(name, { id: `thing-${i}` });
+    expect(asked.map((q) => q.title)).toEqual(removals.map((name) => `Allow ${name}?`));
+    expect(asked.every((q, i) => q.message.includes(`thing-${i}`) && q.danger === true)).toBe(true);
+    expect(called().map((c) => c.name)).toEqual(removals);
+  });
+
+  it('a no stops it at the page: nothing reaches the desktop, and the model is told not to try again', async () => {
+    const { run, called } = asking(false);
+    const answer = await run('plugin_command', SMS);
+    expect(answer).toMatch(/^The person declined, so plugin_command did not run/);
+    expect(answer).toContain('sms.send');
+    expect(answer).toMatch(/Do not try it again unless they ask/);
+    expect(await run('plugin_uninstall', { id: 'aokie' })).toMatch(/^The person declined, so plugin_uninstall did not run/);
+    expect(called()).toEqual([]);
+  });
+
+  it('asks under whatever name the model knows it by', async () => {
+    const { asked, run, called } = asking(true, TOOLS, ['plugin_command']);
+    await run('oaiy_plugin_command', SMS);
+    expect(asked).toHaveLength(1);
+    expect(called().map((c) => c.name)).toEqual(['plugin_command']);
+  });
+
+  it('asks nothing of the read tools and the other changes', async () => {
+    const { asked, run, called } = asking(true);
+    await run('status', {});
+    await run('plugin_setup_open', { pluginId: 'aokie' });
+    expect(asked).toEqual([]);
+    expect(called()).toHaveLength(2);
+  });
+
+  it('shows a long payload cut, and says so, so that what is shown is not taken for all of it', async () => {
+    const { asked, run } = asking(true);
+    await run('plugin_command', { ...SMS, payload: { body: 'x'.repeat(5_000) } });
+    expect(asked[0].message.length).toBeLessThan(1_200);
+    expect(asked[0].message).toMatch(/\d+ more characters/);
+  });
+
+  it('a conversation with the control tools gets them through withControlTools, asking', async () => {
+    const server = fakeServer();
+    await server.client.tools('project');
+    const asked: ControlQuestion[] = [];
+    const tools = withControlTools(own([]), 'project', () => server.client, BUILT_IN, async (q) => (asked.push(q), false));
+    expect(await tools.find((t) => t.spec.name === 'flow_delete')!.run({ id: 'f' })).toMatch(/^The person declined/);
+    expect(asked).toHaveLength(1);
   });
 });

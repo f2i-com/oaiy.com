@@ -207,7 +207,7 @@ fn manifest_of(file: &Path, pass: &str) -> Manifest {
     let zip = plain_zip(file, pass);
     let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
     let mut first = archive.by_index(0).unwrap();
-    assert_eq!(first.name(), "manifest.json", "the manifest is the first entry");
+    assert_eq!(first.name().unwrap(), "manifest.json", "the manifest is the first entry");
     let mut text = String::new();
     first.read_to_string(&mut text).unwrap();
     serde_json::from_str(&text).unwrap()
@@ -305,6 +305,7 @@ left_out!(the_links_events_and_markers_are_left_out, "link/outbox/1.json", "link
 left_out!(the_app_logic_markers_are_left_out, "link/app-logic-storage.json", "link/**", false);
 left_out!(the_tunnel_identity_key_is_left_out, "desktop-e2e-identity.key", "desktop-e2e-identity.key", true);
 left_out!(the_tunnel_published_marker_is_left_out, "desktop-e2e-published.json", "desktop-e2e-identity.key", true);
+left_out!(the_spent_request_keys_stay_with_the_identity, "desktop-e2e-spent.bin", "desktop-e2e-identity.key", true);
 left_out!(the_data_node_key_is_left_out, "data-node-signing.key", "data-node-signing.key", true);
 left_out!(companion_endpoint_keys_are_left_out, "companion/aokie/endpoint.key", "companion/**", true);
 left_out!(the_companion_roster_is_left_out, "companion/aokie/roster.json", "companion/**", true);
@@ -473,10 +474,10 @@ fn the_file_is_a_standard_age_file_around_a_zip_that_starts_with_the_manifest() 
     let zip = plain_zip(&file, PASS);
     assert!(zip.starts_with(b"PK"), "a ZIP");
     let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
-    assert_eq!(archive.by_index(0).unwrap().name(), "manifest.json");
+    assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "manifest.json");
     // Every name in it is relative with forward slashes.
     for i in 0..archive.len() {
-        let name = archive.by_index(i).unwrap().name().to_string();
+        let name = archive.by_index(i).unwrap().name().unwrap().into_owned();
         assert!(!name.contains('\\') && !name.starts_with('/'), "{name}");
     }
     // Nothing readable in the file itself.
@@ -1696,7 +1697,7 @@ fn zip_entries(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
         let mut file = archive.by_index(i).unwrap();
         let mut body = Vec::new();
         file.read_to_end(&mut body).unwrap();
-        out.insert(file.name().to_string(), body);
+        out.insert(file.name().unwrap().into_owned(), body);
     }
     out
 }
@@ -5134,10 +5135,11 @@ fn a_zip_whose_headers_disagree_about_an_items_size_never_stages_bytes_the_recor
             other => panic!("{what}: the look and the staging disagree: {:?}", other.0.as_ref().map(|_| ()).map_err(|e| e.kind)),
         }
         assert_eq!(snapshot(&dst.0), before, "{what}: nothing live changed");
-        // What the ZIP library does with each (zip 2.4.2): it reads an item by the central directory and ignores the
-        // sizes in the local header, and refuses an item whose central-directory size is not the record's. A change here
-        // (a newer library) is worth a look: the property above holds either way.
-        assert_eq!(staged.is_err(), what.starts_with("the central directory"), "{what}");
+        // What the ZIP library does with each (zip 9): it reads an item by the central directory and ignores the sizes in
+        // the local header, and refuses an item whose central-directory size is not the record's, and, as zip 2 did not,
+        // the record's own entry when its size in the central directory is not what its bytes are. A change here (a newer
+        // library) is worth a look: the property above holds either way.
+        assert_eq!(staged.is_err(), what.starts_with("the central directory") || what.starts_with("the sizes of the record's own"), "{what}");
     }
 }
 

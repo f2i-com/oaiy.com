@@ -252,7 +252,7 @@ fn register(
         .map_err(|e| format!("could not reach the data-node lane: {e}"))?;
 
     let status = resp.status();
-    let payload: Value = resp.json().unwrap_or(Value::Null);
+    let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
     if offers_no_data_nodes(status.as_u16(), &payload) {
         return Ok(None);
     }
@@ -299,7 +299,7 @@ fn refresh(account: &LinkedAccount, spec: &DataNodeSpec) -> Option<DataNodeStatu
         super::net::drain(resp);
         return None;
     }
-    node_status(&resp.json::<Value>().ok()?)
+    node_status(&super::net::read_json::<Value>(resp).ok()?)
 }
 
 /// Read the node record out of a register or self response.

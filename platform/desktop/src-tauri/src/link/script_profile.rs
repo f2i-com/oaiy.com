@@ -660,7 +660,7 @@ fn fetch(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if !status.is_success() {
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         let message = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -673,15 +673,8 @@ fn fetch(
         }
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    let raw = resp
-        .bytes()
-        .map_err(|e| format!("the script profile could not be read off the socket: {e}"))?;
-    if raw.len() > MAX_PROFILE_BYTES {
-        return Err(format!(
-            "the script profile is {} bytes and this desktop reads at most {MAX_PROFILE_BYTES}",
-            raw.len()
-        ));
-    }
+    let raw = super::net::read_body(resp, MAX_PROFILE_BYTES as u64)
+        .map_err(|e| format!("the script profile could not be read: {e}"))?;
     let document: Value = serde_json::from_slice(&raw)
         .map_err(|e| format!("the script-profile lane returned something that is not JSON: {e}"))?;
     Ok(Fetched::Document { document, etag: tag })

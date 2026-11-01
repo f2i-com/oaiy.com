@@ -450,7 +450,7 @@ fn send(
     // 401/403 is the one worth naming: it means the key was revoked at the
     // provider, so the link is dead and re-linking is the fix — not something a
     // user would guess from "offline".
-    let detail: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
+    let detail: serde_json::Value = super::net::read_json(resp).unwrap_or(serde_json::Value::Null);
     let message = detail
         .get("message")
         .or_else(|| detail.get("error"))

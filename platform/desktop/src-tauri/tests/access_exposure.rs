@@ -999,6 +999,14 @@ fn n1_a_token_only_install_is_discoverable_with_its_token_on_the_web_build_and_b
     let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/bridge/capabilities", &with);
     assert_eq!(status, 200, "{text}");
     assert!(body["capabilities"].is_array(), "{text}");
+    // The install's id goes to a holder of the token: on the old guard, which reads it. The new one reads no credential on
+    // a public route, so nobody there is known to hold one.
+    assert_eq!(body["deviceId"].is_string(), !cfg!(feature = "web"), "{text}");
+    if !cfg!(feature = "web") {
+        let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/bridge/capabilities", &[]);
+        assert_eq!(status, 200, "{text}");
+        assert!(body["capabilities"].is_array() && body.get("deviceId").is_none(), "a stranger: {text}");
+    }
     // A token that is not the operator's is refused as a wrong token, on a public route too.
     let wrong = format!("Bearer W{}", &TOKEN[1..]);
     let (status, body, text) = server.ask(
@@ -1098,6 +1106,9 @@ fn n1_with_an_owner_the_public_routes_of_the_bridge_are_open_again_and_the_token
     );
     let (status, _, text) = server.ask("127.0.0.1", "GET", "/api/services", &with);
     assert_eq!(status, 200, "{text}");
+    let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/bridge/capabilities", &[]);
+    assert_eq!(status, 200, "{text}");
+    assert!(body["capabilities"].is_array() && body.get("deviceId").is_none(), "a stranger: {text}");
 }
 
 /// The proxy the operator names is believed and no other, and the same headers from a peer that is not named are worth

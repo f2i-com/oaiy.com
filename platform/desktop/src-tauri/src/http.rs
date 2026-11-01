@@ -1540,7 +1540,8 @@ async fn origin_guard(
 }
 
 /// Marks a `GET /api/services` that a web page asked without a token: [`list_services`] answers the view without the
-/// machine's paths, process ids and service errors (see [`tighten`]).
+/// machine's paths, process ids and service errors; and a `GET /api/bridge/capabilities` from a caller with no token and
+/// no trusted origin: the bridge answers without the install's id and the words of a failure (see [`tighten`]).
 #[derive(Clone, Copy)]
 pub(crate) struct PublicView;
 
@@ -1566,6 +1567,11 @@ fn is_own_window_origin(origin: &str) -> bool {
 /// no `Origin`) and a token holder do. A page the owner happens to have open, on any website, must not.
 fn is_page_gated_read_path(path: &str) -> bool {
     matches!(path, "/api/models" | "/api/models/downloads" | "/api/models/catalog" | "/api/python")
+}
+
+/// `GET /api/plugins/:id/ui/:screen/*path`: what a plugin's screen is made of.
+fn is_plugin_screen_file(path: &str) -> bool {
+    path.strip_prefix("/api/plugins/").and_then(|rest| rest.split_once('/')).is_some_and(|(_, rest)| rest.starts_with("ui/"))
 }
 
 /// Whether a request was sent by a web page: it says its `Origin`, or the browser says where the fetch came from
@@ -1632,9 +1638,11 @@ pub(super) fn paired_reaches(access: crate::bridge::pairing::PairingAccess, req:
 ///   [`crate::bridge::pairing::PairingManager::grant_for`]); anywhere else it is taken off the request, which the old
 ///   guard then judges as one without a token (OAIY's own pages still pass by their origin).
 /// - On the desktop, without a token: the page-gated reads ([`is_page_gated_read_path`]) refuse a page whose origin is
-///   not one the old guard trusts, `GET /api/bridge/flows/:id` (a flow may hold a key in a node) is a restricted read
-///   like the flows' list, `DELETE /api/bridge/pairing` takes the privileged gate like the other pairing changes, and a
-///   web page's `GET /api/services` is marked for the [`PublicView`].
+///   not one the old guard trusts, `GET /api/bridge/flows/:id` (a flow may hold a key in a node) and a plugin's screen
+///   files ([`is_plugin_screen_file`]) are restricted reads like the flows' list, `DELETE /api/bridge/pairing` takes the
+///   privileged gate like the other pairing changes, and so does `POST /api/bridge/leases/:name`, and a web page's
+///   `GET /api/services` is marked for the [`PublicView`].
+/// - A caller of `GET /api/bridge/capabilities` with neither a token nor a trusted origin is marked for the [`PublicView`].
 /// - A request from the desktop's own window is marked [`OwnWindow`].
 fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::response::Response> {
     let refuse = || (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "origin not allowed" }))).into_response();
@@ -1671,17 +1679,31 @@ fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::respons
     if auth.gui_mode && origin.as_deref().is_some_and(is_own_window_origin) {
         req.extensions_mut().insert(OwnWindow);
     }
+    let trusted = origin.as_deref().is_some_and(is_allowed_origin);
+    // Before the step below: a headless server answers discovery to anyone too, and it has no trusted origin to go by.
+    if read && path == "/api/bridge/capabilities" && !owner && !paired && !(auth.gui_mode && trusted) {
+        req.extensions_mut().insert(PublicView);
+    }
     if !auth.gui_mode || owner || paired {
         return Ok(req);
     }
-    let trusted = origin.as_deref().is_some_and(is_allowed_origin);
     if read && is_page_gated_read_path(&path) && from_a_page(&req) && !trusted {
         return Err(refuse());
     }
     if read && path.starts_with("/api/bridge/flows/") && !trusted {
         return Err(refuse());
     }
+    // Only the dashboard reads a plugin's screen files: nothing else has any business with them.
+    if read && is_plugin_screen_file(&path) && !trusted {
+        return Err(refuse());
+    }
     if m == Method::DELETE && path == "/api/bridge/pairing" && !origin.as_deref().is_some_and(is_allowed_origin_privileged) {
+        return Err(refuse());
+    }
+    // `prefer` takes a lease from whoever holds it, and the holder of `answer-calls` and `answer-texts` is who answers the
+    // phone: the Agent's, in OAIY's own window, or in a tab with its own token (which has returned above). Here and not in
+    // `is_bridge_exec_path`, which is the old guard's, held to its frozen copy (`legacy_neutrality`).
+    if m == Method::POST && path.starts_with("/api/bridge/leases/") && !origin.as_deref().is_some_and(is_allowed_origin_privileged) {
         return Err(refuse());
     }
     if read && path == "/api/services" && from_a_page(&req) && !trusted {
@@ -1731,6 +1753,10 @@ async fn access_guard(
         req.extensions_mut().insert(s.guard.health_extras());
     }
     if s.guard.claims(&req) {
+        // (the new guard reads no credential on a public route, so nobody is known here to be a token holder)
+        if req.uri().path() == "/api/bridge/capabilities" {
+            req.extensions_mut().insert(PublicView);
+        }
         s.guard.handle(req, next).await
     } else {
         req.extensions_mut().insert(crate::auth::principal::Principal::legacy_owner());
@@ -3209,6 +3235,13 @@ mod tightened_tests {
             .route("/api/bridge/flows/:id", get(ok))
             .route("/api/bridge/connectors/:id/request", post(ok))
             .route("/api/bridge/pairing", get(ok).post(ok).delete(ok))
+            .route("/api/bridge/leases/:name", post(ok))
+            .route(
+                "/api/bridge/capabilities",
+                get(|public: Option<Extension<PublicView>>| async move { if public.is_some() { "public" } else { "full" } }),
+            )
+            .route("/api/plugins/:id/ui/:screen/*path", get(ok))
+            .route("/api/plugins/:id/logs", get(ok))
             .route("/api/network/settings", put(ok))
             .route("/api/voice/calls", get(ok))
             .route("/api/mcp", post(ok))
@@ -3259,6 +3292,76 @@ mod tightened_tests {
         for headers in [&[("origin", OWN)][..], &[("origin", "https://oaiy.com")], &[]] {
             assert_eq!(ask(&app, "GET", "/api/services", headers).await, (200, "full".into()), "{headers:?}");
         }
+    }
+
+    /// Only the dashboard fetches a plugin's screen files, so this is a restricted read: without it any website could read
+    /// a screen's scripts, with CORS open on this listener.
+    #[tokio::test]
+    async fn a_plugins_screen_files_are_read_by_oaiys_own_pages_or_with_a_token() {
+        let p = pairing();
+        let token = grant(&p, Some("https://formlogic.com"), PairingAccess::Apps);
+        let bearer = format!("Bearer {token}");
+        let app = router(p);
+        let path = "/api/plugins/demo/ui/main/ui/app.js";
+        assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await.0, 403, "another site");
+        assert_eq!(ask(&app, "GET", path, &[]).await.0, 403, "as the other restricted reads: an origin or a token");
+        assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await.0, 200, "the dashboard");
+        assert_eq!(ask(&app, "GET", path, &[("origin", "https://oaiy.com")]).await.0, 200);
+        assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://formlogic.com")]).await.0, 200, "a token's plugins.read");
+    }
+
+    /// `/api/bridge/capabilities` is open discovery: what it says of a plugin's commands is what FormLogic reads, and that stays.
+    /// The install's id (a tracking id, across sites) and a failure's words (paths with the user name in them) are for OAIY's
+    /// own pages and for a token holder, as they are on the listing of `/api/plugins`.
+    #[tokio::test]
+    async fn discovery_tells_a_caller_with_neither_token_nor_trusted_origin_only_the_public_view() {
+        let p = pairing();
+        let token = grant(&p, Some("https://formlogic.com"), PairingAccess::Apps);
+        let bearer = format!("Bearer {token}");
+        let app = router(p);
+        let path = "/api/bridge/capabilities";
+        assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await, (200, "public".into()));
+        assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "cross-site")]).await, (200, "public".into()));
+        assert_eq!(ask(&app, "GET", path, &[]).await, (200, "public".into()), "a program with no token");
+        assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await, (200, "full".into()));
+        assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://formlogic.com")]).await, (200, "full".into()), "a paired app");
+        assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://evil.example")]).await, (200, "public".into()), "its token, from another page");
+    }
+
+    /// The headless server answers discovery to anyone: a token is the only way to its full view.
+    #[tokio::test]
+    async fn on_a_headless_server_discovery_is_public_without_the_token() {
+        let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, false, Some("the-token".into()), &|_| None).expect("a legacy guard");
+        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()) }, guard };
+        let app = Router::new()
+            .route("/api/bridge/capabilities", get(|public: Option<Extension<PublicView>>| async move { if public.is_some() { "public" } else { "full" } }))
+            .layer(middleware::from_fn_with_state(state, access_guard));
+        assert_eq!(ask(&app, "GET", "/api/bridge/capabilities", &[]).await, (200, "public".into()));
+        assert_eq!(ask(&app, "GET", "/api/bridge/capabilities", &[("origin", OWN)]).await, (200, "public".into()), "no window here to be");
+        assert_eq!(ask(&app, "GET", "/api/bridge/capabilities", &[("authorization", "Bearer the-token")]).await, (200, "full".into()));
+    }
+
+    /// `prefer` takes the lease from the Agent, so whoever could post here decided who answers the phone. It is the Agent's:
+    /// OAIY's own window, or a page paired with the Agent's access.
+    #[tokio::test]
+    async fn only_the_agent_may_take_an_answering_lease() {
+        let p = pairing();
+        let agent = format!("Bearer {}", grant(&p, Some("https://agent.example"), PairingAccess::Agent));
+        let apps = format!("Bearer {}", grant(&p, Some("https://formlogic.com"), PairingAccess::Apps));
+        let app = router(p);
+        let path = "/api/bridge/leases/answer-calls";
+        assert_eq!(ask(&app, "POST", path, &[]).await.0, 403, "a program with no token");
+        assert_eq!(ask(&app, "POST", path, &[("origin", "https://evil.example")]).await.0, 403);
+        assert_eq!(ask(&app, "POST", path, &[("origin", "null")]).await.0, 403);
+        if !cfg!(debug_assertions) {
+            assert_eq!(ask(&app, "POST", path, &[("origin", "http://localhost:3000")]).await.0, 403, "a page on this computer");
+        }
+        assert_eq!(ask(&app, "POST", path, &[("authorization", apps.as_str()), ("origin", "https://formlogic.com")]).await.0, 403, "an app's grant");
+        assert_eq!(ask(&app, "POST", path, &[("authorization", agent.as_str()), ("origin", "https://agent.example")]).await.0, 200, "the Agent in a browser tab");
+        assert_eq!(ask(&app, "POST", path, &[("origin", OWN)]).await.0, 200, "the dashboard's window");
+        let embedded = if cfg!(windows) { "http://oaiy.localhost" } else { "oaiy://localhost" };
+        assert_eq!(ask(&app, "POST", path, &[("origin", embedded)]).await.0, 200, "the Agent in OAIY's own window");
     }
 
     #[tokio::test]

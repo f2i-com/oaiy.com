@@ -755,17 +755,18 @@ impl PluginManifest {
             }
         }
 
-        // Every declared event must be namespaced under something this plugin
-        // OWNS — its own id or one of its connector ids. Without this, the
-        // `source` pin in the runtime is cosmetic: the trigger dispatcher matches
-        // bindings on NAME alone, so a plugin declaring `aokie.call.incoming` in
-        // its own manifest (source = itself, which passes the runtime check)
-        // fires every binding meant for the real Aokie — forging another
-        // subsystem's events with zero declared capabilities. Tying the event
-        // namespace to an owned prefix is what makes the source pin enforceable.
-        let owned_prefixes: BTreeSet<&str> = std::iter::once(self.id.as_str())
-            .chain(self.connectors.iter().map(|c| c.id.as_str()))
-            .collect();
+        // Every declared event must be namespaced under this plugin's OWN id.
+        // Without this, the `source` pin in the runtime is cosmetic: the trigger
+        // dispatcher matches bindings on NAME alone, so a plugin declaring
+        // `aokie.call.incoming` in its own manifest (source = itself, which
+        // passes the runtime check) fires every binding meant for the real
+        // Aokie — forging another subsystem's events with zero declared
+        // capabilities. Tying the event namespace to the id is what makes the
+        // source pin enforceable. A connector id is no such thing: it is a name
+        // a plugin claims, so counting it here let a plugin own `aokie.*` by
+        // declaring a connector with that name. An event's name has no hyphens,
+        // so `acme-tools` emits under `acme_tools`, a name no other id can read as.
+        let own_prefix = self.id.replace('-', "_");
         for e in &self.events {
             if !is_valid_event_name(e) {
                 return Err(ManifestError::Invalid(format!(
@@ -773,11 +774,10 @@ impl PluginManifest {
                 )));
             }
             let first = e.split('.').next().unwrap_or("");
-            if !owned_prefixes.contains(first) {
+            if first != own_prefix {
                 return Err(ManifestError::Invalid(format!(
                     "event {e:?} is namespaced under {first:?}, which this plugin does not own; \
-                     declare events under the plugin id ({:?}) or a declared connector id",
-                    self.id
+                     declare events under the plugin id ({own_prefix:?})"
                 )));
             }
         }
@@ -810,6 +810,7 @@ impl PluginManifest {
 
         // schemaVersion 4's sections (refused under an older one before this).
         self.validate_modules()?;
+        self.drop_screens_with_unsafe_paths();
         self.resolved_agent_tools = if self.agent_tools.is_empty() {
             Vec::new()
         } else {
@@ -824,6 +825,26 @@ impl PluginManifest {
     /// The connector declaring `command`, if one does.
     pub fn connector_for(&self, command: &str) -> Option<&ConnectorDecl> {
         self.connectors.iter().find(|c| c.commands.iter().any(|x| x == command))
+    }
+
+    /// A screen's `entry` and `files` are read from the plugin's folder and served, so each is held to the rule the paths of
+    /// a signed package are: on Windows `Path::join` with a drive path throws the folder away, and that rule is also what
+    /// keeps a stream or a device name out. A screen that lists anything else is left out with a warning, as a bad `ui`
+    /// entry is (presentation never stops a plugin from loading), and out of `extra`, which is what the dashboard and the
+    /// route read, so neither is left asking for it.
+    fn drop_screens_with_unsafe_paths(&mut self) {
+        let Some(screens) = self.extra.get_mut("ui").and_then(|ui| ui.get_mut("screens")).and_then(Value::as_array_mut) else {
+            return;
+        };
+        let warnings = &mut self.warnings;
+        screens.retain(|screen| {
+            let files = screen.get("files").and_then(Value::as_array).into_iter().flatten();
+            let unsafe_path = screen.get("entry").into_iter().chain(files).filter_map(Value::as_str).find(|path| super::trust::plain_package_path(path).is_err());
+            let Some(path) = unsafe_path else { return true };
+            let id = screen.get("id").and_then(Value::as_str).unwrap_or("");
+            warnings.push(format!("ui.screens: the screen {id:?} lists {path:?}, which is not a plain path inside the plugin's folder, so it is left out."));
+            false
+        });
     }
 
     /// The ids of the plugin's `ui.screens`.
@@ -1827,22 +1848,92 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_may_namespace_events_under_its_id_or_a_connector() {
+    fn a_plugin_may_namespace_events_under_its_own_id_only() {
         // aokie: id == aokie, connector id == aokie, events aokie.* — the real
         // shipped shape, which must still load.
         let d = write_manifest(&base());
         let m = PluginManifest::load(d.path()).expect("owned namespace loads");
         assert!(m.declares_event("aokie.call.incoming"));
 
-        // A connector-namespaced event on a differently-named plugin is fine.
+        // A connector is a name a plugin claims, not one it owns: declaring one called
+        // `aokie` once let a plugin declare, and so forge, `aokie.call.ended`.
         let mut v = base();
-        v["id"] = serde_json::json!("acme-weather");
-        v["connectors"] = serde_json::json!([{ "id": "weather", "commands": ["forecast.get"] }]);
-        v["capabilities"] = serde_json::json!(["connector.weather.forecast.get"]);
-        v["commands"] = serde_json::json!({ "journalled": [] });
-        v["events"] = serde_json::json!(["weather.updated"]);
+        v["id"] = serde_json::json!("aaa");
+        v["events"] = serde_json::json!(["aokie.call.ended"]);
         let d = write_manifest(&v);
-        assert!(PluginManifest::load(d.path()).is_ok(), "connector-owned namespace is legitimate");
+        let err = PluginManifest::load(d.path()).expect_err("a connector's name is not this plugin's to emit under");
+        assert!(err.reason().contains("does not own"), "{}", err.reason());
+
+        // Under its own id, whatever its connector is called.
+        v["events"] = serde_json::json!(["aaa.weather.updated"]);
+        let d = write_manifest(&v);
+        assert!(PluginManifest::load(d.path()).is_ok(), "its own namespace is legitimate");
+
+        // An event's name has no hyphens, so a plugin with one in its id emits under the id with `_` for it.
+        v["id"] = serde_json::json!("acme-weather");
+        v["events"] = serde_json::json!(["acme_weather.updated"]);
+        let d = write_manifest(&v);
+        assert!(PluginManifest::load(d.path()).is_ok(), "the id as an event's name can spell it");
+    }
+
+    // --- a screen's files -------------------------------------------------
+
+    /// What a screen lists is read from the plugin's folder and served, so each path must stay in it whatever the
+    /// system reads it as: `Path::join` with a drive-absolute path throws the folder away. A bad `ui` entry is dropped,
+    /// as a bad nav entry is: presentation never stops a plugin from loading.
+    #[test]
+    fn a_screen_that_lists_anything_but_a_plain_relative_path_is_dropped_with_a_warning() {
+        for bad in [
+            "C:/Users/someone/AppData/Roaming/com.oaiy.app/link/account.json",
+            "C:\\secret.txt",
+            "c:secret.txt",
+            "/etc/passwd",
+            "\\\\host\\share\\secret.txt",
+            "../secret.txt",
+            "ui/../../secret.txt",
+            "ui\\app.js",
+            "ui/app.js:hidden",
+            "ui//app.js",
+            "./app.js",
+            "ui/app.js.",
+            "ui/app.js ",
+            "%SystemDrive%/secret.txt",
+            "",
+        ] {
+            for field in ["files", "entry"] {
+                let mut screen = serde_json::json!({ "id": "bad", "entry": "ui/index.html", "files": ["ui/index.html", "ui/app.js"] });
+                if field == "entry" {
+                    screen["entry"] = serde_json::json!(bad);
+                } else {
+                    screen["files"][1] = serde_json::json!(bad);
+                }
+                let mut v = base();
+                v["ui"] = serde_json::json!({ "screens": [{ "id": "good", "entry": "ui/index.html", "files": ["ui/index.html"] }, screen] });
+                let d = write_manifest(&v);
+                let m = PluginManifest::load(d.path()).expect("a bad ui entry never stops a plugin from loading");
+                assert_eq!(m.ui_screen_ids().into_iter().collect::<Vec<_>>(), ["good"], "{field} {bad:?}");
+                assert!(m.warnings.iter().any(|w| w.contains("\"bad\"")), "{field} {bad:?}: {:?}", m.warnings);
+            }
+        }
+    }
+
+    /// The plugins there are: what each of them lists, and the connectors they declare under their own names.
+    #[test]
+    fn the_real_plugins_screens_and_events_are_all_plain() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tools/tinygpu/plugin/manifest.json");
+        for (name, text) in [
+            ("aokie", include_str!("fixtures/aokie-v4.manifest.json").to_string()),
+            ("aokie as released", include_str!("../update/testdata/aokie-manifest.json").to_string()),
+            ("egpu", fs::read_to_string(shipped).unwrap()),
+        ] {
+            let mut m: PluginManifest = serde_json::from_str(&text).unwrap();
+            let screens = m.ui_screen_ids();
+            m.drop_screens_with_unsafe_paths();
+            assert_eq!(m.ui_screen_ids(), screens, "{name}: {:?}", m.warnings);
+            assert!(m.warnings.is_empty(), "{name}: {:?}", m.warnings);
+            assert!(m.connectors.iter().all(|c| c.id == m.id), "{name}: {:?}", m.connectors);
+            assert!(m.events.iter().all(|e| e.split('.').next() == Some(m.id.as_str())), "{name}: {:?}", m.events);
+        }
     }
 
     #[test]

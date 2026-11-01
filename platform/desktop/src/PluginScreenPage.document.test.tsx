@@ -30,7 +30,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, text: async () => '<p>MOCK plugin</p>', arrayBuffer: async () => new ArrayBuffer(0) }));
   container = document.createElement('div'); document.body.append(container); root = createRoot(container);
 });
-afterEach(() => { act(() => root.unmount()); container.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { act(() => root.unmount()); container.remove(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function mount(connectDirect = true) {
   await act(async () => root.render(<PluginScreenPage pluginId="mock-plugin" navId="screen"/>));
   const frame = container.querySelector('iframe')!;
@@ -39,12 +39,36 @@ async function mount(connectDirect = true) {
   const ports = testPorts();
   const reply = vi.spyOn(ports.port2, 'postMessage');
   if (connectDirect) window.dispatchEvent(testMessageEvent({ source, ports: [ports.port2 as unknown as MessagePort], data: { __pluginHost: 1, documentNonce: nonce, method: 'document.connect' } }));
-  const send = (method: string, documentNonce: unknown = nonce, id = 'test') => ports.port1.postMessage({ __pluginHost: 1, documentNonce, id, method, args: method === 'command' ? ['read'] : method === 'aiComplete' ? [{}] : [] });
+  const send = (method: string, documentNonce: unknown = nonce, id = 'test', args?: unknown[]) => ports.port1.postMessage({ __pluginHost: 1, documentNonce, id, method, args: args ?? (method === 'command' ? ['read'] : method === 'aiComplete' ? [{}] : []) });
   // jsdom emits its initial iframe load; the next dispatched load models a
   // replacement document without fabricating a different WindowProxy.
   return { frame, nonce, source, reply, send };
 }
 describe('mounted plugin document replacement security', () => {
+  it('a screen hears only what its own plugin emits, and may ask only for the events its manifest declares', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const declared = 'mock-plugin.thing.happened';
+    mock.list.mockResolvedValue({ plugins: [{ ...plugin, manifest: { ...plugin.manifest, events: [declared] } }] });
+    mock.events.mockResolvedValue({ events: [], next: 0 });
+    const { reply, send } = await mount();
+    const answer = (id: string) => reply.mock.calls.map(([m]) => m as { id?: string; ok?: boolean; error?: string; event?: unknown }).find((m) => m.id === id);
+    await act(async () => send('subscribe', undefined, 'another-plugins', [['aokie.sms.received', 'aokie.call.incoming']]));
+    expect(answer('another-plugins')).toMatchObject({ ok: false, error: expect.stringContaining('aokie.sms.received') });
+    await act(async () => send('subscribe', undefined, 'one-of-each', [[declared, 'aokie.sms.received']]));
+    expect(answer('one-of-each')).toMatchObject({ ok: false });
+    await act(async () => send('subscribe', undefined, 'its-own', [[declared]]));
+    expect(answer('its-own')).toMatchObject({ ok: true });
+
+    reply.mockClear();
+    const own = { name: declared, source: 'mock-plugin', data: { fine: true } };
+    mock.events.mockResolvedValue({ next: 9, events: [
+      { seq: 7, envelope: { name: 'aokie.sms.received', source: 'aokie', data: { from: '+61491570156', text: 'PRIVATE' } } },
+      { seq: 8, envelope: { name: declared, source: 'aokie', data: { text: 'PRIVATE under a name this screen may hear' } } },
+      { seq: 9, envelope: own },
+    ] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(reply.mock.calls.map(([m]) => (m as { event?: unknown }).event).filter(Boolean)).toEqual([own]);
+  });
   it('legitimate first load works; replacement load disposes AI/voice and cannot replay the old nonce or source', async () => {
     const { frame, source, nonce, reply, send } = await mount();
     await act(async () => send('voice.status'));

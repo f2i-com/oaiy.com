@@ -23,15 +23,20 @@
 //! peer key is pinned at first contact, so a later frame naming the same
 //! request under a different key is refused rather than opened.
 //!
+//! A restarted counter is safe only while no two requests share a box key, so
+//! a peer key gets one request, ever, in every lane and across restarts: see
+//! [`SpentKeys`].
+//!
 //! Scope note, stated rather than hidden: the reference implementation this is
 //! adapted from keeps its identity secret in the OS credential store. OAIY has
 //! no credential-store module, so the secret is a file with owner-only
 //! permissions where the platform offers them — the same posture as this app's
 //! other on-device secrets, and weaker than a keyring on a shared machine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use crypto_box::aead::Aead;
@@ -39,6 +44,12 @@ use crypto_box::{PublicKey, SalsaBox, SecretKey};
 
 /// The identity secret's file name, beside the rest of the app's data.
 const IDENTITY_KEY_FILE: &str = "desktop-e2e-identity.key";
+/// How many spent keys are remembered: some three years at a thousand requests a day. Past it the
+/// older half is forgotten, so a request older than that could be replayed once.
+const MAX_SPENT_KEYS: usize = 1 << 20;
+/// What is kept of a key. Its leading bytes, not all of it: X25519 ignores a public key's top bit,
+/// so a key with that bit flipped is another string that opens the same box.
+const SPENT_KEY_BYTES: usize = 16;
 
 /// browser → desktop (request envelopes and later input frames).
 pub const DIR_BROWSER_TO_DESKTOP: u8 = 0x00;
@@ -97,10 +108,124 @@ impl std::fmt::Display for E2eError {
 
 impl std::error::Error for E2eError {}
 
+/// The request keys this desktop has opened or sealed under, whichever lane it was.
+///
+/// A sealed reply's nonce is a direction and a counter that starts at 0 for every request, and the
+/// box key comes from the browser's ephemeral key alone. The browser makes a new one for each
+/// request, so two replies never share a key and a nonce, unless the row is replayed. Nothing in a
+/// request expires and a session ends with its request, so a backend holding a recorded `ephPub`
+/// and envelope could post them again under a new id at any time. The reply, an error naming a
+/// `kind` the backend wrote, went out at the same key and nonce as the real answer, under the same
+/// stream cipher: known plaintext, and the real answer falls to an XOR. The sealed flows lane was
+/// open to the same thing, and shares this identity. So a key is good for one request, for good,
+/// and that has to outlive a restart, because a recorded request does.
+///
+/// A row offered again after a crash is refused too. It has to be: answering it would reuse the
+/// nonce just the same. The browser mints a new key when the person tries again.
+struct SpentKeys {
+    file: Option<PathBuf>,
+    state: Mutex<SpentState>,
+}
+
+#[derive(Default)]
+struct SpentState {
+    known: HashSet<[u8; SPENT_KEY_BYTES]>,
+    order: VecDeque<[u8; SPENT_KEY_BYTES]>,
+    /// Why the file could not be read. Nothing is sealed until it can: a forgotten key is a replay.
+    unreadable: Option<String>,
+}
+
+impl SpentKeys {
+    fn in_memory() -> Self {
+        Self { file: None, state: Mutex::new(SpentState::default()) }
+    }
+
+    /// The one store for a data folder, whichever lane asks: the lanes share an identity.
+    fn for_dir(dir: &Path) -> Arc<Self> {
+        static OPEN: OnceLock<Mutex<HashMap<PathBuf, Arc<SpentKeys>>>> = OnceLock::new();
+        let mut open = OPEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        // Beside the identity, and not a secret: a key in it was sent in the clear.
+        open.entry(dir.to_path_buf()).or_insert_with(|| Arc::new(Self::load(dir.join("desktop-e2e-spent.bin")))).clone()
+    }
+
+    fn load(path: PathBuf) -> Self {
+        let mut state = SpentState::default();
+        let mut bytes = Vec::new();
+        let read = std::fs::File::open(&path).and_then(|mut file| file.read_to_end(&mut bytes));
+        match read {
+            Ok(_) => {
+                // A crash can leave part of the last entry. The whole ones count, and the rest
+                // goes, or every later entry would be read out of step.
+                let whole = bytes.len() - bytes.len() % SPENT_KEY_BYTES;
+                if whole != bytes.len() {
+                    if let Err(e) = std::fs::OpenOptions::new().write(true).open(&path).and_then(|f| f.set_len(whole as u64)) {
+                        state.unreadable = Some(format!("could not repair the spent keys: {e}"));
+                    }
+                }
+                for entry in bytes[..whole].chunks_exact(SPENT_KEY_BYTES) {
+                    let mut key = [0u8; SPENT_KEY_BYTES];
+                    key.copy_from_slice(entry);
+                    if state.known.insert(key) {
+                        state.order.push_back(key);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => state.unreadable = Some(format!("could not read the spent keys: {e}")),
+        }
+        Self { file: Some(path), state: Mutex::new(state) }
+    }
+
+    /// Mark a key used, durably, before anything is sealed under it. False: it was used before.
+    fn spend(&self, key: &[u8; 32]) -> Result<bool, String> {
+        let mut entry = [0u8; SPENT_KEY_BYTES];
+        entry.copy_from_slice(&key[..SPENT_KEY_BYTES]);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(why) = &state.unreadable {
+            return Err(why.clone());
+        }
+        if state.known.contains(&entry) {
+            return Ok(false);
+        }
+        if let Some(path) = &self.file {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("could not note the request key: {e}"))?;
+            file.write_all(&entry)
+                .and_then(|()| file.sync_data())
+                .map_err(|e| format!("could not note the request key: {e}"))?;
+        }
+        state.known.insert(entry);
+        state.order.push_back(entry);
+        if state.order.len() > MAX_SPENT_KEYS {
+            self.forget_the_older_half(&mut state)?;
+        }
+        Ok(true)
+    }
+
+    fn forget_the_older_half(&self, state: &mut SpentState) -> Result<(), String> {
+        let keep = MAX_SPENT_KEYS / 2;
+        while state.order.len() > keep {
+            if let Some(old) = state.order.pop_front() {
+                state.known.remove(&old);
+            }
+        }
+        let Some(path) = &self.file else { return Ok(()) };
+        let bytes: Vec<u8> = state.order.iter().flatten().copied().collect();
+        let staged = path.with_extension("bin.new");
+        std::fs::write(&staged, bytes)
+            .and_then(|()| std::fs::rename(&staged, path))
+            .map_err(|e| format!("could not trim the spent keys: {e}"))
+    }
+}
+
 /// This desktop's long-term X25519 identity.
 pub struct E2eIdentity {
     secret: SecretKey,
     public: PublicKey,
+    spent: Arc<SpentKeys>,
 }
 
 impl E2eIdentity {
@@ -108,7 +233,13 @@ impl E2eIdentity {
     pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
         let secret = SecretKey::from(bytes);
         let public = secret.public_key();
-        Self { secret, public }
+        Self { secret, public, spent: Arc::new(SpentKeys::in_memory()) }
+    }
+
+    /// Mark a request key used, before anything is opened for good or sealed under it. False
+    /// means it has been, and nothing may be sealed to it again ([`SpentKeys`]).
+    pub fn spend_request_key(&self, eph_pub: &[u8; 32]) -> Result<bool, E2eError> {
+        self.spent.spend(eph_pub).map_err(E2eError::invalid)
     }
 
     /// Mint a fresh identity from OS randomness.
@@ -149,19 +280,22 @@ impl E2eIdentity {
         let path: PathBuf = dir.join(IDENTITY_KEY_FILE);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                return Self::decode_secret(text.trim()).ok_or_else(|| {
+                let mut identity = Self::decode_secret(text.trim()).ok_or_else(|| {
                     format!(
                         "the e2e identity at {} is unreadable — move it aside to mint a new one, \
                          but every browser that trusted this desktop will ask you to trust it again",
                         path.display()
                     )
-                });
+                })?;
+                identity.spent = SpentKeys::for_dir(dir);
+                return Ok(identity);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("could not read the e2e identity: {e}")),
         }
 
-        let identity = Self::generate()?;
+        let mut identity = Self::generate()?;
+        identity.spent = SpentKeys::for_dir(dir);
         // Written to a staging file and renamed, so an interrupted first boot
         // cannot leave a half-written key that the branch above then refuses. The
         // staging file is created owner-only, not narrowed after the write: a copy
@@ -322,6 +456,9 @@ impl E2eSessions {
         let plaintext = shared
             .decrypt((&nonce).into(), ct.as_slice())
             .map_err(|_| E2eError::invalid("authentication failed"))?;
+        if !identity.spend_request_key(&eph_pub_bytes)? {
+            return Err(E2eError::invalid("this request's key has been used before"));
+        }
         self.insert(
             thread,
             ThreadSession {
@@ -451,6 +588,8 @@ fn seal_detached_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPENT_KEYS_FILE: &str = "desktop-e2e-spent.bin";
 
     fn identity(seed: u8) -> E2eIdentity {
         E2eIdentity::from_secret_bytes([seed; 32])
@@ -658,6 +797,115 @@ mod tests {
         );
     }
 
+    /// A recorded request and the frames it was answered with, for the replays below.
+    fn sealed_request(desktop: &E2eIdentity, seed: u8) -> (String, String) {
+        let (secret, public) = browser_keypair(seed);
+        let envelope = seal_detached_envelope(&secret, &desktop.public_key_bytes(), DIR_BROWSER_TO_DESKTOP, 0, b"{\"v\":1}").unwrap();
+        (B64.encode(public), envelope)
+    }
+
+    #[test]
+    fn a_recorded_request_opens_once_under_any_id_in_any_lane() {
+        let desktop = identity(0xD4);
+        let (eph, envelope) = sealed_request(&desktop, 0xB4);
+        let chat = E2eSessions::new();
+        chat.open_inbound(&desktop, "req-1", &eph, &envelope).unwrap();
+        let first = chat.seal_outbound("req-1", b"the answer").unwrap();
+        chat.drop_thread("req-1");
+
+        // The backend posts the same row under a new id, or the old one once its session is gone.
+        for id in ["req-2", "req-1"] {
+            let refused = chat.open_inbound(&desktop, id, &eph, &envelope).unwrap_err();
+            assert_eq!(refused.code(), "sealed_envelope_invalid", "{id}");
+            assert!(refused.message().contains("used before"), "{}", refused.message());
+            assert!(chat.seal_outbound(id, b"chosen").is_err(), "no session, so nothing to seal with");
+        }
+        // The flows lane makes a set of sessions for each poll, and shares the identity.
+        assert!(E2eSessions::new().open_inbound(&desktop, "flow-1", &eph, &envelope).is_err());
+        assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn flipping_a_keys_top_bit_is_not_a_new_key() {
+        // X25519 ignores that bit, so this string opens the same box.
+        let desktop = identity(0xD5);
+        let (eph, envelope) = sealed_request(&desktop, 0xB5);
+        let sessions = E2eSessions::new();
+        sessions.open_inbound(&desktop, "req-1", &eph, &envelope).unwrap();
+        let mut flipped = decode_b64_fixed::<32>(&eph, "ephPub").unwrap();
+        flipped[31] ^= 0x80;
+        let refused = sessions.open_inbound(&desktop, "req-2", &B64.encode(flipped), &envelope).unwrap_err();
+        assert!(refused.message().contains("used before"), "the box opened: {}", refused.message());
+    }
+
+    #[test]
+    fn the_later_frames_of_a_live_request_are_not_replays() {
+        let desktop = identity(0xD6);
+        let (secret, public) = browser_keypair(0xB6);
+        let eph = B64.encode(public);
+        let seal = |counter| seal_detached_envelope(&secret, &desktop.public_key_bytes(), DIR_BROWSER_TO_DESKTOP, counter, b"input").unwrap();
+        let sessions = E2eSessions::new();
+        sessions.open_inbound(&desktop, "req-1", &eph, &seal(0)).unwrap();
+        sessions.open_inbound(&desktop, "req-1", &eph, &seal(1)).unwrap();
+        sessions.open_inbound(&desktop, "req-1", &eph, &seal(2)).unwrap();
+    }
+
+    #[test]
+    fn spent_keys_outlive_a_restart_and_a_torn_write() {
+        let dir = crate::secret_file::testing::TempDir::new("e2espent");
+        let path = dir.0.join(SPENT_KEYS_FILE);
+        let store = SpentKeys::load(path.clone());
+        assert!(store.spend(&[1u8; 32]).unwrap());
+        assert!(!store.spend(&[1u8; 32]).unwrap());
+        assert!(store.spend(&[2u8; 32]).unwrap());
+        drop(store);
+
+        // Part of a third entry, as a crash mid-write leaves.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[9u8; 5]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let store = SpentKeys::load(path.clone());
+        assert!(!store.spend(&[1u8; 32]).unwrap(), "read back");
+        assert!(!store.spend(&[2u8; 32]).unwrap(), "read back");
+        assert!(store.spend(&[3u8; 32]).unwrap(), "new, and written in step");
+        drop(store);
+        assert!(!SpentKeys::load(path).spend(&[3u8; 32]).unwrap());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_seals_nothing() {
+        // A folder in its place: the file exists and cannot be read.
+        let dir = crate::secret_file::testing::TempDir::new("e2espent-broken");
+        std::fs::create_dir_all(dir.0.join(SPENT_KEYS_FILE)).unwrap();
+        let store = SpentKeys::load(dir.0.join(SPENT_KEYS_FILE));
+        assert!(store.spend(&[1u8; 32]).is_err());
+    }
+
+    #[test]
+    fn past_the_limit_the_older_half_goes_and_the_file_agrees() {
+        let dir = crate::secret_file::testing::TempDir::new("e2espent-trim");
+        let path = dir.0.join(SPENT_KEYS_FILE);
+        let key = |n: u32| { let mut k = [0u8; 32]; k[..4].copy_from_slice(&n.to_be_bytes()); k };
+        let store = SpentKeys::load(path.clone());
+        {
+            let mut state = store.state.lock().unwrap();
+            for n in 0..MAX_SPENT_KEYS as u32 {
+                let mut entry = [0u8; SPENT_KEY_BYTES];
+                entry.copy_from_slice(&key(n)[..SPENT_KEY_BYTES]);
+                state.known.insert(entry);
+                state.order.push_back(entry);
+            }
+        }
+        let newest = MAX_SPENT_KEYS as u32;
+        assert!(store.spend(&key(newest)).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len() as usize, MAX_SPENT_KEYS / 2 * SPENT_KEY_BYTES);
+        assert!(store.spend(&key(0)).unwrap(), "the oldest went");
+        assert!(!store.spend(&key(newest)).unwrap(), "the newest stayed");
+        drop(store);
+        assert!(!SpentKeys::load(path).spend(&key(newest)).unwrap(), "and the file says so");
+    }
+
     #[test]
     fn the_identity_survives_a_restart_and_a_broken_one_is_not_silently_rotated() {
         let dir = std::env::temp_dir().join(format!("oaiy-e2e-{}", uuid::Uuid::new_v4().simple()));
@@ -690,6 +938,17 @@ mod tests {
         assert_eq!(stored.public_key_b64(), identity.public_key_b64(), "the file holds this identity's whole secret");
         let names: Vec<_> = std::fs::read_dir(dir.0.join("data")).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 1, "no staging file is left beside the key: {names:?}");
+    }
+
+    #[test]
+    fn the_lanes_of_one_data_folder_share_their_spent_keys() {
+        // The tunnel and the sealed flows lane each load the identity themselves.
+        let dir = crate::secret_file::testing::TempDir::new("e2espent-lanes");
+        let data = dir.0.join("data");
+        let tunnel = E2eIdentity::load_or_create(&data).unwrap();
+        let flows = E2eIdentity::load_or_create(&data).unwrap();
+        assert!(tunnel.spend_request_key(&[7u8; 32]).unwrap());
+        assert!(!flows.spend_request_key(&[7u8; 32]).unwrap());
     }
 
     #[test]

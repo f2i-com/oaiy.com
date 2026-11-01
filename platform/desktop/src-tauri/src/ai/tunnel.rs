@@ -123,7 +123,7 @@ impl Lane<'_> {
             crate::link::net::drain_async(resp).await;
             return Err(format!("the approval poll failed: HTTP {status}"));
         }
-        resp.json::<Value>()
+        crate::link::net::read_json_async::<Value>(resp)
             .await
             .map_err(|e| format!("the approval poll returned nothing readable: {e}"))
     }
@@ -429,7 +429,7 @@ impl AiTunnel {
             return Ok(());
         }
         let status = resp.status().as_u16();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let body: Value = crate::link::net::read_json_async(resp).await.unwrap_or(Value::Null);
         let message = body
             .get("message")
             .and_then(Value::as_str)
@@ -483,7 +483,7 @@ impl AiTunnel {
                     tokio::time::sleep(wait).await;
                 }
             }
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let body: Value = crate::link::net::read_json_async(resp).await.unwrap_or(Value::Null);
             let message = body
                 .get("message")
                 .and_then(Value::as_str)
@@ -495,8 +495,7 @@ impl AiTunnel {
             }
             return Err(format!("HTTP {}: {message}", status.as_u16()));
         }
-        let reply: PendingReply = resp
-            .json()
+        let reply: PendingReply = crate::link::net::read_json_async_up_to(resp, crate::link::net::MAX_LIST_BYTES)
             .await
             .map_err(|e| format!("the AI lane returned an unreadable batch: {e}"))?;
 
@@ -624,6 +623,11 @@ impl AiTunnel {
         .ok()?
         .try_into()
         .ok()?;
+        // Counter 0 under this key once, ever. A garbled envelope naming a key the backend holds
+        // back would otherwise get a reply of known text at the nonce the real answer then uses.
+        if !self.identity.spend_request_key(&eph).unwrap_or(false) {
+            return None;
+        }
         crate::ai::e2e::seal_detached_envelope(
             &self.identity.secret_key_bytes(),
             &eph,
@@ -656,6 +660,7 @@ impl AiTunnel {
                 "the sealed body has no v:1 marker",
             ));
         }
+        sealed_route_matches(request, &body)?;
         let model = body.get("model").and_then(Value::as_str).map(str::to_string);
         if let Some(m) = model.as_deref() {
             if m.is_empty() || m.len() > 256 || m.chars().any(char::is_control) {
@@ -947,7 +952,7 @@ impl AiTunnel {
                     message["tool_calls"] = Value::Array(
                         calls
                             .iter()
-                            .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.input.to_string() } }))
+                            .map(|c| json!({ "id": c.provider_id, "type": "function", "function": { "name": c.name, "arguments": c.input.to_string() } }))
                             .collect(),
                     );
                     convo.push(message);
@@ -1343,7 +1348,7 @@ fn push_result(
             "role": "tool",
             // Every tool_call must receive a reply carrying its id, or the
             // next request is malformed and the provider refuses the round.
-            "tool_call_id": call.id,
+            "tool_call_id": call.provider_id,
             "name": call.name,
             "content": rendered,
         })),
@@ -1444,9 +1449,61 @@ fn urlencode(value: &str) -> String {
     out
 }
 
+/// The row's `kind` and `providerId` are routing plaintext, and the browser seals both. A backend
+/// that rewrote them chose who reads a sealed prompt: one kept on this computer's own engine could
+/// be sent to a cloud provider on the owner's key.
+fn sealed_route_matches(request: &AiRequest, body: &Value) -> Result<(), TunnelError> {
+    let kind = request.kind.as_deref().unwrap_or("chat");
+    let provider = request.provider_id.as_deref().unwrap_or("");
+    if body.get("kind").and_then(Value::as_str) == Some(kind)
+        && body.get("providerId").and_then(Value::as_str) == Some(provider)
+    {
+        return Ok(());
+    }
+    Err(TunnelError::new("sealed_envelope_invalid", "the sealed turn does not match its row"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(kind: &str, provider: &str, eph_pub: &str) -> AiRequest {
+        serde_json::from_value(json!({ "requestId": "turn-1", "kind": kind, "providerId": provider, "ephPub": eph_pub })).unwrap()
+    }
+
+    #[test]
+    fn a_row_cannot_send_a_sealed_turn_elsewhere() {
+        let sealed = json!({ "v": 1, "kind": "chat", "providerId": "oaiy-engine" });
+        assert!(sealed_route_matches(&row("chat", "oaiy-engine", "k"), &sealed).is_ok());
+        for moved in [row("chat", "openai", "k"), row("models", "oaiy-engine", "k")] {
+            assert_eq!(sealed_route_matches(&moved, &sealed).unwrap_err().code(), "sealed_envelope_invalid");
+        }
+        // A body with no route is not one this desktop's browsers seal.
+        assert!(sealed_route_matches(&row("chat", "oaiy-engine", "k"), &json!({ "v": 1 })).is_err());
+    }
+
+    #[test]
+    fn the_providers_list_keeps_its_placeholder_route() {
+        // The browser asks for the list under the provider "all", sealed and on the row alike.
+        let sealed = json!({ "v": 1, "kind": "providers", "providerId": "all" });
+        assert!(sealed_route_matches(&row("providers", "all", "k"), &sealed).is_ok());
+    }
+
+    #[test]
+    fn an_error_is_sealed_to_a_key_once() {
+        // Whatever the backend knows the text of, it must not get twice at one nonce, nor before
+        // the real answer: a garbled envelope naming a held-back key came first.
+        let (tunnel, dir) = tunnel_in("seal-error");
+        let secret = crypto_box::SecretKey::from([0xB7u8; 32]);
+        let eph = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret.public_key().to_bytes());
+        let request = row("chat", "oaiy-engine", &eph);
+        assert!(tunnel.seal_error(&request, "invalid_request", "first").is_some());
+        assert!(tunnel.seal_error(&request, "invalid_request", "second").is_none());
+        let envelope = crate::ai::e2e::seal_detached_envelope(&[0xB7u8; 32], &tunnel.identity.public_key_bytes(), crate::ai::e2e::DIR_BROWSER_TO_DESKTOP, 0, b"{}").unwrap();
+        let refused = tunnel.sessions.open_inbound(&tunnel.identity, "turn-2", &eph, &envelope).unwrap_err();
+        assert!(refused.message().contains("used before"), "{}", refused.message());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn slow_optional_provider_does_not_block_catalog_or_duplicate_probes() {

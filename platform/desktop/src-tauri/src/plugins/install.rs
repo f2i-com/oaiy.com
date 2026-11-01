@@ -151,6 +151,14 @@ fn extract_tar_gz(archive: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Does a ZIP entry's name start at a root or a drive (`/x`, `\x`, `C:/x`, `C:x`, `\\host\share\x`)? zip's
+/// `enclosed_name` takes those off and answers the rest (`C:/Windows/x` is `Windows/x`) instead of refusing the name, as it
+/// did up to zip 2, and such a name is nothing a package holds. Read as text, as `node_runtime::safe_member` reads a tar's:
+/// what an archive holds is decided by whoever built it, not by the system that opens it.
+pub(crate) fn zip_name_is_rooted(name: &str) -> bool {
+    name.starts_with(['/', '\\']) || matches!(name.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic())
+}
+
 /// Aokie's published artifact is a ZIP. Apply the same containment and resource
 /// limits as the tar path, and reject links rather than materializing them.
 fn extract_zip(archive: &Path, dst: &Path) -> Result<(), String> {
@@ -161,6 +169,9 @@ fn extract_zip(archive: &Path, dst: &Path) -> Result<(), String> {
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        if zip_name_is_rooted(&entry.name().map_err(|e| format!("invalid plugin ZIP: {e}"))?) {
+            return Err("ZIP path escapes the package".into());
+        }
         let relative = entry.enclosed_name().ok_or("ZIP path escapes the package")?;
         if !safe_relative(&relative) || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return Err("ZIP entries must be regular files/directories inside the package".into());
@@ -546,6 +557,62 @@ mod tests {
         assert!(install_from_path(&archive, &root, &dev_trust(&base)).is_err());
         assert!(!root.join("outside.txt").exists());
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// On Windows a name can mean something other than a file in the package: `notes.txt:hidden` is a stream of
+    /// `notes.txt`, `aux.txt` is the AUX device, and a trailing dot or space is dropped, so that one name stands for
+    /// another. None of them is a name a package has, so the archive is refused, however the unpacker words it.
+    #[cfg(windows)]
+    #[test]
+    fn a_zip_name_windows_reads_as_something_else_is_refused() {
+        use std::io::Write;
+        let base = tmp("zip-windows-names");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let archive = base.join("plugin.zip");
+        for hostile in ["notes.txt:hidden", "a:b", "ui/aux.txt", "CON", "manifest.json.", "manifest.json "] {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            for name in ["manifest.json", "x.exe"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+            }
+            zip.start_file(hostile, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"not a file of the package").unwrap();
+            zip.finish().unwrap();
+            assert!(install_from_path(&archive, &root, &dev_trust(&base)).is_err(), "{hostile:?} was unpacked");
+            assert!(!root.join("demo").exists(), "{hostile:?} left an installed plugin");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// zip 9's `enclosed_name` takes a root or a drive off a name and answers the rest, where zip 2's refused it: the
+    /// archive must still be refused, on every system, or `C:/Windows/x` is installed as `Windows/x`.
+    #[test]
+    fn a_zip_name_that_starts_at_a_root_or_a_drive_is_refused() {
+        use std::io::Write;
+        let base = tmp("zip-rooted-names");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let archive = base.join("plugin.zip");
+        for hostile in ["/outside.txt", "\\outside.txt", "C:/outside.txt", "C:\\outside.txt", "c:outside.txt", "//host/share/outside.txt", "\\\\?\\C:\\outside.txt"] {
+            assert!(zip_name_is_rooted(hostile), "{hostile:?}");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            for name in ["manifest.json", "x.exe"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+            }
+            zip.start_file(hostile, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"not a file of the package").unwrap();
+            zip.finish().unwrap();
+            assert!(install_from_path(&archive, &root, &dev_trust(&base)).is_err(), "{hostile:?} was unpacked");
+            assert!(!root.join("demo").exists(), "{hostile:?} left an installed plugin");
+        }
+        for fine in ["manifest.json", "ui/index.html", "./manifest.json", "notes:hidden", "ui\\index.html"] {
+            assert!(!zip_name_is_rooted(fine), "{fine:?}");
+        }
         let _ = std::fs::remove_dir_all(base);
     }
 

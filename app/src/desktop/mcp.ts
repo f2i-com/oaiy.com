@@ -244,6 +244,16 @@ export const COVERED: Readonly<Record<string, string>> = {
 
 /** The most of a tool's answer the model reads. */
 const MAX_RESULT = 12_000;
+/** The most of a tool's input a question shows: enough to read, and it says when there was more. */
+const MAX_ASKED = 1_000;
+
+/** What the person is asked before a tool runs. */
+export interface ControlQuestion {
+  title: string;
+  message: string;
+  ok: string;
+  danger?: boolean;
+}
 
 /** What a conversation's control tools need. */
 export interface ControlToolDeps {
@@ -251,8 +261,33 @@ export interface ControlToolDeps {
   client: () => ControlClient | null;
   /** The names the conversation's other tools go by: the app's own come first. */
   taken: ReadonlySet<string>;
+  /** Ask the person; true when they allow it. */
+  approve: (question: ControlQuestion) => Promise<boolean>;
   /** A change tool ran and did what it was asked (by its name on the desktop). */
   changed?: (tool: string) => void;
+}
+
+/**
+ * Does running `tool` take the person's leave? What removes something cannot be put back, and a plugin's command can be a
+ * text or a call: the same conversation reads web pages and imported files, whose words can ask the model for either, and
+ * the same effects through a plugin's own tools and outreach already ask. (`plugin_command` is the one change tool that
+ * says nothing of what it changes, so its annotations cannot speak for it.)
+ */
+function asksFirst(tool: ControlTool): boolean {
+  return tool.destructive || tool.name === 'plugin_command';
+}
+
+/** `value` as the person reads it: all of it, or the start of it and how much more there is. */
+function shown(value: unknown): string {
+  const text = JSON.stringify(value) ?? 'nothing';
+  return text.length > MAX_ASKED ? `${text.slice(0, MAX_ASKED)}… (${text.length - MAX_ASKED} more characters)` : text;
+}
+
+/** What `tool` is about to do with `input`, for the person: a plugin's command by what it sends, anything else by its name and input. */
+function askedFor(tool: ControlTool, input: Record<string, unknown>): string {
+  if (tool.name !== 'plugin_command') return `${tool.title || tool.name}: ${shown(input)}`;
+  const what = `Send the ${String(input.pluginId)} plugin the command ${String(input.command)}`;
+  return input.payload === undefined ? `${what}, with no payload.` : `${what}, with ${shown(input.payload)}`;
 }
 
 /** A tool's text with the names of the tools left out swapped for the app's that stand in for them. */
@@ -283,7 +318,8 @@ export function controlOutcome(result: ControlResult): string {
  * agent's tools: none for a call, a text thread or a flow's task; read tools
  * only for the runner. A tool the app's own already does (`COVERED`) is left
  * out when the app's is there; one whose name another of the conversation's
- * tools has gets `oaiy_` in front.
+ * tools has gets `oaiy_` in front. A tool that removes something, and a plugin's
+ * command, ask the person first (`asksFirst`).
  */
 export function controlSessionTools(tools: ControlTool[], session: ControlSession, deps: ControlToolDeps): SessionTool[] {
   if (UNOFFERED.has(session)) return [];
@@ -303,6 +339,11 @@ export function controlSessionTools(tools: ControlTool[], session: ControlSessio
       run: async (input, signal) => {
         const client = deps.client();
         if (!client) throw new Error('OAIY Desktop is not connected, so OAIY cannot be checked or changed from here');
+        if (asksFirst(tool)) {
+          const message = askedFor(tool, input);
+          const allowed = await deps.approve({ title: `Allow ${name}?`, message, ok: 'Allow', ...(tool.destructive ? { danger: true } : {}) });
+          if (!allowed) return `The person declined, so ${name} did not run (${message}). Do not try it again unless they ask.`;
+        }
         const result = await client.call(session, tool.name, input, signal);
         const text = controlOutcome(result);
         // A tool that failed is read by the model as an error, and says what to do about it.
@@ -323,11 +364,11 @@ export function controlSessionTools(tools: ControlTool[], session: ControlSessio
  * name reaches the model twice. With none listed for this kind (no desktop, an
  * older one, a call, a text or a flow's task) `own` comes back as it is.
  */
-export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, changed?: (tool: string) => void, files?: () => Vfs | null): SessionTool[] {
+export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, approve: ControlToolDeps['approve'], changed?: (tool: string) => void, files?: () => Vfs | null): SessionTool[] {
   const listed = client()?.listed(session) ?? [];
   if (!listed.length) return own;
   const taken = new Set([...builtIns, ...own.map((t) => t.spec.name)]);
-  return distinctTools([...withNodeCalls(own, listed, session, client, changed, files), ...controlSessionTools(listed, session, { client, taken, changed })]);
+  return distinctTools([...withNodeCalls(own, listed, session, client, changed, files), ...controlSessionTools(listed, session, { client, taken, approve, changed })]);
 }
 
 /** The longest a flow run on another computer is waited for (the desktop's flow_run with node takes up to 600 s). */

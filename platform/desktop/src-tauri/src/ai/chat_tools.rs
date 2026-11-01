@@ -94,7 +94,7 @@ pub async fn catalog(
     if !resp.status().is_success() {
         return Vec::new();
     }
-    let Ok(body) = resp.json::<Value>().await else {
+    let Ok(body) = crate::link::net::read_json_async_up_to::<Value>(resp, crate::link::net::MAX_LIST_BYTES).await else {
         return Vec::new();
     };
     let rows = body
@@ -174,9 +174,22 @@ pub fn preamble_with_intro(intro: &str, tools: &[Tool]) -> String {
 /// A tool call the model asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
+    /// This desktop's own id for the call, never the same twice: what its frames, its proposal and the approval go by.
     pub id: String,
+    /// The provider's id for it, for the `tool` message and nothing else: it answers to the model, may be
+    /// missing, and says nothing about which call a person approved.
+    pub provider_id: String,
     pub name: String,
     pub input: Value,
+}
+
+/// A call's own id: the name and a number of its own. The browser matches an approval to its proposal by it, so it is never
+/// the same twice: one id per name, or a provider's own, let a late Approve of a call that had timed out authorise a later
+/// call to the same tool with other input.
+fn next_call_id(kind: &str, name: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{kind}-{name}-{n}")
 }
 
 /// Read a prompt-only reply: either ONE well-formed fenced call, or the text.
@@ -194,15 +207,12 @@ pub fn parse_prompted(reply: &str, tools: &[Tool]) -> Option<ToolCall> {
     if !tools.iter().any(|t| t.name == name) {
         return None;
     }
-    // Prompt-only replies carry no call id, so one is made: the name and a
-    // number of its own. The browser matches an approval to its proposal by
-    // it, so it is never the same twice: one id per name, "prompted-x", let a
-    // late Approve of a call that had timed out authorise a later call to the
-    // same tool with other input.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Prompt-only replies carry no call id, and go back as a line of text, so
+    // the id made for them is all there is.
+    let id = next_call_id("prompted", name);
     Some(ToolCall {
-        id: format!("prompted-{name}-{n}"),
+        provider_id: id.clone(),
+        id,
         name: name.to_string(),
         input: parsed
             .get("input")
@@ -252,7 +262,10 @@ pub fn parse_native(message: &Value) -> Vec<ToolCall> {
                         .and_then(|a| serde_json::from_str::<Value>(a).ok())
                         .unwrap_or_else(|| json!({}));
                     Some(ToolCall {
-                        id: c
+                        id: next_call_id("native", name),
+                        // (a provider that gives no id gets the name back, as it always has: the
+                        // `tool` message has to carry something)
+                        provider_id: c
                             .get("id")
                             .and_then(Value::as_str)
                             .unwrap_or(name)
@@ -295,7 +308,11 @@ pub async fn execute(
         }
     };
     let status = resp.status();
-    let value: Value = resp.json().await.unwrap_or(Value::Null);
+    // Past the cap the tool ran and its answer cannot be read: a failure the model is told of, not an empty success.
+    let value: Value = match crate::link::net::read_body_async(resp, crate::link::net::MAX_REPLY_BYTES).await {
+        Ok(body) => serde_json::from_slice(&body).unwrap_or(Value::Null),
+        Err(error) => return Executed::Failed { error, terminal: false },
+    };
     if status.is_success() {
         // Unwrap the envelope, tolerating a bare body.
         return Executed::Ok(value.get("data").cloned().unwrap_or(value));
@@ -636,7 +653,7 @@ mod tests {
         });
         let calls = parse_native(&message);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].provider_id, "call_1");
         assert_eq!(calls[0].input["title"], "Contact");
 
         // A reply with no tool_calls is an answer, not an empty call list bug.
@@ -645,6 +662,33 @@ mod tests {
         // whole round — the tool's own validation gives a better message.
         let bad = json!({ "tool_calls": [{ "id": "c", "function": { "name": "x", "arguments": "{" } }] });
         assert_eq!(parse_native(&bad)[0].input, json!({}));
+    }
+
+    /// A provider that gives its calls no id left the call's id the tool's name, so a late Approve of a call that had timed
+    /// out was read as the approval of the next call to that tool, with input nobody saw. A proposal and its approval go by
+    /// an id of the desktop's own, whatever the provider says; the provider's goes back to it, in the `tool` message.
+    #[test]
+    fn every_native_call_is_proposed_under_an_id_of_its_own() {
+        let with_no_id = json!({ "tool_calls": [{ "type": "function", "function": { "name": "create_form", "arguments": "{\"title\":\"A\"}" } }] });
+        let (first, second) = (parse_native(&with_no_id).remove(0), parse_native(&with_no_id).remove(0));
+        assert_ne!(first.id, second.id, "a late approval of the first is not read as the second's");
+        assert_eq!(first.provider_id, "create_form", "what the `tool` message carries when the provider gave none");
+
+        let repeated = json!({ "tool_calls": [{ "id": "call_0", "function": { "name": "x", "arguments": "{}" } }] });
+        let (one, again) = (parse_native(&repeated).remove(0), parse_native(&repeated).remove(0));
+        assert_ne!(one.id, again.id, "nor is a provider's id trusted to be different each time");
+        assert_eq!((one.provider_id.as_str(), again.provider_id.as_str()), ("call_0", "call_0"));
+        assert_eq!(proposal_frame(&one, "req-1")["callId"], json!(one.id));
+    }
+
+    /// The tool ran, and its answer cannot be read: `null` would tell the model it returned nothing.
+    #[tokio::test]
+    async fn a_tool_answer_past_the_cap_is_a_failed_result() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(&"x".repeat(crate::link::net::MAX_REPLY_BYTES as usize + 1)));
+        let call = ToolCall { id: "c".into(), provider_id: "c".into(), name: "list_apps".into(), input: json!({}) };
+        let outcome = execute(&reqwest::Client::new(), &server.base, "key", "/tools", "grant", &call).await;
+        assert!(matches!(&outcome, Executed::Failed { error, terminal: false } if error.contains("larger than")), "{:?}", result_frame(&call, &outcome));
     }
 
     #[test]
@@ -682,7 +726,7 @@ mod tests {
 
     #[test]
     fn an_oversized_result_is_noted_rather_than_failing_the_seal() {
-        let call = ToolCall { id: "c1".into(), name: "list_apps".into(), input: json!({}) };
+        let call = ToolCall { id: "c1".into(), provider_id: "c1".into(), name: "list_apps".into(), input: json!({}) };
         let huge = Executed::Ok(json!({ "rows": "x".repeat(MAX_RESULT_FRAME_BYTES + 10) }));
         let frame = result_frame(&call, &huge);
         assert_eq!(frame["status"], "done");
@@ -697,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_reported_as_a_failed_result_not_a_silent_gap() {
-        let call = ToolCall { id: "c2".into(), name: "create_form".into(), input: json!({}) };
+        let call = ToolCall { id: "c2".into(), provider_id: "c2".into(), name: "create_form".into(), input: json!({}) };
         let failed = Executed::Failed { error: "unknown_tool: no such tool".into(), terminal: false };
         let frame = result_frame(&call, &failed);
         assert_eq!(frame["status"], "failed");
@@ -726,7 +770,7 @@ mod tests {
 
     #[test]
     fn the_proposal_and_activity_frames_carry_what_the_reader_matches_on() {
-        let call = ToolCall { id: "c3".into(), name: "create_form".into(), input: json!({ "title": "T" }) };
+        let call = ToolCall { id: "c3".into(), provider_id: "provider-3".into(), name: "create_form".into(), input: json!({ "title": "T" }) };
         let proposal = proposal_frame(&call, "req-1");
         assert_eq!(proposal["callId"], "c3");
         assert_eq!(proposal["tool"], "create_form");

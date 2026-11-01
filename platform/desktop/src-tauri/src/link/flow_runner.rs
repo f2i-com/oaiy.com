@@ -456,7 +456,7 @@ fn poll_once(
                 std::thread::sleep(wait);
             }
         }
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         let message = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -470,8 +470,7 @@ fn poll_once(
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
 
-    let reply: QueuedReply = resp
-        .json()
+    let reply: QueuedReply = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
         .map_err(|e| format!("the flow queue returned an unreadable list: {e}"))?;
     let Some(run) = reply.runs.into_iter().next() else {
         return Ok((0, None));
@@ -1004,7 +1003,7 @@ fn fetch_graph(
             ),
         ));
     }
-    let reply: FlowsReply = resp.json().map_err(|e| {
+    let reply: FlowsReply = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES).map_err(|e| {
         Failure::new(
             FailureCode::InvalidFlow,
             format!("the provider returned an unreadable flow list: {e}"),
@@ -1131,7 +1130,7 @@ fn report(
             }
             Ok(resp) => {
                 let code = resp.status().as_u16();
-                let payload: Value = resp.json().unwrap_or(Value::Null);
+                let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
                 let message = payload
                     .get("message")
                     .and_then(Value::as_str)

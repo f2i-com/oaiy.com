@@ -307,8 +307,7 @@ pub fn exchange_code(
         .map_err(|e| format!("could not reach the token endpoint: {e}"))?;
 
     let status = resp.status();
-    let value: serde_json::Value = resp
-        .json()
+    let value: serde_json::Value = super::net::read_json(resp)
         .map_err(|e| format!("the token endpoint returned a non-JSON response: {e}"))?;
     if !status.is_success() {
         // OAuth error bodies are `{error, error_description}`; surface the

@@ -785,7 +785,14 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
           return await companion.rotate(pluginId);
         case 'subscribe': {
           const [names] = args as [string[]];
-          subscribed.current = Array.isArray(names) ? names : [];
+          const wanted = Array.isArray(names) ? names : [];
+          // This poll runs with the dashboard's own origin, so it can read every plugin's
+          // events: what a screen may ask for is its manifest's, or a screen is a way to read
+          // another plugin's callers and messages.
+          const declared = recordRef.current?.manifest?.events ?? [];
+          const undeclared = wanted.filter((name) => !declared.includes(name));
+          if (undeclared.length) throw new Error(`This plugin does not declare ${undeclared.join(', ')}.`);
+          subscribed.current = wanted;
           // Start from the tail so a screen doesn't replay history on open (`since=0` is the oldest kept event, not the newest).
           cursor.current = await pluginEventsTail(signal);
           return true;
@@ -921,8 +928,9 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
         if (cancelled || channel.signal.aborted || documentChannel.current !== channel) return;
         cursor.current = res.next;
         for (const e of res.events) {
-          const env = e.envelope as { name?: string };
-          if (env?.name && names.includes(env.name)) {
+          const env = e.envelope as { name?: string; source?: string };
+          // A declared name is not enough: what the frame is given is the whole envelope, so it must be this plugin's own.
+          if (env?.name && env.source === pluginId && names.includes(env.name)) {
             channel.post({ event: env });
           }
         }
@@ -933,7 +941,7 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
       }
     }, 2000);
     return () => { cancelled = true; window.clearInterval(id); };
-  }, [attempt, doc]);
+  }, [attempt, doc, pluginId]);
 
   if (error) {
     return (

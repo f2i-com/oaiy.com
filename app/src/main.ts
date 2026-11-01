@@ -338,8 +338,9 @@ async function main(): Promise<void> {
    * call, a text or a flow's task (desktop/mcp.ts). The app's own tools come
    * first and keep their names; no name reaches the model twice. With none
    * listed (no desktop, or an older one), the tools are exactly as they were.
+   * One that removes something, and a plugin's command, ask the person first.
    */
-  const withControl = (kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, controlChanged, () => project.vfs);
+  const withControl =(kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, (question) => confirmAction(question), controlChanged, () => project.vfs);
   /**
    * A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in; the engine's
    * model and whether it runs (the header's menu, and how its loading goes); the computers paired over OAIY Network

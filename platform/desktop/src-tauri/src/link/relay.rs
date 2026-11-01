@@ -195,7 +195,7 @@ fn poll_on(
         // hold) would leave no time to read it in, and the panel would say "the relay
         // refused the poll" in place of the provider's own words.
         let asked = if status.as_u16() == 429 { super::net::retry_after(resp.headers()) } else { None };
-        let body: Value = resp.json().unwrap_or(Value::Null);
+        let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         // Asked to slow down: wait as long as the provider said before the lane's own back-off.
         if let Some(wait) = asked {
             std::thread::sleep(wait);
@@ -213,8 +213,7 @@ fn poll_on(
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
 
-    let reply: PendingReply = resp
-        .json()
+    let reply: PendingReply = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
         .map_err(|e| format!("the relay returned an unreadable batch: {e}"))?;
 
     let mut handled = 0usize;

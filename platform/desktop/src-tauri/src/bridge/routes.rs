@@ -252,7 +252,12 @@ fn bridge_error(status: StatusCode, code: &str, message: String) -> axum::respon
 
 // ---------------------------------------------------------------------------
 
-async fn capabilities(State(st): State<BridgeState>) -> impl IntoResponse {
+async fn capabilities(State(st): State<BridgeState>, public: Option<axum::Extension<crate::http::PublicView>>) -> impl IntoResponse {
+    // A caller with no token and no trusted origin (any website, this route being open and CORS `*`) gets what discovery is
+    // for and no more: which connector commands there are and the closed `reason` codes. Not this install's id, which
+    // would follow a person from site to site, and not the words of a failure, which name paths with the user name in them.
+    // FormLogic's detection reads `capabilities[].id` and `.available` alone, with or without its token.
+    let public = public.is_some();
     // Plugin-contributed connector commands are real capabilities, so discovery
     // must reflect the plugin's live state — a stopped plugin's commands are
     // listed as unavailable WITH a reason rather than omitted, so a caller can
@@ -293,7 +298,7 @@ async fn capabilities(State(st): State<BridgeState>) -> impl IntoResponse {
                         // `detail` must be actionable — the protocol requires it —
                         // so the registry's reason is prefixed with what to DO,
                         // rather than shipped alone as a bare status line.
-                        let detail = match rec.reason.as_deref() {
+                        let detail = match rec.reason.as_deref().filter(|_| !public) {
                             Some(r) => format!(
                                 "The {} plugin is not running ({r}) Start it in OAIY Desktop → Plugins.",
                                 rec.id
@@ -316,12 +321,15 @@ async fn capabilities(State(st): State<BridgeState>) -> impl IntoResponse {
         }
     }
 
-    Json(json!({
+    let mut answer = json!({
         "protocol": BRIDGE_PROTOCOL,
         "runtime": "desktop",
-        "deviceId": st.device_id,
         "capabilities": caps,
-    }))
+    });
+    if !public {
+        answer["deviceId"] = json!(st.device_id);
+    }
+    Json(answer)
 }
 
 /// Whether a request carries this process's own credential (the Agent's tools call the router in-process with it).
@@ -1497,6 +1505,18 @@ fn ui_content_type(path: &str) -> &'static str {
     }
 }
 
+/// `asset` of the plugin at `dir`, from where it really is: a plain path can still lead out of the folder through a link in
+/// it, and a package nobody signed has no list of files to be held to.
+fn read_under(dir: &std::path::Path, asset: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    let unreadable = |e: std::io::Error| (StatusCode::NOT_FOUND, format!("cannot read {asset:?}: {e}"));
+    let root = std::fs::canonicalize(dir).map_err(unreadable)?;
+    let file = std::fs::canonicalize(dir.join(asset)).map_err(unreadable)?;
+    if !file.starts_with(&root) {
+        return Err((StatusCode::FORBIDDEN, format!("{asset:?} is not under the plugin's folder")));
+    }
+    std::fs::read(&file).map_err(unreadable)
+}
+
 /// `GET /api/plugins/:id/ui/:screen/*path` — serve one plugin-shipped UI asset.
 ///
 /// A plugin may contribute screens (`manifest.ui.screens[]`): static HTML/CSS/JS
@@ -1507,14 +1527,18 @@ fn ui_content_type(path: &str) -> &'static str {
 /// Only files the screen DECLARES in its `files` list are served. That, not path
 /// arithmetic, is the real guard: a traversal string simply won't be in the
 /// allow-list, and neither will the plugin's own executables, DLLs or manifest.
-/// The path is additionally rejected if it is absolute or contains `..`.
+/// The path is additionally held to the rule of a signed package's paths
+/// ([`crate::plugins::trust::plain_package_path`]) whatever the manifest said, and
+/// what is read must really be under the plugin's folder.
 async fn plugin_ui_asset(
     State(st): State<BridgeState>,
     Path((id, screen, asset)): Path<(String, String, String)>,
 ) -> axum::response::Response {
-    // Cheap structural rejects before touching the registry.
+    // Cheap structural rejects before touching the registry. Not just `/` and `..`: on
+    // Windows `dir.join` with a drive path throws `dir` away, and such a string was in the
+    // allow-list of any manifest that listed it.
     let asset = asset.replace('\\', "/");
-    if asset.starts_with('/') || asset.split('/').any(|seg| seg == ".." || seg == ".") {
+    if crate::plugins::trust::plain_package_path(&asset).is_err() {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid asset path".into());
     }
 
@@ -1590,7 +1614,7 @@ async fn plugin_ui_asset(
         tokio::task::spawn_blocking(move || match trust.read_signed_file(&dir, &id, &asset) {
             Ok(Some(bytes)) => Ok(bytes),
             Ok(None) if signed => Err((StatusCode::FORBIDDEN, format!("the signature of {id:?} is gone, so {asset:?} cannot be checked"))),
-            Ok(None) => std::fs::read(dir.join(&asset)).map_err(|e| (StatusCode::NOT_FOUND, format!("cannot read {asset:?}: {e}"))),
+            Ok(None) => read_under(&dir, &asset),
             Err(why) => Err((StatusCode::FORBIDDEN, why)),
         })
         .await
@@ -2930,6 +2954,94 @@ done
             assert_eq!(get(&st, "demo", "ui/index.html").await, (StatusCode::OK, SIGNED_PAGE.to_string()));
             // Only what the screen declares, as before.
             assert_eq!(get(&st, "demo", "demo-plugin.exe").await.0, StatusCode::FORBIDDEN);
+        }
+
+        /// `/api/bridge/capabilities`, as a caller of the kind `public` says.
+        async fn capabilities_as(st: &BridgeState, public: bool) -> Value {
+            let view = public.then_some(axum::Extension(crate::http::PublicView));
+            let response = capabilities(State(st.clone()), view).await.into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        #[tokio::test]
+        async fn discovery_leaves_the_install_id_and_a_failures_words_out_of_the_public_view() {
+            let (sb, st) = state_under("capabilities-view", TrustPolicy::developer(), Publishers::default());
+            let dir = plugin(&sb, "demo");
+            let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+            manifest["connectors"] = json!([{ "id": "demo", "commands": ["status.get"] }]);
+            manifest["capabilities"] = json!([]);
+            manifest["commands"] = json!({ "journalled": [] });
+            std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+            rescan(&st);
+            let path = "plugin executable not found at C:\\Users\\someone\\AppData\\demo.exe.";
+            st.plugins.lock().unwrap().set_state("demo", PluginState::Crashed, Some(path.into()));
+
+            let full = capabilities_as(&st, false).await;
+            assert_eq!(full["deviceId"], "device");
+            let listed = |body: &Value| body["capabilities"].as_array().unwrap().iter().find(|c| c["pluginId"] == "demo").cloned().unwrap();
+            assert!(listed(&full)["detail"].as_str().unwrap().contains(path), "{full}");
+
+            let public = capabilities_as(&st, true).await;
+            assert!(public.get("deviceId").is_none(), "{public}");
+            assert!(!public.to_string().contains("someone"), "{public}");
+            // What FormLogic reads, and the rest of what the protocol requires of a stopped plugin's command.
+            let seen = listed(&public);
+            assert_eq!((seen["id"].as_str(), seen["available"].as_bool(), seen["reason"].as_str()), (Some("connector.demo.status.get"), Some(false), Some("plugin_crashed")), "{public}");
+            assert!(seen["detail"].as_str().unwrap().contains("Start it in OAIY Desktop"), "{public}");
+        }
+
+        /// Give the screen `main` of `id` these files, as a manifest that got past the load's own check would.
+        fn list_in_the_record(st: &BridgeState, id: &str, files: &[&str]) {
+            let mut reg = st.plugins.lock().unwrap();
+            let mut rec = reg.get(id).cloned().expect("scanned");
+            let manifest = rec.manifest.as_mut().expect("loaded");
+            manifest.extra.get_mut("ui").unwrap()["screens"][0]["files"] = json!(files);
+            reg.insert(rec);
+        }
+
+        /// On Windows `Path::join` with a drive path throws the plugin's folder away, and the route took any string the
+        /// manifest listed that did not start with `/`: any page could read any file. The route holds to the rule itself.
+        #[tokio::test]
+        async fn a_listed_path_that_is_not_plain_is_refused_by_the_route_itself() {
+            let (sb, st) = state_under("screen-drive", TrustPolicy::developer(), Publishers::default());
+            plugin(&sb, "demo");
+            rescan(&st);
+            let secret = sb.0.join("account.json");
+            std::fs::write(&secret, "the account key").unwrap();
+            let listed = secret.to_string_lossy().replace('\\', "/");
+            list_in_the_record(&st, "demo", &["ui/index.html", &listed, "ui\\app.js", "ui/app.js:hidden", "../account.json"]);
+            for asset in [listed.as_str(), "ui/app.js:hidden", "../account.json"] {
+                let (status, body) = get(&st, "demo", asset).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{asset}: {body}");
+                assert!(!body.contains("the account key"), "{asset}: {body}");
+            }
+            assert_eq!(get(&st, "demo", "ui/index.html").await, (StatusCode::OK, SIGNED_PAGE.to_string()));
+        }
+
+        /// A plain path can still lead out of the folder through a link in it: what is read is where the path really goes.
+        #[tokio::test]
+        async fn a_listed_file_behind_a_link_out_of_the_folder_is_not_served() {
+            let (sb, st) = state_under("screen-link", TrustPolicy::developer(), Publishers::default());
+            let dir = plugin(&sb, "demo");
+            rescan(&st);
+            let outside = sb.0.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("account.json"), "the account key").unwrap();
+            let link = dir.join("ui").join("linked");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            #[cfg(windows)]
+            {
+                // (a junction takes no privilege, as a symbolic link does)
+                let made = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(&link).arg(&outside).output().unwrap();
+                assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            }
+            list_in_the_record(&st, "demo", &["ui/index.html", "ui/linked/account.json"]);
+            let (status, body) = get(&st, "demo", "ui/linked/account.json").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(!body.contains("the account key"), "{body}");
+            assert_eq!(get(&st, "demo", "ui/index.html").await, (StatusCode::OK, SIGNED_PAGE.to_string()));
         }
 
         #[tokio::test]

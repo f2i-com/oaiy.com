@@ -631,7 +631,7 @@ impl Perform for Live<'_> {
             .send()
             .map_err(|e| format!("could not reach the provider to write the record: {e}"))?;
         let status = resp.status();
-        let payload: Value = resp.json().unwrap_or(Value::Null);
+        let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
         if !status.is_success() {
             return Err(Self::refusal(status, &payload, "write the record"));
         }
@@ -660,7 +660,7 @@ impl Perform for Live<'_> {
             .map_err(|e| format!("could not reach the provider to update the record: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let payload: Value = resp.json().unwrap_or(Value::Null);
+            let payload: Value = super::net::read_json(resp).unwrap_or(Value::Null);
             return Err(Self::refusal(status, &payload, "update the record"));
         }
         Ok(())

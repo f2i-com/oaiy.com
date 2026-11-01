@@ -1608,15 +1608,19 @@ impl PluginHost {
             origin_run: None,
         };
 
+        // What follows acts on the phone's events by NAME, so the sender is checked here too: the manifest keeps a plugin to
+        // its own namespace, but one started from an older manifest is still running under it.
+        let from_its_plugin = name.split('.').next() == Some(plugin_id);
+
         // A call ended, or a request to reach the owner came out: whatever rings for it is over.
-        if matches!(name.as_str(), "aokie.call.ended" | "aokie.call.assistance.resolved") {
+        if from_its_plugin && matches!(name.as_str(), "aokie.call.ended" | "aokie.call.assistance.resolved") {
             if let Some(ring) = self.ring() {
                 crate::ring::apply_plugin_event(&ring, &name, &event.data, &event.correlation_id);
             }
         }
 
         // Recorded in the calendar only while a plugin provides it (turned off, it is not written to).
-        if name == "aokie.appointment.requested" && crate::calendar::available() {
+        if from_its_plugin && name == "aokie.appointment.requested" && crate::calendar::available() {
             if let Some(cal) = crate::calendar::shared() {
                 cal.record_request(&event.data);
             }
@@ -3338,6 +3342,25 @@ mod tests {
         let refused_id = crate::ring::testing::plan_id_of(&again);
         assert_ne!(refused_id, plan_id);
         assert_eq!(opened(&refused_id, "call_1").unwrap_err().0, "unknown_plan");
+    }
+
+    /// The ring and the calendar act on `aokie.*` by name: the sender is checked, so a plugin that got such a name past
+    /// its manifest (an old one, still running) ends no ring and writes no appointment.
+    #[test]
+    fn only_the_plugin_an_event_is_named_for_ends_a_ring() {
+        let (_sb, host) = host_with("event-sender", Vec::new());
+        let ring = a_ring();
+        host.set_ring(ring.clone());
+        let plan = PluginHost::ring_request(&ring, "oaiy.ring.plan", json!({"callId": "call_1", "reason": "caller_asked", "recentCallerTurns": ["Can I speak to the owner please"]})).unwrap();
+        let plan_id = plan["planId"].as_str().unwrap();
+        PluginHost::ring_request(&ring, "oaiy.ring.opened", json!({"planId": plan_id, "requestId": "assist_1", "callId": "call_1", "callEpoch": 1, "ownerEpoch": 1, "expiresAt": ring.clock().unix() + 25})).unwrap();
+        assert_eq!(ring.active().len(), 1);
+
+        let said = |source: &str| json!({ "schemaVersion": 1, "source": source, "name": "aokie.call.assistance.resolved", "correlationId": "assist_1", "idempotencyKey": format!("{source}:1"), "occurredAt": "2026-11-01T00:00:00Z", "data": { "requestId": "assist_1", "outcome": "cancelled" } });
+        host.process_event("aaa", said("aaa"));
+        assert_eq!(ring.active().len(), 1, "another plugin does not end Aokie's ring");
+        host.process_event("aokie", said("aokie"));
+        assert!(ring.active().is_empty(), "Aokie does");
     }
 
     #[test]

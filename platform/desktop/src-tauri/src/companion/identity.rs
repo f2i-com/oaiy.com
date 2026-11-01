@@ -266,10 +266,51 @@ pub struct PendingMobileApproval {
     pub received_at: DateTime<Utc>,
 }
 
+/// Why a stored roster cannot be used. The roster is what remembers who was revoked, so one that is there and cannot be
+/// used is not an empty one: taken for one, a revoked key could pair again, and the next save would write over the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RosterFault {
+    /// The file could not be read (another program holds it, or its permissions say no): it may be perfectly good.
+    Unreadable(String),
+    /// The file was read and is no roster. Rotating the key starts a new one, with this one kept aside.
+    Corrupt(String),
+}
+
+impl RosterFault {
+    fn words(&self) -> &str {
+        match self {
+            Self::Unreadable(why) | Self::Corrupt(why) => why,
+        }
+    }
+}
+
+/// The roster at `path`: none yet (a new, empty one), or what is wrong with the file.
+fn read_roster(path: &std::path::Path) -> (PersistedRoster, Option<RosterFault>) {
+    let corrupt = |why: String| {
+        let fault = RosterFault::Corrupt(format!("the companion roster {} is damaged ({why}), so nobody can be approved or told from a revoked device: rotate this desktop's key to start again", path.display()));
+        (PersistedRoster::default(), Some(fault))
+    };
+    match crate::secret_file::read_text_patiently(path, &crate::secret_file::Patience::default().start) {
+        crate::secret_file::Text::Missing => (PersistedRoster::default(), None),
+        crate::secret_file::Text::Text(text) => match serde_json::from_str(&text) {
+            Ok(roster) => (roster, None),
+            Err(e) => corrupt(e.to_string()),
+        },
+        crate::secret_file::Text::Undecodable(why) => corrupt(why),
+        crate::secret_file::Text::Unreadable(e) => {
+            let fault = RosterFault::Unreadable(format!("the companion roster {} cannot be read ({e}): restart OAIY once whatever holds it has let go", path.display()));
+            (PersistedRoster::default(), Some(fault))
+        }
+    }
+}
+
 struct Inner {
     signing_key: Option<SigningKey>,
     protection: KeyProtection,
     roster: PersistedRoster,
+    /// What is wrong with the stored roster, if anything: until it is put right the identity is unavailable, and `roster`
+    /// is an empty one that is never saved.
+    roster_fault: Option<RosterFault>,
     pending: Vec<PendingMobileApproval>,
     warning: Option<String>,
     /// Live offers, by nonce. In memory only: an offer that did not survive a
@@ -281,6 +322,15 @@ struct Inner {
     /// as "unknown", which is the honest reason and the one that tells an
     /// operator they are looking at a duplicate rather than a typo.
     consumed: HashSet<(String, String)>,
+}
+
+/// Why a change to the roster was not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterError {
+    /// It names something that is not there, or that may not be done.
+    Refused(String),
+    /// The roster cannot be saved, or is not usable: the change would be gone at the next start, so it is not made.
+    NotSaved(String),
 }
 
 /// The desktop's half of companion trust.
@@ -298,14 +348,13 @@ impl EndpointIdentity {
     /// Load (or mint) the identity for `owner_plugin` under `root`.
     pub fn open(root: PathBuf, owner_plugin: &str) -> EndpointIdentityHandle {
         let dir = root.join("companion").join(owner_plugin);
-        let roster = std::fs::read_to_string(dir.join("roster.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<PersistedRoster>(&t).ok())
-            .unwrap_or_default();
+        let (roster, roster_fault) = read_roster(&dir.join("roster.json"));
 
-        let (signing_key, protection, warning) = match load_or_create_key(&dir) {
-            Ok((k, p)) => (Some(k), p, None),
-            Err(e) => (None, KeyProtection::SoftwareFile, Some(e)),
+        let (signing_key, protection, warning) = match (&roster_fault, load_or_create_key(&dir)) {
+            // Unavailable as with a key that cannot be read: nobody offered, nobody handed to the plugin.
+            (Some(fault), _) => (None, KeyProtection::SoftwareFile, Some(fault.words().to_string())),
+            (None, Ok((k, p))) => (Some(k), p, None),
+            (None, Err(e)) => (None, KeyProtection::SoftwareFile, Some(e)),
         };
 
         Arc::new(Self {
@@ -315,6 +364,7 @@ impl EndpointIdentity {
                 signing_key,
                 protection,
                 roster,
+                roster_fault,
                 pending: Vec::new(),
                 warning,
                 challenges: HashMap::new(),
@@ -612,15 +662,22 @@ impl EndpointIdentity {
     }
 
     /// Approve a mobile that has already proved possession of its key.
-    pub fn approve(&self, pending_id: &str) -> Result<ApprovedMobile, String> {
-        safe_id("pending approval id", pending_id)?;
+    pub fn approve(&self, pending_id: &str) -> Result<ApprovedMobile, RosterError> {
+        safe_id("pending approval id", pending_id).map_err(RosterError::Refused)?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::roster_usable(&inner)?;
         let idx = inner
             .pending
             .iter()
             .position(|p| p.id == pending_id)
-            .ok_or_else(|| "no pending approval with that id".to_string())?;
-        let p = inner.pending.remove(idx);
+            .ok_or_else(|| RosterError::Refused("no pending approval with that id".to_string()))?;
+        // As `receive_response` holds a fresh ceremony to it: an approval that was waiting when its
+        // key was revoked, or that got here some other way, must not put that key back in the roster.
+        if inner.roster.revoked.iter().any(|r| r.thumbprint == inner.pending[idx].thumbprint) {
+            inner.pending.remove(idx);
+            return Err(RosterError::Refused("that device's key was revoked on this machine".into()));
+        }
+        let p = inner.pending[idx].clone();
 
         let approved = ApprovedMobile {
             device_id: p.device_id,
@@ -628,16 +685,22 @@ impl EndpointIdentity {
             endpoint_key: p.endpoint_key,
             approved_at: Utc::now(),
         };
+        let mut next = inner.roster.clone();
         // Replace rather than append: re-pairing the same handset must not
         // leave a second entry the user has to revoke twice.
-        inner
-            .roster
-            .approved
-            .retain(|m| m.endpoint_key.thumbprint != approved.endpoint_key.thumbprint);
-        inner.roster.approved.push(approved.clone());
-        inner.roster.revision += 1;
-        self.persist(&inner.roster);
+        next.approved.retain(|m| m.endpoint_key.thumbprint != approved.endpoint_key.thumbprint);
+        next.approved.push(approved.clone());
+        next.revision += 1;
+        // Saved first: what is not on disk is not so, and the next start would say otherwise.
+        self.persist(&next).map_err(RosterError::NotSaved)?;
+        inner.roster = next;
+        inner.pending.remove(idx);
         Ok(approved)
+    }
+
+    /// A roster that cannot be used takes no changes: there is nothing to add them to, and saving would write over the file.
+    fn roster_usable(inner: &Inner) -> Result<(), RosterError> {
+        inner.roster_fault.as_ref().map_or(Ok(()), |fault| Err(RosterError::NotSaved(fault.words().to_string())))
     }
 
     pub fn deny(&self, pending_id: &str) -> Result<(), String> {
@@ -656,23 +719,30 @@ impl EndpointIdentity {
     /// The thumbprint is remembered, not merely forgotten: a device that comes
     /// back with the same key must be re-approved deliberately rather than
     /// slipping through as if it were new.
-    pub fn revoke(&self, thumbprint: &str) -> Result<(), String> {
-        safe_id("endpoint key thumbprint", thumbprint)?;
+    pub fn revoke(&self, thumbprint: &str) -> Result<(), RosterError> {
+        safe_id("endpoint key thumbprint", thumbprint).map_err(RosterError::Refused)?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::roster_usable(&inner)?;
         let idx = inner
             .roster
             .approved
             .iter()
             .position(|m| m.endpoint_key.thumbprint == thumbprint)
-            .ok_or_else(|| "no approved device with that thumbprint".to_string())?;
-        let gone = inner.roster.approved.remove(idx);
-        inner.roster.revoked.push(RevokedMobile {
+            .ok_or_else(|| RosterError::Refused("no approved device with that thumbprint".to_string()))?;
+        let mut next = inner.roster.clone();
+        let gone = next.approved.remove(idx);
+        next.revoked.push(RevokedMobile {
             device_id: gone.device_id,
             thumbprint: gone.endpoint_key.thumbprint,
             revoked_at: Utc::now(),
         });
-        inner.roster.revision += 1;
-        self.persist(&inner.roster);
+        next.revision += 1;
+        // Saved first: the owner is told it is done only when the next start will agree. Revoked in
+        // memory alone, the phone would be approved again then, and handed to the plugin.
+        self.persist(&next).map_err(RosterError::NotSaved)?;
+        inner.roster = next;
+        // Nothing from before the revocation goes on waiting for the owner's click on this key.
+        inner.pending.retain(|p| p.thumbprint != thumbprint);
         Ok(())
     }
 
@@ -681,40 +751,47 @@ impl EndpointIdentity {
     /// Clearing the roster is the point, not a side effect: the approvals were
     /// statements about a key that no longer exists, and keeping them would
     /// leave devices listed as trusted that can no longer prove anything.
+    ///
+    /// It is also the way out of a damaged roster, which is kept aside. One that could not be
+    /// read is not touched: it may be perfectly good, and this would end every pairing in it.
     pub fn rotate(&self) -> Result<IdentityStatus, String> {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let dir = self.dir();
+            match &inner.roster_fault {
+                Some(RosterFault::Unreadable(why)) => return Err(why.clone()),
+                Some(RosterFault::Corrupt(_)) => {
+                    let path = dir.join("roster.json");
+                    crate::secret_file::keep_aside(&path).map_err(|e| format!("cannot keep {} aside: {e}", path.display()))?;
+                }
+                None => {}
+            }
+            let mut next = inner.roster.clone();
+            next.approved.clear();
+            next.revoked.clear();
+            next.revision += 1;
+            // The roster first: with the old key and no approvals nobody is trusted, where a new key
+            // beside the old approvals would list devices that can prove nothing.
+            self.persist(&next)?;
+            inner.roster = next;
+            inner.roster_fault = None;
+            inner.pending.clear();
             let (key, protection) = mint_key(&dir)?;
             inner.signing_key = Some(key);
             inner.protection = protection;
             inner.warning = None;
-            inner.pending.clear();
-            inner.roster.approved.clear();
-            inner.roster.revoked.clear();
-            inner.roster.revision += 1;
-            self.persist(&inner.roster);
         }
         Ok(self.status())
     }
 
-    fn persist(&self, roster: &PersistedRoster) {
-        let dir = self.dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let path = dir.join("roster.json");
-        let tmp = path.with_extension("json.tmp");
+    /// Owner-only and whole, as every store of a secret is ([`crate::secret_file::write`]): a rename that a scanner or an
+    /// indexer holds up is retried, and a crash leaves the old roster or the new one, never an empty file.
+    fn persist(&self, roster: &PersistedRoster) -> Result<(), String> {
+        let path = self.dir().join("roster.json");
         let mut out = roster.clone();
         out.schema_version = 1;
-        let write = || -> std::io::Result<()> {
-            let body = serde_json::to_string_pretty(&out).map_err(std::io::Error::other)?;
-            std::fs::write(&tmp, body)?;
-            std::fs::rename(&tmp, &path)
-        };
-        if let Err(e) = write() {
-            log::warn!("cannot persist companion roster to {}: {e}", path.display());
-        }
+        let body = serde_json::to_string_pretty(&out).map_err(|e| format!("cannot encode the companion roster: {e}"))?;
+        crate::secret_file::write(&path, body).map_err(|e| format!("cannot save the companion roster to {}: {e}", path.display()))
     }
 }
 
@@ -931,6 +1008,137 @@ mod tests {
             claims,
             signature: URL_SAFE_NO_PAD.encode(sk.sign(&msg).to_bytes()),
         }
+    }
+
+    /// Where an identity keeps its roster.
+    fn roster_file(dir: &Dir) -> PathBuf {
+        dir.0.join("companion").join("aokie").join("roster.json")
+    }
+
+    /// Turn the roster file into something no write can land on: a folder in its place, as a rename finds a held file.
+    fn make_unwritable(dir: &Dir) {
+        let path = roster_file(dir);
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(path.join("in-the-way")).unwrap();
+    }
+
+    /// The route used to answer 204 to a revocation that was only in memory: at the next start the phone was approved
+    /// again, and went to the plugin in its bootstrap. A change that cannot be saved is reported, and is not made.
+    #[test]
+    fn a_change_to_the_roster_that_cannot_be_saved_is_reported_and_is_not_made() {
+        let dir = Dir::new("not-saved");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let phone = a_key(1);
+        id.approve_for_tests(&phone);
+        id.inner.lock().unwrap().pending.push(pending("p2", &a_key(2)));
+        let revision = id.status().roster_revision;
+        make_unwritable(&dir);
+
+        assert!(matches!(id.revoke(&phone.thumbprint), Err(RosterError::NotSaved(_))), "a revocation");
+        assert!(id.status().approved_mobiles.iter().any(|m| m.endpoint_key == phone), "the phone is still what it was");
+        assert!(matches!(id.approve("p2"), Err(RosterError::NotSaved(_))), "an approval");
+        let status = id.status();
+        assert_eq!(status.approved_mobiles.len(), 1, "nothing changed in memory");
+        assert_eq!(status.roster_revision, revision, "and no revision moved");
+        assert_eq!(status.pending_approvals.len(), 1, "and the approval can be tried again");
+        assert!(id.rotate().is_err(), "a rotation too");
+        assert_eq!(id.status().approved_mobiles.len(), 1);
+
+        std::fs::remove_dir_all(roster_file(&dir)).unwrap();
+        id.revoke(&phone.thumbprint).unwrap();
+        crate::secret_file::testing::assert_private(&roster_file(&dir));
+        let again = EndpointIdentity::open(dir.0.clone(), "aokie");
+        assert!(again.status().approved_mobiles.is_empty(), "and once it can be, it is what the next start reads");
+    }
+
+    /// A roster is what remembers who was revoked. No file is a new roster; a file that cannot be read may hold revocations,
+    /// and taking it for an empty roster would let a revoked key pair again and the next save write over them.
+    #[test]
+    fn a_roster_that_is_there_and_cannot_be_used_is_not_taken_for_an_empty_one() {
+        let dir = Dir::new("corrupt-roster");
+        let phone = a_key(1);
+        {
+            let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+            assert!(id.status().available, "no file: a new roster");
+            assert!(id.status().warning.is_none());
+            id.approve_for_tests(&phone);
+            id.revoke(&phone.thumbprint).unwrap();
+        }
+        for damaged in [&b""[..], b"{ half a ros", &[0xC3, 0x28]] {
+            std::fs::write(roster_file(&dir), damaged).unwrap();
+            let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+            let status = id.status();
+            assert!(!status.available && !status.remote_access_ready, "{damaged:?}");
+            assert!(status.warning.as_deref().unwrap_or("").contains("roster"), "{:?}", status.warning);
+            assert!(id.private_bootstrap(1).is_none(), "{damaged:?}: nobody is handed to a plugin");
+            assert!(id.create_offer("app", None, "local").is_err(), "{damaged:?}: no new pairing");
+            id.inner.lock().unwrap().pending.push(pending("p1", &a_key(2)));
+            assert!(matches!(id.approve("p1"), Err(RosterError::NotSaved(_))), "{damaged:?}");
+            assert_eq!(std::fs::read(roster_file(&dir)).unwrap(), damaged, "the file is left as it was");
+        }
+    }
+
+    /// The way out of a damaged roster is the owner's rotation, which ends every pairing anyway: the file is kept aside.
+    #[test]
+    fn rotating_the_key_starts_a_new_roster_and_keeps_the_damaged_one() {
+        let dir = Dir::new("rotate-corrupt");
+        EndpointIdentity::open(dir.0.clone(), "aokie");
+        std::fs::create_dir_all(roster_file(&dir).parent().unwrap()).unwrap();
+        std::fs::write(roster_file(&dir), b"{ half a ros").unwrap();
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let status = id.rotate().expect("the owner can always start again");
+        assert!(status.available && status.warning.is_none(), "{status:?}");
+        assert!(status.approved_mobiles.is_empty());
+        let parent = roster_file(&dir);
+        assert_eq!(std::fs::read(parent.with_file_name("roster.json.corrupt")).unwrap(), b"{ half a ros");
+        id.approve_for_tests(&a_key(3));
+        assert_eq!(EndpointIdentity::open(dir.0.clone(), "aokie").status().approved_mobiles.len(), 1, "and the new roster is saved");
+    }
+
+    /// A file another program holds may be perfectly good: nothing is written over it, and a rotation is refused rather
+    /// than ending every pairing over a scanner.
+    #[test]
+    fn a_roster_that_cannot_be_read_is_left_alone() {
+        let dir = Dir::new("held-roster");
+        {
+            let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+            id.approve_for_tests(&a_key(1));
+        }
+        let before = std::fs::read(roster_file(&dir)).unwrap();
+        let Some(_held) = crate::secret_file::testing::make_unreadable(&roster_file(&dir)) else { return };
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let status = id.status();
+        assert!(!status.available, "{status:?}");
+        assert!(status.warning.as_deref().unwrap_or("").contains("cannot be read"), "{:?}", status.warning);
+        assert!(id.rotate().is_err());
+        drop(_held);
+        assert_eq!(std::fs::read(roster_file(&dir)).unwrap(), before);
+        assert_eq!(EndpointIdentity::open(dir.0.clone(), "aokie").status().approved_mobiles.len(), 1, "read again, it is all there");
+    }
+
+    /// A pending approval from before the revocation of its key used to put that key back in the roster, listed in both.
+    #[test]
+    fn revoking_a_key_drops_its_pending_approvals_and_a_revoked_key_cannot_be_approved() {
+        let dir = Dir::new("revoked-pending");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let phone = a_key(1);
+        id.approve_for_tests(&phone);
+        {
+            let mut inner = id.inner.lock().unwrap();
+            inner.pending.push(pending("same-key", &phone));
+            inner.pending.push(pending("other-key", &a_key(2)));
+        }
+        id.revoke(&phone.thumbprint).unwrap();
+        let waiting: Vec<String> = id.status().pending_approvals.into_iter().map(|p| p.id).collect();
+        assert_eq!(waiting, ["other-key"], "the revoked key's is gone, another's stays");
+        assert!(id.approve("same-key").is_err());
+
+        // However it got there, a revoked key is not approved.
+        id.inner.lock().unwrap().pending.push(pending("again", &phone));
+        let refused = id.approve("again").unwrap_err();
+        assert!(matches!(&refused, RosterError::Refused(why) if why.contains("revoked")), "{refused:?}");
+        assert!(id.status().approved_mobiles.is_empty(), "it is not in the roster");
+        assert!(id.status().pending_approvals.iter().all(|p| p.id != "again"), "and it does not wait any longer");
     }
 
     #[test]

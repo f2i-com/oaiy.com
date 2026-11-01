@@ -474,7 +474,11 @@ fn extract_zip_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
     let mut zip = zip::ZipArchive::new(BufReader::new(f)).map_err(|e| format!("read zip: {e}"))?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-        // enclosed_name() is None for anything that would escape the root.
+        if crate::plugins::install::zip_name_is_rooted(&entry.name().map_err(|e| format!("zip entry {i}: {e}"))?) {
+            return Err("a zip entry escapes the package".into());
+        }
+        // enclosed_name() is None for anything that would climb out of the root, and on Windows for a name that is not
+        // a file there (a stream, a device). It takes a leading root or drive off instead: that is refused above.
         let Some(path) = entry.enclosed_name() else {
             return Err("a zip entry escapes the package".into());
         };
@@ -631,6 +635,31 @@ mod tests {
         assert!(!safe_member(Path::new("../../evil")));
         assert!(!safe_member(Path::new("/etc/passwd")));
         assert!(safe_member(Path::new("node-v22/bin/node")));
+    }
+
+    /// A name that climbs out of the folder is refused, and on Windows so is one that is not a file at all there: a
+    /// stream of a file, or a device.
+    #[test]
+    fn a_zip_entry_that_is_not_a_file_of_the_package_is_refused() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("oaiy-node-zip-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("node.zip");
+        let dest = dir.join("out");
+        let mut hostile = vec!["node-v24/../../outside.txt", "/node-v24/outside.txt", "C:/node-v24/outside.txt"];
+        if cfg!(windows) {
+            hostile.extend(["node-v24/node.exe:hidden", "node-v24/aux.txt", "node-v24/node.exe."]);
+        }
+        for name in hostile {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"not node").unwrap();
+            zip.finish().unwrap();
+            std::fs::create_dir_all(&dest).unwrap();
+            assert!(extract_zip_stripped(&archive, &dest).is_err(), "{name:?} was unpacked");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

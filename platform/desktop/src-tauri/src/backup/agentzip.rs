@@ -113,8 +113,9 @@ pub(crate) fn file_names(path: &Path) -> Option<Vec<String>> {
     let mut names = Vec::new();
     for index in 0..archive.len() {
         let file = archive.by_index_raw(index).ok()?;
-        if !(file.is_dir() || file.name().ends_with('/')) {
-            names.push(file.name().to_string());
+        let name = file.name().ok()?;
+        if !(file.is_dir() || name.ends_with('/')) {
+            names.push(name.into_owned());
         }
     }
     Some(names)
@@ -129,10 +130,11 @@ pub fn read_listing(path: &Path, limits: &Limits) -> Result<Listing> {
     let mut total = 0u64;
     for index in 0..archive.len() {
         let file = archive.by_index_raw(index).map_err(|_| BackupError::new(ErrorKind::Damaged, "The Agent's storage in this backup is damaged."))?;
-        if file.is_dir() || file.name().ends_with('/') {
+        // (a name that cannot be read is a damaged archive: nothing could say what it is, or whether it is a folder)
+        let name = file.name().map_err(|_| BackupError::new(ErrorKind::Damaged, "The Agent's storage in this backup is damaged."))?.into_owned();
+        if file.is_dir() || name.ends_with('/') {
             continue;
         }
-        let name = file.name().to_string();
         let size = file.size();
         if !seen.insert(name.clone()) {
             return Err(BackupError::new(ErrorKind::Unsafe, "This backup is refused: the Agent's storage in it lists the same file twice."));

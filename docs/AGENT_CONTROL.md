@@ -49,7 +49,8 @@ relay policy, and all of them are recorded in `<data>/relay-log.jsonl` (the rout
 `plugin_command` is not one of them: it is the Agent asking on this computer, so the relay
 policy does not apply and it reaches any command a plugin declares (the Aokie dongle's driver
 install and consent included). It is a change tool, so only the `project` and `setup`
-conversations may use it, and each call is in the control log.
+conversations may use it, the person is asked before each call (see [Who may use which
+tools](#who-may-use-which-tools)), and each call is in the control log.
 
 ### How a tool runs
 
@@ -73,6 +74,15 @@ A value the desktop does not know gets nothing. The point of the rule: a caller 
 phone, or a text, cannot talk the receptionist into reconfiguring OAIY. The app keeps
 the same rule on its side, and the model never holds the desktop's token: it reaches the
 desktop only through these tools.
+
+The conversations that do get the change tools also read web pages and imported files,
+and the words in those can ask the model for anything. So the Agent app asks the person
+before it runs a tool with `destructiveHint`, and before every `plugin_command`, whatever
+the command: the question says what would be sent (the plugin, the command and its
+payload) or removed, and nothing reaches the desktop until they allow it. If they do not,
+the model is told so and that it should not try again unless they ask. This is the app's
+rule, as it is for a plugin's own tools that change something: another MCP client holding
+the desktop's token asks nobody.
 
 ## The switch and the log
 
@@ -120,9 +130,10 @@ models are the ones installed, and the one chosen is the person's.
 | The dashboard | | `ui_open` (show a page, or one contact) |
 | Diagnostics | `logs_tail` (the desktop's log, a service's, a plugin's or the engine's) | |
 
-`chatgpt_sign_out`, `service_uninstall`, `plugin_uninstall`, `flow_delete` and
-`contact_forget_fact` carry `destructiveHint`. `plugin_command` really does what the
-command says: a call is dialled, a text is sent.
+`chatgpt_sign_out`, `network_unpair`, `service_uninstall`, `plugin_uninstall`, `flow_delete`
+and `contact_forget_fact` carry `destructiveHint`. `plugin_command` really does what the
+command says: a call is dialled, a text is sent. The Agent asks the person before each of
+these (see [Who may use which tools](#who-may-use-which-tools)).
 
 Some steps are the person's to do on screen. `plugin_setup_open` and `ui_open` show them
 the right page in the OAIY window (the desktop emits `oaiy://navigate {view, pluginId?,

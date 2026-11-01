@@ -245,6 +245,73 @@ impl<C: Clone> LaneClient<C> {
     }
 }
 
+// ---- reading a reply ------------------------------------------------------------
+//
+// `Response::json` and `bytes` buffer whatever comes: a hostile backend, or anything
+// answering for it, can send several gigabytes to a poll, and the request's timeout
+// is the only bound on them, which at LAN speed is more than a desktop's memory. A
+// failed allocation aborts the process. Every lane reads its replies here instead,
+// and a reply larger than its cap is an error, not a truncated body parsed as JSON.
+
+/// The most of a reply a lane reads: what a claim, a report or a refusal is ever worth,
+/// as the sealed flows lane has always held its replies to.
+pub const MAX_REPLY_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The most of a reply that carries many things. A poll's batch can be 50 sealed turns of
+/// 350 KB each, and one refused for its size comes back at the next poll, for good; the
+/// account's flows with their graphs and its apps with their scripts grow with what the
+/// person has built.
+pub const MAX_LIST_BYTES: u64 = 32 * 1024 * 1024;
+
+fn too_large(at_most: u64) -> String {
+    format!("the reply is larger than the {} MiB this desktop reads", at_most / (1024 * 1024))
+}
+
+/// The body of `response`, at most `at_most` bytes of it. Read one byte past the cap,
+/// so a body of exactly the cap is not taken for one that was cut.
+pub fn read_body(response: reqwest::blocking::Response, at_most: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    response.take(at_most + 1).read_to_end(&mut bytes).map_err(|e| format!("the reply could not be read: {e}"))?;
+    if bytes.len() as u64 > at_most {
+        return Err(too_large(at_most));
+    }
+    Ok(bytes)
+}
+
+/// The JSON body of `response`, at most `at_most` bytes of it.
+pub fn read_json_up_to<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response, at_most: u64) -> Result<T, String> {
+    serde_json::from_slice(&read_body(response, at_most)?).map_err(|e| format!("the reply is not the JSON expected: {e}"))
+}
+
+/// The JSON body of `response`, at most [`MAX_REPLY_BYTES`] of it.
+pub fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T, String> {
+    read_json_up_to(response, MAX_REPLY_BYTES)
+}
+
+/// [`read_body`] for the async client: it stops reading at the cap, as a stream of
+/// chunks lets it.
+pub async fn read_body_async(mut response: reqwest::Response, at_most: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("the reply could not be read: {e}"))? {
+        if bytes.len() as u64 + chunk.len() as u64 > at_most {
+            return Err(too_large(at_most));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// [`read_json_up_to`] for the async client.
+pub async fn read_json_async_up_to<T: serde::de::DeserializeOwned>(response: reqwest::Response, at_most: u64) -> Result<T, String> {
+    serde_json::from_slice(&read_body_async(response, at_most).await?).map_err(|e| format!("the reply is not the JSON expected: {e}"))
+}
+
+/// [`read_json`] for the async client.
+pub async fn read_json_async<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
+    read_json_async_up_to(response, MAX_REPLY_BYTES).await
+}
+
 /// How much of a reply nobody wanted is read to let its connection go on.
 const DRAIN_AT_MOST: u64 = 1024 * 1024;
 
@@ -523,6 +590,58 @@ mod client_tests {
         std::thread::sleep(Duration::from_millis(600));
         let read = reply.text();
         assert!(read.is_err(), "the deadline of the request was past: {read:?}");
+    }
+
+    /// A body of `n` bytes that parses as JSON.
+    fn json_of(n: usize) -> String {
+        format!(r#"{{"pad":"{}"}}"#, "x".repeat(n - r#"{"pad":""}"#.len()))
+    }
+
+    #[test]
+    fn a_reply_past_a_lanes_cap_is_refused_and_one_at_the_cap_is_read() {
+        let cap = MAX_REPLY_BYTES as usize;
+        let server = Provider::start(move |req| Reply::ok(&json_of(if req.target == "/at-the-cap" { cap } else { cap + 1 })));
+        let http = blocking_builder(Keep::Between).build().unwrap();
+        let at = read_json::<serde_json::Value>(http.get(format!("{}/at-the-cap", server.base)).send().unwrap()).unwrap();
+        assert_eq!(at["pad"].as_str().unwrap().len(), cap - r#"{"pad":""}"#.len());
+        let past = read_json::<serde_json::Value>(http.get(format!("{}/past-it", server.base)).send().unwrap()).unwrap_err();
+        assert!(past.contains("larger than the 2 MiB"), "{past}");
+    }
+
+    #[tokio::test]
+    async fn the_async_client_reads_up_to_its_cap_too() {
+        let cap = MAX_REPLY_BYTES as usize;
+        let server = Provider::start(move |req| Reply::ok(&json_of(if req.target == "/at-the-cap" { cap } else { cap + 1 })));
+        let http = async_builder(Keep::Between).build().unwrap();
+        let at = read_json_async::<serde_json::Value>(http.get(format!("{}/at-the-cap", server.base)).send().await.unwrap()).await.unwrap();
+        assert_eq!(at["pad"].as_str().unwrap().len(), cap - r#"{"pad":""}"#.len());
+        let past = read_json_async::<serde_json::Value>(http.get(format!("{}/past-it", server.base)).send().await.unwrap()).await.unwrap_err();
+        assert!(past.contains("larger than the 2 MiB"), "{past}");
+    }
+
+    #[test]
+    fn no_lane_reads_a_reply_of_any_size() {
+        // `.json()` and `.bytes()` buffer whatever comes, and an allocation that fails aborts the desktop. Each lane reads
+        // through `read_json` or `read_body` here. The sealed flows lane has a capped reader of its own.
+        for (name, source) in [
+            ("relay.rs", include_str!("relay.rs")),
+            ("flow_runner.rs", include_str!("flow_runner.rs")),
+            ("heartbeat.rs", include_str!("heartbeat.rs")),
+            ("data_node.rs", include_str!("data_node.rs")),
+            ("flows.rs", include_str!("flows.rs")),
+            ("app_logic.rs", include_str!("app_logic.rs")),
+            ("result_actions.rs", include_str!("result_actions.rs")),
+            ("script_profile.rs", include_str!("script_profile.rs")),
+            ("oauth.rs", include_str!("oauth.rs")),
+            ("ai/tunnel.rs", include_str!("../ai/tunnel.rs")),
+            ("ai/chat_tools.rs", include_str!("../ai/chat_tools.rs")),
+            ("calendar/sync.rs", include_str!("../calendar/sync.rs")),
+        ] {
+            let code = crate::source_scan::production_code(source).split_whitespace().collect::<Vec<_>>().join(" ");
+            for forbidden in ["resp.json(", "resp.json::<", "resp .json(", "resp .json::<", ".bytes() .map_err", "resp.bytes()", "resp.text()"] {
+                assert!(!code.contains(forbidden), "{name} reads a reply of any size with {forbidden}");
+            }
+        }
     }
 
     #[test]
