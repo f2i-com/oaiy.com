@@ -91,6 +91,12 @@
           "first": "first",
           "found": "found"
         },
+        "limit": {
+          "field": "limit",
+          "param": "limit",
+          "default": 200,
+          "max": 500
+        },
         "filters": {
           "field": "filters",
           "opKey": "op",
@@ -119,12 +125,17 @@
       {
         "nodeType": "formlogic_submit_response",
         "operation": "createRecord",
-        "path": "/api/v1/forms/{form}/responses"
+        "path": "/api/v1/forms/{form}/responses",
+        "recordField": "answers",
+        "replyField": "response"
       },
       {
         "nodeType": "formlogic_update_response",
         "operation": "updateRecord",
-        "path": "/api/v1/responses/{id}"
+        "path": "/api/v1/forms/{form}/responses/{responseId}",
+        "method": "PUT",
+        "recordField": "answers",
+        "replyField": "response"
       },
       {
         "nodeType": "connector_request",

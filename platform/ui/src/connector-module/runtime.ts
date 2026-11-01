@@ -233,6 +233,21 @@ function filterQuery(call: ConnectorCall): string {
   return parts.join('&');
 }
 
+/** How many rows the node asks for, as the provider's query parameter. */
+function limitQuery(call: ConnectorCall): string {
+  const spec = call.limit;
+  if (!spec) return '';
+  const asked = Number(call.data[spec.field]);
+  const rows = Number.isFinite(asked) && asked >= 1 ? Math.floor(asked) : spec.default;
+  return `${encodeURIComponent(spec.param)}=${Math.min(rows, spec.max)}`;
+}
+
+/** The record a write gave back: the part the provider's reply wraps it in, if it does. */
+function replyRecord(call: ConnectorCall, reply: unknown): unknown {
+  if (!call.replyField || !isRecord(reply)) return reply;
+  return reply[call.replyField] ?? reply;
+}
+
 /**
  * Hand a listing to the graph in the shape its author reads.
  *
@@ -411,6 +426,16 @@ export function createConnectorRuntime(
      * declared body stand, which keeps "POST nothing on purpose" possible.
      */
     const writeBody = (call: ConnectorCall, input: unknown): Record<string, unknown> => {
+      // The provider's node names its own field, so that is what is written. The
+      // wired input is the flow's data, not this record: sent instead, the
+      // provider stored a blank record and the run reported success.
+      if (call.recordField) {
+        const record = call.data[call.recordField];
+        if (!isRecord(record)) {
+          fail(call, `the node's "${call.recordField}" field did not resolve to an object.`);
+        }
+        return { [call.recordField]: record };
+      }
       const declared = call.data.body ?? call.data.payload ?? call.data.record;
       if (hasContent(declared)) return objectArg(call, declared, 'the node\'s "body" field');
       const fromInput = asRecord(input);
@@ -544,8 +569,8 @@ export function createConnectorRuntime(
       // -- listRecords ------------------------------------------------------
       listRecords: async (input: unknown, call: ConnectorCall): Promise<unknown> => {
         const base = recordUrl(call, input, true);
-        const filters = filterQuery(call);
-        const url = filters ? base + (base.includes('?') ? '&' : '?') + filters : base;
+        const query = [filterQuery(call), limitQuery(call)].filter(Boolean).join('&');
+        const url = query ? base + (base.includes('?') ? '&' : '?') + query : base;
         log(`${label(call)}: GET ${url}`);
         const json = await http(ctx, {
           url,
@@ -562,14 +587,14 @@ export function createConnectorRuntime(
         const url = recordUrl(call, input, false);
         const payload = writeBody(call, input);
         log(`${label(call)}: ${call.method || 'POST'} ${url}`);
-        return await http(ctx, {
+        return replyRecord(call, await http(ctx, {
           url,
           method: call.method || 'POST',
           headers: providerHeaders(true),
           body: JSON.stringify(payload),
           call,
           what: 'creating a record',
-        });
+        }));
       },
 
       // -- updateRecord -----------------------------------------------------
@@ -577,14 +602,14 @@ export function createConnectorRuntime(
         const url = recordUrl(call, input, false);
         const payload = writeBody(call, input);
         log(`${label(call)}: ${call.method || 'PATCH'} ${url}`);
-        return await http(ctx, {
+        return replyRecord(call, await http(ctx, {
           url,
           method: call.method || 'PATCH',
           headers: providerHeaders(true),
           body: JSON.stringify(payload),
           call,
           what: 'updating a record',
-        });
+        }));
       },
 
       // -- connectorRequest -------------------------------------------------

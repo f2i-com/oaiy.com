@@ -335,6 +335,36 @@ async function main(): Promise<void> {
     await m.listRecords(null, callFor(modA, 'ledger_list_entries', { book: 'b', query: { page: 2, tag: ['x', 'y'] } }));
     check('listRecords: query fields become a query string', sent[0].url.endsWith('?page=2&tag=x&tag=y'));
   }
+  {
+    // A provider whose nodes have fields of their own: the record, the wrapped reply and the row count.
+    const modC = createConnectorModule(parseConnectorConfig({
+      baseUrl: 'http://provider-c.local',
+      credential: 'cred_ccc',
+      nodes: [
+        { nodeType: 'pull_rows', operation: 'listRecords', path: '/rows', limit: { field: 'limit', param: 'count', default: 200, max: 500 } },
+        { nodeType: 'add_row', operation: 'createRecord', path: '/rows', recordField: 'fields', replyField: 'row' },
+        { nodeType: 'set_row', operation: 'updateRecord', path: '/rows/{rowId}', method: 'PUT', recordField: 'fields', replyField: 'row' },
+      ],
+    }));
+    const list = mkCtx(() => ({ body: [] }));
+    const lm = modC.runtime.createMethods!(list.ctx);
+    await lm.listRecords(null, callFor(modC, 'pull_rows', { limit: 1 }));
+    await lm.listRecords(null, callFor(modC, 'pull_rows'));
+    await lm.listRecords(null, callFor(modC, 'pull_rows', { limit: 9000 }));
+    check('listRecords: the node\'s limit reaches the provider', list.sent[0].url.endsWith('?count=1'));
+    check('listRecords: no limit asks for the described default, not the provider\'s page', list.sent[1].url.endsWith('?count=200'));
+    check('listRecords: a limit is held to the described most', list.sent[2].url.endsWith('?count=500'));
+
+    const write = mkCtx(() => ({ body: { row: { id: 'r1' } } }));
+    const wm = modC.runtime.createMethods!(write.ctx);
+    const added = await wm.createRecord({ noise: 'the flow data' }, callFor(modC, 'add_row', { fields: { a: 1 } }));
+    check('createRecord: sends the node\'s own field, not the wired input', write.sent[0].body === '{"fields":{"a":1}}');
+    check('createRecord: hands back the record out of its wrapper', (added as { id?: string }).id === 'r1');
+    await wm.updateRecord(null, callFor(modC, 'set_row', { rowId: 'r1', fields: { a: 2 } }));
+    check('updateRecord: the described verb and the node\'s field', write.sent[1].method === 'PUT' && write.sent[1].url.endsWith('/rows/r1') && write.sent[1].body === '{"fields":{"a":2}}');
+    await rejectsWith('createRecord: a record that did not resolve fails, with nothing sent', '"fields" field did not resolve', async () => wm.createRecord({ noise: 1 }, callFor(modC, 'add_row')));
+    check('createRecord: nothing was sent for it', write.sent.length === 2);
+  }
   await rejectsWith('listRecords: a missing placeholder fails loudly', 'needs a value for {book}', async () => {
     const { ctx } = mkCtx(() => ({ body: [] }));
     const m = modA.runtime.createMethods!(ctx);

@@ -196,6 +196,31 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
         }),
       };
     }
+    if (entry.limit !== undefined) {
+      if (operation !== 'listRecords') {
+        throw new Error(`${where}: "limit" only applies to listRecords (this is ${operation}).`);
+      }
+      const l = (entry.limit ?? {}) as Record<string, unknown>;
+      const count = (value: unknown, name: string): number => {
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+          throw new Error(`${where}: "limit.${name}" must be a whole number of rows.`);
+        }
+        return value;
+      };
+      spec.limit = {
+        field: requireString(l.field, 'limit.field', where),
+        param: requireString(l.param, 'limit.param', where),
+        default: count(l.default, 'default'),
+        max: count(l.max, 'max'),
+      };
+    }
+    for (const name of ['recordField', 'replyField'] as const) {
+      if (entry[name] === undefined) continue;
+      if (operation !== 'createRecord' && operation !== 'updateRecord') {
+        throw new Error(`${where}: "${name}" only applies to createRecord / updateRecord (this is ${operation}).`);
+      }
+      spec[name] = requireString(entry[name], name, where);
+    }
 
     return spec;
   });

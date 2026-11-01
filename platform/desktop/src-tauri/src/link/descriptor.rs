@@ -661,6 +661,35 @@ pub struct FlowNodeSpec {
     /// somebody else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<FilterSpec>,
+    /// The verb of a write, where the provider's isn't the operation's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The node field a write sends, under the same name. Omitted, a write sends
+    /// the node's `body` or the wired input, and a provider's own field is
+    /// never read: a blank record, reported as a success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_field: Option<String>,
+    /// The part of a write's reply that is the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_field: Option<String>,
+    /// How many rows a listing asks for. Omitted, it gets the provider's own
+    /// default page, and whatever is past that page is silently not there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitSpec>,
+}
+
+/// How a node's row limit reaches the provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LimitSpec {
+    /// The node field holding the number.
+    pub field: String,
+    /// The query parameter it becomes.
+    pub param: String,
+    /// Asked for when the node names none.
+    pub default: u32,
+    /// The most that is asked for.
+    pub max: u32,
 }
 
 /// The names a provider's graphs read a listing's parts by.

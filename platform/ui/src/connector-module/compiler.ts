@@ -79,6 +79,9 @@ export function createConnectorCompiler(config: ConnectorConfig): ModuleCompiler
       // provider shapes a listing, and how its row filters are spelled.
       if (spec.listResult) call.listResult = spec.listResult;
       if (spec.filters) call.filters = spec.filters;
+      if (spec.recordField) call.recordField = spec.recordField;
+      if (spec.replyField) call.replyField = spec.replyField;
+      if (spec.limit) call.limit = spec.limit;
 
       let callLiteral: string;
       try {

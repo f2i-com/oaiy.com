@@ -91,6 +91,32 @@ export interface ConnectorNodeSpec {
    * belongs to somebody else.
    */
   filters?: ConnectorFilterSpec;
+  /**
+   * For a write: the node field that holds what is written, sent under the same
+   * name. Absent, the body is the node's `body` field or the wired input. A
+   * provider's node with its own field would otherwise send the wired input in
+   * its place: a blank record, reported as a success.
+   */
+  recordField?: string;
+  /** For a write: the part of the reply that is the record. Absent, the whole reply. */
+  replyField?: string;
+  /**
+   * For a listing: how many rows a node asks for. Absent, it gets the provider's
+   * own default page, and everything past that page is silently not there.
+   */
+  limit?: ConnectorLimitSpec;
+}
+
+/** How a node's row limit reaches the provider. */
+export interface ConnectorLimitSpec {
+  /** The node-data field holding the number. */
+  field: string;
+  /** The query parameter it becomes. */
+  param: string;
+  /** Asked for when the node names none. */
+  default: number;
+  /** The most that is asked for. */
+  max: number;
 }
 
 /** The names a provider's graphs read a listing's parts by. */
@@ -159,6 +185,10 @@ export interface ConnectorCall {
   listResult?: ConnectorListResultSpec;
   /** Copied from the node spec: how row filters reach the provider. */
   filters?: ConnectorFilterSpec;
+  /** Copied from the node spec: what a write sends, what comes back, how many rows a listing asks for. */
+  recordField?: string;
+  replyField?: string;
+  limit?: ConnectorLimitSpec;
 }
 
 /**

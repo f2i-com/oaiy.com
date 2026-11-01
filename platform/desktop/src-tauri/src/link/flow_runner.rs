@@ -1440,6 +1440,17 @@ mod tests {
             .iter()
             .any(|n| n["operation"] == "listRecords" && n["path"].as_str().is_some_and(|p| p.starts_with('/'))));
         assert!(nodes.iter().any(|n| n["operation"] == "runInput" && n.get("path").is_none()));
+        // What FormLogic's node fields and routes are. This test read names only, so an update node
+        // that could never succeed passed: a path and verb the server has no route for, on an id
+        // field the node doesn't have.
+        let update = nodes.iter().find(|n| n["nodeType"] == "formlogic_update_response").unwrap();
+        assert_eq!(update["path"], "/api/v1/forms/{form}/responses/{responseId}");
+        assert_eq!(update["method"], "PUT");
+        let submit = nodes.iter().find(|n| n["nodeType"] == "formlogic_submit_response").unwrap();
+        assert_eq!((&submit["recordField"], &update["recordField"]), (&json!("answers"), &json!("answers")));
+        assert_eq!((&submit["replyField"], &update["replyField"]), (&json!("response"), &json!("response")));
+        let list = nodes.iter().find(|n| n["nodeType"] == "formlogic_list_responses").unwrap();
+        assert_eq!(list["limit"]["field"], "limit");
 
         // Every declared operation is one the CLI was told about — the closed
         // set, serialized in the form the contract fixes.
