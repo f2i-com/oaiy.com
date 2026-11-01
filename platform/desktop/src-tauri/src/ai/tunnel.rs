@@ -502,11 +502,18 @@ impl AiTunnel {
         let mut handled = 0usize;
         let mut failed = None;
         for request in reply.requests {
-            if let Err(e) = self.serve(account, spec, instance, &request).await {
-                log::warn!("AI turn {} could not be served: {e}", request.id);
-                failed.get_or_insert(e);
+            match self.serve(account, spec, instance, &request).await {
+                Ok(true) => handled += 1,
+                // Taken, or the lane is busy. The row is still offered while the lane is busy, so
+                // counting this as work would go straight round again, as fast as the provider
+                // answers, until the lane comes free.
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("AI turn {} could not be served: {e}", request.id);
+                    failed.get_or_insert(e);
+                    handled += 1;
+                }
             }
-            handled += 1;
         }
         // Polling that works while every turn fails (the provider half down)
         // must back off like a failed poll, not go straight round again.
@@ -516,14 +523,15 @@ impl AiTunnel {
         }
     }
 
-    /// Claim one turn, answer it, and always report a terminal status.
+    /// Claim one turn, answer it, and always report a terminal status. False when the claim was
+    /// lost, so nothing was served.
     async fn serve(
         &self,
         account: &LinkedAccount,
         spec: &DesktopAiSpec,
         instance: &str,
         request: &AiRequest,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let http = self.http.get()?;
         let claim_url = crate::link::oauth::join(
             &account.base_url,
@@ -543,7 +551,7 @@ impl AiTunnel {
         if !claim_status.is_success() {
             // 409 is the ordinary "someone else got there first".
             return if claim_status.as_u16() == 409 {
-                Ok(())
+                Ok(false)
             } else {
                 Err(format!("claim refused: HTTP {}", claim_status.as_u16()))
             };
@@ -595,7 +603,7 @@ impl AiTunnel {
                 done_status.as_u16()
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Seal a typed failure so the requester learns WHY.
@@ -1679,6 +1687,48 @@ mod tests {
         for pair in polls.windows(2) {
             let gap = pair[1].at - pair[0].at;
             assert!(gap >= Duration::from_millis(2_800) && gap < Duration::from_secs(6), "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn a_turn_it_could_not_claim_waits_like_an_empty_poll() {
+        // While the lane is busy the row is still offered and the claim refused. Counted as work,
+        // that went straight round: a poll and a claim, as fast as the provider answered, for as
+        // long as the lane stayed busy.
+        use crate::link::testkit::{Provider, Reply};
+        let row = json!({
+            "requests": [{
+                "requestId": "1f0c2a1e-0000-4000-8000-000000000001",
+                "kind": "chat",
+                "providerId": "x",
+                "ephPub": "AAAA",
+                "envelope": "AAAA",
+            }]
+        })
+        .to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&row)
+            } else {
+                Reply::status(409, r#"{"code":"lane_busy"}"#)
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "ai-busy", |d| {
+            let lane = d.desktop_ai.as_mut().unwrap();
+            lane.wait_seconds = 1;
+            lane.idle_pause_ms = 1_500;
+        });
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        spawn(store.clone(), sources);
+        let polls = server.wait_for("/api/v1/desktop-ai/pending", 3, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        for pair in polls.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            assert!(gap >= Duration::from_millis(1_200), "polled again after {gap:?}");
         }
     }
 
