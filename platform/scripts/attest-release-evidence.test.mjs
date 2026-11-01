@@ -11,8 +11,13 @@ const REV = 'a'.repeat(40);
 let passed = 0, failed = 0;
 const ok = (name, cond, detail = '') => { if (cond) { passed++; console.log(`  ok  ${name}`); } else { failed++; console.log(`  FAIL ${name} ${detail}`); } };
 
+// (when the process ends, passed or failed: an exception here goes the same way)
+const made = [];
+process.on('exit', () => { for (const dir of made) fs.rmSync(dir, { recursive: true, force: true }); });
+
 function fixture({ revision = REV, status = 'unverified', audit = 'pending', tamper = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-evidence-'));
+  made.push(dir);
   const bytes = Buffer.from('artifact bytes ' + Math.random());
   fs.writeFileSync(path.join(dir, 'oaiy-web-0.0.1.zip'), bytes);
   const sha256 = crypto.createHash('sha256').update(tamper ? Buffer.from('other') : bytes).digest('hex');

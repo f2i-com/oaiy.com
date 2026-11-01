@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/bridge/v1/artifact-ref.schema.json",
   "title": "Artifact reference",
-  "description": "How binaries travel. Inline base64 is capped at 64 KiB because a 32 MB data URL in a run payload gets copied into the run ledger, the event stream and every log sink simultaneously.",
+  "description": "Reserved: no run carries one yet, and /api/bridge/artifacts/* answers 404. How binaries will travel. Inline base64 is capped at 64 KiB because a 32 MB data URL in a run payload gets copied into the run ledger, the event stream and every log sink simultaneously.",
   "type": "object",
   "required": [
     "kind",

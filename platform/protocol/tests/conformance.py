@@ -111,11 +111,28 @@ def refs_of(node) -> list[str]:
     return found
 
 
-known_ids = {s["$id"] for s in schemas.values()}
+def holds(schema: dict, fragment: str) -> bool:
+    """Whether the JSON pointer `fragment` (`/$defs/failed`) names something in `schema`."""
+    node = schema
+    for part in fragment.split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return False
+    return True
+
+
+by_id = {s["$id"]: s for s in schemas.values()}
 for name, schema in schemas.items():
     for ref in refs_of(schema):
-        target = ref.split("#")[0]
-        ok(f"{name} -> {target.rsplit('/', 1)[-1]}", target in known_ids, f"unresolved: {ref}")
+        # A ref with no file part points into its own schema: `#/$defs/failed` has to be there too.
+        target, _, fragment = ref.partition("#")
+        document = by_id.get(target) if target else schema
+        ok(f"{name} -> {ref.rsplit('/', 1)[-1]}",
+           document is not None and holds(document, fragment), f"unresolved: {ref}")
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +143,16 @@ CASES: list[tuple[str, str, dict, bool]] = [
     # --- health / handshake ---
     ("health.schema.json", "a healthy desktop",
      {"status": "ok", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0"}, True),
+    ("health.schema.json", "what the desktop sends, with its access guard in front",
+     {"status": "ok", "product": "oaiy-desktop", "companion": "oaiy-desktop", "protocol": "oaiy-bridge/1",
+      "version": "0.1.0", "apiVersion": 1, "pluginApiVersion": 1, "access": "scoped", "storage": "ok"}, True),
+    ("health.schema.json", "what the desktop sends, with no guard in front",
+     {"status": "ok", "product": "oaiy-desktop", "companion": "oaiy-desktop", "protocol": "oaiy-bridge/1",
+      "version": "0.1.0", "apiVersion": 1, "pluginApiVersion": 1}, True),
+    ("health.schema.json", "an invented access mode is refused",
+     {"status": "ok", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0", "access": "open"}, False),
+    ("health.schema.json", "an unknown field is refused",
+     {"status": "ok", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0", "extra": 1}, False),
     ("health.schema.json", "degraded WITHOUT detail is refused",
      {"status": "degraded", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0"}, False),
     ("health.schema.json", "degraded WITH detail is accepted",
@@ -145,6 +172,13 @@ CASES: list[tuple[str, str, dict, bool]] = [
     ("capability-manifest.schema.json", "an available capability",
      {"protocol": "oaiy-bridge/1", "runtime": "desktop",
       "capabilities": [{"id": "oaiy.llm.chat", "available": True, "connections": ["conn_llama"]}]}, True),
+    ("capability-manifest.schema.json", "a connector id with a hyphen, as the desktop's own flows connector has",
+     {"protocol": "oaiy-bridge/1", "runtime": "desktop",
+      "capabilities": [{"id": "connector.oaiy-flows.flows.list", "available": True},
+                       {"id": "connector.oaiy-flows.flow.run", "available": True}]}, True),
+    ("capability-manifest.schema.json", "an empty segment in a capability id is refused",
+     {"protocol": "oaiy-bridge/1", "runtime": "desktop",
+      "capabilities": [{"id": "connector..flow.run", "available": True}]}, False),
     ("capability-manifest.schema.json", "unavailable WITHOUT a reason is refused",
      {"protocol": "oaiy-bridge/1", "runtime": "desktop",
       "capabilities": [{"id": "oaiy.image.generate", "available": False}]}, False),
@@ -166,6 +200,9 @@ CASES: list[tuple[str, str, dict, bool]] = [
     ("run-request.schema.json", "a flow invoked by id",
      {"protocol": "oaiy-bridge/1", "caller": CALLER, "flowId": "customer-follow-up",
       "input": {"name": "Dana"}, "correlationId": "call_abc", "idempotencyKey": "binding:97:resp:5512"}, True),
+    ("run-request.schema.json", "a flow that needs a hyphened connector's capability",
+     {"protocol": "oaiy-bridge/1", "caller": CALLER, "flowId": "f", "capabilities": ["connector.oaiy-flows.flow.run"],
+      "correlationId": "c", "idempotencyKey": "k"}, True),
     ("run-request.schema.json", "a flow invoked inline",
      {"protocol": "oaiy-bridge/1", "caller": CALLER, "graph": {"nodes": [], "edges": []},
       "correlationId": "c", "idempotencyKey": "k"}, True),

@@ -22,6 +22,11 @@
       "description": "Stable machine identity, e.g. `oaiy-desktop`. Never localised. Match on this.",
       "maxLength": 64
     },
+    "companion": {
+      "type": "string",
+      "description": "The same identity as `product`, under the name a host app's desktop probe reads.",
+      "maxLength": 64
+    },
     "protocol": {
       "type": "string",
       "const": "oaiy-bridge/1",
@@ -31,6 +36,32 @@
       "type": "string",
       "description": "Build version. INFORMATIONAL \u2014 never gate behaviour on it; it moves for reasons unrelated to the wire format.",
       "maxLength": 32
+    },
+    "apiVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version of this HTTP API, so a consumer can refuse a runtime too old for it instead of failing later on a missing route."
+    },
+    "pluginApiVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The newest plugin API this runtime runs."
+    },
+    "access": {
+      "enum": [
+        "legacy",
+        "shadow",
+        "scoped"
+      ],
+      "description": "How this runtime authorises requests. Sent only when the access guard is in front of the route. Anything but `scoped` is worth a banner."
+    },
+    "storage": {
+      "enum": [
+        "ok",
+        "low",
+        "full"
+      ],
+      "description": "Room on the disk of the credential store. Sent only when the access guard is in front of the route."
     },
     "runtime": {
       "enum": [

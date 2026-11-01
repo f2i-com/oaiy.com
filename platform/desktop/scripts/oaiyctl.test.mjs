@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +24,11 @@ const shell = (() => {
   return null;
 })();
 
+const made = [];
+after(() => {
+  for (const dir of [...made, h_marker()]) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 /**
  * A folder with a fake `id`, `sudo` and server, and an environment file. With `running` it also has a `systemctl` that
  * says the service runs as process 4242, and a /proc in which that process was started with `running.dataDir` (or with
@@ -31,6 +36,7 @@ const shell = (() => {
  */
 function harness({ user, envText, running }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiyctl-'));
+  made.push(dir);
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
   const posix = (p) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => `/${d.toLowerCase()}`);

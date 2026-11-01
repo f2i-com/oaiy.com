@@ -64,13 +64,20 @@ GET /api/health
 ```
 
 ```json
-{ "status": "ok", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0" }
+{ "status": "ok", "product": "oaiy-desktop", "companion": "oaiy-desktop", "protocol": "oaiy-bridge/1",
+  "version": "0.1.0", "apiVersion": 1, "pluginApiVersion": 1, "access": "scoped", "storage": "ok" }
 ```
 
 - `product` — the identity to match on. Assert it.
+- `companion` — the same identity, under the name a host app's desktop probe reads.
 - `protocol` — what to branch on for compatibility.
 - `version` — informational. **Never** gate behaviour on it; it moves for reasons
   unrelated to the wire format.
+- `apiVersion`, `pluginApiVersion` — this HTTP API's version and the newest plugin
+  API the runtime runs, so a consumer can refuse a runtime too old for it.
+- `access`, `storage` — how requests are authorised (`legacy`, `shadow` or `scoped`)
+  and the room left on the credential store's disk (`ok`, `low` or `full`). Sent
+  only when the access guard is in front of the route.
 
 A 200 on a fixed loopback port is not proof you reached OAIY. This is not
 hypothetical: an unrelated vendor's app has already answered `/api/health` on a
@@ -126,11 +133,14 @@ may contain PII. Treat it as untrusted text: it reaches log lines and UI.
 | `GET /api/bridge/flows` | flows this runtime can run |
 | `POST /api/bridge/runs` | invoke a flow |
 | `GET /api/bridge/runs/{runId}` | poll one run |
-| `GET /api/bridge/runs/{runId}/events` | stream run events (SSE) |
 | `POST /api/bridge/runs/{runId}/cancel` | request cancellation |
 | `POST /api/bridge/connectors/{connectorId}/request` | call a connector command (a plugin's; or `oaiy-flows`, the desktop's own: `flows.list` and `flow.run` of the flows shared with apps, see `platform/docs/REMOTE_FORMLOGIC.md`) |
-| `GET /api/bridge/events` | stream runtime/plugin events (SSE) |
-| `POST /api/bridge/devices` | register/refresh this device with a cloud tenant |
+| `GET /api/bridge/events?since=N&limit=M` | poll runtime/plugin events: one JSON answer, `{events, next}`, not a stream |
+
+Reserved, not served: `GET /api/bridge/runs/{runId}/events`, `POST /api/bridge/devices`
+and `/api/bridge/artifacts/*` answer `404` today. Their schemas ([`run-event`](v1/run-event.schema.json),
+[`device-registration`](v1/device-registration.schema.json), [`artifact-ref`](v1/artifact-ref.schema.json))
+say what they will carry. Nothing can rely on them yet.
 
 ### Capability discovery
 
@@ -181,19 +191,29 @@ POST /api/bridge/runs
 }
 ```
 
-- `flowId` **or** inline `graph` — one is required, never both.
+- `flowId` **or** inline `graph` — one is required, never both. An inline `graph` is
+  reserved: the desktop runtime reserves the run and then fails it `invalid_flow`,
+  because it executes stored flows only. Use `flowId`.
 - `capabilities` is the flow's declared requirement. The runtime refuses up front
   when the caller's grants do not cover it, rather than failing halfway through a
   flow that has already sent an email.
-- `mode`: `sync` waits for the terminal result; `async` returns `202` with a
-  `runId`; `queued` reserves the run without starting it, for a worker to claim.
+- `mode`: `sync` waits for the terminal result (`200`), and answers `202` with the
+  run as it stands if its time budget passes first; `async` answers `201` with the
+  reserved run; `queued` answers `201` too, the run reserved without starting, for
+  a worker to claim.
 - `idempotencyKey` is **required** and is the deduplication gate.
+
+A request the runtime reads and refuses is `400`, or `422` from a loop guard, with
+a code from the closed taxonomy. A body that is not a run request at all stops
+before that, in the HTTP layer, as plain text and not JSON: `400` for bad JSON,
+`415` with no JSON content type, `422` for a missing or unknown member (no
+`idempotencyKey`, no `caller`).
 
 #### Idempotency is not optional
 
 The run row is reserved under a unique constraint on `idempotencyKey` **before
-execution begins**. A duplicate request returns the existing run with
-`idempotent: true` and does not execute anything.
+execution begins**. A duplicate request returns the existing run with `200` and
+`idempotent: true`, and does not execute anything.
 
 This is load-bearing, not defensive. Triggers fire from retried webhooks, from
 multiple browser tabs, and from at-least-once event delivery. Without the
@@ -257,9 +277,10 @@ burns the ledger.
 
 ### Streaming
 
-`GET /api/bridge/runs/{runId}/events` is SSE, one JSON
-[run event](v1/run-event.schema.json) per message: `node_started`,
-`node_finished`, `log`, `progress`, `status_changed`.
+No runtime streams a run yet: poll `GET /api/bridge/runs/{runId}`.
+`GET /api/bridge/runs/{runId}/events` is reserved for it, and answers `404` today.
+It will be SSE, one JSON [run event](v1/run-event.schema.json) per message:
+`node_started`, `node_finished`, `log`, `progress`, `status_changed`.
 
 Streaming is an optimisation over polling and must never be the only path to a
 result — a dropped connection cannot lose the outcome. The terminal state is
@@ -361,7 +382,9 @@ support ticket.
 
 ## Files and media
 
-Binaries travel as [artifact refs](v1/artifact-ref.schema.json), never inline:
+Reserved: no run carries an artifact ref yet, and `/api/bridge/artifacts/*` answers
+`404`. Binaries will travel as [artifact refs](v1/artifact-ref.schema.json), never
+inline:
 
 ```json
 { "kind": "artifact", "id": "art_01J8…", "mediaType": "image/png",
@@ -399,14 +422,17 @@ the schema wins and this document is the bug.
 | [`flow-descriptor`](v1/flow-descriptor.schema.json) | one flow, enough to invoke it and render a picker |
 | [`run-request`](v1/run-request.schema.json) | invocation, idempotency, lineage + the depth cap |
 | [`run-result`](v1/run-result.schema.json) | terminal state; a failure must carry an error |
-| [`run-event`](v1/run-event.schema.json) | one SSE message from a run's event stream |
+| [`run-event`](v1/run-event.schema.json) | one SSE message of a run's event stream (reserved) |
 | [`error`](v1/error.schema.json) | the closed error taxonomy |
 | [`event-envelope`](v1/event-envelope.schema.json) | plugin → runtime → consumer events |
 | [`trigger-binding`](v1/trigger-binding.schema.json) | binding an event to a flow |
 | [`connector-request`](v1/connector-request.schema.json) | calling a connector command |
 | [`connector-response`](v1/connector-response.schema.json) | its reply |
-| [`device-registration`](v1/device-registration.schema.json) | pairing a device + the heartbeat |
-| [`artifact-ref`](v1/artifact-ref.schema.json) | how binaries travel |
+| [`device-registration`](v1/device-registration.schema.json) | pairing a device + the heartbeat (reserved) |
+| [`artifact-ref`](v1/artifact-ref.schema.json) | how binaries will travel (reserved) |
+| [`script-request`](v1/script-request.schema.json) | a batch of leaf scripts for the ZIPP engine, no workflow graph (`oaiy script`, the desktop's script host) |
+| [`script-result`](v1/script-result.schema.json) | its reply: one entry per job, or the whole request refused |
+| [`script-profile`](v1/script-profile.schema.json) | a requester's prelude for the jobs of one script request |
 
 ## Repo layout
 

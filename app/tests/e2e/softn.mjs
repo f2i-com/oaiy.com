@@ -1,7 +1,7 @@
 // SoftN in bot.computer: a new app renders live, reacts to input, follows
 // edits, reports errors, is checked by the agent, and exports as .softn.
 // Needs the SoftN runtime (npm run fetch:softn).   node tests/e2e/softn.mjs
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -125,6 +125,7 @@ try {
     d.dismiss();
   });
   const downloads = mkdtempSync(join(tmpdir(), 'botc-softn-'));
+  process.on('exit', () => rmSync(downloads, { recursive: true, force: true }));
   const cdp = await page.createCDPSession();
   await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
   await page.goto(base);

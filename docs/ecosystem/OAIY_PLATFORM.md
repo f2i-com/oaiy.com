@@ -115,8 +115,9 @@ Two transports, neither a WebSocket.
   correlationId, idempotencyKey, lineage?}` (unknown fields are refused) → `201` reserved,
   `200 + idempotent:true` for a duplicate, `422` loop guard (lineage depth ≤ 16). `sync`
   waits up to the timeout plus 5 s, then `202`. `claim` and `finish` answer 409 on conflict.
-- Documented but not implemented: `GET /api/bridge/runs/:id/events` (SSE),
-  `POST /api/bridge/devices`, `/api/bridge/artifacts`.
+- Reserved in the protocol, not implemented: `GET /api/bridge/runs/:id/events` (SSE),
+  `POST /api/bridge/devices`, `/api/bridge/artifacts` (each answers 404), and an inline
+  `graph` (the run is reserved, then fails `invalid_flow`).
 
 **Remote: outbound HTTPS to FormLogic.**
 

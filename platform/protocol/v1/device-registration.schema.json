@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/bridge/v1/device-registration.schema.json",
   "title": "Device registration",
-  "description": "POST /api/bridge/devices \u2014 how a desktop announces itself to a cloud tenant and keeps a heartbeat.\n\nAn upsert on `deviceId` that also stamps `lastSeenAt`, so the registry doubles as the liveness signal: a consumer deciding whether a remote runtime exists reads freshness here rather than maintaining a second presence channel.",
+  "description": "Reserved: POST /api/bridge/devices is not served yet and answers 404. How a desktop will announce itself to a cloud tenant and keep a heartbeat.\n\nAn upsert on `deviceId` that also stamps `lastSeenAt`, so the registry doubles as the liveness signal: a consumer deciding whether a remote runtime exists reads freshness here rather than maintaining a second presence channel.",
   "type": "object",
   "required": [
     "deviceId",
@@ -43,7 +43,7 @@
       "items": {
         "type": "string",
         "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
-        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*-]+)+$",
         "maxLength": 128
       },
       "maxItems": 512

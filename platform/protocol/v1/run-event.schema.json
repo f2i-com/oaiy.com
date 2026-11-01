@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/bridge/v1/run-event.schema.json",
   "title": "Run event",
-  "description": "One SSE message from GET /api/bridge/runs/{runId}/events.\n\nStreaming is an optimisation over polling and must never be the only path to a result \u2014 a dropped connection cannot be allowed to lose the outcome. The terminal state is always durably readable from the run itself.",
+  "description": "Reserved: GET /api/bridge/runs/{runId}/events is not served yet and answers 404. One SSE message of that stream, for the runtime that adds it.\n\nStreaming is an optimisation over polling and must never be the only path to a result \u2014 a dropped connection cannot be allowed to lose the outcome. The terminal state is always durably readable from the run itself.",
   "type": "object",
   "required": [
     "runId",

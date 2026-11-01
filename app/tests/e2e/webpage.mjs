@@ -2,7 +2,7 @@
 // project, its JavaScript runs on the Zipp VM against the real DOM, and the
 // agent's tools check, use and screenshot it at chosen screen sizes; SoftN apps
 // and 3D models are screenshotted in the same preview.   node tests/e2e/webpage.mjs
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'vite';
@@ -24,6 +24,11 @@ await page.setViewport({ width: 1280, height: 860 });
 await page.goto(`${base}/tests/e2e/preview-harness.html`);
 await page.waitForFunction(() => document.title === 'ready', { timeout: 60_000 });
 const shots = mkdtempSync(join(tmpdir(), 'bot-webpage-'));
+// (a run that failed keeps its screenshots, and says where: they are what there is to look at)
+process.on('exit', (code) => {
+  if (code === 0) rmSync(shots, { recursive: true, force: true });
+  else console.log(`\nscreenshots in ${shots}`);
+});
 
 let failures = 0;
 const check = async (name, fn) => {
@@ -378,7 +383,6 @@ await check('a SoftN app shows a 3D model from its assets in a Scene3D, and its 
   expect(faces.red > 1000 && faces.cyan > 1000, `the model's faces are not in the screenshot (red ${faces.red}, cyan ${faces.cyan} pixels)`);
 });
 
-console.log(`\nscreenshots in ${shots}`);
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

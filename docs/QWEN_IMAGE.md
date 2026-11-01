@@ -76,8 +76,7 @@ retained by the unloaded worker. Failed controller loading never starts diffusio
 ## Agent tool
 
 The sibling coder-cli exposes `image_generate`. Build the updated coder-cli and
-add the following in its existing `[oaiy]` settings table (or set the
-`OAIY_IMAGE_CONFIG` environment variable):
+add the following in its existing `[oaiy]` settings table:
 
 ```toml
 image_config = 'E:\repos\oaiy\config\qwen-image.local.json'

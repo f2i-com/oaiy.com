@@ -27,7 +27,7 @@
     },
     "graph": {
       "type": "object",
-      "description": "Inline graph: { nodes: [{id,type,data,position?}], edges: [{source,target,sourceHandle?,targetHandle?}] }."
+      "description": "Inline graph: { nodes: [{id,type,data,position?}], edges: [{source,target,sourceHandle?,targetHandle?}] }. Reserved: the desktop runtime reserves such a run and then fails it `invalid_flow`, because it executes stored flows only. Use `flowId`."
     },
     "input": {
       "type": "object",
@@ -39,7 +39,7 @@
       "items": {
         "type": "string",
         "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
-        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*-]+)+$",
         "maxLength": 128
       },
       "maxItems": 64,
@@ -52,7 +52,7 @@
         "queued"
       ],
       "default": "async",
-      "description": "`sync` waits for the terminal result. `async` returns 202 + runId. `queued` reserves without starting, for a worker to claim."
+      "description": "`sync` waits for the terminal result (200), and answers 202 with the run as it stands if its time budget passes first. `async` answers 201 with the reserved run. `queued` answers 201 too: reserved without starting, for a worker to claim."
     },
     "timeoutMs": {
       "type": "integer",
