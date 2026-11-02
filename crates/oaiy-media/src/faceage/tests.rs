@@ -59,6 +59,16 @@ fn encode64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn every_face_found_is_blacked_out_of_the_body_picture() {
+    let img = Rgb { width: 4, height: 4, data: vec![200; 48] };
+    let face = |x: f32, y: f32| super::yunet::Face { x, y, w: 1., h: 1., landmarks: [0.; 10], score: 0.95 };
+    let out = super::without_faces(&img, &[face(0., 0.), face(3., 3.)]);
+    let pixel = |x: usize, y: usize| out.data[(y * 4 + x) * 3];
+    assert_eq!((pixel(0, 0), pixel(3, 3)), (0, 0), "the one in front and the one behind");
+    assert_eq!(pixel(1, 1), 200, "and nothing else");
+}
+
+#[test]
 fn only_the_faces_in_front_of_the_camera_count() {
     let face = |w: f32, h: f32| super::yunet::Face { x: 0., y: 0., w, h, landmarks: [0.; 10], score: 0.95 };
     let sizes = |faces: Vec<super::yunet::Face>| super::in_front(faces).iter().map(|f| f.w).collect::<Vec<_>>();

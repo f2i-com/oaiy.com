@@ -101,6 +101,22 @@ pub fn in_front(found: Vec<yunet::Face>) -> Vec<yunet::Face> {
     found.into_iter().filter(|f| f.w * f.h >= largest * MIN_FACE_SHARE).collect()
 }
 
+/// A found face's box, in the picture's pixels.
+fn face_box(face: &yunet::Face, img: &Rgb) -> PixelBox {
+    PixelBox {
+        x1: face.x.max(0.) as usize,
+        y1: face.y.max(0.) as usize,
+        x2: ((face.x + face.w).max(0.) as usize).min(img.width),
+        y2: ((face.y + face.h).max(0.) as usize).min(img.height),
+    }
+}
+
+/// The picture with every face found blacked out, those left out of the count too: the model's whole-picture input is
+/// for the one person's body, and a parent's face behind a child must not be read into the child's age.
+fn without_faces(img: &Rgb, found: &[yunet::Face]) -> Rgb {
+    found.iter().fold(img.clone(), |out, face| out.without(face_box(face, img)))
+}
+
 /// What one picture showed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
@@ -116,19 +132,15 @@ pub fn read(detector: &yunet::YuNet, model: &mivolo::MiVolo, pictures: &[Rgb], s
     let mut readings = Vec::with_capacity(pictures.len());
     let (mut faces, mut bodies, mut which) = (Vec::new(), Vec::new(), Vec::new());
     for (i, img) in pictures.iter().enumerate() {
-        let found = in_front(detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?);
+        let all = detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?;
+        let found = in_front(all.clone());
         readings.push(Reading { faces: found.len(), age: None, pose: None });
         if let [face] = found.as_slice() {
             readings[i].pose = pose::pose(&face.landmarks);
-            let b = PixelBox {
-                x1: face.x.max(0.) as usize,
-                y1: face.y.max(0.) as usize,
-                x2: ((face.x + face.w).max(0.) as usize).min(img.width),
-                y2: ((face.y + face.h).max(0.) as usize).min(img.height),
-            };
+            let b = face_box(face, img);
             if let Some(crop) = img.crop(b) {
                 faces.push(crop.letterbox(mivolo::SIDE).normalised(&dev)?);
-                bodies.push(img.without(b).letterbox(mivolo::SIDE).normalised(&dev)?);
+                bodies.push(without_faces(img, &all).letterbox(mivolo::SIDE).normalised(&dev)?);
                 which.push(i);
             }
         }
