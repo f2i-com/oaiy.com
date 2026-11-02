@@ -1,6 +1,6 @@
 //! The port checked against the authors' own code: `OAIY_FACEAGE_MIVOLO` names MiVOLO v2's `model.safetensors` and
 //! `OAIY_FACEAGE_REF` a folder of reference tensors made by running their code on the same weights (see
-//! `docs/FACE_AGE.md`). Without them these tests say so and pass.
+//! `tools/faceage`). Without them these tests say so and pass.
 use super::mivolo::MiVolo;
 use super::prep::{PixelBox, Rgb};
 use candle_core::{Device, Tensor};
