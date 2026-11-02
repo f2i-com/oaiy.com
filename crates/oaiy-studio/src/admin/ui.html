@@ -3383,7 +3383,8 @@ const DL_ICONS = {
   music: '<path d="M9 18V6l11-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/>',
   sound: '<path d="M4 10v4h4l5 4V6L8 10z"/><path d="M16 9a4 4 0 010 6M18.5 6.5a8 8 0 010 11"/>',
   model3d: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
-  picture: '<path d="M4 20l7-7M14 4l6 6M12 6l6 6-8 8H4v-6z"/>'
+  picture: '<path d="M4 20l7-7M14 4l6 6M12 6l6 6-8 8H4v-6z"/>',
+  check: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>'
 };
 const dlSize = n => !n ? "nothing" : n >= 1e12 ? (n / 1e12).toFixed(1) + " TB" : n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
 const dur = s => !isFinite(s) || s <= 0 ? "" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
@@ -3479,7 +3480,7 @@ function getLabel(p) {
 function dlCard(m, group) {
   const d = m.download, busy = dlBusy(d);
   // (a Mac's GPU has no memory of its own: what a model needs of it is the GPU's share of the unified memory)
-  const need = macMemory() ? `<span title="Of this Mac's unified memory, for its GPU">Memory <b>${m.vram_gb} GB+</b></span>` : `<span title="The GPU's own memory (VRAM)">GPU <b>${m.vram_gb} GB+</b></span>`;
+  const need = !m.vram_gb ? `<span title="It runs on the processor and needs no graphics card">CPU</span>` : macMemory() ? `<span title="Of this Mac's unified memory, for its GPU">Memory <b>${m.vram_gb} GB+</b></span>` : `<span title="The GPU's own memory (VRAM)">GPU <b>${m.vram_gb} GB+</b></span>`;
   const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, need, `<span title="${esc(m.license)}">${esc(m.license)}</span>`];
   // (what to do, before the download: said as done, "is accepted … then a token is saved", it read as done already)
   const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener">its page on huggingface.co</a>` : "its page on huggingface.co";
