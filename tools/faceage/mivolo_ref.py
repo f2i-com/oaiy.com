@@ -83,3 +83,17 @@ with torch.no_grad():
     pre_head = model(torch.cat([faces, bodies], dim=1))
 print("pre faces", tuple(faces.shape), "bodies", tuple(bodies.shape), "head", pre_head.tolist(), "age", (pre_head[:, 2] * 122 + 61).tolist())
 save_file({"faces": faces.contiguous(), "bodies": bodies.contiguous(), "head": pre_head.contiguous()}, str(out / "mivolo_pre.safetensors"))
+
+# The whole job's path on the same picture: YuNet's best candidate there (OpenCV's FaceDetectorYN, score 0.144, the
+# only one above 0.13), its box cut to whole pixels and clipped as the port does, then MiVOLO on it.
+jx1, jy1, jx2, jy2 = 551, 314, 640, 455
+job_face = img[jy1:jy2, jx1:jx2].copy()
+job_body = img.copy()
+job_body[jy1:jy2, jx1:jx2] = 0
+jf = prepare_classification_images([job_face], 384, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+jb = prepare_classification_images([job_body], 384, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+with torch.no_grad():
+    job_head = model(torch.cat([jf, jb], dim=1))
+job_age = job_head[:, 2] * 122 + 61
+print("job box", (jx1, jy1, jx2, jy2), "age", job_age.tolist())
+save_file({"age": job_age.contiguous()}, str(out / "mivolo_job.safetensors"))

@@ -116,6 +116,42 @@ fn the_job_reads_a_picture_with_no_face_as_no_face() {
     }
 }
 
+#[test]
+fn the_job_reads_one_faces_age_as_the_authors_code_does_two_pictures_at_once() {
+    let (Some((model, reference)), Some((detector, _))) = (paths(), yunet_paths()) else {
+        eprintln!("skipped: set OAIY_FACEAGE_MIVOLO, OAIY_FACEAGE_YUNET and OAIY_FACEAGE_REF");
+        return;
+    };
+    use oaiy_engine::json::Json;
+    // The test picture has no face, but at 0.13 YuNet keeps exactly one candidate there (OpenCV's too: 0.144, the next
+    // 0.117), so the job's one-face path runs: the box, the crop, the body with it blacked out, MiVOLO on a batch.
+    let raw = std::fs::read(reference.join("pre_image_rgb.raw")).unwrap();
+    let mut png = Vec::new();
+    image::RgbImage::from_raw(640, 480, raw).unwrap().write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let request = Json::obj([
+        ("kind", Json::str("face-age")),
+        ("detector", Json::str(detector.to_string_lossy())),
+        ("model", Json::str(model.to_string_lossy())),
+        ("images", Json::Arr(vec![Json::str(encode64(&png)), Json::str(encode64(&png))])),
+        ("score_threshold", Json::Num(0.13)),
+    ]);
+    let answer = super::run(&super::Request::parse(&request).unwrap()).unwrap();
+    eprintln!("{}", answer.to_json());
+    let images = answer.get("images").and_then(Json::as_array).unwrap();
+    let ages: Vec<f64> = images
+        .iter()
+        .map(|i| {
+            assert_eq!(i.get("faces").and_then(Json::as_f64), Some(1.));
+            i.get("age").and_then(Json::as_f64).expect("an age for one face")
+        })
+        .collect();
+    assert_eq!(ages[0], ages[1], "the same picture twice in one batch reads the same");
+    let r = candle_core::safetensors::load(reference.join("mivolo_job.safetensors"), &Device::Cpu).unwrap();
+    let want = r["age"].flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] as f64;
+    eprintln!("age {} against the authors' code's {want:.2}", ages[0]);
+    assert!((ages[0] - want).abs() < 0.5, "{} against {want}", ages[0]);
+}
+
 fn yunet_paths() -> Option<(PathBuf, PathBuf)> {
     let model = std::env::var_os("OAIY_FACEAGE_YUNET").map(PathBuf::from)?;
     let reference = std::env::var_os("OAIY_FACEAGE_REF").map(PathBuf::from)?;

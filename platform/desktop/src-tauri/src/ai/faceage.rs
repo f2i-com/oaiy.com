@@ -50,6 +50,12 @@ fn worker(root: &Path, named: &str) -> Option<PathBuf> {
         dirs.push(dir.join("engines"));
         dirs.push(dir);
     }
+    // The engines an installer carries (the engines write this path into the settings when they start; a studio
+    // that was already running when this one started may not have).
+    #[cfg(feature = "gui")]
+    if let Some(dir) = crate::engines::bundled() {
+        dirs.push(dir.to_path_buf());
+    }
     dirs.push(root.to_path_buf());
     dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file())
 }
