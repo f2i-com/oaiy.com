@@ -32,6 +32,7 @@ fn run() -> candle_core::Result<()> {
         println!("Klein: architecture=flux2-klein-4b, transformer (original BFL safetensors), text_encoder (Qwen3-4B), tokenizer, vae (Flux2), prompt, output_dir. Distilled: 4 steps, CFG=1. Style adapters: loras=[{{path,strength}}]. Native text-to-image; dimensions multiple of 16; no Qwen turbo, negative prompts or references. Explicit variant=base for Klein base 4B weights.");
         println!("FLUX 3: architecture=flux3-klein, transformer (BFL's model.safetensors, distilled or base), text_encoder (Qwen3-VL-4B-Instruct folder), vae (Flux2), prompt, output_dir, optional images (up to 10 references to edit or compose from), width and height (else the first reference's or 1024x1024; multiples of 16, at most 2048x2048 in area). Distilled: 16 steps, no guidance; base: 50 steps, cfg 3.5. LoRAs: loras=[{{path,strength}}] (BFL's, ComfyUI's or diffusers' names). WebGPU only; the prompt as written (no upsampler).");
         println!("MOSS-Image: architecture=moss-image, transformer (OpenMOSS's MOSS-Image-SFT or -Base transformer: its folder, a safetensors file, or a GGUF), text_encoder (Qwen3.5-9B: Hugging Face's folder, MOSS-Image's text_encoder, or a GGUF), tokenizer (Qwen3.5's tokenizer.json; else beside the text encoder, or a GGUF's own), vae (Flux2's, or MOSS-Image's small decoder), prompt (text, tags or a JSON layout), negative_prompt, output_dir, width and height (1024x1024; multiples of 16, at most 2048x2048 in area). 50 steps, cfg 3, shift 5, uncond_skip_layers [22]. WebGPU only.");
+        println!("Face age: kind=face-age, detector (YuNet's face_detection_yunet_2023mar.onnx), model (MiVOLO v2's model.safetensors), images (1 to 16 pictures, base64), optional score_threshold (0.9). Answers each picture's face count and, for one face, its age; on the CPU, and nothing of a picture is kept.");
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "--serve") {
@@ -103,6 +104,12 @@ fn run() -> candle_core::Result<()> {
         configure_cache(&r.output)?;
         let result = oaiy_media::music::generate(&r, |event| eprintln!("{}", event.to_json()))?;
         writeln!(std::io::stdout(), "{}", result.to_json())?;
+        return Ok(());
+    }
+    if j.get("kind").and_then(Json::as_str) == Some("face-age") {
+        let r = oaiy_media::faceage::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+        let result = oaiy_media::faceage::run(&r)?;
+        println!("{}", result.to_json());
         return Ok(());
     }
     if j.get("kind").and_then(Json::as_str) == Some("picture") {

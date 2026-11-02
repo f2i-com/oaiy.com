@@ -46,6 +46,76 @@ fn mivolo_matches_the_authors_code_part_by_part() {
     assert!((age - want).abs() < 0.05);
 }
 
+fn encode64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[test]
+fn base64_reads_what_it_is_given() {
+    for sample in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0, 255, 128, 7, 9]] {
+        assert_eq!(super::base64(&encode64(sample)).unwrap(), sample);
+    }
+    assert_eq!(super::base64("Zm9v\nYmFy").unwrap(), b"foobar");
+    assert!(super::base64("Zm9v!").is_none());
+}
+
+#[test]
+fn a_job_is_refused_without_its_models_or_with_too_many_pictures() {
+    use oaiy_engine::json::Json;
+    let dir = std::env::temp_dir();
+    let missing = Json::obj([("kind", Json::str("face-age")), ("detector", Json::str("no-such-file.onnx")), ("model", Json::str("no-such.safetensors")), ("images", Json::Arr(vec![Json::str(encode64(b"x"))]))]);
+    assert!(super::Request::parse(&missing).err().unwrap().contains("not there"));
+    let exe = std::env::current_exe().unwrap();
+    let many = Json::obj([
+        ("detector", Json::str(exe.to_string_lossy())),
+        ("model", Json::str(exe.to_string_lossy())),
+        ("images", Json::Arr((0..17).map(|_| Json::str(encode64(b"x"))).collect())),
+    ]);
+    assert!(super::Request::parse(&many).err().unwrap().contains("1 to 16"));
+    let none = Json::obj([("detector", Json::str(dir.to_string_lossy())), ("images", Json::Arr(vec![]))]);
+    assert!(super::Request::parse(&none).is_err());
+}
+
+#[test]
+fn the_job_reads_a_picture_with_no_face_as_no_face() {
+    let (Some((model, reference)), Some((detector, _))) = (paths(), yunet_paths()) else {
+        eprintln!("skipped: set OAIY_FACEAGE_MIVOLO, OAIY_FACEAGE_YUNET and OAIY_FACEAGE_REF");
+        return;
+    };
+    use oaiy_engine::json::Json;
+    let raw = std::fs::read(reference.join("pre_image_rgb.raw")).unwrap();
+    let mut png = Vec::new();
+    image::RgbImage::from_raw(640, 480, raw).unwrap().write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let request = Json::obj([
+        ("kind", Json::str("face-age")),
+        ("detector", Json::str(detector.to_string_lossy())),
+        ("model", Json::str(model.to_string_lossy())),
+        ("images", Json::Arr(vec![Json::str(format!("data:image/png;base64,{}", encode64(&png))), Json::str(encode64(&png))])),
+    ]);
+    let r = super::Request::parse(&request).unwrap();
+    let answer = super::run(&r).unwrap();
+    eprintln!("{}", answer.to_json());
+    let images = answer.get("images").and_then(Json::as_array).unwrap();
+    assert_eq!(images.len(), 2);
+    for image in images {
+        assert_eq!(image.get("faces").and_then(Json::as_f64), Some(0.));
+        assert!(image.get("age").is_none());
+    }
+    // Only what is said here leaves the job: no gender, no box, no picture.
+    let text = answer.to_json();
+    for word in ["gender", "male", "box", "base64", "landmark"] {
+        assert!(!text.contains(word), "{word} in {text}");
+    }
+}
+
 fn yunet_paths() -> Option<(PathBuf, PathBuf)> {
     let model = std::env::var_os("OAIY_FACEAGE_YUNET").map(PathBuf::from)?;
     let reference = std::env::var_os("OAIY_FACEAGE_REF").map(PathBuf::from)?;
