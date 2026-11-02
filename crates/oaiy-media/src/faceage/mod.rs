@@ -3,10 +3,12 @@
 //! MiVOLO cuts a face out of its body crop). One job a process: the models are loaded for it and gone when it ends.
 //!
 //! The job (`kind: face-age`) takes the two models' files and the pictures, inline as base64; it answers, for each
-//! picture, how many faces were found and, when there is exactly one, its age. Nothing else of a picture leaves it
+//! picture, how many faces were found and, when there is exactly one, its age and which way it points (`pose`, by
+//! geometry from the detector's landmarks: no model judges it). Nothing else of a picture leaves it
 //! (the model's gender output is not read), and nothing of one is written anywhere.
 pub mod mivolo;
 pub mod onnx;
+pub mod pose;
 pub mod prep;
 pub mod yunet;
 
@@ -89,6 +91,8 @@ pub fn base64(text: &str) -> Option<Vec<u8>> {
 pub struct Reading {
     pub faces: usize,
     pub age: Option<f64>,
+    /// Which way the one face points (from its landmarks), when there is exactly one.
+    pub pose: Option<pose::Pose>,
 }
 
 /// Faces and ages for decoded pictures, with the models loaded.
@@ -98,8 +102,9 @@ pub fn read(detector: &yunet::YuNet, model: &mivolo::MiVolo, pictures: &[Rgb], s
     let (mut faces, mut bodies, mut which) = (Vec::new(), Vec::new(), Vec::new());
     for (i, img) in pictures.iter().enumerate() {
         let found = detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?;
-        readings.push(Reading { faces: found.len(), age: None });
+        readings.push(Reading { faces: found.len(), age: None, pose: None });
         if let [face] = found.as_slice() {
+            readings[i].pose = pose::pose(&face.landmarks);
             let b = PixelBox {
                 x1: face.x.max(0.) as usize,
                 y1: face.y.max(0.) as usize,
@@ -147,6 +152,10 @@ pub fn run(r: &Request) -> Result<Json> {
             let mut fields = vec![("faces".to_string(), Json::Int(reading.faces as i64))];
             if let Some(age) = reading.age {
                 fields.push(("age".to_string(), Json::Num((age * 10.).round() / 10.)));
+            }
+            if let Some(p) = reading.pose {
+                fields.push(("yaw".to_string(), Json::Num((p.yaw * 10.).round() / 10.)));
+                fields.push(("pitch".to_string(), Json::Num((p.pitch * 10.).round() / 10.)));
             }
             Json::Obj(fields)
         })

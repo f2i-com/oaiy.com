@@ -150,13 +150,7 @@ async fn run(files: &Files, pictures: Vec<String>) -> Result<Value, String> {
         .and_then(Value::as_array)
         .ok_or("the media engine's answer has no pictures")?
         .iter()
-        .map(|i| {
-            let mut one = json!({ "faces": i.get("faces").and_then(Value::as_u64).unwrap_or(0) });
-            if let Some(age) = i.get("age").and_then(Value::as_f64) {
-                one["age"] = json!(age);
-            }
-            one
-        })
+        .map(reading)
         .collect();
     Ok(json!({
         "task": TASK,
@@ -164,6 +158,21 @@ async fn run(files: &Files, pictures: Vec<String>) -> Result<Value, String> {
         "detector": answer.get("detector").cloned().unwrap_or(Value::Null),
         "images": images,
     }))
+}
+
+/// One picture's reading as the worker gave it, held to what the check sends on: the face count, and for one face its
+/// age and which way it points (yaw and pitch in degrees, from the detector's landmarks).
+fn reading(i: &Value) -> Value {
+    let mut one = json!({ "faces": i.get("faces").and_then(Value::as_u64).unwrap_or(0) });
+    if let Some(age) = i.get("age").and_then(Value::as_f64).filter(|a| a.is_finite()) {
+        one["age"] = json!(age);
+    }
+    for key in ["yaw", "pitch"] {
+        if let Some(angle) = i.get(key).and_then(Value::as_f64).filter(|a| a.is_finite() && a.abs() <= 90.) {
+            one[key] = json!(angle);
+        }
+    }
+    one
 }
 
 /// The answer to a turn's `verify`, for its final frame: the readings, or why there are none.
@@ -227,6 +236,13 @@ mod tests {
         assert!(pictures(&json!({ "images": [3] }), &messages).unwrap_err().contains("no picture 3"));
         assert!(pictures(&json!({ "images": [] }), &messages).is_err());
         assert!(pictures(&json!({}), &messages).is_err());
+    }
+
+    #[test]
+    fn a_reading_keeps_the_count_the_age_and_the_angles_and_nothing_else() {
+        let r = reading(&json!({ "faces": 1, "age": 31.5, "yaw": -12.3, "pitch": 4.0, "gender": "x", "box": [1, 2, 3, 4] }));
+        assert_eq!(r, json!({ "faces": 1, "age": 31.5, "yaw": -12.3, "pitch": 4.0 }));
+        assert_eq!(reading(&json!({ "faces": 2, "yaw": 400.0 })), json!({ "faces": 2 }), "an angle no head turns is dropped");
     }
 
     #[test]
