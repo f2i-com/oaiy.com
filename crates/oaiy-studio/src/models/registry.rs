@@ -499,6 +499,15 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
             return attach_model3d(cfg, d, target, picked);
         }
         "model3d" | "model3d_dino" | "model3d_naf" => return attach_model3d(cfg, d, target, picked),
+        // The age check's two files: MiVOLO v2 (the age) and YuNet (the faces), each a field of its own section.
+        "faceage_model" | "faceage_detector" => {
+            let (key, other) = if d.kind() == "faceage_model" { ("model", "detector") } else { ("detector", "model") };
+            let value = field_of(d, key).ok_or("detected part has no path")?;
+            let section = obj_mut(cfg, &["media", "faceage"]).ok_or("no age check section")?;
+            set(section, key, value);
+            let missing = if str_or(section, other, "").trim().is_empty() { vec![other.to_string()] } else { Vec::new() };
+            return Ok(Added { section: "faceage", name: key.to_string(), enabled: missing.is_empty(), missing });
+        }
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -1496,5 +1505,26 @@ mod tests {
         let images: Vec<_> = routes.iter().filter(|r| str_or(r, "target", "") == "images").collect();
         assert_eq!(images.len(), 1);
         assert!(bool_or(images[0], "enabled", false));
+    }
+
+    #[test]
+    fn the_age_checks_files_fill_its_section_and_say_what_it_still_needs() {
+        let d = tmp("faceage");
+        let mivolo = d.join("MiVOLO-v2");
+        std::fs::create_dir_all(&mivolo).unwrap();
+        std::fs::write(mivolo.join("config.json"), r#"{"architectures":["MiVOLOForImageClassification"],"model_type":"mivolo"}"#).unwrap();
+        safetensors(&mivolo.join("model.safetensors"), r#"{"mivolo.model.head.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        let yunet = d.join("YuNet");
+        std::fs::create_dir_all(&yunet).unwrap();
+        std::fs::write(yunet.join("face_detection_yunet_2023mar.onnx"), b"\x08\x06").unwrap();
+        let mut cfg = config::default_json();
+        let (a, _) = add(&mut cfg, &mivolo, None, None).unwrap();
+        assert_eq!((a.section, a.name.as_str(), a.enabled, a.missing.clone()), ("faceage", "model", false, vec!["detector".to_string()]));
+        let (b, _) = add(&mut cfg, &yunet.join("face_detection_yunet_2023mar.onnx"), None, None).unwrap();
+        assert_eq!((b.section, b.name.as_str(), b.enabled), ("faceage", "detector", true));
+        let section = get(&cfg, &["media", "faceage"]).unwrap();
+        assert!(str_or(section, "model", "").ends_with("model.safetensors") && str_or(section, "detector", "").ends_with("face_detection_yunet_2023mar.onnx"), "{section:?}");
+        config::validate(&cfg).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

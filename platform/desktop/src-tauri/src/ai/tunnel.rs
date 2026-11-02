@@ -208,6 +208,8 @@ pub struct AiTunnel {
     /// of each making one. Its default timeout is what a turn's [`Lane`] has
     /// always had; the polls and the key publish set their own.
     http: crate::link::net::LaneClient<reqwest::Client>,
+    /// This desktop's data folder: where the engines' settings name the age check's models (aceage).
+    data_dir: std::path::PathBuf,
 }
 
 /// An optional provider must not stall discovery of working local providers.
@@ -258,6 +260,7 @@ impl AiTunnel {
             codex_catalog_probe: OptionalProviderProbe::default(),
             engines,
             http: crate::link::net::LaneClient::new(build_client),
+            data_dir: data_dir.to_path_buf(),
         }))
     }
 
@@ -815,6 +818,28 @@ impl AiTunnel {
     /// text at all. A final holding, say, the last chunk would silently reduce
     /// a long reply to one word.
     async fn chat(
+        &self,
+        lane: &Lane<'_>,
+        provider_id: &str,
+        model: Option<&str>,
+        body: &Value,
+        eph_pub: &str,
+    ) -> Result<Vec<u8>, TunnelError> {
+        // An age check's pictures read by this OAIY's own age model first, when the turn asks (`verify`): loaded in the
+        // media worker for the check and gone when it ends, before the language model answers. Its readings go in
+        // the final frame, whichever way the answer came.
+        let verification = match (body.get("verify"), body.get("messages").and_then(Value::as_array)) {
+            (Some(ask), Some(messages)) => Some(crate::ai::faceage::verify(&self.data_dir, ask, messages).await),
+            _ => None,
+        };
+        let frame = self.answer_chat(lane, provider_id, model, body, eph_pub).await?;
+        Ok(match verification {
+            Some(v) => crate::ai::faceage::with_verification(frame, v),
+            None => frame,
+        })
+    }
+
+    async fn answer_chat(
         &self,
         lane: &Lane<'_>,
         provider_id: &str,

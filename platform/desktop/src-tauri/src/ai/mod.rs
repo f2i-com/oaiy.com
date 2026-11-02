@@ -17,6 +17,7 @@ pub mod chat_tools;
 pub mod codex;
 pub mod e2e;
 pub mod egress;
+pub mod faceage;
 pub mod engine_services;
 pub mod gateway;
 pub mod providers;

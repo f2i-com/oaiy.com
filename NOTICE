@@ -29,6 +29,10 @@ crates/gguf, crates/ggml-quants, crates/ggml-rs and crates/tokenizer and the
 models under crates/oaiy-llm-server/src/llm (once the crate llama-rs), is
 licensed MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE).
 
+crates/oaiy-media/src/faceage follows MiVOLO's model code (Apache-2.0, after timm's VOLO,
+Apache-2.0) and decodes YuNet's outputs as OpenCV does (Apache-2.0); YuNet is MIT. The weights
+are not distributed with OAIY. See docs/licenses/FACE-AGE-NOTICE.md.
+
 platform/desktop/src-tauri/src/auth/bip39_english.txt is the English word list of BIP-39
 (https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt), by Marek Palatinus,
 Pavol Rusnak, Aaron Voisine and Sean Bowe, published under the MIT License. oaiy-server's

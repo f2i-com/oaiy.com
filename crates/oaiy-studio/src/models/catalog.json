@@ -8,7 +8,8 @@
     { "id": "music", "name": "Music", "about": "Songs with vocals from lyrics and a description." },
     { "id": "sound", "name": "Sound effects", "about": "Ambience, creatures, machines and actions from a description." },
     { "id": "model3d", "name": "3D models", "about": "Textured 3D models (GLB) from a picture of an object." },
-    { "id": "picture", "name": "Picture tools", "about": "Background removal and upscaling." }
+    { "id": "picture", "name": "Picture tools", "about": "Background removal and upscaling." },
+    { "id": "check", "name": "Age check", "about": "A person's age from a camera picture, for the age checks a site runs on this OAIY." }
   ],
   "models": [
     {
@@ -426,6 +427,21 @@
         { "url": "https://raw.githubusercontent.com/xinntao/Real-ESRGAN/master/LICENSE", "file": "LICENSE", "into": "Real-ESRGAN" }
       ],
       "add": ["Real-ESRGAN/RealESRGAN_x4plus.pth"]
+    },
+    {
+      "id": "age-check",
+      "group": "check",
+      "name": "Age check (MiVOLO v2 and YuNet)",
+      "about": "A person's age from a camera picture, for a site's age check on this OAIY: YuNet finds the face and MiVOLO v2 estimates its age. Loaded for each check on the CPU and gone after it. An estimate from a face, not an ID check.",
+      "license": "Apache-2.0 (MiVOLO v2), MIT (YuNet)",
+      "size_gb": 0.12,
+      "recommended": false,
+      "parts": [
+        { "repo": "iitolstykh/mivolo_v2", "revision": "53393526c220e34cdd7b722b36d22b6f9e5f4241", "include": ["config.json", "model.safetensors", "README.md"], "into": "MiVOLO-v2" },
+        { "url": "https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/face_detection_yunet_2023mar.onnx", "file": "face_detection_yunet_2023mar.onnx", "size": 232589, "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4", "into": "YuNet" },
+        { "url": "https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/LICENSE", "file": "LICENSE", "into": "YuNet" }
+      ],
+      "add": ["MiVOLO-v2", "YuNet/face_detection_yunet_2023mar.onnx"]
     }
   ]
 }

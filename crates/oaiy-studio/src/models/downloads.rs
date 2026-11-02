@@ -1636,6 +1636,7 @@ fn register_in(cfg: &mut Json, e: &Json, dir: &Path) -> Result<Vec<String>, Stri
                 let said = match (a.section, a.name.as_str()) {
                     ("picture", "background") => "background removal".to_string(),
                     ("picture", _) => "upscaling".to_string(),
+                    ("faceage", _) => format!("the age check{}", if a.enabled { String::new() } else { format!(" (needs {})", a.missing.join(", ")) }),
                     (section, name) => format!("{} {name}{}", section_name(section), if a.enabled { String::new() } else { format!(" (needs {})", a.missing.join(", ")) }),
                 };
                 // (a model and its parts said once: the parts were added to it, and it is said as it ends up)

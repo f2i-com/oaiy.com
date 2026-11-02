@@ -137,6 +137,11 @@ pub const DEFAULT: &str = r#"{
       "enabled": true,
       "background": "",
       "upscaler": ""
+    },
+    "faceage": {
+      "enabled": true,
+      "model": "",
+      "detector": ""
     }
   }
 }"#;

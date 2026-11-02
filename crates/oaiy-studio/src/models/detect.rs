@@ -21,6 +21,9 @@ const MAX_HEADER: u64 = 128 << 20;
 pub(crate) const NAF_FILE: &str = "naf_release.pth";
 pub(crate) const ESRGAN_FILE: &str = "realesrgan_x4plus.pth";
 
+/// YuNet's face detector as OpenCV Zoo publishes it: the age check's (with MiVOLO v2), read from the file as it is.
+pub(crate) const YUNET_FILE: &str = "face_detection_yunet_2023mar.onnx";
+
 /// Is this one of the PyTorch files OAIY reads (by name, any case)?
 pub(crate) fn readable_pth(name: &str) -> bool {
     name.eq_ignore_ascii_case(NAF_FILE) || name.eq_ignore_ascii_case(ESRGAN_FILE)
@@ -152,6 +155,7 @@ pub fn detect(path: &Path) -> Result<Detected, String> {
         // NAF's and Real-ESRGAN's weights are PyTorch files, read without unpickling code.
         "pth" if name == NAF_FILE => Ok(naf(path)),
         "pth" if name == ESRGAN_FILE => Ok(esrgan(path)),
+        "onnx" if name == YUNET_FILE => Ok(yunet(path)),
         "bin" | "pt" | "pth" | "ckpt" => Err(format!(
             "{name}: pickled PyTorch weights are not supported (they can run code when loaded); use the .safetensors or .gguf release"
         )),
@@ -408,6 +412,10 @@ fn safetensors_file(path: &Path) -> Result<Detected, String> {
             return directory(dir);
         }
     }
+    // MiVOLO v2's weights, the age check's age model.
+    if has(&h, "mivolo.model.head.weight") && path.file_name().is_some_and(|n| n == "model.safetensors") {
+        return mivolo(path.parent().unwrap_or(Path::new(".")));
+    }
     classify_header(&h, path, "safetensors")
 }
 
@@ -592,6 +600,19 @@ fn esrgan(path: &Path) -> Detected {
     detected(Role::Component { kind: "model3d_upscaler" }, "pth", "Real-ESRGAN x4plus: enlarges small pictures for 3D models (BSD-3-Clause)".into(), vec![("upscaler", path_json(path))])
 }
 
+fn yunet(path: &Path) -> Detected {
+    detected(Role::Component { kind: "faceage_detector" }, "onnx", "YuNet: finds the faces for the age check (MIT)".into(), vec![("detector", path_json(path))])
+}
+
+/// MiVOLO v2 as `iitolstykh/mivolo_v2` lays it out: its `config.json` and `model.safetensors`.
+fn mivolo(dir: &Path) -> Result<Detected, String> {
+    let weights = dir.join("model.safetensors");
+    if !weights.is_file() {
+        return Err(format!("{}: a MiVOLO folder needs its model.safetensors", stem(dir)));
+    }
+    Ok(detected(Role::Component { kind: "faceage_model" }, "safetensors", "MiVOLO v2: a person's age from their face, for the age check (Apache-2.0)".into(), vec![("model", path_json(&weights))]))
+}
+
 /// A distillation of MOSS-Image to a few passes without guidance (data-space DMD: `moss_image::distill`): its one file
 /// (each block's factors, the time embedding it replaces, its latent mix `latent_mix.Q` and `step_codes`), or one of
 /// its folder's three (`lora.safetensors`, `time_embedding.safetensors`, `dataspace.safetensors`) standing for the
@@ -652,6 +673,10 @@ fn directory(dir: &Path) -> Result<Detected, String> {
     }
     if let Some(weights) = std::fs::read_dir(dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(ESRGAN_FILE)))) {
         return Ok(esrgan(&weights));
+    }
+    // YuNet's folder holds its one network (and its license).
+    if dir.join(YUNET_FILE).is_file() {
+        return Ok(yunet(&dir.join(YUNET_FILE)));
     }
     if let Some(index) = read("model_index.json") {
         let class = str_or(&index, "_class_name", "");
@@ -732,6 +757,10 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         let quant = config.get("quantization_config").map(|q| str_or(q, "quant_method", "")).unwrap_or("");
         let arch = config.get("architectures").and_then(|a| a.at(0)).and_then(Json::as_str).unwrap_or("").to_string();
         let model_type = str_or(&config, "model_type", "");
+        // MiVOLO v2: the age check's age model.
+        if arch == "MiVOLOForImageClassification" || model_type == "mivolo" {
+            return mivolo(dir);
+        }
         // BiRefNet: cuts the object out of a picture for Pixal3D. Its own weights
         // are MIT; RMBG-2.0 (the same network) is for non-commercial use only.
         if arch == "BiRefNet" {
@@ -1178,5 +1207,33 @@ mod tests {
         assert!(field("audio_vae").unwrap().ends_with("a_audio_vae.safetensors"));
         assert!(field("vae").unwrap().ends_with("b_video_vae.safetensors"), "the release's own video VAE");
         assert!(r.missing.is_empty(), "{:?}", r.missing);
+    }
+
+    #[test]
+    fn the_age_checks_two_files_are_recognised() {
+        let d = tmp("faceage");
+        let value = |r: &Detected, key: &str| r.fields.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str()).unwrap_or("").to_string();
+        // MiVOLO v2 as iitolstykh/mivolo_v2 lays it out: its folder, or its weights.
+        let mivolo = d.0.join("MiVOLO-v2");
+        std::fs::create_dir_all(&mivolo).unwrap();
+        std::fs::write(mivolo.join("config.json"), r#"{"architectures":["MiVOLOForImageClassification"],"model_type":"mivolo"}"#).unwrap();
+        assert!(detect(&mivolo).unwrap_err().contains("model.safetensors"));
+        safetensors(&mivolo.join("model.safetensors"), r#"{"mivolo.model.head.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        for p in [mivolo.clone(), mivolo.join("model.safetensors"), mivolo.join("config.json")] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.kind(), "faceage_model");
+            assert!(value(&r, "model").ends_with("model.safetensors"));
+        }
+        // YuNet: its one network, or the folder holding it; no other ONNX file is taken.
+        let yunet = d.0.join("YuNet");
+        std::fs::create_dir_all(&yunet).unwrap();
+        std::fs::write(yunet.join(YUNET_FILE), b"\x08\x06").unwrap();
+        for p in [yunet.join(YUNET_FILE), yunet.clone()] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.kind(), "faceage_detector");
+            assert!(value(&r, "detector").ends_with(YUNET_FILE));
+        }
+        std::fs::write(d.0.join("other.onnx"), b"\x08\x06").unwrap();
+        assert!(detect(&d.0.join("other.onnx")).is_err());
     }
 }
