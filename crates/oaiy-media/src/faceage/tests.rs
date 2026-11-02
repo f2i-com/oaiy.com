@@ -46,6 +46,64 @@ fn mivolo_matches_the_authors_code_part_by_part() {
     assert!((age - want).abs() < 0.05);
 }
 
+fn yunet_paths() -> Option<(PathBuf, PathBuf)> {
+    let model = std::env::var_os("OAIY_FACEAGE_YUNET").map(PathBuf::from)?;
+    let reference = std::env::var_os("OAIY_FACEAGE_REF").map(PathBuf::from)?;
+    (model.is_file() && reference.is_dir()).then_some((model, reference))
+}
+
+#[test]
+fn yunet_runs_the_published_graph_as_onnxruntime_does() {
+    let Some((model, reference)) = yunet_paths() else {
+        eprintln!("skipped: set OAIY_FACEAGE_YUNET and OAIY_FACEAGE_REF");
+        return;
+    };
+    let dev = Device::Cpu;
+    let net = super::yunet::YuNet::load(&model, &dev).unwrap();
+    let r = candle_core::safetensors::load(reference.join("yunet_raw.safetensors"), &dev).unwrap();
+    let got = net.raw(&r["input"]).unwrap();
+    for (name, want) in r.iter().filter(|(n, _)| n.as_str() != "input") {
+        let diff = max_diff(&got[name], want);
+        eprintln!("{name}: max difference {diff:.2e}");
+        assert!(diff < 1e-3, "{name} differs by {diff}");
+    }
+}
+
+#[test]
+fn yunet_finds_what_opencv_finds() {
+    let Some((model, reference)) = yunet_paths() else {
+        eprintln!("skipped: set OAIY_FACEAGE_YUNET and OAIY_FACEAGE_REF");
+        return;
+    };
+    let dev = Device::Cpu;
+    let net = super::yunet::YuNet::load(&model, &dev).unwrap();
+    let image = Rgb::new(640, 480, std::fs::read(reference.join("pre_image_rgb.raw")).unwrap()).unwrap();
+    let lines = std::fs::read_to_string(reference.join("yunet_cv2.txt")).unwrap();
+    for threshold in [0.01f32, 0.05] {
+        let want: Vec<Vec<f32>> = lines
+            .lines()
+            .map(|l| l.split(' ').map(|v| v.parse::<f32>().unwrap()).collect::<Vec<_>>())
+            .filter(|v| (v[0] - threshold).abs() < 1e-6)
+            .map(|v| v[1..].to_vec())
+            .collect();
+        let got = net.detect(&image, threshold, super::yunet::NMS_THRESHOLD, super::yunet::TOP_K).unwrap();
+        eprintln!("threshold {threshold}: OpenCV {} faces, the port {}", want.len(), got.len());
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            let mine = [g.x, g.y, g.w, g.h];
+            for k in 0..4 {
+                assert!((mine[k] - w[k]).abs() < 0.5, "box {mine:?} against {:?}", &w[..4]);
+            }
+            for k in 0..10 {
+                assert!((g.landmarks[k] - w[4 + k]).abs() < 0.5);
+            }
+            assert!((g.score - w[14]).abs() < 1e-3, "score {} against {}", g.score, w[14]);
+        }
+    }
+    // The picture has no face: nothing at OpenCV's own threshold.
+    assert!(net.detect(&image, super::yunet::SCORE_THRESHOLD, super::yunet::NMS_THRESHOLD, super::yunet::TOP_K).unwrap().is_empty());
+}
+
 #[test]
 fn mivolo_preprocessing_and_age_match_the_authors_code() {
     let Some((model, reference)) = paths() else {
