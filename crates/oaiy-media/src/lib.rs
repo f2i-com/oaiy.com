@@ -23,5 +23,8 @@ pub mod music;
 pub mod sound;
 pub mod tts;
 
+// A person's age from a camera picture (an age check).
+pub mod faceage;
+
 // 3D models.
 pub mod model3d;
