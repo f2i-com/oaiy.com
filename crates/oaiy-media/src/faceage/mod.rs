@@ -3,7 +3,7 @@
 //! MiVOLO cuts a face out of its body crop). One job a process: the models are loaded for it and gone when it ends.
 //!
 //! The job (`kind: face-age`) takes the two models' files and the pictures, inline as base64; it answers, for each
-//! picture, how many faces were found and, when there is exactly one, its age and which way it points (`pose`, by
+//! picture, how many faces were found in front of the camera and, when there is exactly one, its age and which way it points (`pose`, by
 //! geometry from the detector's landmarks: no model judges it). Nothing else of a picture leaves it
 //! (the model's gender output is not read), and nothing of one is written anywhere.
 pub mod mivolo;
@@ -29,7 +29,7 @@ pub struct Request {
     pub detector: PathBuf,
     pub model: PathBuf,
     pub pictures: Vec<Vec<u8>>,
-    /// The detector's threshold (OpenCV's 0.9 when not given).
+    /// The detector's threshold (CHECK_SCORE_THRESHOLD when not given).
     pub score_threshold: f32,
 }
 
@@ -52,7 +52,7 @@ impl Request {
                 if bytes.len() > MAX_ENCODED { Err("face-age: a picture larger than 4 MB".to_string()) } else { Ok(bytes) }
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
-        let score_threshold = j.get("score_threshold").and_then(Json::as_f64).map(|v| v as f32).unwrap_or(yunet::SCORE_THRESHOLD);
+        let score_threshold = j.get("score_threshold").and_then(Json::as_f64).map(|v| v as f32).unwrap_or(CHECK_SCORE_THRESHOLD);
         if !(0.0..=1.0).contains(&score_threshold) {
             return Err("face-age: score_threshold is 0 to 1".into());
         }
@@ -86,6 +86,21 @@ pub fn base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The detector's threshold for a check's pictures, below OpenCV's 0.9: they are small webcam frames (360 pixels wide
+/// to fit a relay turn), often dim, and at 0.9 a real face in them can go unseen. Faces in the background are left out by
+/// size instead (in_front).
+pub const CHECK_SCORE_THRESHOLD: f32 = 0.8;
+
+/// A face counts when it is at least this share of the largest face's area: a photo on the wall behind or someone far
+/// back is not the person in front of the camera, whom the check is about. Two people side by side both count.
+pub const MIN_FACE_SHARE: f32 = 0.2;
+
+/// The faces in front of the camera, of those found.
+pub fn in_front(found: Vec<yunet::Face>) -> Vec<yunet::Face> {
+    let largest = found.iter().map(|f| f.w * f.h).fold(0f32, f32::max);
+    found.into_iter().filter(|f| f.w * f.h >= largest * MIN_FACE_SHARE).collect()
+}
+
 /// What one picture showed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
@@ -101,7 +116,7 @@ pub fn read(detector: &yunet::YuNet, model: &mivolo::MiVolo, pictures: &[Rgb], s
     let mut readings = Vec::with_capacity(pictures.len());
     let (mut faces, mut bodies, mut which) = (Vec::new(), Vec::new(), Vec::new());
     for (i, img) in pictures.iter().enumerate() {
-        let found = detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?;
+        let found = in_front(detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?);
         readings.push(Reading { faces: found.len(), age: None, pose: None });
         if let [face] = found.as_slice() {
             readings[i].pose = pose::pose(&face.landmarks);

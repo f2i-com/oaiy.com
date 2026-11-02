@@ -59,6 +59,18 @@ fn encode64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn only_the_faces_in_front_of_the_camera_count() {
+    let face = |w: f32, h: f32| super::yunet::Face { x: 0., y: 0., w, h, landmarks: [0.; 10], score: 0.95 };
+    let sizes = |faces: Vec<super::yunet::Face>| super::in_front(faces).iter().map(|f| f.w).collect::<Vec<_>>();
+    // A webcam frame: the person, a photo on the wall behind (a tenth of the area), someone far back.
+    assert_eq!(sizes(vec![face(120., 140.), face(38., 44.), face(30., 36.)]), [120.], "the background is left out");
+    // Two people side by side are two faces, as they should be.
+    assert_eq!(sizes(vec![face(120., 140.), face(100., 120.)]), [120., 100.]);
+    assert!(super::in_front(Vec::new()).is_empty());
+    assert!(super::CHECK_SCORE_THRESHOLD < super::yunet::SCORE_THRESHOLD, "a check's small frames are read less strictly than OpenCV's default");
+}
+
+#[test]
 fn base64_reads_what_it_is_given() {
     for sample in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0, 255, 128, 7, 9]] {
         assert_eq!(super::base64(&encode64(sample)).unwrap(), sample);
