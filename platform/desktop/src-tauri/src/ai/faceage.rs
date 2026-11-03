@@ -16,6 +16,8 @@ pub const TASK: &str = "face-age";
 const MAX_PICTURES: usize = 16;
 /// Loading both models and reading a few pictures takes seconds on a CPU; past this the check did not happen.
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// The most the worker reads of a job (oaiy-media's `--stdin`): past it, it stops reading and ends.
+const MAX_REQUEST: usize = 2 * 1024 * 1024;
 
 /// The worker and the two model files.
 #[derive(Debug, PartialEq)]
@@ -90,12 +92,14 @@ pub fn files(data_dir: &Path) -> Result<Files, String> {
 /// The pictures the check names: the turn's image parts, numbered from 0 in the order they come, as `data:` URLs
 /// (a picture at an address is never fetched).
 fn pictures(ask: &Value, messages: &[Value]) -> Result<Vec<String>, String> {
-    let all: Vec<&str> = messages
+    // Every image part keeps its place, one with no address too: dropped, it would move each picture after it onto the
+    // number before, and the readings onto the wrong pictures.
+    let all: Vec<Option<&str>> = messages
         .iter()
         .filter_map(|m| m.get("content").and_then(Value::as_array))
         .flatten()
         .filter(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
-        .filter_map(|p| p.get("image_url").and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str))
+        .map(|p| p.get("image_url").and_then(|u| u.get("url").or(Some(u))).and_then(Value::as_str))
         .collect();
     let wanted = ask.get("images").and_then(Value::as_array).ok_or("the age check names no pictures")?;
     if wanted.is_empty() || wanted.len() > MAX_PICTURES {
@@ -105,7 +109,7 @@ fn pictures(ask: &Value, messages: &[Value]) -> Result<Vec<String>, String> {
         .iter()
         .map(|i| {
             let i = i.as_u64().ok_or("a picture named by other than its number")? as usize;
-            let url = all.get(i).ok_or(format!("the turn has no picture {i}"))?;
+            let url = all.get(i).ok_or(format!("the turn has no picture {i}"))?.ok_or(format!("picture {i} of the turn has no address"))?;
             if !url.starts_with("data:image/") {
                 return Err("a picture that is not in the turn itself".to_string());
             }
@@ -116,6 +120,10 @@ fn pictures(ask: &Value, messages: &[Value]) -> Result<Vec<String>, String> {
 
 /// Run the worker's job and read its answer.
 async fn run(files: &Files, pictures: Vec<String>) -> Result<Value, String> {
+    run_within(files, pictures, TIMEOUT).await
+}
+
+async fn run_within(files: &Files, pictures: Vec<String>, limit: Duration) -> Result<Value, String> {
     use crate::HiddenCommand as _;
     use tokio::io::AsyncWriteExt as _;
     let request = serde_json::to_vec(&json!({
@@ -125,25 +133,37 @@ async fn run(files: &Files, pictures: Vec<String>) -> Result<Value, String> {
         "images": pictures,
     }))
     .map_err(|e| e.to_string())?;
+    if request.len() > MAX_REQUEST {
+        return Err(format!("the pictures come to more than the {} MiB the media engine reads in one check", MAX_REQUEST >> 20));
+    }
     let mut std_cmd = std::process::Command::new(&files.worker);
     std_cmd.arg("--stdin").pipe_hidden();
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| format!("the media engine did not start: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("the media engine took no input")?;
-    stdin.write_all(&request).await.map_err(|e| format!("the media engine did not take the pictures: {e}"))?;
-    drop(stdin);
-    let out = tokio::time::timeout(TIMEOUT, child.wait_with_output())
+    // The pictures go in while its answer is read, both under the time limit: a worker that never reads its input held
+    // the write, outside the limit, and with it every turn after this one.
+    let write = async move {
+        let written = stdin.write_all(&request).await;
+        drop(stdin);
+        written
+    };
+    let (written, out) = tokio::time::timeout(limit, async { tokio::join!(write, child.wait_with_output()) })
         .await
-        .map_err(|_| "the age check took too long".to_string())?
-        .map_err(|e| format!("the media engine stopped: {e}"))?;
+        .map_err(|_| "the age check took too long".to_string())?;
+    let out = out.map_err(|e| format!("the media engine stopped: {e}"))?;
     let last_json = |bytes: &[u8]| -> Option<Value> {
         String::from_utf8_lossy(bytes).lines().rev().find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
     };
     if !out.status.success() {
         let said = last_json(&out.stderr).and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string));
-        return Err(said.unwrap_or_else(|| format!("the media engine ended with {}", out.status)));
+        return Err(said.unwrap_or_else(|| match written {
+            Err(e) => format!("the media engine did not take the pictures: {e}"),
+            Ok(()) => format!("the media engine ended with {}", out.status),
+        }));
     }
+    written.map_err(|e| format!("the media engine did not take the pictures: {e}"))?;
     let answer = last_json(&out.stdout).ok_or("the media engine's answer could not be read")?;
     let images: Vec<Value> = answer
         .get("images")
@@ -163,7 +183,12 @@ async fn run(files: &Files, pictures: Vec<String>) -> Result<Value, String> {
 /// One picture's reading as the worker gave it, held to what the check sends on: the face count, and for one face its
 /// age and which way it points (yaw and pitch in degrees, from the detector's landmarks).
 fn reading(i: &Value) -> Value {
-    let mut one = json!({ "faces": i.get("faces").and_then(Value::as_u64).unwrap_or(0) });
+    // A count the worker did not give stays missing: as 0 the site would tell the person no face was found, and count
+    // the try against them.
+    let mut one = json!({});
+    if let Some(faces) = i.get("faces").and_then(Value::as_u64) {
+        one["faces"] = json!(faces);
+    }
     if let Some(age) = i.get("age").and_then(Value::as_f64).filter(|a| a.is_finite()) {
         one["age"] = json!(age);
     }
@@ -236,6 +261,46 @@ mod tests {
         assert!(pictures(&json!({ "images": [3] }), &messages).unwrap_err().contains("no picture 3"));
         assert!(pictures(&json!({ "images": [] }), &messages).is_err());
         assert!(pictures(&json!({}), &messages).is_err());
+    }
+
+    #[test]
+    fn a_picture_with_no_address_keeps_its_number() {
+        let messages = vec![json!({ "role": "user", "content": [
+            { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,AAAA" } },
+            { "type": "image_url", "image_url": {} },
+            { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,CCCC" } },
+        ]})];
+        assert_eq!(pictures(&json!({ "images": [2] }), &messages).unwrap(), ["data:image/jpeg;base64,CCCC"], "not the next one along");
+        assert!(pictures(&json!({ "images": [1] }), &messages).unwrap_err().contains("no address"));
+    }
+
+    #[test]
+    fn a_count_the_worker_did_not_give_stays_missing() {
+        assert_eq!(reading(&json!({ "age": 30.0 })), json!({ "age": 30.0 }), "not 0 faces, which the site reads as no face found");
+        assert_eq!(reading(&json!({ "faces": 0 })), json!({ "faces": 0 }));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_never_reads_its_pictures_is_held_to_the_time_limit() {
+        let d = dir("deaf");
+        // A worker that sleeps and never reads, with more pictures than a pipe holds. Where pipes are the operating
+        // system's own (Linux, macOS) the write waits on the worker; on Windows tokio hands up to 2 MiB to a thread and
+        // goes on, so the write outside the limit hung the lane there only for a larger request.
+        let worker = if cfg!(windows) { d.join("deaf.bat") } else { d.join("deaf.sh") };
+        std::fs::write(&worker, if cfg!(windows) { "@ping -n 30 127.0.0.1 > nul\r\n" } else { "#!/bin/sh\nsleep 30\n" }).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let files = Files { worker, model: d.join("m"), detector: d.join("d") };
+        let started = std::time::Instant::now();
+        let answer = run_within(&files, vec![format!("data:image/jpeg;base64,{}", "A".repeat(1 << 20))], Duration::from_secs(2)).await;
+        assert_eq!(answer.unwrap_err(), "the age check took too long");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let too_much = run_within(&files, vec![format!("data:image/jpeg;base64,{}", "A".repeat(3 << 20))], Duration::from_secs(2)).await;
+        assert!(too_much.unwrap_err().contains("2 MiB"), "said before the worker starts");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
