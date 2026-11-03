@@ -25,9 +25,25 @@ impl Rgb {
         (width > 0 && height > 0 && data.len() == width * height * 3).then_some(Self { width, height, data })
     }
 
-    /// A JPEG or PNG, decoded.
+    /// A JPEG or PNG, decoded: refused from its header when it says it is larger than the job takes, before anything
+    /// is made for it. A picture of a few hundred bytes can say it is 23000 pixels square, and decoded first and
+    /// measured after, it took 2 GB.
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, String> {
-        let img = image::load_from_memory(bytes).map_err(|e| format!("a picture that does not decode: {e}"))?.to_rgb8();
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("a picture that does not decode: {e}"))?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(super::MAX_SIDE as u32);
+        limits.max_image_height = Some(super::MAX_SIDE as u32);
+        reader.limits(limits);
+        let img = reader
+            .decode()
+            .map_err(|e| match e {
+                image::ImageError::Limits(_) => format!("a picture larger than {} pixels on a side", super::MAX_SIDE),
+                e => format!("a picture that does not decode: {e}"),
+            })?
+            // In place where it is RGB already: no second copy of the picture.
+            .into_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
         Self::new(w, h, img.into_raw()).ok_or_else(|| "an empty picture".into())
     }
@@ -97,6 +113,50 @@ impl Rgb {
                     let bottom = at(y1, x0) * (1. - fx) + at(y1, x1) * fx;
                     data[(y * width + x) * 3 + c] = (top * (1. - fy) + bottom * fy).round().clamp(0., 255.) as u8;
                 }
+            }
+        }
+        Self { width, height, data }
+    }
+
+    /// OpenCV's `resize` with `INTER_AREA`, for a smaller picture: each pixel the mean of the part of the picture it
+    /// covers, a pixel cut by its edge counted for the share of it covered. Shrunk by four, the two-tap resize reads two
+    /// pixels in four a direction and can miss a thin line or a fine pattern altogether; this reads every one. Row by row,
+    /// so it holds no more than the two pictures and one row of sums.
+    pub fn resize_area(&self, width: usize, height: usize) -> Self {
+        // For each pixel out, the pixels in it covers and the share of its area each is.
+        let spans = |dst: usize, src: usize| -> Vec<Vec<(usize, f32)>> {
+            let scale = src as f64 / dst as f64;
+            (0..dst)
+                .map(|d| {
+                    let (a, b) = (d as f64 * scale, ((d + 1) as f64 * scale).min(src as f64));
+                    (a.floor() as usize..(b.ceil() as usize).min(src))
+                        .filter_map(|s| {
+                            let cover = b.min(s as f64 + 1.) - a.max(s as f64);
+                            (cover > 1e-9).then_some((s, (cover / (b - a)) as f32))
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let xs = spans(width, self.width);
+        let ys = spans(height, self.height);
+        let mut data = vec![0u8; width * height * 3];
+        let mut sums = vec![0f32; width * 3];
+        for (y, rows) in ys.iter().enumerate() {
+            sums.fill(0.);
+            for &(sy, wy) in rows {
+                let row = &self.data[sy * self.width * 3..(sy + 1) * self.width * 3];
+                for (x, cols) in xs.iter().enumerate() {
+                    for &(sx, wx) in cols {
+                        let w = wx * wy;
+                        for c in 0..3 {
+                            sums[x * 3 + c] += f32::from(row[sx * 3 + c]) * w;
+                        }
+                    }
+                }
+            }
+            for (out, sum) in data[y * width * 3..(y + 1) * width * 3].iter_mut().zip(&sums) {
+                *out = sum.round().clamp(0., 255.) as u8;
             }
         }
         Self { width, height, data }

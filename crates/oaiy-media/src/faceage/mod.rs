@@ -126,7 +126,8 @@ fn without_faces(img: &Rgb, found: &[yunet::Face]) -> Rgb {
     out
 }
 
-/// A picture as it is read: no larger than READ_SIDE on its longer side.
+/// A picture as it is read: no larger than READ_SIDE on its longer side, shrunk by the area each pixel covers (OpenCV's
+/// INTER_AREA, the resize it gives for shrinking), so nothing of it is skipped over.
 pub fn to_read_size(img: Rgb) -> Rgb {
     let longer = img.width.max(img.height);
     if longer <= READ_SIDE {
@@ -134,7 +135,7 @@ pub fn to_read_size(img: Rgb) -> Rgb {
     }
     let scale = READ_SIDE as f64 / longer as f64;
     let (w, h) = (((img.width as f64 * scale).round() as usize).max(1), ((img.height as f64 * scale).round() as usize).max(1));
-    img.resize_linear(w, h)
+    img.resize_area(w, h)
 }
 
 /// What one picture showed.

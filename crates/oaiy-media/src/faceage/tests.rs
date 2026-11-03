@@ -82,6 +82,46 @@ fn a_large_picture_is_read_at_the_read_size_and_a_check_frame_as_it_is() {
 }
 
 #[test]
+fn a_picture_that_says_it_is_too_large_is_refused_from_its_header() {
+    // A flat PNG a few KB long that is 5000 pixels wide: refused as too large, not decoded and measured after.
+    let mut png = Vec::new();
+    image::GrayImage::from_pixel(5000, 8, image::Luma([90]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert!(png.len() < 10_000);
+    assert_eq!(Rgb::decode(&png).unwrap_err(), format!("a picture larger than {} pixels on a side", super::MAX_SIDE));
+    // At the limit it is read, and as RGB.
+    let mut ok = Vec::new();
+    image::GrayImage::from_pixel(super::MAX_SIDE as u32, 2, image::Luma([90]))
+        .write_to(&mut std::io::Cursor::new(&mut ok), image::ImageFormat::Png)
+        .unwrap();
+    let read = Rgb::decode(&ok).unwrap();
+    assert_eq!((read.width, read.height, read.data.len()), (super::MAX_SIDE, 2, super::MAX_SIDE * 2 * 3));
+}
+
+#[test]
+fn a_picture_shrunk_to_the_read_size_keeps_what_falls_between_the_pixels_read() {
+    // A dark picture with a one-pixel bright line at a column a two-tap shrink by four never reads (4n: it reads 4n+1, 4n+2).
+    let (w, h) = (4096, 64);
+    let mut img = Rgb { width: w, height: h, data: vec![10; w * h * 3] };
+    for y in 0..h {
+        img.data[(y * w + 1000) * 3..(y * w + 1001) * 3].fill(250);
+    }
+    let read = super::to_read_size(img.clone());
+    assert_eq!((read.width, read.height), (super::READ_SIDE, 16));
+    let at = |x: usize, y: usize| read.data[(y * read.width + x) * 3];
+    // The line's quarter of its pixel's area: (250 + 3 × 10) / 4.
+    assert_eq!((0..16).map(|y| at(250, y)).collect::<Vec<_>>(), vec![70; 16], "the line is still there");
+    assert_eq!((at(249, 0), at(251, 0), at(0, 15)), (10, 10, 10), "and nothing beside it changed");
+    // Brightness kept: the mean of the picture is the mean of what is read.
+    let mean = |p: &Rgb| p.data.iter().map(|&v| f64::from(v)).sum::<f64>() / p.data.len() as f64;
+    assert!((mean(&img) - mean(&read)).abs() < 0.5, "{} against {}", mean(&img), mean(&read));
+    // A size that does not divide: every pixel read whole or in part, the flat picture flat.
+    let odd = Rgb { width: 3001, height: 7, data: vec![123; 3001 * 7 * 3] }.resize_area(1024, 2);
+    assert!(odd.data.iter().all(|&v| v == 123));
+}
+
+#[test]
 fn a_box_is_blacked_out_in_place_and_held_to_the_picture() {
     let mut img = Rgb { width: 4, height: 3, data: vec![200; 36] };
     img.black_out(super::prep::PixelBox { x1: 2, y1: 1, x2: 99, y2: 99 });
