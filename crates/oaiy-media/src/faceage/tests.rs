@@ -69,6 +69,29 @@ fn every_face_found_is_blacked_out_of_the_body_picture() {
 }
 
 #[test]
+fn a_large_picture_is_read_at_the_read_size_and_a_check_frame_as_it_is() {
+    let picture = |w: usize, h: usize| Rgb { width: w, height: h, data: vec![90; w * h * 3] };
+    let large = super::to_read_size(picture(4096, 2048));
+    assert_eq!((large.width, large.height), (super::READ_SIDE, super::READ_SIDE / 2));
+    assert_eq!(large.data.len(), large.width * large.height * 3);
+    let tall = super::to_read_size(picture(1000, 3000));
+    assert_eq!((tall.width, tall.height), (341, super::READ_SIDE));
+    // A check's frames are 360 pixels wide: read as they came, pixel for pixel.
+    assert_eq!(super::to_read_size(picture(360, 270)), picture(360, 270));
+    assert_eq!(super::to_read_size(picture(super::READ_SIDE, 10)), picture(super::READ_SIDE, 10));
+}
+
+#[test]
+fn a_box_is_blacked_out_in_place_and_held_to_the_picture() {
+    let mut img = Rgb { width: 4, height: 3, data: vec![200; 36] };
+    img.black_out(super::prep::PixelBox { x1: 2, y1: 1, x2: 99, y2: 99 });
+    let pixel = |img: &Rgb, x: usize, y: usize| img.data[(y * 4 + x) * 3];
+    assert_eq!((pixel(&img, 2, 1), pixel(&img, 3, 2), pixel(&img, 1, 1), pixel(&img, 2, 0)), (0, 0, 200, 200));
+    img.black_out(super::prep::PixelBox { x1: 9, y1: 0, x2: 12, y2: 3 });
+    assert_eq!(img.data.iter().filter(|&&v| v == 0).count(), 2 * 2 * 3, "a box beside the picture changes nothing");
+}
+
+#[test]
 fn only_the_faces_in_front_of_the_camera_count() {
     let face = |w: f32, h: f32| super::yunet::Face { x: 0., y: 0., w, h, landmarks: [0.; 10], score: 0.95 };
     let sizes = |faces: Vec<super::yunet::Face>| super::in_front(faces).iter().map(|f| f.w).collect::<Vec<_>>();

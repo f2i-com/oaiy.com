@@ -20,10 +20,15 @@ use oaiy_engine::json::Json;
 use prep::{PixelBox, Rgb};
 use std::path::PathBuf;
 
-/// At most this many pictures a job, each at most this large (encoded) and this many pixels on a side.
+/// At most this many pictures a job, each at most this many pixels on a side. A job's request is at most 2 MiB as a whole
+/// (main.rs), which is what holds a picture's encoded size.
 pub const MAX_PICTURES: usize = 16;
-const MAX_ENCODED: usize = 4 << 20;
 const MAX_SIDE: usize = 4096;
+/// A picture larger than this on its longer side is read at this size. The detector keeps every layer of its pass, and a
+/// flat 4096-pixel picture, a few hundred KB as a JPEG, took 1.9 GB of the computer's memory to read (2048: 1.2 GB); at
+/// this size a picture takes a few hundred MB whatever it was sent as. A check's frames are 360 pixels wide, and a face in
+/// front of the camera is large enough at this size for both models.
+pub const READ_SIDE: usize = 1024;
 
 pub struct Request {
     pub detector: PathBuf,
@@ -48,8 +53,7 @@ impl Request {
             .map(|v| {
                 let text = v.as_str().ok_or("face-age: a picture that is not base64 text")?;
                 let text = text.split_once(";base64,").map_or(text, |(_, b)| b);
-                let bytes = base64(text).ok_or("face-age: a picture that is not base64")?;
-                if bytes.len() > MAX_ENCODED { Err("face-age: a picture larger than 4 MB".to_string()) } else { Ok(bytes) }
+                base64(text).ok_or_else(|| "face-age: a picture that is not base64".to_string())
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
         let score_threshold = j.get("score_threshold").and_then(Json::as_f64).map(|v| v as f32).unwrap_or(CHECK_SCORE_THRESHOLD);
@@ -114,7 +118,23 @@ fn face_box(face: &yunet::Face, img: &Rgb) -> PixelBox {
 /// The picture with every face found blacked out, those left out of the count too: the model's whole-picture input is
 /// for the one person's body, and a parent's face behind a child must not be read into the child's age.
 fn without_faces(img: &Rgb, found: &[yunet::Face]) -> Rgb {
-    found.iter().fold(img.clone(), |out, face| out.without(face_box(face, img)))
+    // One copy, blacked out in place: a copy a face was thousands of copies for a picture of thousands of faces.
+    let mut out = img.clone();
+    for face in found {
+        out.black_out(face_box(face, img));
+    }
+    out
+}
+
+/// A picture as it is read: no larger than READ_SIDE on its longer side.
+pub fn to_read_size(img: Rgb) -> Rgb {
+    let longer = img.width.max(img.height);
+    if longer <= READ_SIDE {
+        return img;
+    }
+    let scale = READ_SIDE as f64 / longer as f64;
+    let (w, h) = (((img.width as f64 * scale).round() as usize).max(1), ((img.height as f64 * scale).round() as usize).max(1));
+    img.resize_linear(w, h)
 }
 
 /// What one picture showed.
@@ -166,7 +186,7 @@ pub fn run(r: &Request) -> Result<Json> {
             if img.width > MAX_SIDE || img.height > MAX_SIDE {
                 candle_core::bail!("face-age: a picture larger than {MAX_SIDE} pixels on a side");
             }
-            Ok(img)
+            Ok(to_read_size(img))
         })
         .collect::<Result<Vec<_>>>()?;
     let dev = Device::Cpu;

@@ -48,12 +48,19 @@ impl Rgb {
     /// The picture with the box blacked out, as MiVOLO cuts a face out of the body it belongs to.
     pub fn without(&self, b: PixelBox) -> Self {
         let mut out = self.clone();
-        for y in b.y1..b.y2.min(self.height) {
-            for x in b.x1..b.x2.min(self.width) {
-                out.data[(y * self.width + x) * 3..(y * self.width + x) * 3 + 3].fill(0);
-            }
-        }
+        out.black_out(b);
         out
+    }
+
+    /// The box blacked out, in place.
+    pub fn black_out(&mut self, b: PixelBox) {
+        let (x2, y2) = (b.x2.min(self.width), b.y2.min(self.height));
+        if b.x1 >= x2 {
+            return;
+        }
+        for y in b.y1..y2 {
+            self.data[(y * self.width + b.x1) * 3..(y * self.width + x2) * 3].fill(0);
+        }
     }
 
     /// OpenCV's `resize` with `INTER_LINEAR`: each output pixel's centre mapped back (half-pixel centres), clamped at
