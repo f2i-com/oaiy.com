@@ -32,9 +32,17 @@ impl Rgb {
         let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|e| format!("a picture that does not decode: {e}"))?;
+        // JPEG and PNG only: a WebP's outer header can say it is small while the picture inside is 16383 pixels
+        // square, which its decoder reads whole before it notices.
+        if !matches!(reader.format(), Some(image::ImageFormat::Jpeg | image::ImageFormat::Png)) {
+            return Err("a picture that is not a JPEG or a PNG".into());
+        }
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(super::MAX_SIDE as u32);
         limits.max_image_height = Some(super::MAX_SIDE as u32);
+        // What the largest picture taken needs, 4096 by 4096 at 16-bit RGBA (128 MiB), and room beside it: a PNG's
+        // colour profile, inflated before any pixel is read, was held only to the 512 MiB default.
+        limits.max_alloc = Some(192 * 1024 * 1024);
         reader.limits(limits);
         let img = reader
             .decode()

@@ -97,6 +97,12 @@ fn a_picture_that_says_it_is_too_large_is_refused_from_its_header() {
         .unwrap();
     let read = Rgb::decode(&ok).unwrap();
     assert_eq!((read.width, read.height, read.data.len()), (super::MAX_SIDE, 2, super::MAX_SIDE * 2 * 3));
+    // A WebP is not read at all: its outer header can say it is small while the picture inside is not.
+    let mut webp = Vec::new();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([90, 90, 90]))
+        .write_to(&mut std::io::Cursor::new(&mut webp), image::ImageFormat::WebP)
+        .unwrap();
+    assert_eq!(Rgb::decode(&webp).unwrap_err(), "a picture that is not a JPEG or a PNG");
 }
 
 #[test]
