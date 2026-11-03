@@ -15,7 +15,7 @@ pub mod yunet;
 #[cfg(test)]
 mod tests;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, Result};
 use oaiy_engine::json::Json;
 use prep::{PixelBox, Rgb};
 use std::path::PathBuf;
@@ -151,26 +151,22 @@ pub struct Reading {
 pub fn read(detector: &yunet::YuNet, model: &mivolo::MiVolo, pictures: &[Rgb], score_threshold: f32) -> Result<Vec<Reading>> {
     let dev = model.device().clone();
     let mut readings = Vec::with_capacity(pictures.len());
-    let (mut faces, mut bodies, mut which) = (Vec::new(), Vec::new(), Vec::new());
-    for (i, img) in pictures.iter().enumerate() {
+    for img in pictures {
         let all = detector.detect(img, score_threshold, yunet::NMS_THRESHOLD, yunet::TOP_K)?;
         let found = in_front(all.clone());
-        readings.push(Reading { faces: found.len(), age: None, pose: None });
+        let mut reading = Reading { faces: found.len(), age: None, pose: None };
         if let [face] = found.as_slice() {
-            readings[i].pose = pose::pose(&face.landmarks);
+            reading.pose = pose::pose(&face.landmarks);
             let b = face_box(face, img);
             if let Some(crop) = img.crop(b) {
-                faces.push(crop.letterbox(mivolo::SIDE).normalised(&dev)?);
-                bodies.push(without_faces(img, &all).letterbox(mivolo::SIDE).normalised(&dev)?);
-                which.push(i);
+                // One face at a time: one batch of every picture's face held MiVOLO's layers for all of them at once
+                // (sixteen one-face frames took about 1.5 GB) and bought no speed.
+                let face_in = crop.letterbox(mivolo::SIDE).normalised(&dev)?;
+                let body_in = without_faces(img, &all).letterbox(mivolo::SIDE).normalised(&dev)?;
+                reading.age = model.ages(&face_in, &body_in)?.into_iter().next();
             }
         }
-    }
-    if !which.is_empty() {
-        let ages = model.ages(&Tensor::cat(&faces, 0)?, &Tensor::cat(&bodies, 0)?)?;
-        for (i, age) in which.into_iter().zip(ages) {
-            readings[i].age = Some(age);
-        }
+        readings.push(reading);
     }
     Ok(readings)
 }

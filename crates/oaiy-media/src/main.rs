@@ -145,6 +145,11 @@ fn run() -> candle_core::Result<()> {
         writeln!(std::io::stdout(), "{}", result.to_json())?;
         return Ok(());
     }
+    // Qwen Image's jobs name no kind. One that names a kind this program does not run is refused by name: read as Qwen
+    // Image's, it was answered "prompt must be a nonempty string" (an age check sent to an engine from before them).
+    if let Some(kind) = j.get("kind") {
+        candle_core::bail!("this oaiy-media does not run {} jobs: it may be older than the OAIY that sent it", kind.to_json());
+    }
     let r = oaiy_media::qwen_image::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
     configure_cache(&r.output)?;
     let result = oaiy_media::qwen_image::pipeline::generate(&r, |event| {

@@ -46,6 +46,31 @@ fn mivolo_matches_the_authors_code_part_by_part() {
     assert!((age - want).abs() < 0.05);
 }
 
+/// The job reads one face at a time (a batch of every picture's held them all in memory at once): the ages are those a
+/// batch gives, since nothing in MiVOLO mixes one picture of a batch with another. Needs only the weights.
+#[test]
+fn a_face_read_alone_has_the_age_it_has_in_a_batch() {
+    let Some(model) = std::env::var_os("OAIY_FACEAGE_MIVOLO").map(PathBuf::from).filter(|m| m.is_file()) else {
+        eprintln!("skipped: set OAIY_FACEAGE_MIVOLO");
+        return;
+    };
+    let dev = Device::Cpu;
+    let net = MiVolo::load(&model, &dev).unwrap();
+    let side = super::mivolo::SIDE;
+    // Three different pictures, each a face and a body: bands of a brightness and a slope of their own.
+    let picture = |seed: u32| {
+        let data = (0..side * side * 3).map(|i| ((i as u32 / 3 % side as u32) * (seed + 1) / 2 + seed * 37 + (i as u32 % 3) * 40) as u8).collect();
+        Rgb { width: side, height: side, data }.normalised(&dev).unwrap()
+    };
+    let (faces, bodies): (Vec<Tensor>, Vec<Tensor>) = (1..=3).map(|s| (picture(s), picture(s + 10))).unzip();
+    let batch = net.ages(&Tensor::cat(&faces, 0).unwrap(), &Tensor::cat(&bodies, 0).unwrap()).unwrap();
+    for (i, (face, body)) in faces.iter().zip(&bodies).enumerate() {
+        let alone = net.ages(face, body).unwrap()[0];
+        eprintln!("picture {i}: {alone:.4} alone, {:.4} in the batch", batch[i]);
+        assert!((alone - batch[i]).abs() < 1e-3, "picture {i}: {alone} alone, {} in a batch", batch[i]);
+    }
+}
+
 fn encode64(bytes: &[u8]) -> String {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
