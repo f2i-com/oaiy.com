@@ -827,9 +827,14 @@ impl AiTunnel {
     ) -> Result<Vec<u8>, TunnelError> {
         // An age check's pictures read by this OAIY's own age model first, when the turn asks (`verify`): loaded in the
         // media worker for the check and gone when it ends, before the language model answers. Its readings go in
-        // the final frame, whichever way the answer came.
+        // the answer's final frame. A turn whose provider cannot answer here is refused before the check, which can
+        // take two minutes of this lane: the site takes an error frame as no answer (FormLogic refunds the try), so
+        // readings run for one would be thrown away.
         let verification = match (body.get("verify"), body.get("messages").and_then(Value::as_array)) {
-            (Some(ask), Some(messages)) => Some(crate::ai::faceage::verify(&self.data_dir, ask, messages).await),
+            (Some(ask), Some(messages)) => {
+                self.can_answer(provider_id).await?;
+                Some(crate::ai::faceage::verify(&self.data_dir, ask, messages).await)
+            }
             _ => None,
         };
         let frame = self.answer_chat(lane, provider_id, model, body, eph_pub).await?;
@@ -837,6 +842,23 @@ impl AiTunnel {
             Some(v) => crate::ai::faceage::with_verification(frame, v),
             None => frame,
         })
+    }
+
+    /// Whether a chat turn for `provider_id` can be answered here at all: asked before work only an answer uses.
+    async fn can_answer(&self, provider_id: &str) -> Result<(), TunnelError> {
+        if is_codex(provider_id) {
+            // The live-call aliases pin a model and a reasoning effort for a
+            // phone call and refuse caller audio; a queued chat turn is not that,
+            // and offering them here would be offering guaranteed failures.
+            if provider_id != crate::ai::codex::CODEX_PROVIDER_ID {
+                return Err(TunnelError::new(
+                    "provider_unavailable",
+                    format!("provider {provider_id:?} is for live calls and cannot serve chat"),
+                ));
+            }
+            return Ok(());
+        }
+        self.resolve(provider_id).await.map(|_| ())
     }
 
     async fn answer_chat(
@@ -892,15 +914,7 @@ impl AiTunnel {
         }
 
         if is_codex(provider_id) {
-            // The live-call aliases pin a model and a reasoning effort for a
-            // phone call and refuse caller audio; a queued chat turn is not that,
-            // and offering them here would be offering guaranteed failures.
-            if provider_id != crate::ai::codex::CODEX_PROVIDER_ID {
-                return Err(TunnelError::new(
-                    "provider_unavailable",
-                    format!("provider {provider_id:?} is for live calls and cannot serve chat"),
-                ));
-            }
+            self.can_answer(provider_id).await?;
             return self.stream_codex(lane, chat_body).await;
         }
 
@@ -1666,6 +1680,47 @@ mod tests {
         let unknown = tunnel.list_models("nowhere").await.unwrap_err();
         assert!(unknown.message.contains("no provider named \"nowhere\""), "{}", unknown.message);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An age check runs for a turn only when its provider can answer it: the check takes up to two minutes of the lane,
+    /// and the site takes an error frame as no answer, so it was run, and thrown away, for a provider this OAIY lacks.
+    #[tokio::test]
+    async fn an_age_check_is_not_run_for_a_turn_no_provider_here_can_answer() {
+        let (tunnel, dir) = tunnel_in("verify-unknown");
+        // An age check that would take thirty seconds: its files are there and its worker never answers.
+        let engines = dir.join("engines");
+        std::fs::create_dir_all(&engines).unwrap();
+        let worker = engines.join(if cfg!(windows) { "slow.bat" } else { "slow.sh" });
+        std::fs::write(&worker, if cfg!(windows) { "@ping -n 30 127.0.0.1 > nul\r\n" } else { "#!/bin/sh\nsleep 30\n" }).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(engines.join("model.safetensors"), b"x").unwrap();
+        std::fs::write(engines.join("yunet.onnx"), b"x").unwrap();
+        std::fs::write(
+            engines.join("oaiy-studio.json"),
+            serde_json::to_vec(&json!({ "media": { "worker": worker, "faceage": { "model": "model.safetensors", "detector": "yunet.onnx" } } })).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::ai::faceage::files(&dir).is_ok(), "the check would run");
+
+        let account = linked("http://127.0.0.1:9".into(), "flk_ai");
+        let spec = descriptor::builtin().remove(0).desktop_ai.unwrap();
+        let lane = Lane { http: reqwest::Client::new(), account: &account, spec: &spec, instance: "oaiy-test", id: "turn-1" };
+        let body = json!({ "v": 1, "verify": { "task": "face-age", "images": [0] }, "messages": [{ "role": "user", "content": [
+            { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,AAAA" } },
+        ]}] });
+        let started = std::time::Instant::now();
+        let refused = tunnel.chat(&lane, "nowhere", None, &body, "unused").await.unwrap_err();
+        assert!(refused.message.contains("no provider named \"nowhere\""), "{}", refused.message);
+        assert!(started.elapsed() < Duration::from_secs(10), "refused before the check: {:?}", started.elapsed());
+        // A live-call alias, which never serves a queued chat turn: refused the same way.
+        let alias = crate::ai::codex::LiveCallAlias::ReasoningLow.id();
+        let refused = tunnel.chat(&lane, alias, None, &body, "unused").await.unwrap_err();
+        assert_eq!(refused.code(), "provider_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(10), "a live-call alias too: {:?}", started.elapsed());
     }
 
     fn linked(base: String, credential: &str) -> LinkedAccount {
