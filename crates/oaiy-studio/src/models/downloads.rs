@@ -440,13 +440,44 @@ fn configured(cfg: &Json, group: &str, id: &str) -> bool {
     }
 }
 
-/// Is the entry in `dir`: every part's marker written, or (downloaded some other
+/// Whether the files a finished part's marker lists (relative to `dir`) are all still there. A file deleted since (to
+/// make room, by a virus scanner, by a sync tool) made a model read as downloaded that could not be used, added again
+/// or discarded, with nothing in OAIY to repair it: such a part reads as partly downloaded, which Resume completes by
+/// fetching what is missing. A marker that lists no files, or cannot be read, is taken at its word, as before.
+fn marker_whole(dir: &Path, marker: &Path) -> bool {
+    let Some(listed) = std::fs::read(marker).ok().and_then(|b| Json::parse(&b).ok()) else { return true };
+    listed
+        .get("files")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_str)
+        .all(|rel| under(dir, &rel.replace('\\', "/")).map_or(true, |p| p.is_file()))
+}
+
+/// What a finished download of `id` put in `dir`, as its parts' markers list it.
+fn marker_files(dir: &Path, id: &str) -> Vec<PathBuf> {
+    let Some(e) = entry(id) else { return Vec::new() };
+    e.get("parts")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|p| marker(dir, p, id).filter(|m| m.is_file()))
+        .filter_map(|m| std::fs::read(&m).ok().and_then(|b| Json::parse(&b).ok()))
+        .flat_map(|listed| listed.get("files").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default())
+        .filter_map(|f: Json| f.as_str().and_then(|rel| under(dir, &rel.replace('\\', "/")).ok()))
+        .collect()
+}
+
+/// Is the entry in `dir`: every part's marker written, with the files it lists in place, or (downloaded some other
 /// way) everything it adds there, with no partial file beside it?
 fn installed(entry: &Json, dir: &Path) -> bool {
     let id = str_or(entry, "id", "");
     let parts = entry.get("parts").and_then(Json::as_array).unwrap_or(&[]);
-    if !parts.is_empty() && parts.iter().all(|p| marker(dir, p, id).is_some_and(|m| m.is_file())) {
-        return true;
+    let markers: Vec<Option<PathBuf>> = parts.iter().map(|p| marker(dir, p, id).filter(|m| m.is_file())).collect();
+    if !parts.is_empty() && markers.iter().all(Option::is_some) {
+        // Markers that list a file no longer there: partly downloaded (`partial`), not anything added some other way.
+        return markers.iter().flatten().all(|m| marker_whole(dir, m));
     }
     let adds = strings(entry.get("add"));
     !adds.is_empty()
@@ -819,8 +850,8 @@ impl Downloads {
         match &listed {
             Some(("adding", _)) => return Err("it is being added to your models now: remove it under Models once it is there".into()),
             // (downloaded whole: its files are a model's, in the settings or to be added again, not a download's to
-            // take away)
-            Some(("done", _)) => return Err("it is downloaded: remove it under Models".into()),
+            // take away; one with a file gone since is partly there, and is discarded like one)
+            Some(("done", at)) if entry(id).is_some_and(|e| installed(e, at)) => return Err("it is downloaded: remove it under Models".into()),
             None if entry(id).is_some_and(|e| installed(e, &dir.clone().unwrap_or_else(|| default_dir(studio)))) => {
                 return Err("it is downloaded: remove it under Models".into());
             }
@@ -890,9 +921,17 @@ impl Downloads {
     /// removed is the link alone), its markers, and the folders that leaves empty; never a file another model uses.
     fn discard(&self, studio: &Studio, id: &str, dir: &Path) {
         let used = self.used_by_others(studio, id, dir);
-        // (what it put in place, as listed, else as its record beside the folder says: after a restart)
+        // (what it put in place, as listed, else, after a restart, as its record beside the folder says and, for a
+        // finished download, as its parts' markers list: one with a file gone since, discarded, otherwise left the rest
+        // of its files, and its folder, read again as the model there)
         let listed = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
-        let fetched = if listed.is_empty() { read_fetched(dir, id) } else { listed };
+        let fetched = if listed.is_empty() {
+            let mut found = read_fetched(dir, id);
+            found.extend(marker_files(dir, id));
+            found
+        } else {
+            listed
+        };
         // (a file the settings name, a model or a part of one, is the settings': never removed with a download)
         let named = settings_files(studio);
         remove_partials(id, dir, &used);
@@ -974,6 +1013,9 @@ impl Downloads {
                     std::iter::once(dir.clone()).chain(elsewhere.iter().cloned()).find(|f| installed(e, f) || partial(e, f)).unwrap_or_else(|| dir.clone())
                 });
                 let have = installed(e, &where_);
+                // (a download finished in this session whose model no longer reads as there, a file deleted since, is
+                // shown as what it is now, partly there to resume or discard, not as its finished download)
+                let d = d.filter(|d| d.status != "done" || have);
                 o.push(("installed".into(), Json::Bool(have)));
                 // (a model all of whose parts are done is installed, not partly downloaded: each part's marker is
                 // what says a part is done)
@@ -1560,6 +1602,15 @@ fn settings_files(studio: &Studio) -> Vec<PathBuf> {
             collect(models);
         }
     }
+    // The models sections name by key rather than under `models`: the picture tools and the age check. A Discard of one
+    // that read as partly there (a README of it deleted) took away the weights these still name.
+    for (section, keys) in [("picture", ["background", "upscaler"]), ("faceage", ["model", "detector"])] {
+        for key in keys {
+            if let Some(v) = cfg.get("media").and_then(|m| m.get(section)).and_then(|s| s.get(key)) {
+                collect(v);
+            }
+        }
+    }
     named.into_iter().map(|n| config::resolve(&studio.root, &n)).filter(|p| p.components().count() > 1).collect()
 }
 
@@ -1773,6 +1824,16 @@ mod tests {
         std::fs::write(folder.join("Qwen3.5-9B-Q4_K_M.gguf"), b"whole").unwrap();
         std::fs::write(folder.join(".oaiy-qwen3.5-9b.json"), br#"{"id":"qwen3.5-9b"}"#).unwrap();
         assert_eq!(of("qwen3.5-9b"), (true, false), "every part done");
+        // A marker that lists its files, as a finished download writes it: a file deleted since makes the model partly
+        // downloaded (the card offers Resume, which fetches what is missing), not downloaded with nothing to repair it.
+        std::fs::write(folder.join(".oaiy-qwen3.5-9b.json"), br#"{"id":"qwen3.5-9b","files":["Qwen3.5-9B-GGUF\\Qwen3.5-9B-Q4_K_M.gguf"]}"#).unwrap();
+        assert_eq!(of("qwen3.5-9b"), (true, false), "its files in place");
+        std::fs::remove_file(folder.join("Qwen3.5-9B-Q4_K_M.gguf")).unwrap();
+        assert_eq!(of("qwen3.5-9b"), (false, true), "a file it lists is gone");
+        let entry = entry("qwen3.5-9b").unwrap();
+        assert!(!installed(entry, &dir) && partial(entry, &dir));
+        std::fs::write(folder.join("Qwen3.5-9B-Q4_K_M.gguf"), b"whole").unwrap();
+        assert_eq!(of("qwen3.5-9b"), (true, false), "back in place");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2213,6 +2274,83 @@ mod tests {
         assert_eq!(d.fetch(&studio, &e, &dir).unwrap(), Want::Run);
         assert_eq!(std::fs::read(&dest).unwrap(), body);
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A downloaded model with a file deleted since is partly there, in the session that downloaded it and after a
+    /// restart alike: offered Resume and Discard, and a Discard takes away the rest of what it put there, so it does not
+    /// read as downloaded again from what was left.
+    #[test]
+    fn a_downloaded_model_missing_a_file_is_discarded_whole_listed_or_after_a_restart() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let folder = dir.join("Qwen3.5-9B-GGUF");
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        let studio = Studio::for_test(&root, cfg);
+        let card = |d: &Downloads| -> (bool, bool, bool) {
+            let state = d.state(&studio);
+            let m = state.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == "qwen3.5-9b").cloned().unwrap();
+            (crate::util::bool_or(&m, "installed", false), crate::util::bool_or(&m, "partial", false), m.get("download").is_some_and(|v| !matches!(v, Json::Null)))
+        };
+        let gguf = folder.join("Qwen3.5-9B-Q4_K_M.gguf");
+        let readme = folder.join("README.md");
+        let place = || {
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(&readme, b"about").unwrap();
+            std::fs::write(folder.join(".oaiy-qwen3.5-9b.json"), br#"{"id":"qwen3.5-9b","files":["Qwen3.5-9B-GGUF\\Qwen3.5-9B-Q4_K_M.gguf","Qwen3.5-9B-GGUF/README.md"]}"#).unwrap();
+        };
+
+        // In the session that downloaded it: the finished download is not what the card shows once a file is gone.
+        place();
+        std::fs::write(&gguf, b"weights").unwrap();
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "done", fetched: vec![gguf.clone(), readme.clone()], ..Download::new("qwen3.5-9b", &dir, None) });
+        assert_eq!(card(&d), (true, false, true), "downloaded");
+        std::fs::remove_file(&gguf).unwrap();
+        assert_eq!(card(&d), (false, true, false), "partly there, to resume or discard");
+        d.cancel(&studio, "qwen3.5-9b", None).unwrap();
+        assert!(!readme.exists() && !folder.exists(), "what it put there is gone with it");
+
+        // After a restart, nothing listed and no record of what it fetched: its markers say what is its.
+        place();
+        let d = Downloads::new();
+        assert_eq!(card(&d), (false, true, false));
+        d.cancel(&studio, "qwen3.5-9b", Some(dir.clone())).unwrap();
+        assert!(!readme.exists() && !folder.exists(), "the rest of its files and its folder");
+        assert_eq!(card(&d), (false, false, false), "not read as downloaded again from what was left");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The age check's files are named in the settings by key (`media.faceage.model`, `.detector`), not under a
+    /// `models` list: a Discard of it, partly there because a README of it went, keeps the files those still name.
+    #[test]
+    fn a_discard_keeps_the_age_checks_files_the_settings_name() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-agecheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let (mivolo, yunet) = (dir.join("MiVOLO-v2"), dir.join("YuNet"));
+        std::fs::create_dir_all(&mivolo).unwrap();
+        std::fs::create_dir_all(&yunet).unwrap();
+        let (weights, detector) = (mivolo.join("model.safetensors"), yunet.join("face_detection_yunet_2023mar.onnx"));
+        for f in [&weights, &detector, &mivolo.join("config.json"), &yunet.join("LICENSE")] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let marker = br#"{"id":"age-check","files":["MiVOLO-v2\\README.md","MiVOLO-v2\\config.json","MiVOLO-v2\\model.safetensors","YuNet\\face_detection_yunet_2023mar.onnx","YuNet\\LICENSE"]}"#;
+        std::fs::write(mivolo.join(".oaiy-age-check.json"), marker).unwrap();
+        std::fs::write(yunet.join(".oaiy-age-check.json"), marker).unwrap();
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        let faceage = crate::models::registry::obj_mut(&mut cfg, &["media", "faceage"]).unwrap();
+        crate::util::set(faceage, "model", Json::str(weights.to_string_lossy()));
+        crate::util::set(faceage, "detector", Json::str(detector.to_string_lossy()));
+        let studio = Studio::for_test(&root, cfg);
+        let e = entry("age-check").unwrap();
+        assert!(!installed(e, &dir) && partial(e, &dir), "its README is gone: partly there");
+        Downloads::new().cancel(&studio, "age-check", Some(dir.clone())).unwrap();
+        assert!(weights.exists() && detector.exists(), "the files the settings name are kept");
+        assert!(!mivolo.join("config.json").exists() && !yunet.join("LICENSE").exists(), "the rest goes");
         let _ = std::fs::remove_dir_all(&root);
     }
 
