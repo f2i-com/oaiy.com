@@ -205,8 +205,33 @@ fn cannot_run(e: &std::io::Error) -> String {
     }
 }
 
+/// Whether the command processor finds a program for `cmd /c codex`: in its current folder, then in each folder of
+/// PATH, with each extension it tries when PATHEXT is not set (the child is given none).
+#[cfg(windows)]
+fn codex_on_path(path: Option<&str>) -> bool {
+    let mut dirs: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
+    if let Some(path) = path {
+        dirs.extend(std::env::split_paths(path));
+    }
+    dirs.iter().any(|dir| [".com", ".exe", ".bat", ".cmd"].iter().any(|ext| dir.join(format!("codex{ext}")).is_file()))
+}
+
 /// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
 fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
+    // Nothing of this process's environment reaches the child except an
+    // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
+    // (from the computer's environment, where OAIY runs from an AppImage: its PATH without the AppImage's programs)
+    let env = allowed_env(oaiy_host_env::vars());
+    // On Windows the child is `cmd /c codex`, which starts whether there is a codex or not: without one it says
+    // "'codex' is not recognized" and ends, which read as an app server that failed (available, with an error), not as
+    // no Codex. The settings did not say Codex is not installed, and an age check ran for a ChatGPT turn that could not
+    // be answered. So it is looked for first, as the command processor would look for it.
+    #[cfg(windows)]
+    {
+        if !codex_on_path(env.iter().find(|(key, _)| *key == "PATH").map(|(_, v)| v.as_str())) {
+            return Err(CodexError::Unavailable(NOT_INSTALLED.to_string()));
+        }
+    }
     // The ChatGPT credential file the child writes lives in here, so where this
     // process makes the folder it makes it owner-only (see `secret_file`).
     crate::secret_file::create_private_dir(codex_home)
@@ -214,11 +239,8 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
 
     let mut cmd = base_command();
     cmd.arg("app-server");
-    // Nothing of this process's environment reaches the child except an
-    // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
     cmd.env_clear();
-    // (from the computer's environment, where OAIY runs from an AppImage: its PATH without the AppImage's programs)
-    for (key, v) in allowed_env(oaiy_host_env::vars()) {
+    for (key, v) in env {
         cmd.env(key, v);
     }
     cmd.env("CODEX_HOME", codex_home);
@@ -1320,6 +1342,27 @@ mod tests {
         assert_eq!(cannot_run(&missing), NOT_INSTALLED);
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         assert!(cannot_run(&denied).starts_with("cannot run the codex CLI: "), "{}", cannot_run(&denied));
+    }
+
+    /// On Windows Codex is looked for as `cmd /c codex` would find it, on PATH with a program's extension: the
+    /// command processor starts without one, so a missing Codex was not seen as missing.
+    #[cfg(windows)]
+    #[test]
+    fn codex_is_found_on_path_as_the_command_processor_finds_it() {
+        let dir = std::env::temp_dir().join(format!("oaiy-codex-path-{}", uuid::Uuid::new_v4().simple()));
+        let (empty, bin) = (dir.join("empty"), dir.join("bin"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::join_paths([&empty, &bin]).unwrap().into_string().unwrap();
+        assert!(!codex_on_path(Some(&path)), "nothing there");
+        assert!(!codex_on_path(None), "no PATH");
+        // npm puts three shims beside each other; cmd runs neither the PowerShell one nor the one without an extension.
+        std::fs::write(bin.join("codex.ps1"), b"").unwrap();
+        std::fs::write(bin.join("codex"), b"").unwrap();
+        assert!(!codex_on_path(Some(&path)), "only shims cmd does not run");
+        std::fs::write(bin.join("codex.cmd"), b"@echo off\r\n").unwrap();
+        assert!(codex_on_path(Some(&path)), "codex.cmd on the second folder of PATH");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A request of the app-server's (an approval, a tool call) is answered, refused, with its own id: unanswered,
