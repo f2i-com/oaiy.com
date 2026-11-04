@@ -3539,9 +3539,11 @@ async function dlAct(what, id) {
   try {
     const body = {id};
     // (a model partly downloaded in a folder downloads went to before: resumed, or discarded, there)
-    // (a download listed, paused or failed, carries on where it is: the box may name another folder, after a reload where
-    // downloads go now, and its partial files were left behind as it began again there)
-    const going = m?.download && ["paused", "failed", "queued"].includes(m.download.status) ? m.download.dir : null;
+    // (a download listed, paused, or failed with some of it fetched, carries on where it is: the box may name another
+    // folder, after a reload where downloads go now, and its partial files were left behind as it began again there.
+    // One that failed with nothing fetched, a drive without room, goes where the box says: that is how another is chosen)
+    const d0 = m?.download;
+    const going = d0 && (["paused", "queued"].includes(d0.status) || (d0.status === "failed" && d0.done > 0)) ? d0.dir : null;
     if (what === "start" || what === "add") body.dir = going || (m?.at && m.partial ? m.at : $("#dl-dir").value.trim());
     if (what === "cancel" || what === "discard") {
       if (m?.at) body.dir = m.at;

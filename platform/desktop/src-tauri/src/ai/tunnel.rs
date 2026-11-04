@@ -872,8 +872,15 @@ impl AiTunnel {
         // (asked once at a time: a Codex that hangs held one more thread for each turn that asked, each waiting on the
         // session's lock behind the one before, and the answers behind them all; while one asks, the turn goes on)
         static ASKING: AtomicBool = AtomicBool::new(false);
+        // (the last plain refusal and when: a turn that comes while one asks takes it while it is fresh, so two age-check
+        // turns at once are not both let through to a check whose answer would fail)
+        static REFUSED: std::sync::Mutex<Option<(std::time::Instant, &'static str)>> = std::sync::Mutex::new(None);
+        let recent = || REFUSED.lock().ok().and_then(|r| *r).filter(|(at, _)| at.elapsed() < Duration::from_secs(30)).map(|(_, why)| why);
         if ASKING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Ok(());
+            return match recent() {
+                Some(why) => Err(TunnelError::new("provider_unavailable", why)),
+                None => Ok(()),
+            };
         }
         let codex = self.sources.codex.clone();
         let status = tokio::time::timeout(
@@ -890,12 +897,17 @@ impl AiTunnel {
             }),
         )
         .await;
-        match status {
-            Ok(Ok(status)) if !status.available => Err(TunnelError::new("provider_unavailable", "ChatGPT (Codex) is not available on this computer")),
-            Ok(Ok(status)) if !status.connected && status.detail.is_none() => {
-                Err(TunnelError::new("provider_unavailable", "ChatGPT is not signed in on this computer"))
-            }
-            _ => Ok(()),
+        let refused = match status {
+            Ok(Ok(status)) if !status.available => Some("ChatGPT (Codex) is not available on this computer"),
+            Ok(Ok(status)) if !status.connected && status.detail.is_none() => Some("ChatGPT is not signed in on this computer"),
+            _ => None,
+        };
+        if let Ok(mut last) = REFUSED.lock() {
+            *last = refused.map(|why| (std::time::Instant::now(), why));
+        }
+        match refused {
+            Some(why) => Err(TunnelError::new("provider_unavailable", why)),
+            None => Ok(()),
         }
     }
 

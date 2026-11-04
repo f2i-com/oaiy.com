@@ -1777,7 +1777,10 @@ fn model_naming(cfg: &Json, group: &str, path: &Path, root: &Path) -> Option<(St
     };
     // (the model is the one whose own file or folder it is: not one that borrows a part from its folder, as an LTX-2.5
     // fine-tune added by hand is lent LTX-2.5's text encoder and VAE, which was taken for LTX-2.5 itself)
-    let naming = |m: &Json| Some(paths_of(m)).filter(|_| resolve(main_paths(group, m)).iter().any(|p| overlap(p, path)));
+    // (also as the files they are: a folder the settings spell another way, by case, a link or another drive letter)
+    let path_real = std::fs::canonicalize(path).ok();
+    let same = |p: &Path| overlap(p, path) || path_real.as_deref().is_some_and(|r| std::fs::canonicalize(p).is_ok_and(|pr| overlap(&pr, r)));
+    let naming = |m: &Json| Some(paths_of(m)).filter(|_| resolve(main_paths(group, m)).iter().any(|p| same(p)));
     match group {
         "picture" | "check" | "" => None,
         "llm" => cfg.get("llm")?.get("models")?.as_array()?.iter().find_map(|m| naming(m).map(|paths| ("llm".to_string(), str_or(m, "name", "").to_string(), paths))),
