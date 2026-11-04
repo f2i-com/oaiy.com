@@ -1549,10 +1549,17 @@ impl Downloads {
             });
             self.keep_fetched(id, dir);
         }
-        // Each part's marker: the model is here, with every file of it (`files`), and what downloads of it put in place
-        // (`placed`: what a Discard takes away; not a file that was here before, which `files` lists too), so no record
-        // of its own any more. What earlier downloads of it placed stays listed: a Resume that fetched one file again is
-        // not the whole of what was put there.
+        self.write_markers(e, dir, &files.iter().map(|f| f.dest.clone()).collect::<Vec<_>>());
+        let _ = std::fs::remove_file(fetched_record(dir, id));
+        Ok(Want::Run)
+    }
+
+    /// Each part's marker, once every file of entry `e` is in `dir`: the model is here, with every file of it (`files`,
+    /// the plan's), and what downloads of it put in place (`placed`: what a Discard takes away; not a file that was here
+    /// before, which `files` lists too), so no record of its own any more. What earlier downloads of it placed stays
+    /// listed: a Resume that fetched one file again is not the whole of what was put there.
+    fn write_markers(&self, e: &Json, dir: &Path, files: &[PathBuf]) {
+        let id = str_or(e, "id", "");
         let mut placed = marker_placed(dir, id);
         let this_time = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
         for f in read_fetched(dir, id).into_iter().chain(this_time) {
@@ -1564,13 +1571,11 @@ impl Downloads {
         for p in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
             if let Some(m) = marker(dir, p, id) {
                 let inside = |path: &Path| m.parent().is_some_and(|folder| path.starts_with(folder));
-                let names: Vec<Json> = files.iter().filter(|f| inside(&f.dest)).map(|f| rel(&f.dest)).collect();
+                let names: Vec<Json> = files.iter().filter(|f| inside(f)).map(|f| rel(f)).collect();
                 let mine: Vec<Json> = placed.iter().filter(|path| inside(path)).map(|path| rel(path)).collect();
                 let _ = std::fs::write(&m, Json::obj([("id", Json::str(id)), ("files", Json::Arr(names)), ("placed", Json::Arr(mine))]).to_json());
             }
         }
-        let _ = std::fs::remove_file(fetched_record(dir, id));
-        Ok(Want::Run)
     }
 
     /// One file with curl into `part`, resuming it; progress as it grows.
@@ -1871,12 +1876,26 @@ fn register_in(cfg: &mut Json, e: &Json, dir: &Path, root: &Path) -> Result<Vec<
 fn keep_set_parts(cfg: &mut Json, section: &str, name: &str, was: &Json) {
     let (Json::Obj(fields), Some(entry)) = (was, model_entry_mut(cfg, section, name)) else { return };
     let set = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty());
-    let completed = !registry::missing_fields(section, was).is_empty();
+    let completed = needed_part_missing(section, was);
     // (a part that was empty stays the download's to fill; what else was set, `enabled` with it, is put back)
     for (key, value) in fields.iter().filter(|(_, v)| set(v) || (!completed && v.as_str().is_none() && !matches!(v, Json::Null))) {
         if entry.get(key).map(Json::to_json) != Some(value.to_json()) {
             crate::util::set(entry, key, value.clone());
         }
+    }
+}
+
+/// Whether model `m` of `section` lacks a part it needs to run, as the Models page says (ui.html `missingOf`):
+/// `registry::missing_fields` knows the image and video models' parts alone, and took every other section's model for
+/// one with parts missing. A language model is never: its parts are its own file and optional ones.
+fn needed_part_missing(section: &str, m: &Json) -> bool {
+    let empty = |k: &str| str_or(m, k, "").trim().is_empty();
+    match section {
+        "image" | "video" => !registry::missing_fields(section, m).is_empty(),
+        "speech" => empty("design") && empty("base") && empty("breeze"),
+        "music" | "sound" => empty("path"),
+        "model3d" => ["path", "dino", "naf"].iter().any(|k| empty(k)),
+        _ => false,
     }
 }
 
@@ -2709,6 +2728,24 @@ mod tests {
         keep_set_parts(&mut cfg, "image", "qi", &was);
         let qi = model_entry(&cfg, "image", "qi").unwrap();
         assert!(!crate::util::bool_or(qi, "enabled", true) && str_or(qi, "vision", "").ends_with("mmproj.gguf"), "filled, and still off");
+        // A speech model is whole with any one of its voices: Qwen3-TTS's VoiceDesign there, switched off, its Base
+        // filled by a Resume, stays off.
+        let mut cfg = Json::parse(br#"{"media":{"speech":{"models":{"tts":{"design":"D:/tts/VoiceDesign","base":"","enabled":false}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "speech", "tts").cloned().unwrap();
+        let tts = model_entry_mut(&mut cfg, "speech", "tts").unwrap();
+        crate::util::set(tts, "base", Json::str("C:/models/Qwen3-TTS-Base"));
+        crate::util::set(tts, "enabled", Json::Bool(true));
+        keep_set_parts(&mut cfg, "speech", "tts", &was);
+        let tts = model_entry(&cfg, "speech", "tts").unwrap();
+        assert!(!crate::util::bool_or(tts, "enabled", true) && str_or(tts, "base", "").ends_with("Qwen3-TTS-Base"), "filled, and still off");
+        // A 3D model without its DINO part, completed: on.
+        let mut cfg = Json::parse(br#"{"media":{"model3d":{"models":{"p3":{"path":"D:/p3/model","dino":"","naf":"D:/p3/naf","enabled":false}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "model3d", "p3").cloned().unwrap();
+        let p3 = model_entry_mut(&mut cfg, "model3d", "p3").unwrap();
+        crate::util::set(p3, "dino", Json::str("C:/models/dino"));
+        crate::util::set(p3, "enabled", Json::Bool(true));
+        keep_set_parts(&mut cfg, "model3d", "p3", &was);
+        assert!(crate::util::bool_or(model_entry(&cfg, "model3d", "p3").unwrap(), "enabled", false), "completed: on");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2763,27 +2800,24 @@ mod tests {
     }
 
     /// A finished download's marker lists every file of the model, and apart, the ones it put in place: not one that was
-    /// here already.
+    /// here already. (Its markers as `fetch` writes them at the end, without a download: one more test fetching from a
+    /// server of its own, with the free-space and model-folder looks a download makes, was enough load beside it for
+    /// `tests::a_full_listener_still_answers_a_probe` to fail four runs in five.)
     #[test]
     fn a_marker_says_what_the_download_put_in_place() {
         let root = std::env::temp_dir().join(format!("oaiy-dl-marker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("models");
         std::fs::create_dir_all(dir.join("two")).unwrap();
-        let body: Vec<u8> = (0..2048u32).map(|i| (i % 241) as u8).collect();
-        let mut h = sha256::Sha256::new();
-        h.update(&body);
-        // here already, as large as it should be
-        std::fs::write(dir.join("two/before.bin"), &body).unwrap();
-        let (url, asked) = serve(body.clone());
-        let studio = Arc::new(Studio::for_test(&root, crate::config::default_json()));
+        let (before, fetched) = (dir.join("two/before.bin"), dir.join("two/fetched.bin"));
+        std::fs::write(&before, b"here already").unwrap();
+        std::fs::write(&fetched, b"downloaded").unwrap();
         let d = Downloads::new();
-        d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new("two", &dir, None) });
-        let sha = h.hex();
-        let part = |file: &str| format!(r#"{{"url":"{url}","file":"{file}","size":{},"sha256":"{sha}","into":"two"}}"#, body.len());
+        // what this session fetched: the file not here already
+        d.list.lock().unwrap().push(Download { status: "downloading", fetched: vec![fetched.clone()], ..Download::new("two", &dir, None) });
+        let part = |file: &str| format!(r#"{{"url":"http://127.0.0.1:9/{file}","file":"{file}","into":"two"}}"#);
         let e = Json::parse(format!(r#"{{"id":"two","parts":[{},{}]}}"#, part("before.bin"), part("fetched.bin")).as_bytes()).unwrap();
-        assert_eq!(d.fetch(&studio, &e, &dir).unwrap(), Want::Run);
-        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "only the file not here was fetched");
+        d.write_markers(&e, &dir, &[before.clone(), fetched.clone()]);
         let marker = Json::parse(&std::fs::read(dir.join("two/.oaiy-two.json")).unwrap()).unwrap();
         let names = |key: &str| marker.get(key).and_then(Json::as_array).unwrap().iter().filter_map(Json::as_str).map(|s| s.replace('\\', "/")).collect::<Vec<_>>();
         assert_eq!(names("files"), ["two/before.bin", "two/fetched.bin"]);
