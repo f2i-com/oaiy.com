@@ -833,6 +833,9 @@ impl AiTunnel {
         let verification = match (body.get("verify"), body.get("messages").and_then(Value::as_array)) {
             (Some(ask), Some(messages)) => {
                 self.can_answer(provider_id).await?;
+                if is_codex(provider_id) {
+                    self.codex_can_answer().await?;
+                }
                 Some(crate::ai::faceage::verify(&self.data_dir, ask, messages).await)
             }
             _ => None,
@@ -859,6 +862,22 @@ impl AiTunnel {
             return Ok(());
         }
         self.resolve(provider_id).await.map(|_| ())
+    }
+
+    /// Before an age check for a ChatGPT turn: whether ChatGPT can answer it, as far as Codex says. Signed out since
+    /// the site chose it, or Codex gone from this computer, the answer fails after the check. Refused only on a plain
+    /// answer: no account, or no Codex; a status slow to come, or an error of Codex's own, lets the turn go on, as
+    /// before this was asked. Asked for an age check alone: other turns go to ChatGPT as they did.
+    async fn codex_can_answer(&self) -> Result<(), TunnelError> {
+        let codex = self.sources.codex.clone();
+        let status = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || codex.status())).await;
+        match status {
+            Ok(Ok(status)) if !status.available => Err(TunnelError::new("provider_unavailable", "ChatGPT (Codex) is not available on this computer")),
+            Ok(Ok(status)) if !status.connected && status.detail.is_none() => {
+                Err(TunnelError::new("provider_unavailable", "ChatGPT is not signed in on this computer"))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn answer_chat(
@@ -1721,6 +1740,13 @@ mod tests {
         let refused = tunnel.chat(&lane, alias, None, &body, "unused").await.unwrap_err();
         assert_eq!(refused.code(), "provider_unavailable");
         assert!(started.elapsed() < Duration::from_secs(10), "a live-call alias too: {:?}", started.elapsed());
+        // ChatGPT with no one signed in (this tunnel's Codex home is new), or no Codex on this computer, which
+        // stream_codex would refuse after the check.
+        let started = std::time::Instant::now();
+        let refused = tunnel.chat(&lane, crate::ai::codex::CODEX_PROVIDER_ID, None, &body, "unused").await.unwrap_err();
+        assert_eq!(refused.code(), "provider_unavailable", "{}", refused.message);
+        assert!(refused.message.contains("ChatGPT"), "{}", refused.message);
+        assert!(started.elapsed() < Duration::from_secs(25), "refused before the thirty-second check: {:?}", started.elapsed());
     }
 
     fn linked(base: String, credential: &str) -> LinkedAccount {

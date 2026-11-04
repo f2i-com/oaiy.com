@@ -5,7 +5,7 @@
 //!
 //! What goes back is each picture's face count and, for one face, its age, and nothing else; no picture is written,
 //! kept or logged here. The models are the files the engines' settings name (`media.faceage.model` and `.detector`,
-//! which adding the Age check on the Models page fills); when they are not there the answer says so, and the turn
+//! which adding the Age check on the Get models page fills); when they are not there the answer says so, and the turn
 //! is answered by the language model as before.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -81,7 +81,7 @@ pub fn files(data_dir: &Path) -> Result<Files, String> {
             .map(|s| resolve(&root, s))
             .filter(|p| p.is_file())
     };
-    let missing = "this OAIY has no age model: add the Age check (MiVOLO v2 and YuNet) on its Models page";
+    let missing = "this OAIY has no age model: add the Age check (MiVOLO v2 and YuNet) on its Get models page";
     let model = file("model").ok_or(missing)?;
     let detector = file("detector").ok_or(missing)?;
     let named = media.and_then(|m| m.get("worker")).and_then(Value::as_str).unwrap_or("oaiy-media");
