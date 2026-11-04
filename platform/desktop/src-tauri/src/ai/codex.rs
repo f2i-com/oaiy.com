@@ -206,14 +206,35 @@ fn cannot_run(e: &std::io::Error) -> String {
 }
 
 /// Whether the command processor finds a program for `cmd /c codex`: in its current folder, then in each folder of
-/// PATH, with each extension it tries when PATHEXT is not set (the child is given none).
+/// PATH, with each extension it tries when PATHEXT is not set (the child is given none): its own list, which is wider
+/// than the four program extensions (a `codex.js` runs too, by its file association).
 #[cfg(windows)]
 fn codex_on_path(path: Option<&str>) -> bool {
+    const CMD_DEFAULT_PATHEXT: [&str; 8] = [".com", ".exe", ".bat", ".cmd", ".vbs", ".js", ".ws", ".msc"];
     let mut dirs: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
     if let Some(path) = path {
         dirs.extend(std::env::split_paths(path));
     }
-    dirs.iter().any(|dir| [".com", ".exe", ".bat", ".cmd"].iter().any(|ext| dir.join(format!("codex{ext}")).is_file()))
+    dirs.iter().any(|dir| CMD_DEFAULT_PATHEXT.iter().any(|ext| dir.join(format!("codex{ext}")).is_file()))
+}
+
+/// Whether the command processor runs an AutoRun command before `cmd /c codex` (`Software\Microsoft\Command
+/// Processor`, `AutoRun`, for the user or the computer: `cmd /c` without `/d` runs it first). Such a command can put
+/// Codex on PATH (a Node version manager's setup does), where `codex_on_path` cannot see it, so a Codex there would
+/// have been said not to be installed.
+#[cfg(windows)]
+fn command_processor_autorun() -> bool {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_ANY};
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (key, value) = (wide(r"Software\Microsoft\Command Processor"), wide("AutoRun"));
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().any(|root| {
+        let mut bytes = 0u32;
+        // SAFETY: the key and value names end in NUL, and no data buffer is passed: the call only writes the value's
+        // size into `bytes`.
+        let status = unsafe { RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_ANY, std::ptr::null_mut(), std::ptr::null_mut(), &mut bytes) };
+        // (an empty value, its NUL alone, runs nothing)
+        status == 0 && bytes > 2
+    })
 }
 
 /// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
@@ -225,10 +246,11 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     // On Windows the child is `cmd /c codex`, which starts whether there is a codex or not: without one it says
     // "'codex' is not recognized" and ends, which read as an app server that failed (available, with an error), not as
     // no Codex. The settings did not say Codex is not installed, and an age check ran for a ChatGPT turn that could not
-    // be answered. So it is looked for first, as the command processor would look for it.
+    // be answered. So it is looked for first, as the command processor would look for it. (Not when the command
+    // processor runs an AutoRun command first, which may put Codex on PATH: then cmd itself is asked, as before.)
     #[cfg(windows)]
     {
-        if !codex_on_path(env.iter().find(|(key, _)| *key == "PATH").map(|(_, v)| v.as_str())) {
+        if !codex_on_path(env.iter().find(|(key, _)| *key == "PATH").map(|(_, v)| v.as_str())) && !command_processor_autorun() {
             return Err(CodexError::Unavailable(NOT_INSTALLED.to_string()));
         }
     }
@@ -1362,6 +1384,13 @@ mod tests {
         assert!(!codex_on_path(Some(&path)), "only shims cmd does not run");
         std::fs::write(bin.join("codex.cmd"), b"@echo off\r\n").unwrap();
         assert!(codex_on_path(Some(&path)), "codex.cmd on the second folder of PATH");
+        // With no PATHEXT the command processor's own list applies, which runs a script by its association too.
+        let js = dir.join("js");
+        std::fs::create_dir_all(&js).unwrap();
+        std::fs::write(js.join("codex.js"), b"").unwrap();
+        assert!(codex_on_path(Some(&js.to_string_lossy())), "codex.js, as cmd runs it");
+        // (asked of this computer's registry; whichever it answers, it answers without failing)
+        let _ = command_processor_autorun();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

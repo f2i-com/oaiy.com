@@ -1416,7 +1416,10 @@ impl Downloads {
         if let Some(free) = free_space(dir) {
             let need = total.saturating_sub(done + partials + found_here);
             if free < need + (1 << 30) {
-                return Err(format!("{} needs {:.1} GB more on that drive and it has {:.1} GB free: choose another folder, or make room", str_or(e, "name", id), need as f64 / 1e9, free as f64 / 1e9));
+                // (part of it is in this folder already: Try again carries on here, so "choose another folder" could not
+                // be followed; Discard is what starts it again somewhere else)
+                let way_out = if done + partials > 0 { "make room on that drive, or Discard it to start again in another folder" } else { "choose another folder, or make room" };
+                return Err(format!("{} needs {:.1} GB more on that drive and it has {:.1} GB free: {way_out}", str_or(e, "name", id), need as f64 / 1e9, free as f64 / 1e9));
             }
         }
         self.update(id, |d| {
@@ -1764,11 +1767,19 @@ fn configured_here(studio: &Studio, e: &Json, dir: &Path) -> bool {
     }
 }
 
+/// Whether two paths are the same file or folder, or one is in the other: as they are spelled, or as the files they
+/// are (a folder the settings spell another way, by case, a link or another drive letter; only paths that are there
+/// compare that way). `model_naming` and `register_in` both ask it: when only the first did, Resume found the model
+/// in the settings and then added a second of it.
+fn same_place(a: &Path, b: &Path) -> bool {
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    overlap(a, b) || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if overlap(&x, &y))
+}
+
 /// The model of the settings' section for `group` that names `path` (it, or a folder it is in, or a file in it): its
 /// section, its name, and every file and folder it names. Not for the picture tools and the age check, which are
 /// named by key and set again in place, not added as a second.
 fn model_naming(cfg: &Json, group: &str, path: &Path, root: &Path) -> Option<(String, String, Vec<PathBuf>)> {
-    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
     let resolve = |named: Vec<String>| named.into_iter().map(|n| config::resolve(root, &n)).filter(|p| p.components().count() > 1).collect::<Vec<_>>();
     let paths_of = |m: &Json| {
         let mut named = Vec::new();
@@ -1778,8 +1789,7 @@ fn model_naming(cfg: &Json, group: &str, path: &Path, root: &Path) -> Option<(St
     // (the model is the one whose own file or folder it is: not one that borrows a part from its folder, as an LTX-2.5
     // fine-tune added by hand is lent LTX-2.5's text encoder and VAE, which was taken for LTX-2.5 itself)
     // (also as the files they are: a folder the settings spell another way, by case, a link or another drive letter)
-    let path_real = std::fs::canonicalize(path).ok();
-    let same = |p: &Path| overlap(p, path) || path_real.as_deref().is_some_and(|r| std::fs::canonicalize(p).is_ok_and(|pr| overlap(&pr, r)));
+    let same = |p: &Path| same_place(p, path);
     let naming = |m: &Json| Some(paths_of(m)).filter(|_| resolve(main_paths(group, m)).iter().any(|p| same(p)));
     match group {
         "picture" | "check" | "" => None,
@@ -1866,7 +1876,6 @@ fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, S
 fn register_in(cfg: &mut Json, e: &Json, dir: &Path, root: &Path) -> Result<Vec<String>, String> {
     let mut added = Vec::new();
     let adds = strings(e.get("add"));
-    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
     let (mut first, has): (Option<(String, String)>, Vec<PathBuf>) = match adds.first() {
         Some(rel) => match model_naming(cfg, str_or(e, "group", ""), &under(dir, rel)?, root) {
             Some((section, name, paths)) => (Some((section, name)), paths),
@@ -1879,7 +1888,7 @@ fn register_in(cfg: &mut Json, e: &Json, dir: &Path, root: &Path) -> Result<Vec<
     let before = first.as_ref().and_then(|(section, name)| model_entry(cfg, section, name).map(|m| (section.clone(), name.clone(), m.clone())));
     for rel in adds {
         let path = under(dir, &rel)?;
-        if has.iter().any(|p| overlap(p, &path)) {
+        if has.iter().any(|p| same_place(p, &path)) {
             continue;
         }
         // (a model whose file is named for nothing, `model.safetensors`, named as the catalog names it)
@@ -2736,6 +2745,17 @@ mod tests {
         assert_eq!(cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().len(), 1, "no qwen3.5-9b-2");
         assert_eq!(model_naming(&cfg, "llm", &gguf, &root).map(|(s, n, _)| (s, n)), Some(("llm".to_string(), "mine".to_string())));
         assert!(model_naming(&cfg, "image", &gguf, &root).is_none(), "another section's model is not this one");
+        // Named another way (here through `..`; a link, or a drive letter's case, the same): still that model, completed
+        // where it is. The card read "in your models" by the file it is, and Resume then added a second by its spelling.
+        std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
+        std::fs::write(&gguf, b"weights").unwrap();
+        let spelled = root.join("models").join("..").join(gguf.strip_prefix(&root).unwrap());
+        let mut cfg = crate::config::default_json();
+        let llm = Json::parse(format!(r#"{{"models":[{{"name":"mine","path":"{}"}}]}}"#, spelled.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(&mut cfg, "llm", llm);
+        assert_eq!(model_naming(&cfg, "llm", &gguf, &root).map(|(_, n, _)| n), Some("mine".to_string()));
+        assert_eq!(register_in(&mut cfg, e, &dir, &root).unwrap(), Vec::<String>::new(), "nothing to add, spelled another way");
+        assert_eq!(cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().len(), 1, "no qwen3.5-9b-2 by another spelling");
         // A model that borrows a part from the folder (a fine-tune lent LTX-2.5's text encoder) is not the model itself;
         // the one whose transformer is in it is.
         let ltx = root.join("models/LTX-2.5");
