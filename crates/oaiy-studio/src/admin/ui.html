@@ -3488,30 +3488,35 @@ function dlCard(m, group) {
       ? `Accept its licence on ${page}, signed in as the account your saved token is from, before you download it.`
       : `Accept its licence on ${page} (signed in), then save a Hugging Face token (read access) above, before you download it.`}</span></div>` : "";
   let state = "", actions = "";
+  // (a model the settings have, fetched again or partly there: its files are theirs, and a Cancel or Discard of it is
+  // refused, so neither is offered; Resume completes it, and it is removed under Models)
+  const cancel = m.in_models ? "" : `<button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+  const discard = m.in_models ? "" : `<button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
+  const used = m.in_models ? `<div class="line"><span>${m.group === "check" ? "The age check uses its files" : "In your models, which use its files"}: Resume fetches what is missing</span></div>` : "";
   if (d && d.status === "downloading") {
     const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0, left = d.speed > 0 && d.total ? (d.total - d.done) / d.speed : NaN;
     state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}${d.reused ? " · " + dlSize(d.reused) + " found here" : ""}${d.lan ? " · " + dlSize(d.lan) + " from " + esc((d.lan_from || []).join(", ")) : ""}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
-    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button>${cancel}`;
   } else if (d && d.status === "queued") {
     state = `<div class="line"><span>Waiting for the download before it</span></div>`;
-    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button>${cancel}`;
   } else if (d && d.status === "adding") {
     state = `<div class="meter"><div style="width:100%"></div></div><div class="line"><span>Adding to your models…</span></div>`;
   } else if (d && d.status === "paused") {
     const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0;
     state = `<div class="meter"><div style="width:${pct}%;opacity:.5"></div></div><div class="line"><span>Paused at ${dlSize(d.done)}${d.total ? " of " + dlSize(d.total) : ""}</span></div>`;
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume</button>${cancel}`;
   } else if (d && d.status === "failed") {
     // (how far it got, and the room left where it goes: a full drive is the usual reason)
     const got = !d.total ? "" : d.done ? `${dlSize(d.done)} of ${dlSize(d.total)} downloaded` : `None of its ${dlSize(d.total)} downloaded yet`, room = dl.free != null ? `${dlSize(dl.free)} free on this drive` : "";
     state = `<div class="err">${esc(d.error || "The download failed.")}</div>${got || room ? `<div class="line"><span>${[got, room].filter(Boolean).join(" · ")}</span></div>` : ""}`;
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>${discard}`;
   } else if (m.installed || d?.status === "done") {
     state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}${d?.lan ? `<div class="line"><span>${dlSize(d.lan)} came from ${esc((d.lan_from || []).join(", "))} over OAIY Network</span></div>` : ""}`;
     actions = `<button class="btn" data-goto-models>Open Models</button><button class="btn quiet" data-dl="add" data-id="${m.id}" title="Add it to the model list again (after it was removed)">Add again</button>`;
   } else if (m.partial) {
-    state = `<div class="line"><span>Partly downloaded${m.at ? " in " + esc(m.at) : ""}</span></div>`;
-    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="discard" data-id="${m.id}">Discard</button>`;
+    state = `<div class="line"><span>Partly downloaded${m.at ? " in " + esc(m.at) : ""}</span></div>${used}`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button>${discard}`;
   } else {
     const p = dlPlans[m.id];
     // (in the models already, under this name, from files kept elsewhere: said first, the plan still to be asked)
@@ -3545,7 +3550,7 @@ async function dlAct(what, id) {
     const answer = await api(what === "start" ? "/api/downloads" : `/api/downloads/${what === "discard" ? "cancel" : what}`, {method: "POST", body});
     forgetPlans(id);
     // (Add again answers what it added, not the downloads)
-    if (what === "add") { toast("Added again"); await loadConfig(); await refreshDownloads(); return; }
+    if (what === "add") { toast(answer?.added?.length ? "Added again" : "It is in your models already"); await loadConfig(); await refreshDownloads(); return; }
     dl = answer;
     renderDownloads();
   } catch (e) { toast(e.message, true); }
@@ -3582,7 +3587,8 @@ $("#dl-token-save").onclick = async () => {
 };
 function renderFirstRun() {
   if (!cfg) return;
-  const any = (cfg.llm?.models || []).length || Object.values(cfg.media || {}).some(s => s && typeof s === "object" && s.models && Object.keys(s.models).length) || cfg.media?.picture?.background || cfg.media?.picture?.upscaler;
+  // (the age check, downloaded, is named by key as the picture tools are: something is there to use)
+  const any = (cfg.llm?.models || []).length || Object.values(cfg.media || {}).some(s => s && typeof s === "object" && s.models && Object.keys(s.models).length) || cfg.media?.picture?.background || cfg.media?.picture?.upscaler || cfg.media?.faceage?.model;
   $("#first-run").hidden = !!any; $("#models-first-run").hidden = !!any;
 }
 

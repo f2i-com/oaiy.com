@@ -455,18 +455,51 @@ fn marker_whole(dir: &Path, marker: &Path) -> bool {
         .all(|rel| under(dir, &rel.replace('\\', "/")).map_or(true, |p| p.is_file()))
 }
 
-/// What a finished download of `id` put in `dir`, as its parts' markers list it.
+/// What finished downloads of `id` put in `dir` themselves, as its parts' markers list it (`placed`): not a file of the
+/// model's that was there before it was downloaded. A marker written before markers said so lists every file of the
+/// model (`files`), and is taken at its word.
+fn marker_placed(dir: &Path, id: &str) -> Vec<PathBuf> {
+    let Some(e) = entry(id) else { return Vec::new() };
+    let mut placed: Vec<PathBuf> = Vec::new();
+    let markers = e.get("parts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|p| marker(dir, p, id).filter(|m| m.is_file()));
+    for listed in markers.filter_map(|m| std::fs::read(&m).ok().and_then(|b| Json::parse(&b).ok())) {
+        let names = listed.get("placed").and_then(Json::as_array).or_else(|| listed.get("files").and_then(Json::as_array)).unwrap_or(&[]);
+        for path in names.iter().filter_map(|f| f.as_str().and_then(|rel| under(dir, &rel.replace('\\', "/")).ok())) {
+            if !placed.contains(&path) {
+                placed.push(path);
+            }
+        }
+    }
+    placed
+}
+
+/// Said when a Discard kept the markers of a model whose files another model of the settings uses.
+const KEPT_FOR_ANOTHER: &str = "another model in your settings uses its files, so they are kept and it is still partly there: Resume to fetch what is missing, or remove that model under Models first";
+
+/// Every file of `id` in `dir`, as its parts' markers list them (`files`).
 fn marker_files(dir: &Path, id: &str) -> Vec<PathBuf> {
     let Some(e) = entry(id) else { return Vec::new() };
-    e.get("parts")
-        .and_then(Json::as_array)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|p| marker(dir, p, id).filter(|m| m.is_file()))
-        .filter_map(|m| std::fs::read(&m).ok().and_then(|b| Json::parse(&b).ok()))
-        .flat_map(|listed| listed.get("files").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default())
-        .filter_map(|f: Json| f.as_str().and_then(|rel| under(dir, &rel.replace('\\', "/")).ok()))
-        .collect()
+    let markers = e.get("parts").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|p| marker(dir, p, id).filter(|m| m.is_file()));
+    let mut files: Vec<PathBuf> = Vec::new();
+    for listed in markers.filter_map(|m| std::fs::read(&m).ok().and_then(|b| Json::parse(&b).ok())) {
+        for path in listed.get("files").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|f| f.as_str().and_then(|rel| under(dir, &rel.replace('\\', "/")).ok())) {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Whether the settings have the model `e` downloaded into `dir`: its first file or folder (the model itself, not a
+/// part it may share with another, as MOSS Image's text encoder is the Qwen3.5 language model) is one the settings
+/// name, or holds one (the age check's weights in its MiVOLO folder).
+fn in_models(e: &Json, dir: &Path, named: &[PathBuf]) -> bool {
+    let Some(first) = strings(e.get("add")).into_iter().next() else { return false };
+    let Ok(at) = under(dir, &first) else { return false };
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let at_real = std::fs::canonicalize(&at).ok();
+    named.iter().any(|n| overlap(n, &at) || at_real.as_deref().is_some_and(|r| std::fs::canonicalize(n).is_ok_and(|nr| overlap(&nr, r))))
 }
 
 /// Is the entry in `dir`: every part's marker written, with the files it lists in place, or (downloaded some other
@@ -847,15 +880,29 @@ impl Downloads {
     pub fn cancel(&self, studio: &Studio, id: &str, dir: Option<PathBuf>) -> Result<Json, String> {
         // (being added to the models: its files are the model's now, not a download's to take away)
         let listed = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| (d.status, d.dir.clone()));
+        // (the age check is no model of the Models page: it is the age check's, and there is no removing it there)
+        let check = entry(id).is_some_and(|e| str_or(e, "group", "") == "check");
+        let downloaded = if check { "it is downloaded, and the age check uses it" } else { "it is downloaded: remove it under Models" };
         match &listed {
             Some(("adding", _)) => return Err("it is being added to your models now: remove it under Models once it is there".into()),
             // (downloaded whole: its files are a model's, in the settings or to be added again, not a download's to
             // take away; one with a file gone since is partly there, and is discarded like one)
-            Some(("done", at)) if entry(id).is_some_and(|e| installed(e, at)) => return Err("it is downloaded: remove it under Models".into()),
+            Some(("done", at)) if entry(id).is_some_and(|e| installed(e, at)) => return Err(downloaded.into()),
             None if entry(id).is_some_and(|e| installed(e, &dir.clone().unwrap_or_else(|| default_dir(studio)))) => {
-                return Err("it is downloaded: remove it under Models".into());
+                return Err(downloaded.into());
             }
             _ => {}
+        }
+        // Partly there and in the settings (a file of it deleted since it was downloaded and added): its files are the
+        // model's the settings use, which a Discard keeps, and taking its markers away with the rest made it read as
+        // downloaded again, with the file still missing and nothing offered to fetch it. Resume fetches what is missing.
+        let at = listed.as_ref().map(|(_, d)| d.clone()).or_else(|| dir.clone()).unwrap_or_else(|| default_dir(studio));
+        if entry(id).is_some_and(|e| configured_here(studio, e, &at)) {
+            return Err(if check {
+                "the age check uses its files: Resume to fetch what is missing".into()
+            } else {
+                "it is in your models, which use its files: Resume to fetch what is missing, or remove it under Models before discarding it".into()
+            });
         }
         self.want.lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_string(), Want::Cancel);
         let (active, dir) = {
@@ -866,7 +913,11 @@ impl Downloads {
         if active {
             self.stop_child();
         } else {
-            self.discard(studio, id, &dir);
+            if self.discard(studio, id, &dir) {
+                // (off the list, so its card reads from its markers, partly there, as this says)
+                self.list.lock().unwrap_or_else(|p| p.into_inner()).retain(|d| d.id != id);
+                return Err(KEPT_FOR_ANOTHER.into());
+            }
             self.update(id, |d| d.status = "cancelled");
         }
         Ok(self.state(studio))
@@ -912,26 +963,30 @@ impl Downloads {
 
     /// Write down beside `dir` what download `id` has put in place so far (`.oaiy-<id>.fetched.json`), so a Discard after
     /// a restart, with no download of it listed, still knows what to take away.
+    /// Added to what the record says already: a download resumed after a restart lists only what this session fetched.
     fn keep_fetched(&self, id: &str, dir: &Path) {
-        let fetched = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        let mut fetched = read_fetched(dir, id);
+        for f in self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default() {
+            if !fetched.contains(&f) {
+                fetched.push(f);
+            }
+        }
         let _ = std::fs::write(fetched_record(dir, id), Json::Arr(fetched.iter().map(|f| Json::str(f.to_string_lossy())).collect()).to_json());
     }
 
     /// Delete what `id` downloaded into `dir`: its partial files and the files this download put in place (a link
     /// removed is the link alone), its markers, and the folders that leaves empty; never a file another model uses.
-    fn discard(&self, studio: &Studio, id: &str, dir: &Path) {
+    fn discard(&self, studio: &Studio, id: &str, dir: &Path) -> bool {
         let used = self.used_by_others(studio, id, dir);
-        // (what it put in place, as listed, else, after a restart, as its record beside the folder says and, for a
-        // finished download, as its parts' markers list: one with a file gone since, discarded, otherwise left the rest
-        // of its files, and its folder, read again as the model there)
-        let listed = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
-        let fetched = if listed.is_empty() {
-            let mut found = read_fetched(dir, id);
-            found.extend(marker_files(dir, id));
-            found
-        } else {
-            listed
-        };
+        // (what it put in place: as listed, as its record beside the folder says, and as its parts' markers list for a
+        // finished download, all of them: one resumed after a restart lists only what this session fetched, and one with
+        // a file gone since, discarded, otherwise left the rest of its files, and its folder, read again as the model)
+        let mut fetched = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        for f in read_fetched(dir, id).into_iter().chain(marker_placed(dir, id)) {
+            if !fetched.contains(&f) {
+                fetched.push(f);
+            }
+        }
         // (a file the settings name, a model or a part of one, is the settings': never removed with a download)
         let named = settings_files(studio);
         remove_partials(id, dir, &used);
@@ -948,13 +1003,24 @@ impl Downloads {
             let is_link = std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_symlink());
             !is_link && real(f).is_some_and(|r| used_real.contains(&r) || named_real.iter().any(|n| r.starts_with(n)))
         };
-        for f in fetched.iter().filter(|f| !kept(f)) {
+        let listed = marker_files(dir, id);
+        let (held, gone): (Vec<&PathBuf>, Vec<&PathBuf>) = fetched.iter().partition(|f| kept(f));
+        for f in gone {
             let _ = std::fs::remove_file(f);
         }
         let _ = std::fs::remove_file(fetched_record(dir, id));
+        // (its markers stay when what is kept, as another model of the settings uses it, would read without them as the
+        // model downloaded whole, by the files and folders it adds, though a file of it is missing: Pixal3D keeps the
+        // BiRefNet folder its weights went from. With them it reads as partly there, for Resume. Otherwise they go: a
+        // model whose own first file went is no longer there, whatever another model keeps beside it)
+        let reads_whole = entry(id).is_some_and(|e| {
+            let adds = strings(e.get("add"));
+            !adds.is_empty() && adds.iter().all(|rel| under(dir, rel).is_ok_and(|p| p.exists()))
+        });
+        let keep_markers = !held.is_empty() && reads_whole && listed.iter().any(|f| !f.exists());
         if let Some(e) = entry(id) {
             for part in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
-                if let Some(m) = marker(dir, part, id) {
+                if let Some(m) = marker(dir, part, id).filter(|_| !keep_markers) {
                     let _ = std::fs::remove_file(&m);
                 }
                 if let Ok(folder) = under(dir, str_or(part, "into", "")) {
@@ -967,6 +1033,7 @@ impl Downloads {
             d.done = 0;
         });
         library::forget_scan();
+        keep_markers
     }
 
     /// Add a downloaded model to the model list again.
@@ -1019,7 +1086,13 @@ impl Downloads {
                 o.push(("installed".into(), Json::Bool(have)));
                 // (a model all of whose parts are done is installed, not partly downloaded: each part's marker is
                 // what says a part is done)
-                o.push(("partial".into(), Json::Bool(d.is_none() && !have && partial(e, &where_))));
+                let part_there = d.is_none() && !have && partial(e, &where_);
+                o.push(("partial".into(), Json::Bool(part_there)));
+                // (being fetched again, or partly there, while the settings have it: its files are theirs, so it is
+                // not offered to cancel or discard, which would only be refused; Resume completes it)
+                if !have && (d.is_some() || part_there) {
+                    o.push(("in_models".into(), Json::Bool(configured_here(studio, e, &where_))));
+                }
                 if where_ != dir {
                     o.push(("at".into(), Json::str(where_.to_string_lossy())));
                 }
@@ -1232,11 +1305,21 @@ impl Downloads {
                     self.update(id, |d| d.status = "paused");
                     return;
                 }
+                // (a model downloaded and added before, with a file of it fetched again by Resume, is in the settings
+                // already: completed there, not added again (register_in))
+                let already = configured_here(studio, e, &dir);
                 let registered = register(studio, e, &dir);
                 drop(adding);
                 match registered {
                     Ok(added) => {
-                        studio.log.push(format!("downloaded {name}: {}", if added.is_empty() { "nothing to add".into() } else { added.join(", ") }));
+                        let said = if already && added.is_empty() {
+                            "in your models already".to_string()
+                        } else if added.is_empty() {
+                            "nothing to add".to_string()
+                        } else {
+                            added.join(", ")
+                        };
+                        studio.log.push(format!("downloaded {name}: {said}"));
                         self.update(id, |d| {
                             d.status = "done";
                             d.added = added;
@@ -1259,9 +1342,15 @@ impl Downloads {
                 });
             }
             Ok(Want::Cancel) => {
-                self.discard(studio, id, &dir);
+                let kept = self.discard(studio, id, &dir);
                 studio.log.push(format!("cancelled {name}"));
                 let resumed = again();
+                if kept && !resumed {
+                    // (as `cancel` does for one that was not running: its card reads from its markers, and why is said)
+                    studio.log.push(format!("{name}: {KEPT_FOR_ANOTHER}"));
+                    self.list.lock().unwrap_or_else(|p| p.into_inner()).retain(|d| d.id != id);
+                    return;
+                }
                 self.update(id, |d| {
                     d.status = if resumed { "queued" } else { "cancelled" };
                     d.speed = 0.;
@@ -1460,11 +1549,24 @@ impl Downloads {
             });
             self.keep_fetched(id, dir);
         }
-        // Each part's marker: the model is here (and what it fetched is in them: no record of its own any more).
+        // Each part's marker: the model is here, with every file of it (`files`), and what downloads of it put in place
+        // (`placed`: what a Discard takes away; not a file that was here before, which `files` lists too), so no record
+        // of its own any more. What earlier downloads of it placed stays listed: a Resume that fetched one file again is
+        // not the whole of what was put there.
+        let mut placed = marker_placed(dir, id);
+        let this_time = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| d.fetched.clone()).unwrap_or_default();
+        for f in read_fetched(dir, id).into_iter().chain(this_time) {
+            if !placed.contains(&f) {
+                placed.push(f);
+            }
+        }
+        let rel = |path: &Path| Json::str(path.strip_prefix(dir).unwrap_or(path).to_string_lossy());
         for p in e.get("parts").and_then(Json::as_array).unwrap_or(&[]) {
             if let Some(m) = marker(dir, p, id) {
-                let names: Vec<Json> = files.iter().filter(|f| m.parent().is_some_and(|folder| f.dest.starts_with(folder))).map(|f| Json::str(f.dest.strip_prefix(dir).unwrap_or(&f.dest).to_string_lossy())).collect();
-                let _ = std::fs::write(&m, Json::obj([("id", Json::str(id)), ("files", Json::Arr(names))]).to_json());
+                let inside = |path: &Path| m.parent().is_some_and(|folder| path.starts_with(folder));
+                let names: Vec<Json> = files.iter().filter(|f| inside(&f.dest)).map(|f| rel(&f.dest)).collect();
+                let mine: Vec<Json> = placed.iter().filter(|path| inside(path)).map(|path| rel(path)).collect();
+                let _ = std::fs::write(&m, Json::obj([("id", Json::str(id)), ("files", Json::Arr(names)), ("placed", Json::Arr(mine))]).to_json());
             }
         }
         let _ = std::fs::remove_file(fetched_record(dir, id));
@@ -1591,20 +1693,34 @@ fn read_fetched(dir: &Path, id: &str) -> Vec<PathBuf> {
 
 /// The files and folders the settings' models name (a model, a part of one): a download never removes them.
 fn settings_files(studio: &Studio) -> Vec<PathBuf> {
+    named_in_settings(studio, None)
+}
+
+/// Those the settings name in the section of the catalog's `group` alone (`None`: every section): where a model of
+/// that group is the settings' itself, rather than a file another model uses as a part of its own (MOSS Image's text
+/// encoder is the Qwen3.5 language model's GGUF; Pixal3D names BiRefNet and Real-ESRGAN). The age check's group,
+/// `check`, is `media.faceage`; the picture tools' is `media.picture`'s keys.
+fn named_in_settings(studio: &Studio, group: Option<&str>) -> Vec<PathBuf> {
     let cfg = studio.config();
+    let wants = |g: &str| group.is_none_or(|want| want == g);
     let mut named = Vec::new();
     let mut collect = |v: &Json| library::paths_named(v, &mut named);
-    if let Some(llm) = cfg.get("llm").and_then(|l| l.get("models")) {
-        collect(llm);
+    if wants("llm") {
+        if let Some(llm) = cfg.get("llm").and_then(|l| l.get("models")) {
+            collect(llm);
+        }
     }
-    for (_, section) in cfg.get("media").and_then(Json::as_object).unwrap_or(&[]) {
-        if let Some(models) = section.get("models") {
+    for (name, section) in cfg.get("media").and_then(Json::as_object).unwrap_or(&[]) {
+        if let Some(models) = section.get("models").filter(|_| wants(name.as_str())) {
             collect(models);
         }
     }
     // The models sections name by key rather than under `models`: the picture tools and the age check. A Discard of one
     // that read as partly there (a README of it deleted) took away the weights these still name.
-    for (section, keys) in [("picture", ["background", "upscaler"]), ("faceage", ["model", "detector"])] {
+    for (section, of, keys) in [("picture", "picture", ["background", "upscaler"]), ("faceage", "check", ["model", "detector"])] {
+        if !wants(of) {
+            continue;
+        }
         for key in keys {
             if let Some(v) = cfg.get("media").and_then(|m| m.get(section)).and_then(|s| s.get(key)) {
                 collect(v);
@@ -1612,6 +1728,29 @@ fn settings_files(studio: &Studio) -> Vec<PathBuf> {
         }
     }
     named.into_iter().map(|n| config::resolve(&studio.root, &n)).filter(|p| p.components().count() > 1).collect()
+}
+
+/// Whether the settings have the model `e` itself, downloaded into `dir` (`in_models` in its own group's section).
+fn configured_here(studio: &Studio, e: &Json, dir: &Path) -> bool {
+    in_models(e, dir, &named_in_settings(studio, Some(str_or(e, "group", ""))))
+}
+
+/// The model of the settings' section for `group` that names `path` (it, or a folder it is in, or a file in it): its
+/// section, its name, and every file and folder it names. Not for the picture tools and the age check, which are
+/// named by key and set again in place, not added as a second.
+fn model_naming(cfg: &Json, group: &str, path: &Path, root: &Path) -> Option<(String, String, Vec<PathBuf>)> {
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let paths_of = |m: &Json| {
+        let mut named = Vec::new();
+        library::paths_named(m, &mut named);
+        named.into_iter().map(|n| config::resolve(root, &n)).filter(|p| p.components().count() > 1).collect::<Vec<_>>()
+    };
+    let naming = |m: &Json| Some(paths_of(m)).filter(|paths| paths.iter().any(|p| overlap(p, path)));
+    match group {
+        "picture" | "check" | "" => None,
+        "llm" => cfg.get("llm")?.get("models")?.as_array()?.iter().find_map(|m| naming(m).map(|paths| ("llm".to_string(), str_or(m, "name", "").to_string(), paths))),
+        section => cfg.get("media")?.get(section)?.get("models")?.as_object()?.iter().find_map(|(name, m)| naming(m).map(|paths| (section.to_string(), name.clone(), paths))),
+    }
 }
 
 /// Remove `dir` and the folders in it that hold nothing.
@@ -1664,23 +1803,42 @@ fn section_name(section: &str) -> &str {
 /// to that model (a part of it: a GGUF's vision projector, a Qwen Image model's base, text encoder and vision tower).
 fn register(studio: &Arc<Studio>, e: &Json, dir: &Path) -> Result<Vec<String>, String> {
     // (on the settings as they are now, under the save's lock: a save beside it neither loses this nor is lost)
-    studio.update_config(|cfg| register_in(cfg, e, dir).map_err(|e| (400, e))).map(|(added, _)| added).map_err(|(_, e)| e)
+    let root = studio.root.clone();
+    studio.update_config(|cfg| register_in(cfg, e, dir, &root).map_err(|e| (400, e))).map(|(added, _)| added).map_err(|(_, e)| e)
 }
 
-fn register_in(cfg: &mut Json, e: &Json, dir: &Path) -> Result<Vec<String>, String> {
+/// `root`: what the settings' relative paths are relative to. A model the settings have already, by its first file
+/// (downloaded and added before, then a file of it fetched again by Resume, or its file added by hand while it
+/// downloaded), is completed rather than added again: added again, it was a second of it, `<name>-2`, at every repair,
+/// and the first left as it was. Each file it adds that the model does not name is attached to that model.
+fn register_in(cfg: &mut Json, e: &Json, dir: &Path, root: &Path) -> Result<Vec<String>, String> {
     let mut added = Vec::new();
-    let mut first: Option<(&'static str, String)> = None;
-    for rel in strings(e.get("add")) {
+    let adds = strings(e.get("add"));
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let (mut first, has): (Option<(String, String)>, Vec<PathBuf>) = match adds.first() {
+        Some(rel) => match model_naming(cfg, str_or(e, "group", ""), &under(dir, rel)?, root) {
+            Some((section, name, paths)) => (Some((section, name)), paths),
+            None => (None, Vec::new()),
+        },
+        None => (None, Vec::new()),
+    };
+    // (completing a model the settings have, a part is only filled where it has none: one the person set, a text encoder
+    // or a vision projector of their own, is not written over with the catalog's)
+    let before = first.as_ref().and_then(|(section, name)| model_entry(cfg, section, name).map(|m| (section.clone(), name.clone(), m.clone())));
+    for rel in adds {
         let path = under(dir, &rel)?;
+        if has.iter().any(|p| overlap(p, &path)) {
+            continue;
+        }
         // (a model whose file is named for nothing, `model.safetensors`, named as the catalog names it)
         let generic = first.is_none() && path.file_stem().is_some_and(|n| {
             let n = n.to_string_lossy().to_ascii_lowercase();
             n == "model" || n.starts_with("model-0") || n.starts_with("diffusion_pytorch_model")
         });
         let name = generic.then(|| str_or(e, "id", "").to_string());
-        let result = registry::add(cfg, &path, name.as_deref(), first.as_ref().map(|(s, n)| (*s, n.as_str())));
+        let result = registry::add(cfg, &path, name.as_deref(), first.as_ref().map(|(s, n)| (s.as_str(), n.as_str())));
         if let (Ok((a, _)), None) = (&result, &first) {
-            first = Some((a.section, a.name.clone()));
+            first = Some((a.section.to_string(), a.name.clone()));
         }
         match result {
             Ok((a, _)) => {
@@ -1700,7 +1858,44 @@ fn register_in(cfg: &mut Json, e: &Json, dir: &Path) -> Result<Vec<String>, Stri
             Err(err) => return Err(format!("{}: {err}", path.display())),
         }
     }
+    if let Some((section, name, was)) = &before {
+        keep_set_parts(cfg, section, name, was);
+    }
     Ok(added)
+}
+
+/// The model's files and parts as they were (`was`) put back where adding wrote over one that was set: only the empty
+/// ones are the download's to fill. Unless it was missing a part it needs, which the download completes, the model is
+/// as it was in all else too: switched off, it is not switched on by filling an optional part (a Qwen Image model's
+/// vision projector) or by an attach that changed nothing of it.
+fn keep_set_parts(cfg: &mut Json, section: &str, name: &str, was: &Json) {
+    let (Json::Obj(fields), Some(entry)) = (was, model_entry_mut(cfg, section, name)) else { return };
+    let set = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty());
+    let completed = !registry::missing_fields(section, was).is_empty();
+    // (a part that was empty stays the download's to fill; what else was set, `enabled` with it, is put back)
+    for (key, value) in fields.iter().filter(|(_, v)| set(v) || (!completed && v.as_str().is_none() && !matches!(v, Json::Null))) {
+        if entry.get(key).map(Json::to_json) != Some(value.to_json()) {
+            crate::util::set(entry, key, value.clone());
+        }
+    }
+}
+
+/// The settings' model `name` of `section` (`llm`: the language models' list, by name; else `media.<section>.models`).
+fn model_entry<'a>(cfg: &'a Json, section: &str, name: &str) -> Option<&'a Json> {
+    match section {
+        "llm" => cfg.get("llm")?.get("models")?.as_array()?.iter().find(|m| str_or(m, "name", "") == name),
+        _ => cfg.get("media")?.get(section)?.get("models")?.get(name),
+    }
+}
+
+fn model_entry_mut<'a>(cfg: &'a mut Json, section: &str, name: &str) -> Option<&'a mut Json> {
+    match section {
+        "llm" => match registry::obj_mut(cfg, &["llm", "models"])? {
+            Json::Arr(models) => models.iter_mut().find(|m| str_or(m, "name", "") == name),
+            _ => None,
+        },
+        _ => registry::obj_mut(cfg, &["media", section, "models", name]),
+    }
 }
 
 #[cfg(test)]
@@ -2323,10 +2518,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The age check's files are named in the settings by key (`media.faceage.model`, `.detector`), not under a
-    /// `models` list: a Discard of it, partly there because a README of it went, keeps the files those still name.
+    /// A model the settings use, partly there because a file of it went, is not discarded: its files are the settings'
+    /// to keep, and a Discard that kept them but took its markers made it read as downloaded again, the file still
+    /// missing and nothing offered to fetch it. It stays partly there, for Resume. The age check's files are named by key
+    /// (`media.faceage.model`, `.detector`), not under a `models` list, and count the same; MiVOLO's config.json, which
+    /// the settings do not name, is not taken from under the weights they do.
     #[test]
-    fn a_discard_keeps_the_age_checks_files_the_settings_name() {
+    fn a_partly_there_model_the_settings_use_is_kept_for_resume() {
         let root = std::env::temp_dir().join(format!("oaiy-dl-agecheck-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("models");
@@ -2348,9 +2546,248 @@ mod tests {
         let studio = Studio::for_test(&root, cfg);
         let e = entry("age-check").unwrap();
         assert!(!installed(e, &dir) && partial(e, &dir), "its README is gone: partly there");
-        Downloads::new().cancel(&studio, "age-check", Some(dir.clone())).unwrap();
-        assert!(weights.exists() && detector.exists(), "the files the settings name are kept");
-        assert!(!mivolo.join("config.json").exists() && !yunet.join("LICENSE").exists(), "the rest goes");
+        let refused = Downloads::new().cancel(&studio, "age-check", Some(dir.clone())).unwrap_err();
+        assert!(refused.contains("age check uses its files") && refused.contains("Resume"), "{refused}");
+        for f in [&weights, &detector, &mivolo.join("config.json"), &yunet.join("LICENSE")] {
+            assert!(f.exists(), "{} kept", f.display());
+        }
+        assert!(!installed(e, &dir) && partial(e, &dir), "still partly there, to resume");
+
+        // A language model the settings name by its file: the same, in words for the Models page.
+        let folder = dir.join("Qwen3.5-9B-GGUF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let gguf = folder.join("Qwen3.5-9B-Q4_K_M.gguf");
+        std::fs::write(&gguf, b"weights").unwrap();
+        std::fs::write(folder.join(".oaiy-qwen3.5-9b.json"), br#"{"id":"qwen3.5-9b","files":["Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf","Qwen3.5-9B-GGUF/README.md"]}"#).unwrap();
+        let mut cfg = studio.config();
+        let llm = Json::parse(format!(r#"{{"models":[{{"name":"qwen3.5-9b","path":"{}"}}]}}"#, gguf.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(&mut cfg, "llm", llm);
+        let studio = Studio::for_test(&root, cfg);
+        let refused = Downloads::new().cancel(&studio, "qwen3.5-9b", Some(dir.clone())).unwrap_err();
+        assert!(refused.contains("in your models") && refused.contains("Resume"), "{refused}");
+        assert!(gguf.exists() && folder.join(".oaiy-qwen3.5-9b.json").exists());
+        assert!(partial(entry("qwen3.5-9b").unwrap(), &dir) && !installed(entry("qwen3.5-9b").unwrap(), &dir));
+
+        // The card says so, and is offered neither Cancel nor Discard (ui.html), only Resume.
+        let state = Downloads::new().state(&studio);
+        let card = state.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == "qwen3.5-9b").cloned().unwrap();
+        assert!(crate::util::bool_or(&card, "partial", false) && crate::util::bool_or(&card, "in_models", false));
+
+        // In the settings is the model itself, in its own section, not a file another model uses as a part: MOSS Image's
+        // last file to add is that same Qwen3.5 GGUF, and MOSS Image is not in the settings for it.
+        assert!(configured_here(&studio, entry("qwen3.5-9b").unwrap(), &dir));
+        assert!(!configured_here(&studio, entry("moss-image-sft-q4").unwrap(), &dir));
+        // Nor is the language model when MOSS Image alone names its GGUF (as its text encoder): its Discard goes ahead,
+        // keeps the file MOSS Image uses, and says so: what is left would read as the model downloaded whole, so it stays
+        // partly there, for Resume.
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        let moss = Json::parse(format!(r#"{{"moss":{{"architecture":"moss-image","text_encoder":"{}"}}}}"#, gguf.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["media", "image"]).unwrap(), "models", moss);
+        let studio = Studio::for_test(&root, cfg);
+        assert!(!configured_here(&studio, entry("qwen3.5-9b").unwrap(), &dir));
+        let said = Downloads::new().cancel(&studio, "qwen3.5-9b", Some(dir.clone())).unwrap_err();
+        assert!(said.contains("another model in your settings uses its files"), "{said}");
+        assert!(gguf.exists(), "the file MOSS Image names stays");
+        assert!(partial(entry("qwen3.5-9b").unwrap(), &dir), "partly there, not downloaded");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A model whose files another model of the settings keeps (Pixal3D names the BiRefNet folder as its matte) is not
+    /// read as downloaded whole once discarded: its markers stay, so it reads as partly there, with Resume; and a model
+    /// is added again after a Resume unless its section names every file it adds (the age check's detector left empty
+    /// is filled).
+    #[test]
+    fn a_discard_that_keeps_another_models_files_leaves_the_model_partly_there() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-heldby-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let e = entry("birefnet").unwrap();
+        let folder = under(&dir, &strings(e.get("add"))[0]).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("config.json"), b"{}").unwrap();
+        let rel = |f: &str| folder.join(f).strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/");
+        let listed = format!(r#"{{"id":"birefnet","files":["{}","{}"],"placed":["{}","{}"]}}"#, rel("config.json"), rel("model.safetensors"), rel("config.json"), rel("model.safetensors"));
+        for part in e.get("parts").and_then(Json::as_array).unwrap() {
+            std::fs::write(marker(&dir, part, "birefnet").unwrap(), &listed).unwrap();
+        }
+        assert!(partial(e, &dir) && !installed(e, &dir), "its weights went: partly there");
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+        let pixal = Json::parse(format!(r#"{{"pixal3d":{{"matte":"{}"}}}}"#, folder.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["media", "model3d"]).unwrap(), "models", pixal);
+        let studio = Studio::for_test(&root, cfg);
+        assert!(!configured_here(&studio, e, &dir), "not the picture tool itself");
+        // (a download of it listed, failed: its card, once discarded, reads from its markers, as the answer says)
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "failed", ..Download::new("birefnet", &dir, None) });
+        let said = d.cancel(&studio, "birefnet", None).unwrap_err();
+        assert!(said.contains("another model in your settings uses its files") && said.contains("Resume"), "{said}");
+        let state = d.state(&studio);
+        let card = state.get("models").and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == "birefnet").cloned().unwrap();
+        assert!(crate::util::bool_or(&card, "partial", false) && card.get("download").is_some_and(|v| matches!(v, Json::Null)), "partly there, to resume");
+        assert!(folder.join("config.json").exists(), "what Pixal3D uses stays");
+        assert!(partial(e, &dir) && !installed(e, &dir), "and it still reads as partly there, not downloaded");
+
+        // A model whose own first file went is not there, whatever another model keeps beside it: MOSS Image's GGUF
+        // deleted, the Qwen3.5 GGUF it fetched kept for the language model the settings have. Its markers go.
+        let moss = entry("moss-image-sft-q4").unwrap();
+        let adds: Vec<PathBuf> = strings(moss.get("add")).iter().map(|rel| under(&dir, rel).unwrap()).collect();
+        let qwen = adds.iter().find(|p| p.to_string_lossy().contains("Qwen3.5-9B")).cloned().unwrap();
+        std::fs::create_dir_all(qwen.parent().unwrap()).unwrap();
+        std::fs::write(&qwen, b"weights").unwrap();
+        let names: Vec<String> = adds.iter().map(|p| format!("\"{}\"", p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/"))).collect();
+        let listed = format!(r#"{{"id":"moss-image-sft-q4","files":[{0}],"placed":[{0}]}}"#, names.join(","));
+        for part in moss.get("parts").and_then(Json::as_array).unwrap() {
+            let m = marker(&dir, part, "moss-image-sft-q4").unwrap();
+            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+            std::fs::write(&m, &listed).unwrap();
+        }
+        let mut cfg = crate::config::default_json();
+        let llm = Json::parse(format!(r#"{{"models":[{{"name":"qwen3.5-9b","path":"{}"}}]}}"#, qwen.display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(&mut cfg, "llm", llm);
+        let studio = Studio::for_test(&root, cfg);
+        assert!(partial(moss, &dir));
+        Downloads::new().cancel(&studio, "moss-image-sft-q4", Some(dir.clone())).unwrap();
+        assert!(qwen.exists(), "the language model's GGUF stays");
+        assert!(!partial(moss, &dir) && !installed(moss, &dir), "MOSS Image is gone, not left partly there for good");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A model the settings have already, by its first file, is completed where it is, not added again as `<name>-2`.
+    #[test]
+    fn a_model_the_settings_have_is_not_added_a_second_time() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let e = entry("qwen3.5-9b").unwrap();
+        let gguf = under(&dir, &strings(e.get("add"))[0]).unwrap();
+        // (named relative to the settings' folder, as the settings may name it)
+        let mut cfg = crate::config::default_json();
+        let llm = Json::parse(format!(r#"{{"models":[{{"name":"mine","path":"{}"}}]}}"#, gguf.strip_prefix(&root).unwrap().display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        crate::util::set(&mut cfg, "llm", llm);
+        assert_eq!(register_in(&mut cfg, e, &dir, &root).unwrap(), Vec::<String>::new(), "nothing to add");
+        assert_eq!(cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().len(), 1, "no qwen3.5-9b-2");
+        assert_eq!(model_naming(&cfg, "llm", &gguf, &root).map(|(s, n, _)| (s, n)), Some(("llm".to_string(), "mine".to_string())));
+        assert!(model_naming(&cfg, "image", &gguf, &root).is_none(), "another section's model is not this one");
+
+        // Completed, a part the person set is kept: the catalog's text encoder is not written over their own.
+        let mut cfg = Json::parse(br#"{"media":{"image":{"models":{"moss":{"architecture":"moss-image","text_encoder":"D:/mine/encoder-q8.gguf","vae":""}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "image", "moss").cloned().unwrap();
+        let moss = model_entry_mut(&mut cfg, "image", "moss").unwrap();
+        crate::util::set(moss, "text_encoder", Json::str("C:/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"));
+        crate::util::set(moss, "vae", Json::str("C:/models/MOSS-Image-SFT-parts/vae/diffusion_pytorch_model.safetensors"));
+        keep_set_parts(&mut cfg, "image", "moss", &was);
+        let moss = model_entry(&cfg, "image", "moss").unwrap();
+        assert_eq!(str_or(moss, "text_encoder", ""), "D:/mine/encoder-q8.gguf", "theirs kept");
+        assert!(str_or(moss, "vae", "").ends_with("diffusion_pytorch_model.safetensors"), "the empty one filled");
+
+        // Switched off by the person, and nothing of it filled: it stays off. Completed, it is switched on.
+        let mut cfg = Json::parse(br#"{"media":{"image":{"models":{"moss":{"architecture":"moss-image","transformer":"D:/mine/moss.gguf","text_encoder":"D:/mine/encoder-q8.gguf","vae":"D:/mine/vae.safetensors","tokenizer":"D:/mine/tokenizer.json","enabled":false}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "image", "moss").cloned().unwrap();
+        assert!(crate::models::registry::missing_fields("image", &was).is_empty(), "whole");
+        let moss = model_entry_mut(&mut cfg, "image", "moss").unwrap();
+        crate::util::set(moss, "text_encoder", Json::str("C:/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"));
+        crate::util::set(moss, "enabled", Json::Bool(true));
+        keep_set_parts(&mut cfg, "image", "moss", &was);
+        assert!(!crate::util::bool_or(model_entry(&cfg, "image", "moss").unwrap(), "enabled", true), "still off");
+        let mut cfg = Json::parse(br#"{"media":{"image":{"models":{"moss":{"architecture":"moss-image","transformer":"D:/mine/moss.gguf","text_encoder":"D:/mine/encoder-q8.gguf","vae":"","enabled":false}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "image", "moss").cloned().unwrap();
+        assert!(!crate::models::registry::missing_fields("image", &was).is_empty(), "missing its VAE");
+        let moss = model_entry_mut(&mut cfg, "image", "moss").unwrap();
+        crate::util::set(moss, "vae", Json::str("C:/models/MOSS-Image-SFT-parts/vae/diffusion_pytorch_model.safetensors"));
+        crate::util::set(moss, "enabled", Json::Bool(true));
+        keep_set_parts(&mut cfg, "image", "moss", &was);
+        assert!(crate::util::bool_or(model_entry(&cfg, "image", "moss").unwrap(), "enabled", false), "completed: on");
+        // Whole, switched off, with an optional part empty: filling that part leaves it off.
+        let mut cfg = Json::parse(br#"{"media":{"image":{"models":{"qi":{"base":"D:/qi/base","transformer":"D:/qi/t.gguf","text_encoder":"D:/qi/te.gguf","vae":"D:/qi/vae.safetensors","vision":"","enabled":false}}}}}"#).unwrap();
+        let was = model_entry(&cfg, "image", "qi").cloned().unwrap();
+        assert!(crate::models::registry::missing_fields("image", &was).is_empty(), "nothing it needs is missing");
+        let qi = model_entry_mut(&mut cfg, "image", "qi").unwrap();
+        crate::util::set(qi, "vision", Json::str("C:/models/Qwen-Image/mmproj.gguf"));
+        crate::util::set(qi, "enabled", Json::Bool(true));
+        keep_set_parts(&mut cfg, "image", "qi", &was);
+        let qi = model_entry(&cfg, "image", "qi").unwrap();
+        assert!(!crate::util::bool_or(qi, "enabled", true) && str_or(qi, "vision", "").ends_with("mmproj.gguf"), "filled, and still off");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Discard takes away what downloads of a model put in place, in every session (listed, written down, or in its
+    /// markers' `placed`), and not a file of it that was there before it was downloaded (in `files`, not `placed`).
+    #[test]
+    fn a_discard_takes_what_every_session_put_in_place_and_not_what_was_there_before() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-placed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        let folder = dir.join("Qwen3.5-9B-GGUF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (before, readme, notes) = (folder.join("Qwen3.5-9B-Q4_K_M.gguf"), folder.join("README.md"), folder.join("notes.txt"));
+        for f in [&before, &readme, &notes] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        // Downloaded whole once (the GGUF was here before), then a file of it went: partly there. Not in the settings.
+        std::fs::write(
+            folder.join(".oaiy-qwen3.5-9b.json"),
+            br#"{"id":"qwen3.5-9b","files":["Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf","Qwen3.5-9B-GGUF/README.md","Qwen3.5-9B-GGUF/notes.txt","Qwen3.5-9B-GGUF/gone.bin"],"placed":["Qwen3.5-9B-GGUF/README.md","Qwen3.5-9B-GGUF/notes.txt","Qwen3.5-9B-GGUF/gone.bin"]}"#,
+        )
+        .unwrap();
+        let studio = Studio::for_test(&root, crate::config::default_json());
+        // After a restart, resumed: this session fetched notes.txt again and was paused before gone.bin.
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "paused", fetched: vec![notes.clone()], ..Download::new("qwen3.5-9b", &dir, None) });
+        d.keep_fetched("qwen3.5-9b", &dir);
+        d.cancel(&studio, "qwen3.5-9b", None).unwrap();
+        assert!(!readme.exists() && !notes.exists(), "what any download of it put there goes, not only this session's");
+        assert!(before.exists(), "what was here before it was downloaded stays");
+        assert!(!folder.join(".oaiy-qwen3.5-9b.json").exists() && !fetched_record(&dir, "qwen3.5-9b").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The record of what a download fetched is added to, not replaced: one resumed after a restart lists only what the
+    /// new session fetched.
+    #[test]
+    fn what_a_download_fetched_is_written_down_across_sessions() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, second) = (dir.join("m/a.bin"), dir.join("m/b.bin"));
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "paused", fetched: vec![first.clone()], ..Download::new("m", &dir, None) });
+        d.keep_fetched("m", &dir);
+        let after = Downloads::new();
+        after.list.lock().unwrap().push(Download { status: "downloading", fetched: vec![second.clone()], ..Download::new("m", &dir, None) });
+        after.keep_fetched("m", &dir);
+        assert_eq!(read_fetched(&dir, "m"), vec![first, second]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A finished download's marker lists every file of the model, and apart, the ones it put in place: not one that was
+    /// here already.
+    #[test]
+    fn a_marker_says_what_the_download_put_in_place() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("models");
+        std::fs::create_dir_all(dir.join("two")).unwrap();
+        let body: Vec<u8> = (0..2048u32).map(|i| (i % 241) as u8).collect();
+        let mut h = sha256::Sha256::new();
+        h.update(&body);
+        // here already, as large as it should be
+        std::fs::write(dir.join("two/before.bin"), &body).unwrap();
+        let (url, asked) = serve(body.clone());
+        let studio = Arc::new(Studio::for_test(&root, crate::config::default_json()));
+        let d = Downloads::new();
+        d.list.lock().unwrap().push(Download { status: "downloading", ..Download::new("two", &dir, None) });
+        let sha = h.hex();
+        let part = |file: &str| format!(r#"{{"url":"{url}","file":"{file}","size":{},"sha256":"{sha}","into":"two"}}"#, body.len());
+        let e = Json::parse(format!(r#"{{"id":"two","parts":[{},{}]}}"#, part("before.bin"), part("fetched.bin")).as_bytes()).unwrap();
+        assert_eq!(d.fetch(&studio, &e, &dir).unwrap(), Want::Run);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "only the file not here was fetched");
+        let marker = Json::parse(&std::fs::read(dir.join("two/.oaiy-two.json")).unwrap()).unwrap();
+        let names = |key: &str| marker.get(key).and_then(Json::as_array).unwrap().iter().filter_map(Json::as_str).map(|s| s.replace('\\', "/")).collect::<Vec<_>>();
+        assert_eq!(names("files"), ["two/before.bin", "two/fetched.bin"]);
+        assert_eq!(names("placed"), ["two/fetched.bin"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
