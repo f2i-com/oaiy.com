@@ -181,10 +181,12 @@ fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> 
     let field = if d.kind() == "speech_design" { "design" } else { "base" };
     let value = field_of(d, field).ok_or("detected part has no path")?;
     let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "speech", "models"]) else { return Err("no speech section".into()) };
+    // (a Breeze TTS 2 model lacks both halves, and is not one of them: the half went into it, Breeze answered for it,
+    // and Qwen3-TTS was in effect never added)
     let chosen = models
         .iter()
         .position(|(n, _)| target.is_some_and(|(_, t)| n == t))
-        .or_else(|| models.iter().position(|(_, m)| str_or(m, field, "").trim().is_empty()));
+        .or_else(|| models.iter().position(|(_, m)| str_or(m, field, "").trim().is_empty() && str_or(m, "breeze", "").trim().is_empty()));
     let name = match chosen {
         Some(i) => {
             set(&mut models[i].1, field, value);
@@ -1322,12 +1324,17 @@ mod tests {
         };
         let (design, base) = (make("Qwen3-TTS-VoiceDesign", "voice_design"), make("Qwen3-TTS-Base", "base"));
         let mut cfg = config::default_json();
+        // (a Breeze TTS 2 model there already is not completed with a Qwen3-TTS half)
+        let breeze = Json::parse(br#"{"breeze-tts-2":{"breeze":"D:/models/Breeze-TTS-2","enabled":true}}"#).unwrap();
+        set(obj_mut(&mut cfg, &["media", "speech"]).unwrap(), "models", breeze);
         let (a, _) = add(&mut cfg, &design, None, None).unwrap();
         assert_eq!((a.section, a.name.as_str()), ("speech", "qwen3-tts"));
         let (b, _) = add(&mut cfg, &base, None, None).unwrap();
         assert_eq!(b.name, "qwen3-tts", "the Base half completes the same model");
         let m = get(&cfg, &["media", "speech", "models", "qwen3-tts"]).unwrap();
         assert!(str_or(m, "design", "").ends_with("Qwen3-TTS-VoiceDesign") && str_or(m, "base", "").ends_with("Qwen3-TTS-Base"));
+        let b2 = get(&cfg, &["media", "speech", "models", "breeze-tts-2"]).unwrap();
+        assert!(str_or(b2, "design", "").is_empty() && str_or(b2, "base", "").is_empty(), "Breeze left as it was");
         assert_eq!(get(&cfg, &["media", "speech", "default_model"]).and_then(Json::as_str), Some("qwen3-tts"));
         let routes = get(&cfg, &["gateway", "routes"]).unwrap().as_array().unwrap();
         assert!(["speech", "voices"].iter().all(|t| routes.iter().any(|r| str_or(r, "target", "") == *t)));

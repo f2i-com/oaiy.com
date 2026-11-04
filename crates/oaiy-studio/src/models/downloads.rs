@@ -473,6 +473,25 @@ fn marker_placed(dir: &Path, id: &str) -> Vec<PathBuf> {
     placed
 }
 
+/// Whether `p`, a file or folder a model adds, is there: a folder only with a file in it that is not a marker or a
+/// partial file. One a Discard emptied, but for markers kept beside a file another model uses elsewhere, is not the
+/// model, and kept its markers, and so itself, for good.
+fn there(p: &Path) -> bool {
+    fn any_file(dir: &Path, depth: usize) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    return depth > 0 && any_file(&path, depth - 1);
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                !name.starts_with(".oaiy-") && !name.ends_with(".part")
+            })
+        })
+    }
+    if p.is_dir() { any_file(p, 4) } else { p.exists() }
+}
+
 /// Said when a Discard kept the markers of a model whose files another model of the settings uses.
 const KEPT_FOR_ANOTHER: &str = "another model in your settings uses its files, so they are kept and it is still partly there: Resume to fetch what is missing, or remove that model under Models first";
 
@@ -1015,7 +1034,7 @@ impl Downloads {
         // model whose own first file went is no longer there, whatever another model keeps beside it)
         let reads_whole = entry(id).is_some_and(|e| {
             let adds = strings(e.get("add"));
-            !adds.is_empty() && adds.iter().all(|rel| under(dir, rel).is_ok_and(|p| p.exists()))
+            !adds.is_empty() && adds.iter().all(|rel| under(dir, rel).is_ok_and(|p| there(&p)))
         });
         let keep_markers = !held.is_empty() && reads_whole && listed.iter().any(|f| !f.exists());
         if let Some(e) = entry(id) {
@@ -1735,9 +1754,14 @@ fn named_in_settings(studio: &Studio, group: Option<&str>) -> Vec<PathBuf> {
     named.into_iter().map(|n| config::resolve(&studio.root, &n)).filter(|p| p.components().count() > 1).collect()
 }
 
-/// Whether the settings have the model `e` itself, downloaded into `dir` (`in_models` in its own group's section).
+/// Whether the settings have the model `e` itself, downloaded into `dir`: the model of its own section whose own file or
+/// folder is its first (`model_naming`); the picture tools and the age check, named by key, as `in_models` finds them.
 fn configured_here(studio: &Studio, e: &Json, dir: &Path) -> bool {
-    in_models(e, dir, &named_in_settings(studio, Some(str_or(e, "group", ""))))
+    let group = str_or(e, "group", "");
+    match group {
+        "picture" | "check" => in_models(e, dir, &named_in_settings(studio, Some(group))),
+        _ => strings(e.get("add")).first().and_then(|rel| under(dir, rel).ok()).is_some_and(|at| model_naming(&studio.config(), group, &at, &studio.root).is_some()),
+    }
 }
 
 /// The model of the settings' section for `group` that names `path` (it, or a folder it is in, or a file in it): its
@@ -1745,16 +1769,36 @@ fn configured_here(studio: &Studio, e: &Json, dir: &Path) -> bool {
 /// named by key and set again in place, not added as a second.
 fn model_naming(cfg: &Json, group: &str, path: &Path, root: &Path) -> Option<(String, String, Vec<PathBuf>)> {
     let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let resolve = |named: Vec<String>| named.into_iter().map(|n| config::resolve(root, &n)).filter(|p| p.components().count() > 1).collect::<Vec<_>>();
     let paths_of = |m: &Json| {
         let mut named = Vec::new();
         library::paths_named(m, &mut named);
-        named.into_iter().map(|n| config::resolve(root, &n)).filter(|p| p.components().count() > 1).collect::<Vec<_>>()
+        resolve(named)
     };
-    let naming = |m: &Json| Some(paths_of(m)).filter(|paths| paths.iter().any(|p| overlap(p, path)));
+    // (the model is the one whose own file or folder it is: not one that borrows a part from its folder, as an LTX-2.5
+    // fine-tune added by hand is lent LTX-2.5's text encoder and VAE, which was taken for LTX-2.5 itself)
+    let naming = |m: &Json| Some(paths_of(m)).filter(|_| resolve(main_paths(group, m)).iter().any(|p| overlap(p, path)));
     match group {
         "picture" | "check" | "" => None,
         "llm" => cfg.get("llm")?.get("models")?.as_array()?.iter().find_map(|m| naming(m).map(|paths| ("llm".to_string(), str_or(m, "name", "").to_string(), paths))),
         section => cfg.get("media")?.get(section)?.get("models")?.as_object()?.iter().find_map(|(name, m)| naming(m).map(|paths| (section.to_string(), name.clone(), paths))),
+    }
+}
+
+/// A settings model's own file or folder, as against the parts it uses (which may be lent from another model): a
+/// language model's `path`; an image model's transformer or checkpoint, or its `base` when it is a whole pipeline with
+/// none; a video model's transformer; a speech model's voices; a music, sound or 3D model's `path`.
+fn main_paths(section: &str, m: &Json) -> Vec<String> {
+    let set = |k: &str| Some(str_or(m, k, "").trim().to_string()).filter(|v| !v.is_empty());
+    let any = |keys: &[&str]| keys.iter().filter_map(|k| set(k)).collect::<Vec<_>>();
+    match section {
+        "image" => {
+            let own = any(&["transformer", "safetensors_transformer", "checkpoint"]);
+            if own.is_empty() { any(&["base"]) } else { own }
+        }
+        "video" => any(&["transformer"]),
+        "speech" => any(&["design", "base", "breeze"]),
+        _ => any(&["path"]),
     }
 }
 
@@ -2689,6 +2733,21 @@ mod tests {
         assert_eq!(cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap().len(), 1, "no qwen3.5-9b-2");
         assert_eq!(model_naming(&cfg, "llm", &gguf, &root).map(|(s, n, _)| (s, n)), Some(("llm".to_string(), "mine".to_string())));
         assert!(model_naming(&cfg, "image", &gguf, &root).is_none(), "another section's model is not this one");
+        // A model that borrows a part from the folder (a fine-tune lent LTX-2.5's text encoder) is not the model itself;
+        // the one whose transformer is in it is.
+        let ltx = root.join("models/LTX-2.5");
+        let mut video = Json::parse(format!(r#"{{"media":{{"video":{{"models":{{"tune":{{"transformer":"D:/mine/tune.safetensors","text_encoder":"{}"}}}}}}}}}}"#, ltx.join("text_encoder").display().to_string().replace('\\', "\\\\")).as_bytes()).unwrap();
+        assert!(model_naming(&video, "video", &ltx, &root).is_none(), "a borrower is not LTX-2.5");
+        crate::util::set(model_entry_mut(&mut video, "video", "tune").unwrap(), "transformer", Json::str(ltx.join("transformer/model.safetensors").to_string_lossy()));
+        assert_eq!(model_naming(&video, "video", &ltx, &root).map(|(_, n, _)| n), Some("tune".to_string()), "its own transformer in the folder: it");
+        // A folder emptied but for markers and partial files is not the model there.
+        let emptied = root.join("models/Emptied/sub");
+        std::fs::create_dir_all(&emptied).unwrap();
+        std::fs::write(emptied.join(".oaiy-x.json"), b"{}").unwrap();
+        std::fs::write(emptied.join("weights.safetensors.part"), b"half").unwrap();
+        assert!(!there(&root.join("models/Emptied")));
+        std::fs::write(emptied.join("config.json"), b"{}").unwrap();
+        assert!(there(&root.join("models/Emptied")));
 
         // Completed, a part the person set is kept: the catalog's text encoder is not written over their own.
         let mut cfg = Json::parse(br#"{"media":{"image":{"models":{"moss":{"architecture":"moss-image","text_encoder":"D:/mine/encoder-q8.gguf","vae":""}}}}}"#).unwrap();
