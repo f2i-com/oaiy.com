@@ -869,8 +869,27 @@ impl AiTunnel {
     /// answer: no account, or no Codex; a status slow to come, or an error of Codex's own, lets the turn go on, as
     /// before this was asked. Asked for an age check alone: other turns go to ChatGPT as they did.
     async fn codex_can_answer(&self) -> Result<(), TunnelError> {
+        // (asked once at a time: a Codex that hangs held one more thread for each turn that asked, each waiting on the
+        // session's lock behind the one before, and the answers behind them all; while one asks, the turn goes on)
+        static ASKING: AtomicBool = AtomicBool::new(false);
+        if ASKING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Ok(());
+        }
         let codex = self.sources.codex.clone();
-        let status = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || codex.status())).await;
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                struct Done;
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        ASKING.store(false, Ordering::Release);
+                    }
+                }
+                let _done = Done;
+                codex.status()
+            }),
+        )
+        .await;
         match status {
             Ok(Ok(status)) if !status.available => Err(TunnelError::new("provider_unavailable", "ChatGPT (Codex) is not available on this computer")),
             Ok(Ok(status)) if !status.connected && status.detail.is_none() => {
