@@ -1,4 +1,4 @@
-// Copied by scripts/generate-softn-knowledge.mjs from softn.com (apps/softn-api/data/apps/*/v1.softn at 0fef7fa6ff3f),
+// Copied by scripts/generate-softn-knowledge.mjs from softn.com (apps/softn-api/data/apps/*/v1.softn at 8092359d6d06),
 // Copyright f2i-com, Apache License 2.0. Do not edit by hand.
 
 export interface SoftnExample { slug: string; name: string; description: string; tags: string[]; files: string[]; /** The .softn, base64. */ softn: string }
