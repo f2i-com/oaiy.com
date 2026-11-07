@@ -1099,6 +1099,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2 data-jump="Sound effects">Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="3D">3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
       <div class="block"><div class="spread"><h2 data-jump="Picture tools">Picture tools</h2><span class="muted small">Served on /v1/images/background_removal and /v1/images/upscale</span></div><div class="list" id="m-picture"></div></div>
+      <div class="block"><div class="spread"><h2 data-jump="Age check">Age check</h2><span class="muted small">Asked by a FormLogic site's age gate through this computer's link</span></div><div class="list" id="m-faceage"></div></div>
     </section>
 
     <!-- Get models -->
@@ -1711,7 +1712,8 @@ const kindName = {llm: "Language model", image: "Image model", video: "Video mod
   flux2_vae: "FLUX.2 VAE", flux3_text_encoder: "FLUX 3 text encoder (Qwen3-VL)", flux3_lora: "FLUX 3 LoRA", klein_text_encoder: "FLUX.2 Klein text encoder",
   klein_tokenizer: "FLUX.2 Klein tokenizer", klein_lora: "FLUX.2 Klein LoRA", moss_text_encoder: "MOSS-Image text encoder (Qwen3.5-9B)", moss_tokenizer: "MOSS-Image tokenizer",
   moss_vae: "MOSS-Image VAE", moss_distill: "MOSS-Image distillation", music_lm: "Music model's language model", music_model: "Music model",
-  speech_design: "Speech model (its VoiceDesign half)", speech_base: "Speech model (its Base half)"};
+  speech_design: "Speech model (its VoiceDesign half)", speech_base: "Speech model (its Base half)",
+  faceage_model: "Age check: MiVOLO v2 (reads the age)", faceage_detector: "Age check: YuNet (finds the faces)"};
 // (kinds the Check calls a part, which are a model of their own when added: a new one, or the half one lacks)
 const NEW_MODEL = {speech_design: "speech", speech_base: "speech", speech_breeze: "speech", music_model: "music", sound_model: "sound effect", model3d: "3D"};
 async function detectPath() {
@@ -1720,7 +1722,7 @@ async function detectPath() {
   try {
     const d = await api("/api/detect", {method: "POST", body: {path}});
     const made = NEW_MODEL[d.kind];
-    const where = made ? `Adds a ${made} model (or completes one that lacks it)` : d.section === "component" ? "Attaches to the model that needs it" : `Adds to ${d.section === "llm" ? "chat" : d.section + "s"}`;
+    const where = made ? `Adds a ${made} model (or completes one that lacks it)` : /^faceage_/.test(d.kind) ? "Used by the age check (under Models, Age check)" : d.section === "component" ? "Attaches to the model that needs it" : `Adds to ${d.section === "llm" ? "chat" : d.section + "s"}`;
     out.innerHTML = `<div class="detected ${d.section}"><strong>${esc(kindName[d.kind] || d.kind)}</strong><span>${esc(d.summary)}</span>
       <span class="muted small">${where}${d.missing.length ? ". It also needs: " + d.missing.map(esc).join(", ") + " (found automatically when possible)" : ""}</span>
       <div class="row" style="margin-top:6px"><input type="text" id="add-name" placeholder="Name (optional)" aria-label="Name (optional)" style="max-width:240px" ${d.section === "component" && !made ? "hidden" : ""}><button class="btn go" id="add-go">Add ${d.section === "component" && !made ? "part" : "model"}</button></div></div>`;
@@ -1730,7 +1732,8 @@ async function detectPath() {
 async function addModel(path, name, target) {
   try {
     const r = await api("/api/models/add", {method: "POST", body: Object.assign({path, name: name || undefined}, target || {})});
-    toast(`${r.enabled ? "Added" : "Added (incomplete)"} ${r.name} to ${r.section === "llm" ? "language models" : r.section === "model3d" ? "3D models" : r.section + " models"}` + (r.missing.length ? `. Still needs ${r.missing.join(", ")}` : ""));
+    toast(r.section === "faceage" ? `Added to the age check` + (r.missing.length ? `. It still needs its ${r.missing.map(k => k === "model" ? "age model (MiVOLO v2)" : "face finder (YuNet)").join(" and ")}` : "")
+      : `${r.enabled ? "Added" : "Added (incomplete)"} ${r.name} to ${r.section === "llm" ? "language models" : r.section === "model3d" ? "3D models" : r.section + " models"}` + (r.missing.length ? `. Still needs ${r.missing.join(", ")}` : ""));
     $("#add-result").innerHTML = ""; $("#add-path").value = "";
     await loadConfig();
   } catch (e) { toast(e.message, true); }
@@ -1770,6 +1773,8 @@ function modelObj(section, name) {
   if (section === "llm") return cfg.llm.models.find(m => m.name === name);
   // (the picture tools are one of each, under their section itself: background removal and upscaling)
   if (section === "picture") return cfg.media.picture ??= {enabled: true, background: "", upscaler: ""};
+  // (the age check is one too, under its section: its age model and its face finder)
+  if (section === "faceage") return cfg.media.faceage ??= {enabled: true, model: "", detector: ""};
   return cfg.media[section].models[name];
 }
 // The picture tools (Get models' BiRefNet and Real-ESRGAN, or the person's own): each a path, changed, cleared, or
@@ -1779,6 +1784,24 @@ function renderPictureTools() {
   const tools = [["background", "Background removal (BiRefNet: its folder)", true], ["upscaler", "Upscaling (Real-ESRGAN: its .pth or folder)", false]];
   $("#m-picture").innerHTML = `<div class="item"><div class="cols" style="gap:12px">${tools.map(([key, label, dir]) => `<div class="pathfield-row">${field(label, "picture", "tools", key, p[key], {dir})}${p[key] ? `<button class="btn quiet warn" type="button" data-ptool-clear="${key}">Remove</button>` : ""}</div>`).join("")}</div></div>`;
   $$("[data-ptool-clear]").forEach(b => b.onclick = () => { cfg.media.picture[b.dataset.ptoolClear] = ""; renderModels(); touch(); });
+}
+// The age check (Get models' MiVOLO v2 and YuNet): what a FormLogic site's age gate asks this computer, through its
+// link, of the pictures its camera took. Its two files, changed or cleared as the picture tools' are, and Enabled:
+// switched off, or without both files, it answers that it is not set up and reads no face. Remove takes it out of the
+// settings; its files stay on disk, as a removed model's do. (Until it was here, the settings file was the only way
+// to stop it, and Get models refused to discard it because the age check used it.)
+function renderFaceAge() {
+  const f = cfg.media.faceage || {};
+  const parts = [["model", "Age model (MiVOLO v2: its model.safetensors)"], ["detector", "Face finder (YuNet: its .onnx)"]];
+  const miss = parts.filter(([k]) => !(f[k] || "").trim()).map(([k]) => k);
+  const set = parts.some(([k]) => (f[k] || "").trim());
+  $("#m-faceage").innerHTML = set ? `<div class="item"><div class="item-head"><strong>Age check</strong>
+      ${miss.length ? `<span class="tag bad">Needs its ${miss.map(k => k === "model" ? "age model" : "face finder").join(" and ")}</span>` : ""}
+      <span class="item-acts"><label class="check"><input type="checkbox" data-menable="faceage|check" ${f.enabled !== false ? "checked" : ""}> Enabled</label>
+      <button class="btn quiet warn" type="button" data-faceage-remove>Remove</button></span></div>
+      <div class="cols" style="gap:12px">${parts.map(([key, label]) => field(label, "faceage", "check", key, f[key], {missing: miss.includes(key)})).join("")}</div></div>`
+    : '<div class="empty">No age check. Get models has it, under Age check.</div>';
+  $$("[data-faceage-remove]").forEach(b => b.onclick = () => { Object.assign(modelObj("faceage", "check"), {model: "", detector: ""}); renderModels(); touch(); });
 }
 function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
@@ -1937,11 +1960,12 @@ function renderModels() {
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
 
   renderPictureTools();
+  renderFaceAge();
   watchOpenItems();
   pathEnds($("#v-models"));
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
-    pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" || s === "picture" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && s !== "picture" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
+    pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const own = s === "llm" || s === "picture" || s === "faceage"; const miss = own ? [] : missingOf(s, modelObj(s, n)); if (!own && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
   $$("[data-mgpu]").forEach(el => el.onchange = () => {
     const [name] = el.dataset.mgpu.split("|"), m = modelObj("llm", name);
     const picked = $$("[data-mgpu]").filter(i => i.checked && i.dataset.mgpu.split("|")[0] === name).map(i => +i.dataset.mgpu.split("|")[1]);
@@ -2019,6 +2043,11 @@ function filterModels() {
   if (pic) {
     const hay = ["picture tools background removal upscaling upscaler birefnet real-esrgan", tools.background, tools.upscaler].join(" ").toLowerCase();
     pic.closest(".block").hidden = words.length > 0 && !words.every(w => hay.includes(w));
+  }
+  const age = $("#m-faceage"), check = cfg.media?.faceage || {};
+  if (age) {
+    const hay = ["age check faceage face mivolo yunet", check.model, check.detector, check.enabled === false ? "off" : ""].join(" ").toLowerCase();
+    age.closest(".block").hidden = words.length > 0 && !words.every(w => hay.includes(w));
   }
   $("#model-search-count").textContent = !words.length ? "" : shown ? `${shown} of ${total} model${total === 1 ? "" : "s"} · Enter goes to the first` : "No model matches";
   if ($("#v-models").classList.contains("on")) renderJump("models");

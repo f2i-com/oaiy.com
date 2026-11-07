@@ -136,7 +136,9 @@ async fn run_within(files: &Files, pictures: Vec<String>, limit: Duration) -> Re
     if request.len() > MAX_REQUEST {
         return Err(format!("the pictures come to more than the {} MiB the media engine reads in one check", MAX_REQUEST >> 20));
     }
-    let mut std_cmd = std::process::Command::new(&files.worker);
+    // (with the computer's environment, as the studio starts this same engine: from an AppImage it inherited the
+    // AppImage's library paths and a working folder inside it)
+    let mut std_cmd = oaiy_host_env::command(&files.worker);
     std_cmd.arg("--stdin").pipe_hidden();
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);

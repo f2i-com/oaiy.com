@@ -899,9 +899,9 @@ impl Downloads {
     pub fn cancel(&self, studio: &Studio, id: &str, dir: Option<PathBuf>) -> Result<Json, String> {
         // (being added to the models: its files are the model's now, not a download's to take away)
         let listed = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).map(|d| (d.status, d.dir.clone()));
-        // (the age check is no model of the Models page: it is the age check's, and there is no removing it there)
+        // (the age check is under Models too, as one item of its own: its files are taken out of the settings there)
         let check = entry(id).is_some_and(|e| str_or(e, "group", "") == "check");
-        let downloaded = if check { "it is downloaded, and the age check uses it" } else { "it is downloaded: remove it under Models" };
+        let downloaded = if check { "it is downloaded: remove it under Models, Age check" } else { "it is downloaded: remove it under Models" };
         match &listed {
             Some(("adding", _)) => return Err("it is being added to your models now: remove it under Models once it is there".into()),
             // (downloaded whole: its files are a model's, in the settings or to be added again, not a download's to
