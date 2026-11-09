@@ -322,7 +322,8 @@ It redeems the code (`POST /api/oauth/oaiy-link`, the descriptor's `auth.linkCod
 start. A link made "AI only" (`connector:relay`) does not ask for the flow-run queue, the script
 prelude or the sealed flows, which need `flows:read` (the descriptor's `queueScope`, `scope`), and
 takes a storage-node enrolment refused `insufficient_scope` as one not offered: no error, and no
-record to read back.
+record to read back. Its command lane, answered `403 insufficient_scope` or `ai_only_link`, rests
+until the link changes; a 401, or a 403 saying anything else, is still a key to link again.
 
 Configuration is by environment variable (no pointer file):
 

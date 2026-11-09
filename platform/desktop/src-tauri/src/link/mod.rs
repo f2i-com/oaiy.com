@@ -703,6 +703,12 @@ impl LinkStore {
     pub(crate) fn drop_account_for_tests(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).account = None;
     }
+
+    /// Link the store to `account` in place, as a new link would: for the tests of what a lane does when the link
+    /// changes under it.
+    pub(crate) fn set_account_for_tests(&self, account: LinkedAccount) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).account = Some(account);
+    }
 }
 
 /// A store holding `account`, for the tests of a lane's loop: it needs a link to

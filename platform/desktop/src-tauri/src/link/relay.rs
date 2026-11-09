@@ -80,13 +80,21 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
 /// test that starts the loop gives it a client of its own, so that the connections
 /// of the other tests that use the lane's are not the loop's to close.
 fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
+    // The link the provider said is not granted this lane (`Refused::NotGranted`): not asked again
+    // while it is the link, and asked at once when the link changes.
+    let mut parked: Option<LinkedAccount> = None;
     std::thread::spawn(move || loop {
         let Some(account) = store.account() else {
             // Not linked. Sleep rather than spin; a link is a human action and
             // will not appear in the next millisecond.
+            parked = None;
             std::thread::sleep(Duration::from_secs(5));
             continue;
         };
+        if parked.as_ref() == Some(&account) {
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
         let Some(spec) = descriptor::find(store.data_dir(), &account.connector_id)
             .and_then(|d| d.relay)
             // (a link not granted the lane's scope has no commands to take here)
@@ -119,7 +127,15 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
                     std::thread::sleep(pause);
                 }
             }
-            Err(e) => {
+            // Not this link's lane at all (one made for AI alone): nothing wrong to show, and
+            // nothing to ask for again until the link is another.
+            Err(Refused::NotGranted(why)) => {
+                log::info!("relay: the provider routes no commands to this link ({why}); not asked again while it is linked so");
+                store.note_relay(None);
+                lane.start_afresh();
+                parked = Some(account);
+            }
+            Err(Refused::Trouble(e)) => {
                 store.note_relay(Some(e));
                 // The try after a failure is on a new client, not one that has
                 // seen the trouble.
@@ -130,6 +146,35 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
             }
         }
     });
+}
+
+/// Why a poll did no work.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// The provider gives this link no commands at all: a 403 saying `insufficient_scope` (RFC 6750's word for a key
+    /// not granted what it asked) or `ai_only_link` (FormLogic's, for a link made for AI alone), to the poll or a
+    /// claim. Not trouble, and no use asking again while the link is the same.
+    NotGranted(String),
+    /// Anything else, shown on the panel and tried again after the lane's back-off. A 401, or a 403 saying anything
+    /// else, is a key the provider no longer takes.
+    Trouble(String),
+}
+
+impl From<String> for Refused {
+    fn from(e: String) -> Self {
+        Refused::Trouble(e)
+    }
+}
+
+/// Whether a refusal is the provider saying this link is not granted the lane ([`Refused::NotGranted`]): its code as
+/// FormLogic writes one (`{error: true, code}`) or as OAuth does (`{error: "<code>"}`).
+fn not_granted(status: u16, body: &Value) -> bool {
+    status == 403
+        && [body.get("code"), body.get("error")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|code| matches!(code, "insufficient_scope" | "ai_only_link"))
 }
 
 /// A lane's client, and the connections it keeps.
@@ -155,7 +200,7 @@ fn poll_once(
     spec: &RelaySpec,
     instance: &str,
     dispatch: &Dispatcher,
-) -> Result<(usize, Option<String>), String> {
+) -> Result<(usize, Option<String>), Refused> {
     poll_on(&HTTP, account, spec, instance, dispatch)
 }
 
@@ -163,14 +208,15 @@ fn poll_once(
 ///
 /// Returns how many commands were handled, and the first that could not be
 /// served at all — the claim or the report failing, not the work failing, which
-/// is answered rather than swallowed.
+/// is answered rather than swallowed. A provider that gives this link no
+/// commands (to the poll or a claim) is [`Refused::NotGranted`].
 fn poll_on(
     lane: &Lane,
     account: &LinkedAccount,
     spec: &RelaySpec,
     instance: &str,
     dispatch: &Dispatcher,
-) -> Result<(usize, Option<String>), String> {
+) -> Result<(usize, Option<String>), Refused> {
     let wait_ms = spec.wait_seconds * 1000;
     let url = format!(
         "{}?wait={}&limit={}&instanceId={}",
@@ -207,12 +253,15 @@ fn poll_on(
             .or_else(|| body.get("error"))
             .and_then(|v| v.as_str())
             .unwrap_or("the relay refused the poll");
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(format!(
-                "the provider no longer accepts this desktop's key ({message}) — link again"
-            ));
+        if not_granted(status.as_u16(), &body) {
+            return Err(Refused::NotGranted(message.to_string()));
         }
-        return Err(format!("HTTP {}: {message}", status.as_u16()));
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(Refused::Trouble(format!(
+                "the provider no longer accepts this desktop's key ({message}) — link again"
+            )));
+        }
+        return Err(Refused::Trouble(format!("HTTP {}: {message}", status.as_u16())));
     }
 
     let reply: PendingReply = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
@@ -223,12 +272,17 @@ fn poll_on(
     for command in reply.commands {
         // One failure must not abandon the rest of the batch: they are
         // independent actions a user is waiting on.
-        if let Err(e) = serve(lane, account, spec, instance, dispatch, &command) {
-            log::warn!("relay command {} could not be served: {e}", command.id);
-            // Kept, not just logged. This is the failure that looks like
-            // nothing: the poll succeeded so the lane appears healthy, while
-            // every command the user issues expires unanswered.
-            trouble.get_or_insert(e);
+        match serve(lane, account, spec, instance, dispatch, &command) {
+            Ok(()) => {}
+            // (no claim of this link's will be taken, so the rest of the batch is not asked for either)
+            Err(Refused::NotGranted(why)) => return Err(Refused::NotGranted(why)),
+            Err(Refused::Trouble(e)) => {
+                log::warn!("relay command {} could not be served: {e}", command.id);
+                // Kept, not just logged. This is the failure that looks like
+                // nothing: the poll succeeded so the lane appears healthy, while
+                // every command the user issues expires unanswered.
+                trouble.get_or_insert(e);
+            }
         }
         handled += 1;
     }
@@ -243,7 +297,7 @@ fn serve(
     instance: &str,
     dispatch: &Dispatcher,
     command: &Command,
-) -> Result<(), String> {
+) -> Result<(), Refused> {
     let http = lane.get()?;
     let body = serde_json::json!({ "instanceId": instance });
 
@@ -262,19 +316,25 @@ fn serve(
         .json(&body)
         .send()
         .map_err(|e| format!("could not claim: {e}"))?;
-    // Only the status is wanted; the rest is read out so the connection can
-    // carry the report.
+    // Only the status is wanted (and a refusal's code); the rest is read out so
+    // the connection can carry the report.
     let claim_status = claimed.status();
-    super::net::drain(claimed);
     if !claim_status.is_success() {
+        let body: Value = super::net::read_json(claimed).unwrap_or(Value::Null);
+        // A link the provider gives no commands (one made for AI alone).
+        if not_granted(claim_status.as_u16(), &body) {
+            let why = body.get("message").and_then(Value::as_str).unwrap_or("this link takes no commands");
+            return Err(Refused::NotGranted(why.to_string()));
+        }
         // 409 is the ordinary "someone else got it" and not worth reporting as
         // an error anywhere a user would see.
         return if claim_status.as_u16() == 409 {
             Ok(())
         } else {
-            Err(format!("claim refused: HTTP {}", claim_status.as_u16()))
+            Err(Refused::Trouble(format!("claim refused: HTTP {}", claim_status.as_u16())))
         };
     }
+    super::net::drain(claimed);
 
     let outcome = dispatch(
         command.connector_id.as_deref().unwrap_or("desktop"),
@@ -336,14 +396,14 @@ fn serve(
                 }
                 // Refused outright: another try says the same.
                 if status.is_client_error() {
-                    return Err(format!("the relay refused the outcome: HTTP {}", status.as_u16()));
+                    return Err(Refused::Trouble(format!("the relay refused the outcome: HTTP {}", status.as_u16())));
                 }
                 last = format!("the relay refused the outcome: HTTP {}", status.as_u16());
             }
             Err(e) => last = format!("could not report the outcome: {}", super::net::unreachable(&e)),
         }
     }
-    Err(last)
+    Err(Refused::Trouble(last))
 }
 
 fn urlencode(value: &str) -> String {
@@ -932,6 +992,94 @@ mod tests {
         assert!(seen.iter().any(|(line, conn)| line.ends_with("/claim") && *conn == 0), "{seen:?}");
     }
 
+    /// FormLogic answers a link made for AI alone `403 insufficient_scope` to its poll (and `ai_only_link` to a
+    /// claim): not a key it no longer takes, and nothing to show as wrong.
+    #[test]
+    fn a_provider_that_gives_this_link_no_commands_is_not_trouble() {
+        for (code, message) in [
+            ("insufficient_scope", "This computer is linked for AI only: it takes no connector or plugin commands."),
+            ("ai_only_link", "This computer is linked for AI only."),
+        ] {
+            let body = serde_json::json!({ "error": true, "code": code, "message": message }).to_string();
+            let server = Provider::start(move |_| Reply::status(403, &body));
+            let refused = poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap_err();
+            assert_eq!(refused, Refused::NotGranted(message.into()), "{code}");
+        }
+        // The OAuth shape of the same refusal.
+        let server = Provider::start(|_| Reply::status(403, r#"{"error":"insufficient_scope","error_description":"no"}"#));
+        assert!(matches!(poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher()), Err(Refused::NotGranted(_))));
+
+        // A command offered and its claim refused so: the same, and nothing of it is run or reported.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = Provider::start(|req| {
+            if req.target.contains("/pending") {
+                Reply::ok(r#"{"commands":[{"commandId":"c-1","connectorId":"desktop","command":"services.list","payload":{}}]}"#)
+            } else if req.target.ends_with("/claim") {
+                Reply::status(403, r#"{"error":true,"code":"ai_only_link","message":"This computer is linked for AI only: it takes no connector or plugin commands."}"#)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let seen = ran.clone();
+        let dispatch: Dispatcher = Arc::new(move |_: &str, _: &str, _: &Value, _: &str| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Value::Null)
+        });
+        let refused = poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &dispatch).unwrap_err();
+        assert!(matches!(refused, Refused::NotGranted(_)), "{refused:?}");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "nothing claimed is run");
+        assert!(!server.lines().iter().any(|l| l.ends_with("/complete")), "{:?}", server.lines());
+    }
+
+    /// A key the provider no longer takes is said so, as it always was: a 401, or a 403 saying anything else.
+    #[test]
+    fn a_key_refused_for_any_other_reason_is_still_a_link_to_make_again() {
+        for (status, body) in [
+            (401, r#"{"error":true,"message":"Invalid, expired, or revoked API key"}"#),
+            (403, r#"{"error":true,"code":"forbidden","message":"Not your desktop"}"#),
+            (403, r#"{"error":true,"message":"Insufficient scope. Required: flows:read"}"#),
+        ] {
+            let server = Provider::start(move |_| Reply::status(status, body));
+            let refused = poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap_err();
+            let Refused::Trouble(why) = refused else { panic!("{status} {body} is trouble") };
+            assert!(why.contains("link again"), "{why}");
+        }
+    }
+
+    /// The lane's own loop: told the link is not granted its commands, it does not ask again, shows nothing wrong,
+    /// and asks at once (within its next look at the link) when the link is another.
+    #[test]
+    fn a_lane_not_granted_to_this_link_rests_until_the_link_changes() {
+        let server = Provider::start(|req| {
+            if req.header("authorization") == Some("Bearer flk_lane") {
+                Reply::status(403, r#"{"error":true,"code":"insufficient_scope","message":"This computer is linked for AI only: it takes no connector or plugin commands."}"#)
+            } else {
+                Reply::ok(r#"{"commands":[]}"#)
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "relay-parked", |d| {
+            let relay = d.relay.as_mut().unwrap();
+            relay.wait_seconds = 1;
+            relay.error_backoff_seconds = 1;
+        });
+        spawn_on(store.clone(), working_dispatcher(), Box::leak(Box::new(crate::link::net::LaneClient::new(build_client))));
+        server.wait_for("/api/v1/connector-commands/pending", 1, Duration::from_secs(30));
+        // Three back-offs' worth: a lane that took this for trouble would have asked three times more.
+        std::thread::sleep(Duration::from_secs(3));
+        let polls = server.lines().iter().filter(|l| l.contains("/pending")).count();
+        let said = serde_json::to_string(&store.status()).unwrap();
+        // Linked again, with another key: asked at once.
+        let mut relinked = store.account().unwrap();
+        relinked.credential = "flk_full".into();
+        store.set_account_for_tests(relinked);
+        let after = server.wait_for("/api/v1/connector-commands/pending", 2, Duration::from_secs(15));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(polls, 1, "asked once: {:?}", server.lines());
+        assert!(!said.contains("link again"), "nothing wrong is shown: {said}");
+        assert_eq!(after[1].header("authorization"), Some("Bearer flk_full"));
+    }
+
     #[test]
     fn a_refusal_for_asking_too_often_still_says_why_after_a_wait_longer_than_the_poll_may_take() {
         // A poll of this spec (a hold of 1 second) is given 16 seconds, from the
@@ -942,7 +1090,7 @@ mod tests {
         let server = Provider::start(|_| Reply::too_many(17, "API key rate limit exceeded. Try again in 17s."));
         let started = std::time::Instant::now();
         let error = poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap_err();
-        assert_eq!(error, "HTTP 429: API key rate limit exceeded. Try again in 17s.");
+        assert_eq!(error, Refused::Trouble("HTTP 429: API key rate limit exceeded. Try again in 17s.".into()));
         assert!(started.elapsed() >= Duration::from_secs(17), "{:?}", started.elapsed());
     }
 
