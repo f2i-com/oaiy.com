@@ -131,7 +131,7 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
             // nothing to ask for again until the link is another.
             Err(Refused::NotGranted(why)) => {
                 log::info!("relay: the provider routes no commands to this link ({why}); not asked again while it is linked so");
-                store.note_relay(None);
+                store.note_relay_not_used(why);
                 lane.start_afresh();
                 parked = Some(account);
             }
@@ -1077,6 +1077,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(polls, 1, "asked once: {:?}", server.lines());
         assert!(!said.contains("link again"), "nothing wrong is shown: {said}");
+        // What it does show: that the lane is not used, in the provider's words, and no moment it listened at.
+        assert!(said.contains(r#""relayNotUsed":"This computer is linked for AI only: it takes no connector or plugin commands.""#), "{said}");
+        assert!(!said.contains("lastRelayAt") && !said.contains("relayError"), "{said}");
         assert_eq!(after[1].header("authorization"), Some("Bearer flk_full"));
     }
 

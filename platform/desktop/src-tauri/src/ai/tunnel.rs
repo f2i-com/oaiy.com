@@ -22,18 +22,23 @@
 //! timing and the batch size come from [`crate::link::descriptor`], so a second
 //! provider with this lane is a JSON file. Nothing here names a product.
 //!
-//! One chat turn at a time, by construction: the claim is atomic server-side and
-//! this loop serves the turns strictly sequentially, so a long answer cannot
-//! overlap another.
+//! One turn of each kind at a time (contract §0.11): the loop claims every row,
+//! in the batch's order, and answers it on a task of its own behind a slot of
+//! its kind, so the loop goes straight back to polling.
 //!
-//! Pictures (the `image` kind, [`crate::ai::tunnel_pictures`]) have a slot of
-//! their own beside that loop: one picture at a time on this computer, claimed
-//! by the loop like any turn and then made on a task of its own. A picture takes
-//! a minute; a chat turn that came after it is answered meanwhile. A picture
-//! offered while another is being made is left unclaimed for a later poll, and
-//! one whose claim is lost is never made, as a turn is never answered. While a
-//! picture is drawn it posts a `progress` frame every fifteen seconds, and its
-//! picture, or why there is none, comes in a `final` frame as a turn's answer does.
+//! - **Chat turns** (and the listings of providers and models) share one slot: a
+//!   long answer cannot overlap another, and a turn offered while one is being
+//!   answered is left unclaimed for a later poll.
+//! - **Pictures** (the `image` kind, [`crate::ai::tunnel_pictures`]) have a slot of
+//!   their own: one picture at a time on this computer. A picture offered while
+//!   another is being made is left unclaimed for a later poll. While a picture is
+//!   drawn it posts a `progress` frame every fifteen seconds, and its picture, or
+//!   why there is none, comes in a `final` frame as a turn's answer does.
+//!
+//! So a chat turn that comes while a picture is drawn is answered meanwhile, and a
+//! picture that comes while a chat turn is answered is drawn meanwhile. A row
+//! whose claim is lost runs nothing, of either kind: the claim is atomic
+//! server-side, and its slot is free again at once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -230,6 +235,9 @@ pub struct AiTunnel {
     /// The one picture this computer makes at a time (the site's rule too): a permit is held from a picture's claim
     /// until its outcome is reported, on the task that makes it, and goes back when that task ends, however it ends.
     picture_slot: Arc<tokio::sync::Semaphore>,
+    /// The one other turn (a chat, or a listing) this computer answers at a time, beside the picture: held from its
+    /// claim until its outcome is reported, on the task that answers it, as the picture slot is (contract §0.11).
+    turn_slot: Arc<tokio::sync::Semaphore>,
     /// How often a picture being drawn says so: [`tunnel_pictures::PROGRESS_EVERY`] (a test's own, shorter).
     picture_progress: Duration,
 }
@@ -284,6 +292,7 @@ impl AiTunnel {
             http: crate::link::net::LaneClient::new(build_client),
             data_dir: data_dir.to_path_buf(),
             picture_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            turn_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             picture_progress: tunnel_pictures::PROGRESS_EVERY,
         }))
     }
@@ -550,14 +559,17 @@ impl AiTunnel {
                 }
                 continue;
             }
-            match self.serve(account, spec, instance, &request).await {
+            // A chat turn (or a listing) the same way, behind a slot of its own (contract §0.11): a picture offered while
+            // it is answered is claimed by the next poll, as a turn offered while a picture is drawn is.
+            let id = request.id.clone();
+            match self.start_turn(account, spec, instance, request).await {
                 Ok(true) => handled += 1,
-                // Taken, or the lane is busy. The row is still offered while the lane is busy, so
-                // counting this as work would go straight round again, as fast as the provider
-                // answers, until the lane comes free.
+                // Taken, the lane is busy, or this computer's turn slot is: nothing was served. The row is still
+                // offered while the lane is busy, so counting this as work would go straight round again, as fast as
+                // the provider answers, until the lane comes free.
                 Ok(false) => {}
                 Err(e) => {
-                    log::warn!("AI turn {} could not be served: {e}", request.id);
+                    log::warn!("AI turn {id} could not be served: {e}");
                     failed.get_or_insert(e);
                     handled += 1;
                 }
@@ -571,28 +583,44 @@ impl AiTunnel {
         }
     }
 
-    /// Claim one turn, answer it, and always report a terminal status. False when the claim was
-    /// lost, so nothing was served.
-    async fn serve(
-        &self,
+    /// Claim one turn (a chat, or a listing of providers or models) and answer it on a task of its own, holding the
+    /// turn slot until its terminal status is reported. True once it is being answered.
+    ///
+    /// False, with nothing claimed, while the slot is taken: a computer answers one turn at a time, and the site
+    /// sends it one picture and one other request at a time (contract §0.11). Left unclaimed, the row stays the
+    /// site's, offered again at the next poll and claimed once the slot is free. False too when the claim is lost,
+    /// and then nothing of it runs.
+    async fn start_turn(
+        self: &Arc<Self>,
         account: &LinkedAccount,
         spec: &DesktopAiSpec,
         instance: &str,
-        request: &AiRequest,
+        request: AiRequest,
     ) -> Result<bool, String> {
+        let Ok(slot) = Arc::clone(&self.turn_slot).try_acquire_owned() else {
+            return Ok(false);
+        };
         let http = self.http.get()?;
+        // (lost or refused, `slot` goes as this returns, and the slot is free again)
         if !self.claim(&http, account, spec, instance, &request.id).await? {
             return Ok(false);
         }
-        let lane = Lane {
-            http,
-            account,
-            spec,
-            instance,
-            id: &request.id,
-        };
-        let outcome = self.answer(&lane, request).await;
-        self.finish(&lane, request, outcome).await?;
+        let tunnel = Arc::clone(self);
+        let (account, spec, instance) = (account.clone(), spec.clone(), instance.to_string());
+        tokio::spawn(async move {
+            let _slot = slot;
+            let lane = Lane {
+                http,
+                account: &account,
+                spec: &spec,
+                instance: &instance,
+                id: &request.id,
+            };
+            let outcome = tunnel.answer(&lane, &request).await;
+            if let Err(e) = tunnel.finish(&lane, &request, outcome).await {
+                log::warn!("AI turn {} could not be reported: {e}", request.id);
+            }
+        });
         Ok(true)
     }
 
@@ -2354,10 +2382,11 @@ mod tests {
         }
     }
 
-    /// The contract's concurrency: a picture takes a minute, and the chat turn after it in the same batch is answered
-    /// meanwhile. The engines here make the picture only once the chat turn has been reported, so a lane that served
-    /// them one after the other would wait on itself: the cycle has ten seconds. A second picture offered while the
-    /// first is being made is left unclaimed, and claimed at the next poll once the slot is free.
+    /// The contract's concurrency, one way: a picture takes a minute, and the chat turn after it in the same batch is
+    /// answered meanwhile. The engines here make the picture only once the chat turn has been reported, so a lane that
+    /// served them one after the other would wait on itself (the engines give up waiting after twenty seconds; this
+    /// test has ten). A second picture offered while the first is being made is left unclaimed, and claimed at the
+    /// next poll once the slot is free.
     #[tokio::test]
     async fn a_chat_turn_is_answered_while_a_picture_is_being_made() {
         use crate::link::testkit::{Provider, Reply};
@@ -2410,15 +2439,18 @@ mod tests {
         };
         let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
 
+        let started = std::time::Instant::now();
         let handled = tokio::time::timeout(Duration::from_secs(10), tunnel.poll_cycle(&account, &spec, "oaiy-test"))
             .await
-            .expect("the chat turn waited for the picture")
+            .expect("the poll waited on what it claimed")
             .unwrap();
-        assert_eq!(handled, 2, "the picture being made and the chat turn answered: {:?}", server.lines());
-        assert_eq!(completed_as(&server, "chat-1").as_deref(), Some("done"));
+        assert_eq!(handled, 2, "the picture being made and the chat turn being answered: {:?}", server.lines());
         assert!(!server.lines().iter().any(|l| l.contains("picture-2")), "the second picture is left unclaimed: {:?}", server.lines());
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        assert_eq!(completed_as(&server, "chat-1").as_deref(), Some("done"));
 
         until("the picture", || completed_as(&server, "picture-1").is_some()).await;
+        assert!(started.elapsed() < Duration::from_secs(10), "the chat turn waited for the picture: {:?}", started.elapsed());
         assert!(overlapped.load(Ordering::SeqCst), "the picture was being made while the chat turn was answered");
         let order = server.lines();
         let at = |line: &str| order.iter().position(|l| l == line).unwrap();
@@ -2451,6 +2483,109 @@ mod tests {
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(second["picture"]["seed"], sent[1].body["seed"], "the seed chosen is the one reported");
         assert!(sent.iter().all(|a| a.body["incognito"] == true && a.incognito_header.as_deref() == Some("1")));
+    }
+
+    /// The contract's concurrency, the other way (§0.11): a picture offered while a chat turn is being answered is
+    /// claimed by the next poll and drawn meanwhile. The engines here answer the chat turn only once the picture has
+    /// been reported, so a lane that answered the chat turn before it polled again would wait on itself. A second
+    /// chat turn offered meanwhile is left unclaimed (one turn at a time), and claimed once the first is reported.
+    #[tokio::test]
+    async fn a_picture_is_drawn_while_a_chat_turn_is_answered() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let picture_reported = {
+            let lines = lines.clone();
+            move || lines.lock().unwrap().iter().any(|l| l == "POST /api/v1/desktop-ai/picture-1/complete")
+        };
+        let engines = fake_engines(Setup {
+            picture: crate::ai::tunnel_pictures::tests::detailed_png(1024, 1024),
+            chat_hold: Some(Arc::new(picture_reported)),
+            ..Setup::default()
+        })
+        .await;
+        let (mut tunnel, _dir) = tunnel_with_engines("chat-beside-picture", Some(engines.ui.clone()));
+        Arc::get_mut(&mut tunnel).unwrap().picture_progress = Duration::from_millis(100);
+
+        let turn = |seed: u8| sealed_to(&tunnel, seed, &json!({ "v": 1, "kind": "chat", "providerId": "oaiy-engine", "messages": [{ "role": "user", "content": "hi" }] }));
+        let (chat_1, chat_2) = (turn(0x61), turn(0x62));
+        let picture = sealed_to(&tunnel, 0x63, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let batches = [
+            json!({ "requests": [pending_row("chat-1", "chat", &chat_1)] }).to_string(),
+            json!({ "requests": [pending_row("chat-2", "chat", &chat_2), pending_row("picture-1", "image", &picture)] }).to_string(),
+            json!({ "requests": [pending_row("chat-2", "chat", &chat_2)] }).to_string(),
+        ];
+        let polls = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let (lines, polls) = (lines.clone(), polls.clone());
+            Provider::start(move |req| {
+                lines.lock().unwrap().push(req.line());
+                if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                    Reply::ok(&batches[polls.fetch_add(1, Ordering::SeqCst).min(2)])
+                } else {
+                    Reply::ok("{}")
+                }
+            })
+        };
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+        let cycle = || tokio::time::timeout(Duration::from_secs(5), tunnel.poll_cycle(&account, &spec, "oaiy-test"));
+
+        let started = std::time::Instant::now();
+        assert_eq!(cycle().await.expect("the poll waited on the chat turn").unwrap(), 1, "{:?}", server.lines());
+        // The chat turn is being answered (its engine holds it): the next poll claims the picture, and not chat-2.
+        assert_eq!(cycle().await.expect("the poll waited on the chat turn").unwrap(), 1, "{:?}", server.lines());
+        assert!(completed_as(&server, "chat-1").is_none(), "the chat turn is still being answered: {:?}", server.lines());
+        assert!(!server.lines().iter().any(|l| l.contains("chat-2")), "a second chat turn is left unclaimed: {:?}", server.lines());
+        assert_eq!(tunnel.turn_slot.available_permits(), 0);
+
+        until("the picture", || completed_as(&server, "picture-1").is_some()).await;
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        assert!(started.elapsed() < Duration::from_secs(10), "the picture waited for the chat turn: {:?}", started.elapsed());
+        assert_eq!((completed_as(&server, "picture-1").as_deref(), completed_as(&server, "chat-1").as_deref()), (Some("done"), Some("done")));
+        let order = server.lines();
+        let at = |line: &str| order.iter().position(|l| l == line).unwrap();
+        assert!(at("POST /api/v1/desktop-ai/chat-1/claim") < at("POST /api/v1/desktop-ai/picture-1/claim"), "{order:?}");
+        assert!(at("POST /api/v1/desktop-ai/picture-1/claim") < at("POST /api/v1/desktop-ai/chat-1/complete"), "the picture was claimed while the chat turn was open: {order:?}");
+        assert!(at("POST /api/v1/desktop-ai/picture-1/complete") < at("POST /api/v1/desktop-ai/chat-1/complete"), "{order:?}");
+        let answer = frames_of(&tunnel, &server, "chat-1", 0x61);
+        assert!(answer.last().unwrap().to_string().contains("hello from the engine"), "{answer:?}");
+        let drawn = frame_of(&tunnel, &server, "picture-1", 0x63);
+        assert_eq!(drawn["picture"]["mimeType"], "image/jpeg", "{drawn}");
+
+        // The turn slot is free once chat-1 is reported (its task gives it back): chat-2 is claimed and answered.
+        until("the turn slot", || tunnel.turn_slot.available_permits() == 1).await;
+        assert_eq!(cycle().await.unwrap().unwrap(), 1);
+        until("the second chat turn", || completed_as(&server, "chat-2").is_some()).await;
+        assert_eq!(completed_as(&server, "chat-2").as_deref(), Some("done"));
+        assert_eq!(engines.pictures_asked().len(), 1);
+        assert_eq!(engines.asked.lock().unwrap().iter().filter(|a| a.route == "chat").count(), 2, "each chat turn answered once");
+    }
+
+    /// A chat turn whose claim another computer won is never answered, as a picture is never made: the engines are not
+    /// asked, nothing is posted for it, and the turn slot is free again.
+    #[tokio::test]
+    async fn a_chat_turn_whose_claim_is_lost_is_never_answered() {
+        use crate::link::testkit::{Provider, Reply};
+        let engines = fake_engines(Setup::default()).await;
+        let (tunnel, _dir) = tunnel_with_engines("chat-lost", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x71, &json!({ "v": 1, "kind": "chat", "providerId": "oaiy-engine", "messages": [{ "role": "user", "content": "hi" }] }));
+        let batch = json!({ "requests": [pending_row("chat-1", "chat", &row)] }).to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else if req.target.ends_with("/claim") {
+                Reply::status(409, r#"{"code":"already_claimed"}"#)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0, "a lost claim is not work done");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(engines.asked.lock().unwrap().is_empty(), "{:?}", engines.asked.lock().unwrap());
+        assert_eq!(tunnel.turn_slot.available_permits(), 1, "the slot is free again");
+        assert!(!server.lines().iter().any(|l| l.ends_with("/frames") || l.ends_with("/complete")), "{:?}", server.lines());
     }
 
     /// A picture whose claim another computer won is not made: the engines are never asked, and the slot is free again.

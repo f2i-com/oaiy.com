@@ -834,6 +834,8 @@ pub(crate) mod tests {
         pub chat_delay: Duration,
         /// What the images route waits for before it answers (it gives up after 20 seconds).
         pub hold: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        /// What the chat route waits for before it answers, the same way.
+        pub chat_hold: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     }
 
     impl Default for Setup {
@@ -851,6 +853,7 @@ pub(crate) mod tests {
                 delay: Duration::ZERO,
                 chat_delay: Duration::ZERO,
                 hold: None,
+                chat_hold: None,
             }
         }
     }
@@ -930,6 +933,12 @@ pub(crate) mod tests {
                 post(|State(s): State<Shared>, Json(body): Json<Value>| async move {
                     s.asked.lock().unwrap().push(Asked { route: "chat", incognito_header: None, body });
                     tokio::time::sleep(s.setup.chat_delay).await;
+                    if let Some(hold) = s.setup.chat_hold.clone() {
+                        let until = std::time::Instant::now() + Duration::from_secs(20);
+                        while !hold() && std::time::Instant::now() < until {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
                     Json(json!({
                         "id": "cmpl-1",
                         "object": "chat.completion",

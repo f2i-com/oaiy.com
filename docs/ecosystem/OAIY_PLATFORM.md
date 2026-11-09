@@ -133,7 +133,7 @@ Two transports, neither a WebSocket.
 |---|---|---|
 | Heartbeat (45 s) | `link/heartbeat.rs` | `POST /api/v1/desktop-connections {desktopInstanceId, deviceName, capabilities}` |
 | Command relay | `link/relay.rs`, `ops.rs` | `GET …/connector-commands/pending`, `POST …/{id}/claim`, `…/{id}/complete` |
-| Encrypted AI tunnel (providers, models, chat; pictures, `image`, in a slot of their own: `ai/tunnel_pictures.rs`) | `ai/tunnel.rs`, `e2e.rs`, `chat_tools.rs` | `/api/v1/desktop-ai/{pubkey,pending,{id}/claim,{id}/frames,{id}/complete,{id}/input}` |
+| Encrypted AI tunnel (providers, models, chat; pictures, `image`: `ai/tunnel_pictures.rs`; one turn and one picture at a time, each on its own task, so either is claimed while the other runs) | `ai/tunnel.rs`, `e2e.rs`, `chat_tools.rs` | `/api/v1/desktop-ai/{pubkey,pending,{id}/claim,{id}/frames,{id}/complete,{id}/input}` |
 | Encrypted flow relay | `link/sealed_flows.rs` | `/api/v1/desktop-flows/{pending,{id}/claim,{id}/complete}` |
 | Queued flow runs | `link/flow_runner.rs` | below |
 

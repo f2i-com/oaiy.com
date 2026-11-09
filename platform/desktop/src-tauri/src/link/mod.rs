@@ -527,6 +527,11 @@ pub struct LinkStatus {
     pub last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_error: Option<String>,
+    /// Why the command lane is not used at all, when the provider said it gives this link no commands (a link made
+    /// for AI alone: `relay::Refused::NotGranted`), in the provider's words. Not an error, and not a lane listening:
+    /// the panel says so rather than "Listening for commands" at the moment it was told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_not_used: Option<String>,
     /// When this desktop last looked at the account's queued flow runs, and why
     /// it stopped if it did.
     ///
@@ -608,6 +613,7 @@ struct Inner {
     heartbeat_error: Option<String>,
     last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     relay_error: Option<String>,
+    relay_not_used: Option<String>,
     last_flow_run_at: Option<chrono::DateTime<chrono::Utc>>,
     flow_run_error: Option<String>,
     last_sealed_flow_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -684,6 +690,7 @@ fn load_store(data_dir: PathBuf) -> LinkHandle {
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            relay_not_used: None,
             last_flow_run_at: None,
             flow_run_error: None,
             last_sealed_flow_at: None,
@@ -730,6 +737,7 @@ pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>)
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            relay_not_used: None,
             last_flow_run_at: None,
             flow_run_error: None,
             last_sealed_flow_at: None,
@@ -773,6 +781,7 @@ impl LinkStore {
                 heartbeat_error: None,
                 last_relay_at: None,
                 relay_error: None,
+                relay_not_used: None,
                 last_flow_run_at: None,
                 flow_run_error: None,
                 heartbeat_supported: false,
@@ -807,6 +816,7 @@ impl LinkStore {
                     heartbeat_error: inner.heartbeat_error.clone(),
                     last_relay_at: inner.last_relay_at,
                     relay_error: inner.relay_error.clone(),
+                    relay_not_used: inner.relay_not_used.clone(),
                     last_flow_run_at: inner.last_flow_run_at,
                     flow_run_error: inner.flow_run_error.clone(),
                     heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
@@ -884,6 +894,17 @@ impl LinkStore {
             inner.last_relay_at = Some(chrono::Utc::now());
         }
         inner.relay_error = error;
+        // (a poll that came back, either way, is a lane in use again: a new link)
+        inner.relay_not_used = None;
+    }
+
+    /// Record that the provider gives this link no commands (`why`, in its words): the command lane rests until the
+    /// link changes. Neither an error nor a lane listening, so it clears both.
+    pub fn note_relay_not_used(&self, why: String) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.relay_error = None;
+        inner.last_relay_at = None;
+        inner.relay_not_used = Some(why);
     }
 
     /// Record the outcome of one look at the account's queued flow runs.
@@ -1114,6 +1135,7 @@ impl LinkStore {
             // would be shown against the next one that is linked.
             inner.last_relay_at = None;
             inner.relay_error = None;
+            inner.relay_not_used = None;
             inner.last_flow_run_at = None;
             inner.flow_run_error = None;
             inner.last_sealed_flow_at = None;
@@ -1628,6 +1650,20 @@ mod tests {
         // The timestamp is what makes "no error" mean something: on a long poll,
         // a clean return is the only evidence the lane is alive at all.
         assert!(good.last_relay_at.is_some());
+
+        // A link the provider gives no commands: not an error, and not a lane listening since some moment.
+        s.note_relay(Some("claim refused: HTTP 500".into()));
+        s.note_relay_not_used("This computer is linked for AI only.".into());
+        let unused = s.status();
+        assert_eq!(unused.relay_not_used.as_deref(), Some("This computer is linked for AI only."));
+        assert!(unused.relay_error.is_none() && unused.last_relay_at.is_none(), "{unused:?}");
+        let wire = serde_json::to_value(&unused).unwrap();
+        assert_eq!(wire["relayNotUsed"], "This computer is linked for AI only.", "the panel's name for it");
+        assert!(wire.get("lastRelayAt").is_none(), "{wire}");
+        // A poll that comes back (the link is another) is a lane in use again.
+        s.note_relay(None);
+        let again = s.status();
+        assert!(again.relay_not_used.is_none() && again.last_relay_at.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1667,6 +1703,10 @@ mod tests {
         assert!(after.relay_error.is_none(), "a stale error must not outlive the link");
         assert!(after.last_relay_at.is_none());
         assert!(after.heartbeat_error.is_none());
+        // Nor a lane the last link was not given.
+        s.inner.lock().unwrap().account = Some(account());
+        s.note_relay_not_used("This computer is linked for AI only.".into());
+        assert!(s.unlink().relay_not_used.is_none(), "the next link's lane is not the last one's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

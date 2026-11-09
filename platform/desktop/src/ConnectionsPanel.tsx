@@ -584,6 +584,12 @@ export default function ConnectionsPanel() {
                     <small className="link-line is-error">
                       Not receiving commands: {account.relayError}
                     </small>
+                  ) : account.relayNotUsed ? (
+                    // The provider gives this link no commands (made for AI alone): nothing is
+                    // listening, and nothing is wrong.
+                    <small className="link-line" title={account.relayNotUsed}>
+                      Commands: not used by this AI-only link
+                    </small>
                   ) : account.lastRelayAt ? (
                     <small className="link-line">
                       Listening for commands · {new Date(account.lastRelayAt).toLocaleTimeString()}
