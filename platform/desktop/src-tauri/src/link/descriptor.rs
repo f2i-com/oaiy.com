@@ -54,6 +54,27 @@ pub struct Oauth2Pkce {
     pub extra_authorize_params: BTreeMap<String, String>,
     /// Where the interesting values live in the token response.
     pub token_response: TokenResponseSpec,
+    /// Linking with a one-time code, for a computer that cannot do the browser's
+    /// part of the ceremony: a headless server, whose approval in a browser would
+    /// redirect to its own loopback (`oaiy-server link --code`). None: the
+    /// provider has no such codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_code: Option<LinkCodeSpec>,
+}
+
+/// Where and how a one-time link code is redeemed ([`super::oauth::redeem_link_code`]).
+/// The provider answers it as it answers [`Oauth2Pkce::token_path`], so
+/// `token_response` reads both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkCodeSpec {
+    /// Joined to the base URL, and POSTed to with a form.
+    pub path: String,
+    /// The form field the code goes in.
+    pub code_field: String,
+    /// The form field this computer's name goes in, when the provider takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_field: Option<String>,
 }
 
 fn default_callback_path() -> String {
@@ -155,6 +176,11 @@ pub struct ScriptProfileSpec {
     /// "no prelude" state this block exists to remove.
     #[serde(default = "default_profile_ttl")]
     pub ttl_seconds: u64,
+    /// That read scope, by name. A link the provider did not grant it (one made
+    /// for AI alone) never asks: it would be refused at every revalidation, and
+    /// it runs none of the logic the profile serves. None: any link reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 fn default_profile_ttl() -> u64 {
@@ -430,6 +456,11 @@ pub struct FlowsSpec {
     /// twenty.
     #[serde(default = "default_queued_idle_seconds")]
     pub queued_idle_seconds: u64,
+    /// The scope a link needs to read the queue. A link the provider did not grant
+    /// it (one made for AI alone) is not run from the queue: every look would be
+    /// refused, and said as a key to link again. None: any link reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_scope: Option<String>,
     /// Take one queued run, exactly-once. `{id}` is substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_path: Option<String>,
@@ -1061,7 +1092,10 @@ impl ConnectorDescriptor {
             ("authorizePath", &o.authorize_path),
             ("tokenPath", &o.token_path),
             ("callbackPath", &o.callback_path),
-        ] {
+        ]
+        .into_iter()
+        .chain(o.link_code.as_ref().map(|c| ("linkCode.path", &c.path)))
+        {
             if !path.starts_with('/') {
                 return Err(format!(
                     "connector {:?} {label} must be a path beginning with '/', got {path:?}",
@@ -1071,6 +1105,11 @@ impl ConnectorDescriptor {
         }
         if o.scopes.is_empty() {
             return Err(format!("connector {:?} requests no scopes", self.id));
+        }
+        if let Some(c) = &o.link_code {
+            if c.code_field.trim().is_empty() || c.device_field.as_deref().is_some_and(|f| f.trim().is_empty()) {
+                return Err(format!("connector {:?} linkCode names an empty field", self.id));
+            }
         }
         if let Some(h) = &self.heartbeat {
             if !h.path.starts_with('/') {

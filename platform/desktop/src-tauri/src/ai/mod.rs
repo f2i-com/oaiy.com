@@ -8,6 +8,8 @@
 //! - `engine_services` — OAIY's engine's models as flow services, and their calls.
 //! - `e2e`        — the sealed envelope a provider's web app chats through.
 //! - `tunnel`     — answering the sealed turns it relays here.
+//! - `tunnel_pictures` — the pictures it relays (its `image` kind), made by
+//!   OAIY's own picture engine in a slot beside the chat turns.
 //! - `chat_tools` — letting one of those turns act on the linked account.
 //! - `agent_model` — the Agent's model (engine or ChatGPT), and what this
 //!   computer can run it on.
@@ -24,6 +26,7 @@ pub mod providers;
 pub mod plugin_completion;
 pub mod routes;
 pub mod tunnel;
+pub mod tunnel_pictures;
 
 pub use codex::{CodexHandle, CODEX_PROVIDER_ID};
 pub use providers::{open_handle, ProviderStoreHandle};

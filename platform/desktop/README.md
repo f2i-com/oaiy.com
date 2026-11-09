@@ -310,6 +310,18 @@ pass `--features gui` for the GUI. The **`web`** feature is the server's web log
 the server with it (`scripts/check-release.mjs` fails if it does not), its default access
 mode is `scoped`, and a lan or a proxied install needs it (a build without it says so).
 
+A server links to a FormLogic account with a one-time code made there ("Connect an OAIY
+server"), since the desktop's browser approval ends on the approving computer's own loopback:
+
+```bash
+oaiy-server link --code K7QM-2WXR-9DFT --base-url https://formlogic.com [--name "Studio server"]
+```
+
+It redeems the code (`POST /api/oauth/oaiy-link`, the descriptor's `auth.linkCode`), writes the
+`link/account.json` the browser link writes, and ends; the server serves the link from its next
+start. A link made "AI only" (`connector:relay`) does not ask for the flow-run queue or the script
+prelude, which need `flows:read`.
+
 Configuration is by environment variable (no pointer file):
 
 | env | default | purpose |

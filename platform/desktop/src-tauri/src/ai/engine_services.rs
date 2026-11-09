@@ -292,7 +292,7 @@ fn runnable(m: &Value) -> bool {
 
 /// The gateway path serving `target` (an OpenAI-dialect route; images and
 /// videos also have OAIY-dialect ones, which these contracts do not speak).
-fn endpoint_path(discovery: &Value, target: &str) -> Option<String> {
+pub(crate) fn endpoint_path(discovery: &Value, target: &str) -> Option<String> {
     discovery.get("endpoints").and_then(Value::as_array)?.iter().find(|e| {
         e.get("name").and_then(Value::as_str) == Some(target) && e.get("spec").and_then(Value::as_str).unwrap_or("openai") == "openai"
     })

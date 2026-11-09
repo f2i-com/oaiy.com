@@ -90,6 +90,14 @@ pub(crate) async fn engine_now_at(ui: Option<String>) -> Result<(String, String)
     Ok((gateway, chosen_model(&discovery)))
 }
 
+/// The engines' gateway and discovery document, for a caller that holds no `AiState` and needs no language model
+/// (the relay's pictures, `tunnel_pictures`): the engines whose control pages are at `ui` (none: not running), asked
+/// exactly as [`engine_now_at`] asks them. Nothing is started.
+pub(crate) async fn engine_discovery_at(ui: Option<String>) -> Result<(String, Value), String> {
+    let (gateway, discovery, _) = engine_discovery_snapshot_at(ui, false).await?;
+    Ok((gateway, discovery))
+}
+
 /// The engines' gateway and its discovery document, asked of the engines now. Only
 /// asks: nothing is started (the gateway answers discovery from its configuration).
 pub(super) async fn engine_discovery(st: &AiState) -> Result<(String, Value), String> {

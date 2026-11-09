@@ -22,9 +22,18 @@
 //! timing and the batch size come from [`crate::link::descriptor`], so a second
 //! provider with this lane is a JSON file. Nothing here names a product.
 //!
-//! One turn at a time, by construction: the claim is atomic server-side and
-//! this loop processes strictly sequentially, so a long answer cannot overlap
-//! another.
+//! One chat turn at a time, by construction: the claim is atomic server-side and
+//! this loop serves the turns strictly sequentially, so a long answer cannot
+//! overlap another.
+//!
+//! Pictures (the `image` kind, [`crate::ai::tunnel_pictures`]) have a slot of
+//! their own beside that loop: one picture at a time on this computer, claimed
+//! by the loop like any turn and then made on a task of its own. A picture takes
+//! a minute; a chat turn that came after it is answered meanwhile. A picture
+//! offered while another is being made is left unclaimed for a later poll, and
+//! one whose claim is lost is never made, as a turn is never answered. While a
+//! picture is drawn it posts a `progress` frame every fifteen seconds, and its
+//! picture, or why there is none, comes in a `final` frame as a turn's answer does.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +45,7 @@ use serde_json::{json, Value};
 use crate::ai::chat_tools;
 use crate::ai::e2e::{E2eIdentity, E2eSessions};
 use crate::ai::providers::Capability;
+use crate::ai::tunnel_pictures::{self, PictureError};
 use crate::link::descriptor::{self, DesktopAiSpec};
 use crate::link::{LinkHandle, LinkedAccount};
 
@@ -62,6 +72,12 @@ impl TunnelError {
     }
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+impl From<PictureError> for TunnelError {
+    fn from(e: PictureError) -> Self {
+        Self::new(e.code(), e.message())
     }
 }
 
@@ -169,7 +185,8 @@ pub struct AiSources {
 struct AiRequest {
     #[serde(rename = "requestId")]
     id: String,
-    /// `chat`, `models` or `providers`.
+    /// `chat`, `models`, `providers` or `image` (a picture, made in its own
+    /// slot: [`AiTunnel::start_picture`]).
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -210,6 +227,11 @@ pub struct AiTunnel {
     http: crate::link::net::LaneClient<reqwest::Client>,
     /// This desktop's data folder: where the engines' settings name the age check's models (aceage).
     data_dir: std::path::PathBuf,
+    /// The one picture this computer makes at a time (the site's rule too): a permit is held from a picture's claim
+    /// until its outcome is reported, on the task that makes it, and goes back when that task ends, however it ends.
+    picture_slot: Arc<tokio::sync::Semaphore>,
+    /// How often a picture being drawn says so: [`tunnel_pictures::PROGRESS_EVERY`] (a test's own, shorter).
+    picture_progress: Duration,
 }
 
 /// An optional provider must not stall discovery of working local providers.
@@ -261,6 +283,8 @@ impl AiTunnel {
             engines,
             http: crate::link::net::LaneClient::new(build_client),
             data_dir: data_dir.to_path_buf(),
+            picture_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            picture_progress: tunnel_pictures::PROGRESS_EVERY,
         }))
     }
 
@@ -451,9 +475,10 @@ impl AiTunnel {
         }
     }
 
-    /// One long-poll and the turns it carried. Returns how many were handled.
+    /// One long-poll and the turns it carried. Returns how many were handled: a
+    /// picture counts once its claim is won and it is being made.
     async fn poll_cycle(
-        &self,
+        self: &Arc<Self>,
         account: &LinkedAccount,
         spec: &DesktopAiSpec,
         instance: &str,
@@ -508,6 +533,23 @@ impl AiTunnel {
         let mut handled = 0usize;
         let mut failed = None;
         for request in reply.requests {
+            // A picture is claimed here, in the batch's order, and made beside this loop, which goes straight on to
+            // the next turn.
+            if request.kind.as_deref() == Some(tunnel_pictures::KIND) {
+                let id = request.id.clone();
+                match self.start_picture(account, spec, instance, request).await {
+                    Ok(true) => handled += 1,
+                    // The slot is taken (the row is left for a later poll) or the claim was lost: nothing was served,
+                    // and as with a turn the lane refused, this is not counted as work.
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("AI picture {id} could not be claimed: {e}");
+                        failed.get_or_insert(e);
+                        handled += 1;
+                    }
+                }
+                continue;
+            }
             match self.serve(account, spec, instance, &request).await {
                 Ok(true) => handled += 1,
                 // Taken, or the lane is busy. The row is still offered while the lane is busy, so
@@ -539,9 +581,35 @@ impl AiTunnel {
         request: &AiRequest,
     ) -> Result<bool, String> {
         let http = self.http.get()?;
+        if !self.claim(&http, account, spec, instance, &request.id).await? {
+            return Ok(false);
+        }
+        let lane = Lane {
+            http,
+            account,
+            spec,
+            instance,
+            id: &request.id,
+        };
+        let outcome = self.answer(&lane, request).await;
+        self.finish(&lane, request, outcome).await?;
+        Ok(true)
+    }
+
+    /// Take request `id`, exactly once: the claim is atomic on the provider's side. False when
+    /// another got there first (409), the ordinary end of a lost race, after which nothing of the
+    /// request may run.
+    async fn claim(
+        &self,
+        http: &reqwest::Client,
+        account: &LinkedAccount,
+        spec: &DesktopAiSpec,
+        instance: &str,
+        id: &str,
+    ) -> Result<bool, String> {
         let claim_url = crate::link::oauth::join(
             &account.base_url,
-            &spec.claim_path.replace("{id}", &request.id),
+            &spec.claim_path.replace("{id}", id),
         );
         let claimed = http
             .post(&claim_url)
@@ -562,15 +630,17 @@ impl AiTunnel {
                 Err(format!("claim refused: HTTP {}", claim_status.as_u16()))
             };
         }
+        Ok(true)
+    }
 
-        let lane = Lane {
-            http: http.clone(),
-            account,
-            spec,
-            instance,
-            id: &request.id,
-        };
-        let outcome = self.answer(&lane, request).await;
+    /// Seal what a claimed request came to, post it as its last frame, and report it `done` or
+    /// `failed`.
+    async fn finish(
+        &self,
+        lane: &Lane<'_>,
+        request: &AiRequest,
+        outcome: Result<Vec<u8>, TunnelError>,
+    ) -> Result<(), String> {
         let (status, frame) = match outcome {
             Ok(final_plaintext) => match self.sessions.seal_outbound(&request.id, &final_plaintext) {
                 Ok(envelope) => ("done", Some(envelope)),
@@ -588,15 +658,16 @@ impl AiTunnel {
             }
         }
         let complete_url = crate::link::oauth::join(
-            &account.base_url,
-            &spec.complete_path.replace("{id}", &request.id),
+            &lane.account.base_url,
+            &lane.spec.complete_path.replace("{id}", &request.id),
         );
         // Exactly `done` or `failed`. Any other word is a 400, the row stays
         // claimed, and the requester waits out the TTL and is told it expired.
-        let done = http
+        let done = lane
+            .http
             .post(&complete_url)
-            .bearer_auth(&account.credential)
-            .json(&json!({ "instanceId": instance, "status": status }))
+            .bearer_auth(&lane.account.credential)
+            .json(&json!({ "instanceId": lane.instance, "status": status }))
             .send()
             .await
             .map_err(|e| format!("could not report the outcome: {e}"))?;
@@ -609,7 +680,86 @@ impl AiTunnel {
                 done_status.as_u16()
             ));
         }
+        Ok(())
+    }
+
+    /// Claim a picture and make it on a task of its own, holding the picture slot until its outcome
+    /// is reported. True once it is being made.
+    ///
+    /// False, with nothing claimed, while the slot is taken: the site sends one picture at a time
+    /// to a computer too, so a second comes only when the two disagree for a while (a picture the
+    /// site has given up on is still being drawn here). Left unclaimed it stays the site's, offered
+    /// again at the next poll and claimed once the first is done. False too when the claim is lost,
+    /// and then nothing of it runs.
+    async fn start_picture(
+        self: &Arc<Self>,
+        account: &LinkedAccount,
+        spec: &DesktopAiSpec,
+        instance: &str,
+        request: AiRequest,
+    ) -> Result<bool, String> {
+        let Ok(slot) = Arc::clone(&self.picture_slot).try_acquire_owned() else {
+            return Ok(false);
+        };
+        let http = self.http.get()?;
+        // (lost or refused, `slot` goes as this returns, and the slot is free again)
+        if !self.claim(&http, account, spec, instance, &request.id).await? {
+            return Ok(false);
+        }
+        let tunnel = Arc::clone(self);
+        let (account, spec, instance) = (account.clone(), spec.clone(), instance.to_string());
+        tokio::spawn(async move {
+            let _slot = slot;
+            let lane = Lane {
+                http,
+                account: &account,
+                spec: &spec,
+                instance: &instance,
+                id: &request.id,
+            };
+            // Drawn, saying so every so often until it is done (each frame the site takes is news of the request).
+            let making = tunnel.answer_picture(&request);
+            tokio::pin!(making);
+            let every = tunnel.picture_progress;
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut making => break outcome,
+                    _ = ticks.tick() => tunnel.post_progress(&lane).await,
+                }
+            };
+            if let Err(e) = &outcome {
+                log::info!("AI picture {}: {} ({})", request.id, e.code(), e.message());
+            }
+            if let Err(e) = tunnel.finish(&lane, &request, outcome).await {
+                log::warn!("AI picture {} could not be reported: {e}", request.id);
+            }
+        });
         Ok(true)
+    }
+
+    /// Say that a picture is still being drawn ([`tunnel_pictures::progress_frame`]). Best effort:
+    /// a frame that does not land costs the site a sign of life, not the picture.
+    async fn post_progress(&self, lane: &Lane<'_>) {
+        // (only once the request has opened: before that there is no session to seal with, and
+        // nothing yet to say)
+        let Ok(envelope) = self
+            .sessions
+            .seal_outbound(lane.id, tunnel_pictures::progress_frame().to_string().as_bytes())
+        else {
+            return;
+        };
+        if let Err(e) = lane.post_frame(&envelope).await {
+            log::warn!("AI picture {} progress frame: {e}", lane.id);
+        }
+    }
+
+    /// Open a picture request and make the picture: the plaintext of its terminal frame.
+    async fn answer_picture(&self, request: &AiRequest) -> Result<Vec<u8>, TunnelError> {
+        let body = self.open_request(request)?;
+        let asked = tunnel_pictures::PictureRequest::from_sealed(request.provider_id.as_deref(), &body)?;
+        Ok(tunnel_pictures::make(self.engines_ui(), &asked, tunnel_pictures::PICTURE_TIMEOUT).await?)
     }
 
     /// Seal a typed failure so the requester learns WHY.
@@ -618,13 +768,18 @@ impl AiTunnel {
     /// from, so this seals detached at outbound counter 0 — the browser has not
     /// seen an outbound frame for this turn either, so the counters agree.
     fn seal_error(&self, request: &AiRequest, code: &str, message: &str) -> Option<String> {
-        let frame = json!({
-            "v": 1,
-            "type": "error",
-            "kind": "error",
-            "code": code,
-            "message": message,
-        })
+        // A picture's says it in the shape and the codes of the picture contract, whatever went wrong.
+        let frame = if request.kind.as_deref() == Some(tunnel_pictures::KIND) {
+            tunnel_pictures::error_frame(code, message)
+        } else {
+            json!({
+                "v": 1,
+                "type": "error",
+                "kind": "error",
+                "code": code,
+                "message": message,
+            })
+        }
         .to_string();
         if let Ok(envelope) = self.sessions.seal_outbound(&request.id, frame.as_bytes()) {
             return Some(envelope);
@@ -652,8 +807,8 @@ impl AiTunnel {
         .ok()
     }
 
-    /// Open the sealed turn and produce the plaintext to seal back.
-    async fn answer(&self, lane: &Lane<'_>, request: &AiRequest) -> Result<Vec<u8>, TunnelError> {
+    /// Open a request's sealed envelope: its body, as JSON.
+    fn open_request(&self, request: &AiRequest) -> Result<Value, TunnelError> {
         let eph_pub = request
             .eph_pub
             .as_deref()
@@ -666,8 +821,14 @@ impl AiTunnel {
             .sessions
             .open_inbound(&self.identity, &request.id, eph_pub, envelope)
             .map_err(|e| TunnelError::new(e.code(), e.message()))?;
-        let body: Value = serde_json::from_slice(&plaintext)
-            .map_err(|_| TunnelError::new("sealed_envelope_invalid", "the sealed body is not JSON"))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|_| TunnelError::new("sealed_envelope_invalid", "the sealed body is not JSON"))
+    }
+
+    /// Open the sealed turn and produce the plaintext to seal back.
+    async fn answer(&self, lane: &Lane<'_>, request: &AiRequest) -> Result<Vec<u8>, TunnelError> {
+        let body = self.open_request(request)?;
+        let eph_pub = request.eph_pub.as_deref().unwrap_or_default();
         if body.get("v").and_then(Value::as_u64) != Some(1) {
             return Err(TunnelError::new(
                 "sealed_envelope_invalid",
@@ -793,6 +954,16 @@ impl AiTunnel {
             tokio::task::spawn_blocking(move || codex.models())
                 .await
                 .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?
+                .map_err(|e| TunnelError::new("provider_unavailable", e.message()))?
+        } else if provider_id == crate::ai::routes::ENGINE_PROVIDER_ID {
+            // The engine's list needs no language model chosen, which answering a chat turn does
+            // (`resolve`): engines that make only pictures list their picture models, each with its
+            // `type`, and that is where the site finds the model an `image` request names.
+            let (gateway, _) = crate::ai::routes::engine_now_at(self.engines_ui())
+                .await
+                .map_err(|e| TunnelError::new("provider_unavailable", format!("OAIY's engine cannot answer: {e}")))?;
+            crate::ai::gateway::models(&crate::ai::routes::engine_provider(gateway, String::new()))
+                .await
                 .map_err(|e| TunnelError::new("provider_unavailable", e.message()))?
         } else {
             let (provider, _) = self.resolve(provider_id).await?;
@@ -1503,9 +1674,13 @@ fn codex_code(e: &crate::ai::codex::CodexError) -> &'static str {
     }
 }
 
-/// Flatten a model catalogue into the plain `[{id, name?}]` array the web app
-/// renders. It keeps object entries only, so an OpenAI `{data:[…]}` body passed
-/// through verbatim leaves the dropdown empty with nothing explaining why.
+/// Flatten a model catalogue into the plain `[{id, name?, type?}]` array the web
+/// app renders. It keeps object entries only, so an OpenAI `{data:[…]}` body
+/// passed through verbatim leaves the dropdown empty with nothing explaining why.
+///
+/// `type` is what kind of model it is, as OAIY's engines say (`image`, `video`,
+/// `speech`; their language models say none), kept so the site can offer the
+/// picture models for an `image` request and the others for chat.
 fn normalize_models(value: &Value) -> Vec<Value> {
     let entries = value
         .get("data")
@@ -1531,6 +1706,13 @@ fn normalize_models(value: &Value) -> Vec<Value> {
                 .filter(|s| !s.is_empty())
             {
                 out["name"] = json!(name);
+            }
+            if let Some(kind) = entry
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 32)
+            {
+                out["type"] = json!(kind);
             }
             Some(out)
         })
@@ -2072,6 +2254,279 @@ mod tests {
         );
         // A shape with no entries at all is an empty list, not a panic.
         assert!(normalize_models(&json!({ "oops": true })).is_empty());
+    }
+
+    #[test]
+    fn a_models_type_is_kept_so_the_site_can_list_picture_models() {
+        // OAIY's engines say what each model is; their language models say nothing.
+        let engines = json!({ "object": "list", "data": [
+            { "id": "nanbeige4.3-33b", "object": "model", "owned_by": "oaiy", "loaded": true },
+            { "id": "flux-3-klein", "object": "model", "owned_by": "oaiy-studio", "type": "image", "loaded": false },
+            { "id": "ltx-2.5", "object": "model", "owned_by": "oaiy-studio", "type": "video", "loaded": false },
+            { "id": "odd", "type": 7 },
+        ]});
+        assert_eq!(
+            normalize_models(&engines),
+            vec![
+                json!({ "id": "nanbeige4.3-33b" }),
+                json!({ "id": "flux-3-klein", "type": "image" }),
+                json!({ "id": "ltx-2.5", "type": "video" }),
+                json!({ "id": "odd" }),
+            ]
+        );
+    }
+
+    // ---- pictures (the `image` kind) ----
+
+    use crate::ai::tunnel_pictures::tests::{fake_engines, sealed, Setup};
+    use base64::Engine as _;
+
+    const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    /// `body` sealed to `tunnel` with the requester's key `seed`, as a row carries it: `(ephPub, envelope)`.
+    fn sealed_to(tunnel: &AiTunnel, seed: u8, body: &Value) -> (String, String) {
+        let public = crypto_box::SecretKey::from([seed; 32]).public_key().to_bytes();
+        let envelope = crate::ai::e2e::seal_detached_envelope(
+            &[seed; 32],
+            &tunnel.identity.public_key_bytes(),
+            crate::ai::e2e::DIR_BROWSER_TO_DESKTOP,
+            0,
+            body.to_string().as_bytes(),
+        )
+        .unwrap();
+        (B64.encode(public), envelope)
+    }
+
+    /// A pending row of the provider's.
+    fn pending_row(id: &str, kind: &str, (eph, envelope): &(String, String)) -> Value {
+        json!({ "requestId": id, "kind": kind, "providerId": "oaiy-engine", "ephPub": eph, "envelope": envelope })
+    }
+
+    /// The frames `tunnel` posted for request `id`, in order, opened with the requester's key `seed`: what the
+    /// requester reads. Each is checked to be at the next counter, as a reader holds them to.
+    fn frames_of(tunnel: &AiTunnel, server: &crate::link::testkit::Provider, id: &str, seed: u8) -> Vec<Value> {
+        let posted: Vec<_> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.line() == format!("POST /api/v1/desktop-ai/{id}/frames"))
+            .collect();
+        assert!(!posted.is_empty(), "no frame for {id}: {:?}", server.lines());
+        posted
+            .iter()
+            .enumerate()
+            .map(|(counter, frame)| {
+                let envelope = serde_json::from_str::<Value>(&frame.body).unwrap()["envelope"].as_str().unwrap().to_string();
+                let (nonce, ct) = crate::ai::e2e::unpack_envelope(&envelope).unwrap();
+                assert_eq!(nonce, crate::ai::e2e::frame_nonce(crate::ai::e2e::DIR_DESKTOP_TO_BROWSER, counter as u64));
+                let plain = crate::ai::e2e::open_detached(
+                    &[seed; 32],
+                    &tunnel.identity.public_key_bytes(),
+                    crate::ai::e2e::DIR_DESKTOP_TO_BROWSER,
+                    &B64.encode(nonce),
+                    &B64.encode(ct),
+                )
+                .unwrap();
+                serde_json::from_slice(&plain).unwrap()
+            })
+            .collect()
+    }
+
+    /// The last frame posted for request `id`: its answer.
+    fn frame_of(tunnel: &AiTunnel, server: &crate::link::testkit::Provider, id: &str, seed: u8) -> Value {
+        frames_of(tunnel, server, id, seed).pop().unwrap()
+    }
+
+    /// The status request `id` was reported with.
+    fn completed_as(server: &crate::link::testkit::Provider, id: &str) -> Option<String> {
+        server
+            .requests()
+            .into_iter()
+            .find(|r| r.line() == format!("POST /api/v1/desktop-ai/{id}/complete"))
+            .map(|r| serde_json::from_str::<Value>(&r.body).unwrap()["status"].as_str().unwrap().to_string())
+    }
+
+    /// Wait (yielding, so the picture's task runs) until `done`, or fail after 20 seconds.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "waited 20 seconds for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The contract's concurrency: a picture takes a minute, and the chat turn after it in the same batch is answered
+    /// meanwhile. The engines here make the picture only once the chat turn has been reported, so a lane that served
+    /// them one after the other would wait on itself: the cycle has ten seconds. A second picture offered while the
+    /// first is being made is left unclaimed, and claimed at the next poll once the slot is free.
+    #[tokio::test]
+    async fn a_chat_turn_is_answered_while_a_picture_is_being_made() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let chat_reported = {
+            let lines = lines.clone();
+            move || lines.lock().unwrap().iter().any(|l| l == "POST /api/v1/desktop-ai/chat-1/complete")
+        };
+        // (the picture was at the engines while the chat turn was still open)
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let hold = {
+            let overlapped = overlapped.clone();
+            move || {
+                let reported = chat_reported();
+                if !reported {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                reported
+            }
+        };
+        let engines = fake_engines(Setup {
+            picture: crate::ai::tunnel_pictures::tests::detailed_png(1024, 1024),
+            chat_delay: Duration::from_millis(500),
+            hold: Some(Arc::new(hold)),
+            ..Setup::default()
+        })
+        .await;
+        let (mut tunnel, _dir) = tunnel_with_engines("picture-beside-chat", Some(engines.ui.clone()));
+        // (says it is drawing every tenth of a second, not every fifteen)
+        Arc::get_mut(&mut tunnel).unwrap().picture_progress = Duration::from_millis(100);
+
+        let first = sealed_to(&tunnel, 0x11, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let chat = sealed_to(&tunnel, 0x22, &json!({ "v": 1, "kind": "chat", "providerId": "oaiy-engine", "messages": [{ "role": "user", "content": "hi" }] }));
+        let second = sealed_to(&tunnel, 0x33, &sealed(json!({ "providerId": "oaiy-engine", "seed": null, "size": "512x512" })));
+        let batch = json!({ "requests": [pending_row("picture-1", "image", &first), pending_row("chat-1", "chat", &chat), pending_row("picture-2", "image", &second)] }).to_string();
+        let later = json!({ "requests": [pending_row("picture-2", "image", &second)] }).to_string();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let (lines, polls) = (lines.clone(), polls.clone());
+            Provider::start(move |req| {
+                lines.lock().unwrap().push(req.line());
+                if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                    Reply::ok(if polls.fetch_add(1, Ordering::SeqCst) == 0 { &batch } else { &later })
+                } else {
+                    Reply::ok("{}")
+                }
+            })
+        };
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        let handled = tokio::time::timeout(Duration::from_secs(10), tunnel.poll_cycle(&account, &spec, "oaiy-test"))
+            .await
+            .expect("the chat turn waited for the picture")
+            .unwrap();
+        assert_eq!(handled, 2, "the picture being made and the chat turn answered: {:?}", server.lines());
+        assert_eq!(completed_as(&server, "chat-1").as_deref(), Some("done"));
+        assert!(!server.lines().iter().any(|l| l.contains("picture-2")), "the second picture is left unclaimed: {:?}", server.lines());
+
+        until("the picture", || completed_as(&server, "picture-1").is_some()).await;
+        assert!(overlapped.load(Ordering::SeqCst), "the picture was being made while the chat turn was answered");
+        let order = server.lines();
+        let at = |line: &str| order.iter().position(|l| l == line).unwrap();
+        assert!(at("POST /api/v1/desktop-ai/chat-1/complete") < at("POST /api/v1/desktop-ai/picture-1/complete"), "{order:?}");
+        assert!(at("POST /api/v1/desktop-ai/picture-1/claim") < at("POST /api/v1/desktop-ai/chat-1/claim"), "claimed in the batch's order: {order:?}");
+        assert_eq!(completed_as(&server, "picture-1").as_deref(), Some("done"));
+
+        let answer = frames_of(&tunnel, &server, "chat-1", 0x22);
+        assert_eq!(answer.len(), 1, "a chat turn's frames are as they were: {answer:?}");
+        assert!(answer[0].to_string().contains("hello from the engine"), "{answer:?}");
+        // While it was drawn the picture said so, in frames of their own kind, and then came in chat's final kind.
+        let mut frames = frames_of(&tunnel, &server, "picture-1", 0x11);
+        let made = frames.pop().unwrap();
+        assert!(!frames.is_empty(), "no progress frame while the picture was drawn");
+        assert!(frames.iter().all(|f| *f == crate::ai::tunnel_pictures::progress_frame()), "{frames:?}");
+        assert_eq!((made["kind"].as_str(), made["type"].as_str()), (Some("final"), Some("final")));
+        let picture = &made["picture"];
+        assert_eq!((picture["mimeType"].as_str(), picture["seed"].as_u64(), picture["model"].as_str()), (Some("image/jpeg"), Some(12345), Some("flux-3-klein")));
+        let bytes = B64.decode(picture["data"].as_str().unwrap()).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(u64::from(decoded.width()), picture["width"].as_u64().unwrap());
+        assert!(made.to_string().len() <= crate::ai::e2e::MAX_ENVELOPE_PLAINTEXT_BYTES);
+
+        // The slot is free: the next poll claims the second picture, whose seed is this computer's to choose.
+        assert_eq!(tunnel.picture_slot.available_permits(), 1);
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the second picture", || completed_as(&server, "picture-2").is_some()).await;
+        let second = frame_of(&tunnel, &server, "picture-2", 0x33);
+        let sent = engines.pictures_asked();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(second["picture"]["seed"], sent[1].body["seed"], "the seed chosen is the one reported");
+        assert!(sent.iter().all(|a| a.body["incognito"] == true && a.incognito_header.as_deref() == Some("1")));
+    }
+
+    /// A picture whose claim another computer won is not made: the engines are never asked, and the slot is free again.
+    #[tokio::test]
+    async fn a_picture_whose_claim_is_lost_is_never_made() {
+        use crate::link::testkit::{Provider, Reply};
+        let engines = fake_engines(Setup::default()).await;
+        let (tunnel, _dir) = tunnel_with_engines("picture-lost", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x44, &sealed(json!({})));
+        let batch = json!({ "requests": [pending_row("picture-1", "image", &row)] }).to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else if req.target.ends_with("/claim") {
+                Reply::status(409, r#"{"code":"already_claimed"}"#)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0, "a lost claim is not work done");
+        // (time for anything that had been started to reach the engines)
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(engines.pictures_asked().is_empty(), "{:?}", engines.pictures_asked());
+        assert_eq!(tunnel.picture_slot.available_permits(), 1, "the slot is free again");
+        assert!(!server.lines().iter().any(|l| l.ends_with("/frames") || l.ends_with("/complete")), "{:?}", server.lines());
+    }
+
+    /// A picture request that does not open, or that the engines refuse, is answered in the contract's shape:
+    /// `{error: {code, message}}`, with a code of its own list.
+    #[tokio::test]
+    async fn a_refused_picture_is_answered_in_the_contracts_shape() {
+        use crate::link::testkit::{Provider, Reply};
+        let engines = fake_engines(Setup::default()).await;
+        let (tunnel, _dir) = tunnel_with_engines("picture-refused", Some(engines.ui.clone()));
+        // Sealed with another key than the row names: it does not open, and the error goes back under the row's.
+        let (garbled_key, _) = sealed_to(&tunnel, 0x55, &json!({}));
+        let (_, other) = sealed_to(&tunnel, 0x56, &sealed(json!({})));
+        let disabled = sealed_to(&tunnel, 0x57, &sealed(json!({ "model": "qwen-image-2.1" })));
+        let batch = json!({ "requests": [pending_row("garbled", "image", &(garbled_key, other))] }).to_string();
+        let later = json!({ "requests": [pending_row("disabled", "image", &disabled)] }).to_string();
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(if polls.fetch_add(1, Ordering::SeqCst) == 0 { &batch } else { &later })
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the garbled picture", || completed_as(&server, "garbled").is_some()).await;
+        assert_eq!(completed_as(&server, "garbled").as_deref(), Some("failed"));
+        let refused = frame_of(&tunnel, &server, "garbled", 0x55);
+        assert_eq!(refused["error"]["code"], "bad_request", "{refused}");
+        assert_eq!(refused["kind"], "final", "an error ends a picture as its picture would: {refused}");
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the disabled picture", || completed_as(&server, "disabled").is_some()).await;
+        let refused = frame_of(&tunnel, &server, "disabled", 0x57);
+        assert_eq!(refused["error"]["code"], "model_disabled", "{refused}");
+        assert!(refused["error"]["message"].as_str().unwrap().contains("qwen-image-2.1 is disabled"), "{refused}");
+        assert_eq!(engines.pictures_asked().len(), 1, "the engines said why; no picture was made");
+    }
+
+    /// The site lists the engine's picture models through the lane, each with its type, on a computer that has no
+    /// language model chosen: listing needs none, though a chat turn still does.
+    #[tokio::test]
+    async fn the_engines_picture_models_are_listed_with_no_language_model_chosen() {
+        let engines = fake_engines(Setup { llm: String::new(), ..Setup::default() }).await;
+        let (tunnel, _dir) = tunnel_with_engines("picture-models", Some(engines.ui.clone()));
+        let listed: Value = serde_json::from_slice(&tunnel.list_models("oaiy-engine").await.unwrap()).unwrap();
+        assert_eq!(listed["models"][0], json!({ "id": "flux-3-klein", "type": "image" }), "{listed}");
+        let Err(chat) = tunnel.resolve("oaiy-engine").await else { panic!("a chat turn needs a language model chosen") };
+        assert!(chat.message.contains("no language model chosen"), "{}", chat.message);
     }
 
     #[test]

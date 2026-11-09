@@ -101,6 +101,13 @@ pub struct Fitted {
 /// `bytes`, a picture, in at most `max` bytes: as it is when it fits, else as a JPEG that does.
 pub fn fit(bytes: &[u8], max: usize) -> Result<Fitted, String> {
     let picture = image::load_from_memory(bytes).map_err(|e| format!("it is not a picture this can read ({e})"))?;
+    fit_decoded(bytes, &picture, max)
+}
+
+/// [`fit`], for `picture`, already decoded from `bytes`: a caller that has to tell a picture it cannot read from one
+/// that does not fit (the AI lane's pictures, `ai::tunnel_pictures`, answer the two with different codes) decodes it
+/// itself, and every error here is then one of size.
+pub fn fit_decoded(bytes: &[u8], picture: &image::DynamicImage, max: usize) -> Result<Fitted, String> {
     let (width, height) = (picture.width(), picture.height());
     if bytes.len() <= max {
         let mime = match image::guess_format(bytes) {
@@ -111,6 +118,12 @@ pub fn fit(bytes: &[u8], max: usize) -> Result<Fitted, String> {
         };
         return Ok(Fitted { bytes: bytes.to_vec(), mime, width, height, reencoded: false });
     }
+    jpeg_within(picture, max)
+}
+
+/// `picture` as a JPEG of at most `max` bytes: a lower quality first, then smaller. The encoder writes baseline
+/// JPEGs (never progressive), which every reader takes.
+pub fn jpeg_within(picture: &image::DynamicImage, max: usize) -> Result<Fitted, String> {
     let mut current = picture.to_rgb8();
     loop {
         for quality in QUALITIES {

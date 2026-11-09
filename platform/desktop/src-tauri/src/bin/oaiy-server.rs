@@ -67,6 +67,13 @@
 //!
 //! SIGTERM / Ctrl-C stops every managed service before exiting, and on unix the plugins
 //! first (on Windows a plugin ends with the server's job object).
+//!
+//! Linking to a site's account: the desktop's browser ceremony ends in a redirect to
+//! 127.0.0.1 on the computer that started it, which a server has no browser for. So a
+//! server links with a one-time code its owner makes on the site ("Connect an OAIY
+//! server"): `oaiy-server link --code <code> --base-url <url> [--name <device>]`. It
+//! writes the link into the data folder (OAIY_DATA_DIR) as the ceremony does, starts
+//! nothing, and the server serves the link from its next start.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -155,6 +162,8 @@ const USAGE: &str = "usage:
   oaiy-server check           validate the configuration and the data folder
   oaiy-server auth ...        the console: setup, passwords, tokens, sessions
   oaiy-server flows ...       the flows the console can list and approve
+  oaiy-server link --code <code> --base-url <url> [--name <device>] [--connector <id>]
+                              link this server to a site's account with a one-time code made there
   oaiy-server --help | --version";
 
 /// What the arguments ask for: the server only when there are none, so that a mistyped word (`oaiyctl status`, with
@@ -167,6 +176,7 @@ fn main() {
     match args.first().map(String::as_str) {
         None => {}
         Some("auth" | "check" | "flows") => std::process::exit(console(&args)),
+        Some("link") => std::process::exit(link(&args[1..])),
         Some("--help") if args.len() == 1 => {
             println!("{USAGE}");
             return;
@@ -209,21 +219,97 @@ fn console(args: &[String]) -> i32 {
     2
 }
 
+/// The data folder: OAIY_DATA_DIR, else `.oaiy-server` in the home folder. The server and the link
+/// command find it alike, so a link is written where the server reads it.
+fn data_dir() -> Result<PathBuf, String> {
+    match std::env::var_os("OAIY_DATA_DIR") {
+        Some(d) => Ok(PathBuf::from(d)),
+        None => home_dir()
+            .map(|h| h.join(".oaiy-server"))
+            .ok_or_else(|| "set OAIY_DATA_DIR — no HOME/USERPROFILE to derive a default data dir".to_string()),
+    }
+}
+
+/// `oaiy-server link --code <code> --base-url <url> [--name <device>] [--connector <id>]`: link the
+/// data folder's install to a site's account with a one-time code its owner made there. It runs
+/// before (and without) the server: it writes `link/account.json` and ends, and the server serves
+/// the link from its next start. Exit 0 linked, 1 not (said why), 2 the arguments.
+fn link(args: &[String]) -> i32 {
+    let (mut code, mut base, mut name, mut connector) = (None, None, None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        // `--flag value` or `--flag=value`
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let slot: &mut Option<String> = match flag {
+            "--code" => &mut code,
+            "--base-url" => &mut base,
+            "--name" => &mut name,
+            "--connector" => &mut connector,
+            _ => {
+                eprintln!("oaiy-server link: unknown argument {arg:?}\n{USAGE}");
+                return 2;
+            }
+        };
+        let Some(value) = inline.or_else(|| rest.next().cloned()) else {
+            eprintln!("oaiy-server link: {flag} needs a value\n{USAGE}");
+            return 2;
+        };
+        if slot.replace(value).is_some() {
+            eprintln!("oaiy-server link: {flag} is given twice");
+            return 2;
+        }
+    }
+    let (Some(code), Some(base)) = (code, base) else {
+        eprintln!("oaiy-server link: --code and --base-url are both needed\n{USAGE}");
+        return 2;
+    };
+    let data_dir = match data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("oaiy-server: {e}");
+            return 1;
+        }
+    };
+    // Owner-only when this makes it, as the server makes it: the link's key is kept in here.
+    if let Err(e) = oaiy_desktop_lib::secret_file::create_private_dir(&data_dir) {
+        eprintln!("oaiy-server: cannot create data dir {}: {e}", data_dir.display());
+        return 1;
+    }
+    match oaiy_desktop_lib::link::link_with_code(data_dir.clone(), connector.as_deref(), &base, &code, name.as_deref()) {
+        Ok(account) => {
+            // (never the key: it is in the file, owner-only, and nowhere else)
+            println!(
+                "oaiy-server: linked to {} as {:?}{}",
+                account.base_url,
+                account.account_name.as_deref().unwrap_or("this computer"),
+                account.account_id.as_deref().map(|id| format!(" (connection {id})")).unwrap_or_default(),
+            );
+            println!(
+                "oaiy-server: the link is kept in {}. Start oaiy-server (restart it, if it is running) to serve the site.",
+                data_dir.join("link").join("account.json").display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("oaiy-server link: {e}");
+            1
+        }
+    }
+}
+
 async fn server_main() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
-    let data_dir = match std::env::var_os("OAIY_DATA_DIR") {
-        Some(d) => PathBuf::from(d),
-        None => match home_dir() {
-            Some(h) => h.join(".oaiy-server"),
-            None => {
-                eprintln!(
-                    "oaiy-server: set OAIY_DATA_DIR — no HOME/USERPROFILE to derive a default data dir"
-                );
-                std::process::exit(1);
-            }
-        },
+    let data_dir = match data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("oaiy-server: {e}");
+            std::process::exit(1);
+        }
     };
     let models_dir = std::env::var_os("OAIY_MODELS_DIR")
         .map(PathBuf::from)
