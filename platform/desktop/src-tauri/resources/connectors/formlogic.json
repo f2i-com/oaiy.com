@@ -53,7 +53,8 @@
     "completePath": "/api/v1/desktop-flows/{id}/complete",
     "waitSeconds": 25,
     "batchLimit": 1,
-    "errorBackoffSeconds": 10
+    "errorBackoffSeconds": 10,
+    "scope": "flows:read"
   },
   "desktopAi": {
     "pubkeyPath": "/api/v1/desktop-ai/pubkey",

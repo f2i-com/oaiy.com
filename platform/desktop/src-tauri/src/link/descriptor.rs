@@ -924,9 +924,19 @@ pub struct RelaySpec {
     /// begins (see [`super::net::LaneClient::rest`]), and holds none through it.
     #[serde(default = "default_idle_pause_ms")]
     pub idle_pause_ms: u64,
+    /// The scope a link needs for this lane. A link the provider did not grant it
+    /// (one made for AI alone) does not poll a lane that would refuse it at every
+    /// poll. None: any link polls it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl RelaySpec {
+    /// Whether `account` was granted what this lane needs ([`RelaySpec::scope`]).
+    pub fn granted_to(&self, account: &super::LinkedAccount) -> bool {
+        self.scope.as_deref().is_none_or(|scope| account.grants(scope))
+    }
+
     /// How long this lane waits before polling again after one that came back
     /// with nothing, given how long that poll took.
     pub fn idle_pause(&self, polled_for: std::time::Duration) -> std::time::Duration {

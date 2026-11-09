@@ -405,6 +405,12 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
             };
+            // A link made without the lane's scope (one for AI alone) runs no flows: every poll
+            // would be refused, ten seconds apart, and the refusal kept as the lane's state.
+            if !spec.granted_to(&account) {
+                std::thread::sleep(Duration::from_secs(30));
+                continue;
+            }
             let http = match lane.get() {
                 Ok(http) => http,
                 Err(_) => {
@@ -1151,6 +1157,32 @@ mod tests {
         crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 1], "{:?}", server.lines());
+    }
+
+    /// A link made for AI alone (`connector:relay`) is never sent to the sealed flows: FormLogic refuses it them
+    /// (`insufficient_scope`, App AI §0.10), and the lane would ask again every ten seconds. A link granted flows asks.
+    #[test]
+    fn a_link_made_for_ai_alone_does_not_poll_the_sealed_flows() {
+        let polls = |tag: &str, granted: &str| {
+            let server = Provider::start(|_| Reply::ok(&json!({"requests":[]}).to_string()));
+            let (made, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| {
+                d.desktop_flows.as_mut().unwrap().wait_seconds = 1;
+            });
+            let mut account = made.account().unwrap();
+            account.granted_scopes = Some(granted.into());
+            let store = crate::link::store_for_tests(dir.clone(), Some(account));
+            spawn_on(store.clone(), None, a_client_of_its_own());
+            std::thread::sleep(Duration::from_millis(1_500));
+            crate::link::testkit::stop_lane(&store);
+            let _ = std::fs::remove_dir_all(dir);
+            (server.lines().iter().filter(|l| l.contains("/api/v1/desktop-flows/")).count(), store.status())
+        };
+        let (ai_only, status) = polls("sealed-ai-only", "connector:relay");
+        assert_eq!(ai_only, 0, "an AI-only link polled the sealed flows");
+        let said = serde_json::to_string(&status).unwrap();
+        assert!(!said.contains("sealed flow poll"), "no refusal kept as the lane's state: {said}");
+        let (full, _) = polls("sealed-full", "flows:read flows:write connector:relay");
+        assert!(full >= 1, "a link granted flows polls them");
     }
 
     #[test]

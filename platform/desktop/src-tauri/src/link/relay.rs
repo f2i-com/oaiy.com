@@ -89,6 +89,8 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
         };
         let Some(spec) = descriptor::find(store.data_dir(), &account.connector_id)
             .and_then(|d| d.relay)
+            // (a link not granted the lane's scope has no commands to take here)
+            .filter(|spec| spec.granted_to(&account))
         else {
             std::thread::sleep(Duration::from_secs(30));
             continue;
@@ -524,6 +526,7 @@ mod tests {
             batch_limit: 5,
             error_backoff_seconds: 1,
             idle_pause_ms: 500,
+            scope: None,
         }
     }
 

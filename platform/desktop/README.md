@@ -319,8 +319,10 @@ oaiy-server link --code K7QM-2WXR-9DFT --base-url https://formlogic.com [--name 
 
 It redeems the code (`POST /api/oauth/oaiy-link`, the descriptor's `auth.linkCode`), writes the
 `link/account.json` the browser link writes, and ends; the server serves the link from its next
-start. A link made "AI only" (`connector:relay`) does not ask for the flow-run queue or the script
-prelude, which need `flows:read`.
+start. A link made "AI only" (`connector:relay`) does not ask for the flow-run queue, the script
+prelude or the sealed flows, which need `flows:read` (the descriptor's `queueScope`, `scope`), and
+takes a storage-node enrolment refused `insufficient_scope` as one not offered: no error, and no
+record to read back.
 
 Configuration is by environment variable (no pointer file):
 
