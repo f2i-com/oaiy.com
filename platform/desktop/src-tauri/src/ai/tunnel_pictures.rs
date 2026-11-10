@@ -842,6 +842,8 @@ pub(crate) mod tests {
         /// The chat route answers as a stream (`text/event-stream`), in this many pieces with this long before each,
         /// as a model writing its answer does; none: one whole answer.
         pub chat_stream: Option<(usize, Duration)>,
+        /// A chunk of another kind in the stream (a tool call's piece, say), sent after this many pieces of text.
+        pub chat_stream_odd: Option<(usize, Value)>,
     }
 
     impl Default for Setup {
@@ -861,6 +863,7 @@ pub(crate) mod tests {
                 hold: None,
                 chat_hold: None,
                 chat_stream: None,
+                chat_stream_odd: None,
             }
         }
     }
@@ -925,24 +928,45 @@ pub(crate) mod tests {
         chat_pieces: Arc<AtomicUsize>,
     }
 
-    /// A chat answer as a stream of `pieces` chunks in OpenAI's shape, `gap` before each, then `[DONE]`. Each piece
-    /// written is counted; a caller that hangs up ends the stream, and the count with it.
-    fn streamed_answer(pieces: usize, gap: Duration, written: Arc<AtomicUsize>) -> axum::response::Response {
+    /// A chat answer as a stream, as `oaiy-llm-server` writes one (OpenAI's shape, and its own word of the prompt's
+    /// progress), `gap` before each chunk: who speaks, how far the prompt has got (twice, with no choices),
+    /// `pieces` chunks of text ("word0 ", "word1 ", …), why the model stopped, what it used (with no choices), then
+    /// `[DONE]`. `odd`: a chunk of another kind sent after that many pieces. Each piece written is counted; a
+    /// caller that hangs up ends the stream, and the count with it.
+    fn streamed_answer(pieces: usize, gap: Duration, odd: Option<(usize, Value)>, written: Arc<AtomicUsize>) -> axum::response::Response {
         use axum::response::IntoResponse;
-        let stream = futures_util::stream::unfold(0usize, move |i| {
+        let chunk = |choices: Value, more: Value| {
+            let mut chunk = json!({ "id": "cmpl-1", "object": "chat.completion.chunk", "created": 7, "model": "flash", "choices": choices });
+            for (key, value) in more.as_object().into_iter().flatten() {
+                chunk[key] = value.clone();
+            }
+            format!("data: {chunk}\n\n")
+        };
+        let said = |delta: Value, finish: Value| json!([{ "index": 0, "delta": delta, "finish_reason": finish }]);
+        // (each event, and whether it is a piece of the text)
+        let mut events: Vec<(bool, String)> = vec![
+            (false, chunk(said(json!({ "role": "assistant", "content": "" }), Value::Null), json!({}))),
+            (false, chunk(json!([]), json!({ "oaiy_progress": { "prompt_done": 0, "prompt_total": 3 } }))),
+            (false, chunk(json!([]), json!({ "oaiy_progress": { "prompt_done": 3, "prompt_total": 3 } }))),
+        ];
+        for i in 0..pieces {
+            events.push((true, chunk(said(json!({ "content": format!("word{i} ") }), Value::Null), json!({}))));
+            if let Some((_, odd)) = odd.as_ref().filter(|(after, _)| *after == i + 1) {
+                events.push((false, format!("data: {odd}\n\n")));
+            }
+        }
+        events.push((false, chunk(said(json!({}), json!("stop")), json!({}))));
+        events.push((false, chunk(json!([]), json!({ "usage": { "prompt_tokens": 3, "completion_tokens": pieces, "total_tokens": pieces + 3 } }))));
+        events.push((false, "data: [DONE]\n\n".to_string()));
+        let stream = futures_util::stream::unfold(events.into_iter(), move |mut rest| {
             let written = written.clone();
             async move {
-                if i > pieces {
-                    return None;
-                }
+                let (piece, event) = rest.next()?;
                 tokio::time::sleep(gap).await;
-                let event = if i == pieces {
-                    "data: [DONE]\n\n".to_string()
-                } else {
+                if piece {
                     written.fetch_add(1, Ordering::SeqCst);
-                    format!("data: {}\n\n", json!({ "id": "cmpl-1", "object": "chat.completion.chunk", "choices": [{ "index": 0, "delta": { "content": format!("word{i} ") } }] }))
-                };
-                Some((Ok::<_, std::convert::Infallible>(event), i + 1))
+                }
+                Some((Ok::<_, std::convert::Infallible>(event), rest))
             }
         });
         ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
@@ -997,7 +1021,7 @@ pub(crate) mod tests {
                         }
                     }
                     if let Some((pieces, gap)) = s.setup.chat_stream {
-                        return streamed_answer(pieces, gap, s.chat_pieces.clone());
+                        return streamed_answer(pieces, gap, s.setup.chat_stream_odd.clone(), s.chat_pieces.clone());
                     }
                     Json(json!({
                         "id": "cmpl-1",

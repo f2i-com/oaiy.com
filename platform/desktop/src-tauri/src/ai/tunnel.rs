@@ -155,11 +155,20 @@ impl From<PictureError> for TunnelError {
 /// to the reader — the browser appends whatever arrives — and still shows the
 /// answer building rather than landing all at once.
 const DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(220);
-/// …or sooner once this much text is waiting.
+/// …or sooner once this much text is waiting (the ChatGPT stream).
 const DELTA_FLUSH_BYTES: usize = 400;
 /// Bound on the frames one turn may emit, so a runaway stream cannot hold the
-/// lane open indefinitely.
+/// lane open indefinitely. Of a provider's stream it bounds the chunks, each of
+/// which was once a frame: an answer is as long as it could be before they were
+/// gathered ([`Gathered`]), and no longer.
 const MAX_STREAM_FRAMES: u64 = 4096;
+/// How often word of a turn whose answer has not begun goes by itself (how far
+/// the prompt has got, while a long one goes in): see `stream_registry`.
+const BEFORE_THE_ANSWER_EVERY: Duration = Duration::from_secs(1);
+/// The most text gathered into one frame of a provider's stream before it goes
+/// without waiting for its interval: far under what a frame carries (256 KiB),
+/// and far over what a model writes in an interval.
+const GATHER_AT_MOST_BYTES: usize = 32 * 1024;
 
 /// Everything one claimed turn needs to talk back to the provider.
 ///
@@ -1563,11 +1572,23 @@ impl AiTunnel {
         })
     }
 
-    /// Stream a registry provider's answer, forwarding each upstream chunk.
+    /// Stream a registry provider's answer (OAIY's engine among them), its chunks
+    /// gathered into a few frames a second.
     ///
-    /// The chunk goes through VERBATIM, nested under `delta`. Spreading it at
-    /// the frame's top level instead is silently dropped by the reader — no
-    /// error, just an answer that never appears.
+    /// A model writes a chunk a token, fifty and more a second, and a frame each
+    /// was a request each to the provider: 282 in five seconds of one answer,
+    /// against the 600 a minute a FormLogic link's key may make, so one long
+    /// answer had every other request of the link refused. The chunks are now
+    /// joined ([`Gathered`]): the first text goes at once, so the reader sees the
+    /// answer start, and what follows goes every [`DELTA_FLUSH_INTERVAL`], the
+    /// last of it before the final frame. No text is lost by it: a chunk that
+    /// cannot be joined to others goes as it came, in its place. Before the
+    /// first text there is only word of the turn, which goes with that text, or
+    /// by itself every [`BEFORE_THE_ANSWER_EVERY`] while the text is awaited.
+    ///
+    /// A frame's chunk is nested under `delta`, in the shape the provider sent.
+    /// Spreading it at the frame's top level instead is silently dropped by the
+    /// reader — no error, just an answer that never appears.
     async fn stream_registry(
         &self,
         lane: &Lane<'_>,
@@ -1599,10 +1620,44 @@ impl AiTunnel {
 
         let mut stream = upstream.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut sent = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| TunnelError::new("upstream_error", format!("stream read failed: {e}")))?;
+        // The provider's chunks read, and the frames made of them.
+        let (mut chunks, mut frames) = (0u64, 0u64);
+        // The chunks waiting to go as one frame, and when the last frame went (the stream's start, until one has).
+        let mut waiting = Gathered::default();
+        let mut last_frame = std::time::Instant::now();
+        // Whether a frame with text in it has gone: until then, the first text does not wait.
+        let mut begun = false;
+        // How long what is waiting may wait since the last frame: an interval, once there is text. Before any,
+        // only word of the turn is waiting (who speaks, how far the prompt has got), which nobody reads as it
+        // comes: it goes with the first text, or by itself once a second while the answer is still to begin, so
+        // that the provider hears of the turn and can say it was cancelled.
+        let pace = |waiting: &Gathered, begun: bool| if begun || waiting.has_text() { DELTA_FLUSH_INTERVAL } else { BEFORE_THE_ANSWER_EVERY };
+        loop {
+            // What is waiting goes when its time comes, whether or not the provider sends more meanwhile (a model
+            // that pauses mid-answer does not keep the last words back).
+            let next = if waiting.is_empty() {
+                stream.next().await
+            } else {
+                let due_in = pace(&waiting, begun).saturating_sub(last_frame.elapsed());
+                match tokio::time::timeout(due_in, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        begun |= waiting.has_text();
+                        self.post_delta(lane, waiting.chunk(), &mut frames).await?;
+                        last_frame = std::time::Instant::now();
+                        continue;
+                    }
+                }
+            };
+            let Some(chunk) = next else { break };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    // (what was read is not lost with the stream)
+                    self.post_gathered(lane, &mut waiting, &mut frames).await?;
+                    return Err(TunnelError::new("upstream_error", format!("stream read failed: {e}")));
+                }
+            };
             buf.extend_from_slice(&chunk);
             while let Some(end) = sse_event_end(&buf) {
                 let event: Vec<u8> = buf.drain(..end).collect();
@@ -1617,31 +1672,34 @@ impl AiTunnel {
                     let Ok(delta) = serde_json::from_slice::<Value>(data) else {
                         continue;
                     };
-                    sent += 1;
-                    if sent > MAX_STREAM_FRAMES {
+                    chunks += 1;
+                    if chunks > MAX_STREAM_FRAMES {
+                        self.post_gathered(lane, &mut waiting, &mut frames).await?;
                         return Err(TunnelError::new(
                             "upstream_error",
                             "the provider's stream exceeded the frame cap",
                         ));
                     }
-                    let frame = json!({ "v": 1, "type": "delta", "kind": "delta", "delta": delta });
-                    let envelope = self
-                        .sessions
-                        .seal_outbound(lane.id, frame.to_string().as_bytes())
-                        .map_err(|e| TunnelError::new(e.code(), e.message()))?;
-                    match lane.post_frame(&envelope).await {
-                        Ok(()) => {}
-                        // The request is over. The provider's stream goes as this returns, and a
-                        // server whose reader has gone stops writing the answer (OAIY's engine does).
-                        Err(FrameRefused::Cancelled) => return Err(TunnelError::cancelled()),
-                        // A dropped frame leaves a gap the reader can see in its
-                        // own text; abandoning the turn over it would be worse.
-                        Err(e) => log::warn!("AI turn {} delta {sent}: {e}", lane.id),
+                    if !waiting.take(&delta) {
+                        // Not text to join to other text (a tool call, a second choice): what is waiting goes
+                        // first, then this as it came, so everything stays in the provider's order.
+                        self.post_gathered(lane, &mut waiting, &mut frames).await?;
+                        self.post_delta(lane, delta, &mut frames).await?;
+                        last_frame = std::time::Instant::now();
                     }
                 }
             }
+            // The first text at once, so the reader sees the answer start; after it, a frame an interval (or
+            // sooner, should more be waiting than a frame ought to carry).
+            if !waiting.is_empty() && ((!begun && waiting.has_text()) || waiting.is_full() || last_frame.elapsed() >= pace(&waiting, begun)) {
+                begun |= waiting.has_text();
+                self.post_delta(lane, waiting.chunk(), &mut frames).await?;
+                last_frame = std::time::Instant::now();
+            }
         }
-        if sent == 0 {
+        // The stream is over: the last of it goes before the final frame.
+        self.post_gathered(lane, &mut waiting, &mut frames).await?;
+        if chunks == 0 {
             // Say so rather than closing a turn with no content and no reason:
             // an empty answer with a `done` status reads as the model having
             // nothing to say.
@@ -1651,6 +1709,37 @@ impl AiTunnel {
             ));
         }
         Ok(final_after_stream())
+    }
+
+    /// Post what is waiting of a provider's stream, if anything is.
+    async fn post_gathered(&self, lane: &Lane<'_>, waiting: &mut Gathered, frames: &mut u64) -> Result<(), TunnelError> {
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        self.post_delta(lane, waiting.chunk(), frames).await
+    }
+
+    /// Seal one chunk of a provider's stream (one of its own, or several gathered into one) as a delta frame, and
+    /// post it.
+    async fn post_delta(&self, lane: &Lane<'_>, chunk: Value, frames: &mut u64) -> Result<(), TunnelError> {
+        *frames += 1;
+        let frame = json!({ "v": 1, "type": "delta", "kind": "delta", "delta": chunk });
+        let envelope = self
+            .sessions
+            .seal_outbound(lane.id, frame.to_string().as_bytes())
+            .map_err(|e| TunnelError::new(e.code(), e.message()))?;
+        match lane.post_frame(&envelope).await {
+            Ok(()) => Ok(()),
+            // The request is over. The provider's stream goes as this returns, and a
+            // server whose reader has gone stops writing the answer (OAIY's engine does).
+            Err(FrameRefused::Cancelled) => Err(TunnelError::cancelled()),
+            // A dropped frame leaves a gap the reader can see in its
+            // own text; abandoning the turn over it would be worse.
+            Err(e) => {
+                log::warn!("AI turn {} delta {frames}: {e}", lane.id);
+                Ok(())
+            }
+        }
     }
 
     /// Seal and post whatever text is waiting, if any.
@@ -1798,6 +1887,125 @@ fn push_result(
             "content": rendered,
         })),
         None => prompted_extra.push(rendered),
+    }
+}
+
+/// The fields of a streamed chunk's delta that are pieces of a longer text, joined in order when chunks are
+/// gathered. Any other field of a delta (`role`) is a fact, of which the newest is kept.
+const DELTA_TEXT_FIELDS: [&str; 4] = ["content", "reasoning_content", "reasoning", "refusal"];
+
+/// Chunks of a provider's streamed answer (OpenAI's `chat.completion.chunk`) gathered into one of the same shape,
+/// to go as one frame: a reader that joins each frame's `choices[].delta.content` reads the same text from one
+/// gathered chunk as from the chunks it was made of.
+///
+/// - The delta's text fields ([`DELTA_TEXT_FIELDS`]) are joined in order.
+/// - Of everything else the newest is kept, a null never replacing a value: the chunk's own fields (`id`, `model`,
+///   `usage`), the choice's (`finish_reason`, which only the last chunk says) and the delta's (`role`).
+/// - A chunk with no choices (`choices: []`) is no part of the answer but word of how the turn is getting on:
+///   what was used (OpenAI's last chunk), or from OAIY's engine how far the prompt has got (`oaiy_progress`, sent
+///   as it goes) and how much the model has thought (`oaiy_thinking`). Its fields are the chunk's own, so only
+///   the newest of each goes on, with the text gathered beside it or by itself.
+#[derive(Default)]
+struct Gathered {
+    /// The chunk's own fields, but `choices`.
+    top: serde_json::Map<String, Value>,
+    /// Its one choice's fields, but `delta`.
+    choice: serde_json::Map<String, Value>,
+    delta: serde_json::Map<String, Value>,
+    /// Whether any of its chunks had a choice (else it goes with `choices: []`, as they came).
+    spoke: bool,
+    /// How many chunks are in it, and how many bytes of text.
+    chunks: usize,
+    text_bytes: usize,
+}
+
+impl Gathered {
+    fn is_empty(&self) -> bool {
+        self.chunks == 0
+    }
+
+    fn has_text(&self) -> bool {
+        self.text_bytes > 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.text_bytes >= GATHER_AT_MOST_BYTES
+    }
+
+    /// Add `chunk`, if it can be joined to others with nothing lost: an object with no choices (word of the turn,
+    /// see above), or with exactly one, of index 0, whose delta holds only text and nulls (so no tool call, which
+    /// comes in pieces of its own kind) and whose other fields are plain values (so no per-token `logprobs`).
+    /// False leaves it out, for the caller to send as it came: anything else, an object with no `choices` at all
+    /// among them (an error, or a side note of a provider's own).
+    fn take(&mut self, chunk: &Value) -> bool {
+        let Some(top) = chunk.as_object() else { return false };
+        let choice = match top.get("choices").and_then(Value::as_array).map(Vec::as_slice) {
+            Some([]) => None,
+            Some([choice]) => Some(choice),
+            _ => return false,
+        };
+        let parts = match choice {
+            None => None,
+            Some(choice) => {
+                let Some(choice) = choice.as_object() else { return false };
+                let Some(delta) = choice.get("delta").and_then(Value::as_object) else { return false };
+                let plain = |v: &Value| !v.is_array() && !v.is_object();
+                if !delta.values().all(|v| v.is_string() || v.is_null())
+                    || !choice.iter().all(|(key, v)| key == "delta" || plain(v))
+                    || choice.get("index").is_some_and(|i| i.as_u64() != Some(0))
+                {
+                    return false;
+                }
+                Some((choice, delta))
+            }
+        };
+        for (key, value) in top.iter().filter(|(key, _)| *key != "choices") {
+            newest(&mut self.top, key, value);
+        }
+        self.chunks += 1;
+        let Some((choice, delta)) = parts else { return true };
+        self.spoke = true;
+        for (key, value) in choice.iter().filter(|(key, _)| *key != "delta") {
+            newest(&mut self.choice, key, value);
+        }
+        for (key, value) in delta {
+            let text = DELTA_TEXT_FIELDS.contains(&key.as_str());
+            let joined = text
+                && match (value.as_str(), self.delta.get_mut(key)) {
+                    (Some(piece), Some(Value::String(so_far))) => {
+                        so_far.push_str(piece);
+                        true
+                    }
+                    _ => false,
+                };
+            if !joined {
+                newest(&mut self.delta, key, value);
+            }
+            if text {
+                self.text_bytes += value.as_str().map_or(0, str::len);
+            }
+        }
+        true
+    }
+
+    /// What was gathered, as one chunk, leaving this empty.
+    fn chunk(&mut self) -> Value {
+        let Gathered { mut top, mut choice, delta, spoke, .. } = std::mem::take(self);
+        let choices = if spoke {
+            choice.insert("delta".into(), Value::Object(delta));
+            json!([choice])
+        } else {
+            json!([])
+        };
+        top.insert("choices".into(), choices);
+        Value::Object(top)
+    }
+}
+
+/// Keep `value` under `key`, unless it is a null and something is there already.
+fn newest(into: &mut serde_json::Map<String, Value>, key: &str, value: &Value) {
+    if !value.is_null() || !into.contains_key(key) {
+        into.insert(key.to_string(), value.clone());
     }
 }
 
@@ -2958,9 +3166,226 @@ mod tests {
         until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
         assert_eq!((completed_as(&server, "picture-1").as_deref(), completed_as(&server, "chat-1").as_deref()), (Some("done"), Some("done")));
         assert_eq!(frame_of(&tunnel, &server, "picture-1", 0x86)["picture"]["mimeType"], "image/png");
-        // Every piece of the answer was written and sent on, then its last frame: 6 deltas and the final.
-        assert_eq!((engines.chat_pieces.load(Ordering::SeqCst), frames_posted(&server, "chat-1")), (6, 7), "{:?}", server.lines());
+        // Every piece of the answer was written, and the turn went on to its last frame, its first two frames lost.
+        assert_eq!(engines.chat_pieces.load(Ordering::SeqCst), 6, "{:?}", server.lines());
+        assert!(frames_posted(&server, "chat-1") >= 2, "{:?}", server.lines());
+        assert_eq!(frame_of(&tunnel, &server, "chat-1", 0x87), json!({ "v": 1, "type": "final", "kind": "final" }));
         assert_eq!(engines.abandoned.load(Ordering::SeqCst), 0, "the picture was not dropped");
+    }
+
+    /// The text a reader joins from a turn's delta frames: each frame's `choices[].delta.content`, as FormLogic reads.
+    fn text_read(frames: &[Value]) -> String {
+        frames.iter().map(|f| f["delta"]["choices"][0]["delta"]["content"].as_str().unwrap_or_default()).collect()
+    }
+
+    /// A long answer goes in a few frames a second, and none of it is lost. A frame a chunk, as it was, is a
+    /// request to the site for each token a model writes: 282 in five seconds of a real answer, against the 600 a
+    /// minute a link's key may make, so that one long answer had every other request of its link refused.
+    #[tokio::test]
+    async fn a_long_streamed_answer_goes_in_a_few_frames_a_second_and_loses_no_text() {
+        use crate::link::testkit::{Provider, Reply};
+        // 300 chunks, 10 ms and more apart: a model writing fast for three seconds or longer.
+        const PIECES: usize = 300;
+        let engines = fake_engines(Setup { chat_stream: Some((PIECES, Duration::from_millis(10))), ..Setup::default() }).await;
+        let (tunnel, _dir) = tunnel_with_engines("chat-gathered", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x88, &chat_turn());
+        let batch = json!({ "requests": [pending_row("chat-1", "chat", &row)] }).to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        assert_eq!(completed_as(&server, "chat-1").as_deref(), Some("done"));
+        assert_eq!(engines.chat_pieces.load(Ordering::SeqCst), PIECES);
+
+        let mut frames = frames_of(&tunnel, &server, "chat-1", 0x88);
+        assert_eq!(frames.pop().unwrap(), json!({ "v": 1, "type": "final", "kind": "final" }), "the answer was streamed: its last frame carries no text");
+        assert!(frames.iter().all(|f| f["kind"] == "delta" && f["type"] == "delta"), "{frames:?}");
+        // None of it is lost, and it reads in order: what a reader joins from the frames is what the model wrote.
+        let written: String = (0..PIECES).map(|i| format!("word{i} ")).collect();
+        assert_eq!(text_read(&frames), written);
+        // The first frame went at once with the start of the answer (its first word or three, not an interval's
+        // worth of them). With it went what came before the first word: who speaks, and the newest word of the
+        // prompt's progress, which had been two chunks with no choices.
+        let first = &frames[0]["delta"]["choices"][0]["delta"];
+        let began = first["content"].as_str().unwrap();
+        assert!(began.starts_with("word0 ") && began.len() <= "word0 word1 word2 ".len(), "{first}");
+        assert_eq!(first["role"], "assistant");
+        assert_eq!(frames[0]["delta"]["oaiy_progress"], json!({ "prompt_done": 3, "prompt_total": 3 }), "{}", frames[0]);
+        // The last says why the model stopped and what it used, as the provider's last chunks did.
+        let last = &frames.last().unwrap()["delta"];
+        assert_eq!((&last["choices"][0]["finish_reason"], &last["usage"]["completion_tokens"]), (&json!("stop"), &json!(PIECES)), "{last}");
+        assert_eq!((&last["id"], &last["model"]), (&json!("cmpl-1"), &json!("flash")));
+
+        // A few frames a second, where there was one a chunk. While the answer is written its frames are an interval
+        // apart, so never more than five in any second; when it ends, the last of its text and the final frame
+        // follow at once (two frames, once a turn).
+        let seen = server.requests();
+        let posted: Vec<std::time::Instant> = seen.iter().filter(|r| r.line() == "POST /api/v1/desktop-ai/chat-1/frames").map(|r| r.at).collect();
+        assert_eq!(posted.len(), frames.len() + 1);
+        let while_written = &posted[..posted.len() - 2];
+        for pair in while_written.windows(2) {
+            // (as the site saw them arrive, so a few milliseconds are allowed for)
+            assert!(pair[1] - pair[0] >= DELTA_FLUSH_INTERVAL - Duration::from_millis(10), "two frames {:?} apart", pair[1] - pair[0]);
+        }
+        for six in while_written.windows(6) {
+            assert!(six[5] - six[0] >= Duration::from_secs(1), "six frames in {:?} ({} frames in all)", six[5] - six[0], posted.len());
+        }
+        let took = posted[posted.len() - 1] - posted[0];
+        assert!(posted.len() as f64 <= 5.0 * took.as_secs_f64() + 3.0, "{} frames in {took:?}", posted.len());
+        assert!(frames.len() < PIECES / 5, "{} frames for {PIECES} chunks", frames.len());
+        // And it streamed: the first frame came promptly, long before the last, with frames between.
+        let claimed = seen.iter().find(|r| r.line() == "POST /api/v1/desktop-ai/chat-1/claim").unwrap().at;
+        assert!(posted[0] - claimed < Duration::from_secs(2), "the first frame waited {:?}", posted[0] - claimed);
+        assert!(took >= Duration::from_secs(1) && frames.len() >= 4, "{} frames in {took:?}", frames.len());
+    }
+
+    /// Before the answer begins there is only word of the turn (who speaks, how far the prompt has got). It does not
+    /// go a frame an interval, nobody reading it as it comes, but once a second while the first word is awaited, so
+    /// that the site hears of a turn whose prompt is long in going in; and the first word then goes at once.
+    #[tokio::test]
+    async fn word_of_a_turn_whose_answer_has_not_begun_goes_once_a_second() {
+        use crate::link::testkit::{Provider, Reply};
+        // A chunk every 300 ms: who speaks, the prompt's progress twice, then the first word 1.2 s in.
+        let engines = fake_engines(Setup { chat_stream: Some((4, Duration::from_millis(300))), ..Setup::default() }).await;
+        let (tunnel, _dir) = tunnel_with_engines("chat-slow-start", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x8a, &chat_turn());
+        let batch = json!({ "requests": [pending_row("chat-1", "chat", &row)] }).to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        let mut frames = frames_of(&tunnel, &server, "chat-1", 0x8a);
+        assert_eq!(frames.pop().unwrap(), json!({ "v": 1, "type": "final", "kind": "final" }));
+        assert_eq!(text_read(&frames), "word0 word1 word2 word3 ");
+        // One frame before the first word, about a second in and not at each of the three chunks it was made of.
+        let words_from = frames.iter().position(|f| !text_read(std::slice::from_ref(f)).is_empty()).unwrap();
+        assert_eq!(words_from, 1, "{frames:?}");
+        let before = &frames[0]["delta"];
+        assert_eq!((&before["choices"][0]["delta"]["role"], &before["oaiy_progress"]["prompt_total"]), (&json!("assistant"), &json!(3)), "{before}");
+        assert!(frames[..2].iter().any(|f| f["delta"]["oaiy_progress"]["prompt_done"] == 3), "the newest word of the prompt went on: {frames:?}");
+        let seen = server.requests();
+        let posted: Vec<std::time::Instant> = seen.iter().filter(|r| r.line() == "POST /api/v1/desktop-ai/chat-1/frames").map(|r| r.at).collect();
+        let claimed = seen.iter().find(|r| r.line() == "POST /api/v1/desktop-ai/chat-1/claim").unwrap().at;
+        assert!(posted[0] - claimed >= Duration::from_millis(900), "it went {:?} after the claim", posted[0] - claimed);
+        // The first word did not wait for an interval after it.
+        assert_eq!(frames[1]["delta"]["choices"][0]["delta"]["content"], "word0 ");
+    }
+
+    /// A chunk that is not text to join to other text (a tool call's piece) goes as it came, in its place: what was
+    /// waiting goes before it and what follows after, so a reader gets everything in the provider's order.
+    #[tokio::test]
+    async fn a_chunk_that_cannot_be_joined_goes_as_it_came_in_its_place() {
+        use crate::link::testkit::{Provider, Reply};
+        let odd = json!({ "id": "cmpl-1", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "name": "look_up", "arguments": "{\"q\":" } }] } }] });
+        let engines = fake_engines(Setup { chat_stream: Some((12, Duration::from_millis(10))), chat_stream_odd: Some((5, odd.clone())), ..Setup::default() }).await;
+        let (tunnel, _dir) = tunnel_with_engines("chat-odd-chunk", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x89, &chat_turn());
+        let batch = json!({ "requests": [pending_row("chat-1", "chat", &row)] }).to_string();
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        let mut frames = frames_of(&tunnel, &server, "chat-1", 0x89);
+        assert_eq!(frames.pop().unwrap(), json!({ "v": 1, "type": "final", "kind": "final" }));
+        let at = frames.iter().position(|f| f["delta"] == odd).unwrap_or_else(|| panic!("the odd chunk is not among the frames as it came: {frames:?}"));
+        let words = |range: std::ops::Range<usize>| range.map(|i| format!("word{i} ")).collect::<String>();
+        assert_eq!(text_read(&frames[..at]), words(0..5), "what came before it is sent before it: {frames:?}");
+        assert_eq!(text_read(&frames[at + 1..]), words(5..12), "and what came after it, after: {frames:?}");
+    }
+
+    /// Chunks gathered into one read the same as the chunks did: the text joined in order, the newest of everything
+    /// else. What cannot be joined so is left for the caller to send as it came.
+    #[test]
+    fn chunks_of_a_stream_are_gathered_into_one_that_reads_the_same() {
+        let chunk = |delta: Value, finish: Value| {
+            json!({ "id": "c1", "object": "chat.completion.chunk", "created": 7, "model": "m", "choices": [{ "index": 0, "delta": delta, "finish_reason": finish, "logprobs": null }] })
+        };
+        let mut gathered = Gathered::default();
+        assert!(gathered.is_empty() && !gathered.has_text());
+        // One chunk in, the same chunk out.
+        let only = chunk(json!({ "role": "assistant", "content": "" }), Value::Null);
+        assert!(gathered.take(&only));
+        assert!(!gathered.is_empty() && !gathered.has_text(), "a role is not text");
+        assert_eq!(gathered.chunk(), only);
+        assert!(gathered.is_empty());
+
+        // Several: the answer's text joined in order and the model's reasoning beside it, the newest of the rest,
+        // and a null never in a value's place.
+        for piece in [
+            json!({ "role": "assistant", "content": null }),
+            json!({ "reasoning_content": "Let me " }),
+            json!({ "reasoning_content": "think." }),
+            json!({ "content": "Hel" }),
+            json!({ "content": "lo, " }),
+            json!({ "content": "wörld" }),
+        ] {
+            assert!(gathered.take(&chunk(piece, Value::Null)));
+        }
+        let mut last = chunk(json!({}), json!("length"));
+        last["usage"] = json!({ "completion_tokens": 5 });
+        assert!(gathered.take(&last));
+        assert!(gathered.has_text() && !gathered.is_full());
+        assert_eq!(
+            gathered.chunk(),
+            json!({
+                "id": "c1", "object": "chat.completion.chunk", "created": 7, "model": "m", "usage": { "completion_tokens": 5 },
+                "choices": [{ "index": 0, "finish_reason": "length", "logprobs": null,
+                    "delta": { "role": "assistant", "content": "Hello, wörld", "reasoning_content": "Let me think." } }],
+            })
+        );
+
+        // A chunk with no choices is word of how the turn is getting on, of which the newest goes on: by itself
+        // while the prompt goes in (still with no choices), or beside the text once there is some.
+        let progress = |done: u64| json!({ "id": "c1", "choices": [], "oaiy_progress": { "prompt_done": done, "prompt_total": 40 } });
+        assert!(gathered.take(&progress(0)) && gathered.take(&progress(24)));
+        assert!(!gathered.is_empty() && !gathered.has_text());
+        assert_eq!(gathered.chunk(), progress(24));
+        assert!(gathered.take(&progress(40)) && gathered.take(&chunk(json!({ "content": "Hi" }), Value::Null)));
+        assert!(gathered.take(&json!({ "id": "c1", "choices": [], "usage": { "total_tokens": 9 } })));
+        let with_text = gathered.chunk();
+        assert_eq!(with_text["choices"][0]["delta"], json!({ "content": "Hi" }));
+        assert_eq!((&with_text["oaiy_progress"]["prompt_done"], &with_text["usage"]["total_tokens"]), (&json!(40), &json!(9)), "{with_text}");
+
+        // Not to be joined: no chunk at all, more or other choices than the first, a tool call's piece, per-token
+        // detail, a whole message, and an object with no `choices` (an error, a side note of a provider's own).
+        for odd in [
+            json!("text"),
+            json!({ "oaiy_reasoning_preview": "weighing the two" }),
+            json!({ "choices": [{ "index": 0, "delta": { "content": "a" } }, { "index": 1, "delta": { "content": "b" } }] }),
+            json!({ "choices": [{ "index": 1, "delta": { "content": "the second choice" } }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{\"a\"" } }] } }] }),
+            json!({ "choices": [{ "index": 0, "delta": { "content": "a" }, "logprobs": { "content": [] } }] }),
+            json!({ "choices": [{ "index": 0, "message": { "content": "whole" } }] }),
+            json!({ "error": { "message": "overloaded" } }),
+        ] {
+            assert!(!gathered.take(&odd), "{odd}");
+            assert!(gathered.is_empty(), "{odd}");
+        }
+
+        // More than a frame ought to carry does not wait for its interval.
+        assert!(gathered.take(&chunk(json!({ "content": "x".repeat(GATHER_AT_MOST_BYTES) }), Value::Null)));
+        assert!(gathered.is_full());
     }
 
     /// Contract §0.13: the answer's limit a chat request names (`maxTokens`) reaches the model as `max_tokens`, in
