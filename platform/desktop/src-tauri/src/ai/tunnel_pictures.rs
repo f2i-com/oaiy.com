@@ -95,8 +95,10 @@ const MAX_REFERENCE_SIDE: u32 = 8192;
 pub const PICTURE_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// How often a picture being drawn says so ([`progress_frame`]): well inside the five minutes after which the site
-/// lets a silent picture go, and often enough for it to tell a slow picture from a dead one long before that.
-pub const PROGRESS_EVERY: Duration = Duration::from_secs(15);
+/// lets a silent picture go, and often enough for it to tell a slow picture from a dead one long before that. The
+/// site's answer to one is also where it says the picture was cancelled (contract §0.13), so this is how soon a
+/// cancelled picture stops being drawn: five seconds at most (it was fifteen), twelve small requests a minute.
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
 /// The most of the engines' answer read: one picture, as base64, with room to spare.
 const MAX_ENGINE_REPLY_BYTES: u64 = 32 * 1024 * 1024;
@@ -513,6 +515,7 @@ pub fn contract_code(code: &str) -> &'static str {
 pub(crate) mod tests {
     use super::*;
     use axum::{extract::State, http::HeaderMap, routing::{get, post}, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A picture with detail all over, so its PNG is large and a JPEG of it is not trivially small.
@@ -836,6 +839,9 @@ pub(crate) mod tests {
         pub hold: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
         /// What the chat route waits for before it answers, the same way.
         pub chat_hold: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        /// The chat route answers as a stream (`text/event-stream`), in this many pieces with this long before each,
+        /// as a model writing its answer does; none: one whole answer.
+        pub chat_stream: Option<(usize, Duration)>,
     }
 
     impl Default for Setup {
@@ -854,6 +860,7 @@ pub(crate) mod tests {
                 chat_delay: Duration::ZERO,
                 hold: None,
                 chat_hold: None,
+                chat_stream: None,
             }
         }
     }
@@ -871,12 +878,35 @@ pub(crate) mod tests {
     pub(crate) struct FakeEngines {
         pub ui: String,
         pub asked: Arc<Mutex<Vec<Asked>>>,
+        /// Pictures whose caller hung up before they were answered: `oaiy-studio` cancels such a job.
+        pub abandoned: Arc<AtomicUsize>,
+        /// The pieces of streamed chat answers written so far ([`Setup::chat_stream`]): a caller that hangs up
+        /// stops the writing, as it stops `oaiy-studio`'s language model.
+        pub chat_pieces: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
     }
 
     impl FakeEngines {
         pub(crate) fn pictures_asked(&self) -> Vec<Asked> {
             self.asked.lock().unwrap().iter().filter(|a| a.route == "images").cloned().collect()
+        }
+
+        pub(crate) fn chats_asked(&self) -> Vec<Asked> {
+            self.asked.lock().unwrap().iter().filter(|a| a.route == "chat").cloned().collect()
+        }
+    }
+
+    /// Counts a picture as abandoned when its request is dropped before it is answered (its caller hung up).
+    struct Abandoned {
+        count: Arc<AtomicUsize>,
+        answered: bool,
+    }
+
+    impl Drop for Abandoned {
+        fn drop(&mut self) {
+            if !self.answered {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -891,13 +921,39 @@ pub(crate) mod tests {
         setup: Setup,
         gateway: String,
         asked: Arc<Mutex<Vec<Asked>>>,
+        abandoned: Arc<AtomicUsize>,
+        chat_pieces: Arc<AtomicUsize>,
+    }
+
+    /// A chat answer as a stream of `pieces` chunks in OpenAI's shape, `gap` before each, then `[DONE]`. Each piece
+    /// written is counted; a caller that hangs up ends the stream, and the count with it.
+    fn streamed_answer(pieces: usize, gap: Duration, written: Arc<AtomicUsize>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let stream = futures_util::stream::unfold(0usize, move |i| {
+            let written = written.clone();
+            async move {
+                if i > pieces {
+                    return None;
+                }
+                tokio::time::sleep(gap).await;
+                let event = if i == pieces {
+                    "data: [DONE]\n\n".to_string()
+                } else {
+                    written.fetch_add(1, Ordering::SeqCst);
+                    format!("data: {}\n\n", json!({ "id": "cmpl-1", "object": "chat.completion.chunk", "choices": [{ "index": 0, "delta": { "content": format!("word{i} ") } }] }))
+                };
+                Some((Ok::<_, std::convert::Infallible>(event), i + 1))
+            }
+        });
+        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
     }
 
     pub(crate) async fn fake_engines(setup: Setup) -> FakeEngines {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ui = format!("http://{}", listener.local_addr().unwrap());
         let asked: Arc<Mutex<Vec<Asked>>> = Arc::default();
-        let shared = Shared { setup, gateway: format!("{ui}/gw"), asked: asked.clone() };
+        let (abandoned, chat_pieces): (Arc<AtomicUsize>, Arc<AtomicUsize>) = Default::default();
+        let shared = Shared { setup, gateway: format!("{ui}/gw"), asked: asked.clone(), abandoned: abandoned.clone(), chat_pieces: chat_pieces.clone() };
         let app = Router::new()
             .route("/api/state", get(|State(s): State<Shared>| async move { Json(json!({ "gateway_url": s.gateway })) }))
             .route(
@@ -931,6 +987,7 @@ pub(crate) mod tests {
             .route(
                 "/gw/v1/chat/completions",
                 post(|State(s): State<Shared>, Json(body): Json<Value>| async move {
+                    use axum::response::IntoResponse;
                     s.asked.lock().unwrap().push(Asked { route: "chat", incognito_header: None, body });
                     tokio::time::sleep(s.setup.chat_delay).await;
                     if let Some(hold) = s.setup.chat_hold.clone() {
@@ -939,17 +996,21 @@ pub(crate) mod tests {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                     }
+                    if let Some((pieces, gap)) = s.setup.chat_stream {
+                        return streamed_answer(pieces, gap, s.chat_pieces.clone());
+                    }
                     Json(json!({
                         "id": "cmpl-1",
                         "object": "chat.completion",
                         "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hello from the engine" }, "finish_reason": "stop" }],
                     }))
+                    .into_response()
                 }),
             )
             .route("/gw/v1/images/generations", post(images))
             .with_state(shared);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        FakeEngines { ui, asked, server }
+        FakeEngines { ui, asked, abandoned, chat_pieces, server }
     }
 
     /// The images route, as `oaiy-studio` answers: a model it has switched off or does not know is refused; one of
@@ -975,6 +1036,8 @@ pub(crate) mod tests {
         } else {
             return refuse(400, format!("unknown image model {asked:?}"));
         };
+        // (dropped with this request when its caller hangs up while the picture is being made)
+        let mut making = Abandoned { count: s.abandoned.clone(), answered: false };
         tokio::time::sleep(s.setup.delay).await;
         if let Some(hold) = s.setup.hold.clone() {
             let until = std::time::Instant::now() + Duration::from_secs(20);
@@ -982,6 +1045,7 @@ pub(crate) mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+        making.answered = true;
         Json(json!({
             "created": 1,
             "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(&s.setup.picture), "revised_prompt": body["prompt"] }],

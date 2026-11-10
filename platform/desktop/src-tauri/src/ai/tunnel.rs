@@ -32,13 +32,22 @@
 //! - **Pictures** (the `image` kind, [`crate::ai::tunnel_pictures`]) have a slot of
 //!   their own: one picture at a time on this computer. A picture offered while
 //!   another is being made is left unclaimed for a later poll. While a picture is
-//!   drawn it posts a `progress` frame every fifteen seconds, and its picture, or
+//!   drawn it posts a `progress` frame every five seconds, and its picture, or
 //!   why there is none, comes in a `final` frame as a turn's answer does.
 //!
 //! So a chat turn that comes while a picture is drawn is answered meanwhile, and a
 //! picture that comes while a chat turn is answered is drawn meanwhile. A row
 //! whose claim is lost runs nothing, of either kind: the claim is atomic
 //! server-side, and its slot is free again at once.
+//!
+//! A request the provider ends while it is answered (its requester cancelled it,
+//! or it ran out of time) is stopped here too (contract §0.13). The provider says
+//! so in its answer to the request's next frame, `409 {code: "cancelled"}`
+//! ([`FrameRefused::Cancelled`]): a picture's request to the engines is dropped,
+//! which ends their job; a chat's stream from its provider is dropped, which ends
+//! the answer; nothing more is sent for the request, not a frame and not an
+//! outcome; and its slot is free. Answered so to its last frame, there is nothing
+//! left to stop. Any other refusal of a frame is what it always was: a frame lost.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +87,59 @@ impl TunnelError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// The provider ended the request while it was being answered ([`FrameRefused::Cancelled`]). Never sealed into
+    /// a frame: [`AiTunnel::finish`] sends nothing for it.
+    fn cancelled() -> Self {
+        Self::new(CANCELLED, "the provider cancelled the request")
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.code == CANCELLED
+    }
+}
+
+/// The code of [`TunnelError::cancelled`]: this desktop's own, and no code a requester is ever sent.
+const CANCELLED: &str = "cancelled";
+
+/// Why the provider did not take a frame.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameRefused {
+    /// The provider has ended the request itself (its requester cancelled it, or it ran out of time) and says so:
+    /// `409 {code: "cancelled"}` (contract §0.13). An ordinary end, not trouble with the link: the work stops,
+    /// nothing more is sent for the request, and its slot is free.
+    Cancelled,
+    /// Anything else. The frame is lost and the request goes on, as it always did.
+    Other(String),
+}
+
+impl std::fmt::Display for FrameRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameRefused::Cancelled => f.write_str("the provider cancelled the request"),
+            FrameRefused::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Whether a 409 of the provider's says it has ended the request: `{code: "cancelled"}` (contract §0.13). The
+/// reply is read out either way.
+async fn says_cancelled(refusal: reqwest::Response) -> bool {
+    let said: Value = crate::link::net::read_json_async(refusal).await.unwrap_or(Value::Null);
+    said.get("code").and_then(Value::as_str) == Some(CANCELLED)
+}
+
+/// The longest answer a chat request may ask for, in tokens: more than any model writes, so a larger number is a
+/// mistake and is ignored as a missing one is ([`answer_limit`]).
+const MAX_ANSWER_TOKENS: u64 = 1_000_000;
+
+/// The answer's limit in tokens a sealed chat request asks for (`maxTokens`, contract §0.13), for the model's
+/// `max_tokens`: a whole number from 1 to [`MAX_ANSWER_TOKENS`]. Anything else (none, zero, a negative, a fraction,
+/// text, a number past the bound) is no limit of the requester's, and the provider's own applies as it did.
+fn answer_limit(body: &Value) -> Option<u64> {
+    body.get("maxTokens")
+        .and_then(Value::as_u64)
+        .filter(|n| (1..=MAX_ANSWER_TOKENS).contains(n))
 }
 
 impl From<PictureError> for TunnelError {
@@ -149,7 +211,7 @@ impl Lane<'_> {
             .map_err(|e| format!("the approval poll returned nothing readable: {e}"))
     }
 
-    async fn post_frame(&self, envelope: &str) -> Result<(), String> {
+    async fn post_frame(&self, envelope: &str) -> Result<(), FrameRefused> {
         let url = crate::link::oauth::join(
             &self.account.base_url,
             &self.spec.frames_path.replace("{id}", self.id),
@@ -161,13 +223,20 @@ impl Lane<'_> {
             .json(&json!({ "instanceId": self.instance, "envelope": envelope }))
             .send()
             .await
-            .map_err(|e| format!("could not post a frame: {e}"))?;
-        // Only the status is wanted; the rest is read out so the connection can
-        // carry the next frame.
+            .map_err(|e| FrameRefused::Other(format!("could not post a frame: {e}")))?;
         let status = resp.status();
+        // The one refusal whose words are read: the provider saying the request is over (contract §0.13).
+        if status.as_u16() == 409 {
+            if says_cancelled(resp).await {
+                return Err(FrameRefused::Cancelled);
+            }
+            return Err(FrameRefused::Other("the lane refused a frame: HTTP 409".into()));
+        }
+        // Otherwise only the status is wanted; the rest is read out so the
+        // connection can carry the next frame.
         crate::link::net::drain_async(resp).await;
         if !status.is_success() {
-            return Err(format!("the lane refused a frame: HTTP {}", status.as_u16()));
+            return Err(FrameRefused::Other(format!("the lane refused a frame: HTTP {}", status.as_u16())));
         }
         Ok(())
     }
@@ -663,12 +732,20 @@ impl AiTunnel {
 
     /// Seal what a claimed request came to, post it as its last frame, and report it `done` or
     /// `failed`.
+    ///
+    /// A request the provider ended meanwhile (contract §0.13) gets neither: its work was stopped
+    /// when a frame of it was answered so ([`TunnelError::cancelled`]), or its last frame is
+    /// answered so here, where there is nothing left to stop. Either way that is an ordinary end.
     async fn finish(
         &self,
         lane: &Lane<'_>,
         request: &AiRequest,
         outcome: Result<Vec<u8>, TunnelError>,
     ) -> Result<(), String> {
+        if matches!(&outcome, Err(e) if e.is_cancelled()) {
+            self.ended_by_provider(request, "its work is stopped");
+            return Ok(());
+        }
         let (status, frame) = match outcome {
             Ok(final_plaintext) => match self.sessions.seal_outbound(&request.id, &final_plaintext) {
                 Ok(envelope) => ("done", Some(envelope)),
@@ -681,8 +758,13 @@ impl AiTunnel {
         // completing purges the lane's frames, so anything posted after it would
         // never be readable and the user would see an empty reply.
         if let Some(envelope) = frame {
-            if let Err(e) = lane.post_frame(&envelope).await {
-                log::warn!("AI turn {} final frame: {e}", request.id);
+            match lane.post_frame(&envelope).await {
+                Ok(()) => {}
+                Err(FrameRefused::Cancelled) => {
+                    self.ended_by_provider(request, "it was already answered");
+                    return Ok(());
+                }
+                Err(e) => log::warn!("AI turn {} final frame: {e}", request.id),
             }
         }
         let complete_url = crate::link::oauth::join(
@@ -701,6 +783,15 @@ impl AiTunnel {
             .map_err(|e| format!("could not report the outcome: {e}"))?;
         self.sessions.drop_thread(&request.id);
         let done_status = done.status();
+        if done_status.as_u16() == 409 {
+            // The provider ended the request between its last frame and this (it answers the outcome of such a
+            // request as it answers its frames): the same ordinary end.
+            if says_cancelled(done).await {
+                self.ended_by_provider(request, "it was already answered");
+                return Ok(());
+            }
+            return Err("the AI lane refused the outcome: HTTP 409".into());
+        }
         crate::link::net::drain_async(done).await;
         if !done_status.is_success() {
             return Err(format!(
@@ -709,6 +800,15 @@ impl AiTunnel {
             ));
         }
         Ok(())
+    }
+
+    /// The provider ended a request this desktop had claimed ([`FrameRefused::Cancelled`]): nothing
+    /// more is sent for it (no frame, no outcome), its session goes, and it is said once. Its slot is
+    /// free as its task ends. `what`: what became of its work.
+    fn ended_by_provider(&self, request: &AiRequest, what: &str) {
+        self.sessions.drop_thread(&request.id);
+        let kind = if request.kind.as_deref() == Some(tunnel_pictures::KIND) { "picture" } else { "turn" };
+        log::info!("AI {kind} {}: cancelled by the provider; {what}, and nothing more is sent for it", request.id);
     }
 
     /// Claim a picture and make it on a task of its own, holding the picture slot until its outcome
@@ -745,19 +845,30 @@ impl AiTunnel {
                 instance: &instance,
                 id: &request.id,
             };
-            // Drawn, saying so every so often until it is done (each frame the site takes is news of the request).
-            let making = tunnel.answer_picture(&request);
-            tokio::pin!(making);
-            let every = tunnel.picture_progress;
-            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let outcome = loop {
-                tokio::select! {
-                    outcome = &mut making => break outcome,
-                    _ = ticks.tick() => tunnel.post_progress(&lane).await,
+            // Drawn, saying so every so often until it is done (each frame the site takes is news of the request,
+            // and the site's answer to one is where it says the request is over).
+            let outcome = {
+                let making = tunnel.answer_picture(&request);
+                tokio::pin!(making);
+                let every = tunnel.picture_progress;
+                let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        outcome = &mut making => break outcome,
+                        _ = ticks.tick() => {
+                            if tunnel.post_progress(&lane).await {
+                                // Cancelled: `making` goes as this block ends, and with it the request to the
+                                // engines, which stop the job of a caller that has gone (their worker is ended
+                                // at once, a model it was still loading included) or never start it.
+                                break Err(TunnelError::cancelled());
+                            }
+                        }
+                    }
                 }
             };
-            if let Err(e) = &outcome {
+            // (a cancelled one is said once, by `finish`)
+            if let Some(e) = outcome.as_ref().err().filter(|e| !e.is_cancelled()) {
                 log::info!("AI picture {}: {} ({})", request.id, e.code(), e.message());
             }
             if let Err(e) = tunnel.finish(&lane, &request, outcome).await {
@@ -768,18 +879,25 @@ impl AiTunnel {
     }
 
     /// Say that a picture is still being drawn ([`tunnel_pictures::progress_frame`]). Best effort:
-    /// a frame that does not land costs the site a sign of life, not the picture.
-    async fn post_progress(&self, lane: &Lane<'_>) {
+    /// a frame that does not land costs the site a sign of life, not the picture. True when the
+    /// site answers that the request is over ([`FrameRefused::Cancelled`]): the picture is not to
+    /// be drawn any further.
+    async fn post_progress(&self, lane: &Lane<'_>) -> bool {
         // (only once the request has opened: before that there is no session to seal with, and
         // nothing yet to say)
         let Ok(envelope) = self
             .sessions
             .seal_outbound(lane.id, tunnel_pictures::progress_frame().to_string().as_bytes())
         else {
-            return;
+            return false;
         };
-        if let Err(e) = lane.post_frame(&envelope).await {
-            log::warn!("AI picture {} progress frame: {e}", lane.id);
+        match lane.post_frame(&envelope).await {
+            Ok(()) => false,
+            Err(FrameRefused::Cancelled) => true,
+            Err(e) => {
+                log::warn!("AI picture {} progress frame: {e}", lane.id);
+                false
+            }
         }
     }
 
@@ -1128,6 +1246,13 @@ impl AiTunnel {
         if let Some(m) = model {
             chat_body["model"] = json!(m);
         }
+        // How long the answer may be, when the requester says (contract §0.13): the model's
+        // `max_tokens`, so an answer that runs on ends there instead of holding the lane for
+        // minutes. This desktop adds no limit of its own; a provider's own still applies.
+        let max_tokens = answer_limit(body);
+        if let Some(n) = max_tokens {
+            chat_body["max_tokens"] = json!(n);
+        }
 
         // A turn carrying a grant may act on the account. Without one — or with
         // a catalogue that is empty or unreachable — this is byte-for-byte the
@@ -1157,6 +1282,7 @@ impl AiTunnel {
                         tools,
                         confirm: body.get("toolMode").and_then(Value::as_str) == Some("confirm"),
                         eph_pub: eph_pub.to_string(),
+                        max_tokens,
                     })
                     .await;
             }
@@ -1223,6 +1349,9 @@ impl AiTunnel {
                     let mut request = json!({ "messages": convo });
                     if let Some(m) = model {
                         request["model"] = json!(m);
+                    }
+                    if let Some(n) = run.max_tokens {
+                        request["max_tokens"] = json!(n);
                     }
                     if offer_tools {
                         request["tools"] = json!(chat_tools::as_openai_tools(&run.tools));
@@ -1363,12 +1492,17 @@ impl AiTunnel {
             .sessions
             .seal_outbound(lane.id(), frame.to_string().as_bytes())
             .map_err(|e| TunnelError::new(e.code(), e.message()))?;
-        // A dropped activity frame costs the user a progress line, not the
-        // answer — the turn continues.
-        if let Err(e) = lane.post_frame(&envelope).await {
-            log::warn!("AI turn {} activity frame: {e}", lane.id());
+        match lane.post_frame(&envelope).await {
+            Ok(()) => Ok(()),
+            // The request is over: no further tool is run and the model is not asked again.
+            Err(FrameRefused::Cancelled) => Err(TunnelError::cancelled()),
+            // A dropped activity frame costs the user a progress line, not the
+            // answer — the turn continues.
+            Err(e) => {
+                log::warn!("AI turn {} activity frame: {e}", lane.id());
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Stream the managed ChatGPT account's answer.
@@ -1495,10 +1629,14 @@ impl AiTunnel {
                         .sessions
                         .seal_outbound(lane.id, frame.to_string().as_bytes())
                         .map_err(|e| TunnelError::new(e.code(), e.message()))?;
-                    // A dropped frame leaves a gap the reader can see in its
-                    // own text; abandoning the turn over it would be worse.
-                    if let Err(e) = lane.post_frame(&envelope).await {
-                        log::warn!("AI turn {} delta {sent}: {e}", lane.id);
+                    match lane.post_frame(&envelope).await {
+                        Ok(()) => {}
+                        // The request is over. The provider's stream goes as this returns, and a
+                        // server whose reader has gone stops writing the answer (OAIY's engine does).
+                        Err(FrameRefused::Cancelled) => return Err(TunnelError::cancelled()),
+                        // A dropped frame leaves a gap the reader can see in its
+                        // own text; abandoning the turn over it would be worse.
+                        Err(e) => log::warn!("AI turn {} delta {sent}: {e}", lane.id),
                     }
                 }
             }
@@ -1543,10 +1681,16 @@ impl AiTunnel {
             .map_err(|e| TunnelError::new(e.code(), e.message()))?;
         pending.clear();
         *streamed += 1;
-        if let Err(e) = lane.post_frame(&envelope).await {
-            log::warn!("AI turn {} delta {streamed}: {e}", lane.id);
+        match lane.post_frame(&envelope).await {
+            Ok(()) => Ok(()),
+            // The request is over: nothing more of the answer is read or sent. (ChatGPT's own turn
+            // has no stop: it runs to its end on its thread, unheard.)
+            Err(FrameRefused::Cancelled) => Err(TunnelError::cancelled()),
+            Err(e) => {
+                log::warn!("AI turn {} delta {streamed}: {e}", lane.id);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Fail closed: an unknown, disabled or keyless provider is refused by name
@@ -1629,6 +1773,8 @@ struct ToolRun<'a> {
     confirm: bool,
     /// The browser's per-request key, needed to OPEN its approval frames.
     eph_pub: String,
+    /// The requester's limit on an answer ([`answer_limit`]): each reply of the model in the loop is held to it.
+    max_tokens: Option<u64>,
 }
 
 /// Feed one tool's outcome back to the model, in whichever form its transport
@@ -2474,8 +2620,9 @@ mod tests {
         assert_eq!(u64::from(decoded.width()), picture["width"].as_u64().unwrap());
         assert!(made.to_string().len() <= crate::ai::e2e::MAX_ENVELOPE_PLAINTEXT_BYTES);
 
-        // The slot is free: the next poll claims the second picture, whose seed is this computer's to choose.
-        assert_eq!(tunnel.picture_slot.available_permits(), 1);
+        // The slot is free (once the picture's task has read the answer to its outcome and ended): the next poll
+        // claims the second picture, whose seed is this computer's to choose.
+        until("the picture slot", || tunnel.picture_slot.available_permits() == 1).await;
         assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
         until("the second picture", || completed_as(&server, "picture-2").is_some()).await;
         let second = frame_of(&tunnel, &server, "picture-2", 0x33);
@@ -2586,6 +2733,274 @@ mod tests {
         assert!(engines.asked.lock().unwrap().is_empty(), "{:?}", engines.asked.lock().unwrap());
         assert_eq!(tunnel.turn_slot.available_permits(), 1, "the slot is free again");
         assert!(!server.lines().iter().any(|l| l.ends_with("/frames") || l.ends_with("/complete")), "{:?}", server.lines());
+    }
+
+    /// What the site answers a frame of a request it has ended (contract §0.13).
+    const CANCELLED_BY_THE_SITE: &str = r#"{"error":true,"code":"cancelled","message":"This request was cancelled."}"#;
+
+    /// A chat turn's sealed body.
+    fn chat_turn() -> Value {
+        json!({ "v": 1, "kind": "chat", "providerId": "oaiy-engine", "messages": [{ "role": "user", "content": "hi" }] })
+    }
+
+    /// How many frames `tunnel`'s side posted for request `id`, taken or not.
+    fn frames_posted(server: &crate::link::testkit::Provider, id: &str) -> usize {
+        server.lines().iter().filter(|l| **l == format!("POST /api/v1/desktop-ai/{id}/frames")).count()
+    }
+
+    /// Contract §0.13: the site answers a frame of a request it has ended `409 {code: "cancelled"}`. Answered so to
+    /// a progress frame, a picture stops being drawn: the request to the engines is dropped (they end the job of a
+    /// caller that has gone), nothing more is sent for it, not a frame and not an outcome, and the picture slot is
+    /// free for the next picture.
+    #[tokio::test]
+    async fn a_picture_the_site_cancels_is_stopped_at_the_engines_and_its_slot_is_free() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        // The engines keep the first picture until the test lets go (they would wait twenty seconds for it).
+        let released = Arc::new(AtomicBool::new(false));
+        let hold = {
+            let released = released.clone();
+            move || released.load(Ordering::SeqCst)
+        };
+        let engines = fake_engines(Setup { hold: Some(Arc::new(hold)), ..Setup::default() }).await;
+        let (mut tunnel, _dir) = tunnel_with_engines("picture-cancelled", Some(engines.ui.clone()));
+        Arc::get_mut(&mut tunnel).unwrap().picture_progress = Duration::from_millis(100);
+
+        let first = sealed_to(&tunnel, 0x81, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let second = sealed_to(&tunnel, 0x82, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let batches = [
+            json!({ "requests": [pending_row("picture-1", "image", &first)] }).to_string(),
+            json!({ "requests": [pending_row("picture-2", "image", &second)] }).to_string(),
+        ];
+        let (polls, frames) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batches[polls.fetch_add(1, Ordering::SeqCst).min(1)])
+            } else if req.line() == "POST /api/v1/desktop-ai/picture-1/frames" && frames.fetch_add(1, Ordering::SeqCst) >= 1 {
+                // Its first progress frame was taken; the site has ended the request since, and says so to the next.
+                Reply::status(409, CANCELLED_BY_THE_SITE)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        let started = std::time::Instant::now();
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the engines to see their caller gone", || engines.abandoned.load(Ordering::SeqCst) == 1).await;
+        until("the picture slot", || tunnel.picture_slot.available_permits() == 1).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "stopped at the second progress frame, not when the engines gave up: {:?}", started.elapsed());
+        // (time for anything more to be sent)
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(frames_posted(&server, "picture-1"), 2, "one frame taken, one answered cancelled, none after: {:?}", server.lines());
+        assert!(completed_as(&server, "picture-1").is_none(), "no outcome is reported for it: {:?}", server.lines());
+        assert!(tunnel.sessions.seal_outbound("picture-1", b"more").is_err(), "its session is gone: nothing more can be sealed for it");
+        assert_eq!(engines.pictures_asked().len(), 1);
+
+        // The slot is free: the next picture is claimed and drawn as any other.
+        released.store(true, Ordering::SeqCst);
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the next picture", || completed_as(&server, "picture-2").is_some()).await;
+        assert_eq!(completed_as(&server, "picture-2").as_deref(), Some("done"));
+        assert_eq!(frame_of(&tunnel, &server, "picture-2", 0x82)["picture"]["mimeType"], "image/png");
+        assert_eq!(engines.abandoned.load(Ordering::SeqCst), 1, "only the cancelled one was dropped");
+    }
+
+    /// The same for a chat turn, answered so to a frame of its streamed answer: the provider's stream is dropped,
+    /// which stops the answer being written (as OAIY's engine stops for a reader that has gone), nothing more is
+    /// sent, and the turn slot is free.
+    #[tokio::test]
+    async fn a_chat_turn_the_site_cancels_stops_being_written_and_its_slot_is_free() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        // An answer of 400 pieces, 10 ms apart: four seconds of writing.
+        let engines = fake_engines(Setup { chat_stream: Some((400, Duration::from_millis(10))), ..Setup::default() }).await;
+        let (tunnel, _dir) = tunnel_with_engines("chat-cancelled", Some(engines.ui.clone()));
+        let row = sealed_to(&tunnel, 0x83, &chat_turn());
+        let batch = json!({ "requests": [pending_row("chat-1", "chat", &row)] }).to_string();
+        let frames = AtomicUsize::new(0);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(&batch)
+            } else if req.line() == "POST /api/v1/desktop-ai/chat-1/frames" && frames.fetch_add(1, Ordering::SeqCst) >= 3 {
+                Reply::status(409, CANCELLED_BY_THE_SITE)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        let started = std::time::Instant::now();
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
+        until("the turn slot", || tunnel.turn_slot.available_permits() == 1).await;
+        assert!(started.elapsed() < Duration::from_secs(2), "stopped at its fourth frame, not at the end of the answer: {:?}", started.elapsed());
+        // The engine stops writing once its reader has gone: the count of pieces written settles, well short of 400.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let written = engines.chat_pieces.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(engines.chat_pieces.load(Ordering::SeqCst), written, "the answer is still being written");
+        assert!(written < 200, "{written} of 400 pieces were written");
+        assert_eq!(frames_posted(&server, "chat-1"), 4, "three frames taken, one answered cancelled, none after: {:?}", server.lines());
+        assert!(completed_as(&server, "chat-1").is_none(), "no outcome is reported for it: {:?}", server.lines());
+        assert!(tunnel.sessions.seal_outbound("chat-1", b"more").is_err(), "its session is gone");
+        assert_eq!(engines.chats_asked().len(), 1);
+    }
+
+    /// Answered so to its last frame, a request has nothing left to stop: the picture was drawn and the answer
+    /// written. It ends there all the same, with no outcome reported, both slots free and the lane untroubled.
+    #[tokio::test]
+    async fn a_request_the_site_cancelled_before_its_last_frame_ends_there() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        let engines = fake_engines(Setup::default()).await;
+        let (tunnel, _dir) = tunnel_with_engines("final-cancelled", Some(engines.ui.clone()));
+        let picture = sealed_to(&tunnel, 0x84, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let chat = sealed_to(&tunnel, 0x85, &chat_turn());
+        let batch = json!({ "requests": [pending_row("picture-1", "image", &picture), pending_row("chat-1", "chat", &chat)] }).to_string();
+        let polls = AtomicUsize::new(0);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(if polls.fetch_add(1, Ordering::SeqCst) == 0 { &batch } else { r#"{"requests":[]}"# })
+            } else if req.target.ends_with("/frames") {
+                Reply::status(409, CANCELLED_BY_THE_SITE)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 2);
+        until("both last frames", || frames_posted(&server, "picture-1") == 1 && frames_posted(&server, "chat-1") == 1).await;
+        until("both slots", || tunnel.picture_slot.available_permits() == 1 && tunnel.turn_slot.available_permits() == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!((frames_posted(&server, "picture-1"), frames_posted(&server, "chat-1")), (1, 1), "{:?}", server.lines());
+        assert!(!server.lines().iter().any(|l| l.ends_with("/complete")), "no outcome is reported: {:?}", server.lines());
+        assert!(tunnel.sessions.seal_outbound("picture-1", b"more").is_err() && tunnel.sessions.seal_outbound("chat-1", b"more").is_err());
+        // The work was done before the site said so: nothing was there to stop.
+        assert_eq!((engines.pictures_asked().len(), engines.chats_asked().len(), engines.abandoned.load(Ordering::SeqCst)), (1, 1, 0));
+        // And it is no trouble of the lane's: the next poll is an ordinary one.
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0);
+    }
+
+    /// The site answers the outcome of a request it has ended as it answers its frames. Ended between a request's
+    /// last frame and its outcome, that is the same ordinary end; an outcome refused for another reason is still
+    /// the lane's trouble to report.
+    #[tokio::test]
+    async fn an_outcome_the_site_answers_cancelled_is_an_ordinary_end_too() {
+        use crate::link::testkit::{Provider, Reply};
+        let (tunnel, dir) = tunnel_in("outcome-cancelled");
+        let server = Provider::start(|req| {
+            if req.target == "/api/v1/desktop-ai/ended/complete" {
+                Reply::status(409, CANCELLED_BY_THE_SITE)
+            } else {
+                Reply::status(409, r#"{"error":true,"code":"not_claimed","message":"This request is not in a claimed state"}"#)
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+        for (id, ordinary) in [("ended", true), ("other", false)] {
+            // (a request that never opened and names no key: nothing can be sealed for it, so only its outcome is sent)
+            let request = AiRequest { id: id.into(), kind: Some("chat".into()), provider_id: None, eph_pub: None, envelope: None };
+            let lane = Lane { http: reqwest::Client::new(), account: &account, spec: &spec, instance: "oaiy-test", id };
+            let reported = tunnel.finish(&lane, &request, Err(TunnelError::new("invalid_request", "the turn carries no chat key"))).await;
+            assert_eq!(reported.is_ok(), ordinary, "{id}: {reported:?}");
+        }
+        assert_eq!(server.lines(), ["POST /api/v1/desktop-ai/ended/complete", "POST /api/v1/desktop-ai/other/complete"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Any other refusal of a frame is what it always was, a frame lost: a 409 that says anything else (or
+    /// nothing), a 429, a 500. The picture is drawn to its end and the answer written to its end, and each is
+    /// reported.
+    #[tokio::test]
+    async fn a_frame_refused_for_any_other_reason_is_a_frame_lost_and_the_work_goes_on() {
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::AtomicUsize;
+        // The engines keep the picture until three of its progress frames have been refused.
+        let refused = Arc::new(AtomicUsize::new(0));
+        let hold = {
+            let refused = refused.clone();
+            move || refused.load(Ordering::SeqCst) >= 3
+        };
+        let engines = fake_engines(Setup { hold: Some(Arc::new(hold)), chat_stream: Some((6, Duration::from_millis(10))), ..Setup::default() }).await;
+        let (mut tunnel, _dir) = tunnel_with_engines("frame-refused", Some(engines.ui.clone()));
+        Arc::get_mut(&mut tunnel).unwrap().picture_progress = Duration::from_millis(100);
+        let picture = sealed_to(&tunnel, 0x86, &sealed(json!({ "providerId": "oaiy-engine" })));
+        let chat = sealed_to(&tunnel, 0x87, &chat_turn());
+        let batch = json!({ "requests": [pending_row("picture-1", "image", &picture), pending_row("chat-1", "chat", &chat)] }).to_string();
+        let (polls, chat_frames) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let server = {
+            let refused = refused.clone();
+            Provider::start(move |req| {
+                if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                    Reply::ok(if polls.fetch_add(1, Ordering::SeqCst) == 0 { &batch } else { r#"{"requests":[]}"# })
+                } else if req.line() == "POST /api/v1/desktop-ai/picture-1/frames" {
+                    match refused.fetch_add(1, Ordering::SeqCst) {
+                        0 => Reply::status(409, r#"{"error":true,"code":"lane_busy","message":"Another request holds the lane."}"#),
+                        1 => Reply::status(409, "conflict"),
+                        2 => Reply::status(500, r#"{"error":true,"code":"cancelled","message":"not a 409"}"#),
+                        _ => Reply::ok("{}"),
+                    }
+                } else if req.line() == "POST /api/v1/desktop-ai/chat-1/frames" {
+                    match chat_frames.fetch_add(1, Ordering::SeqCst) {
+                        0 => Reply::status(409, r#"{"error":true,"code":"not_claimed"}"#),
+                        1 => Reply::status(429, r#"{"error":true,"message":"API key rate limit exceeded. Try again in 3s."}"#),
+                        _ => Reply::ok("{}"),
+                    }
+                } else {
+                    Reply::ok("{}")
+                }
+            })
+        };
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 2);
+        until("the picture", || completed_as(&server, "picture-1").is_some()).await;
+        until("the chat turn", || completed_as(&server, "chat-1").is_some()).await;
+        assert_eq!((completed_as(&server, "picture-1").as_deref(), completed_as(&server, "chat-1").as_deref()), (Some("done"), Some("done")));
+        assert_eq!(frame_of(&tunnel, &server, "picture-1", 0x86)["picture"]["mimeType"], "image/png");
+        // Every piece of the answer was written and sent on, then its last frame: 6 deltas and the final.
+        assert_eq!((engines.chat_pieces.load(Ordering::SeqCst), frames_posted(&server, "chat-1")), (6, 7), "{:?}", server.lines());
+        assert_eq!(engines.abandoned.load(Ordering::SeqCst), 0, "the picture was not dropped");
+    }
+
+    /// Contract §0.13: the answer's limit a chat request names (`maxTokens`) reaches the model as `max_tokens`, in
+    /// a streamed request as in a whole one. A missing or silly one sends none, and the provider's own applies.
+    #[tokio::test]
+    async fn a_chat_requests_limit_on_its_answer_reaches_the_engine_and_a_silly_one_does_not() {
+        let engines = fake_engines(Setup::default()).await;
+        let (tunnel, dir) = tunnel_with_engines("answer-limit", Some(engines.ui.clone()));
+        // The engine answers in one piece, so nothing is posted to the account on this path.
+        let account = linked("http://127.0.0.1:9".into(), "flk_ai");
+        let spec = descriptor::builtin().remove(0).desktop_ai.unwrap();
+        let lane = Lane { http: reqwest::Client::new(), account: &account, spec: &spec, instance: "oaiy-test", id: "turn-1" };
+        let cases = [
+            (Some(json!(1500)), Some(1500)),
+            (Some(json!(1)), Some(1)),
+            (Some(json!(MAX_ANSWER_TOKENS)), Some(MAX_ANSWER_TOKENS)),
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!(0)), None),
+            (Some(json!(-200)), None),
+            (Some(json!(1500.5)), None),
+            (Some(json!("1500")), None),
+            (Some(json!(true)), None),
+            (Some(json!([1500])), None),
+            (Some(json!(MAX_ANSWER_TOKENS + 1)), None),
+        ];
+        for (asked, reaches) in cases {
+            let mut body = json!({ "v": 1, "messages": [{ "role": "user", "content": "hi" }] });
+            if let Some(n) = &asked {
+                body["maxTokens"] = n.clone();
+            }
+            tunnel.chat(&lane, "oaiy-engine", None, &body, "unused").await.unwrap();
+            let sent = engines.chats_asked().pop().unwrap().body;
+            assert_eq!(sent.get("max_tokens").and_then(Value::as_u64), reaches, "maxTokens {asked:?}: {sent}");
+            assert_eq!(sent.get("max_tokens").is_some(), reaches.is_some(), "maxTokens {asked:?}: {sent}");
+            assert!(sent.get("maxTokens").is_none(), "the lane's own name for it is not the model's: {sent}");
+            assert_eq!(sent["stream"], true, "asked as a stream, as every turn of the engine is: {sent}");
+        }
+        assert_eq!(answer_limit(&json!({ "maxTokens": 64 })), Some(64));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A picture whose claim another computer won is not made: the engines are never asked, and the slot is free again.
