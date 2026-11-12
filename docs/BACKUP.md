@@ -106,7 +106,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `bridge/pairings.json` | excluded | Never | Tokens of paired browsers and apps. To do again: Pair your browsers and apps with OAIY again. |
 | `network/**` | excluded | Never | OAIY Network: this computer's identity on the LAN, its settings and the computers paired with it: A computer's own key and the certificates it trusts: a restored computer is another one to its peers, and pairs again. To do again: Switch OAIY Network on again in Setup, Networking, and pair the computers again. |
 | `ai/codex-home/**` | excluded | Never | The ChatGPT sign-in, which belongs to the Codex program. To do again: Sign in to ChatGPT again. |
-| `engines/**` | excluded | Never | The engines' programs, models and settings (their settings hold a gateway key and the Hugging Face token). To do again: Choose your engine models again, and enter your Hugging Face token if you use one. |
+| `engines/**` | excluded | Never | The engines' programs, models and settings (their settings hold a gateway key). To do again: Choose your engine models again. |
 | `hf-token` | excluded | Never | The Hugging Face token. To do again: Enter your Hugging Face token again if you use one. |
 | `ai/providers.json` | excluded | Never, unless the keys box is ticked when the backup is made | Your API provider keys. Tick "Include my API provider keys" to add them. To do again: Enter your API provider keys again. |
 | `link/**` | excluded | Never | The FormLogic link's own state (events waiting to be sent, delivery markers, its cache): it belongs to the link, which you make again. |

@@ -89,22 +89,60 @@ fn token(cfg: &Json) -> Result<Option<String>, String> {
     if !t.is_empty() {
         return check_token(&t).map(|_| Some(t));
     }
-    let env = ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"].iter().find_map(|k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()));
+    env_token()
+}
+
+/// The environment's token (`HF_TOKEN`, or the older `HUGGING_FACE_HUB_TOKEN`), as `var` reads the environment: what
+/// a person set on this computer for every Hugging Face tool they run.
+fn env_token_in(var: impl Fn(&str) -> Option<String>) -> Result<Option<String>, String> {
+    let env = ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"].iter().find_map(|k| var(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()));
     match env {
         Some(t) => check_token(&t).map(|_| Some(t)).map_err(|e| format!("HF_TOKEN: {e}")),
         None => Ok(None),
     }
 }
 
+fn env_token() -> Result<Option<String>, String> {
+    env_token_in(|k| std::env::var(k).ok())
+}
+
+/// The token a download goes with where a host keeps it, and whether it is the environment's: the host's where it
+/// has one; else the environment's, as before a host kept the token. (A person who set `HF_TOKEN` for their tools had
+/// gated downloads working here with nothing saved anywhere; keeping the token in one place must not end that. The
+/// settings' own is not read: that is the second place there used to be.)
+fn hosted_token(hosts: Option<String>, env: impl FnOnce() -> Result<Option<String>, String>) -> Result<(Option<String>, bool), String> {
+    match hosts.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(t) => check_token(&t).map(|_| (Some(t), false)),
+        None => env().map(|t| {
+            let found = t.is_some();
+            (t, found)
+        }),
+    }
+}
+
+/// A host that keeps the Hugging Face token itself (OAIY Desktop, in its Settings → Storage): asked at each use, so a
+/// token changed there is the next download's. None: no token is set there.
+pub type TokenHost = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Where a refusal says a token is saved, the studio on its own; and what it says instead in a host that keeps the
+/// token ([`Downloads::in_host_words`]): the control page has no field for it there.
+const OWN_PLACES: [&str; 3] = [" on Get models or in OAIY's Settings", " in OAIY's Settings or on Get models", " on Get models"];
+const HOST_PLACE: &str = " in OAIY's Settings → Storage";
+
 /// Whether `t` reads as a Hugging Face token (`hf_` and letters and digits): letters, digits, `_`, `.` and `-` alone.
 /// It is written into curl's configuration ([`token_to_curl`]), where a line break would begin an option of its own
 /// (one that writes a file anywhere, say), so nothing else is taken.
-pub(crate) fn check_token(t: &str) -> Result<(), String> {
+pub fn check_token(t: &str) -> Result<(), String> {
     if t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')) {
         Ok(())
     } else {
         Err("the Hugging Face token has characters no token has (only letters, digits, _ . and -): copy it again from huggingface.co/settings/tokens".into())
     }
+}
+
+/// [`Downloads::in_host_words`]'s change, by itself.
+fn host_words(e: String) -> String {
+    OWN_PLACES.iter().fold(e, |e, own| e.replace(own, HOST_PLACE))
 }
 
 fn curl_program(cfg: &Json) -> String {
@@ -749,6 +787,10 @@ pub struct Downloads {
     /// Held while a download is added to the models (the settings saved): a shutdown waits for it, and none is
     /// added after one.
     adding: Mutex<()>,
+    /// The host that keeps the Hugging Face token, where there is one ([`Downloads::keep_token_in`]).
+    token_host: std::sync::RwLock<Option<TokenHost>>,
+    /// Where downloads go is a host's to say ([`Downloads::keep_dir_in_host`]).
+    dir_host: std::sync::atomic::AtomicBool,
 }
 
 /// What a download asked of a studio that is stopping is told.
@@ -757,6 +799,70 @@ const STOPPING: &str = "the studio is stopping: downloads carry on from where th
 impl Downloads {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The Hugging Face token is `host`'s to keep from now on: the settings' own is not read. (The environment's
+    /// still counts where the host has none: [`hosted_token`].)
+    pub(crate) fn keep_token_in(&self, host: TokenHost) {
+        *self.token_host.write().unwrap_or_else(|p| p.into_inner()) = Some(host);
+    }
+
+    /// Whether a host keeps the token ([`Downloads::keep_token_in`]).
+    pub(crate) fn token_hosted(&self) -> bool {
+        self.token_host.read().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
+    /// Where downloads go is the host's to say from now on (OAIY Desktop, its Settings → Storage "Models folder",
+    /// which it writes into `downloads.dir` as it starts the studio: [`crate::host_downloads_dir`]): the control page
+    /// shows the folder and where it is changed, with no field for it, and a save of another one is refused.
+    pub(crate) fn keep_dir_in_host(&self) {
+        self.dir_host.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a host says where downloads go ([`Downloads::keep_dir_in_host`]).
+    pub(crate) fn dir_hosted(&self) -> bool {
+        self.dir_host.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The token downloads go with: where a host keeps it, the host's (asked now) and else the environment's
+    /// ([`hosted_token`]); with no host, the studio's own ([`token`]).
+    fn token(&self, cfg: &Json) -> Result<Option<String>, String> {
+        let host = self.token_host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        match host {
+            Some(ask) => hosted_token(ask(), env_token).map(|(token, _)| token),
+            None => token(cfg),
+        }
+    }
+
+    /// Whether the token in use is the environment's, in a host that keeps the token and has none: the page says so,
+    /// since nothing in the host's Settings shows it or can remove it.
+    fn token_is_environments(&self) -> bool {
+        let host = self.token_host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        host.is_some_and(|ask| hosted_token(ask(), env_token).is_ok_and(|(_, env)| env))
+    }
+
+    /// [`token_for`], with the host's token where one keeps it. There the host's is the only one, as it is now: a
+    /// token that came with a download (the desktop's own, from its Settings as they were when it began) is not
+    /// used past a change there. It was kept with the download, and a Try again after the person replaced or
+    /// removed their token sent the old one again, then told them to set a token.
+    fn token_for(&self, cfg: &Json, given: Option<&str>) -> Result<Option<String>, String> {
+        if self.token_hosted() {
+            return self.token(cfg);
+        }
+        match given.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(_) => token_for(cfg, given),
+            None => self.token(cfg),
+        }
+    }
+
+    /// A refusal's words where a host keeps the token: the place to save one is the host's Settings, not this
+    /// page's Get models (which has no field for it there).
+    fn in_host_words(&self, e: String) -> String {
+        if self.token_hosted() {
+            host_words(e)
+        } else {
+            e
+        }
     }
 
     fn closed(&self) -> bool {
@@ -1124,9 +1230,15 @@ impl Downloads {
             .collect();
         Json::obj([
             ("dir", Json::str(dir.to_string_lossy())),
+            // (said by a host, OAIY Desktop in its Settings: the page shows the folder and where it is changed)
+            ("dir_host", Json::Bool(self.dir_hosted())),
             ("free", self.free_cached(&dir).map_or(Json::Null, |v| Json::Int(v as i64))),
-            ("token", Json::Bool(token(&cfg).is_ok_and(|t| t.is_some()))),
-            ("groups", catalog().get("groups").cloned().unwrap_or(Json::Arr(Vec::new()))),
+            ("token", Json::Bool(self.token(&cfg).is_ok_and(|t| t.is_some()))),
+            // (kept by a host, OAIY Desktop in its Settings: the page shows no field for it, and says where it is)
+            ("token_host", Json::Bool(self.token_hosted())),
+            // (the host has none and this computer's environment does: said on the page, which cannot show or change it)
+            ("token_env", Json::Bool(self.token_is_environments())),
+            ("groups",catalog().get("groups").cloned().unwrap_or(Json::Arr(Vec::new()))),
             ("models", Json::Arr(models)),
         ])
     }
@@ -1142,8 +1254,8 @@ impl Downloads {
         // as Download takes it, `~` its home folder, refused where it is not a full path)
         let dir = chosen_dir(studio, dir)?;
         let cfg = studio.config();
-        let token = token_for(&cfg, token.as_deref())?;
-        let files = plan(&cfg, e, &dir, token.as_deref())?;
+        let token = self.token_for(&cfg, token.as_deref())?;
+        let files = plan(&cfg, e, &dir, token.as_deref()).map_err(|e| self.in_host_words(e))?;
         let here = library::scan(&library::roots(&studio.root, &cfg, &dir));
         // Each file: in place, on this computer elsewhere, on a computer on the network, or to download.
         let mut said: Vec<(&'static str, Option<String>, Option<bool>)> = files
@@ -1377,6 +1489,7 @@ impl Downloads {
                 });
             }
             Err(err) => {
+                let err = self.in_host_words(err);
                 studio.log.push(format!("downloading {name} failed: {err}"));
                 self.update(id, |d| {
                     d.status = "failed";
@@ -1394,7 +1507,7 @@ impl Downloads {
         let gated = e.get("gated").and_then(Json::as_bool).unwrap_or(false);
         let cfg = studio.config();
         let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
-        let files = plan(&cfg, e, dir, token_for(&cfg, given.as_deref())?.as_deref())?;
+        let files = plan(&cfg, e, dir, self.token_for(&cfg, given.as_deref())?.as_deref())?;
         self.update(id, |d| d.planned = files.iter().map(|f| f.dest.clone()).collect());
         let total: u64 = files.iter().filter_map(|f| f.size).sum();
         let have = |f: &Planned| in_place(&studio.root, f);
@@ -1612,7 +1725,7 @@ impl Downloads {
             // rather than waiting on it for ever)
             c.args(["-sS", "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60", "-C", "-", "-H", "User-Agent: oaiy-studio", "-o"]).arg(part);
             let given = self.list.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|d| d.id == id).and_then(|d| d.token.clone());
-            let token = token_for(cfg, given.as_deref())?.filter(|_| f.hub);
+            let token = self.token_for(cfg, given.as_deref())?.filter(|_| f.hub);
             let token_sent = token.is_some();
             let said = token_to_curl(&mut c, token.as_deref());
             c.arg(&f.url).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -1830,19 +1943,45 @@ fn remove_empty(dir: &Path) {
 /// The folders downloads went to besides the one they go to now (`download-dirs.json` beside the settings): what is
 /// partly downloaded there is found after a restart.
 fn remembered_dirs(studio: &Studio) -> Vec<PathBuf> {
-    std::fs::read(studio.root.join(DIRS_FILE))
+    remembered_dirs_at(&studio.root)
+}
+
+fn remember_dir(studio: &Studio, dir: &Path) {
+    remember_dir_at(&studio.root, dir)
+}
+
+/// [`remembered_dirs`], of the studio whose settings are in `root`.
+fn remembered_dirs_at(root: &Path) -> Vec<PathBuf> {
+    std::fs::read(root.join(DIRS_FILE))
         .ok()
         .and_then(|b| Json::parse(&b).ok())
         .and_then(|j| j.as_array().map(|a| a.iter().filter_map(Json::as_str).map(PathBuf::from).collect()))
         .unwrap_or_default()
 }
 
-fn remember_dir(studio: &Studio, dir: &Path) {
-    let mut dirs = remembered_dirs(studio);
+/// [`remember_dir`], of the studio whose settings are in `root`: for one that is not running (a host that changes
+/// where its downloads go before it starts it writes down where they went until then).
+pub(crate) fn remember_dir_at(root: &Path, dir: &Path) {
+    let mut dirs = remembered_dirs_at(root);
     dirs.retain(|d| d != dir);
     dirs.insert(0, dir.to_path_buf());
     dirs.truncate(8);
-    let _ = std::fs::write(studio.root.join(DIRS_FILE), Json::Arr(dirs.iter().map(|d| Json::str(d.to_string_lossy())).collect()).to_json());
+    let _ = std::fs::write(root.join(DIRS_FILE), Json::Arr(dirs.iter().map(|d| Json::str(d.to_string_lossy())).collect()).to_json());
+}
+
+/// Whether `a` and `b` name one folder: each made a full path, a closing separator and (on Windows) the letters' case
+/// aside. Not through links: two names a link gives one folder are two folders here.
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    let said = |p: &Path| {
+        let full: PathBuf = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).components().collect();
+        let full = full.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            full.to_lowercase()
+        } else {
+            full
+        }
+    };
+    said(a) == said(b)
 }
 
 const DIRS_FILE: &str = "download-dirs.json";
@@ -2435,6 +2574,123 @@ mod tests {
         let studio = Arc::new(Studio::for_test(&root, crate::config::default_json()));
         assert!(studio.downloads.start(&studio, "qwen3.5-9b", None, Some("hf_x\nfoo".into())).unwrap_err().contains("Hugging Face token"));
         assert!(studio.downloads.list.lock().unwrap().is_empty(), "nothing queued");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// In a host that keeps the token (OAIY Desktop, in its Settings), the host's is the one a download goes with,
+    /// asked at each use, so one changed there is the next download's; the settings' own is not read; the page learns
+    /// that one is set and that a host keeps it, never the token; and a refusal names the host's Settings.
+    /// Where a host keeps the token and has none, the environment's (`HF_TOKEN`) still counts, as it did before a
+    /// host kept it; the host's comes first; and neither is taken with characters no token has.
+    #[test]
+    fn where_a_host_keeps_the_token_and_has_none_the_environments_still_counts() {
+        let env = |name: &str| (name == "HF_TOKEN").then(|| " hf_made_up_in_the_environment ".to_string());
+        let older = |name: &str| (name == "HUGGING_FACE_HUB_TOKEN").then(|| "hf_made_up_older_name".to_string());
+        let none = |_: &str| None::<String>;
+        assert_eq!(env_token_in(env).unwrap().as_deref(), Some("hf_made_up_in_the_environment"));
+        assert_eq!(env_token_in(older).unwrap().as_deref(), Some("hf_made_up_older_name"));
+        assert_eq!(env_token_in(none).unwrap(), None);
+        // The host's own first, and it is not the environment's.
+        assert_eq!(hosted_token(Some(" hf_made_up_hosts ".into()), || env_token_in(env)).unwrap(), (Some("hf_made_up_hosts".into()), false));
+        // None in the host (or only spaces): the environment's, and said to be.
+        for hosts in [None, Some("   ".to_string())] {
+            assert_eq!(hosted_token(hosts, || env_token_in(env)).unwrap(), (Some("hf_made_up_in_the_environment".into()), true));
+        }
+        // Neither: none, and not the environment's.
+        assert_eq!(hosted_token(None, || env_token_in(none)).unwrap(), (None, false));
+        // Checked as any other before it reaches curl, wherever it came from.
+        assert!(hosted_token(Some("hf_x\noutput = \"/tmp/x\"".into()), || env_token_in(none)).is_err());
+        assert!(hosted_token(None, || env_token_in(|_| Some("hf_x\noutput = \"/tmp/x\"".into()))).is_err());
+    }
+
+    #[test]
+    fn a_host_that_keeps_the_token_is_asked_at_each_use_and_the_settings_own_is_not_read() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-host-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = crate::config::default_json();
+        crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "hf_token", Json::str("hf_made_up_engines_own"));
+        let studio = Arc::new(Studio::for_test(&root, cfg.clone()));
+        let dl = &studio.downloads;
+        // On its own: the settings' token, and the page is not told of a host.
+        assert_eq!(dl.token(&cfg).unwrap().as_deref(), Some("hf_made_up_engines_own"));
+        let state = dl.state(&studio);
+        assert_eq!((state.get("token").and_then(Json::as_bool), state.get("token_host").and_then(Json::as_bool)), (Some(true), Some(false)));
+        // A host keeps it: what the host says now, each time it is asked.
+        let hosts = Arc::new(Mutex::new(None::<String>));
+        let asked = Arc::clone(&hosts);
+        dl.keep_token_in(Arc::new(move || asked.lock().unwrap().clone()));
+        assert_eq!(dl.token(&cfg).unwrap(), None, "the host has none: the settings' own is not used in its place");
+        let state = dl.state(&studio);
+        assert_eq!((state.get("token").and_then(Json::as_bool), state.get("token_host").and_then(Json::as_bool)), (Some(false), Some(true)));
+        *hosts.lock().unwrap() = Some(" hf_made_up_for_a_test ".into());
+        assert_eq!(dl.token(&cfg).unwrap().as_deref(), Some("hf_made_up_for_a_test"), "set in the host: used at once, with no restart");
+        assert_eq!(dl.token_for(&cfg, None).unwrap().as_deref(), Some("hf_made_up_for_a_test"));
+        // A token that came with a download (the host's own, as it was when the download began) does not outlive a
+        // change in the host: the host's, as it is now, is the one.
+        assert_eq!(dl.token_for(&cfg, Some("hf_made_up_when_it_began")).unwrap().as_deref(), Some("hf_made_up_for_a_test"));
+        *hosts.lock().unwrap() = None;
+        assert_eq!(dl.token_for(&cfg, Some("hf_made_up_when_it_began")).unwrap(), None, "removed in the host: not sent again by a Try again");
+        *hosts.lock().unwrap() = Some("hf_made_up_for_a_test".into());
+        let state = dl.state(&studio);
+        assert_eq!(state.get("token").and_then(Json::as_bool), Some(true));
+        assert!(!state.to_json().contains("hf_made_up"), "the page is told a token is set, never the token");
+        *hosts.lock().unwrap() = Some("hf_x\noutput = \"/tmp/x\"".into());
+        assert!(dl.token(&cfg).is_err(), "the host's own is checked as any other before it reaches curl");
+        *hosts.lock().unwrap() = None;
+        assert_eq!(dl.token(&cfg).unwrap(), None, "cleared in the host: gone at once");
+        // A refusal for want of a token says where one is set there: the host's Settings, not Get models.
+        for refused in [
+            curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/resolve/main/model.safetensors", true, false),
+            curl_error("curl: (22) The requested URL returned error: 403", "https://example.com/x", true, false),
+            curl_error("curl: (22) The requested URL returned error: 401", "https://huggingface.co/a/b/resolve/main/x", false, false),
+        ] {
+            assert!(refused.contains("Get models"), "on its own, the studio's own page is where one is saved: {refused}");
+            let hosted = dl.in_host_words(refused);
+            assert!(hosted.contains("in OAIY's Settings → Storage") && !hosted.contains("Get models"), "{hosted}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_that_says_where_downloads_go_keeps_the_folder_whatever_a_save_sends() {
+        let root = std::env::temp_dir().join(format!("oaiy-dl-host-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (hosts, mine) = (root.join("hosts-models"), root.join("mine"));
+        let named = |dir: &Path| {
+            let mut cfg = crate::config::default_json();
+            crate::util::set(crate::models::registry::obj_mut(&mut cfg, &["downloads"]).unwrap(), "dir", Json::str(dir.to_string_lossy()));
+            cfg
+        };
+        let studio = Arc::new(Studio::for_test(&root, named(&hosts)));
+        assert_eq!(studio.downloads.state(&studio).get("dir_host").and_then(Json::as_bool), Some(false));
+        // On its own, the folder is the settings' to change.
+        studio.set_config(named(&mine)).unwrap();
+        assert_eq!(default_dir(&studio), mine);
+        studio.set_config(named(&hosts)).unwrap();
+        // A host says where: the page is told, and the folder stays the host's whatever a save of the settings sends,
+        // another folder or no downloads settings at all.
+        studio.keep_downloads_dir_in_host();
+        let state = studio.downloads.state(&studio);
+        assert_eq!(state.get("dir_host").and_then(Json::as_bool), Some(true));
+        assert_eq!(state.get("dir").and_then(Json::as_str).map(PathBuf::from), Some(hosts.clone()));
+        studio.set_config(named(&mine)).unwrap();
+        assert_eq!(default_dir(&studio), hosts);
+        let mut bare = named(&mine);
+        if let Json::Obj(fields) = &mut bare {
+            fields.retain(|(k, _)| k != "downloads");
+        }
+        studio.set_config(bare).unwrap();
+        assert_eq!(default_dir(&studio), hosts);
+        // One folder written two ways is one folder; another is another.
+        let mut again = hosts.clone().into_os_string();
+        again.push(std::path::MAIN_SEPARATOR_STR);
+        assert!(same_folder(&hosts, Path::new(&again)));
+        assert!(!same_folder(&hosts, &mine));
+        if cfg!(windows) {
+            assert!(same_folder(&hosts, Path::new(&hosts.to_string_lossy().to_uppercase())));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

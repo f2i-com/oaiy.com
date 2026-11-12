@@ -42,12 +42,115 @@ pub fn bundled() -> Option<&'static Path> {
 
 static MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// The desktop's models folder: the one its "Model files" lists and "models downloaded to" opens. The engines kept
-/// what they downloaded in a folder of their own beside their configuration (`<data>/engines/models`), so a person
-/// who downloaded a model in the setup wizard opened the models folder and did not find it. An install whose
-/// engines have downloaded nothing yet keeps their downloads here (`oaiy_studio::use_downloads_dir`).
+/// The desktop's models folder: the one its "Model files" lists and "models downloaded to" opens, chosen in Settings
+/// → Storage. It is where the engines save what they download, too, and the one place that folder is chosen: their
+/// own page had a "Save models in" of its own, which could name another folder than Settings did. Each start of the
+/// engines writes this folder into their settings (`oaiy_studio::host_downloads_dir`, which keeps the folder they
+/// used before known to them: nothing in it is moved, or lost sight of), and their page shows it with no field.
 pub fn set_models_dir(dir: PathBuf) {
     let _ = MODELS_DIR.set(dir);
+}
+
+/// The folder an install's engines were saving models to, where it should become the desktop's Models folder: for an
+/// install from before there was one place to choose it. All of:
+///
+/// - Settings names no folder of its own (`chosen`), so its Models folder is the default, `default`;
+/// - the engines' settings name one, another than the default: a full path to a folder that is there now. (A person
+///   chose it on the engines' Get models page, where the downloads are: with a drive short of room, that choice is
+///   the one that matters, and the next model must not land on the other drive unasked.)
+/// - nothing is in the default folder. The desktop's own services keep what they install in the Models folder (the
+///   voice and speech models, each with a marker there): moved to another folder they would read as not installed.
+///   (What a file manager leaves in a folder it was looked at in, and a dot-file, are nothing.)
+///
+/// Else none: the Models folder stays what it is, the engines save there from now on, and the folder they used stays
+/// known to them. Nothing is written here; the caller keeps the answer as the person's choice.
+///
+/// Asked once for an install, by the caller: from the first start on, the engines' settings name the folder the
+/// desktop gave them, and taking that up again would put back a folder the person had Reset in Settings since.
+pub fn models_dir_to_adopt(data_dir: &Path, chosen: Option<&str>, default: &Path) -> Option<PathBuf> {
+    if chosen.is_some_and(|c| !c.trim().is_empty()) {
+        return None;
+    }
+    let named = oaiy_studio::named_downloads_dir(&config_path(data_dir))?;
+    if oaiy_studio::downloads::same_folder(&named, default) || !named.is_dir() {
+        return None;
+    }
+    let nothing = |name: &std::ffi::OsStr| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name.starts_with('.') || name == "desktop.ini" || name == "thumbs.db"
+    };
+    if std::fs::read_dir(default).is_ok_and(|entries| entries.flatten().any(|entry| !nothing(&entry.file_name()))) {
+        return None;
+    }
+    Some(named)
+}
+
+/// The desktop's Hugging Face token (Settings → Storage), for the engines it starts: there is one, and it is kept
+/// there. `read` says it as it is now, each time it is asked (so one changed in Settings is the engines' next
+/// download's, with no restart, and none is ever copied into their settings); `keep` writes one into the desktop's
+/// store (a token typed into the Engines page before there was one place for it).
+pub struct HfToken {
+    pub read: oaiy_studio::downloads::TokenHost,
+    pub keep: std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+}
+
+static HF_TOKEN: OnceLock<HfToken> = OnceLock::new();
+
+/// The app says where its Hugging Face token is, once, as it starts. The engines start on a thread of their own:
+/// ones started already are told now, and each start after is told as it starts ([`start`]).
+pub fn keep_hf_token(token: HfToken) {
+    if HF_TOKEN.set(token).is_err() {
+        return;
+    }
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    if let (Some(running), Some(token)) = (running.as_ref(), HF_TOKEN.get()) {
+        one_hf_token(running.studio.as_ref(), token);
+    }
+}
+
+/// The engines' side of [`one_hf_token`] (`oaiy_studio::Studio`'s; a stand-in in the tests).
+trait EnginesToken {
+    /// The token their settings hold, typed into their page.
+    fn own(&self) -> Option<String>;
+    /// Their settings saved without it.
+    fn forget(&self) -> Result<(), String>;
+    /// The token is the desktop's from now on: asked for at each use, and their page has no field for it.
+    fn kept_by(&self, read: oaiy_studio::downloads::TokenHost);
+}
+
+impl EnginesToken for oaiy_studio::Studio {
+    fn own(&self) -> Option<String> {
+        self.own_hf_token()
+    }
+    fn forget(&self) -> Result<(), String> {
+        self.forget_own_hf_token()
+    }
+    fn kept_by(&self, read: oaiy_studio::downloads::TokenHost) {
+        self.keep_hf_token_in(read)
+    }
+}
+
+/// One Hugging Face token, the desktop's. A token found in the engines' settings (typed into the Engines page before
+/// this) is moved into the desktop's store where the desktop has none; where both have one the desktop's wins; it is
+/// removed from the engines' settings either way, and the engines ask the desktop from then on. Where it could not be
+/// moved it is left where it is and the engines keep their own for this run: nobody's token is lost, and the next
+/// start tries again. The token is never said, here or in the log.
+fn one_hf_token(engines: &impl EnginesToken, token: &HfToken) {
+    if let Some(found) = engines.own() {
+        if (token.read)().is_none() {
+            if let Err(e) = (token.keep)(&found) {
+                log::warn!("engines: the Hugging Face token saved on the Engines page was not moved to Settings → Storage ({e}): it stays the engines' own for now");
+                return;
+            }
+            log::info!("engines: the Hugging Face token saved on the Engines page is now the one in Settings → Storage");
+        } else {
+            log::info!("engines: a Hugging Face token saved on the Engines page is removed: the one in Settings → Storage is the one used");
+        }
+        if let Err(e) = engines.forget() {
+            log::warn!("engines: the Hugging Face token was not removed from the engines' settings: {e}");
+        }
+    }
+    engines.kept_by(token.read.clone());
 }
 
 /// How the desktop treats the engines (see the module docs).
@@ -166,14 +269,25 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
             log::info!("engines: the programs are in {}", programs.display());
         }
     }
-    if let Some(models) = MODELS_DIR.get() {
-        match oaiy_studio::use_downloads_dir(&config, models) {
-            Ok(true) => log::info!("engines: what they download is kept in {}", models.display()),
-            Ok(false) => {}
-            Err(e) => log::warn!("engines: where their downloads go was not set: {e}"),
+    // (the Models folder of Settings → Storage is where they save what they download: written into their settings at
+    // each start, so a folder changed there is theirs from the restart it asks for. Where it could not be written they
+    // keep their own folder, and its field, for this run.)
+    let hosts_folder = MODELS_DIR.get().is_some_and(|models| match oaiy_studio::host_downloads_dir(&config, models) {
+        Ok(changed) => {
+            if changed {
+                log::info!("engines: what they download is kept in {}", models.display());
+            }
+            true
         }
-    }
+        Err(e) => {
+            log::warn!("engines: where their downloads go was not set: {e}");
+            false
+        }
+    });
     let running = oaiy_studio::launch(&args, true)?;
+    if hosts_folder {
+        running.studio.keep_downloads_dir_in_host();
+    }
     if let Some(runtime) = EGPU_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         running.studio.provide_egpu(Some(runtime));
     }
@@ -181,7 +295,13 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     log::info!("engines: started (control pages {url}, gateway {})", running.gateway_url);
     crate::http::set_engines_ui(&url);
     *UI_URL.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
-    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(running);
+    let mut started = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    // (the Hugging Face token is the desktop's: told now where the app has said where it is, else when it does,
+    // [`keep_hf_token`], which looks here under the same lock)
+    if let Some(token) = HF_TOKEN.get() {
+        one_hf_token(running.studio.as_ref(), token);
+    }
+    *started = Some(running);
     Ok(url)
 }
 
@@ -546,6 +666,120 @@ mod tests {
     #[test]
     fn the_configuration_lives_in_the_data_folder() {
         assert_eq!(config_path(Path::new("D:/data")), Path::new("D:/data").join("engines").join("oaiy-studio.json"));
+    }
+
+    /// The engines' settings and the desktop's store, stood in for: what each holds, and what was done to each.
+    #[derive(Default)]
+    struct Tokens {
+        engines: Mutex<Option<String>>,
+        desktop: std::sync::Arc<Mutex<Option<String>>>,
+        hosted: Mutex<bool>,
+        refuse_keeping: bool,
+    }
+
+    impl EnginesToken for Tokens {
+        fn own(&self) -> Option<String> {
+            self.engines.lock().unwrap().clone()
+        }
+        fn forget(&self) -> Result<(), String> {
+            *self.engines.lock().unwrap() = None;
+            Ok(())
+        }
+        fn kept_by(&self, _read: oaiy_studio::downloads::TokenHost) {
+            *self.hosted.lock().unwrap() = true;
+        }
+    }
+
+    impl Tokens {
+        fn of(engines: Option<&str>, desktop: Option<&str>) -> Tokens {
+            Tokens { engines: Mutex::new(engines.map(str::to_string)), desktop: std::sync::Arc::new(Mutex::new(desktop.map(str::to_string))), ..Tokens::default() }
+        }
+        fn desktops(&self) -> HfToken {
+            let (read, keep, refuse) = (self.desktop.clone(), self.desktop.clone(), self.refuse_keeping);
+            HfToken {
+                read: std::sync::Arc::new(move || read.lock().unwrap().clone()),
+                keep: std::sync::Arc::new(move |t: &str| {
+                    if refuse {
+                        return Err("the folder is read-only".into());
+                    }
+                    *keep.lock().unwrap() = Some(t.to_string());
+                    Ok(())
+                }),
+            }
+        }
+        /// (the engines' own, the desktop's, whether the engines ask the desktop from now on)
+        fn after(self) -> (Option<String>, Option<String>, bool) {
+            one_hf_token(&self, &self.desktops());
+            let now = (self.engines.lock().unwrap().clone(), self.desktop.lock().unwrap().clone(), *self.hosted.lock().unwrap());
+            now
+        }
+    }
+
+    /// There is one Hugging Face token, the desktop's. One typed into the Engines page before is moved to the
+    /// desktop's store where the desktop has none, and removed from the engines' settings; where both have one the
+    /// desktop's wins and the engines' is removed; and nobody loses one that could not be moved.
+    #[test]
+    fn a_token_saved_on_the_engines_page_moves_to_the_desktops_store_and_the_desktops_wins() {
+        let (engines, desktop) = ("hf_made_up_engines_own", "hf_made_up_for_a_test");
+        // Only the engines have one: it is the desktop's now, and gone from the engines' settings.
+        assert_eq!(Tokens::of(Some(engines), None).after(), (None, Some(engines.to_string()), true));
+        // Both have one: the desktop's stays, the engines' is removed.
+        assert_eq!(Tokens::of(Some(engines), Some(desktop)).after(), (None, Some(desktop.to_string()), true));
+        // Only the desktop, or neither: nothing to move, and the engines ask the desktop.
+        assert_eq!(Tokens::of(None, Some(desktop)).after(), (None, Some(desktop.to_string()), true));
+        assert_eq!(Tokens::of(None, None).after(), (None, None, true));
+        // The desktop could not keep it (its folder refused the write): left where it is, the engines' own for this
+        // run, and tried again at the next start.
+        let stuck = Tokens { refuse_keeping: true, ..Tokens::of(Some(engines), None) };
+        assert_eq!(stuck.after(), (Some(engines.to_string()), None, false));
+    }
+
+    /// There is one models folder, the desktop's. The folder an install's engines were saving to becomes it only where
+    /// that is plainly the person's one choice and takes nothing from the desktop's own services.
+    #[test]
+    fn the_folder_the_engines_saved_to_becomes_the_models_folder_only_where_nothing_is_lost() {
+        let base = std::env::temp_dir().join(format!("oaiy-adopt-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let install = |name: &str, named: Option<&Path>| {
+            let data = base.join(name);
+            std::fs::create_dir_all(data.join("engines")).unwrap();
+            if let Some(dir) = named {
+                std::fs::write(config_path(&data), serde_json::json!({ "downloads": { "dir": dir.display().to_string() } }).to_string()).unwrap();
+            }
+            data
+        };
+        let roomy = base.join("roomy-drive").join("models");
+        std::fs::create_dir_all(&roomy).unwrap();
+        // The engines were told a folder on their own page, Settings names none, and the default folder holds nothing
+        // (it is not there, or is empty): theirs is the one.
+        let data = install("chose-on-the-engines-page", Some(&roomy));
+        assert_eq!(models_dir_to_adopt(&data, None, &data.join("models")), Some(roomy.clone()));
+        std::fs::create_dir_all(data.join("models")).unwrap();
+        assert_eq!(models_dir_to_adopt(&data, Some("  "), &data.join("models")), Some(roomy.clone()));
+        // Settings names a folder: Settings is the one place, and stays as it is.
+        assert_eq!(models_dir_to_adopt(&data, Some("D:/chosen-in-settings"), &data.join("models")), None);
+        // What a file manager leaves behind in the default folder, and a dot-file, are nothing in it.
+        for left in [".DS_Store", "desktop.ini", "Thumbs.db", ".oaiy-write-test"] {
+            std::fs::write(data.join("models").join(left), b"x").unwrap();
+        }
+        assert_eq!(models_dir_to_adopt(&data, None, &data.join("models")), Some(roomy.clone()));
+        // The desktop's services have installed into the default folder: left where they look for it.
+        std::fs::create_dir_all(data.join("models").join("oaiy-voice")).unwrap();
+        assert_eq!(models_dir_to_adopt(&data, None, &data.join("models")), None);
+        // The engines name the default folder itself (the desktop gave it to them), none at all, or have no settings yet.
+        let same = install("same", None);
+        std::fs::write(config_path(&same), serde_json::json!({ "downloads": { "dir": same.join("models").display().to_string() } }).to_string()).unwrap();
+        assert_eq!(models_dir_to_adopt(&same, None, &same.join("models")), None);
+        let unnamed = install("unnamed", None);
+        std::fs::write(config_path(&unnamed), serde_json::json!({ "downloads": { "dir": "" } }).to_string()).unwrap();
+        assert_eq!(models_dir_to_adopt(&unnamed, None, &unnamed.join("models")), None);
+        let new = install("new", None);
+        assert_eq!(models_dir_to_adopt(&new, None, &new.join("models")), None);
+        assert!(!config_path(&new).exists(), "asking makes no settings");
+        // A folder that is not there now (a drive unplugged today) is not taken up.
+        let gone = install("gone", Some(&base.join("not-there")));
+        assert_eq!(models_dir_to_adopt(&gone, None, &gone.join("models")), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

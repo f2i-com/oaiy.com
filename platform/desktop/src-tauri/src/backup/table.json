@@ -67,8 +67,8 @@
       "class": "excluded",
       "paths": ["engines/**"],
       "what": "The engines' programs, models and settings",
-      "reason": "The engines' programs, models and settings (their settings hold a gateway key and the Hugging Face token).",
-      "redo": "Choose your engine models again, and enter your Hugging Face token if you use one."
+      "reason": "The engines' programs, models and settings (their settings hold a gateway key).",
+      "redo": "Choose your engine models again."
     },
     {
       "id": "hf-token",
@@ -843,6 +843,7 @@
       ".model-catalog.seed.json": "rebuilt",
       "flow-files": "not-a-store: the CLI's own data folder for a confined flow run, on a headless server and on the desktop (bridge/worker.rs confine_child: its flows' databases and memory, kept apart from the server's credentials), as the CLI's data folder is for a run that is not confined: the CLI's, not a store of the desktop's",
       "Contents": "not-a-store: the folder inside a Mac app bundle (OAIY.app/Contents), looked at by the updater to know the app it would replace (update/kind.rs); the app's, never in the data folder",
+      "thumbs.db": "not-a-store: what Windows leaves in a folder it showed pictures in; named only to be counted as nothing when the default models folder is looked into once (engines.rs models_dir_to_adopt), never read or written",
       "Info.plist": "not-a-store: the file inside a Mac app bundle that says it is one (OAIY.app/Contents/Info.plist), looked at by the updater before it replaces the app (update/kind.rs); the app's, never in the data folder",
       ".oaiy-isolated.json": "not-a-store: the marker an isolated plugin-qualification launch writes in its own root folder (isolated.rs); that root is never the desktop's data folder",
       ".oaiy-isolated.lock": "not-a-store: the lock of an isolated plugin-qualification launch's own root folder (isolated.rs)",

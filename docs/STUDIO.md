@@ -176,6 +176,16 @@ licence. **Recommended** picks one of each kind to start with.
 - **Where they go:** **Save models in** (default: the studio's `models`
   folder). Each model gets a folder of its own there, and the page shows the
   drive's free space. A download that would not fit is refused before it starts.
+  Inside OAIY Desktop there is one place to choose the folder, the **Models
+  folder** of Settings → Storage: this page names it, with a link there, and
+  has no field for it (a save of another folder is refused with `409`). The
+  desktop writes its folder into `downloads.dir` each time it starts the
+  engines. A folder downloads went to before stays known
+  (`download-dirs.json`): what is in it still reads as downloaded, keeps
+  working, and is added again from where it is. An install whose engines were
+  saving to a folder chosen on this page, with Settings on its default and
+  nothing in the default folder, has that folder made its Models folder the
+  first time the new version starts.
 - **Pause and resume:** **Pause** stops a download and keeps the partial file
   (`NAME.part`). **Resume** carries on from there, also after the studio
   restarts (a model partly downloaded into another folder is found there too:

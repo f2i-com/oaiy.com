@@ -334,9 +334,17 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             studio.update_config(|next| {
                 let mut d = next.get("downloads").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
                 if let Some(dir) = b.get("dir").and_then(Json::as_str) {
+                    // (in a host that says where models are saved, OAIY Desktop: chosen there, in one place)
+                    if studio.downloads.dir_hosted() {
+                        return Err((409, "where models are saved is set in OAIY's Settings → Storage (Models folder): change it there".into()));
+                    }
                     crate::util::set(&mut d, "dir", Json::str(dir.trim()));
                 }
                 if let Some(t) = b.get("hf_token").and_then(Json::as_str) {
+                    // (in a host that keeps the token, OAIY Desktop: set there, in one place, and never kept here)
+                    if studio.downloads.token_hosted() {
+                        return Err((409, "the Hugging Face token is kept in OAIY's Settings → Storage: set it there".into()));
+                    }
                     // (written into curl's configuration as it downloads: letters, digits, _ . and - alone)
                     crate::models::downloads::check_token(t.trim()).map_err(|e| (400, e))?;
                     crate::util::set(&mut d, "hf_token", Json::str(t.trim()));

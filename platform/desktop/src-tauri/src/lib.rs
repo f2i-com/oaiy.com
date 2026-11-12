@@ -1360,6 +1360,11 @@ fn set_hf_token(
     dashboard_only(&webview)?;
     let trimmed = token.trim();
     let value = if trimmed.is_empty() { None } else { Some(trimmed) };
+    // (held to what a token is made of before it is kept: the engines refuse any other at each download, the public
+    // models' too, and their page could only say that no token was set)
+    if let Some(token) = value {
+        oaiy_studio::downloads::check_token(token)?;
+    }
     write_hf_token(&app, value)?;
     downloads.set_token(value.map(str::to_string));
     Ok(())
@@ -1566,8 +1571,34 @@ pub fn run() {
                 if let Ok(resources) = app.path().resource_dir() {
                     crate::engines::set_bundled(resources.join("resources").join("engines"));
                 }
-                // The folder the window calls the models' is where the engines keep what they download, too.
-                crate::engines::set_models_dir(resolve_models_dir(app.handle(), &data_dir));
+                // One models folder, chosen in one place: Settings → Storage. An install whose engines were saving to a
+                // folder chosen on their own page goes on saving there: that folder becomes the Models folder, where
+                // nothing is lost by it (`models_dir_to_adopt`), before the folder is read below. Asked once for an
+                // install (`modelsFolderJoined` in the pointer file): from this start on the engines' settings name
+                // the folder given to them here, and taking that up again at a later start put back a folder the
+                // person had Reset in Settings.
+                const JOINED: &str = "modelsFolderJoined";
+                if read_config_str(app.handle(), JOINED).is_none() {
+                    if let Some(adopt) = crate::engines::models_dir_to_adopt(&data_dir, read_models_dir_override(app.handle()).as_deref(), &data_dir.join("models")) {
+                        let said = adopt.display().to_string();
+                        match validate_local_dir_path(&said).and_then(|()| write_models_dir_override(app.handle(), Some(&said))) {
+                            Ok(()) => log::info!("models: the folder the engines were saving to, {said}, is the Models folder now (Settings → Storage)"),
+                            Err(e) => log::warn!("models: the folder the engines were saving to, {said}, was not made the Models folder: {e}"),
+                        }
+                    }
+                    if let Err(e) = write_config_str(app.handle(), JOINED, Some("1")) {
+                        log::warn!("models: that the engines' folder was looked at once could not be kept ({e}): it is looked at again next time");
+                    }
+                }
+                // The folder the window calls the models' is where the engines keep what they download, too: the one
+                // Settings names, even where it cannot be used at this start (its drive is unplugged). The desktop's
+                // own services fall back to the default folder then, as they always did; the engines' downloads, tens
+                // of gigabytes each, fail and say why rather than fill the data drive unasked.
+                let engines_models = read_models_dir_override(app.handle())
+                    .filter(|chosen| validate_local_dir_path(chosen).is_ok())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| resolve_models_dir(app.handle(), &data_dir));
+                crate::engines::set_models_dir(engines_models);
                 let data_dir = data_dir.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = crate::engines::start(&data_dir) {
@@ -1666,6 +1697,20 @@ pub fn run() {
             // Load the saved HuggingFace token (if any) so gated downloads
             // work from the first launch without re-entering it.
             downloads.set_token(if isolated { None } else { read_hf_token(app.handle()) });
+            // The one Hugging Face token (Settings → Storage) is the engines' too: they ask for it here at each
+            // download, so none is copied into their settings and one changed in Settings needs no restart; and one
+            // typed into the Engines page before there was one place for it is kept here (`engines::one_hf_token`).
+            if !isolated {
+                let (read, live, app_for_token) = (downloads.clone(), downloads.clone(), app.handle().clone());
+                crate::engines::keep_hf_token(crate::engines::HfToken {
+                    read: Arc::new(move || read.token()),
+                    keep: Arc::new(move |token: &str| {
+                        write_hf_token(&app_for_token, Some(token))?;
+                        live.set_token(Some(token.to_string()));
+                        Ok(())
+                    }),
+                });
+            }
             let python: PythonHandle = Python::new(data_dir.clone()).into_handle();
             let catalog = CatalogHandle::new(data_dir.clone());
 

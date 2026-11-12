@@ -144,6 +144,41 @@ impl Studio {
         }
     }
 
+    /// The Hugging Face token is its host's to keep from now on (OAIY Desktop, in its Settings → Storage): `ask` is
+    /// asked at each use (a download, the control page's "a token is set"), so one changed there is the next
+    /// download's; the settings keep none (a save leaves `downloads.hf_token` empty, whatever it was sent); and the
+    /// control page shows no field for it, only that one is set and where. A host reads [`Studio::own_hf_token`]
+    /// first and keeps what it finds, so a token typed into the page before is not lost.
+    pub fn keep_hf_token_in(&self, ask: downloads::TokenHost) {
+        self.downloads.keep_token_in(ask);
+    }
+
+    /// Where downloads go is its host's to say from now on (OAIY Desktop, the "Models folder" of its Settings →
+    /// Storage, which it wrote into the settings before it started this studio: [`host_downloads_dir`]): the control
+    /// page shows the folder and where it is changed, with no field for it, and a save of another one is refused.
+    pub fn keep_downloads_dir_in_host(&self) {
+        self.downloads.keep_dir_in_host();
+    }
+
+    /// The Hugging Face token the settings hold (typed into the control page's Get models), if any.
+    pub fn own_hf_token(&self) -> Option<String> {
+        let cfg = self.config();
+        Some(cfg.get("downloads").map_or("", |d| str_or(d, "hf_token", "")).trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    /// The settings' own Hugging Face token removed, and the settings saved without it.
+    pub fn forget_own_hf_token(&self) -> Result<(), String> {
+        self.update_config(|next| {
+            if let Some(mut d) = next.get("downloads").cloned() {
+                util::set(&mut d, "hf_token", Json::str(""));
+                util::set(next, "downloads", d);
+            }
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|(_, e)| e)
+    }
+
     pub fn output_root(&self) -> PathBuf {
         let cfg = self.config();
         config::resolve(&self.root, cfg.get("media").map_or("outputs", |m| str_or(m, "output_dir", "outputs")))
@@ -225,6 +260,23 @@ impl Studio {
                     util::set(&mut sec, key, Json::str(kept));
                     util::set(&mut next, section, sec);
                 }
+            }
+        }
+        // (in a host that keeps the Hugging Face token, the settings keep none, whatever a save sends)
+        if self.downloads.token_hosted() {
+            if let Some(mut d) = next.get("downloads").cloned().filter(|d| !str_or(d, "hf_token", "").is_empty()) {
+                util::set(&mut d, "hf_token", Json::str(""));
+                util::set(&mut next, "downloads", d);
+            }
+        }
+        // (in a host that says where downloads go, the folder stays the host's, whatever a save sends: the settings as a
+        // whole saved from the page, with an older folder in them)
+        if self.downloads.dir_hosted() {
+            let hosts = current.get("downloads").map_or("", |d| str_or(d, "dir", "")).to_string();
+            let mut d = next.get("downloads").cloned().unwrap_or(Json::Obj(Vec::new()));
+            if str_or(&d, "dir", "") != hosts {
+                util::set(&mut d, "dir", Json::str(hosts));
+                util::set(&mut next, "downloads", d);
             }
         }
         // (entries set aside as the settings were read stay set aside, and in the file: a page that does not send them
@@ -903,25 +955,49 @@ pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -
     Ok(changed)
 }
 
-/// For a host with a models folder of its own (OAIY Desktop: the folder its window lists and opens): `downloads.dir`
-/// in the configuration at `config_path` set to `dir`, where the configuration names none and nothing has been
-/// downloaded into the default folder yet (`models` beside the configuration). A folder the person chose stays
-/// theirs, and an install that already has downloads keeps finding them where they are: the catalog tells what is
-/// installed by looking in the downloads folder. Returns whether anything changed.
-pub fn use_downloads_dir(config_path: &std::path::Path, dir: &std::path::Path) -> Result<bool, String> {
+/// For a host that says where models are saved (OAIY Desktop: the "Models folder" of its Settings → Storage, the
+/// folder its window lists and opens): `downloads.dir` in the configuration at `config_path` set to `dir`, for a
+/// studio that is not running. There is one place to choose the folder then, the host's, and the studio it starts is
+/// told so ([`Studio::keep_downloads_dir_in_host`]).
+///
+/// The folder downloads went to until now, where it is another one, is written down as a folder they went to
+/// (`download-dirs.json`): the one the configuration named (a person's choice on the control page, kept whether or not
+/// it can be read now: a drive that is unplugged today), else the default (`models` beside the configuration) where
+/// something is in it. What was downloaded there still reads as downloaded and what is partly there is still found:
+/// nothing is moved, and the models added from it are named by their paths, which have not changed.
+///
+/// Returns whether anything changed.
+pub fn host_downloads_dir(config_path: &std::path::Path, dir: &std::path::Path) -> Result<bool, String> {
     let mut cfg = config::load(config_path)?;
+    let root = config_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let mut downloads = cfg.get("downloads").cloned().unwrap_or(Json::Obj(Vec::new()));
-    if !str_or(&downloads, "dir", "").trim().is_empty() {
-        return Ok(false);
-    }
-    let root = config_path.parent().unwrap_or(std::path::Path::new("."));
-    if std::fs::read_dir(root.join("models")).is_ok_and(|mut entries| entries.next().is_some()) {
-        return Ok(false);
+    let named = str_or(&downloads, "dir", "").trim().to_string();
+    let was = config::resolve(&root, if named.is_empty() { "models" } else { &named });
+    if downloads::same_folder(&was, dir) {
+        if !named.is_empty() {
+            return Ok(false);
+        }
+    } else if !named.is_empty() || std::fs::read_dir(&was).is_ok_and(|mut entries| entries.next().is_some()) {
+        downloads::remember_dir_at(&root, &was);
     }
     util::set(&mut downloads, "dir", Json::str(dir.to_string_lossy()));
     util::set(&mut cfg, "downloads", downloads);
     config::save(config_path, &cfg)?;
     Ok(true)
+}
+
+/// The folder the configuration at `config_path` names for downloads (`downloads.dir`: a person's choice on the
+/// control page, or the folder a host gave it), as a full path. None where there is no configuration yet, it cannot be
+/// read, or it names none. Nothing is written (a configuration is not made for being asked).
+pub fn named_downloads_dir(config_path: &std::path::Path) -> Option<PathBuf> {
+    let cfg = Json::parse(&std::fs::read(config_path).ok()?).ok()?;
+    let named = cfg.get("downloads").map_or("", |d| str_or(d, "dir", "")).trim().to_string();
+    if named.is_empty() {
+        return None;
+    }
+    let root = config_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    Some(config::resolve(&std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()), &named))
 }
 
 fn running_at(args: &Args) -> Option<String> {
@@ -1200,6 +1276,37 @@ mod tests {
         studio.save_config_from(fresh).unwrap();
         assert_eq!(studio.config().get("downloads").map(|d| str_or(d, "hf_token", "").to_string()).as_deref(), Some("hf_secret"));
         assert!(studio.config().get(CONFIG_VERSION).is_none(), "the version is not a setting");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A host that keeps the Hugging Face token (OAIY Desktop) reads the settings' own first, to keep it; it is then
+    /// removed, from the file too; and the settings keep none after, whatever a save of them sends.
+    #[test]
+    fn in_a_host_that_keeps_the_token_the_settings_keep_none() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-host-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let with_token = |cfg: &mut Json, token: &str| {
+            let mut d = cfg.get("downloads").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
+            util::set(&mut d, "hf_token", Json::str(token));
+            util::set(cfg, "downloads", d);
+        };
+        let mut cfg = config::default_json();
+        with_token(&mut cfg, " hf_made_up_engines_own ");
+        let studio = Studio::for_test(&root, cfg);
+        assert_eq!(studio.own_hf_token().as_deref(), Some("hf_made_up_engines_own"), "what the page saved before, for the host to keep");
+        studio.forget_own_hf_token().unwrap();
+        assert_eq!(studio.own_hf_token(), None);
+        assert!(!std::fs::read_to_string(&studio.config_path).unwrap().contains("hf_made_up"), "gone from the file too");
+        studio.forget_own_hf_token().unwrap();
+        // The host's from now on. A save that sends a token (a page read before, another client) puts none back.
+        studio.keep_hf_token_in(Arc::new(|| Some("hf_made_up_for_a_test".into())));
+        let mut page = studio.config_for_page();
+        with_token(&mut page, "hf_made_up_typed_in_the_page");
+        studio.save_config_from(page).unwrap();
+        assert_eq!(studio.own_hf_token(), None);
+        assert!(!std::fs::read_to_string(&studio.config_path).unwrap().contains("hf_made_up"));
+        assert!(!studio.config_for_page().to_json().contains("hf_made_up"), "and the host's is never among the settings answered");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1539,28 +1646,54 @@ mod tests {
     }
 
     #[test]
-    fn a_hosts_models_folder_takes_the_downloads_of_an_install_that_has_none() {
+    fn a_hosts_models_folder_is_where_downloads_go_and_the_folder_before_it_stays_known() {
         let base = std::env::temp_dir().join(format!("oaiy-downloads-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (conf_dir, models) = (base.join("engines"), base.join("models"));
         std::fs::create_dir_all(&conf_dir).unwrap();
         let path = conf_dir.join(config::FILE_NAME);
         let named = |path: &std::path::Path| str_or(config::load(path).unwrap().get("downloads").unwrap(), "dir", "").to_string();
-        // A new install: the host's folder is where downloads go, and a second call changes nothing.
-        assert!(use_downloads_dir(&path, &models).unwrap());
-        assert_eq!(std::path::PathBuf::from(named(&path)), models);
-        assert!(!use_downloads_dir(&path, &base.join("other")).unwrap(), "a folder that is named stays");
-        assert_eq!(std::path::PathBuf::from(named(&path)), models);
-        // An install with something in the engines' own folder keeps it there: the catalog looks for it in that folder.
+        let known = |dir: &std::path::Path| -> Vec<PathBuf> {
+            std::fs::read(dir.join("download-dirs.json")).ok().and_then(|b| Json::parse(&b).ok()).map_or(Vec::new(), |j| j.as_array().unwrap_or(&[]).iter().filter_map(Json::as_str).map(PathBuf::from).collect())
+        };
+        // No configuration yet: none is named, and asking makes none.
+        assert_eq!(named_downloads_dir(&path), None);
+        assert!(!path.exists());
+        // A new install: the host's folder is where downloads go, and a second start changes nothing.
+        assert!(host_downloads_dir(&path, &models).unwrap());
+        assert_eq!(PathBuf::from(named(&path)), models);
+        assert_eq!(named_downloads_dir(&path), Some(models.clone()));
+        assert!(!host_downloads_dir(&path, &models).unwrap());
+        assert!(known(&conf_dir).is_empty(), "nothing went anywhere else");
+        // The same folder written another way is the same folder (a closing separator; on Windows the letters' case).
+        let mut again = models.clone().into_os_string();
+        again.push(std::path::MAIN_SEPARATOR_STR);
+        assert!(!host_downloads_dir(&path, std::path::Path::new(&again)).unwrap());
+        // The host's folder changed (its Settings): downloads go to the new one, and the one before it stays known,
+        // with or without anything in it (it was named: a drive that is not there today may be tomorrow).
+        let other = base.join("other");
+        assert!(host_downloads_dir(&path, &other).unwrap());
+        assert_eq!(PathBuf::from(named(&path)), other);
+        assert_eq!(known(&conf_dir), vec![models.clone()]);
+        // An install from before the host said: something in the engines' own folder. It stays known, and found.
         let old = base.join("old");
         std::fs::create_dir_all(old.join("models").join("Qwen3.5-9B-GGUF")).unwrap();
         let old_path = old.join(config::FILE_NAME);
-        assert!(!use_downloads_dir(&old_path, &models).unwrap());
-        assert_eq!(named(&old_path), "");
-        // An empty folder of its own is not a download.
+        assert!(host_downloads_dir(&old_path, &models).unwrap());
+        assert_eq!(PathBuf::from(named(&old_path)), models);
+        assert_eq!(known(&old), vec![old.join("models")]);
+        // An empty folder of its own is not a download, and is not kept in mind.
         let empty = base.join("empty");
         std::fs::create_dir_all(empty.join("models")).unwrap();
-        assert!(use_downloads_dir(&empty.join(config::FILE_NAME), &models).unwrap());
+        assert!(host_downloads_dir(&empty.join(config::FILE_NAME), &models).unwrap());
+        assert!(known(&empty).is_empty());
+        // A name relative to the settings' folder is that folder's.
+        let mut cfg = config::load(&path).unwrap();
+        let mut downloads = cfg.get("downloads").cloned().unwrap();
+        util::set(&mut downloads, "dir", Json::str("mine"));
+        util::set(&mut cfg, "downloads", downloads);
+        config::save(&path, &cfg).unwrap();
+        assert_eq!(named_downloads_dir(&path), Some(conf_dir.join("mine")));
         let _ = std::fs::remove_dir_all(&base);
     }
 
