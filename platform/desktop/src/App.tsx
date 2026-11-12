@@ -1,20 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import {
+  Archive,
   BookUser,
   Bot,
   CalendarDays,
-  Check,
   ChevronDown,
   Clock3,
-  Copy,
   Cpu,
   ExternalLink,
+  FolderOpen,
   HardDrive,
   History,
   Inbox,
   LayoutDashboard,
   ListChecks,
-  LockKeyhole,
   Moon,
   Package,
   PhoneForwarded,
@@ -26,7 +25,6 @@ import {
   ShieldCheck,
   Sparkles,
   Sun,
-  TriangleAlert,
   Workflow,
   type LucideIcon,
   Network,
@@ -53,13 +51,13 @@ import ContactsPanel from './ContactsPanel';
 import MessagesPanel from './MessagesPanel';
 import RingDialog from './RingDialog';
 import { forgetUnsaved, hasUnsaved, whenLeaving } from './unsavedChanges';
-import { useToastIfAny } from './Toasts';
+import { useToastIfAny, useToastSlot } from './Toasts';
 import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
-import SettingsPanel from './SettingsPanel';
+import SettingsPanel, { BackupSettings, StorageSettings } from './SettingsPanel';
 import EmbeddedPage from './EmbeddedPage';
 import SetupPage from './SetupPage';
 import AgentSettingsPanel from './AgentSettingsPanel';
@@ -68,14 +66,15 @@ import { SetupHeading } from './SetupParts';
 import { carryGuideDismissal, guideDismissed, onOpenSetup, openSetup, useSetupState } from './useSetupState';
 
 /**
- * OAIY Desktop: a sidebar of a few sections, and a workspace of topbar / page /
- * endpoint dock. A section with more than one page shows them as tabs under the
- * topbar; every page keeps its own view id, so anything that opens a page by id
- * (the Overview, a plugin screen's `navigate`, the dock) still lands on it.
+ * OAIY Desktop: a sidebar of a few sections, and a workspace of topbar / page.
+ * A section with more than one page shows them as tabs under the topbar (on the
+ * topbar's own line where the section holds a page in a webview: the Agent,
+ * Flows, Engines); every page keeps its own view id, so anything that opens a
+ * page by id (the Overview, a plugin screen's `navigate`) still lands on it.
  *
  * The HTTP API uses the native launch endpoint; the health poll below drives the
- * dock. If the Rust side isn't up, everything degrades to "unreachable"
- * without crashing.
+ * state at the foot of the sidebar ("Running" / "Not answering"). If the Rust
+ * side isn't up, everything degrades to "not answering" without crashing.
  */
 
 interface HealthResponse {
@@ -115,7 +114,12 @@ type BuiltinView =
   | 'python'
   | 'providers'
   | 'connections'
+  /** Settings → General: setup, and About and updates. */
   | 'settings'
+  /** Settings → Backup: backing up, restoring, and moving to a new computer. */
+  | 'backup'
+  /** Settings → Storage: where OAIY keeps its data and models, and the Hugging Face token. */
+  | 'storage'
   /** Settings → Agent: what it may change, its model, what it changed. */
   | 'agent-settings'
   /** The setup wizard: first run, or one plugin's own. */
@@ -150,7 +154,7 @@ const SECTIONS: Section[] = [
   { id: 'network', label: 'Networking', icon: Network, group: 'Setup', tabs: ['network'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
 ];
-const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings', 'agent-settings'] };
+const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings', 'backup', 'storage', 'agent-settings'] };
 
 /**
  * The sections that are there only while a module is (a plugin provides it),
@@ -205,7 +209,8 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     copy: 'Whether the receptionist may try to reach you for a caller who asks, how it rings, and when it takes a message.',
   },
   engines: {
-    tab: 'Engines',
+    // (beside the section's name on the one-line header: "Engines · This computer · Other computers", not "Engines · Engines")
+    tab: 'This computer',
     icon: Cpu,
     copy: 'The language, picture, video, speech, music and 3D models this computer runs, and their endpoints.',
   },
@@ -219,14 +224,17 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     icon: Network,
     copy: 'The models of the computers paired over OAIY Network, and which of them this computer uses by default.',
   },
-  models: { tab: 'Model files', icon: Package, copy: 'Download weights from Hugging Face and manage what is on disk.' },
+  // (what is on disk and what is downloading; getting a model is the Engines page's own Get models, the one place)
+  models: { tab: 'Model files', icon: Package, copy: 'The model files on this computer, and what is downloading.' },
   services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this computer offers OAIY.' },
   python: { tab: 'Python', icon: HardDrive, copy: 'A bundled Python and reusable venvs, so no system Python is needed.' },
   network: { tab: 'Networking', icon: Network, copy: 'Other OAIY computers on your network: pair them, and use their GPUs and models from here.' },
   connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this computer.' },
-  providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this computer.' },
+  providers: { tab: 'AI providers', icon: Sparkles, copy: 'The AI providers your flows can call: ones on the internet, with a key, or ones on this computer.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
-  settings: { tab: 'Settings', icon: Settings2, copy: 'Updates to OAIY, where it keeps its data and models, and your Hugging Face token.' },
+  settings: { tab: 'General', icon: Settings2, copy: 'Run setup again, see which OAIY this is, and update it.' },
+  backup: { tab: 'Backup', icon: Archive, copy: 'Back up what OAIY keeps on this computer, restore a backup, or move to a new computer.' },
+  storage: { tab: 'Storage', icon: FolderOpen, copy: 'Where OAIY keeps its data and its models, and the token for models that need one.' },
   'agent-settings': { tab: 'Agent', icon: Bot, copy: 'What the Agent may change in OAIY, the model it thinks with, and every change it made.' },
   setup: { tab: 'Setup', icon: ListChecks, copy: 'Choose your AI and what the Agent may do. Leave any time: setup keeps its place.' },
 };
@@ -304,13 +312,13 @@ function onSidebarKey(e: KeyboardEvent<HTMLElement>, setOpen: (id: string, open:
       if (!parent) return;
       e.preventDefault();
       const first = nav.querySelector<HTMLButtonElement>(`button[data-child-of="${parent}"]`);
-      // The narrow sidebar (icons only) has no chevron, and shows a sub-menu's pages only while one of them is open:
-      // there, right opens its first page, which shows them, and steps onto it once it shows.
+      // The narrow sidebar (icons only) has no chevron, and a sub-menu's pages are the header's tabs there: right
+      // opens the section (its first page, if none of them is open) and steps onto the open page's tab.
       const narrow = !here?.parentElement?.querySelector('.nav-toggle')?.getClientRects().length;
       if (narrow && first && first.getClientRects().length === 0) {
         setOpen(parent, true);
-        first.click();
-        focusOnceShown(first);
+        if (!here?.classList.contains('active')) first.click();
+        requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector<HTMLElement>('.topbar [role="tab"][aria-selected="true"]')?.focus()));
         return;
       }
       if (!isOpen(parent)) setOpen(parent, true);
@@ -326,16 +334,44 @@ function onSidebarKey(e: KeyboardEvent<HTMLElement>, setOpen: (id: string, open:
   }
 }
 
-/** Focus `el` once it shows (a page opening re-draws the sidebar): tried for a few frames, then given up. */
-function focusOnceShown(el: HTMLElement, frames = 10) {
-  requestAnimationFrame(() => {
-    if (el.isConnected && el.getClientRects().length > 0) el.focus();
-    else if (frames > 1) focusOnceShown(el, frames - 1);
-  });
+/** The sidebar is icons alone at this width and under (sidebar.css): a section's sub-menu folds into the header's tabs. */
+const NARROW_SIDEBAR = '(max-width: 1240px)';
+
+/** Whether the window matches a media query, kept up to date. False where the question cannot be asked. */
+function useMedia(query: string): boolean {
+  const ask = () => (typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query) : null);
+  const [matches, setMatches] = useState(() => ask()?.matches ?? false);
+  useEffect(() => {
+    const media = ask();
+    if (!media) return;
+    const changed = () => setMatches(media.matches);
+    changed();
+    media.addEventListener('change', changed);
+    return () => media.removeEventListener('change', changed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query]);
+  return matches;
 }
 
-/** A section's pages as tabs (its own, then any a plugin adds): the dashboard's segmented control, keyboard-driven with the arrow keys. */
-function SectionTabs({ section, view, onSelect }: { section: NavSection; view: View; onSelect: (v: View) => void }) {
+/**
+ * A section's pages as tabs, beside the page's name on the header's one line (its own, then any a plugin adds): the
+ * dashboard's segmented control, keyboard-driven with the arrow keys. Each tab is named for a screen reader and by
+ * its tooltip too, as a tab can be its icon alone where the line is short. `count` is what waits on a page (requests
+ * to confirm, new messages); `folded` marks the tabs of a section whose sub-menu the narrow sidebar folded away.
+ */
+function SectionTabs({
+  section,
+  view,
+  onSelect,
+  count,
+  folded = false,
+}: {
+  section: NavSection;
+  view: View;
+  onSelect: (v: View) => void;
+  count?: (view: string) => { n: number; words: string } | null;
+  folded?: boolean;
+}) {
   const views = section.tabs.map((t) => t.view);
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const i = views.indexOf(view);
@@ -348,10 +384,11 @@ function SectionTabs({ section, view, onSelect }: { section: NavSection; view: V
   };
   return (
     <div className="section-tabs">
-      <div className="seg-tabs" role="tablist" aria-label={`${section.label} pages`} onKeyDown={onKey}>
+      <div className={folded ? 'seg-tabs is-folded' : 'seg-tabs'} role="tablist" aria-label={`${section.label} pages`} onKeyDown={onKey}>
         {section.tabs.map((t) => {
           const Icon = t.icon;
           const on = t.view === view;
+          const waiting = count?.(t.view) ?? null;
           return (
             <button
               type="button"
@@ -361,11 +398,13 @@ function SectionTabs({ section, view, onSelect }: { section: NavSection; view: V
               aria-selected={on}
               tabIndex={on ? 0 : -1}
               className={on ? 'active' : undefined}
-              title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : undefined}
+              aria-label={waiting ? `${t.label}, ${waiting.words}` : t.label}
+              title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : waiting ? `${t.label}: ${waiting.words}` : t.label}
               onClick={() => onSelect(t.view as View)}
             >
               <Icon size={14} />
               <span>{t.label}</span>
+              {waiting && <em className="tab-count">{waiting.n}</em>}
             </button>
           );
         })}
@@ -416,6 +455,23 @@ export default function App() {
   /** The messages callers left that nobody has looked at: the Messages page's count. */
   const unread = useUnreadMessages(phoneOn === true);
   const countOf = (v: string) => (v === 'calendar' ? (waiting?.length ?? 0) : v === 'messages' ? unread : 0);
+  /** What waits on a page, in words: on its line in the sidebar, and on its tab. */
+  const countWords = (n: number, v = 'calendar') => (v === 'messages' ? `${n} new message${n === 1 ? '' : 's'}` : `${n} request${n === 1 ? '' : 's'} waiting`);
+  const tabCount = (v: string) => {
+    const n = countOf(v);
+    return n > 0 ? { n, words: countWords(n, v) } : null;
+  };
+  const narrowSidebar = useMedia(NARROW_SIDEBAR);
+  const toastSlot = useToastSlot();
+  // A page change can take away what held the keyboard (the wizard's "Continue later" goes with the wizard), which
+  // leaves it on nothing. It is put on the page that opened, so the next Tab is that page's first control.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const held = document.activeElement;
+      if (!held || held === document.body) document.getElementById('main')?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [view]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>(readExpanded);
   const isOpen = useCallback((id: string) => expanded[id] !== false, [expanded]);
   const setOpen = useCallback((id: string, open: boolean) => {
@@ -432,7 +488,6 @@ export default function App() {
   const lastTab = useRef<Record<string, string>>({}).current;
   const [seen, setSeen] = useState<Set<string>>(readSeen);
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
-  const [copied, setCopied] = useState(false);
   /** The setup page: a plugin's own wizard (its id), or the first-run wizard (null); and where it goes back to. */
   const [setupPlugin, setSetupPlugin] = useState<string | null>(null);
   /** The step it opens at (the Agent asked for one), and a count of opens so each opens afresh. */
@@ -504,16 +559,6 @@ export default function App() {
   const setTheme = useCallback((next: ThemeMode) => {
     setThemeState(next);
     applyTheme(next);
-  }, []);
-
-  const copyEndpoint = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(API_BASE);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      // Clipboard can be unavailable in a webview without a focused document.
-    }
   }, []);
 
   useEffect(() => {
@@ -690,15 +735,23 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, revealId]);
 
-  // One derived state drives the dock (and the topbar's warning when the API is down).
+  // One derived state drives the sidebar's "Running" / "Not answering". (A page that cannot read what it shows says
+  // so itself, once, with its own "Try again": the top bar does not say it a second time.)
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
   const section = findSection(sections, view);
   // A plugin screen has no PAGE entry: its line comes from the page the plugin
   // contributed (a tab in a built-in section keeps that section's heading).
   const pluginView = view.startsWith('plugin:') ? view.split(':') : null;
   const activePluginPage = pluginView ? pluginPageOf(sections, view) : null;
-  // A page in a sub-menu: its parent is the kicker, the page the title.
-  const subTab = section?.sub ? section.tabs.find((t) => t.view === view) : undefined;
+  // A section with a sub-menu (the AI Receptionist): its pages are lines of the sidebar while the sidebar has
+  // words. Where the sidebar is icons alone the sub-menu folds away, and its pages are the header's tabs instead, as
+  // every other section's pages are: one icon in the sidebar a section, at every width.
+  const folded = !!section?.sub && narrowSidebar;
+  // A page's header: its name, the section's tabs beside the name, and (on a page of the dashboard's own) one line
+  // under them on what the page is for. A page in a sub-menu has its own name as the title; once the sub-menu has
+  // folded into tabs, the section is the title (its tabs name the pages). (`kicker`, the group, is no longer drawn:
+  // the sidebar's labels say it.)
+  const subTab = section?.sub && !folded ? section.tabs.find((t) => t.view === view) : undefined;
   const header = subTab
     ? {
         kicker: section!.label,
@@ -725,13 +778,22 @@ export default function App() {
         title: section?.label ?? PAGE[view as BuiltinView].tab,
         copy: PAGE[view as BuiltinView].copy,
       };
-  // A sub-menu's pages are in the sidebar: no tabs under the header too.
-  const tabbed = section && !section.sub && section.tabs.length > 1 ? section : null;
+  // A section's pages are tabs beside its name; a sub-menu's are in the sidebar instead, until it folds away.
+  const tabbed = section && section.tabs.length > 1 && (!section.sub || folded) ? section : null;
   // Keep unavailable panels from mounting effects that contact live integrations.
   // Native HTTP and IPC enforce the same boundary independently of this UI.
   const isolatedUnavailable = isolated && view !== 'plugins' && !pluginView;
   const embedded = !isolated && EMBEDDED.has(view);
+  // A section that holds a page in a webview (the Agent, Flows, Engines) is a whole application in the window: its
+  // header is the one line alone (the name, the tabs, the buttons), so the page gets the height, on every page of
+  // the section, so its tabs stay where they are from one to the next. What the page is for is the name's tooltip.
+  const compact = !isolated && view !== 'setup' && !!section && section.tabs.some((t) => EMBEDDED.has(t.view as View));
   const visibleSections = sections.filter((s) => s.id !== SETTINGS.id);
+
+  // A notice (a toast) never moves the page. Over a page of the dashboard's own it is drawn at the page's top right,
+  // under the header, over the content. A page in a webview is laid over everything under the header, so there a
+  // notice is one line in the header's own row, in the place given below (`top-notices`, between the tabs and the
+  // buttons). The box the webview follows (EmbeddedPage) is the same with or without a notice.
 
   const navButton = (s: NavSection) => {
     const Icon = s.icon;
@@ -800,7 +862,7 @@ export default function App() {
     const open = isOpen(s.id);
     const badge = newBadge(s, seen);
     const count = s.tabs.reduce((n, t) => n + countOf(t.view), 0);
-    const countText = (n: number, view = 'calendar') => (view === 'messages' ? `${n} new message${n === 1 ? '' : 's'}` : `${n} request${n === 1 ? '' : 's'} waiting`);
+    const countText = countWords;
     // The parent's count adds the requests and the new messages: said as what waits for the owner.
     const parentText = (n: number) => (s.tabs.some((t) => t.view === 'messages') && s.tabs.some((t) => t.view === 'calendar') ? `${n} waiting for you` : countText(n, s.tabs.find((t) => countOf(t.view) > 0)?.view));
     return (
@@ -907,6 +969,19 @@ export default function App() {
           })}
         </nav>
 
+        {/* Whether OAIY is answering: a dot and a word or two, where the eye rests least. It opens Services, as the
+            bar at the foot of every page did. (In the narrow sidebar the dot alone: its name says the rest.) */}
+        <button
+          type="button"
+          className={`api-status is-${link}`}
+          aria-label={link === 'up' ? 'OAIY is running. Open Services.' : link === 'down' ? 'OAIY is not answering. Open Services.' : 'OAIY is starting. Open Services.'}
+          title={link === 'up' ? `OAIY ${health?.version ?? ''} is running on this computer`.replace('  ', ' ') : link === 'down' ? (healthError ?? 'OAIY is not answering') : 'Asking OAIY…'}
+          onClick={() => setView('services')}
+        >
+          <i aria-hidden />
+          <span>{link === 'up' ? 'Running' : link === 'down' ? 'Not answering' : 'Starting…'}</span>
+        </button>
+
         <button
           className={section?.id === SETTINGS.id ? 'settings active' : 'settings'}
           type="button"
@@ -925,25 +1000,26 @@ export default function App() {
         </button>
       </aside>
 
-      <main id="main" className="workspace" tabIndex={-1}>
-        <header className={tabbed ? 'topbar has-tabs' : 'topbar'}>
-          <div className="top-title">
-            {header.kicker && <span className="top-kicker">{header.kicker}</span>}
-            <h1>{header.title}</h1>
-            <p title={header.copy}>{header.copy}</p>
-          </div>
+      <main id="main" className={compact ? 'workspace is-compact' : 'workspace'} tabIndex={-1}>
+        <header className={compact ? 'topbar is-compact' : 'topbar'}>
+          {/* One header on every page. Its first row is the same everywhere, 48px: the page's name at one size and
+              in one place, the section's tabs beside it, and the buttons at the right, so the name never jumps or
+              changes size as a person goes down the sidebar. A page of the dashboard's own has one more row under
+              it, a line on what the page is for; a section with a page in a webview has the first row alone (the
+              line is the name's tooltip, and its description for a screen reader), as a short window and a phone
+              have. No group word over the name: the sidebar's own labels say it. */}
+          <div className="top-row">
+            <div className="top-heading">
+              <h1 title={header.copy || undefined} aria-description={compact ? header.copy || undefined : undefined}>
+                {header.title}
+              </h1>
+              {tabbed && <SectionTabs section={tabbed} view={view} onSelect={(v) => setView(v)} count={tabCount} folded={folded} />}
+            </div>
+            {/* Where a notice is drawn while a page in a webview is open (Toasts.tsx): in this row, beside the
+                buttons, as the webview covers everything under the header. */}
+            {embedded && <div className="top-notices" ref={toastSlot} />}
 
-          <div className="top-actions">
-            {link === 'down' && (
-              <button
-                type="button"
-                className="top-alert"
-                title={healthError ?? undefined}
-                onClick={() => setView('services')}
-              >
-                <TriangleAlert size={13} /> API unreachable
-              </button>
-            )}
+            <div className="top-actions">
             {pluginView && (
               <button
                 type="button"
@@ -962,8 +1038,8 @@ export default function App() {
             <button
               type="button"
               className="icon-button"
-              aria-label={theme === 'dark' ? `Switch to the ${THEME_LABEL.light} light theme` : `Switch to the ${THEME_LABEL.dark} dark theme`}
-              title={theme === 'dark' ? `Switch to ${THEME_LABEL.light}` : `Switch to ${THEME_LABEL.dark}`}
+              aria-label={theme === 'dark' ? `Switch to the ${THEME_LABEL.light.toLowerCase()}` : `Switch to the ${THEME_LABEL.dark.toLowerCase()}`}
+              title={theme === 'dark' ? THEME_LABEL.light : THEME_LABEL.dark}
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
             >
               {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
@@ -976,7 +1052,9 @@ export default function App() {
             >
               <span>oaiy.com</span> <ExternalLink size={13} />
             </button>
+            </div>
           </div>
+          {!compact && header.copy && <p className="top-copy">{header.copy}</p>}
         </header>
 
         <section className={`view view-${view}`}>
@@ -985,7 +1063,6 @@ export default function App() {
               <span><strong>Isolated local qualification.</strong> Only plugins and their screens are available. AI, accounts, engines, flows and setup are unavailable.</span>
             </div>
           )}
-          {tabbed && <SectionTabs section={tabbed} view={view} onSelect={(v) => setView(v)} />}
           {/* Asked wherever the person is, above a page in a webview too (which is laid below them), and kept
               across pages rather than asked again at each. */}
           {!isolated && (
@@ -1058,6 +1135,8 @@ export default function App() {
             {view === 'connections' && <ConnectionsPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
+            {view === 'backup' && <BackupSettings />}
+            {view === 'storage' && <StorageSettings />}
             {view === 'agent-settings' && <AgentSettingsPanel onOpenEngines={() => setView('engines')} />}
             {view === 'setup' && (
               <SetupHeading.Provider value={putSetupHeading}>
@@ -1073,42 +1152,8 @@ export default function App() {
             </>}
           </div>
         </section>
-
-        <footer className={link === 'down' ? 'endpoint-dock offline' : link === 'pending' ? 'endpoint-dock pending' : 'endpoint-dock'}>
-          <button
-            type="button"
-            className="dock-status"
-            title={healthError ?? 'The services this computer runs'}
-            onClick={() => setView('services')}
-          >
-            <i />
-            <span>
-              <strong>
-                {link === 'up' ? 'Local API running' : link === 'down' ? 'Local API down' : 'Local API…'}
-              </strong>
-              <small>
-                {link === 'up' ? `v${health?.version} · ` : ''}localhost only
-              </small>
-            </span>
-          </button>
-          <div className="dock-endpoint">
-            <code>{API_BASE}</code>
-            <button
-              type="button"
-              className="icon-button"
-              /* The confirmation is otherwise only an icon swap — name the button
-                 for its current state so a screen reader hears the copy landed. */
-              aria-label={copied ? 'Local API URL copied' : 'Copy the local API URL'}
-              title={copied ? 'Copied' : 'Copy endpoint'}
-              onClick={() => void copyEndpoint()}
-            >
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-            </button>
-          </div>
-          <em className="dock-trust">
-            <LockKeyhole size={12} /> Keys stay on this computer
-          </em>
-        </footer>
+        {/* (no bar at the foot: whether OAIY is answering is at the foot of the sidebar, its address in Settings →
+            General, and "Keys stay on this computer" on AI providers, where keys are typed) */}
       </main>
     </div>
   );

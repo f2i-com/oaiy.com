@@ -165,7 +165,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
           <h3 className="section-title">ChatGPT</h3>
           {status && (
             <span className={connected ? 'badge badge-ok' : 'badge badge-neutral'}>
-              {connected ? 'signed in' : 'signed out'}
+              {connected ? 'Signed in' : 'Signed out'}
             </span>
           )}
         </div>
@@ -173,8 +173,8 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
 
       {!bare && (
         <p className="form-hint">
-          Use an eligible ChatGPT account instead of an API key. Your account limits apply. The sign-in is owned by the{' '}
-          <code>codex</code> agent running on this computer — OAIY never receives or stores a token.
+          Use your ChatGPT account instead of an API key, where your plan allows it. Your plan’s limits apply. The sign-in is kept by the Codex app
+          on this computer: OAIY never sees your password or a token.
         </p>
       )}
 

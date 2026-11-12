@@ -84,6 +84,8 @@ const rail = () => Array.from(host.querySelectorAll('.setup-rail-text strong')).
 const button = (label: string) => Array.from(host.querySelectorAll<HTMLButtonElement>('.setup-foot button')).find((b) => b.textContent?.trim() === label);
 const heading = () => host.querySelector('.setup-step-head h2')?.firstChild?.textContent;
 const choices = () => Array.from(host.querySelectorAll('.ai-choice'));
+/** What the chosen one is and would use: said under the row of choices, for the one chosen alone. */
+const about = () => host.querySelector('.ai-choice-about')?.textContent ?? '';
 const click = async (el: Element | undefined | null) => {
   expect(el).toBeTruthy();
   await act(async () => (el as HTMLElement).click());
@@ -119,25 +121,55 @@ describe('first run, on a desktop without the new routes', () => {
   it('is the essentials only, and falls back to ChatGPT first when Engines has nothing chosen', async () => {
     await render();
     // A desktop that keeps no Agent model cannot keep a provider as one: two choices.
-    expect(host.querySelector('.ai-choices.is-trio')).toBeNull();
-    expect(rail()).toEqual(['Welcome', 'Your AI', 'The Agent', 'Continue with the Agent']);
-    expect(heading()).toBe('Welcome to OAIY');
-    await click(button('Get started'));
+    expect(choices()).toHaveLength(2);
+    // Three steps: it opens on Your AI (a record left on the old welcome step opens there too), whose heading says
+    // the welcome's one sentence.
+    expect(rail()).toEqual(['Your AI', 'The Agent', 'Continue with the Agent']);
     expect(heading()).toBe('Your AI');
-    expect(choices()[0].textContent).toContain('ChatGPT');
-    expect(choices()[0].textContent).toContain('Recommended');
-    expect(choices()[1].textContent).toContain('On this computer');
-    expect(choices()[1].textContent).toContain('The catalog recommends Catalog LLM (5.7 GB download · needs 8 GB of GPU memory).');
-    // ChatGPT chosen: its sign-in below both; not signed in, so Next waits and Skip is offered.
+    expect(host.querySelector('.setup-step-head')!.textContent).toContain('Step 1 of 3');
+    expect(host.querySelector('.setup-step-head p')!.textContent).toContain('Welcome to OAIY. Two choices get it going');
+    // The choices are one row of tiles: a name and its marks, no paragraph in any of them.
+    expect(choices()[1].textContent).toBe('ChatGPTRecommended');
+    expect(choices()[0].textContent).toBe('On this computer');
+    // ChatGPT chosen: what it is under the row, its sign-in below; not signed in, so Next waits and Skip is offered.
+    expect(about()).toContain('Your ChatGPT account, through OAIY’s Codex connection');
+    expect(about()).not.toContain('A language model in OAIY’s engines');
     expect(host.textContent).toContain('Sign in with ChatGPT');
     expect(host.textContent).not.toContain('Download Catalog LLM (5.7 GB)');
     expect(button('Next')!.disabled).toBe(true);
     expect(button('Skip')).toBeTruthy();
-    // The other one stays choosable: local shows the engine step's card, the download offer.
-    await click(choices()[1].querySelector('input'));
+    // Back is not offered on the first step, and "Continue later" is in the footer, beside where Back goes.
+    expect(button('Back')).toBeUndefined();
+    expect(button('Continue later')).toBeTruthy();
+    // The other one stays choosable: local says what it is, and shows the engine step's card with the models to download.
+    await click(choices()[0].querySelector('input'));
     expect(host.querySelector('.ai-choice.is-selected')!.textContent).toContain('On this computer');
+    expect(about()).toContain('A language model in OAIY’s engines');
     expect(host.querySelector('.setup-reqs')!.textContent).toContain('The catalog recommends:');
-    expect(host.querySelector('.setup-reqs')!.textContent).toContain('Download Catalog LLM (5.7 GB)');
+    // The one thing to press is the footer's button, by the model's name and size; not a second one inside the card.
+    expect(host.querySelector('.setup-reqs')!.textContent).not.toContain('Download Catalog LLM');
+    const download = button('Download Catalog LLM (5.7 GB)')!;
+    expect(download.classList.contains('btn-primary')).toBe(true);
+    expect(download.disabled).toBe(false);
+    expect(button('Next')).toBeUndefined();
+    expect(host.querySelector('.setup-foot-status')!.textContent).toBe('Next opens when the download finishes. You can go on and come back.');
+    const { engines } = await import('./api');
+    await click(download);
+    expect(engines.download).toHaveBeenCalledWith('catalog-llm');
+  });
+
+  it('says how far the download is on the footer’s button, and offers Next once Engines has the model', async () => {
+    m.setupGet.mockResolvedValue(record({ position: 'ai' }));
+    const going = catalog(null);
+    going.models![0].download = { id: 'catalog-llm', status: 'downloading', done: 1.9e9, total: 5.7e9, file: 'm.gguf', filesDone: 0, filesTotal: 1 };
+    m.catalog.mockResolvedValue(going);
+    await render();
+    await click(choices()[0].querySelector('input'));
+    const busy = Array.from(host.querySelectorAll<HTMLButtonElement>('.setup-foot button')).find((b) => b.textContent?.includes('Downloading…'))!;
+    expect(busy.textContent?.trim()).toBe('Downloading… 33%');
+    expect(busy.disabled).toBe(true);
+    expect(button('Skip')).toBeTruthy();
+    expect(host.querySelector('.setup-reqs [role=progressbar]')).toBeTruthy();
   });
 
   it('puts local first when Engines has a model chosen, and names it', async () => {
@@ -147,7 +179,8 @@ describe('first run, on a desktop without the new routes', () => {
     expect(heading()).toBe('Your AI');
     expect(choices()[0].textContent).toContain('On this computer');
     expect(choices()[0].textContent).toContain('Recommended');
-    expect(choices()[0].textContent).toContain('Uses Picked-In-Engines, chosen in Engines.');
+    expect(choices()[0].textContent).toContain('Ready');
+    expect(about()).toContain('Uses Picked-In-Engines, chosen in Engines.');
     expect(button('Next')!.disabled).toBe(false);
     await click(button('Next'));
     // No preference kept on this desktop: nothing to write.
@@ -213,7 +246,7 @@ describe('first run, on a desktop without the new routes', () => {
     await render();
     await click(button('Set up the rest myself'));
     expect(heading()).toBe('Plugins');
-    expect(rail()).toEqual(['Welcome', 'Your AI', 'The Agent', 'Continue with the Agent', 'Plugins', 'Connect an app', 'Done']);
+    expect(rail()).toEqual(['Your AI', 'The Agent', 'Continue with the Agent', 'Plugins', 'Connect an app', 'Done']);
     expect(m.putFirstRun).toHaveBeenLastCalledWith(expect.objectContaining({ position: 'plugins', finished: false }));
     await click(button('Back'));
     expect(heading()).toBe('Continue with the Agent');
@@ -263,7 +296,8 @@ describe('first run, with the desktop’s new routes', () => {
       model.dispatchEvent(new Event('change', { bubbles: true }));
     });
     await settle();
-    expect(choices()[2].textContent).toContain('LM Studio · qwen3.5-9b');
+    expect(about()).toContain('LM Studio · qwen3.5-9b');
+    expect(choices()[2].textContent).toContain('Ready');
     expect(button('Next')!.disabled).toBe(false);
     await click(button('Next'));
     expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'provider', provider: 'lm-studio', model: 'qwen3.5-9b' } });
@@ -285,10 +319,13 @@ describe('first run, with the desktop’s new routes', () => {
   it('orders by the recommendation, says why, and sets the Agent to ChatGPT on Next', async () => {
     m.setupGet.mockResolvedValue(record({ position: 'ai' }));
     await render();
-    expect(choices()[0].textContent).toContain('ChatGPT');
-    expect(choices()[0].textContent).toContain('Signed in as owner@example.com.');
-    expect(choices()[1].textContent).toContain('The largest GPU has 6 GB; the recommended model needs 8 GB.');
-    expect(choices()[1].textContent).toContain('Laptop GPU · 6 GB');
+    expect(choices()[1].textContent).toContain('ChatGPT');
+    expect(about()).toContain('Signed in as owner@example.com.');
+    // Why the other is not the recommended one, said when it is looked at.
+    await click(choices()[0].querySelector('input'));
+    expect(about()).toContain('The largest GPU has 6 GB; the recommended model needs 8 GB.');
+    expect(about()).toContain('Laptop GPU · 6 GB');
+    await click(choices()[1].querySelector('input'));
     await click(button('Next'));
     expect(m.prefsSet).toHaveBeenCalledWith({ model: { source: 'chatgpt' } });
     expect(heading()).toBe('The Agent');
@@ -324,10 +361,10 @@ describe('first run, as a first-timer meets it', () => {
     });
     m.setupGet.mockResolvedValue(record({ position: 'ai' }));
     await render();
-    const local = choices()[0];
-    expect(local.textContent).toContain('Uses Catalog LLM, chosen in Engines.');
-    expect(local.textContent).not.toContain('catalog-llm');
-    expect(local.textContent).not.toContain('A language model is chosen in Engines');
+    expect(choices()[0].textContent).toContain('On this computer');
+    expect(about()).toContain('Uses Catalog LLM, chosen in Engines.');
+    expect(about()).not.toContain('catalog-llm');
+    expect(about()).not.toContain('A language model is chosen in Engines');
     expect(host.querySelector('.setup-chosen strong')!.textContent).toBe('Catalog LLM');
   });
 

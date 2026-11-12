@@ -1,4 +1,5 @@
 import type { PackageTrust, PackageTrustState } from './api';
+import { capital } from './words';
 
 /**
  * A small badge for what OAIY knows about a plugin's package: who signed it, or why it
@@ -44,7 +45,7 @@ function trustTitle(trust: PackageTrust): string {
 export default function PackageTrustBadge({ trust }: { trust: PackageTrust }) {
   return (
     <span className={CLASS[trust.state]} title={trustTitle(trust)} data-trust={trust.state}>
-      {trustLabel(trust)}
+      {capital(trustLabel(trust))}
     </span>
   );
 }

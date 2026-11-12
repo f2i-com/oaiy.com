@@ -97,6 +97,38 @@ describe("Today's tiles and the desktop's modules", () => {
     expect(calendarSync).not.toHaveBeenCalled();
   });
 
+  it('with no phone and no calendar, and a place given for it, draws no Today card: the model’s tile goes to that place', async () => {
+    modulesMock.mockResolvedValue(snapshot(false, false));
+    // On its own (no place given) Today is its card, holding the one tile.
+    await mount();
+    expect(host.querySelectorAll('.service-section .overview-tile')).toHaveLength(1);
+    expect(text()).toContain('Today');
+    // Given a place among the page's own tiles (the Overview's "This computer"), the tile goes there and no card is drawn.
+    const slot = document.createElement('div');
+    document.body.appendChild(slot);
+    try {
+      await act(async () => {
+        root.render(<TodayPanel onNavigate={vi.fn()} soloSlot={slot} />);
+      });
+      for (let i = 0; i < 4; i++) await act(async () => {});
+      expect(host.querySelector('.service-section')).toBeNull();
+      expect(text()).not.toContain('Today');
+      expect(slot.querySelectorAll('.overview-tile')).toHaveLength(1);
+      expect(slot.textContent).toContain('Language model');
+      // With the phone on, Today has more to say and stays its own card, place or no place.
+      modulesMock.mockResolvedValue(snapshot(true, false));
+      resetModules();
+      await act(async () => {
+        root.render(<TodayPanel key="again" onNavigate={vi.fn()} soloSlot={slot} />);
+      });
+      for (let i = 0; i < 6; i++) await act(async () => {});
+      expect(host.querySelector('.service-section')).not.toBeNull();
+      expect(slot.querySelectorAll('.overview-tile')).toHaveLength(0);
+    } finally {
+      slot.remove();
+    }
+  });
+
   it('until the desktop has said, neither is shown nor asked', async () => {
     modulesMock.mockReturnValue(new Promise(() => {}));
     await mount();

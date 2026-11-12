@@ -128,7 +128,16 @@ export function StepHeader({ kicker, title, description, state, aside }: { kicke
   );
 }
 
-/** Back, a status line, Skip, and Next (or Finish). */
+/**
+ * The way out of the wizard, given by its frame: the footer of each step offers it at its left ("Continue later"),
+ * beside Back, where it was a row of its own above the step.
+ */
+const WizardLeave = createContext<(() => void) | null>(null);
+
+/**
+ * Continue later and Back, a status line, Skip, and the step's one thing to do: Next (or Finish), or, where the step
+ * waits on something the person starts (a model to download), that thing itself, by its name.
+ */
 export function StepFooter({
   onBack,
   backLabel = 'Back',
@@ -137,6 +146,7 @@ export function StepFooter({
   skipLabel = 'Skip',
   onNext,
   nextLabel = 'Next',
+  nextIcon,
   nextDisabled,
   busy,
 }: {
@@ -147,14 +157,25 @@ export function StepFooter({
   skipLabel?: string;
   onNext?: () => void;
   nextLabel?: string;
+  /** An icon for a primary button that is not "Next" (a download). */
+  nextIcon?: ReactNode;
   nextDisabled?: boolean;
   busy?: boolean;
 }) {
+  const leave = useContext(WizardLeave);
   return (
     <footer className="setup-foot">
-      <button type="button" className="btn btn-ghost" onClick={onBack} disabled={!onBack || busy}>
-        {backLabel}
-      </button>
+      {leave && (
+        <button type="button" className="btn btn-ghost setup-leave" onClick={leave} disabled={busy} title="Leave setup: it keeps its place">
+          Continue later
+        </button>
+      )}
+      {/* (no Back on the first step: a button that can never be pressed is not shown) */}
+      {(onBack || !leave) && (
+        <button type="button" className="btn btn-ghost" onClick={onBack} disabled={!onBack || busy}>
+          {backLabel}
+        </button>
+      )}
       <span className="setup-foot-status" role="status">
         {status}
       </span>
@@ -165,7 +186,7 @@ export function StepFooter({
       )}
       {onNext && (
         <button type="button" className="btn btn-primary" onClick={onNext} disabled={nextDisabled || busy}>
-          {busy && <Loader2 size={14} className="spin" />} {nextLabel}
+          {busy ? <Loader2 size={14} className="spin" /> : nextIcon} {nextLabel}
         </button>
       )}
     </footer>
@@ -179,11 +200,14 @@ export function StepFooter({
  */
 export const SetupHeading = createContext<((heading: { title: string; subtitle?: string }) => void) | null>(null);
 
-/** The whole wizard: its heading (in the top bar), its progress, the steps, and the pane with its footer. */
+/**
+ * The whole wizard: its heading (in the top bar), the steps, and the pane with its footer. How far it has got is the
+ * step list's to say (each step ticked as it is done, the count in the step's own "Step 2 of 3"): the thin bar that
+ * stood over the step, in a row of its own with "Continue later", is gone, and "Continue later" is in the footer.
+ */
 export function WizardFrame({
   title,
   subtitle,
-  progress,
   rail,
   current,
   onPick,
@@ -195,7 +219,8 @@ export function WizardFrame({
 }: {
   title: string;
   subtitle?: string;
-  progress: { done: number; total: number };
+  /** (taken, and no longer drawn: the step list shows it) */
+  progress?: { done: number; total: number };
   rail: RailItem[];
   current: number;
   onPick?: (i: number) => void;
@@ -206,45 +231,44 @@ export function WizardFrame({
   children: ReactNode;
   footer?: ReactNode;
 }) {
-  const pct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
   const putHeading = useContext(SetupHeading);
   useEffect(() => putHeading?.({ title, subtitle }), [putHeading, title, subtitle]);
   return (
     <div className="setup-page">
-      <div className={putHeading ? 'setup-hero is-bare' : 'setup-hero'}>
-        {!putHeading && (
+      {!putHeading && (
+        <div className="setup-hero">
           <div className="setup-hero-text">
             <h1>{title}</h1>
             {subtitle && <p>{subtitle}</p>}
           </div>
-        )}
-        <div className="setup-hero-side">
-          {/* (a bar, not a second count: the step says where it is, "Step 2 of 4") */}
-          <span
-            className="setup-progress"
-            role="progressbar"
-            aria-label="Setup progress"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={pct}
-            aria-valuetext={`${progress.done} of ${progress.total} done`}
-            title={`${progress.done} of ${progress.total} done`}
-          >
-            <i style={{ width: `${pct}%` }} />
-          </span>
-          <button type="button" className="btn btn-ghost setup-leave" onClick={onLeave} title="Leave setup: it keeps its place">
-            Continue later
-          </button>
         </div>
-      </div>
+      )}
       <div className="setup-layout">
         <StepRail items={rail} current={current} onPick={onPick} label={railLabel} />
         <div className="setup-main">
-          <section className={flush ? 'setup-pane is-flush' : 'setup-pane'}>{children}</section>
-          {footer}
+          <WizardLeave.Provider value={onLeave}>
+            <section className={flush ? 'setup-pane is-flush' : 'setup-pane'}>{children}</section>
+            {footer ?? (
+              // (a step that draws no footer of its own, a plugin's screen: the way out stays in reach)
+              <WizardLeaveFallback flush={flush} />
+            )}
+          </WizardLeave.Provider>
         </div>
       </div>
     </div>
+  );
+}
+
+/** Nothing where the pane draws its own footer inside (a plugin's wizard as a step, which has "Continue later" in its own). */
+function WizardLeaveFallback({ flush }: { flush?: boolean }) {
+  const leave = useContext(WizardLeave);
+  if (flush || !leave) return null;
+  return (
+    <footer className="setup-foot">
+      <button type="button" className="btn btn-ghost setup-leave" onClick={leave} title="Leave setup: it keeps its place">
+        Continue later
+      </button>
+    </footer>
   );
 }
 
@@ -445,7 +469,7 @@ export function DownloadPlan({ plan }: { plan: EnginePlan }) {
       </span>
       {plan.gated && !plan.token && (
         <span className="card-warn">
-          <TriangleAlert size={12} aria-hidden /> {plan.name} is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings.
+          <TriangleAlert size={12} aria-hidden /> {plan.name} is gated: accept its licence on huggingface.co, then add a Hugging Face token in Settings → Storage.
         </span>
       )}
       {tight && (
@@ -536,8 +560,7 @@ function OwnModelFile({ onAdded }: { onAdded: (added: AddedModelFile) => void })
         </button>
       </div>
       <small className="form-hint">
-        A language model in a .gguf file, such as one LM Studio downloaded (of a model split into files, the first). The engine runs Qwen3.5, Qwen3, Qwen2, Llama, Mistral, Gemma
-        3 and 4, and GLM models; the Agent can use its tools with Qwen3.5 and GLM, and chats with the others.
+        A language model in a .gguf file you already have (of a model split into files, the first). After you add it, OAIY says whether the Agent can use its tools with it.
       </small>
       {error && (
         <p className="card-warn" role="alert">
@@ -546,6 +569,28 @@ function OwnModelFile({ onAdded }: { onAdded: (added: AddedModelFile) => void })
       )}
     </form>
   );
+}
+
+/**
+ * What the Agent can do with a model file the person added, from what the engine reported as it added it (`tools`):
+ * said of that file by its name, in words that name no model and no family of models.
+ */
+export function addedFileLine(name: string, added: Pick<AddedModelFile, 'tools'>): string {
+  return added.tools
+    ? `The Agent can use its tools with ${name}, so it can work OAIY for you as well as chat.`
+    : `The Agent chats with ${name} but cannot use its tools with it, so it can answer but not work OAIY for you. Choose another language model in Engines to change that.`;
+}
+
+/**
+ * The one thing to do next for the model offered, for a page that puts it on its own button (the first-run wizard's
+ * footer): download it, by its name and size, or nothing while it downloads (how far, as a percentage when known).
+ */
+export interface EngineAction {
+  kind: 'download' | 'downloading';
+  /** "Download <name> (18.4 GB)", or "Downloading… 34%". */
+  label: string;
+  busy: boolean;
+  run: () => void;
 }
 
 /**
@@ -562,6 +607,7 @@ export function EngineModelCard({
   gpuGb,
   onChanged,
   onOpenEngines,
+  onAction,
 }: {
   group: string;
   why?: string;
@@ -570,6 +616,11 @@ export function EngineModelCard({
   gpuGb?: number;
   onChanged: () => void;
   onOpenEngines: () => void;
+  /**
+   * Given, the page draws the download button itself (its footer's primary button) and is told what it does; the
+   * card then shows the models and the progress, and no Download button of its own.
+   */
+  onAction?: (action: EngineAction | null) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -619,6 +670,30 @@ export function EngineModelCard({
     }
   };
 
+  // The one thing to do for the model offered: download it (said with its name, and what there is to download), or
+  // wait while it downloads. Told to the page that draws the button (`onAction`), and drawn here otherwise.
+  const downloading = !!dl && ACTIVE.has(dl.status);
+  const canDownload = !!catalog?.running && !chosen && !!offer && !offer.installed && !downloading;
+  const downloadLabel = !offer
+    ? ''
+    : dl?.status === 'failed'
+      ? `Download ${offer.name} again`
+      : plan && planFor === plan.id
+        ? plan.downloadBytes > 0
+          ? `Download ${offer.name} (${formatBytes(plan.downloadBytes)})`
+          : `Add ${offer.name} (all here)`
+        : `Download ${offer.name}${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`;
+  const pct = downloading && dl?.total ? Math.min(100, Math.floor((dl.done / dl.total) * 100)) : null;
+  const actionKind: EngineAction['kind'] | null = !catalog?.running || chosen || !offer ? null : downloading ? 'downloading' : canDownload ? 'download' : null;
+  const actionLabel = actionKind === 'downloading' ? (pct === null ? 'Downloading…' : `Downloading… ${pct}%`) : downloadLabel;
+  const run = useRef(download);
+  run.current = download;
+  useEffect(() => {
+    onAction?.(actionKind ? { kind: actionKind, label: actionLabel, busy, run: () => void run.current() } : null);
+  }, [onAction, actionKind, actionLabel, busy]);
+  // (gone with the card: the page's button goes back to its own "Next")
+  useEffect(() => () => onAction?.(null), [onAction]);
+
   let body: ReactNode;
   let action: ReactNode = null;
   if (!catalog) body = <span className="form-hint">Asking the engines…</span>;
@@ -634,8 +709,9 @@ export function EngineModelCard({
         <span className="setup-chosen">
           <span className="badge badge-ok">Chosen in Engines</span> <strong title={chosen}>{modelName(catalog, chosen)}</strong>
         </span>
-        {added && added.name === chosen && !added.tools && (
-          <p className="card-warn setup-chat-only">The Agent chats with {modelName(catalog, chosen)} but cannot use its tools with it: they need a Qwen3.5 or GLM model.</p>
+        {/* What the engine said of the file as it added it (`tools`): said in words that name no model. */}
+        {added && added.name === chosen && (
+          <p className={added.tools ? 'form-hint setup-chat-only' : 'card-warn setup-chat-only'}>{addedFileLine(modelName(catalog, chosen), added)}</p>
         )}
       </>
     );
@@ -674,19 +750,13 @@ export function EngineModelCard({
         {llm && options.length > 1 && <small className="form-hint">The Agent works OAIY with tools, which it can use with the models marked Agent tools; with the others it chats only.</small>}
         {plan && planFor === plan.id && <DownloadPlan plan={plan} />}
         {!plan && planError && <p className="card-warn">{planError}</p>}
-        {!plan && !planError && planFor && offer.gated && <p className="form-hint">It is gated: its licence is accepted on huggingface.co first, with a Hugging Face token in Settings.</p>}
-        {/* Under the list, naming the model it gets: beside the card it lined up with whichever model sat in the middle. */}
-        {!offer.installed && !(dl && ACTIVE.has(dl.status)) && (
+        {!plan && !planError && planFor && offer.gated && <p className="form-hint">It is gated: its licence is accepted on huggingface.co first, with a Hugging Face token in Settings → Storage.</p>}
+        {/* Under the list, naming the model it gets: beside the card it lined up with whichever model sat in the middle.
+            (Not here where the page has the button, the first-run wizard's footer: one button, always in view.) */}
+        {canDownload && !onAction && (
           <div className="setup-offer-action">
             <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void download()}>
-              {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />}{' '}
-              {dl?.status === 'failed'
-                ? `Download ${offer.name} again`
-                : plan && planFor === plan.id
-                  ? plan.downloadBytes > 0
-                    ? `Download ${offer.name} (${formatBytes(plan.downloadBytes)})`
-                    : `Add ${offer.name} (all here)`
-                  : `Download ${offer.name}${offer.sizeGb ? ` (${offer.sizeGb} GB)` : ''}`}
+              {busy ? <Loader2 size={14} className="spin" /> : <Download size={14} />} {downloadLabel}
             </button>
           </div>
         )}

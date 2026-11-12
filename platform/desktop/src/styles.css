@@ -48,6 +48,39 @@
   --page-pad-t: 24px;
   --page-pad-x: 30px;
   --page-pad-b: 40px;
+  /* How wide a page's content runs, one rule for every page: a form stops at a width its lines read at; a list or
+     a grid of cards uses the window, up to a width a row still reads across. (`.panel`, `.panel.is-form`) */
+  /* (1000px: at the window's default size, 1280 wide, a form's cards and a list's are then the same 988px, and
+     only a wider window lets a list run on past where a form stops; at 920px Settings' cards were 68px narrower
+     than Services' beside them in the sidebar, which read as a mistake) */
+  --w-form: 1000px;
+  --w-wide: 1400px;
+  /* What parts a small label from the heading under it, and a heading from the line of text under that, wherever
+     the three stack (a page's header, a setup step, an empty state, the sidebar's name): one gap, with each line
+     at a line height that leaves it room, so a stack reads as lines and never as one block. */
+  --stack-gap: 6px;
+  /* The sizes the controls are built on, named so the Agent and the flow editor can match them (the radii are
+     further down, `--r-card`, `--r-ctl`, `--r-sm`: a card, a control, a small part; a chip is a full pill).
+     Heights: a button and a field 34px, a small button 28px, a tab in the header 24px (in a box of 30px), a chip
+     20px. Text: 14px the page's base, 13px in cards and fields, 12.5px hints and tabs, 11px chips, 10.5px small
+     capitals, 16px a page's name. Spacing: steps of 2, 4, 6, 8, 12, 16, 24. */
+  --h-control: 34px;
+  --h-control-sm: 28px;
+  --h-tab: 24px;
+  --h-chip: 20px;
+  --text-base: 14px;
+  --text-body: 13px;
+  --text-hint: 12.5px;
+  --text-chip: 11px;
+  --text-label: 10.5px;
+  --text-title: 16px;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 24px;
   --shell: #070a12;
   --sidebar: #090e18;
   --surface: rgba(14, 20, 34, 0.94);
@@ -232,6 +265,9 @@ a:hover { text-decoration: underline; text-underline-offset: 2px; }
 ::-webkit-scrollbar-track,
 ::-webkit-scrollbar-corner { background: transparent; }
 
+/* The page takes the keyboard when what held it has gone (App.tsx): no ring round the whole page for that. */
+#main:focus { outline: none; }
+
 .skip {
   position: fixed;
   z-index: 200;
@@ -274,100 +310,116 @@ kbd {
 @keyframes led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 /* ---------------------------------------------------------------------------
- * WORKSPACE — topbar (the page's header) / page / endpoint dock
+ * WORKSPACE — topbar (the page's header) / page
  * ------------------------------------------------------------------------- */
 
 .workspace {
-  /* The dock is as tall as the sidebar's Settings row and its margins, so the line above the dock and the hairline
-     above Settings are one line across the window (sidebar.css: 10px under the row, 34px of row, 4px above it). */
-  --dock-h: 48px;
+  /* The header's height, and the foot's: there is no bar at the foot (whether OAIY answers is at the foot of the
+     sidebar), so `--dock-h` is nothing. Both are named because pages measure against them (the Calendar's and
+     Contacts' side panels, calendar.css and contacts.css): change a height here and they follow. The pages in
+     webviews need neither: the desktop lays each over the box the dashboard measures (EmbeddedPage). */
+  --dock-h: 0px;
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: 78px minmax(0, 1fr) var(--dock-h);
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr);
 }
-/* (a short window's rows are 31px; the narrow sidebar's 38px) */
-@media (max-height: 760px) and (min-width: 761px) { .workspace { --dock-h: 45px; } }
-@media (max-width: 1240px) and (min-width: 761px) { .workspace { --dock-h: 52px; } }
+/* The header's two heights (`--topbar-h` is the page's, on the root so the notices' place reads it too): its first
+   row alone, 48px, for a section that holds a page in a webview (the Agent, Flows, Engines), a short window and a
+   phone; the first row and the line on what the page is for, 78px, for a page of the dashboard's own. */
+:root { --topbar-row: 48px; --topbar-h: 78px; }
+:root:has(.workspace.is-compact) { --topbar-h: var(--topbar-row); }
 
-/* Every page's header, the same for the dashboard's own pages and the ones in
-   webviews: the group it is in, its name, and one line on what it is for. */
+/* A page's header, the same on every page: three lines, each with room of its own. The group the page is in; the
+   page's name, with its section's tabs beside it; and one line on what the page is for. Every line has a fixed
+   height (14, 28 and 18px) and the same gap parts any two (`--stack-gap`, 6px), so the lines cannot close up
+   whatever font draws them: 14 + 6 + 28 + 6 + 18 is 72px of text in a 96px bar, 12px clear above and below.
+   (Before: line heights of 1.3, 1.2 and 1.4 with 2px between, 57px of text in a 78px bar, which read as one block.) */
 .topbar {
   z-index: 8;
   display: flex;
   min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
+  flex-direction: column;
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface-solid) 91%, transparent);
-  padding: 0 20px 0 30px;
   backdrop-filter: blur(18px);
 }
-/* A section with tabs: the tabs are the header's lower half, so no line between. */
-.topbar.has-tabs { border-bottom-color: transparent; }
-.top-title { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.top-kicker {
-  /* The group the page is in, in the voice of the sidebar's group labels (mono capitals), in the accent. */
-  color: var(--primary-text);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.12em;
-  line-height: 1.3;
-  text-transform: uppercase;
+/* The first row, the same on every page: 48px, the name (16px on a 22px line) 13px from the row's top and foot, the
+   section's tabs 16px after the name, a place for a notice, and the buttons at the right. */
+.top-row {
+  display: flex;
+  min-width: 0;
+  /* (the row and the header's own 1px line under it are the 48px) */
+  height: calc(var(--topbar-row) - 1px);
+  flex: none;
+  align-items: center;
+  gap: 16px;
+  padding: 0 12px 0 var(--page-pad-x);
 }
-.top-title h1 {
+.top-heading { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; gap: 16px; }
+.top-heading h1 {
   overflow: hidden;
+  flex: 0 1 auto;
   margin: 0;
-  font-size: 19px;
+  font-size: 16px;
   font-weight: 650;
-  letter-spacing: -0.018em;
-  line-height: 1.2;
+  letter-spacing: -0.012em;
+  line-height: 22px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.top-title p {
+/* The second row, on a page of the dashboard's own: what the page is for, a line of its own (13px on an 18px line)
+   that starts where the first row ends, so 13px of the first row part it from the name's line, and 12px part it
+   from the header's foot. 48 + 18 + 12 is the 78px of `--topbar-h`. */
+.top-copy {
   overflow: hidden;
+  height: 30px;
+  flex: none;
   margin: 0;
+  padding: 0 12px 12px var(--page-pad-x);
   color: var(--muted);
-  font-size: 12.5px;
-  line-height: 1.4;
+  font-size: 13px;
+  line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A notice's place in the first row, while a page in a webview is open: what is left between the tabs and the
+   buttons (Toasts.tsx draws in it; `.toast-stack.is-in-header`). */
+.top-notices { display: flex; min-width: 0; flex: 1 1 0; justify-content: flex-end; }
 
-.top-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.top-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; margin-left: auto; }
 /* (square, as tall as the button beside it) */
 .top-actions .icon-button { width: 34px; height: 34px; border-radius: var(--r-ctl); }
-/* Only while the local API cannot be reached: the dock says so too, in red. */
-.top-alert {
-  display: inline-flex;
-  height: 30px;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
-  border-radius: 999px;
-  background: var(--danger-soft);
-  color: var(--danger);
-  padding: 0 11px;
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-}
 
-/* A section's pages, under its header: the segmented tabs the Flows editor and
-   plugin screens use too. For a page in a webview the strip sits above it, and
-   the webview is laid below the strip. */
-.section-tabs {
-  z-index: 7;
-  display: flex;
-  flex: none;
-  min-width: 0;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface-solid) 91%, transparent);
-  padding: 0 30px 10px;
+/* A section's pages, beside its name: the segmented tabs the Flows editor and plugin screens use too. */
+.section-tabs { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; }
+.topbar .seg-tabs { flex: none; flex-wrap: nowrap; overflow-x: auto; padding: 2px; scrollbar-width: none; }
+.topbar .seg-tabs::-webkit-scrollbar { display: none; }
+.topbar .seg-tabs > button { flex: none; height: 24px; padding: 0 11px; }
+/* What waits on a page (requests to confirm, new messages), on its tab as on its line in the sidebar. */
+.seg-tabs > button > .tab-count {
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--amber);
+  color: var(--surface-solid);
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+}
+/* Where the line is short of room, only the open tab keeps its word; the others are their icons (each named, and
+   with its name as its tooltip). The pages of a section whose menu the narrow sidebar folds away (`.is-folded`: the
+   AI Receptionist's six) are many, so theirs do at every width they show at. */
+.topbar .seg-tabs.is-folded > button:not(.active) > span { display: none; }
+.topbar .seg-tabs.is-folded > button:not(.active) { padding: 0 9px; }
+@media (max-width: 900px) {
+  .topbar .seg-tabs > button:not(.active) > span { display: none; }
+  .topbar .seg-tabs > button:not(.active) { padding: 0 9px; }
 }
 .seg-tabs {
   display: inline-flex;
@@ -512,13 +564,17 @@ kbd {
   font-size: 11px;
   font-weight: 500;
 }
+/* A card's heading with what belongs beside it at the right: the card's one action (Add, Refresh), a chip on how it
+   stands, or a count. One pattern for every card: an action is never a card of its own. */
 .section-title-row {
   display: flex;
-  align-items: baseline;
+  min-height: 28px;
+  align-items: center;
   flex-wrap: wrap;
   justify-content: space-between;
   gap: 8px 12px;
 }
+.section-actions { display: inline-flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; }
 
 /* ---------------------------------------------------------------------------
  * BUTTONS — .button is the prototype's name, .btn* is the panels' contract.
@@ -692,6 +748,58 @@ kbd {
    never take effect and the buttons were clipped instead. Shrinking is what
    makes wrapping reachable. */
 .service-actions { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; }
+/* A phone's width (the dashboard in a phone's browser, through oaiy-server): the buttons took the row and lay over
+   the service's name and state, its words beside them one to a line. There the buttons go under the words, from
+   the left. */
+@media (max-width: 560px) {
+  .service-row { flex-direction: column; gap: 12px; }
+  .service-row > .service-info { width: 100%; flex: none; }
+  .service-actions { width: 100%; justify-content: flex-start; }
+}
+
+/* A row's less-used actions, behind one "⋯" button (MoreMenu): the menu hangs under it, over the page. */
+.btn.more-button { width: 34px; padding: 0; }
+.more-menu {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  min-width: 190px;
+  max-width: min(300px, calc(100vw - 16px));
+  flex-direction: column;
+  gap: 1px;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+.more-menu > button {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: left;
+}
+.more-menu > button > svg { flex: none; margin-top: 2px; color: var(--faint); }
+.more-menu > button > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.more-menu > button small { color: var(--muted); font-size: 11.5px; font-weight: 400; line-height: 1.4; }
+.more-menu > button:hover:not(:disabled),
+.more-menu > button:focus-visible { background: var(--surface-soft); outline: none; }
+.more-menu > button:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+.more-menu > button.is-danger,
+.more-menu > button.is-danger > svg { color: var(--danger); }
+.more-menu > button.is-danger:hover:not(:disabled) { background: var(--danger-soft); }
+.more-menu > button:disabled { cursor: not-allowed; opacity: 0.55; }
+@media (max-width: 700px) { .more-menu > button { padding: 11px 12px; } }
+/* Services' foot: where services are kept, for someone who writes one; closed until asked for. */
+.services-authors > .datadir-note { margin-top: 8px; }
 
 /* ---------------------------------------------------------------------------
  * DATA VOICE — code, paths, readouts
@@ -851,6 +959,10 @@ code {
   justify-content: space-between;
   gap: 10px;
 }
+/* A banner whose only button is its close mark (the Overview's "a newer OAIY is available"): the mark stays at the
+   top right and the words wrap beside it. On a phone's width it dropped to a line of its own under them. */
+.banner-dismissable:has(> .banner-dismiss) { flex-wrap: nowrap; align-items: flex-start; }
+.banner-dismissable:has(> .banner-dismiss) > span:first-child { flex: 1 1 auto; min-width: 0; }
 .banner-dismiss {
   display: inline-grid;
   width: 24px;
@@ -910,7 +1022,7 @@ code {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: var(--stack-gap);
   border: 1px dashed var(--border);
   border-radius: var(--r-ctl);
   background: color-mix(in srgb, var(--surface-soft) 45%, transparent);
@@ -974,6 +1086,12 @@ code {
 /* The note and its buttons on one line (they wrap under it when there is no room). */
 .datadir-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .datadir-row > span:first-child { min-width: 0; flex: 1 1 320px; overflow-wrap: anywhere; }
+/* The model files' tab: at the page's foot, one file by its address (closed until asked for); and its folder's path
+   breaks after a slash, where ModelsPanel.tsx allows it, not inside a folder's name. */
+.models-by-address { order: 9; }
+.models-by-address > summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.models-by-address > summary:hover, .models-by-address[open] > summary { color: var(--text); }
+.models-folder > .path-code { display: inline; overflow-wrap: break-word; }
 
 /* ---------------------------------------------------------------------------
  * SERVICE CARDS — status rides the left rail, as an accent per state.
@@ -1025,16 +1143,14 @@ code {
   font-weight: 640;
   letter-spacing: -0.01em;
 }
+/* What a service is, in full: it was cut at three lines, which at the window's smallest ended it mid-word
+   ("(about 4.3 G…") with no way to read the rest. */
 .service-desc {
-  display: -webkit-box;
-  overflow: hidden;
   margin-bottom: 6px;
   color: var(--muted);
   font-size: 12.5px;
   line-height: 1.55;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  overflow-wrap: break-word;
 }
 .service-meta { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
 /* A service's "Start with the app": a box to tick and its words, in the card's secondary voice (it was faded with
@@ -1076,8 +1192,9 @@ code {
   padding-top: 14px;
 }
 /* A form under a sub-heading of its own, or straight under its section's title: no rule of its own (a rule under a
-   title reads as a second divider). */
+   title reads as a second divider). Nor one that opens its card, its title inside it: the rule divided it from nothing. */
 .dl-form-flush,
+.service-section > .dl-form:first-child,
 .section-title + .dl-form,
 .section-title-row + .dl-form,
 .section-title-row + .network-add { border-top: 0; padding-top: 0; }
@@ -1236,6 +1353,11 @@ textarea {
 input,
 select { height: 34px; }
 textarea { resize: vertical; padding: 8px 10px; line-height: 1.5; }
+/* On paper a field is the page's white, inside its line: on a card's off-white the tinted fill read as a field
+   that is switched off (and one that is switched off could not be told from the rest). */
+:root[data-theme='light'] input:not([type='checkbox']):not([type='radio']):not([type='range']),
+:root[data-theme='light'] select,
+:root[data-theme='light'] textarea { background-color: var(--surface-raised); }
 input[type='checkbox'],
 input[type='radio'] { width: auto; height: auto; }
 input::placeholder,
@@ -1623,7 +1745,7 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 }
 
 /* Narrow: a run's facts on two lines, its state and flow above, who, how long and when below. */
-@media (max-width: 760px) {
+@media (max-width: 700px) {
   .run-head,
   .dead-head {
     grid-template-areas: 'state name name chevron' 'who who took when';
@@ -1641,9 +1763,11 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   .run-line > .btn-tiny { margin-bottom: 9px; }
   .run-head + .btn-tiny { margin-left: 12px; }
   /* The filter on a line of its own, its three on one line. */
-  .run-tools { flex: 1 1 100%; }
-  .run-tools .seg { flex: 1 1 auto; flex-wrap: nowrap; }
-  .run-tools .seg > button { flex: 1 1 auto; padding: 0 7px; }
+  /* (inside the page at a phone's width too, where the page's scrollbar takes ten of its pixels: at 7px a side
+     the row was 7px wider than the card, and the page scrolled sideways for it) */
+  .run-tools { flex: 1 1 100%; min-width: 0; }
+  .run-tools .seg { flex: 1 1 auto; flex-wrap: nowrap; min-width: 0; }
+  .run-tools .seg > button { flex: 1 1 auto; padding: 0 4px; }
   .run-fields { grid-template-columns: minmax(0, 1fr); }
   .run-field dt { margin-top: 4px; }
 }
@@ -1730,85 +1854,16 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .logs-empty { color: var(--faint); padding: 20px 0; font-style: italic; text-align: center; }
 .logs-error { color: var(--danger); padding: 8px; }
 
-/* ---------------------------------------------------------------------------
- * ENDPOINT DOCK — the prototype's persistent local-API footer.
- * ------------------------------------------------------------------------- */
+/* (The bar that was at the foot of every page, the "endpoint dock", is gone: whether OAIY is answering is at the
+   foot of the sidebar (sidebar.css `.api-status`), its address in Settings → General, and "Keys stay on this
+   computer" on AI providers, where keys are typed.) */
 
-/* One readout of the local API: whether it is up (the dot), where it is, and the promise that keys stay here. */
-.endpoint-dock {
-  z-index: 9;
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 16px;
-  border-top: 1px solid var(--border);
-  background: var(--surface-solid);
-  padding: 0 20px 0 30px;
-}
-.dock-status {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: 10px;
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  padding: 0;
-  text-align: left;
-}
-.dock-status > i {
-  flex: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 4px var(--green-soft);
-}
-.endpoint-dock.offline .dock-status > i { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
-.endpoint-dock.pending .dock-status > i {
-  background: var(--primary);
-  box-shadow: 0 0 0 4px var(--primary-soft);
-  animation: led-pulse 1.3s ease-in-out infinite;
-}
-.dock-status > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
-.dock-status strong { font-size: 11.5px; font-weight: 640; line-height: 1.3; }
-.endpoint-dock.offline .dock-status strong { color: var(--danger); }
-.dock-status small { color: var(--faint); font-size: 10.5px; line-height: 1.3; }
-.dock-status:hover strong { color: var(--primary-text); }
-.dock-endpoint {
-  display: flex;
-  min-width: 0;
-  flex: 0 1 360px;
-  height: 30px;
-  align-items: center;
-  border: 1px solid var(--border);
-  border-radius: var(--r-ctl);
-  background: var(--surface-soft);
-  padding-left: 11px;
-}
-.dock-endpoint code {
-  overflow: hidden;
-  min-width: 0;
-  flex: 1;
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  padding: 0;
-  font-size: 11.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.dock-endpoint .icon-button { width: 28px; height: 28px; min-height: 0; }
-.dock-trust {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  color: var(--faint);
-  font-size: 11px;
-  font-style: normal;
-  white-space: nowrap;
-}
+/* A promise in one line, with its lock: on AI providers, by the keys it is about. */
+.trust-line { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--faint); font-size: 12px; }
+.trust-line > svg { flex: none; }
+/* Settings → General: the local API's address and its Copy. */
+.api-address { gap: 10px; }
+.update-state:empty { margin: 0; }
 
 /* ---------------------------------------------------------------------------
  * TOASTS — rendered OUTSIDE .app-shell, hence tokens live on :root.
@@ -1816,10 +1871,12 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
  * covered the actions pages keep there (the setup wizard's Next, a save bar).
  * ------------------------------------------------------------------------- */
 
+/* Notices. Nothing moves for one: over a page of the dashboard's own they are a stack at the page's top right,
+   under the header (not over its buttons), lying over the content. */
 .toast-stack {
   position: fixed;
   z-index: 9999;
-  top: 14px;
+  top: calc(var(--topbar-h) + 10px);
   right: 20px;
   display: flex;
   max-width: 380px;
@@ -1827,6 +1884,18 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   gap: 10px;
   pointer-events: none;
 }
+/* While a page in a webview is open (it covers everything under the header), a notice is one line in the header's
+   own row, in what is left between the tabs and the buttons: the newest alone, its words cut with an ellipsis where
+   the row is short (the whole of it is its tooltip). */
+/* (All the room the row has left, so a message is cut only when the window itself is too narrow for it: it was
+   held to 460 px, and lost its end with 350 px of the row empty beside it.) */
+.toast-stack.is-in-header { position: static; z-index: auto; min-width: 0; max-width: 100%; flex-direction: row; }
+.toast-stack.is-in-header > .toast { min-width: 0; height: 32px; align-items: center; gap: 6px; box-shadow: none; padding: 0 5px 0 11px; }
+.toast-stack.is-in-header > .toast:not(:last-child) { display: none; }
+.toast-stack.is-in-header .toast-content { display: flex; min-width: 0; align-items: baseline; gap: 8px; overflow: hidden; white-space: nowrap; }
+.toast-stack.is-in-header .toast-title { overflow: hidden; flex: 0 1 auto; text-overflow: ellipsis; }
+.toast-stack.is-in-header .toast-body { overflow: hidden; min-width: 0; flex: 1 1 0; margin: 0; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
+.toast-stack.is-in-header .toast-close { margin: 0; }
 .toast {
   --node: var(--primary);
   display: flex;
@@ -1883,7 +1952,6 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 
 @media (max-width: 1240px) {
   .app-shell { grid-template-columns: 74px minmax(0, 1fr); }
-  .topbar, .section-tabs, .endpoint-dock { padding-left: 24px; }
   :root { --page-pad-t: 22px; --page-pad-x: 24px; --page-pad-b: 36px; }
 }
 
@@ -1892,16 +1960,20 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   .top-site, .top-refresh { width: 34px; padding: 0; }
 }
 
-@media (max-width: 760px) {
-  .workspace { grid-template-rows: 60px minmax(0, 1fr) 50px; }
-  .topbar { padding: 0 12px 0 16px; }
-  .top-kicker, .top-title p { display: none; }
-  .top-title h1 { font-size: 16px; }
-  .section-tabs { padding: 0 16px 8px; }
+/* A short window (the window at its smallest is 560px tall) or a phone: the header is the name's line alone, on
+   every page, as it is on the pages in webviews. The group and the line on what the page is for are not squeezed
+   in: they are left out, and the page gets the height (what the page is for stays the name's tooltip). */
+@media (max-width: 700px), (max-height: 640px) {
+  :root { --topbar-h: var(--topbar-row); }
+  .top-copy { display: none; }
+}
+
+/* The window's smallest (760 by 560) is still a desktop's: its controls keep their size and its rows their one
+   line. What is below is for a phone or a narrow tablet (the dashboard in a browser, through oaiy-server). */
+@media (max-width: 700px) {
+  .topbar { gap: 8px; padding-right: 4px; }
   .seg-tabs > button { padding: 0 10px; }
   :root { --page-pad-t: 18px; --page-pad-x: 16px; --page-pad-b: 30px; }
-  .endpoint-dock { gap: 10px; padding: 0 12px 0 16px; }
-  .dock-status > span, .dock-trust { display: none; }
   .form-row-pair { flex-direction: column; }
   /* (stacked, a field's width basis would become its height) */
   .form-row-pair > .network-port { flex: none; }
@@ -1972,9 +2044,22 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .link-line.link-scopes { color: var(--faint); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
 .link-line.is-live { color: var(--green); }
 .link-line.is-error { color: var(--danger); }
+/* The linked account's one word on how it stands ("Working."), and the lines that only say each part is fine, under
+   "Details". */
+.link-state { color: var(--muted); font-weight: 600; }
+.link-state.is-live { color: var(--green); }
+.link-state.is-error { color: var(--danger); }
+.link-details { margin-top: 6px; }
+.link-details > summary { width: fit-content; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.link-details > summary:hover { color: var(--text); }
+.link-details .pairing-origin { margin-left: 4px; }
+.link-how > .form-hint { margin-top: 6px; }
+.pairing-list li > .banner-actions { flex: none; }
 .pairing-body { overflow-wrap: anywhere; }
 /* The agent, the flow editor and the engines: webviews of their own, laid over this box by the app. */
 .embedded-page { flex: 1 1 auto; min-height: 0; position: relative; background: var(--canvas); }
+/* Room above that box while a notice (a toast) hangs below the one-line header: nothing otherwise (App sets its
+   height from where the notices end, and the webview follows the box down and back). */
 .embedded-problem { margin: 24px; color: var(--muted); }
 /* Under the webview while it opens (the first time, it is made): covered by the page once it is there. */
 .embedded-opening { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 0; color: var(--faint); font-size: 12.5px; }
@@ -2179,7 +2264,9 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .network-stale .network-device { border-style: dashed; background: transparent; }
 .network-stale-note { margin-top: 10px; color: var(--faint); font-size: 12px; }
 .network-stale-note + .network-devices { margin-top: 6px; }
-.network-devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; margin-top: 12px; }
+/* (four across at a form's width, a computer's processor, memory and two cards on one line: at 210px the fourth
+   fell to a line of its own) */
+.network-devices { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 8px; margin-top: 12px; }
 .network-device {
   display: flex;
   min-width: 0;
@@ -2530,3 +2617,18 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .banner-dismissable > span:first-child { flex: 1 1 auto; min-width: 0; }
 .banner-dismissable > .banner-actions { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
 .banner-detail { display: block; margin-top: 4px; font-family: var(--font-mono); font-size: 11.5px; opacity: 0.85; overflow-wrap: anywhere; }
+
+/* ---------------------------------------------------------------------------
+ * OVERVIEW — what needs you, and a page whose figures could not be read
+ * ------------------------------------------------------------------------- */
+
+/* A tile that counts something wrong (a service that gave up and needs Repair): the danger colour at its edge, and
+   a line under its figure saying what. */
+.overview-tile.is-alarm { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.overview-tile.is-alarm > svg { color: var(--danger); }
+.overview-tile .tile-alarm { display: block; color: var(--danger); font-style: normal; font-weight: 600; }
+/* OAIY is not answering: the notice at the top says so, once; the figures under it are old or not there, so they
+   stand back rather than each say it again. */
+.panel.is-stale .overview-grid,
+.panel.is-stale .overview-status-list,
+.panel.is-stale .overview-hero { opacity: 0.5; }

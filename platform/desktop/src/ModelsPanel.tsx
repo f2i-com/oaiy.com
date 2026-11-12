@@ -183,24 +183,36 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
   return (
     <div className="panel">
       {error && <LoadError what="The model files" error={error} onRetry={refresh} />}
-      {/* What this page is for, beside the engines' own Get models (which most people want) */}
-      <div className="banner banner-pending models-what">
-        <span>
-          To add a model to OAIY’s own engines, use <strong>Engines → Get models</strong>: it gets every part a model needs (its text encoder,
-          VAE…), none of them twice, and adds it ready to use. This page downloads single files for other programs, such as a llama.cpp server
-          you run yourself.
-        </span>
-        {onOpenEngines && (
-          <button className="btn-tiny" onClick={onOpenEngines}>
-            Open Engines
+      {/* What could not be done (a copy, a delete, a download), said at the top of the page whatever is open below. */}
+      {actionError && (
+        <div className="banner banner-err banner-dismissable">
+          <span>⚠ {actionError}</span>
+          <button type="button" className="banner-dismiss" aria-label="Dismiss error" onClick={() => setActionError(null)}>
+            ×
           </button>
-        )}
-      </div>
+        </div>
+      )}
+      {/* The page is what is on disk and what is downloading. Getting a model is the Engines page's Get models, the
+          one place for it: a button here goes there (no second catalogue, and no banner sending people away). */}
       {snapshot && (
         <div className="datadir-note datadir-row">
-          <span>
-            Models download to <code className="path-code">{snapshot.rootDir}</code>
+          <span className="models-folder">
+            Model files are kept in{' '}
+            {/* (a place to break after each slash, so a long path wraps between folders, not inside a name) */}
+            <code className="path-code">
+              {snapshot.rootDir.split(/(?<=[\\/])/).map((part, i) => (
+                <span key={i}>
+                  {part}
+                  <wbr />
+                </span>
+              ))}
+            </code>
           </span>
+          {onOpenEngines && (
+            <button className="btn-tiny" onClick={onOpenEngines} title="Engines → Get models: ready-to-run models, with every part each needs">
+              <Download size={13} /> Get models
+            </button>
+          )}
           <button
             className="btn-tiny"
             onClick={async () => {
@@ -234,9 +246,12 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
         </div>
       )}
 
-      <section className="model-section">
-        <h3 className="section-title">Download a model</h3>
-        <form className="dl-form" onSubmit={onSubmit}>
+      {/* Models are got in one place, the Engines page's Get models (the button above). What is left here is one file
+          by its address, for a program of the person's own: at the foot of the page (styles.css), closed until asked. */}
+      <details className="model-section models-by-address">
+        <summary>Download one file by its address</summary>
+        <p className="form-hint">For a program you run yourself. A model for OAIY’s own engines comes from Engines → Get models, with every part it needs.</p>
+        <form className="dl-form form-narrow" onSubmit={onSubmit}>
           <label className="form-row">
             <span>URL</span>
             <input className="is-mono"
@@ -276,79 +291,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
             rewritten to direct downloads automatically.
           </p>
         </form>
-        {actionError && (
-          <div className="banner banner-err banner-dismissable">
-            <span>⚠ {actionError}</span>
-            <button
-              type="button"
-              className="banner-dismiss"
-              aria-label="Dismiss error"
-              onClick={() => setActionError(null)}
-            >
-              ×
-            </button>
-          </div>
-        )}
-      </section>
-
-      {catalog && catalog.catalog.categories.length > 0 && (
-        <section className="model-section">
-          <div className="section-title-row">
-            <h3 className="section-title">Quick add</h3>
-          </div>
-          {catalog.catalog.categories.map((cat) => (
-            <div key={cat.id} className="catalog-category">
-              <div className="catalog-cat-name">{cat.name}</div>
-              <div className="catalog-cat-desc">{cat.description}</div>
-              <div className="catalog-grid">
-                {cat.models.map((m) => {
-                  const onDisk = snapshot?.models.some(
-                    (f) => f.name.split(/[\\/]/).pop() === m.filename,
-                  );
-                  const active = downloads.find(
-                    (d) =>
-                      d.url === m.url &&
-                      ['queued', 'active', 'paused'].includes(d.status),
-                  );
-                  return (
-                    <div key={m.id} className="catalog-card">
-                      <div className="catalog-name">{m.name}</div>
-                      <div className="catalog-desc">{m.description}</div>
-                      <div className="catalog-meta">
-                        {m.sizeBytes ? formatBytes(m.sizeBytes) : 'size unknown'}
-                      </div>
-                      {onDisk ? (
-                        <button className="btn btn-ghost" disabled>
-                          <Check size={14} /> On disk
-                        </button>
-                      ) : active ? (
-                        <button className="btn btn-ghost" disabled>
-                          {DOWNLOAD_WORDS[active.status]}
-                        </button>
-                      ) : (
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() =>
-                            onAction(() =>
-                              models.download(
-                                m.url,
-                                m.filename,
-                                m.subdir ?? undefined,
-                              ),
-                            )
-                          }
-                        >
-                          <Download size={14} /> Download
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-        </section>
-      )}
+      </details>
 
       {inFlight.length > 0 && (
         <section className="model-section">

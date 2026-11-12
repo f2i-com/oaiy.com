@@ -540,19 +540,20 @@ export function BackupSection() {
           <Archive size={14} aria-hidden /> {lastLine}
         </p>
       )}
-      <p className="form-hint">
-        A backup is one encrypted file with your contacts, calendar, conversations, flows, triggers, settings and
-        plugin data. Plugin data is backed up plugin by plugin, with PINs, keys and sealed values left out. Keep the
-        file somewhere safe, and use it on this computer or a new one to get your data back.
-      </p>
-      <div className="banner banner-pending" role="note">
-        <strong>If you lose the passphrase, the backup is lost.</strong> Nobody, including OAIY, can open it without
-        it and nobody can reset it. The passphrase is not stored anywhere.
-      </div>
-      <p className="form-hint">
-        The FormLogic link, the phone pairing, the ChatGPT sign-in and the Hugging Face token are never in a backup:
-        you set them up again after a restore. Your API provider keys are added only if you tick the box below, and even then they come back only if you tick them again when you restore.
-      </p>
+      {/* One line on what a backup is; what it holds and leaves out is under "What is in a backup" at the foot, and
+          the warning about the passphrase is beside the passphrase. The page starts with making one. */}
+      <p className="form-hint">One encrypted file with your OAIY setup. Keep it somewhere safe, and use it on this computer or a new one to get your data back.</p>
+      <details className="setup-more">
+        <summary>What is in a backup</summary>
+        <p className="form-hint">
+          A backup is one encrypted file with your contacts, calendar, conversations, flows, triggers, settings and
+          plugin data. Plugin data is backed up plugin by plugin, with PINs, keys and sealed values left out.
+        </p>
+        <p className="form-hint">
+          The FormLogic link, the phone pairing, the ChatGPT sign-in and the Hugging Face token are never in a backup:
+          you set them up again after a restore. Your API provider keys are added only if you tick the box below, and even then they come back only if you tick them again when you restore.
+        </p>
+      </details>
 
       {/* ---------- a restore waits for a restart ---------- */}
       {pending && (
@@ -684,6 +685,12 @@ export function BackupSection() {
         </label>
         {tooShort && <p className="form-hint">Use at least {MIN_PASSPHRASE} characters.</p>}
         {mismatch && <p className="form-hint">The two passphrases are not the same.</p>}
+        <div className="banner banner-pending" role="note">
+          <span>
+            <strong>If you lose the passphrase, the backup is lost.</strong> Nobody, including OAIY, can open it without
+            it and nobody can reset it. The passphrase is not stored anywhere.
+          </span>
+        </div>
         <label className="form-row form-row-inline">
           <input
             type="checkbox"

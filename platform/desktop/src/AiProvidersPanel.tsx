@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   KeyRound,
   Loader2,
+  LockKeyhole,
   Pencil,
   Plug2,
   Plus,
@@ -38,9 +39,35 @@ const DEFAULT_BASE: Record<AiProtocol, string> = {
   anthropic: 'https://api.anthropic.com',
 };
 
+/** How a provider is spoken to, as its card says it (the form's own words for the same choice). */
+const PROTOCOL_WORDS: Record<AiProtocol, string> = {
+  openai: 'OpenAI-compatible',
+  anthropic: 'Anthropic',
+};
+
 /** The backend's rule (ai/providers.rs `valid_id`) — checked here too so a typo
  *  is caught in the form instead of coming back as a raw API rejection. */
 const ID_RE = /^[a-z0-9-]{1,64}$/;
+
+/** The id a provider gets from its name, so nobody has to make one up: the name's letters and digits in lower case,
+ *  everything else a dash ("My Ollama box" is `my-ollama-box`). One that is `taken` already gets `-2`, `-3`… */
+function idFromName(name: string, taken: readonly string[]): string {
+  const base = name
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+    .replace(/-+$/, '');
+  if (!base || !taken.includes(base)) return base;
+  for (let n = 2; n < 1000; n++) {
+    const tail = `-${n}`;
+    const id = base.slice(0, 64 - tail.length).replace(/-+$/, '') + tail;
+    if (!taken.includes(id)) return id;
+  }
+  return base;
+}
 
 interface FormState {
   id: string;
@@ -118,6 +145,8 @@ export default function AiProvidersPanel() {
    *  was actually clicked rather than always on Test. */
   const [busy, setBusy] = useState<Record<string, string>>({});
   const nameRef = useRef<HTMLInputElement>(null);
+  /** The person typed an ID of their own into the add form: it stops following the name. */
+  const idTyped = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -155,6 +184,7 @@ export default function AiProvidersPanel() {
 
   const startAdd = () => {
     setForm(EMPTY);
+    idTyped.current = false;
     setEditingId(null);
     setShowForm(true);
     window.setTimeout(() => nameRef.current?.focus(), 0);
@@ -301,7 +331,7 @@ export default function AiProvidersPanel() {
   };
 
   return (
-    <div className="panel">
+    <div className="panel is-form">
       {loadError && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>Couldn't reach the AI gateway: {loadError}</span>
@@ -343,39 +373,52 @@ export default function AiProvidersPanel() {
       <ChatGptConnector />
 
       {/* Add / edit form — gated behind a button like ServicesPanel's add form, so
-          the panel opens on the providers themselves rather than an empty form. */}
-      <section className="service-section">
-        {showForm ? (
+          the panel opens on the providers themselves rather than an empty form. (The button is in the list's own
+          heading: a card that held nothing but the button floated between the two.) */}
+      {showForm && (
+        <section className="service-section">
           <form className="dl-form" onSubmit={submit}>
             <div className="section-title-row">
-              <h3 className="section-title">{editingId ? `Edit ${editingId}` : 'Add a provider'}</h3>
+              <h3 className="section-title">{editingId ? `Edit ${form.name || editingId}` : 'Add a provider'}</h3>
               <button type="button" className="btn-tiny" onClick={resetForm}>
                 Cancel
               </button>
             </div>
 
+            {/* The name first: it is what a person knows. The ID is made from it as they type (and stops following
+                once they type one of their own), so adding a provider never starts with inventing an identifier. */}
             <div className="form-row-pair">
               <label className="form-row">
-                <span>ID (lowercase, digits, dash)</span>
+                <span>Name</span>
                 <input
+                  ref={nameRef}
+                  type="text"
+                  placeholder="OpenAI"
+                  value={form.name}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    const follows = editingId === null && !idTyped.current;
+                    const taken = providers?.map((p) => p.id) ?? [];
+                    setForm((f) => ({ ...f, name, id: follows ? idFromName(name, taken) : f.id }));
+                  }}
+                  required
+                />
+              </label>
+              <label className="form-row">
+                <span>{editingId !== null ? 'ID (cannot be changed)' : 'ID (made from the name)'}</span>
+                <input
+                  className="is-mono"
                   type="text"
                   placeholder="openai"
                   value={form.id}
                   /* readOnly (not disabled) while editing: the id is the record key
                      so it can't change, but it stays selectable and readable. */
                   readOnly={editingId !== null}
-                  onChange={(e) => setForm((f) => ({ ...f, id: e.target.value }))}
-                  required
-                />
-              </label>
-              <label className="form-row">
-                <span>Display name</span>
-                <input
-                  ref={nameRef}
-                  type="text"
-                  placeholder="OpenAI"
-                  value={form.name}
-                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                  onChange={(e) => {
+                    // (emptied again, it goes back to following the name)
+                    idTyped.current = e.target.value !== '';
+                    setForm((f) => ({ ...f, id: e.target.value }));
+                  }}
                   required
                 />
               </label>
@@ -437,10 +480,7 @@ export default function AiProvidersPanel() {
                 checked={form.allowLocal}
                 onChange={(e) => setForm((f) => ({ ...f, allowLocal: e.target.checked }))}
               />
-              <span>
-                This is a local endpoint (allow <code>http</code> / loopback — e.g. Ollama, LM
-                Studio)
-              </span>
+              <span>It runs on this computer or my own network (Ollama or LM Studio, for example), so it needs no key and may use plain http</span>
             </label>
 
             <div className="form-actions">
@@ -450,14 +490,8 @@ export default function AiProvidersPanel() {
               </button>
             </div>
           </form>
-        ) : (
-          <div className="card-actions card-actions-flush">
-            <button className="btn btn-secondary" onClick={startAdd}>
-              <Plus size={14} /> Add provider
-            </button>
-          </div>
-        )}
-      </section>
+        </section>
+      )}
 
       {/* Configured providers */}
       {loadError && providers === null ? (
@@ -472,15 +506,33 @@ export default function AiProvidersPanel() {
       ) : providers.length === 0 ? (
         <div className="empty-state">
           <Sparkles size={22} aria-hidden />
-          <p>No AI providers configured.</p>
+          <p>No AI providers yet.</p>
           <p>
-            Use <strong>Add provider</strong> above to give your flows a cloud (or local) chat
-            model. The key stays on this computer — flows reach the provider through OAIY, never with
-            the key in the browser.
+            Add one to give your flows a chat model, in the cloud or on this computer. Its key stays on this computer: flows reach the provider
+            through OAIY, never with the key in the browser.
           </p>
+          {!showForm && (
+            <button className="btn btn-secondary" onClick={startAdd}>
+              <Plus size={14} /> Add provider
+            </button>
+          )}
         </div>
       ) : (
         <section className="service-section">
+          <div className="section-title-row">
+            <h3 className="section-title">Providers with a key or an address</h3>
+            {!showForm && (
+              <span className="section-actions">
+                {/* The promise, where keys are typed (it was at the foot of every page). */}
+                <span className="trust-line">
+                  <LockKeyhole size={12} aria-hidden /> Keys stay on this computer
+                </span>
+                <button className="btn-tiny" onClick={startAdd}>
+                  <Plus size={13} /> Add provider
+                </button>
+              </span>
+            )}
+          </div>
           {providers.map((p) => {
             const action = busy[p.id];
             const working = action !== undefined;
@@ -489,23 +541,26 @@ export default function AiProvidersPanel() {
               <div key={p.id} className={`service-card service-card-${cardStatus(p)}`}>
                 <div className="card-head">
                   <Waypoints size={14} aria-hidden />
-                  <strong className="card-title">{p.name}</strong>
-                  <span className="badge badge-neutral">{p.protocol}</span>
+                  {/* (its id is what flows name it by: in its tooltip, and in the Edit form, not a chip of code on the card) */}
+                  <strong className="card-title" title={`Flows name this provider “${p.id}”`}>
+                    {p.name}
+                  </strong>
+                  <span className="badge badge-neutral">{PROTOCOL_WORDS[p.protocol] ?? p.protocol}</span>
                   {/* Key state, agreeing with the card accent: a local endpoint needs
                       no key, so it isn't an error — it's simply not required. */}
                   {p.hasKey ? (
-                    <span className="badge badge-ok">key set</span>
+                    <span className="badge badge-ok">Key saved</span>
                   ) : p.allowLocal ? (
-                    <span className="badge badge-neutral">no key needed</span>
+                    <span className="badge badge-neutral">No key needed</span>
                   ) : (
-                    <span className="badge badge-pending">key needed</span>
+                    <span className="badge badge-pending">Needs a key</span>
                   )}
-                  {!p.enabled && <span className="badge badge-neutral">disabled</span>}
+                  {!p.enabled && <span className="badge badge-neutral">Off</span>}
                 </div>
 
                 <p className="card-desc card-address">
-                  <code>{p.id}</code> · {p.baseUrl}
-                  {p.model ? ` · ${p.model}` : ''}
+                  {p.baseUrl}
+                  {p.model ? ` · uses ${p.model}` : ''}
                 </p>
 
                 <div className="card-actions">

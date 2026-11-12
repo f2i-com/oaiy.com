@@ -137,7 +137,7 @@ export default function PythonPanel() {
 
   if (!snapshot) {
     return (
-      <div className="panel">
+      <div className="panel is-form">
         {error ? (
           <LoadError error={error} what="Python on this computer" onRetry={refresh} />
         ) : (
@@ -150,7 +150,7 @@ export default function PythonPanel() {
   const jobActive = !!snapshot.currentJob && !snapshot.currentJob.finishedAt;
 
   return (
-    <div className="panel">
+    <div className="panel is-form">
       {error && <LoadError error={error} what="Python on this computer" onRetry={refresh} />}
       {actionError && (
         <div className="banner banner-err banner-dismissable">
@@ -172,7 +172,7 @@ export default function PythonPanel() {
           <span
             className={`badge ${snapshot.installed ? 'badge-ok' : 'badge-neutral'}`}
           >
-            {snapshot.installed ? 'installed' : 'not installed'}
+            {snapshot.installed ? 'Installed' : 'Not installed'}
           </span>
         </h3>
         <div className="datadir-note datadir-row">

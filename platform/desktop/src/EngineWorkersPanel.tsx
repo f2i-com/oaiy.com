@@ -117,12 +117,8 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
         <div className="section-title-row">
           <h3 className="section-title">Defaults</h3>
         </div>
-        <p className="form-hint" data-testid="defaults-what">
-          The model of each kind that OAIY’s own work uses: the Agent (on the model chosen in Engines), Flows’ “Default … model” and the desktop’s engine
-          route. It is this computer’s own, or a paired computer’s you choose below. The Engines page’s gateway (port 8080) and its Playground answer
-          with this computer’s own model unless a paired one is picked there. “Use this computer’s”, beside a default, makes this computer’s own the
-          default again.
-        </p>
+        {/* Which model does each kind of work is the card's first line; what "default" reaches is closed until asked. */}
+        <p className="form-hint">The model OAIY uses for each kind of work: this computer’s own, or a paired computer’s you choose below.</p>
         {kinds.length === 0 ? (
           <p className="form-hint">{nodes.length === 0 ? 'A paired computer’s models can be chosen here once one is paired (below).' : 'The paired computers have not said which models they have yet.'}</p>
         ) : (
@@ -183,6 +179,15 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
             })}
           </div>
         )}
+        <details className="setup-more">
+          <summary>What uses a default</summary>
+          <p className="form-hint" data-testid="defaults-what">
+            The model of each kind that OAIY’s own work uses: the Agent (on the model chosen in Engines), Flows’ “Default … model” and the desktop’s engine
+            route. It is this computer’s own, or a paired computer’s you choose below. The Engines page’s gateway (port 8080) and its Playground answer
+            with this computer’s own model unless a paired one is picked there. “Use this computer’s”, beside a default, makes this computer’s own the
+            default again.
+          </p>
+        </details>
       </section>
 
       {nodes.length === 0 ? (

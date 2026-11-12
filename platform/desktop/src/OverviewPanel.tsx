@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChevronRight,
   CircleDot,
@@ -20,7 +20,7 @@ import SetupGuidePanel, { waitingForTrust } from './SetupGuidePanel';
 import UpdateBanner from './UpdateBanner';
 import { BackupLine } from './BackupPanel';
 import TodayPanel from './TodayPanel';
-import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
+import { dismissGuide, reopenGuide, settledCardGone, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
 import LoadError from './LoadError';
 import {
@@ -84,7 +84,9 @@ export type OverviewNav =
   | 'python'
   | 'connections'
   | 'network'
-  | 'settings';
+  | 'settings'
+  /** Settings → Backup. */
+  | 'backup';
 
 interface Props {
   /** Jump to one of the built-in panels. */
@@ -121,6 +123,22 @@ function healthPill(status: string | null): { label: string; badge: string } | n
   }
 }
 
+/** The services OAIY stopped restarting (`needsRepair`): each stays down until someone presses Repair on Services. */
+export function servicesNeedingRepair(services: ServiceSnapshot[] | null | undefined): ServiceSnapshot[] {
+  return (services ?? []).filter((s) => s.needsRepair === true && s.status !== 'running');
+}
+
+/** What the Overview says of them: one by its name, several counted and named. */
+export function repairLine(services: ServiceSnapshot[]): string {
+  if (services.length === 1) return `${services[0].name} stopped and needs Repair.`;
+  return `${services.length} services stopped and need Repair: ${services.map((s) => s.name).join(', ')}.`;
+}
+
+/** Why a service stopped, in its own words: what it last said as it died, else its error. */
+function repairCause(service: ServiceSnapshot): string | null {
+  return service.lastCrash?.detail?.trim() || service.error?.trim() || null;
+}
+
 export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props) {
   // Seeded from the last known values so returning to Overview paints straight
   // away instead of showing four em-dashes while the round trips land.
@@ -134,6 +152,10 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [net, setNet] = useState<NetworkStatus | null>(() => peek('networkStatus') ?? null);
   // Shown until dismissed; the rows tick themselves, so it stays honest.
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
+  /** Whether the setup card has nothing left to ask, as the card says once it has read what it reads (`null` before). */
+  const [guideSettled, setGuideSettled] = useState<boolean | null>(null);
+  /** The place among "This computer"'s tiles for the language model's tile, when it is all Today would show. */
+  const [todaySlot, setTodaySlot] = useState<HTMLElement | null>(null);
   const [codexConnected, setCodexConnected] = useState(false);
   const [unavailable, setUnavailable] = useState<string[]>([]);
   /** Every read that failed got no answer at all: OAIY's local API is not answering, said as that alone. */
@@ -187,6 +209,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   }, [refresh]);
 
   const runningSvc = (svc ?? []).filter((s) => s.status === 'running').length;
+  // A service OAIY gave up restarting: it stays down until someone presses Repair, so the page that promises "anything
+  // that needs you" says so (OAIY Voice is a service: while it is the one that gave up, calls are not heard).
+  const needRepair = servicesNeedingRepair(svc);
   const runningPlug = (plug ?? []).filter((p) => p.state === 'running').length;
   // A plugin unhealthy only because its setup has not recorded what it needs is waiting for that setup (the guide
   // above offers it), not a fault to raise an alarm about.
@@ -275,33 +300,132 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     return plugin.state === 'starting' ? 'Starting…' : 'Not running';
   };
 
-  return (
-    <div className="panel">
-      {unavailable.length > 0 && (
-        <LoadError
-          error={notAnswering ? NOT_ANSWERING : `Couldn't refresh ${unavailable.join(', ')}. Showing last known values where available.`}
-          onRetry={refresh}
-        />
+  // The setup card. While it asks for something (setup to continue, a plugin to set up, a check that fails) it is one
+  // of the things that need the person, under Today; once settled ("You’re set up") it goes last, stays a day, and
+  // then leaves by itself. (Keyed, so moving it between the two places keeps what it has read.)
+  const guideLast = guideSettled ?? setupState?.firstRun.finished === true;
+  const guideGone = guideOpen && guideSettled === true && settledCardGone();
+  const guideShown = guideOpen && !guideGone;
+  const guide = guideOpen ? (
+    <SetupGuidePanel
+      key="setup-guide"
+      codexConnected={codexConnected}
+      runtime={runtime}
+      providers={provs}
+      services={svc}
+      plugins={plug}
+      connected={apps}
+      live={live}
+      quiet={notAnswering}
+      onSettled={setGuideSettled}
+      actions={{ runtime: runtimeFix }}
+      onNavigate={(t: StepTarget) => onNavigate(t === 'overview' ? 'runs' : t)}
+      onDismiss={() => {
+        dismissGuide();
+        setGuideOpen(false);
+      }}
+    />
+  ) : null;
+
+  // What needs the person, in one place under Today: runs that failed, a service that gave up, a plugin that stopped,
+  // and a newer OAIY.
+  const needsYou = (
+    <Fragment key="needs-you">
+      {/* Not inside "Next steps": that section yields to the setup guide, and a
+          run that has ALREADY failed is not a setup step to work through. On a
+          fresh install the guide is open — precisely when a failure is most
+          likely and least excusable to hide. */}
+      {since.any && (
+        <div className="banner banner-err banner-dismissable" role="alert">
+          <span>
+            <TriangleAlert size={13} />{' '}
+            {seenAny
+              ? since.count
+                ? `${since.count} more run${since.count === 1 ? '' : 's'} failed since you last looked.`
+                : 'More runs failed since you last looked.'
+              : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this computer.`}
+          </span>
+          <span className="banner-actions">
+            <button
+              className="btn-tiny"
+              onClick={() => {
+                markFailedSeen();
+                onNavigate('runs');
+              }}
+            >
+              <History size={13} /> See why
+            </button>
+            <button className="banner-dismiss" aria-label="Dismiss: these failures are seen" title="Dismiss" onClick={markFailedSeen}>
+              <X size={13} />
+            </button>
+          </span>
+        </div>
       )}
+
+      {needRepair.length > 0 && (
+        <div className="banner banner-err banner-dismissable" role="alert" data-testid="service-needs-repair">
+          <span>
+            <TriangleAlert size={13} /> {repairLine(needRepair)}
+            {needRepair.length === 1 && repairCause(needRepair[0]) && (
+              // Why it stopped, in the service's own words: its first line only (all of it on hover).
+              <span className="banner-detail" title={repairCause(needRepair[0])!}>
+                {firstLine(repairCause(needRepair[0])!)}
+              </span>
+            )}
+          </span>
+          <span className="banner-actions">
+            <button className="btn-tiny" onClick={() => onNavigate('services')}>
+              <Server size={13} /> Open Services
+            </button>
+          </span>
+        </div>
+      )}
+
+      {crashedPlug.length > 0 && (
+        <div className="banner banner-err banner-dismissable" role="alert">
+          <span>
+            <TriangleAlert size={13} />{' '}
+            {crashedPlug.length === 1 ? (
+              <>
+                {`${plugName(crashedPlug[0])} has ${crashedPlug[0].state === 'crashed' ? 'stopped' : 'a problem'}.`}
+                {crashedPlug[0].reason && (
+                  // What the plugin said, in its own words: under the plain line, its first line only (all of it on hover).
+                  <span className="banner-detail" title={crashedPlug[0].reason}>
+                    {firstLine(crashedPlug[0].reason)}
+                  </span>
+                )}
+              </>
+            ) : (
+              `${crashedPlug.length} plugins need attention: ${crashedPlug.map(plugName).join(', ')}.`
+            )}
+          </span>
+          <span className="banner-actions">
+            <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
+              <Plug size={13} /> Open Plugins
+            </button>
+          </span>
+        </div>
+      )}
+
       <UpdateBanner onOpenSettings={() => onNavigate('settings')} />
-      <TodayPanel onNavigate={onNavigate} />
-      {guideOpen && (
-        <SetupGuidePanel
-          codexConnected={codexConnected}
-          runtime={runtime}
-          providers={provs}
-          services={svc}
-          plugins={plug}
-          connected={apps}
-          live={live}
-          actions={{ runtime: runtimeFix }}
-          onNavigate={(t: StepTarget) => onNavigate(t === 'overview' ? 'runs' : t)}
-          onDismiss={() => {
-            dismissGuide();
-            setGuideOpen(false);
-          }}
-        />
-      )}
+    </Fragment>
+  );
+
+  return (
+    <div className={notAnswering ? 'panel is-stale' : 'panel'}>
+      {[
+        // OAIY not answering, or a part that could not be read: said once, here, with the one "Try again".
+        unavailable.length > 0 && (
+          <LoadError
+            key="load-error"
+            error={notAnswering ? NOT_ANSWERING : `Couldn't refresh ${unavailable.join(', ')}. Showing last known values where available.`}
+            onRetry={refresh}
+          />
+        ),
+        <TodayPanel key="today" onNavigate={onNavigate} soloSlot={todaySlot} />,
+        needsYou,
+        !guideLast && guide,
+        <Fragment key="plugin-cards">
 
       {/* Plugin-contributed hero cards. A plugin declares these so it can own a
           spot on the control centre rather than hiding under Plugins. */}
@@ -425,73 +549,26 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           </div>
         </section>
       )}
+        </Fragment>,
 
-      {/* Not inside "Next steps": that section yields to the setup guide, and a
-          run that has ALREADY failed is not a setup step to work through. On a
-          fresh install the guide is open — precisely when a failure is most
-          likely and least excusable to hide. */}
-      {since.any && (
-        <div className="banner banner-err banner-dismissable" role="alert">
-          <span>
-            <TriangleAlert size={13} />{' '}
-            {seenAny
-              ? since.count
-                ? `${since.count} more run${since.count === 1 ? '' : 's'} failed since you last looked.`
-                : 'More runs failed since you last looked.'
-              : `${failed} run${failed === 1 ? ' has' : 's have'} failed on this computer.`}
-          </span>
-          <span className="banner-actions">
-            <button
-              className="btn-tiny"
-              onClick={() => {
-                markFailedSeen();
-                onNavigate('runs');
-              }}
-            >
-              <History size={13} /> See why
-            </button>
-            <button className="banner-dismiss" aria-label="Dismiss: these failures are seen" title="Dismiss" onClick={markFailedSeen}>
-              <X size={13} />
-            </button>
-          </span>
-        </div>
-      )}
-
-      {crashedPlug.length > 0 && (
-        <div className="banner banner-err banner-dismissable" role="alert">
-          <span>
-            <TriangleAlert size={13} />{' '}
-            {crashedPlug.length === 1 ? (
-              <>
-                {`${plugName(crashedPlug[0])} has ${crashedPlug[0].state === 'crashed' ? 'stopped' : 'a problem'}.`}
-                {crashedPlug[0].reason && (
-                  // What the plugin said, in its own words: under the plain line, its first line only (all of it on hover).
-                  <span className="banner-detail" title={crashedPlug[0].reason}>
-                    {firstLine(crashedPlug[0].reason)}
-                  </span>
-                )}
-              </>
-            ) : (
-              `${crashedPlug.length} plugins need attention: ${crashedPlug.map(plugName).join(', ')}.`
-            )}
-          </span>
-          <span className="banner-actions">
-            <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
-              <Plug size={13} /> Open Plugins
-            </button>
-          </span>
-        </div>
-      )}
-
-      <section className="service-section">
+      <section className="service-section" key="this-computer">
         <div className="section-title-row">
           <h3 className="section-title">This computer</h3>
         </div>
         <div className="overview-grid">
-          <button className="overview-tile" onClick={() => onNavigate('services')}>
+          {/* The language model's tile, when it is all Today would hold (TodayPanel): first here, and no Today card. */}
+          <div className="overview-solo" ref={setTodaySlot} />
+          <button
+            className={needRepair.length ? 'overview-tile is-alarm' : 'overview-tile'}
+            onClick={() => onNavigate('services')}
+            title={needRepair.length ? `${repairLine(needRepair)} Open Services to repair ${needRepair.length === 1 ? 'it' : 'them'}.` : undefined}
+          >
             <Server size={16} aria-hidden />
             <strong>{svc === null ? '—' : svc.length === 0 ? 'None yet' : `${runningSvc}/${svc.length}`}</strong>
-            <small>{svc !== null && svc.length === 0 ? 'Services' : 'Services running'}</small>
+            <small>
+              {svc !== null && svc.length === 0 ? 'Services' : 'Services running'}
+              {needRepair.length > 0 && <em className="tile-alarm">{needRepair.length === 1 ? '1 needs Repair' : `${needRepair.length} need Repair`}</em>}
+            </small>
           </button>
           <button className="overview-tile" onClick={() => onNavigate('plugins')}>
             <Plug size={16} aria-hidden />
@@ -529,13 +606,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             </button>
           )}
         </div>
-        <BackupLine onOpenSettings={() => onNavigate('settings')} />
-      </section>
+        <BackupLine onOpenSettings={() => onNavigate('backup')} />
+      </section>,
 
-      {/* Anything actionable, rather than making the user hunt for it. While the
-          setup guide is open it covers this same ground, so only one shows. */}
-      {!guideOpen && (svc !== null || plug !== null || provs !== null) && (
-        <section className="service-section">
+      // Anything actionable, rather than making the user hunt for it. While the
+      // setup guide is open it covers this same ground, so only one shows.
+      !guideShown && (svc !== null || plug !== null || provs !== null) && (
+        <section className="service-section" key="next-steps">
           <div className="section-title-row">
             <h3 className="section-title">Next steps</h3>
           </div>
@@ -609,6 +686,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             svc !== null &&
             readyProv > 0 &&
             crashedPlug.length === 0 &&
+            needRepair.length === 0 &&
             untrusted.length === 0 &&
             (plug.length === 0 || runningPlug > 0) && (
               <div className="datadir-note datadir-row">
@@ -619,30 +697,35 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </div>
             )}
         </section>
-      )}
+      ),
 
-      {!guideOpen && (
-        <div className="setup-reopen">
+      // Settled, the setup card is the last thing on the page (and gone by itself a day later).
+      guideLast && guide,
+
+      !guideShown && (
+        <div className="setup-reopen" key="setup-reopen">
           <button
             className="btn-tiny"
             onClick={() => {
               reopenGuide();
+              setGuideSettled(null);
               setGuideOpen(true);
             }}
           >
             <ListChecks size={13} /> Show the setup guide
           </button>
         </div>
-      )}
+      ),
 
-      {/* Only while nothing at all is installed: a service counts too (its tile above already shows it). */}
-      {plug !== null && plug.length === 0 && svc !== null && svc.length === 0 && cards.length === 0 && (
-        <div className="empty-state">
+      // Only while nothing at all is installed: a service counts too (its tile above already shows it).
+      plug !== null && plug.length === 0 && svc !== null && svc.length === 0 && cards.length === 0 && (
+        <div className="empty-state" key="nothing-installed">
           <Package size={22} aria-hidden />
           <p>Nothing installed yet.</p>
           <p>Install a plugin, such as the phone, or a local service, and what it brings shows up here.</p>
         </div>
-      )}
+      ),
+      ]}
     </div>
   );
 }

@@ -14,6 +14,7 @@ import {
   sameHoursWeekdays,
   sameSettings,
   greetingOf,
+  hoursWords,
   sayHours,
   sayMinutes,
   withBreak,
@@ -498,7 +499,10 @@ export function SettingsForm({
               aria-invalid={!!problems.noticeMinutes}
               onChange={(e) => setS({ ...s, noticeMinutes: e.target.value === '' ? Number.NaN : Number(e.target.value) })}
             />
-            <span>minutes’ notice.</span>
+            {/* (an hour or more is said in hours too: "120 minutes’ notice" is read as "2 hours") */}
+            <span>
+              minutes’ notice{hoursWords(s.noticeMinutes) ? ` (${hoursWords(s.noticeMinutes)})` : ''}.
+            </span>
             {problems.noticeMinutes && <small className="hours-error">{problems.noticeMinutes}</small>}
           </li>
           <li>

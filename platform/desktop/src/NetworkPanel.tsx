@@ -160,7 +160,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   // (not read yet: what went wrong, with a way to ask again, rather than a page with nothing on it)
   if (!status) {
     return (
-      <div className="panel">
+      <div className="panel is-form">
         {error ? (
           <>
             <LoadError error={error} what="OAIY Network’s status" onRetry={refresh} />
@@ -174,7 +174,7 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
   }
 
   return (
-    <div className="panel" data-testid="network-panel">
+    <div className="panel is-form" data-testid="network-panel">
       {error && <LoadError error={error} what="OAIY Network’s status" onRetry={refresh} />}
       {actionError && <div className="banner banner-err" role="alert">{actionError}</div>}
       <ThisComputer status={status} busy={busy} onChange={change} />
@@ -326,10 +326,13 @@ function ThisComputer({ status, busy, onChange }: { status: NetworkStatus; busy:
           This computer <span className={`badge ${status.enabled ? 'badge-ok' : 'badge-neutral'}`}>{doesNow(status)}</span>
         </h3>
       </div>
-      <p className="form-hint">
-        OAIY Network lets OAIY computers on the same network work as one: a computer uses another’s models, GPUs, shared flows and OAIY Voice
-        as if they were its own, and can lend its own at the same time. Nothing leaves your network, and it stays off until you switch it on.
-      </p>
+      {/* What OAIY Network is, while it is off (the two choices under it say the rest once it is on). */}
+      {!status.enabled && (
+        <p className="form-hint">
+          OAIY Network lets OAIY computers on the same network work as one: a computer uses another’s models, GPUs, shared flows and OAIY Voice
+          as if they were its own, and can lend its own at the same time. Nothing leaves your network, and it stays off until you switch it on.
+        </p>
+      )}
       {!status.enabled && (
         <ol className="network-steps" data-testid="network-steps">
           <li>

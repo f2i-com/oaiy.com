@@ -108,6 +108,20 @@ export function sayMinutes(n: number): string {
   return m ? `${h} hr ${m} min` : `${h} hr`;
 }
 
+/**
+ * A count of minutes that is an hour or more, in hours, as a sentence says it ("2 hours", "1 hour 30 minutes", "1
+ * day"); nothing under an hour, which is read as minutes as it is. For a rule typed in minutes ("Need at least 120
+ * minutes’ notice (2 hours).").
+ */
+export function hoursWords(n: number): string {
+  if (!Number.isInteger(n) || n < 60) return '';
+  const many = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  if (n % 1440 === 0) return many(n / 1440, 'day');
+  const h = Math.floor(n / 60);
+  const m = n % 60;
+  return m ? `${many(h, 'hour')} ${many(m, 'minute')}` : many(h, 'hour');
+}
+
 // ---- status ------------------------------------------------------------------------
 
 export const STATUS_TEXT: Record<AppointmentStatus, string> = {

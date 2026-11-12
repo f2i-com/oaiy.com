@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { ChevronDown, Inbox, Loader2, RotateCw, X } from 'lucide-react';
 import { bridge, type DeadLetter } from './api';
+import { capital } from './words';
 import { JsonBlock, eventWords, fullWhen, whenText } from './RunParts';
 import { useVisiblePoll } from './useVisiblePoll';
 import { ask } from './ask';
@@ -155,7 +156,7 @@ export default function DeadLetters() {
               <div className="run-line">
                 <button type="button" className="run-head dead-head" aria-expanded={shown} aria-controls={`dead-${d.id}`} onClick={() => setOpen(shown ? null : d.id)}>
                   <span className="run-state">
-                    <span className="badge badge-err">{KIND[d.reason.kind] ?? d.reason.kind}</span>
+                    <span className="badge badge-err">{capital(KIND[d.reason.kind] ?? d.reason.kind)}</span>
                   </span>
                   <span className="run-name">
                     <strong className="run-flow">{said(d)}</strong>

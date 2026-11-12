@@ -39,9 +39,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "category": "DeveloperTool",
-    "shortDescription": "Local AI services + browser automation for oaiy-web",
-    "longDescription": "OAIY is a tray-resident desktop app that manages local AI services (OAIY Voice, ComfyUI, custom Python) and browser automation, exposing them to the oaiy-web flow editor via a localhost API.",
+    "category": "Productivity",
+    "shortDescription": "Your AI, on your own computer",
+    "longDescription": "OAIY is one app with an agent that works in your projects and answers your business's phone, the models it runs on your own computer, a flow editor for automations, and the plugins and connections around them.",
     "resources": [
       "resources/cli/**/*",
       "resources/app",

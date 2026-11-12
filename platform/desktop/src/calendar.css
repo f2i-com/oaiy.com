@@ -66,7 +66,8 @@
 /* ---- the Calendar ------------------------------------------------------------------- */
 
 /* The calendar uses the page's whole width. */
-.panel.cal-page { max-width: none; gap: 14px; }
+/* (a week's grid: the one page that takes all the window gives it) */
+.panel.cal-page { max-width: none; }
 
 .cal-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; }
 .cal-toolbar-nav { display: flex; min-width: 0; align-items: center; gap: 12px; margin-right: auto; }
@@ -467,7 +468,8 @@
   position: sticky;
   top: calc(-1 * var(--page-pad-t) + 12px);
   display: flex;
-  max-height: calc(100dvh - 78px - var(--dock-h, 54px) - 24px);
+  /* (the window less the header and whatever is at its foot: both named by the workspace, styles.css) */
+  max-height: calc(100dvh - var(--topbar-h, 78px) - var(--dock-h, 0px) - 24px);
   min-width: 0;
   flex-direction: column;
   overflow: hidden;
@@ -480,7 +482,7 @@
 @keyframes cal-side-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .cal-side { animation: none; } }
 .cal-side-head { display: flex; align-items: flex-start; gap: 10px; border-bottom: 1px solid var(--border); padding: 14px 12px 12px 16px; }
-.cal-side-heading { display: flex; min-width: 0; flex: 1; flex-direction: column; align-items: flex-start; gap: 7px; }
+.cal-side-heading { display: flex; min-width: 0; flex: 1; flex-direction: column; align-items: flex-start; gap: var(--stack-gap); }
 .cal-side-heading h2 { margin: 0; overflow-wrap: anywhere; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.25; }
 .cal-side-heading h2:focus { outline: 0; }
 /* (the page header's kicker, as the sidebar's group labels: mono capitals) */
@@ -576,7 +578,7 @@
   .cal-main.has-side .cal-board { display: none; }
   .cal-side { position: static; max-height: none; }
 }
-@media (max-width: 760px) {
+@media (max-width: 700px) {
   .cal-toolbar-nav { flex-basis: 100%; }
   .cal-toolbar-end { margin-left: auto; }
   .cal-sync > span { display: none; }
@@ -592,7 +594,7 @@
 /* ---- Hours & Services ---------------------------------------------------------------- */
 
 .panel.hours-page { max-width: none; }
-.hours-form { display: grid; width: 100%; max-width: 920px; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.hours-form { display: grid; width: 100%; max-width: var(--w-form); grid-template-columns: minmax(0, 1fr); gap: 16px; }
 /* A wide window: the business, hours and rules on the left, the services on the right. */
 @media (min-width: 1560px) {
   .hours-form:not(.is-embedded) {
@@ -828,7 +830,7 @@
 .hours-form.is-embedded > .hours-card:first-child { border-top: 0; padding-top: 4px; }
 .hours-form.is-embedded > .hours-savebar { bottom: -22px; margin-top: 6px; box-shadow: var(--shadow-card); }
 
-@media (max-width: 760px) {
+@media (max-width: 700px) {
   .hours-card { padding: 14px 14px 16px; }
   .hours-day { grid-template-columns: minmax(0, 1fr) auto; }
   .hours-spans { grid-column: 1 / -1; grid-row: 2; }

@@ -1,8 +1,10 @@
-import type { ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { Check, ChevronRight, CircleDashed, ListChecks, PartyPopper, ShieldAlert, TriangleAlert, X } from 'lucide-react';
-import { agentPreferences, engines, link, type PluginRecord } from './api';
+import { agentPreferences, engines, link, NOT_ANSWERING, type PluginRecord } from './api';
 import {
   deriveSetupSteps,
+  noteSettled,
+  settledCardGone,
   setupComplete,
   setupProgress,
   type SetupInput,
@@ -31,9 +33,19 @@ interface Props extends SetupInput {
   actions?: Partial<Record<StepId, ReactNode>>;
   /** The plugins found set up by their live checks, where the page asks them already (else asked here). */
   live?: Record<string, boolean | null | undefined>;
+  /**
+   * OAIY is not answering, and the page says so already with its own "Try again": the card does not say it a second
+   * time as "Setup could not be read".
+   */
+  quiet?: boolean;
+  /**
+   * Told whether the card has nothing left to ask ("You’re set up"), so the page can put it last, under what needs
+   * the person, and above it while it asks for something.
+   */
+  onSettled?: (settled: boolean) => void;
 }
 
-export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: liveFromPage, ...state }: Props) {
+export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: liveFromPage, quiet, onSettled, ...state }: Props) {
   const setup = useSetupState();
   const setupError = useSetupError();
   const unfinished = !!setup && !setup.firstRun.finished;
@@ -57,7 +69,7 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
     ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state, live, prefs: answered(prefsAnswer, prefsError), linked: linked === true })
     : null;
   const progress = firstRun ? firstRunProgress(firstRun) : null;
-  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'welcome' && s.id !== 'handoff' && s.id !== 'done') ?? firstRun?.find((s) => s.id === 'handoff' && s.state === 'todo');
+  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'handoff' && s.id !== 'done') ?? firstRun?.find((s) => s.id === 'handoff' && s.state === 'todo');
 
   const title = firstRun
     ? `Continue setup · ${progress!.done} of ${progress!.total}`
@@ -68,7 +80,16 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
         : setup || complete
           ? 'You’re set up'
           : `Getting started · ${guide.done} of ${guide.total}`;
-  const settled = !firstRun && !nudges.length && !failing.length && !untrusted.length && (setup ? true : complete);
+  const asks = !!firstRun || nudges.length > 0 || failing.length > 0 || untrusted.length > 0;
+  const settled = !asks && (setup ? true : complete);
+  // When it settled is kept, and forgotten once it asks for something again: settled, the card stays a day and then
+  // goes by itself. (Neither is known before the record is read: nothing is noted on a guess.)
+  useEffect(() => {
+    if (settled) noteSettled(true);
+    else if (asks) noteSettled(false);
+    onSettled?.(settled);
+  }, [settled, asks, onSettled]);
+  if (settled && settledCardGone()) return null;
 
   return (
     <section className={settled ? 'service-section setup-guide is-complete' : 'service-section setup-guide'}>
@@ -142,7 +163,8 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, live: 
           ))}
         </ul>
       )}
-      {!setup && setupError && <RetryLine message={`Setup could not be read: ${setupError}`} onRetry={() => void refetchSetup()} />}
+      {/* (OAIY not answering at all is said once, by the page's own notice with its "Try again": not here as well) */}
+      {!setup && setupError && !(quiet && setupError === NOT_ANSWERING) && <RetryLine message={`Setup could not be read: ${setupError}`} onRetry={() => void refetchSetup()} />}
       {!setup && !setupError && !complete && (
         <div className="form-actions">
           <button className="btn btn-primary" onClick={() => openSetup()}>

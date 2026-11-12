@@ -4,8 +4,8 @@
  * dashboard's tokens (styles.css), so it follows both themes and fits a 760px window.
  * ========================================================================== */
 
-.panel.messages-page,
-.panel.transfers-page { max-width: 980px; gap: 14px; }
+/* (their widths are the dashboard's one rule, workspace.css: Messages is a list and uses the window; Transfers is a
+   form and stops at a form's width) */
 
 /* What could not be read or done, beside the form or list it is about. */
 .form-error { margin: 0; color: var(--danger); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
@@ -54,6 +54,36 @@
 
 .transfers-page .switch-row { display: flex; align-items: flex-start; gap: 12px; padding: 4px 0; cursor: pointer; }
 .transfers-page .switch-row input { flex: none; margin-top: 3px; }
+/* (the pill switch Hours & Services uses for the same kind of on and off: its top on the first line of its words) */
+.transfers-page .switch-row input.switch { margin-top: 0; }
+/* Who else can change the switch above it: one closed line, its two notes inside. */
+.transfers-who { margin: -2px 0 2px 52px; }
+.transfers-who > summary { width: fit-content; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.transfers-who > summary:hover { color: var(--text); }
+.transfers-who[open] > summary { margin-bottom: 8px; }
+.transfers-who > .transfers-warning + .transfers-warning { margin-top: 6px; }
+/* A card's settings at the left and the lines typed for them at the right (the urgent phrases beside how it rings,
+   the VIP numbers beside quiet hours); one under the other where there is no room for both. */
+.transfers-two { display: grid; align-items: start; gap: 14px 28px; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+.transfers-two > .transfers-vip { max-width: none; }
+.transfers-quiet { display: flex; min-width: 0; flex-direction: column; gap: 12px; }
+@media (max-width: 1100px) { .transfers-two { grid-template-columns: minmax(0, 1fr); } }
+/* How it rings, and the limits: sentences with their choices in them (the booking rules' list, calendar.css). */
+.transfers-rules select { min-width: 0; max-width: 100%; font-family: var(--font-body); }
+.transfers-rules > li > label { font-weight: 600; }
+.transfers-rules > li > .form-hint { flex-basis: 100%; margin-top: -4px; }
+/* What each approved device is: one choice of three, each with a line on what it means. */
+.transfers-kinds { display: grid; flex: 1 1 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.transfers-kinds > label { display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface-soft); padding: 8px 10px; cursor: pointer; }
+.transfers-kinds > label.is-on { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); background: var(--primary-soft); }
+.transfers-kinds > label > input { flex: none; margin: 2px 0 0; }
+.transfers-kinds > label > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.transfers-kinds b { color: var(--text); font-size: 12.5px; font-weight: 620; line-height: 1.35; }
+.transfers-kinds small { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+@media (max-width: 700px) {
+  .transfers-kinds { grid-template-columns: minmax(0, 1fr); }
+  .transfers-who { margin-left: 0; }
+}
 .transfers-page .switch-row strong { display: block; color: var(--text); font-size: 13.5px; font-weight: 620; }
 .transfers-page .switch-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
 /* Its fields, labelled like every form's; a hint under a field is the form's hint. */
@@ -97,9 +127,10 @@
 }
 :root[data-theme='light'] .ring-dialog { border-color: var(--border); box-shadow: 0 18px 44px rgba(50, 42, 30, 0.18), 3px 3px 0 rgba(50, 42, 30, 0.06); }
 .ring-dialog h2 { margin: 0; font-size: 17px; }
-.ring-dialog .ring-who { display: flex; flex-direction: column; gap: 2px; }
-.ring-dialog .ring-who strong { font-size: 16px; }
-.ring-dialog .ring-who span { color: var(--muted); font-family: var(--font-mono); font-size: 12.5px; }
+/* (who is calling, and their number under the name: the gap every such pair has, styles.css `--stack-gap`) */
+.ring-dialog .ring-who { display: flex; flex-direction: column; gap: var(--stack-gap); }
+.ring-dialog .ring-who strong { font-size: 16px; line-height: 22px; }
+.ring-dialog .ring-who span { color: var(--muted); font-family: var(--font-mono); font-size: 12.5px; line-height: 18px; }
 .ring-said { margin: 0; border-left: 3px solid var(--border); padding: 2px 0 2px 10px; color: var(--muted); font-size: 13.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .ring-clock { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
 .ring-bar { position: relative; height: 5px; flex: 1; overflow: hidden; border-radius: 999px; background: var(--border); }

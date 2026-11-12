@@ -62,7 +62,7 @@ impl Cause {
             Cause::AllNever => "Every approved Companion is set to never ring, so nothing can ring and every caller is offered a message.",
             Cause::PhonesOff => "Your phone is set to never ring, so nothing rings and a caller who asks for you is offered a message. Set Phones to “Ring when I am away” or “Always ring”.",
             Cause::OnlyThisComputers => {
-                "The only Companion is set as the one on this computer, and it rings only while you are at the computer, which you are not now, so a caller who asks for you is offered a message. If it is a phone, untick “This is the Companion on this computer” below."
+                "The only Companion is set as the one on this computer, and it rings only while you are at the computer, which you are not now, so a caller who asks for you is offered a message. If it is a phone, choose “A phone or tablet” for it below."
             }
             Cause::Nothing => "Nothing would ring right now, so a caller who asks for you is offered a message.",
         }

@@ -117,7 +117,7 @@ const SETTINGS = {
 let host: HTMLDivElement;
 let root: Root;
 const text = () => host.textContent ?? '';
-const title = () => host.querySelector('.top-title h1')?.textContent;
+const title = () => host.querySelector('.top-heading h1')?.textContent;
 const kicker = () => host.querySelector('.top-kicker')?.textContent;
 const nav = () => host.querySelector('nav[aria-label="Primary"]')!;
 const settle = async () => {
@@ -228,11 +228,11 @@ describe('the AI Receptionist’s sub-menu', () => {
 
     await go('messages');
     expect(title()).toBe('Messages');
-    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.nav-sub.has-active .nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     expect(host.querySelector('.messages-page')).not.toBeNull();
     await go('transfers');
     expect(title()).toBe('Transfers');
-    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.nav-sub.has-active .nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     expect(text()).toContain('Transfer calls to me');
     expect(text()).toContain('Take messages');
   });
@@ -240,7 +240,7 @@ describe('the AI Receptionist’s sub-menu', () => {
   it('lands the old id `calendar`, and `hours`, on their pages, with the AI Receptionist over them', async () => {
     await go('calendar');
     expect(title()).toBe('Calendar');
-    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.nav-sub.has-active .nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     expect(host.querySelector('.cal-page')).not.toBeNull();
     // The sub-menu is in the sidebar: no tabs under the header too.
     expect(host.querySelector('.section-tabs')).toBeNull();
@@ -249,7 +249,7 @@ describe('the AI Receptionist’s sub-menu', () => {
 
     await go('hours');
     expect(title()).toBe('Hours & Services');
-    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.nav-sub.has-active .nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     expect(host.querySelector('.hours-form')).not.toBeNull();
     expect(text()).toContain('Opening hours');
     expect(nav().querySelector('[aria-current="page"]')?.textContent).toBe('Hours & Services');
@@ -311,7 +311,7 @@ describe('the AI Receptionist’s sub-menu', () => {
   it('lands `contacts` on Contacts, and the Agent’s contact key opens that person', async () => {
     await go('contacts');
     expect(title()).toBe('Contacts');
-    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.nav-sub.has-active .nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     expect(nav().querySelector('[aria-current="page"]')?.textContent).toBe('Contacts');
     expect([...host.querySelectorAll('.contact-row strong')].map((s) => s.textContent)).toEqual(['Liam', 'Sam']);
     expect(host.querySelector('.contacts-side')).toBeNull();
@@ -418,7 +418,9 @@ describe('without the AI Receptionist', () => {
     expect(nav().querySelector('button[aria-label^="Calendar"]')).not.toBeNull();
     await go('hours');
     expect(title()).toBe('Calendar');
-    expect([...host.querySelectorAll('.section-tabs [role="tab"]')].map((t) => t.textContent)).toEqual(['Calendar', 'Hours & Services']);
+    // (a tab says what waits on its page, as its line in the sidebar does: the count is in the tab, after its name)
+    expect([...host.querySelectorAll('.section-tabs [role="tab"]')].map((t) => t.querySelector('span')!.textContent)).toEqual(['Calendar', 'Hours & Services']);
+    expect(host.querySelector('.section-tabs [role="tab"] .tab-count')?.textContent).toBe(String(host.querySelector('nav button[aria-label^="Calendar"] .nav-count')?.textContent ?? ''));
     expect(host.querySelector('.hours-form')).not.toBeNull();
   });
 

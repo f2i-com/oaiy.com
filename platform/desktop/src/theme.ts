@@ -18,10 +18,13 @@ export type ThemeMode = 'light' | 'dark';
 
 const KEY = 'oaiy-theme';
 
-/** Human labels, matching the design system's theme names. */
+/**
+ * What a person calls each theme. ("Prism Lab" and "Paper Circuit" are the design system's names for them, and stay
+ * in the stylesheets' comments: the button says "Light theme" and "Dark theme".)
+ */
 export const THEME_LABEL: Record<ThemeMode, string> = {
-  dark: 'Prism Lab',
-  light: 'Paper Circuit',
+  dark: 'Dark theme',
+  light: 'Light theme',
 };
 
 export function initialTheme(): ThemeMode {

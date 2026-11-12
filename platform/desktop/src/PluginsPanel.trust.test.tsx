@@ -100,7 +100,7 @@ describe('an unsigned plugin in a release build', () => {
   });
   it('shows the unsigned badge and its reason, cannot be started, and offers to be trusted', async () => {
     await render([held(UNSIGNED)]);
-    expect(host.querySelector('.card-head .badge[data-trust="unsigned"]')?.textContent).toBe('unsigned');
+    expect(host.querySelector('.card-head .badge[data-trust="unsigned"]')?.textContent).toBe('Unsigned');
     expect(host.querySelector('.card-reason')?.textContent).toContain('you can trust this exact package');
     const start = button('Start')!;
     expect(start.disabled).toBe(true);
@@ -158,7 +158,7 @@ describe('an unsigned plugin in a release build', () => {
         trust: { state: 'trusted-local', reason: 'You trusted this exact package on 2026-09-29.', trustedAt: '2026-09-29T01:02:03Z' },
       },
     ]);
-    expect(host.querySelector('.card-head .badge[data-trust="trusted-local"]')?.textContent).toBe('trusted by you');
+    expect(host.querySelector('.card-head .badge[data-trust="trusted-local"]')?.textContent).toBe('Trusted by you');
     expect(button('Trust this plugin')).toBeUndefined();
     expect(button('Start')!.disabled).toBe(false);
   });
@@ -188,7 +188,7 @@ describe('the trust action is for an unsigned package and nothing else', () => {
 
   it('is not offered for a quarantined package: a signature that fails is not something a click fixes', async () => {
     await render([held(QUARANTINED)]);
-    expect(host.querySelector('.card-head .badge[data-trust="quarantined"]')?.textContent).toBe('quarantined');
+    expect(host.querySelector('.card-head .badge[data-trust="quarantined"]')?.textContent).toBe('Quarantined');
     expect(host.querySelector('.card-reason')?.textContent).toContain('digest mismatch: aokie-plugin.exe');
     expect(button('Trust this plugin')).toBeUndefined();
     const start = button('Start')!;
@@ -229,7 +229,7 @@ describe('an unsigned plugin in a developer build', () => {
     expect(m.start).not.toHaveBeenCalled();
     expect(m.stop).not.toHaveBeenCalled();
     expect(button('Trust this plugin')).toBeUndefined();
-    expect(host.querySelector('.badge[data-trust="trusted-local"]')?.textContent).toBe('trusted by you');
+    expect(host.querySelector('.badge[data-trust="trusted-local"]')?.textContent).toBe('Trusted by you');
     expect(m.push).toHaveBeenCalledWith(expect.objectContaining({
       title: 'Trusted Narrator', body: state === 'running' ? 'Return to the plugin and read its host models again.' : 'Click Start to run it.',
     }));

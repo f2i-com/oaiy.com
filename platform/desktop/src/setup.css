@@ -223,22 +223,25 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-weight: 650;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
+  line-height: 14px;
   text-transform: uppercase;
 }
+/* (the step's three lines keep the page header's rhythm: the same gap between any two, styles.css `--stack-gap`) */
 .setup-step-head h2 {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
-  margin: 5px 0 0;
+  margin: var(--stack-gap) 0 0;
   font-size: 19px;
   font-weight: 660;
   letter-spacing: -0.01em;
+  line-height: 26px;
 }
 .setup-step-head p {
   max-width: 72ch;
-  margin: 6px 0 0;
+  margin: var(--stack-gap) 0 0;
   color: var(--muted);
   font-size: 13.5px;
   line-height: 1.55;
@@ -583,7 +586,51 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .ai-choices.is-trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
 .ai-choices.is-trio .ai-choice-head > input[type='radio'] { margin-top: 3px; }
 @media (max-width: 980px) {
-  .ai-choices.is-trio { grid-template-columns: minmax(0, 1fr); }
+  .ai-choices.is-trio:not(.ai-tiles) { grid-template-columns: minmax(0, 1fr); }
+}
+/* The wizard's choices as one row of tiles: a radio, an icon, the name, and its marks ("Recommended", "Ready").
+   What the chosen one is, is said under the row (`.ai-choice-about`), so the row is one line tall and what there is
+   to do (a model to download) is in the first screen. */
+.ai-choices.ai-tiles { gap: 10px; }
+.ai-tile {
+  display: flex;
+  min-width: 0;
+  min-height: 64px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.ai-tile > input[type='radio'] { width: 16px; height: 16px; flex: none; margin: 0; cursor: pointer; }
+.ai-tile-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.ai-tile-text { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.ai-tile-text > strong { color: var(--text); font-size: 14px; font-weight: 650; line-height: 1.25; }
+.ai-tile-marks { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }
+/* (a mark never stands out of its tile: it is cut with an ellipsis before it would) */
+.ai-tile-marks .badge { overflow: hidden; max-width: 100%; margin-left: 0; text-overflow: ellipsis; white-space: nowrap; }
+/* A tile that is in its place and not yet to choose (the provider's, for the moment the desktop takes to say
+   whether it can keep one): drawn from the first paint, quieter until it can be pressed. */
+.ai-tile.is-pending { cursor: default; opacity: 0.6; }
+/* The computer has not said what it has yet: a quiet line under the tiles, where the chosen tile's words will be. */
+.ai-looking { display: flex; align-items: center; gap: 7px; margin: -6px 0 0; }
+.ai-tile-marks .badge-pending::before { animation: none; }
+.ai-choice-about { display: flex; max-width: 76ch; flex-direction: column; gap: 4px; margin-top: -6px; }
+.ai-choice-about > p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.ai-choice-about > p.ai-choice-fact { color: var(--text); }
+.ai-choice-about > p.setup-mono { color: var(--faint); font-size: 11.5px; }
+@media (max-width: 620px) {
+  .ai-choices.ai-tiles.is-trio,
+  .ai-choices.ai-tiles.is-pair { grid-template-columns: minmax(0, 1fr); }
+  .ai-tile { min-height: 52px; }
 }
 .agent-provider { display: flex; max-width: 560px; flex-direction: column; gap: 10px; }
 .agent-provider-add { display: flex; flex-direction: column; gap: 8px; }
@@ -744,7 +791,17 @@ input[type='checkbox'].switch:focus-visible { box-shadow: 0 0 0 3px var(--primar
   .setup-pane,
   .setup-embedded-body { min-height: 0; }
 }
-@media (max-width: 760px) {
+/* Where the step is narrow (the window at its smallest, a phone): the footer's line of words has a line of its own
+   over the buttons (between them it wrapped to three lines), and a tile's icon gives its room to the tile's name and
+   its mark ("Recommended" stood out of the tile). */
+@media (max-width: 900px) {
+  .setup-foot { flex-wrap: wrap; }
+  .setup-foot-status { flex-basis: 100%; order: -1; text-align: left; }
+  .setup-foot-status .card-warn { justify-content: flex-start; }
+  .setup-foot .btn-primary { margin-left: auto; }
+  .ai-tiles .ai-tile-icon { display: none; }
+}
+@media (max-width: 700px) {
   .setup-hero h1 { font-size: 19px; }
   .setup-hero-side { width: 100%; }
   .setup-hero-side .setup-progress { flex: 1; width: auto; }
@@ -758,11 +815,7 @@ input[type='checkbox'].switch:focus-visible { box-shadow: 0 0 0 3px var(--primar
   .setup-check { align-items: flex-start; text-align: left; }
   .setup-req { flex-wrap: wrap; }
   .setup-req-action { width: 100%; justify-content: flex-end; }
-  .setup-foot { flex-wrap: wrap; }
-  .setup-foot-status { flex-basis: 100%; order: -1; text-align: left; }
-  .setup-foot-status .card-warn { justify-content: flex-start; }
-  .setup-foot .btn-primary { margin-left: auto; }
-  .ai-choices.is-pair { grid-template-columns: minmax(0, 1fr); }
+  .ai-choices.is-pair:not(.ai-tiles) { grid-template-columns: minmax(0, 1fr); }
   .ai-choice-body,
   .ai-choices.is-compact .ai-choice-body { padding-left: 16px; }
   .agent-switch-row { align-items: flex-start; }

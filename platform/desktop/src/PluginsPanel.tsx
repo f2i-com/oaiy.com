@@ -36,6 +36,7 @@ import { ask } from './ask';
 import { useVisiblePoll } from './useVisiblePoll';
 import LogsViewer from './LogsViewer';
 import PackageTrustBadge from './PackageTrustBadge';
+import { capital } from './words';
 import LoadError from './LoadError';
 import { trustQuestion } from './PluginRunNote';
 import { catalogNote } from './setupFlow';
@@ -266,78 +267,8 @@ export default function PluginsPanel() {
     <div className="panel">
       {error && <LoadError what="The plugins" error={error} onRetry={refresh} />}
 
-      {snapshot && (
-        <div className="datadir-note datadir-row">
-          <span>
-            Plugins live in <code className="path-code">{snapshot.root}</code>
-          </span>
-          <button
-            className="btn-tiny"
-            onClick={() => openInExplorer(snapshot.root).catch(() => {})}
-          >
-            <FolderOpen size={13} /> Open folder
-          </button>
-        </div>
-      )}
-
-      {/* Install from a path on this machine. Until this existed the only way to
-          add a plugin was to copy a folder in by hand — and every connector OAIY
-          offers a flow comes from a plugin. */}
-      <section className="service-section">
-        <div className="section-title-row">
-          <h3 className="section-title">Install a plugin</h3>
-        </div>
-        <form
-          className="dl-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void installPlugin();
-          }}
-        >
-          <label className="form-row">
-            <span>Plugin folder, .zip or .tar.gz on this computer</span>
-            <span className="setup-folder-row">
-              <input className="is-mono"
-                type="text"
-                placeholder={PLUGIN_PATH_EXAMPLE}
-                value={installSource}
-                onChange={(e) => {
-                  setInstallSource(e.target.value);
-                  setInstallError(null);
-                }}
-              />
-              {isTauri() && (
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => void appConfig.pickFolder().then((p) => p && setInstallSource(p)).catch(() => {})}
-                >
-                  <FolderOpen size={14} /> Browse
-                </button>
-              )}
-            </span>
-          </label>
-          <p className="form-hint">
-            Installing a plugin installs native code this app will run. Only install plugins you
-            trust. Re-installing over an existing plugin updates it in place.
-          </p>
-          {installError && (
-            <div className="card-warn" role="alert">
-              <TriangleAlert size={13} aria-hidden /> It was not installed: {installError}
-            </div>
-          )}
-          <div className="form-actions">
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={installing || !installSource.trim()}
-            >
-              {installing ? <Loader2 size={14} className="spin" /> : <Plug size={14} />} Install
-            </button>
-          </div>
-        </form>
-      </section>
-
+      {/* The plugins this computer has come first: they are what the page is opened for. Installing another, and
+          where they are kept, follow. */}
       {!snapshot ? (
         // (not read, and the banner above says why: no "Loading" under it that never ends)
         !error && <div className="empty-state is-loading">Loading plugins…</div>
@@ -345,6 +276,11 @@ export default function PluginsPanel() {
         <PluginCatalog onInstall={(path) => setInstallSource(path)} />
       ) : (
         <section className="service-section">
+          <div className="section-title-row">
+            <h3 className="section-title">
+              Installed plugins <span className="section-count">{list.length}</span>
+            </h3>
+          </div>
           {list.map((p) => {
             const name = p.manifest?.name ?? declaredOf(p)?.name ?? p.id;
             return (
@@ -383,7 +319,7 @@ export default function PluginsPanel() {
               <div className="card-head">
                 <Boxes size={14} aria-hidden />
                 <strong className="card-title">{d.name}</strong>
-                <span className="badge badge-neutral">{d.category ?? 'service'}</span>
+                <span className="badge badge-neutral">{capital(d.category ?? 'service')}</span>
                 <span className="card-note">
                   from <code>{d.pluginId}</code>
                 </span>
@@ -399,6 +335,76 @@ export default function PluginsPanel() {
           ))}
         </section>
       )}
+
+      {/* Install from a path on this machine. Until this existed the only way to
+          add a plugin was to copy a folder in by hand — and every connector OAIY
+          offers a flow comes from a plugin. */}
+      <section className="service-section">
+        <div className="section-title-row">
+          <h3 className="section-title">Install a plugin</h3>
+        </div>
+        <form
+          className="dl-form form-narrow"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void installPlugin();
+          }}
+        >
+          <label className="form-row">
+            <span>Plugin folder, .zip or .tar.gz on this computer</span>
+            <span className="setup-folder-row">
+              <input className="is-mono"
+                type="text"
+                placeholder={PLUGIN_PATH_EXAMPLE}
+                value={installSource}
+                onChange={(e) => {
+                  setInstallSource(e.target.value);
+                  setInstallError(null);
+                }}
+              />
+              {isTauri() && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void appConfig.pickFolder().then((p) => p && setInstallSource(p)).catch(() => {})}
+                >
+                  <FolderOpen size={14} /> Browse
+                </button>
+              )}
+            </span>
+          </label>
+          <p className="form-hint">
+            A plugin is a program this computer will run: install only ones you trust. Installing one you already have updates it.
+          </p>
+          {installError && (
+            <div className="card-warn" role="alert">
+              <TriangleAlert size={13} aria-hidden /> It was not installed: {installError}
+            </div>
+          )}
+          <div className="form-actions">
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={installing || !installSource.trim()}
+            >
+              {installing ? <Loader2 size={14} className="spin" /> : <Plug size={14} />} Install
+            </button>
+          </div>
+        </form>
+        {snapshot && (
+          <div className="datadir-note datadir-row">
+            <span>
+              Plugins are kept in <code className="path-code">{snapshot.root}</code>
+            </span>
+            <button
+              className="btn-tiny"
+              onClick={() => openInExplorer(snapshot.root).catch(() => {})}
+            >
+              <FolderOpen size={13} /> Open folder
+            </button>
+          </div>
+        )}
+      </section>
 
       {logsFor && (
         <LogsViewer
@@ -466,15 +472,15 @@ function PluginCard({
       <div className="card-head">
         <CircleDot size={14} aria-hidden />
         <strong className="card-title">{p.manifest?.name ?? declaredOf(p)?.name ?? p.id}</strong>
-        <span className={waiting ? 'badge badge-pending' : badgeClass(p.state)}>{waiting ? 'needs setup' : p.state}</span>
+        <span className={waiting ? 'badge badge-pending' : badgeClass(p.state)}>{waiting ? 'Needs setup' : capital(p.state)}</span>
         {p.manifest?.version && (
           <span className="card-note">v{p.manifest.version}</span>
         )}
         {p.trust && <PackageTrustBadge trust={p.trust} />}
-        {p.userDisabled && <span className="badge badge-neutral">disabled by you</span>}
+        {p.userDisabled && <span className="badge badge-neutral">Disabled by you</span>}
         {setupTitle && setupStatus === 'set-up' && (
           <span className="badge badge-ok" title={`${setupTitle}: done`}>
-            set up
+            Set up
           </span>
         )}
       </div>

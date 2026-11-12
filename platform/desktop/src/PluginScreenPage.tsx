@@ -975,10 +975,15 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
       <div className="panel">
         <div className="empty-state">
           <TriangleAlert size={22} style={{ opacity: 0.5 }} />
-          <p>This plugin doesn't ship that screen.</p>
-          <p style={{ fontSize: 13, opacity: 0.7 }}>
-            Its manifest declares no <code>ui.screens</code> entry for “{screenId ?? navId}”.
-          </p>
+          <p>This page is not in the plugin.</p>
+          <p>The plugin that provides it has no page of this name. Updating the plugin may bring it back.</p>
+          {/* (the exact fault, for whoever wrote the plugin: closed until asked for) */}
+          <details className="setup-more">
+            <summary>For the plugin’s author</summary>
+            <p className="form-hint">
+              Its manifest declares no <code>ui.screens</code> entry for “{screenId ?? navId}”.
+            </p>
+          </details>
         </div>
       </div>
     );

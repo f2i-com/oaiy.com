@@ -1,81 +1,57 @@
 import { useState, type ReactNode } from 'react';
-import { Bot, Check, Cpu, MessageSquare, Plug, Puzzle, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react';
+import { Check, Cpu, Loader2, MessageSquare, Plug, ShieldCheck, TriangleAlert } from 'lucide-react';
 import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
 import { bridge, nodeRuntime, type AgentModelSource, type AgentPreferences, type CodexStatus, type EngineCatalog, type EngineRecommendation } from './api';
 import { AgentMaySwitch, type ControlSwitch } from './AgentAccess';
 import { aiChoices, isRecommended, localModelLine, type FirstRunStep, type ModelLine } from './setupFlow';
-import { EngineModelCard, errorText, StepHeader, usePoll } from './SetupParts';
+import { EngineModelCard, errorText, StepHeader, usePoll, type EngineAction } from './SetupParts';
 
 /**
- * The first-run wizard's essentials: welcome, the Agent's AI (on this
- * computer, ChatGPT, or an AI provider such as LM Studio), what the Agent may
- * change, and the hand-off to the Agent, which sets up the rest with the
- * person in a chat.
+ * The first-run wizard's essentials: the Agent's AI (on this computer,
+ * ChatGPT, or an AI provider such as LM Studio), what the Agent may change,
+ * and the hand-off to the Agent, which sets up the rest with the person in a
+ * chat. (There is no welcome step before them: it asked only for "Get
+ * started". Its one sentence heads the first step, which also keeps what it
+ * said when flows cannot run yet, and that OAIY keeps things on this computer.)
  */
 
-export function WelcomeStep({ kicker }: { kicker: string }) {
+/** Flows cannot run on this computer yet (the flow runtime is not ready): said, with Node installed in one press where that is what is missing. */
+function RuntimeNote() {
   const [runtime] = usePoll(() => bridge.status(), 5000);
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const node = runtime?.nodeRuntime;
-  const parts: Array<{ icon: ReactNode; title: string; text: string }> = [
-    { icon: <Sparkles size={17} />, title: 'Your AI', text: 'What the Agent thinks with: a language model on this computer, your ChatGPT account, or a provider such as LM Studio.' },
-    { icon: <Bot size={17} />, title: 'The Agent', text: 'Your assistant in OAIY. You choose whether it may set up and change OAIY for you.' },
-    { icon: <Puzzle size={17} />, title: 'The rest, with the Agent', text: 'Plugins such as the AI receptionist, your phone, your business hours and your apps: the Agent sets them up with you in a chat.' },
-  ];
+  if (!runtime || runtime.ready) return null;
   return (
-    <div className="setup-welcome">
-      <StepHeader
-        kicker={kicker}
-        title="Welcome to OAIY"
-        description="Orchestrate AI Yourself: your models, your devices and your flows, on this computer. Two choices get it going; then the Agent sets up the rest with you, or you can do it step by step."
-      />
-      <ul className="setup-welcome-parts">
-        {parts.map((p) => (
-          <li key={p.title}>
-            <span className="setup-req-icon" aria-hidden>
-              {p.icon}
-            </span>
-            <span>
-              <strong>{p.title}</strong>
-              <small>{p.text}</small>
-            </span>
-          </li>
-        ))}
-      </ul>
-      {runtime && !runtime.ready && (
-        <div className="setup-note" role="status">
-          <TriangleAlert size={13} />
-          <span>Flows cannot run on this computer yet: {runtime.flowRuntime.detail ?? 'the flow runtime is not ready.'}</span>
-          {node && !node.available && (
-            <button
-              type="button"
-              className="btn-tiny"
-              disabled={installing || node.installing}
-              onClick={() => {
-                setInstalling(true);
-                setInstallError(null);
-                void nodeRuntime
-                  .install()
-                  .catch((e: unknown) => setInstallError(`Node was not installed: ${errorText(e)}`))
-                  .finally(() => setInstalling(false));
-              }}
-            >
-              {node.installing || installing ? 'Installing Node…' : `Install Node ${node.installsVersion}`}
-            </button>
-          )}
-        </div>
-      )}
+    <>
+      <div className="setup-note" role="status">
+        <TriangleAlert size={13} />
+        <span>Flows cannot run on this computer yet: {runtime.flowRuntime.detail ?? 'the flow runtime is not ready.'}</span>
+        {node && !node.available && (
+          <button
+            type="button"
+            className="btn-tiny"
+            disabled={installing || node.installing}
+            onClick={() => {
+              setInstalling(true);
+              setInstallError(null);
+              void nodeRuntime
+                .install()
+                .catch((e: unknown) => setInstallError(`Node was not installed: ${errorText(e)}`))
+                .finally(() => setInstalling(false));
+            }}
+          >
+            {node.installing || installing ? 'Installing Node…' : `Install Node ${node.installsVersion}`}
+          </button>
+        )}
+      </div>
       {installError && (
         <p className="card-warn" role="alert">
           {installError}
         </p>
       )}
-      <p className="setup-trust">
-        <ShieldCheck size={13} /> OAIY runs on this computer. Keys, conversations and recordings are kept on it.
-      </p>
-    </div>
+    </>
   );
 }
 
@@ -123,6 +99,8 @@ export function YourAiStep({
   onOpenEngines,
   providerPick,
   onProviderPick,
+  onEngineAction,
+  providerPending,
 }: {
   kicker: string;
   state: FirstRunStep['state'];
@@ -139,7 +117,13 @@ export function YourAiStep({
   providerPick?: ProviderPick | null;
   /** Given, the provider is a choice (a desktop that keeps the Agent's model). */
   onProviderPick?: (p: ProviderPick) => void;
+  /** Given, the page draws the model's Download button (its footer's) and is told what it does (EngineModelCard). */
+  onEngineAction?: (action: EngineAction | null) => void;
+  /** Whether the desktop keeps the Agent's model is still being asked: the provider's tile is drawn from the first
+   *  paint, in its place, and waits (it arrived a moment after the other two, and the row was seen to change). */
+  providerPending?: boolean;
 }) {
+  const withProvider = !!onProviderPick || !!providerPending;
   const line = localModelLine(rec, catalog);
   const gpus = rec?.local.gpus ?? [];
   // Why it is (or is not) recommended, where that adds to the line naming the model: with a model chosen, it only says
@@ -147,85 +131,89 @@ export function YourAiStep({
   const reason = line.kind === 'chosen' ? null : rec?.local.reason ?? null;
   const gpuLine = gpus.length > 0 && !(reason && gpus.every((g) => reason.includes(g.name)));
   const head = (
-    <StepHeader
-      kicker={kicker}
-      title="Your AI"
-      state={state}
-      description={`What the Agent thinks with: a language model on this computer, your ChatGPT account${onProviderPick ? ', or an AI provider such as LM Studio' : ''}. You can change it any time in Settings → Agent.`}
-    />
+    <>
+      <StepHeader
+        kicker={kicker}
+        title="Your AI"
+        state={state}
+        // (the welcome's one sentence, and what this step chooses)
+        description={`Welcome to OAIY. Two choices get it going, and this is the first: what the Agent thinks with. A language model on this computer, your ChatGPT account${withProvider ? ', or an AI provider such as LM Studio' : ''}. You can change it any time in Settings → Agent.`}
+      />
+      <RuntimeNote />
+    </>
   );
-  if (!rec) {
-    return (
-      <>
-        {head}
-        <p className="form-hint">Looking at this computer…</p>
-      </>
-    );
-  }
-  // Both choices side by side, the recommended one first; what the chosen one needs goes below them both.
+  // The choices in one row of tiles, always in the same order: its icon, its name, and whether it is recommended or
+  // ready. Until the computer has said what it has (`rec` is null), the tiles are there to choose from with none
+  // marked, and a quiet line says it is being looked at; the recommendation is then marked where its tile stands.
+  // What each one is, and what it would use, is said under the row for the one chosen alone; what it needs (a model
+  // to download, a sign-in, a provider) goes below that.
+  const NAME: Record<AgentModelSource, string> = { engine: 'On this computer', chatgpt: 'ChatGPT', provider: 'An AI provider' };
+  const readyOf = (source: AgentModelSource) => (source === 'engine' ? line.kind === 'chosen' : source === 'chatgpt' ? codex?.connected === true : !!providerPick);
   const option = (source: AgentModelSource): ReactNode => {
     const selected = choice === source;
-    const recommended = isRecommended(rec, source);
-    if (source === 'provider') {
-      return (
-        <label key={source} className={`ai-choice ai-choice-head${selected ? ' is-selected' : ''}`}>
-          <input type="radio" name="ai-source" value={source} checked={selected} onChange={() => onChoose(source)} />
-          <span className="ai-choice-text">
-            <strong>
-              <span className="ai-choice-icon" aria-hidden>
-                <Plug size={15} />
-              </span>
-              An AI provider
-              {providerPick && (
+    const recommended = !!rec && isRecommended(rec, source);
+    const ready = readyOf(source);
+    // (the provider's tile while it is not known whether this desktop can keep one: in its place, not yet to choose)
+    const pending = source === 'provider' && !onProviderPick;
+    return (
+      <label key={source} className={`ai-choice ai-tile${selected ? ' is-selected' : ''}${pending ? ' is-pending' : ''}`}>
+        <input type="radio" name="ai-source" value={source} checked={selected} disabled={pending} aria-describedby={selected ? 'ai-choice-about' : undefined} onChange={() => onChoose(source)} />
+        <span className="ai-tile-icon" aria-hidden>
+          {source === 'engine' ? <Cpu size={17} /> : source === 'chatgpt' ? <MessageSquare size={17} /> : <Plug size={17} />}
+        </span>
+        <span className="ai-tile-text">
+          <strong>{NAME[source]}</strong>
+          {(recommended || ready) && (
+            <span className="ai-tile-marks">
+              {recommended && <span className="badge badge-pending">Recommended</span>}
+              {ready && (
                 <span className="badge badge-ok">
                   <Check size={11} strokeWidth={2.6} /> Ready
                 </span>
               )}
-            </strong>
-            <small>LM Studio or Ollama on this computer, or an API key (OpenAI, OpenRouter, Gemini): the models you already run or pay for. Keys stay on this computer.</small>
-            {providerPick && <small className="ai-choice-fact">{`${providerPick.name} · ${providerPick.model}`}</small>}
-          </span>
-        </label>
-      );
-    }
-    const local = source === 'engine';
-    const ready = local ? line.kind === 'chosen' : codex?.connected === true;
-    return (
-      <label key={source} className={`ai-choice ai-choice-head${selected ? ' is-selected' : ''}`}>
-        <input type="radio" name="ai-source" value={source} checked={selected} onChange={() => onChoose(source)} />
-        <span className="ai-choice-text">
-          <strong>
-            <span className="ai-choice-icon" aria-hidden>
-              {local ? <Cpu size={15} /> : <MessageSquare size={15} />}
             </span>
-            {local ? 'On this computer' : 'ChatGPT'}
-            {recommended && <span className="badge badge-pending">Recommended</span>}
-            {ready && (
-              <span className="badge badge-ok">
-                <Check size={11} strokeWidth={2.6} /> Ready
-              </span>
-            )}
-          </strong>
-          <small>
-            {local
-              ? 'A language model in OAIY’s engines: private, with nothing to pay per message. It needs a graphics card with enough memory.'
-              : 'Your ChatGPT account, through OAIY’s Codex connection: nothing to download. Your plan’s limits apply, and what the Agent reads and writes goes to OpenAI.'}
-          </small>
-          {/* The model it would use; while it is chosen, the card below offers the download instead. */}
-          {local && (line.kind === 'chosen' || !selected) && <small className="ai-choice-fact">{modelLineText(line)}</small>}
-          {local && reason && <small className="ai-choice-fact">{reason}</small>}
-          {local && gpuLine && <small className="setup-mono">{gpus.map((g) => `${g.name} · ${g.totalGb} GB`).join('  ·  ')}</small>}
-          {!local && codex?.connected && <small className="ai-choice-fact">Signed in{codex.email ? ` as ${codex.email}` : ''}.</small>}
+          )}
         </span>
       </label>
     );
   };
+  const about =
+    choice === 'engine' ? (
+      <>
+        <p>A language model in OAIY’s engines: private, with nothing to pay per message. It needs a graphics card with enough memory.</p>
+        {/* The model it uses; with none chosen yet, the card below offers the download instead. */}
+        {line.kind === 'chosen' && <p className="ai-choice-fact">{modelLineText(line)}</p>}
+        {reason && <p className="ai-choice-fact">{reason}</p>}
+        {gpuLine && <p className="setup-mono">{gpus.map((g) => `${g.name} · ${g.totalGb} GB`).join('  ·  ')}</p>}
+      </>
+    ) : choice === 'chatgpt' ? (
+      <>
+        <p>Your ChatGPT account, through OAIY’s Codex connection: nothing to download. Your plan’s limits apply, and what the Agent reads and writes goes to OpenAI.</p>
+        {codex?.connected && <p className="ai-choice-fact">Signed in{codex.email ? ` as ${codex.email}` : ''}.</p>}
+      </>
+    ) : choice === 'provider' ? (
+      <>
+        <p>LM Studio or Ollama on this computer, or an API key (OpenAI, OpenRouter, Google): the models you already run or pay for. Keys stay on this computer.</p>
+        {providerPick && <p className="ai-choice-fact">{`${providerPick.name} · ${providerPick.model}`}</p>}
+      </>
+    ) : null;
   return (
     <>
       {head}
-      <div className={`ai-choices ${onProviderPick ? 'is-trio' : 'is-pair'}`} role="radiogroup" aria-label="What the Agent thinks with">
-        {aiChoices(rec, !!onProviderPick).map(option)}
+      {/* (three columns whether or not the third choice is there yet: the first two keep their places and widths) */}
+      <div className="ai-choices ai-tiles is-trio" role="radiogroup" aria-label="What the Agent thinks with">
+        {aiChoices(rec, withProvider).map(option)}
       </div>
+      {!rec && (
+        <p className="form-hint ai-looking" role="status">
+          <Loader2 size={13} className="spin" aria-hidden /> Looking at this computer…
+        </p>
+      )}
+      {about && (
+        <div className="ai-choice-about" id="ai-choice-about">
+          {about}
+        </div>
+      )}
       {choice === 'engine' && (
         <div className="setup-reqs">
           <EngineModelCard
@@ -234,6 +222,7 @@ export function YourAiStep({
             gpuGb={gpus.length > 0 ? Math.max(...gpus.map((g) => g.totalGb)) : undefined}
             onChanged={onCatalogChanged}
             onOpenEngines={onOpenEngines}
+            onAction={onEngineAction}
             why="The Agent uses the language model chosen in Engines, whatever it is."
           />
         </div>
@@ -253,6 +242,9 @@ export function YourAiStep({
           </div>
         </div>
       )}
+      <p className="setup-trust">
+        <ShieldCheck size={13} /> OAIY runs on this computer. Keys, conversations and recordings are kept on it.
+      </p>
     </>
   );
 }

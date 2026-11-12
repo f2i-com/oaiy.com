@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Network, Phone } from 'lucide-react';
 import { calendar, engines, link, network, phone, type Appointment, type CalendarSync, type EngineCatalog, type EnginesStatus, type LinkStatus, type NetworkDefault } from './api';
 import { modelName } from './setupFlow';
@@ -34,12 +35,19 @@ function sayWhen(start: string): { day: string; clock: string } {
   return { day: d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', ''), clock };
 }
 
-export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'engine-workers' | 'connections') => void }) {
+export default function TodayPanel({
+  onNavigate,
+  soloSlot,
+}: {
+  onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'engine-workers' | 'connections') => void;
+  /** Where the language model's tile goes when it is the only thing Today would show (see below); not given, Today is always its own card. */
+  soloSlot?: HTMLElement | null;
+}) {
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
   /** The engine's default language model where it is a paired computer's, and in effect (OAIY Network). */
   const [onPaired, setOnPaired] = useState<NetworkDefault | null>(null);
-  /** The engines' catalogue, for a model's name ("Qwen3.5 9B" rather than "qwen3.5-9b"). */
+  /** The engines' catalogue, for a model's name (the one written for a person, rather than its id). */
   const [catalog, setCatalog] = useState<Pick<EngineCatalog, 'models'> | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
   /** The requests waiting to be confirmed: from today on, one earlier today still waiting too (as the sidebar counts them). */
@@ -107,7 +115,12 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const requests = waiting ?? [];
   const next = (upcoming ?? []).find((a) => a.status === 'confirmed') ?? upcoming?.[0];
   const when = next ? sayWhen(next.start) : null;
-  const llm = model?.llm;
+  const modelTile = <ModelTile onPaired={onPaired} model={model} catalog={catalog} onNavigate={onNavigate} />;
+  // With no phone, no calendar and no linked account, the language model's tile is all Today would hold: a whole
+  // card for one tile and four empty columns. The page then gives a place for that tile among its own (`soloSlot`,
+  // the first of "This computer", whose row it fills), and no Today card is drawn. With the receptionist, Today
+  // stays as it is.
+  if (soloSlot !== undefined && !phoneOn && !calendarOn && !formlogic) return soloSlot ? createPortal(modelTile, soloSlot) : null;
 
   return (
     <section className="service-section">
@@ -123,38 +136,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
             <small>The phone</small>
           </button>
         )}
-        {onPaired ? (
-          // (in effect while that computer's engines are not answering: nothing runs in its place, so it is not ready)
-          onPaired.waiting === 'engines_down' ? (
-            <button
-              className="overview-tile"
-              onClick={() => onNavigate('engine-workers')}
-              title={`${onPaired.nodeName || 'The paired computer'}’s engines aren’t answering: chats that use ${modelName(catalog, onPaired.model)} fail until they do (Engines → Other computers)`}
-            >
-              <Network size={16} aria-hidden />
-              <strong className="warn">Not answering</strong>
-              <small>
-                {modelName(catalog, onPaired.model)} · on {onPaired.nodeName || 'a paired computer'}
-              </small>
-            </button>
-          ) : (
-            <button
-              className="overview-tile"
-              onClick={() => onNavigate('engine-workers')}
-              title={`The engine’s default language model is ${modelName(catalog, onPaired.model)} on ${onPaired.nodeName} (Engines → Other computers)`}
-            >
-              <Network size={16} aria-hidden />
-              <strong>On {onPaired.nodeName || 'a paired computer'}</strong>
-              <small>{modelName(catalog, onPaired.model)} · paired computer</small>
-            </button>
-          )
-        ) : (
-          <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${modelName(catalog, llm.resident)}: ${llm.state}` : 'The engines'}>
-            <Cpu size={16} aria-hidden />
-            <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
-            <small>{modelName(catalog, llm?.resident) ?? 'Language model'}</small>
-          </button>
-        )}
+        {modelTile}
         {calendarOn && (
           <>
             <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">
@@ -188,5 +170,56 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
         )}
       </div>
     </section>
+  );
+}
+
+/** The language model's tile: this computer's, or the paired computer's that is the default. */
+function ModelTile({
+  onPaired,
+  model,
+  catalog,
+  onNavigate,
+}: {
+  onPaired: NetworkDefault | null;
+  model: EnginesStatus | null;
+  catalog: Pick<EngineCatalog, 'models'> | null;
+  onNavigate: (view: 'engines' | 'engine-workers') => void;
+}) {
+  const llm = model?.llm;
+  return (
+    <>
+        {onPaired ? (
+          // (in effect while that computer's engines are not answering: nothing runs in its place, so it is not ready)
+          onPaired.waiting === 'engines_down' ? (
+            <button
+              className="overview-tile"
+              onClick={() => onNavigate('engine-workers')}
+              title={`${onPaired.nodeName || 'The paired computer'}’s engines aren’t answering: chats that use ${modelName(catalog, onPaired.model)} fail until they do (Engines → Other computers)`}
+            >
+              <Network size={16} aria-hidden />
+              <strong className="warn">Not answering</strong>
+              <small>
+                {modelName(catalog, onPaired.model)} · on {onPaired.nodeName || 'a paired computer'}
+              </small>
+            </button>
+          ) : (
+            <button
+              className="overview-tile"
+              onClick={() => onNavigate('engine-workers')}
+              title={`The engine’s default language model is ${modelName(catalog, onPaired.model)} on ${onPaired.nodeName} (Engines → Other computers)`}
+            >
+              <Network size={16} aria-hidden />
+              <strong>On {onPaired.nodeName || 'a paired computer'}</strong>
+              <small>{modelName(catalog, onPaired.model)} · paired computer</small>
+            </button>
+          )
+        ) : (
+          <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${modelName(catalog, llm.resident)}: ${llm.state}` : 'The engines'}>
+            <Cpu size={16} aria-hidden />
+            <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
+            <small>{modelName(catalog, llm?.resident) ?? 'Language model'}</small>
+          </button>
+        )}
+    </>
   );
 }

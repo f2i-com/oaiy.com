@@ -56,7 +56,7 @@ vi.mock('./api', () => ({
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 vi.mock('./useCached', () => ({ peek: () => null, put: vi.fn() }));
 
-import ConnectionsPanel from './ConnectionsPanel';
+import ConnectionsPanel, { listWords, scopeWords } from './ConnectionsPanel';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -140,8 +140,21 @@ describe('ConnectionsPanel · Linked account', () => {
     await mount();
     const input = container.querySelector('input[placeholder*="provider.example"]');
     expect((input as HTMLInputElement)?.value).toBe('https://acme.example');
-    // Consent is meaningless if the user cannot see what is being granted.
-    expect(container.textContent).toContain('data:read, data:write');
+    // Consent is meaningless if the user cannot see what is being granted: said in words, and as the provider
+    // writes it in the line's tooltip.
+    const asks = Array.from(container.querySelectorAll('p.form-hint')).find((p) => p.textContent?.startsWith('It will ask to use'))!;
+    expect(asks.textContent).toBe('It will ask to use your data.');
+    expect(asks.getAttribute('title')).toContain('data:read, data:write');
+  });
+
+  it('says what a link may use in words: each thing once, one it may only read said so, an unknown one as written', () => {
+    expect(listWords(scopeWords('calendar flows ai.use'))).toBe('your calendar, your flows and your AI');
+    expect(scopeWords(['data:read'])).toEqual(['your data (to read)']);
+    expect(scopeWords(['data:read', 'data:write'])).toEqual(['your data']);
+    expect(scopeWords('ai.read ai.use')).toEqual(['your AI']);
+    expect(scopeWords('billing.manage')).toEqual(['billing.manage']);
+    expect(scopeWords(null)).toEqual([]);
+    expect(listWords(['your calendar'])).toBe('your calendar');
   });
 
   it('starts the ceremony with the chosen provider and address', async () => {
@@ -235,7 +248,77 @@ describe('ConnectionsPanel · Linked account', () => {
     await mount();
     expect(container.textContent).toContain('Acme Cloud');
     expect(container.textContent).toContain('Reception PC');
-    expect(container.textContent).toContain('data:read');
+    // One line says who it is linked to and how it stands; what it may use is said in words.
+    const row = container.querySelector('.pairing-list li > span')!;
+    expect(row.textContent).toContain('Connected to Acme Cloud as Reception PC.');
+    expect(row.querySelector('.link-state')!.textContent).toBe('Checking in…');
+    expect(row.textContent).toContain('It may use your data (to read).');
+    // The address, and the grant as the provider writes it, are under Details, closed until asked for.
+    const details = row.querySelector<HTMLDetailsElement>('details.link-details')!;
+    expect(details.open).toBe(false);
+    expect(details.querySelector('summary')!.textContent).toBe('Details');
+    expect(details.textContent).toContain('https://acme.example');
+    expect(details.textContent).toContain('data:read');
+  });
+
+  it('says "Working." in one line when every part answers, with each part’s line under Details and no seconds', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      accountName: 'Reception PC',
+      grantedScopes: 'calendar flows ai.use',
+      heartbeatSupported: true,
+      lastHeartbeatAt: '2026-07-31T13:14:57Z',
+      relaySupported: true,
+      lastRelayAt: '2026-07-31T13:14:58Z',
+      sealedFlowsSupported: true,
+      lastSealedFlowAt: '2026-07-31T13:10:02Z',
+      dataNodeSupported: true,
+      dataNode: { fingerprint: 'a1b2c3d4e5f60718a1b2c3d4', status: 'approved', approved: true },
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const row = container.querySelector('.pairing-list li > span')!;
+    expect(row.querySelector('.link-state')!.textContent).toBe('Working.');
+    expect(row.querySelector('.link-state')!.classList.contains('is-live')).toBe(true);
+    expect(row.textContent).toContain('It may use your calendar, your flows and your AI.');
+    // Outside Details: the one line and what it may use, nothing that only says a part is fine.
+    const outside = row.cloneNode(true) as HTMLElement;
+    outside.querySelector('details')!.remove();
+    expect(outside.textContent).not.toMatch(/Listening|Checked in|Storage node/);
+    const details = row.querySelector('details.link-details')!.textContent ?? '';
+    expect(details).toContain('Listening for encrypted flows');
+    expect(details).toContain('Checked in');
+    expect(details).toContain('Storage node: approved');
+    expect(details).toContain('Listening for commands');
+    // To the minute.
+    expect(details).not.toContain(new Date('2026-07-31T13:14:57Z').toLocaleTimeString());
+  });
+
+  it('keeps what is wrong, and a storage node waiting for approval, in view and not under Details', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      heartbeatSupported: true,
+      lastHeartbeatAt: '2026-07-31T13:14:57Z',
+      relaySupported: true,
+      relayError: 'the account answered 503',
+      dataNodeSupported: true,
+      dataNode: { fingerprint: 'a1b2c3d4e5f60718a1b2c3d4', status: 'pending', approved: false },
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const row = container.querySelector('.pairing-list li > span')!;
+    expect(row.querySelector('.link-state')!.textContent).toBe('Something needs a look.');
+    const outside = row.cloneNode(true) as HTMLElement;
+    outside.querySelector('details')!.remove();
+    expect(outside.textContent).toContain('Not receiving commands: the account answered 503');
+    expect(outside.textContent).toContain('waiting for you to approve it on the provider’s site');
+    expect(outside.textContent).toContain('a1b2 c3d4 e5f6 0718 a1b2 c3d4');
   });
 
   it('says when the desktop last checked in with the provider', async () => {
@@ -758,7 +841,23 @@ describe('ConnectionsPanel · Companion relay', () => {
       hasToken: false,
     });
     await mount();
-    expect(container.textContent).toContain('reconnect');
+    expect(container.textContent).toContain('Its access key is missing: connect it again with “Change relay”.');
+  });
+
+  it('shows a connected relay as its address and Disconnect, with the three fields behind “Change relay”', async () => {
+    relayStatusMock.mockResolvedValue({ configured: true, baseUrl: 'https://r.example', hasToken: true });
+    await mount();
+    const relaySection = Array.from(container.querySelectorAll('section')).find((s) => s.textContent?.includes('Companion relay'))!;
+    expect(relaySection.textContent).toContain('Connected to https://r.example');
+    // The form is for connecting or changing a relay: not open under one that is connected.
+    expect(relaySection.querySelector('form')).toBeNull();
+    expect(relaySection.querySelector('input[type=password]')).toBeNull();
+    await click('Change relay');
+    expect(relaySection.querySelector('form')).not.toBeNull();
+    expect(relaySection.querySelector<HTMLInputElement>('input[type=password]')!.type).toBe('password');
+    expect(Array.from(relaySection.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Replace relay')).toBe(true);
+    await click('Cancel');
+    expect(relaySection.querySelector('form')).toBeNull();
   });
 });
 

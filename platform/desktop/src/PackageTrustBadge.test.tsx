@@ -31,32 +31,32 @@ afterEach(() => {
 describe('the package trust badge', () => {
   it('a verified package names its publisher, in the green badge, and the tooltip says which key and release', async () => {
     const el = await badge({ state: 'verified', publisher: 'Aokie', keyId: 'fl-aokie-2026a', version: '0.1.0' });
-    expect(el.textContent).toBe('verified · Aokie');
+    expect(el.textContent).toBe('Verified · Aokie');
     expect(el.className).toContain('badge-ok');
     expect(el.getAttribute('title')).toBe('Signed by Aokie (key fl-aokie-2026a), release 0.1.0. Every file is as signed.');
   });
 
   it('a package the person trusted is neutral, and says so', async () => {
     const el = await badge({ state: 'trusted-local', reason: 'You trusted this exact package on 2026-09-29.', trustedAt: '2026-09-29T01:02:03Z' });
-    expect(el.textContent).toBe('trusted by you');
+    expect(el.textContent).toBe('Trusted by you');
     expect(el.className).toContain('badge-neutral');
     expect(el.getAttribute('title')).toContain('You trusted this exact package');
   });
 
   it('an unsigned package in a developer build is neutral, not an alarm', async () => {
     const el = await badge({ state: 'unsigned-dev', reason: 'Not signed. It runs because this is a developer build.' });
-    expect(el.textContent).toBe('unsigned (dev)');
+    expect(el.textContent).toBe('Unsigned (dev)');
     expect(el.className).toContain('badge-neutral');
   });
 
   it('an unsigned package a release build holds back, and a quarantined one, are the red badge with the host’s reason', async () => {
     const unsigned = await badge({ state: 'unsigned', reason: 'Not signed by a publisher this OAIY trusts.' });
-    expect(unsigned.textContent).toBe('unsigned');
+    expect(unsigned.textContent).toBe('Unsigned');
     expect(unsigned.className).toContain('badge-err');
     expect(unsigned.getAttribute('title')).toBe('Not signed by a publisher this OAIY trusts.');
 
     const quarantined = await badge({ state: 'quarantined', reason: 'Quarantined: digest mismatch: aokie-plugin.exe.' });
-    expect(quarantined.textContent).toBe('quarantined');
+    expect(quarantined.textContent).toBe('Quarantined');
     expect(quarantined.className).toContain('badge-err');
     expect(quarantined.getAttribute('title')).toBe('Quarantined: digest mismatch: aokie-plugin.exe.');
   });

@@ -13,9 +13,9 @@ describe('hostOS', () => {
 
 describe('pathExamples', () => {
   it('writes a drive letter on Windows, a volume on a Mac, and a mount elsewhere', () => {
-    expect(pathExamples('windows')).toEqual({ data: 'D:\\OAIY', models: 'E:\\models', extra: 'E:\\ckpts' });
+    expect(pathExamples('windows')).toEqual({ data: 'D:\\OAIY', models: 'E:\\models', extra: 'E:\\more-models' });
     expect(pathExamples('macos').models).toBe('/Volumes/Data/models');
-    expect(pathExamples('linux').extra).toBe('/mnt/data/ckpts');
+    expect(pathExamples('linux').extra).toBe('/mnt/data/more-models');
     expect(Object.values(pathExamples('macos')).some((p) => p.includes(':\\'))).toBe(false);
   });
 });

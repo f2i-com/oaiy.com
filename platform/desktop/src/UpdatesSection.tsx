@@ -166,6 +166,9 @@ export default function UpdatesSection() {
   const manualUrl = nowhere ? null : !s.canAutoUpdate || s.state === 'failed' || retrying ? s.manualUrl : null;
   const noteUrl = nowhere || manualUrl ? null : (s.note && s.noteLink) || null;
   const shownError = actionError ?? s.error;
+  const latestShown = !!s.latestVersion && !nowhere;
+  // "Version 0.1.14 is available." under a row that reads "Latest version: OAIY 0.1.14" says the one thing twice.
+  const saidInRow = s.state === 'available' && latestShown;
 
   return (
     <section className="model-section" aria-label="About and updates">
@@ -182,29 +185,27 @@ export default function UpdatesSection() {
             <strong>OAIY {s.currentVersion}</strong>
           </div>
         </div>
-        <div className="settings-row">
-          <span className="settings-label">Channel</span>
-          <div className="settings-value">
-            <span className="badge badge-neutral">stable releases</span>
-          </div>
-        </div>
+        {/* (no "Channel" row: there is one channel, the stable releases, and nothing to choose) */}
         <div className="settings-row">
           <span className="settings-label">Last checked</span>
           <div className="settings-value">{s.lastCheckedAt ? formatTimestamp(s.lastCheckedAt) : 'Not checked yet'}</div>
         </div>
         {/* (the feed's version is for other kinds of computer where there is none for this one: not shown as this one's) */}
-        {s.latestVersion && !noReleaseHere(s) && (
+        {latestShown && (
           <div className="settings-row">
             <span className="settings-label">Latest version</span>
             <div className="settings-value">
               <strong>OAIY {s.latestVersion}</strong>
+              {/* A newer one to download: said here, once (the line under the rows said it a second time). */}
+              {s.state === 'available' && <span className="badge badge-pending">Available</span>}
               {s.publishedAt && <small> published {shortDate(s.publishedAt)}</small>}
             </div>
           </div>
         )}
       </div>
 
-      <p className="update-state" role="status" aria-live="polite">{stateLine(s)}</p>
+      {/* (the status region stays, empty, while the row above says it: a screen reader hears the next change) */}
+      <p className={saidInRow ? 'update-state is-said' : 'update-state'} role="status" aria-live="polite">{saidInRow ? '' : stateLine(s)}</p>
       {/* (idle says its note as the state; beside any other state it is said under it: a local build, a newer release whose
           update for this computer is not out while the one downloaded can be installed) */}
       {s.note && s.state !== 'idle' && !nowhere && <p className="form-hint update-note">{s.note}</p>}

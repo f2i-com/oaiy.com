@@ -91,11 +91,13 @@ afterEach(() => {
 });
 
 describe('About and updates', () => {
-  it('says which OAIY this is, that it follows the stable releases, and that nothing has been checked', async () => {
+  it('says which OAIY this is and that nothing has been checked, with no row for a channel nobody can choose', async () => {
     await mount(status());
     expect(host.querySelector('h3')?.textContent).toBe('About and updates');
     expect(text()).toContain('OAIY 0.1.0');
-    expect(text()).toContain('stable releases');
+    // (there is one channel, the stable releases: a row that offers no choice is not drawn)
+    expect(text()).not.toContain('Channel');
+    expect(text()).not.toContain('stable releases');
     expect(text()).toContain('Not checked yet');
     expect(text()).toContain('has not looked for updates yet');
     expect(button('Check for updates')).toBeTruthy();
@@ -106,7 +108,10 @@ describe('About and updates', () => {
   it('shows the time of the last check', async () => {
     await mount(status({ state: 'upToDate', lastCheckedAt: '2026-10-01T02:03:04Z', latestVersion: '0.1.0' }));
     expect(text()).not.toContain('Not checked yet');
-    expect(text()).toContain(new Date('2026-10-01T02:03:04Z').toLocaleString());
+    // To the minute: nobody needs the second a check was made at.
+    const when = new Date('2026-10-01T02:03:04Z');
+    expect(text()).toContain(when.toLocaleString(undefined, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' }));
+    expect(text()).not.toContain(when.toLocaleTimeString());
     expect(text()).toContain('OAIY is up to date.');
   });
 
@@ -123,8 +128,12 @@ describe('About and updates', () => {
 
   it('shows a newer version with its date and notes, and Download starts the download', async () => {
     await mount(status({ state: 'available', latestVersion: '0.2.0', publishedAt: '2026-10-01T02:03:04Z', notes: 'Calls keep their audio.', lastCheckedAt: '2026-10-01T03:00:00Z' }));
-    expect(text()).toContain('Version 0.2.0 is available.');
+    // Said once, in the row that names it ("Latest version: OAIY 0.2.0, Available"): not again as a line under the rows.
+    expect(text()).not.toContain('Version 0.2.0 is available.');
     expect(text()).toContain('OAIY 0.2.0');
+    const latest = [...host.querySelectorAll('.settings-row')].find((r) => r.textContent?.includes('Latest version'))!;
+    expect(latest.querySelector('.badge')?.textContent).toBe('Available');
+    expect(host.querySelector('.update-state')?.getAttribute('role')).toBe('status');
     expect(text()).toContain(`published ${new Date('2026-10-01T02:03:04Z').toLocaleDateString()}`);
     expect(text()).toContain('Calls keep their audio.');
     const downloading = status({ state: 'downloading', latestVersion: '0.2.0', progress: { downloaded: 0, total: null } });

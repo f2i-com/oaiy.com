@@ -27,6 +27,21 @@ export const PAIRED_APP_CAN_CHANGE = 'A program on this computer that OAIY has p
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** What an approved Companion is, for when it rings: a phone or tablet, the app on this computer, or one never rung. */
+export type DeviceKind = 'phone' | 'companion' | 'never';
+
+export const DEVICE_KINDS: Array<{ kind: DeviceKind; label: string; hint: string }> = [
+  { kind: 'phone', label: 'A phone or tablet', hint: 'Rings by the Phones setting above.' },
+  { kind: 'companion', label: 'The Companion app on this computer', hint: 'Rings only while you are at this computer.' },
+  { kind: 'never', label: 'Never ring it', hint: 'For the phone that carries your calls: it cannot take its own.' },
+];
+
+/** The kind a device is saved as: never rung wins (it is rung by neither rule), then this computer's Companion, else a phone. */
+export function deviceKind(settings: Pick<RingSettings, 'windowsCompanions' | 'excludedDevices'>, id: string): DeviceKind {
+  if (settings.excludedDevices.includes(id)) return 'never';
+  return settings.windowsCompanions.includes(id) ? 'companion' : 'phone';
+}
+
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 const lines = (list: string[]) => list.join('\n');
@@ -142,10 +157,18 @@ export default function TransfersPanel() {
   };
   const patchQuiet = (change: Partial<RingSettings['quietHours']>) => patch({ quietHours: { ...draft!.quietHours, ...change } });
   const patchLimits = (change: Partial<RingSettings['limits']>) => patch({ limits: { ...draft!.limits, ...change } });
-  const toggleIn = (key: 'windowsCompanions' | 'excludedDevices', id: string, on: boolean) => {
-    const list = draft![key].filter((x) => x !== id);
-    patch({ [key]: on ? [...list, id] : list } as Partial<RingSettings>);
+  /** What an approved device is, said as one choice: it sets the two lists the desktop keeps (this computer's Companions, and the devices never rung). */
+  const setDeviceKind = (id: string, kind: DeviceKind) => {
+    const without = (list: string[]) => list.filter((x) => x !== id);
+    const windows = without(draft!.windowsCompanions);
+    const excluded = without(draft!.excludedDevices);
+    patch({
+      windowsCompanions: kind === 'companion' ? [...windows, id] : kind === 'never' ? draft!.windowsCompanions : windows,
+      excludedDevices: kind === 'never' ? [...excluded, id] : excluded,
+    });
   };
+  /** "Who else can change this", opened by the person (it opens by itself while transfers are being turned on). */
+  const [whoOpen, setWhoOpen] = useState(false);
 
   const save = async () => {
     if (!current || !saved) return;
@@ -197,14 +220,14 @@ export default function TransfersPanel() {
 
   if (missing) {
     return (
-      <div className="panel transfers-page">
+      <div className="panel is-form transfers-page">
         <p className="form-hint">This OAIY cannot put callers through to you yet: update it to have the receptionist try to reach you.</p>
       </div>
     );
   }
   if (!current) {
     return (
-      <div className="panel transfers-page">
+      <div className="panel is-form transfers-page">
         {error ? (
           <>
             <p className="form-error" role="alert">Could not read the settings: {error}</p>
@@ -222,34 +245,46 @@ export default function TransfersPanel() {
   const on = current.enabled;
   // What is saved is what rings, and the desktop says what a caller would get: a warning about a setting not yet saved would say something it is not doing.
   const nothingRings = preview?.enabled && !preview.rings && preview.cause ? preview : null;
+  // Being turned on, and not saved yet: the moment to read who else can change it, so that line opens by itself.
+  const turningOn = on && !saved!.enabled;
+  // The switch's one line: what a caller who asks for you would get. As saved, by the desktop's own words; a switch
+  // moved and not saved yet says that saving is what makes it so.
+  const outcome =
+    on !== saved!.enabled
+      ? on
+        ? 'When you save, the receptionist will try to reach you for a caller who asks for you, and take a message if you do not answer.'
+        : 'When you save, the receptionist will stop trying to reach you.'
+      : !on
+        ? 'Off: nothing rings. Turned on, the receptionist says it will try to reach you when a caller asks for you, rings your devices, and takes a message if you do not answer.'
+        : preview?.enabled && !nothingRings && preview.text
+          ? preview.text
+          : 'On: when a caller asks for you, the receptionist tries to reach you, and takes a message if you do not answer.';
   return (
-    <div className="panel transfers-page">
+    <div className="panel is-form transfers-page">
       <section className="model-section">
         <h3 className="section-title">Calls to you</h3>
-        <p className="form-hint">
-          When a caller asks for you, the receptionist says it will try to reach you (never that they are put through until you have taken the call), rings your
-          devices, and, if you do not answer, offers to take a message. Nothing changes until you turn this on.
-        </p>
-        <div className="transfers-warning" data-testid="consent-not-signed">
-          <TriangleAlert size={14} aria-hidden />
-          <span>{CONSENT_NOT_SIGNED}</span>
-        </div>
-        <div className="transfers-warning" data-testid="paired-app-can-change">
-          <TriangleAlert size={14} aria-hidden />
-          <span>{PAIRED_APP_CAN_CHANGE}</span>
-        </div>
+        {/* The one decision first: may the receptionist ring me. Its line under it says what a caller would get. */}
         <label className="switch-row">
-          <input type="checkbox" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
+          <input type="checkbox" className="switch" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
           <span>
             <strong>Transfer calls to me</strong>
-            <small>
-              Needs the Companion on this computer or on a second phone (not the phone that carries the calls), and the Companion’s consent for taking calls on the Phone page.
-              Without either, the receptionist takes a message.
-            </small>
+            <small data-testid={on === saved!.enabled && on && preview?.enabled && !nothingRings && preview.text ? 'what-would-ring' : undefined}>{outcome}</small>
           </span>
         </label>
+        {/* Who else could turn this on: one closed line under the switch, open by itself while it is being turned on. */}
+        <details className="transfers-who" open={turningOn || whoOpen} onToggle={(e) => setWhoOpen((e.currentTarget as HTMLDetailsElement).open)}>
+          <summary>Who else can change this</summary>
+          <div className="transfers-warning" data-testid="consent-not-signed">
+            <TriangleAlert size={14} aria-hidden />
+            <span>{CONSENT_NOT_SIGNED}</span>
+          </div>
+          <div className="transfers-warning" data-testid="paired-app-can-change">
+            <TriangleAlert size={14} aria-hidden />
+            <span>{PAIRED_APP_CAN_CHANGE}</span>
+          </div>
+        </details>
         <label className="switch-row">
-          <input type="checkbox" checked={on || current.takeMessages} disabled={on} onChange={(e) => patch({ takeMessages: e.target.checked })} />
+          <input type="checkbox" className="switch" checked={on || current.takeMessages} disabled={on} onChange={(e) => patch({ takeMessages: e.target.checked })} />
           <span>
             <strong>Take messages</strong>
             <small>
@@ -282,11 +317,7 @@ export default function TransfersPanel() {
             <span>{preview.plugin}</span>
           </div>
         )}
-        {preview?.enabled && !nothingRings && preview.text && (
-          <p className="form-hint" data-testid="what-would-ring">
-            {preview.text}
-          </p>
-        )}
+        {/* (what would ring now is the switch's own line, above) */}
         {features && (
           <p className="form-hint" data-testid="what-it-may-do">
             Now: {features.transfer ? 'the receptionist may try to reach you' : 'it does not try to reach you'}; {features.messages ? 'it takes messages' : 'it takes no messages'}.
@@ -306,9 +337,10 @@ export default function TransfersPanel() {
               and have the receptionist take a message, or be put away with Not now.
             </li>
             <li>
-              Nothing rings unless a Companion is set up to take the call: approve one on the Phone page. A phone rings when you are away, and also when no Companion on this
-              computer can take the call, so one phone is enough; tick “This is the Companion on this computer” only for a Companion that is the Windows app here. With none, callers are
-              offered a message and you are told someone asked for you.
+              Nothing rings unless a Companion is set up to take the call: approve one on the Phone page, on this computer or on a second phone (not the phone that carries the
+              calls), and give the Companion’s consent for taking calls there. A phone rings when you are away, and also when no Companion on this computer can take the call, so
+              one phone is enough; say “The Companion app on this computer” only of a Companion that is the Windows app here. With none, callers are offered a message and you are
+              told someone asked for you.
             </li>
             <li>The receptionist stops speaking, tells the caller it is connecting them, and you talk to the caller. The receptionist does not come back unless you hand the call back.</li>
             <li>
@@ -326,57 +358,61 @@ export default function TransfersPanel() {
 
       <section className="model-section">
         <h3 className="section-title">How it rings</h3>
-        <div className="transfers-grid transfers-grid-fields">
-          <label className="form-row">
-            <span>Ring for (seconds)</span>
-            <input type="number" min={20} max={90} value={current.ringSeconds} onChange={(e) => patch({ ringSeconds: Number(e.target.value) })} />
-          </label>
-          <label className="form-row">
-            <span>This computer</span>
-            <select value={current.desktopRing} onChange={(e) => patch({ desktopRing: e.target.value as RingSettings['desktopRing'] })}>
+        {/* Each setting a sentence with its choice in it, as Hours & Services writes its booking rules. */}
+        <div className="transfers-two">
+        <ul className="rules transfers-rules">
+          <li>
+            <label htmlFor="ring-seconds">Ring for</label>
+            <input id="ring-seconds" type="number" min={20} max={90} value={current.ringSeconds} onChange={(e) => patch({ ringSeconds: Number(e.target.value) })} />
+            <span>seconds, then offer to take a message.</span>
+          </li>
+          <li>
+            <label htmlFor="ring-desktop">This computer</label>
+            <select id="ring-desktop" value={current.desktopRing} onChange={(e) => patch({ desktopRing: e.target.value as RingSettings['desktopRing'] })}>
               <option value="auto">Rings while I am at it</option>
               <option value="always">Always rings</option>
               <option value="never">Never rings</option>
             </select>
-          </label>
-          <label className="form-row">
-            <span>Phones</span>
-            <select value={current.phoneRing} onChange={(e) => patch({ phoneRing: e.target.value as RingSettings['phoneRing'] })}>
+          </li>
+          <li>
+            <label htmlFor="ring-phones">Phones</label>
+            <select id="ring-phones" value={current.phoneRing} onChange={(e) => patch({ phoneRing: e.target.value as RingSettings['phoneRing'] })}>
               <option value="when_away">Ring when I am away</option>
               <option value="always">Always ring</option>
               <option value="never">Never ring</option>
             </select>
-          </label>
-        </div>
-        <p className="form-hint">A phone rings when you are away, and also when no Companion on this computer can take the call. Choose “Always ring” under Phones to have it ring even when one does.</p>
-        <div className="transfers-grid transfers-grid-wide">
-          <label className="form-row">
-            <span>I am</span>
-            <select value={current.away} onChange={(e) => patch({ away: e.target.value as RingSettings['away'] })}>
-              <option value="auto">Away when I am not at this computer</option>
-              <option value="on">Away</option>
-              <option value="off">Here</option>
+            <small className="form-hint">A phone also rings when no Companion on this computer can take the call.</small>
+          </li>
+          <li>
+            <label htmlFor="ring-away">Treat me as away</label>
+            <select id="ring-away" value={current.away} onChange={(e) => patch({ away: e.target.value as RingSettings['away'] })}>
+              <option value="auto">when I am not at this computer</option>
+              <option value="on">all the time</option>
+              <option value="off">never: I am here</option>
             </select>
-          </label>
-          <label className="form-row">
-            <span>The receptionist may ask on its own</span>
-            <select value={current.initiative} onChange={(e) => patch({ initiative: e.target.value as RingSettings['initiative'] })}>
-              <option value="on_request">Only when the caller asks for a person</option>
-              <option value="on_request_or_urgent">Also when they say one of my urgent phrases</option>
+          </li>
+          <li>
+            <label htmlFor="ring-when">Ring me</label>
+            <select id="ring-when" value={current.initiative} onChange={(e) => patch({ initiative: e.target.value as RingSettings['initiative'] })}>
+              <option value="on_request">only when the caller asks for a person</option>
+              <option value="on_request_or_urgent">also when they say one of my urgent phrases</option>
             </select>
-          </label>
-          <label className="form-row">
-            <span>Urgent phrases, one a line</span>
-            <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
-            <small className="form-hint">Used only when the receptionist may ask on its own for them.</small>
-          </label>
+          </li>
+        </ul>
+        <label className="form-row transfers-vip">
+          <span>Urgent phrases, one a line</span>
+          <textarea rows={3} value={urgentText} onChange={(e) => { setJustSaved(false); setUrgentText(e.target.value); }} placeholder={'gas leak\nburst pipe'} aria-label="Urgent phrases" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
+          <small className="form-hint">Used when you have the receptionist ring you for them, here or in quiet hours.</small>
+        </label>
         </div>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Quiet hours</h3>
+        <div className="transfers-two">
+        <div className="transfers-quiet">
         <label className="switch-row">
-          <input type="checkbox" checked={current.quietHours.enabled} onChange={(e) => patchQuiet({ enabled: e.target.checked })} />
+          <input type="checkbox" className="switch" checked={current.quietHours.enabled} onChange={(e) => patchQuiet({ enabled: e.target.checked })} />
           <span>
             <strong>Do not ring me during quiet hours</strong>
             <small>The receptionist takes a message instead. By this computer’s clock.</small>
@@ -403,52 +439,51 @@ export default function TransfersPanel() {
               ))}
             </div>
             <label className="switch-row">
-              <input type="checkbox" checked={current.quietHours.allowVip} onChange={(e) => patchQuiet({ allowVip: e.target.checked })} />
+              <input type="checkbox" className="switch" checked={current.quietHours.allowVip} onChange={(e) => patchQuiet({ allowVip: e.target.checked })} />
               <span><strong>Still ring me for my VIPs</strong></span>
             </label>
             <label className="switch-row">
-              <input type="checkbox" checked={current.quietHours.allowUrgent} onChange={(e) => patchQuiet({ allowUrgent: e.target.checked })} />
+              <input type="checkbox" className="switch" checked={current.quietHours.allowUrgent} onChange={(e) => patchQuiet({ allowUrgent: e.target.checked })} />
               <span><strong>Still ring me when it is urgent</strong><small>Only for the urgent phrases above.</small></span>
             </label>
           </>
         )}
+        </div>
         <label className="form-row transfers-vip">
           <span>VIP numbers, one a line</span>
           <textarea rows={3} value={vipText} onChange={(e) => { setJustSaved(false); setVipText(e.target.value); }} placeholder="0491 570 006" aria-label="VIP numbers" onFocus={() => (typing.current = true)} onBlur={() => (typing.current = false)} />
           <small className="form-hint">They ring through quiet hours. A caller ID can be faked, so the limits below still apply to them.</small>
         </label>
+        </div>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Limits</h3>
         <p className="form-hint">So one caller cannot make your devices ring over and over.</p>
-        <div className="transfers-grid transfers-grid-fields">
-          <label className="form-row">
-            <span>Tries a call</span>
-            <input type="number" min={1} max={5} value={current.limits.perCall} onChange={(e) => patchLimits({ perCall: Number(e.target.value) })} />
-          </label>
-          <label className="form-row">
-            <span>Seconds between tries</span>
-            <input type="number" min={10} max={600} value={current.limits.gapSeconds} onChange={(e) => patchLimits({ gapSeconds: Number(e.target.value) })} />
-          </label>
-          <label className="form-row">
-            <span>Tries a caller in an hour</span>
-            <input type="number" min={1} max={10} value={current.limits.perCallerHour} onChange={(e) => patchLimits({ perCallerHour: Number(e.target.value) })} />
-          </label>
-          <label className="form-row">
-            <span>Tries in an hour, everyone</span>
-            <input type="number" min={1} max={100} value={current.limits.globalHour} onChange={(e) => patchLimits({ globalHour: Number(e.target.value) })} />
-          </label>
-        </div>
+        {/* The four limits as two sentences, each number in its place. */}
+        <ul className="rules transfers-rules">
+          <li>
+            <span>Ring me up to</span>
+            <input type="number" aria-label="Times to ring in one call" min={1} max={5} value={current.limits.perCall} onChange={(e) => patchLimits({ perCall: Number(e.target.value) })} />
+            <span>times in one call,</span>
+            <input type="number" aria-label="Seconds between rings" min={10} max={600} value={current.limits.gapSeconds} onChange={(e) => patchLimits({ gapSeconds: Number(e.target.value) })} />
+            <span>seconds apart.</span>
+          </li>
+          <li>
+            <span>No more than</span>
+            <input type="number" aria-label="Times an hour for one caller" min={1} max={10} value={current.limits.perCallerHour} onChange={(e) => patchLimits({ perCallerHour: Number(e.target.value) })} />
+            <span>times an hour for one caller, and</span>
+            <input type="number" aria-label="Times an hour for everyone" min={1} max={100} value={current.limits.globalHour} onChange={(e) => patchLimits({ globalHour: Number(e.target.value) })} />
+            <span>an hour in all.</span>
+          </li>
+        </ul>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Devices that may take a call</h3>
         <p className="form-hint">
-          The Companions you approved on the Phone page. This computer cannot tell which of them is on the phone that carries your calls, and that phone cannot take its own
-          calls: do not approve a Companion on it, or say never to ring it. Tick “This is the Companion on this computer” only for a
-          Companion that is the Windows app on this computer: it rings only while you are at the computer. A phone stays unticked, and rings by the Phones setting above. Say
-          which never to ring.
+          The Companions you approved on the Phone page. Say what each one is: this computer cannot tell which of them is on the phone that carries your calls, and that phone
+          cannot take its own calls.
         </p>
         {devicesError && devices === null ? (
           <p className="form-error" role="alert">
@@ -462,15 +497,23 @@ export default function TransfersPanel() {
           <ul className="transfers-devices">
             {devices.map((d) => {
               const id = d.endpointKey.thumbprint;
+              const name = d.displayName || 'A device';
+              const is = deviceKind(current, id);
               return (
                 <li key={id}>
-                  <strong>{d.displayName || 'A device'}</strong>
-                  <label>
-                    <input type="checkbox" checked={current.windowsCompanions.includes(id)} onChange={(e) => toggleIn('windowsCompanions', id, e.target.checked)} /> This is the Companion on this computer
-                  </label>
-                  <label>
-                    <input type="checkbox" checked={current.excludedDevices.includes(id)} onChange={(e) => toggleIn('excludedDevices', id, e.target.checked)} /> Never ring it
-                  </label>
+                  <strong id={`device-${id}`}>{name}</strong>
+                  {/* One choice of three, each with what it means: what the device is decides when it rings. */}
+                  <div className="transfers-kinds" role="radiogroup" aria-labelledby={`device-${id}`}>
+                    {DEVICE_KINDS.map((k) => (
+                      <label key={k.kind} className={is === k.kind ? 'is-on' : undefined}>
+                        <input type="radio" name={`device-kind-${id}`} checked={is === k.kind} onChange={() => setDeviceKind(id, k.kind)} />
+                        <span>
+                          <b>{k.label}</b>
+                          <small>{k.hint}</small>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
                 </li>
               );
             })}

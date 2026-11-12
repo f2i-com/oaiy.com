@@ -668,7 +668,8 @@ fn the_preview_says_what_a_caller_would_get_in_each_state_of_the_owner_and_of_th
     for presence in [Presence::Idle, Presence::Locked, Presence::Off] {
         let p = previewed(presence, vec![windows("pc1")], none.clone());
         assert!(!p.rings && p.cause == Some("onlyThisComputers"), "{presence:?}: {p:?}");
-        assert!(p.text.contains("which you are not now") && p.text.contains("untick"), "{presence:?}: the way out is said: {}", p.text);
+        // (the way out by the page's own words for it: each device is "A phone or tablet", "The Companion app on this computer" or "Never ring it")
+        assert!(p.text.contains("which you are not now") && p.text.contains("choose “A phone or tablet”"), "{presence:?}: the way out is said: {}", p.text);
     }
     // A phone the owner ticked as this computer's (the mistake the page's advice made easy): at the computer it rings, away it does not, and
     // the page says so and how to put it right.

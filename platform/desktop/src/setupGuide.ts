@@ -156,7 +156,45 @@ export function dismissGuide(): void {
 export function reopenGuide(): void {
   try {
     localStorage.removeItem(DISMISS_KEY);
+    // (asked for again: the settled card stays another day)
+    localStorage.removeItem(SETTLED_KEY);
   } catch {
     /* ignore */
   }
+}
+
+/** When this window first saw setup with nothing left to ask ("You’re set up"), as milliseconds since 1970. */
+const SETTLED_KEY = 'oaiy.setupGuide.settledAt';
+/** How long the settled card stays on the Overview: a day, then it goes by itself. */
+export const SETTLED_CARD_MS = 24 * 60 * 60 * 1000;
+
+function settledAt(): number | null {
+  try {
+    const at = Number(localStorage.getItem(SETTLED_KEY));
+    return Number.isFinite(at) && at > 0 ? at : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keep when setup settled: the first time it is seen settled is remembered, and forgotten as soon as it asks for
+ * something again (a plugin to set up, a check that fails), so the day starts afresh the next time it settles.
+ */
+export function noteSettled(settled: boolean, now = Date.now()): void {
+  try {
+    if (!settled) localStorage.removeItem(SETTLED_KEY);
+    else if (settledAt() === null) localStorage.setItem(SETTLED_KEY, String(now));
+  } catch {
+    /* storage can be unavailable: the card just stays */
+  }
+}
+
+/**
+ * The settled card has had its day: setup settled more than a day ago, so "You’re set up" is no longer news and the
+ * Overview leaves it out ("Show the setup guide" brings it back). Never while storage cannot say when.
+ */
+export function settledCardGone(now = Date.now()): boolean {
+  const at = settledAt();
+  return at !== null && now - at >= SETTLED_CARD_MS;
 }

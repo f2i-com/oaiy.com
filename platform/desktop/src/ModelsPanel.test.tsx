@@ -88,16 +88,19 @@ describe('Model files', () => {
     await render();
     const badges = Array.from(host.querySelectorAll('.dl-head .badge')).map((b) => b.textContent);
     expect(badges).toEqual(['Downloading…', 'Waiting…', 'Paused', 'Done']);
-    // The quick-add entry being downloaded says so in words too.
-    expect(Array.from(host.querySelectorAll('.catalog-card button')).map((b) => b.textContent)).toEqual(['Downloading…']);
     expect(host.textContent).not.toMatch(/\b(active|queued)…/);
-    expect(host.querySelector('.catalog-meta')!.textContent).toBe('4.9 GB');
     expect(host.textContent).not.toContain('GiB');
   });
 
-  it('does not send the person to edit the JSON file the quick-add list comes from', async () => {
+  it('is what is on disk and what is downloading: no second catalogue of models, and no file to edit', async () => {
     await render();
-    expect(host.textContent).toContain('Quick add');
+    // Getting a model is the Engines page's Get models, the one place for it.
+    expect(host.textContent).not.toContain('Quick add');
+    expect(host.querySelector('.catalog-card')).toBeNull();
+    expect(host.querySelector('.models-what')).toBeNull();
+    // One file by its address is still there for a program of the person's own, closed until asked for.
+    expect(host.querySelector('details.models-by-address')!.hasAttribute('open')).toBe(false);
+    expect(host.querySelector('details.models-by-address > summary')!.textContent).toBe('Download one file by its address');
     expect(host.textContent).not.toContain('model-catalog.json');
     expect(host.textContent).not.toContain('edit it to add your own');
   });

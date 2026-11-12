@@ -18,7 +18,7 @@ vi.mock('./api', async (importOriginal) => {
   };
 });
 
-import TransfersPanel from './TransfersPanel';
+import TransfersPanel, { DEVICE_KINDS, deviceKind } from './TransfersPanel';
 
 const OFF: RingSettings = {
   enabled: false,
@@ -95,23 +95,54 @@ describe('Transfers', () => {
     expect(saveButton().disabled).toBe(true);
   });
 
-  it('says plainly that consent is not signed on this computer, whether transfers are on or off', async () => {
+  it('says plainly that consent is not signed on this computer, whether transfers are on or off: under the switch, open while it is being turned on', async () => {
     await mount();
     const warning = () => host.querySelector('[data-testid=consent-not-signed]');
+    const who = () => host.querySelector<HTMLDetailsElement>('details.transfers-who')!;
     expect(warning()?.textContent).toBe('The permission you give for taking calls is not protected on this computer, so another plugin you installed could change it. Keep this off unless you trust every plugin you have installed.');
     // (in a person's words: not the words of the code that keeps it)
     expect(warning()?.textContent).not.toMatch(/signed|scope/);
-    // It sits with the switch it is about, before it.
+    // The switch comes first, with its one line; who else can change it is one closed line under it, both notes inside.
     const switchRow = box('Transfer calls to me').closest('label')!;
-    expect(warning()!.compareDocumentPosition(switchRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(host.querySelector('.transfers-page .model-section')!.querySelector('label, p, div')).toBe(switchRow);
+    expect(switchRow.compareDocumentPosition(who()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(who().querySelector('summary')!.textContent).toBe('Who else can change this');
+    expect(who().contains(warning())).toBe(true);
+    expect(who().contains(host.querySelector('[data-testid=paired-app-can-change]'))).toBe(true);
+    expect(who().open).toBe(false);
+    // Being turned on, and not saved yet: it is open, to be read before saving.
     await click(box('Transfer calls to me'));
     expect(warning()).not.toBeNull();
-    // A desktop that keeps it on says it as well.
+    expect(who().open).toBe(true);
+    // A desktop that keeps it on says it as well, closed again (it is on already).
     await act(async () => root.unmount());
     root = createRoot(host);
     on();
     await mount();
     expect(warning()?.textContent).toContain('Keep this off unless you trust every plugin');
+    expect(who().open).toBe(false);
+  });
+
+  it('says what the switch does in one line under it, and that a change takes saving', async () => {
+    await mount();
+    const line = () => box('Transfer calls to me').closest('label')!.querySelector('small')!.textContent;
+    expect(line()).toContain('Off: nothing rings.');
+    await click(box('Transfer calls to me'));
+    expect(line()).toBe('When you save, the receptionist will try to reach you for a caller who asks for you, and take a message if you do not answer.');
+  });
+
+  it('writes the limits as two sentences with their numbers in them, and how it rings as sentences too', async () => {
+    await mount();
+    // (each sentence as its parts are read, one after another: the words, then a number's box, then more words)
+    const rules = [...host.querySelectorAll('.transfers-rules > li')].map((li) => [...li.children].map((c) => c.textContent?.trim()).filter(Boolean).join(' '));
+    expect(rules).toContain('Ring me up to times in one call, seconds apart.');
+    expect(rules).toContain('No more than times an hour for one caller, and an hour in all.');
+    expect(rules.some((r) => r.startsWith('Treat me as away'))).toBe(true);
+    expect(rules.some((r) => r.startsWith('Ring me') && r.includes('only when the caller asks for a person'))).toBe(true);
+    // Each number is named for a screen reader, and saved as it was before.
+    await type(field('Times an hour for everyone') as HTMLInputElement, '20');
+    await click(saveButton());
+    expect(api.save.mock.calls[0][0]).toEqual({ limits: { globalHour: 20 } });
   });
 
   it('explains how a call is put through, in a few lines, without promising a transfer', async () => {
@@ -239,10 +270,18 @@ describe('Transfers', () => {
     expect(text()).toContain('Pixel 6');
     const pc = [...host.querySelectorAll('.transfers-devices li')].find((li) => li.textContent?.includes('Office PC'))!;
     const pixel = [...host.querySelectorAll('.transfers-devices li')].find((li) => li.textContent?.includes('Pixel 6'))!;
-    await click(pc.querySelectorAll('input')[0]);
-    await click(pixel.querySelectorAll('input')[1]);
+    // Each device has one choice of three: a phone or tablet, the Companion app on this computer, never ring it.
+    const choice = (li: Element, label: string) => [...li.querySelectorAll('label')].find((l) => l.textContent?.startsWith(label))!.querySelector('input')!;
+    expect(pc.querySelectorAll('input[type=radio]')).toHaveLength(3);
+    await click(choice(pc, 'The Companion app on this computer'));
+    await click(choice(pixel, 'Never ring it'));
     await click(saveButton());
     expect(api.save.mock.calls[0][0]).toMatchObject({ windowsCompanions: ['thumb-pc'], excludedDevices: ['thumb-pixel'] });
+    // Back to "A phone or tablet": it is in neither list.
+    await click(choice(pc, 'A phone or tablet'));
+    await click(choice(pixel, 'A phone or tablet'));
+    await click(saveButton());
+    expect(api.save.mock.calls[1][0]).toMatchObject({ windowsCompanions: [], excludedDevices: [] });
   });
 
   const PIXEL = { deviceId: 'd1', displayName: 'Pixel 6', endpointKey: { thumbprint: 'thumb-pixel' }, approvedAt: '2026-09-01T00:00:00Z' };
@@ -278,9 +317,11 @@ describe('Transfers', () => {
     // The only Companion is ticked as this computer's and the owner is not at it: the way out is in the words.
     await act(async () => root.unmount());
     root = createRoot(host);
-    says(preview({ cause: 'onlyThisComputers', text: 'The only Companion is set as the one on this computer, and it rings only while you are at the computer, which you are not now, so a caller who asks for you is offered a message. If it is a phone, untick “This is the Companion on this computer” below.' }));
+    says(preview({ cause: 'onlyThisComputers', text: 'The only Companion is set as the one on this computer, and it rings only while you are at the computer, which you are not now, so a caller who asks for you is offered a message. If it is a phone, choose “A phone or tablet” for it below.' }));
     await mount();
-    expect(warning()?.textContent).toContain('untick “This is the Companion on this computer”');
+    // (the desktop's words name the choice as the page words it: ring/preview.rs)
+    expect(warning()?.textContent).toContain('choose “A phone or tablet” for it below');
+    expect(DEVICE_KINDS.map((k) => k.label)).toContain('A phone or tablet');
   });
 
   it('says what would ring when something would, and quiet hours as a plain line and not as a warning', async () => {
@@ -364,14 +405,23 @@ describe('Transfers', () => {
     expect(api.preview.mock.calls.length).toBeGreaterThan(before);
   });
 
-  it('tells a phone from the Companion on this computer in its own words: only the second is ticked', async () => {
+  it('tells a phone from the Companion on this computer in its own words: each device is a phone until the owner says otherwise', async () => {
     approve(PIXEL, OFFICE);
     await mount();
-    expect(text()).toContain('Tick “This is the Companion on this computer” only for a Companion that is the Windows app on this computer');
-    expect(text()).toContain('A phone stays unticked, and rings by the Phones setting');
-    expect(text()).toContain('A phone rings when you are away, and also when no Companion on this computer can take the call');
-    // Nothing is ticked for either until the owner says.
-    expect([...host.querySelectorAll<HTMLInputElement>('.transfers-devices input')].every((i) => !i.checked)).toBe(true);
+    const devices = host.querySelector('.transfers-devices')!.textContent ?? '';
+    expect(devices).toContain('A phone or tabletRings by the Phones setting above.');
+    expect(devices).toContain('The Companion app on this computerRings only while you are at this computer.');
+    expect(devices).toContain('Never ring itFor the phone that carries your calls: it cannot take its own.');
+    expect(text()).toContain('A phone also rings when no Companion on this computer can take the call.');
+    // Each starts as a phone or tablet (in neither of the desktop's two lists) until the owner says.
+    for (const li of host.querySelectorAll('.transfers-devices li')) {
+      const on = [...li.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((i) => i.checked);
+      expect(on).toEqual([true, false, false]);
+    }
+    // One saved as both this computer's and never rung (the two ticks an older page allowed) reads as never rung.
+    expect(deviceKind({ windowsCompanions: ['a'], excludedDevices: ['a'] }, 'a')).toBe('never');
+    expect(deviceKind({ windowsCompanions: ['a'], excludedDevices: [] }, 'a')).toBe('companion');
+    expect(deviceKind({ windowsCompanions: [], excludedDevices: [] }, 'a')).toBe('phone');
   });
 
   it('says how to pair a Companion when there is none', async () => {

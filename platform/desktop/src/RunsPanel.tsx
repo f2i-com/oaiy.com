@@ -3,6 +3,7 @@ import { ChevronDown, CircleAlert, Loader2, RefreshCw, RotateCcw, Search, Square
 import { bridge, network, type RunHistory, type RunPage, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
 import LoadError, { loadErrorText } from './LoadError';
+import { capital } from './words';
 import { ask } from './ask';
 import { CopyButton, Fields, JsonBlock, RunAnswer, durationText, errorText, eventWords, fullWhen, whenText, whoAsked } from './RunParts';
 import { lastFailedOf, writeFailedSeen } from './failedSeen';
@@ -808,7 +809,7 @@ function RunRow({ r, name, flowKnown, who, open, held, now, busy, onToggle, onSt
       <div className="run-line">
         <button type="button" className="run-head" aria-expanded={open} aria-controls={`run-${r.runId}`} onClick={onToggle}>
           <span className="run-state">
-            <span className={badgeFor(r.status)}>{LABEL[r.status]}</span>
+            <span className={badgeFor(r.status)}>{capital(LABEL[r.status])}</span>
           </span>
           <span className="run-name">
             <strong className="run-flow">{name}</strong>

@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import {
   isPermissionGranted,
@@ -72,6 +73,8 @@ interface ToastContextValue {
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
+/** Hands the provider the element the notices are drawn in (or `null`: the stack of its own). Outside a provider, nothing. */
+const ToastSlotContext = createContext<(el: HTMLElement | null) => void>(() => {});
 
 let nextId = 1;
 
@@ -145,18 +148,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   // array don't tear down + recreate their polling intervals on every toast
   // add/auto-dismiss (which re-renders this provider). `push` is already stable.
   const value = useMemo(() => ({ push }), [push]);
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
 
-  return (
-    <ToastContext.Provider value={value}>
-      {children}
-      {/* Named so the region is identifiable in a landmark list. Errors carry
-          role="alert" so they're announced immediately rather than queuing behind
-          routine success chatter. */}
-      <div className="toast-stack" role="region" aria-label="Notifications" aria-live="polite">
+  // Where the notices are drawn. Nothing moves for a notice: over a page of the dashboard's own they are a stack at
+  // the page's top right, under the header (styles.css `.toast-stack`). A page in a webview covers everything under
+  // the header, so there the dashboard hands over a place in the header's own row (`useToastSlot`), and a notice is
+  // one line in it, beside the buttons and never over them.
+  const stack = (
+      <div className={slot ? 'toast-stack is-in-header' : 'toast-stack'} role="region" aria-label="Notifications" aria-live="polite">
         {toasts.map((t) => (
           <div
             key={t.id}
             className={`toast toast-${t.kind}`}
+            title={slot ? (t.body ? `${t.title}: ${t.body}` : t.title) : undefined}
             role={t.kind === 'error' ? 'alert' : undefined}
             onMouseEnter={() => hold(t.id, 'pointer')}
             onMouseLeave={() => release(t.id, 'pointer')}
@@ -177,8 +181,27 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           </div>
         ))}
       </div>
+  );
+
+  return (
+    <ToastContext.Provider value={value}>
+      <ToastSlotContext.Provider value={setSlot}>
+        {children}
+        {/* Named so the region is identifiable in a landmark list. Errors carry
+            role="alert" so they're announced immediately rather than queuing behind
+            routine success chatter. */}
+        {slot ? createPortal(stack, slot) : stack}
+      </ToastSlotContext.Provider>
     </ToastContext.Provider>
   );
+}
+
+/**
+ * A place for the notices in the page's own layout, as a `ref` for the element that holds them (the header's row,
+ * while a page in a webview is open: App.tsx). With none given, they are the stack at the page's top right.
+ */
+export function useToastSlot(): (el: HTMLElement | null) => void {
+  return useContext(ToastSlotContext);
 }
 
 /** The toasts where the page has them (`null` outside a ToastProvider): for the app's shell, also drawn bare. */

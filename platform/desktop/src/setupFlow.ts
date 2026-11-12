@@ -251,8 +251,8 @@ export function chosenModel(catalog: EngineCatalog | null, group: string): strin
 }
 
 /**
- * A model as people read it: its name in the engines' catalogue ("Qwen3.5 9B") where the catalogue has its id
- * ("qwen3.5-9b"), else the id as it is (a model file of the person's own has no other name).
+ * A model as people read it: its name in the engines' catalogue (written for a person) where the catalogue has its
+ * id (written for a program), else the id as it is (a model file of the person's own has no other name).
  */
 export function modelName(catalog: Pick<EngineCatalog, 'models'> | null | undefined, id: string): string;
 export function modelName(catalog: Pick<EngineCatalog, 'models'> | null | undefined, id: string | null | undefined): string | null;
@@ -358,11 +358,13 @@ export function canSkip(s: PluginStep): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * The essentials are `welcome`, `ai` (what the Agent thinks with), `agent`
- * (what it may change) and `handoff` (continue with the Agent). The rest,
- * from `plugins` on, shows only once the person chooses to set it up by hand.
+ * The essentials are `ai` (what the Agent thinks with), `agent` (what it may
+ * change) and `handoff` (continue with the Agent). The rest, from `plugins`
+ * on, shows only once the person chooses to set it up by hand. (There was a
+ * `welcome` step before `ai` that asked for nothing but "Get started": its
+ * sentence is now the first step's, and a record left on it opens at `ai`.)
  */
-export type FirstRunId = 'welcome' | 'ai' | 'agent' | 'handoff' | 'plugins' | `plugin:${string}` | 'connect' | 'done';
+export type FirstRunId = 'ai' | 'agent' | 'handoff' | 'plugins' | `plugin:${string}` | 'connect' | 'done';
 
 export interface FirstRunStep {
   id: FirstRunId;
@@ -376,13 +378,13 @@ export interface FirstRunStep {
 }
 
 /** Steps an older dashboard saved by another name: a record it left resumes at the step it became. */
-const RENAMED: Record<string, FirstRunId> = { engine: 'ai' };
+const RENAMED: Record<string, FirstRunId> = { engine: 'ai', welcome: 'ai' };
 
 export function currentStepId(id: string): string {
   return RENAMED[id] ?? id;
 }
 
-const ORDER: Record<string, number> = { welcome: 0, ai: 1, agent: 2, handoff: 3, plugins: 4, connect: 6, done: 7 };
+const ORDER: Record<string, number> = { ai: 1, agent: 2, handoff: 3, plugins: 4, connect: 6, done: 7 };
 
 /** Where a step id sits in the whole flow (-1: not one of its steps). */
 function rank(id: string | null | undefined): number {
@@ -445,7 +447,6 @@ export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
   const passed = (id: string) => !!fr && (fr.finished || at > rank(id));
   const ready = aiReady({ catalog: input.catalog, prefs: input.prefs, codexConnected: input.guide.codexConnected === true });
   const steps: FirstRunStep[] = [
-    { id: 'welcome', title: 'Welcome', hint: 'What OAIY sets up', state: mark('welcome', passed('welcome')), optional: false },
     { id: 'ai', title: 'Your AI', hint: 'On this computer, ChatGPT or a provider', state: mark('ai', ready), optional: false },
     { id: 'agent', title: 'The Agent', hint: 'What it may change', state: mark('agent', passed('agent')), optional: false },
     { id: 'handoff', title: 'Continue with the Agent', hint: 'It sets up the rest with you', state: fr?.finished ? 'done' : 'todo', optional: false },
@@ -509,9 +510,9 @@ export function firstRunPosition(steps: FirstRunStep[], position: string | null 
   return open >= 0 ? open : steps.length - 1;
 }
 
-/** "1 of 2": the steps done (a skipped one is not), over the ones that count (not the welcome, the hand-off or the end). */
+/** "1 of 2": the steps done (a skipped one is not), over the ones that count (not the hand-off or the end). */
 export function firstRunProgress(steps: FirstRunStep[]): { done: number; total: number } {
-  const counted = steps.filter((s) => s.id !== 'welcome' && s.id !== 'handoff' && s.id !== 'done');
+  const counted = steps.filter((s) => s.id !== 'handoff' && s.id !== 'done');
   return { done: counted.filter((s) => s.state === 'done').length, total: counted.length };
 }
 
@@ -550,12 +551,13 @@ export function isRecommended(rec: EngineRecommendation, source: AgentModelSourc
 }
 
 /**
- * The choices, the recommended one first (the other stays there to choose); an
- * AI provider last, on a desktop that can keep it as the Agent's model.
+ * The choices, in one order for good: on this computer, ChatGPT, then an AI provider (on a desktop that can keep it
+ * as the Agent's model). The recommended one is marked where it stands, not moved to the front: the recommendation
+ * can arrive after the page has opened (the engines say what the computer has once they have started), and a tile
+ * that changed places then moved from under the pointer.
  */
-export function aiChoices(rec: EngineRecommendation, withProvider = false): AgentModelSource[] {
-  const two: AgentModelSource[] = rec.recommend === 'chatgpt' ? ['chatgpt', 'engine'] : ['engine', 'chatgpt'];
-  return withProvider ? [...two, 'provider'] : two;
+export function aiChoices(_rec: EngineRecommendation | null = null, withProvider = false): AgentModelSource[] {
+  return withProvider ? ['engine', 'chatgpt', 'provider'] : ['engine', 'chatgpt'];
 }
 
 /** The choice the step opens on: ChatGPT or a provider when the Agent already uses it, local when Engines has a model chosen, else the recommendation. */
@@ -581,7 +583,7 @@ export interface ModelLine {
  */
 export function localModelLine(rec: EngineRecommendation | null, catalog: EngineCatalog | null): ModelLine {
   const chosen = chosenModel(catalog, 'llm') ?? rec?.local.chosen ?? null;
-  // (by its catalogue name, "Qwen3.5 9B", not its id)
+  // (by its catalogue name, not its id)
   if (chosen) return { kind: 'chosen', name: modelName(catalog, chosen), detail: null };
   const offer: SuggestedModel | null = recommendedModel(catalog, 'llm') ?? rec?.local.suggested ?? null;
   if (!offer) return { kind: 'none', name: null, detail: null };

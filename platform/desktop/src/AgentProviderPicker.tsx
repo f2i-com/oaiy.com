@@ -6,7 +6,7 @@ import { errorText } from './SetupParts';
 /**
  * An AI provider for the Agent to think with: one already set up in AI
  * providers, or one added here from a preset (LM Studio, Ollama, OpenAI,
- * OpenRouter, Google Gemini, or any OpenAI-compatible server), and a model
+ * OpenRouter, Google AI Studio, or any OpenAI-compatible server), and a model
  * from the list it gives. The setup wizard and Settings → Agent both use it.
  *
  * The Agent works with tool calls, which the desktop relays to OpenAI-
@@ -34,10 +34,11 @@ export interface ProviderPreset {
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: 'lm-studio', name: 'LM Studio', baseUrl: 'http://localhost:1234/v1', key: 'none', help: 'In LM Studio, load a model and start its server (Developer → Start Server; it listens on port 1234).' },
-  { id: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', key: 'none', help: 'Start Ollama and pull a model first (for example: ollama pull qwen3.5).' },
+  { id: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', key: 'none', help: 'Start Ollama and pull a model first: “ollama pull”, then the model’s name as ollama.com lists it.' },
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', key: 'required', help: 'An API key from platform.openai.com. OpenAI charges for what the Agent uses.' },
   { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', key: 'required', help: 'One key for many vendors’ models, from openrouter.ai/keys. Set a spending limit on the key there.' },
-  { id: 'gemini', name: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', key: 'required', help: 'A key from Google AI Studio (aistudio.google.com/apikey), through Google’s OpenAI-compatible address.' },
+  // (named for where its key comes from: the id is the one saved, kept as it was)
+  { id: 'gemini', name: 'Google AI Studio', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', key: 'required', help: 'A key from Google AI Studio (aistudio.google.com/apikey), through Google’s OpenAI-compatible address.' },
   { id: 'openai-compatible', name: 'Another OpenAI-compatible server', baseUrl: '', key: 'optional', help: 'vLLM, llama.cpp’s server, Jan, LocalAI or a hosted API: its address ends in /v1. Most local servers need no key.' },
 ];
 
@@ -409,7 +410,7 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
           </div>
         </form>
       )}
-      <small className="form-hint">The Agent works OAIY with tool calls: choose a model that supports them (most recent Qwen, Llama, Mistral, GPT and Gemini models do).</small>
+      <small className="form-hint">The Agent works OAIY with tool calls, so choose a model that supports them: the provider’s own page for a model says whether it does.</small>
     </div>
   );
 }

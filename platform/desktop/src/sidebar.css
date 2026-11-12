@@ -37,10 +37,12 @@
 }
 .brand > span {
   display: block;
-  margin-top: 6px;
+  /* (the name and the line under it: the gap every such pair has, styles.css `--stack-gap`) */
+  margin-top: var(--stack-gap);
   color: var(--muted);
   font-size: 11.5px;
   letter-spacing: 0.01em;
+  line-height: 16px;
 }
 
 /* ---- the sections: the one part that scrolls (only when it must) --------------- */
@@ -212,12 +214,30 @@
 .nav-sub.is-expanded .nav-count-parent,
 .nav-sub.is-expanded .nav-badge-parent { display: none; }
 
-/* ---- Settings: fixed at the bottom ------------------------------------------------ */
+/* ---- whether OAIY is answering, then Settings: fixed at the bottom ----------------- */
 
-.sidebar .settings {
+/* A dot and a word or two ("Running", "Not answering"), a row like the sections' but quieter: it is a state, and
+   opens Services. The hairline that closes the sections is above it. */
+.sidebar .api-status {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-height: 30px;
+  flex: none;
+  align-items: center;
+  gap: 10px;
   margin-top: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--faint);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 520;
+  text-align: left;
+  transition: background 0.12s, color 0.12s;
 }
-.sidebar .settings::after {
+.sidebar .api-status::after {
   position: absolute;
   top: -4px;
   right: 6px;
@@ -226,10 +246,34 @@
   background: var(--border);
   content: '';
 }
+/* (the dot sits where a row's icon does: 17px wide) */
+.sidebar .api-status > i {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin: 0 4.5px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-soft);
+}
+.sidebar .api-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar .api-status:hover { background: var(--surface-soft); color: var(--text); }
+.sidebar .api-status:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sidebar .api-status.is-down { color: var(--danger); font-weight: 620; }
+.sidebar .api-status.is-down > i { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.sidebar .api-status.is-pending > i {
+  background: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+  animation: led-pulse 1.3s ease-in-out infinite;
+}
+
+.sidebar .settings {
+  margin-top: 1px;
+}
 
 /* ---- a short window: tighter still, so the sections fit there too ------------------ */
 
-@media (max-height: 760px) and (min-width: 761px) {
+@media (max-height: 760px) and (min-width: 701px) {
   .sidebar { padding-top: 16px; }
   .brand { padding-bottom: 12px; }
   .brand > strong { font-size: 24px; }
@@ -248,9 +292,13 @@
   .brand > strong { font-size: 17px; letter-spacing: 0.06em; }
   .brand > span,
   .sidebar nav button > span,
+  .sidebar .api-status > span,
   .sidebar .settings > span { display: none; }
   .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 8px; }
   .sidebar .settings { width: 42px; }
+  /* (the dot alone: "OAIY is running" is its name and its tooltip) */
+  .sidebar .api-status { width: 42px; min-height: 30px; justify-content: center; padding: 0; }
+  .sidebar .api-status > i { margin: 0; }
   .sidebar nav button,
   .sidebar .settings { width: 42px; min-height: 38px; justify-content: center; padding: 0; }
   .sidebar nav button > svg,
@@ -259,22 +307,16 @@
   .sidebar nav .nav-group { width: 22px; height: 1px; margin: 8px 0 7px; overflow: hidden; background: var(--border); padding: 0; color: transparent; font-size: 0; }
   .sidebar nav .nav-group:first-child { margin-top: 2px; }
   .sidebar .nav-badge { display: none; }
-  /* A sub-menu's pages show, as icons under their entry, while one of them is open. No chevron. */
+  /* A sub-menu folds away: its entry is one icon like the others, and its pages are the tabs beside the page's
+     name (App.tsx, `folded`). Shown under their entry, six more icons pushed the sections below them out of a
+     short window (at 760 by 560 Engines, Services, Networking and Connections could not be reached). No chevron. */
   .sidebar nav .nav-toggle { display: none; }
   .sidebar nav .nav-sub-head > .nav-parent { padding-right: 0; }
   .sidebar nav .nav-sub { align-items: center; }
   .sidebar nav .nav-sub.is-expanded .nav-children,
-  .sidebar nav .nav-children {
-    display: none;
-    margin: 2px 0 4px;
-    border-left: 0;
-    border-radius: 10px;
-    background: var(--surface-soft);
-    padding: 3px;
-  }
-  .sidebar nav .nav-sub.has-active .nav-children { display: flex; }
-  .sidebar nav .nav-children > .nav-child { width: 36px; min-height: 32px; justify-content: center; padding: 0; }
-  .sidebar nav .nav-children > .nav-child.active::before { left: 0; }
+  .sidebar nav .nav-sub.has-active .nav-children,
+  .sidebar nav .nav-children { display: none; }
+  .sidebar nav .nav-sub.is-expanded .nav-parent.active { background: var(--primary-soft); }
   .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
   /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
   .sidebar .nav-count {
@@ -287,8 +329,9 @@
     font-size: 9px;
     line-height: 15px;
   }
-  .nav-sub.is-expanded .nav-count-parent { display: inline-block; }
-  .nav-sub.has-active .nav-count-parent { display: none; }
+  /* (what waits in its pages is on its icon whether or not one of them is open: the pages themselves are tabs) */
+  .nav-sub.is-expanded .nav-count-parent,
+  .nav-sub.has-active .nav-count-parent { display: inline-block; }
 }
 
 @media (max-width: 480px) {

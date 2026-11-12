@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  API_BASE,
   appConfig,
   formatBytes,
   isTauri,
@@ -9,7 +10,7 @@ import {
   type MigratePlan,
   type MigrationProgress,
 } from './api';
-import { FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
+import { Check, Copy, FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
 import { ask } from './ask';
 import UpdatesSection from './UpdatesSection';
@@ -96,8 +97,12 @@ function OpenButton({ path, onError }: { path: string; onError: (message: string
 }
 
 /**
- * Settings panel — the data + models folders, additional model scan dirs,
- * and the HuggingFace token. Still the natural home for future options.
+ * Settings, a tab for each thing a person comes for:
+ *
+ * - General (`SettingsPanel`): run setup again; About and updates; the local API's address.
+ * - Backup (`BackupSettings`): back up, restore, move to a new computer.
+ * - Storage (`StorageSettings`): the data and models folders, additional model folders, the Hugging Face token.
+ * - Agent: AgentSettingsPanel.
  *
  * The data folder is where EVERYTHING OAIY manages lives:
  * downloaded models, venvs, installed service binaries, templates,
@@ -106,6 +111,59 @@ function OpenButton({ path, onError }: { path: string; onError: (message: string
  * at — point it wherever they like. The choice persists in a tiny
  * pointer file and applies on the next launch.
  */
+
+/** Where a browser tab stands in for the window: these settings are the window's own (its folders, its updater). */
+function OnlyInTheApp() {
+  return <div className="empty-state">These settings are in the OAIY desktop app, on the computer OAIY runs on.</div>;
+}
+
+/**
+ * The address other programs on this computer reach OAIY at, with a button to copy it. It was in a bar at the foot
+ * of every page; someone setting up another program needs it now and then, and it is here for them.
+ */
+function ApiAddressSection() {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(API_BASE);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard can be unavailable in a webview without a focused document.
+    }
+  };
+  return (
+    <section className="model-section" aria-label="Local API address">
+      <h3 className="section-title">Local API address</h3>
+      <p className="form-hint">Where other programs on this computer reach OAIY. It answers this computer only: nothing outside it can use this address.</p>
+      <div className="settings-value api-address">
+        <code className="path-code">{API_BASE}</code>
+        {/* The confirmation is otherwise only an icon swap — name the button
+            for its current state so a screen reader hears the copy landed. */}
+        <button type="button" className="btn-tiny" aria-label={copied ? 'Local API address copied' : 'Copy the local API address'} onClick={() => void copy()}>
+          {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+/** Settings → General: setup again, which OAIY this is and its updates, and the local API's address. */
+export default function SettingsPanel() {
+  return (
+    <div className="panel is-form settings-page">
+      <SetupSection />
+      {isTauri() ? <UpdatesSection /> : <OnlyInTheApp />}
+      <ApiAddressSection />
+    </div>
+  );
+}
+
+/** Settings → Backup: one encrypted file of the setup, made, restored, or carried to a new computer. */
+export function BackupSettings() {
+  return <div className="panel is-form settings-page">{isTauri() ? <BackupSection /> : <OnlyInTheApp />}</div>;
+}
+
 /** "Run setup again": the first-run wizard from its start. What is set up already shows as done. */
 function SetupSection() {
   const state = useSetupState();
@@ -117,7 +175,7 @@ function SetupSection() {
       // So the old guide's dismissal does not finish it again by itself.
       forgetGuideDismissal();
       setSetupState(
-        await setupApi.putFirstRun({ finished: false, position: 'welcome', skipped: [], chosenPlugins: state?.firstRun.chosenPlugins ?? [] }),
+        await setupApi.putFirstRun({ finished: false, position: 'ai', skipped: [], chosenPlugins: state?.firstRun.chosenPlugins ?? [] }),
       );
       openSetup();
     } catch (e) {
@@ -143,7 +201,8 @@ function SetupSection() {
   );
 }
 
-export default function SettingsPanel() {
+/** Settings → Storage: where OAIY keeps its data and its models, more folders to look in, and the Hugging Face token. */
+export function StorageSettings() {
   const [cfg, setCfg] = useState<DesktopConfig | null>(null);
   const [logFile, setLogFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -153,7 +212,7 @@ export default function SettingsPanel() {
   const [modelsManualPath, setModelsManualPath] = useState('');
   const [modelsBusy, setModelsBusy] = useState(false);
   // Additional model folders — extra read-only search roots beyond the
-  // primary (e.g. E:\ckpts), exposed to services as ${modelDirs}.
+  // primary (a library on another drive), exposed to services as ${modelDirs}.
   const [extraDirs, setExtraDirs] = useState<string[]>([]);
   const [extraManualPath, setExtraManualPath] = useState('');
   const [extraBusy, setExtraBusy] = useState(false);
@@ -240,7 +299,7 @@ export default function SettingsPanel() {
           kind: 'success',
           title: value ? 'Hugging Face token saved' : 'Hugging Face token cleared',
           body: value
-            ? 'Gated/private repo downloads will use it.'
+            ? 'Downloads that need it will use it.'
             : undefined,
           timeoutMs: 6000,
         });
@@ -432,7 +491,7 @@ export default function SettingsPanel() {
         toast.push({
           kind: 'success',
           title: 'Model folder added',
-          body: `Services will also scan ${path} for weights (takes effect next time a service starts).`,
+          body: `OAIY also looks in ${path} for models, from the next time a service starts.`,
           timeoutMs: 7000,
         });
       } catch (e) {
@@ -453,7 +512,7 @@ export default function SettingsPanel() {
         setExtraDirs(await appConfig.removeModelDir(path));
         toast.push({
           kind: 'info',
-          title: 'Folder removed from scan list',
+          title: 'Folder removed: OAIY no longer looks in it',
           body: path,
           timeoutMs: 5000,
         });
@@ -478,32 +537,21 @@ export default function SettingsPanel() {
 
   if (!isTauri()) {
     return (
-      <div className="panel">
-        <SetupSection />
-        <div className="empty-state">
-          Settings are only available inside the OAIY desktop app.
-        </div>
+      <div className="panel is-form settings-page">
+        <OnlyInTheApp />
       </div>
     );
   }
 
   return (
-    <div className="panel">
+    <div className="panel is-form settings-page">
       {error && <div className="banner banner-err" role="alert">⚠ {error}</div>}
-
-      <SetupSection />
-
-      <UpdatesSection />
-
-      <BackupSection />
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>
         <p className="form-hint">
-          Everything OAIY manages — downloaded models, Python venvs,
-          installed service binaries, templates and scripts — lives under this
-          folder. Put it on whichever drive you like so your models are easy
-          to find.
+          Where OAIY keeps what it installs: its services, the Python they run on and, unless you choose another folder for them below, the models it
+          downloads. Any drive will do.
         </p>
 
         {cfg && (
@@ -514,9 +562,9 @@ export default function SettingsPanel() {
                 <code className="path-code">{cfg.activeDir}</code>
                 <OpenButton path={cfg.activeDir} onError={setError} />
                 {cfg.isCustom ? (
-                  <span className="badge badge-ok">custom</span>
+                  <span className="badge badge-ok">Your choice</span>
                 ) : (
-                  <span className="badge badge-neutral">default</span>
+                  <span className="badge badge-neutral">Default</span>
                 )}
               </div>
             </div>
@@ -620,8 +668,8 @@ export default function SettingsPanel() {
                 <strong>Bring your data to the new folder?</strong>
                 <p className="form-hint" style={{ margin: '6px 0' }}>
                   {plan.fileCount} file{plan.fileCount === 1 ? '' : 's'} · {formatBytes(plan.totalBytes)} in{' '}
-                  {plan.subdirs.join(', ')}. Python runtimes &amp; venvs aren't
-                  moved — reinstall them in the new location (one click each).
+                  {plan.subdirs.join(', ')}. Python and the services’ own Python folders are not moved: install them again in
+                  the new place, one click each on Services.
                 </p>
                 <div className="form-actions">
                   <button
@@ -649,22 +697,14 @@ export default function SettingsPanel() {
           </div>
         ) : (
           <p className="form-hint">
-            Changing the folder applies on restart. Models you've already
-            downloaded stay in the old folder unless you bring them over.
+            A new folder is used from the next time OAIY starts. What is in the old folder stays there unless you bring it over.
           </p>
         )}
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Models folder</h3>
-        <p className="form-hint">
-          Where downloaded models &amp; weights are saved — a service
-          installer's <code className="path-code">OAIY_MODELS_DIR</code> points
-          here too. Defaults to a <code className="path-code">models</code>{' '}
-          subfolder of the data folder; point it at a big drive (e.g.{' '}
-          <code className="path-code">{EXAMPLE.models}</code>) to keep your library
-          separate. Files already on disk are reused, not re-downloaded.
-        </p>
+        <p className="form-hint">Where OAIY keeps the models it downloads. Put it on a drive with room. A model already in the folder is used as it is, not downloaded again.</p>
 
         {cfg && (
           <div className="settings-grid">
@@ -674,9 +714,9 @@ export default function SettingsPanel() {
                 <code className="path-code">{cfg.modelsActiveDir}</code>
                 <OpenButton path={cfg.modelsActiveDir} onError={setError} />
                 {cfg.modelsIsCustom ? (
-                  <span className="badge badge-ok">custom</span>
+                  <span className="badge badge-ok">Your choice</span>
                 ) : (
-                  <span className="badge badge-neutral">default</span>
+                  <span className="badge badge-neutral">Default</span>
                 )}
               </div>
             </div>
@@ -718,22 +758,14 @@ export default function SettingsPanel() {
           onBrowse={browseModels}
           onReset={cfg?.modelsIsCustom ? () => applyModelsDir('') : undefined}
         />
-        <p className="form-hint">
-          Changing the folder applies on restart. Models already downloaded
-          stay in the old folder.
-        </p>
+        <p className="form-hint">A new folder is used from the next time OAIY starts. Models already downloaded stay in the old folder.</p>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Additional model folders</h3>
         <p className="form-hint">
-          Extra folders to scan for weights, on top of the models folder above.
-          Point a service at a library you already have on another drive (e.g.{' '}
-          <code className="path-code">{EXAMPLE.extra}</code>) without moving anything —
-          nothing is downloaded or written here. Services that support it (a
-          template can read the list as <code className="path-code">{'${modelDirs}'}</code>)
-          search all of these for their checkpoints. Applies the next time a
-          service starts; no restart needed.
+          Other folders where you already keep models. OAIY looks in them too and never writes there, so nothing has to be moved. A folder added here is
+          used the next time a service starts.
         </p>
 
         {extraDirs.length > 0 ? (
@@ -747,7 +779,7 @@ export default function SettingsPanel() {
                     className="btn-tiny btn-danger"
                     onClick={() => removeExtraDir(dir)}
                     disabled={extraBusy}
-                    title="Stop scanning this folder"
+                    title="Stop looking in this folder (nothing in it is deleted)"
                   >
                     <X size={13} /> Remove
                   </button>
@@ -770,16 +802,22 @@ export default function SettingsPanel() {
           onSet={addExtraDir}
           onBrowse={browseExtra}
         />
+        {/* The names a service's own files use for these folders: for someone who writes one, closed until asked for. */}
+        <details className="setup-more storage-authors">
+          <summary>For service authors</summary>
+          <p className="form-hint">
+            A service’s installer is given the models folder as <code className="path-code">OAIY_MODELS_DIR</code>, and a service template can read the
+            additional folders as <code className="path-code">{'${modelDirs}'}</code>.
+          </p>
+        </details>
       </section>
 
       <section className="model-section">
         <h3 className="section-title">Hugging Face token</h3>
         <p className="form-hint">
-          Some models are gated or private (FLUX 3, Llama, some Gemma releases). Paste
-          an access token from{' '}
-          <code className="path-code">huggingface.co/settings/tokens</code> (and
-          accept the model's terms on its Hugging Face page) so OAIY can download
-          them, here and in Engines. Stored locally; only ever sent to huggingface.co.
+          Some models can be downloaded only after you accept their terms on Hugging Face, and some are private. For those, accept the terms on the
+          model’s page there, then paste an access token from <code className="path-code">huggingface.co/settings/tokens</code> here. It is kept on this
+          computer and sent only to huggingface.co.
         </p>
         <div className="settings-row settings-row-flat">
           <span className="settings-label">Status</span>
@@ -787,9 +825,9 @@ export default function SettingsPanel() {
             {hfTokenSet == null ? (
               <span className="badge badge-neutral">…</span>
             ) : hfTokenSet ? (
-              <span className="badge badge-ok">token saved</span>
+              <span className="badge badge-ok">A token is saved</span>
             ) : (
-              <span className="badge badge-neutral">none set</span>
+              <span className="badge badge-neutral">None saved</span>
             )}
           </div>
         </div>

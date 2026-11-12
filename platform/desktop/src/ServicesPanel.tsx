@@ -12,8 +12,9 @@ import {
   type ServiceStatus,
   type ServiceTemplateInput,
 } from './api';
-import { Download, FolderOpen, Plus, Trash2, Upload } from 'lucide-react';
+import { Download, FolderOpen, PackageMinus, Plus, RotateCw, Trash2, Upload } from 'lucide-react';
 import LogsViewer from './LogsViewer';
+import MoreMenu, { type MoreItem } from './MoreMenu';
 import { useToast } from './Toasts';
 import LoadError from './LoadError';
 import { ask } from './ask';
@@ -191,13 +192,15 @@ export default function ServicesPanel() {
     }
   }, [toast]);
 
-  // Group by category for cleaner sectioning.
+  // Group by category for cleaner sectioning: under the category's name in words, so `speech` and `Speech` are one
+  // group and a service the person added is under "Your own".
   const grouped = useMemo(() => {
     const map = new Map<string, ServiceSnapshot[]>();
     for (const s of snapshot?.services ?? []) {
-      const arr = map.get(s.category) ?? [];
+      const name = categoryName(s.category);
+      const arr = map.get(name) ?? [];
       arr.push(s);
-      map.set(s.category, arr);
+      map.set(name, arr);
     }
     return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [snapshot]);
@@ -218,27 +221,6 @@ export default function ServicesPanel() {
           </button>
         </div>
       )}
-      {snapshot && (
-        <div className="datadir-note datadir-row">
-          <span>
-            Services live in <code className="path-code">{snapshot.dataDir}</code>
-            <br />
-            Drop a package <code>*.json</code> into <code>templates/</code>, or use <strong>Import package</strong> at the end of
-            the page; <strong>Export</strong> makes one of any service.
-          </span>
-          <button
-            className="btn-tiny"
-            onClick={() =>
-              openInExplorer(snapshot.dataDir).catch((e) =>
-                setActionError(e instanceof Error ? e.message : String(e)),
-              )
-            }
-            title="Open data folder in file explorer"
-          >
-            <FolderOpen size={13} /> Open folder
-          </button>
-        </div>
-      )}
       {grouped.length === 0 && snapshot && !error && (
         <div className="empty-state">
           No service templates loaded. Built-ins should appear on first
@@ -251,6 +233,7 @@ export default function ServicesPanel() {
       {grouped.map(([category, svcs]) => (
         <section key={category} className="service-section">
           <h3 className="section-title">{category}</h3>
+          {/* (the group's name in words: "Your own" for a service the person added, not the template's `custom`) */}
           {svcs.map((svc) => (
             <ServiceCard
               key={svc.id}
@@ -314,32 +297,60 @@ export default function ServicesPanel() {
             onError={(msg) => setActionError(msg)}
           />
         ) : (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button
-              className="btn btn-secondary"
-              onClick={() => setShowAddForm(true)}
-            >
-              <Plus size={14} /> Add custom service
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={() => importInputRef.current?.click()}
-              title="Import a self-contained service package (.json with bundled scripts)"
-            >
-              <Download size={14} /> Import package
-            </button>
-            <input
-              ref={importInputRef}
-              type="file"
-              accept="application/json,.json"
-              style={{ display: 'none' }}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void importPackage(f);
-                e.currentTarget.value = '';
-              }}
-            />
-          </div>
+          <>
+            <h3 className="section-title">Add a service</h3>
+            <p className="form-hint">A program of your own for OAIY to start and stop, or a service package someone gave you.</p>
+            <div className="form-actions">
+              <button
+                className="btn btn-secondary"
+                onClick={() => setShowAddForm(true)}
+              >
+                <Plus size={14} /> Add custom service
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => importInputRef.current?.click()}
+                title="Import a service package: a .json file with the service and its scripts"
+              >
+                <Download size={14} /> Import package
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json,.json"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void importPackage(f);
+                  e.currentTarget.value = '';
+                }}
+              />
+            </div>
+            {/* Where services are kept, for someone who writes one: closed until asked for, at the foot of the page. */}
+            {snapshot && (
+              <details className="setup-more services-authors">
+                <summary>For service authors</summary>
+                <div className="datadir-note datadir-row">
+                  <span>
+                    Services are kept in <code className="path-code">{snapshot.dataDir}</code>. A package <code>*.json</code> put in its{' '}
+                    <code>templates</code> folder is picked up too, and <strong>Export</strong>, under a service’s <strong>More</strong>, makes a package of any
+                    service.
+                  </span>
+                  <button
+                    className="btn-tiny"
+                    onClick={() =>
+                      openInExplorer(snapshot.dataDir).catch((e) =>
+                        setActionError(e instanceof Error ? e.message : String(e)),
+                      )
+                    }
+                    title="Open the folder in the file explorer"
+                  >
+                    <FolderOpen size={13} /> Open folder
+                  </button>
+                </div>
+              </details>
+            )}
+          </>
         )}
       </section>
     </div>
@@ -710,6 +721,24 @@ function ServiceCard({
     () => () => services.logs(service.id, 200),
     [service.id],
   );
+  const crash = crashWords(service);
+  const busy = service.status === 'running' || service.status === 'starting' || service.status === 'installing';
+  // What a person presses every day stays on the row (Start or Stop, Repair, Install, Logs); the rest is under More.
+  const more: MoreItem[] = [];
+  if (!busy && service.installed) {
+    if (service.uninstallable) more.push({ key: 'uninstall', label: 'Uninstall', icon: <PackageMinus size={14} aria-hidden />, hint: 'Removes its installed files, so it can be installed afresh', disabled: pending, onSelect: onUninstall });
+    else if (service.installable) more.push({ key: 'reinstall', label: 'Reinstall', icon: <RotateCw size={14} aria-hidden />, hint: 'Runs its installer again, to update or mend it', disabled: pending, onSelect: onInstall });
+  }
+  more.push({ key: 'export', label: 'Export', icon: <Upload size={14} aria-hidden />, hint: 'Saves it as a package file to share', onSelect: onExport });
+  more.push({
+    key: 'remove',
+    label: 'Remove',
+    icon: <Trash2 size={14} aria-hidden />,
+    danger: true,
+    disabled: pending || busy,
+    hint: busy ? 'Stop it first' : 'Takes it off this list, its template too',
+    onSelect: onDelete,
+  });
 
   return (
     <div className={`service-card service-card-${service.status}`}>
@@ -726,7 +755,7 @@ function ServiceCard({
             port {service.port}
             {service.pid != null && <> · pid {service.pid}</>}
             {service.startedAt && (
-              <> · started {new Date(service.startedAt).toLocaleTimeString()}</>
+              <> · started {new Date(service.startedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}</>
             )}
             {service.docsUrl && /^https?:\/\//i.test(service.docsUrl) && (
               <>
@@ -749,10 +778,7 @@ function ServiceCard({
               </>
             )}
           </div>
-          {service.error && (
-            <div className="service-error">⚠ {service.error}</div>
-          )}
-          {/* Why it died, and whether we are still retrying — the runner's log
+          {/* Why it died, said once, and then what OAIY did about it — the runner's log
               buffer is replaced by the next start, so without this an
               auto-recovered crash leaves no trace the user can see.
 
@@ -760,14 +786,8 @@ function ServiceCard({
               the flex .service-row its basis was the max-content width of the
               whole message, so one long crash detail squeezed the name column
               to nothing and pushed the buttons out of the card. */}
-          {service.lastCrash && service.status !== 'running' && (
-            <p className="service-crash">
-              Exited with code {service.lastCrash.code}
-              {service.restartAttempts ? ` · restart attempt ${service.restartAttempts}` : ''}
-              {service.needsRepair ? ' · gave up, needs Repair' : ''}
-              {service.lastCrash.detail ? ` — ${service.lastCrash.detail}` : ''}
-            </p>
-          )}
+          {crash.cause && <div className="service-error">⚠ {crash.cause}</div>}
+          {crash.after && <p className="service-crash">{crash.after}</p>}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
           <AutostartToggle serviceId={service.id} autostart={service.autostart === true} />
         </div>
@@ -794,59 +814,21 @@ function ServiceCard({
             </button>
           )}
 
-          {/* A SINGLE install-state button (not separate Install + Uninstall):
-              Install when not installed → Uninstall when installed (or Reinstall if the
-              service has no uninstall spec, e.g. a system-installed tool). */}
+          {/* Installing: its Cancel. Not installed yet: Install. (Uninstall, or Reinstall for a service with nothing to
+              uninstall, is under More with Export and Remove.) */}
           {service.status === 'installing' ? (
             <button onClick={onCancelInstall} disabled={pending} className="btn btn-warn">
               Cancel install
             </button>
-          ) : service.status === 'running' || service.status === 'starting' ? null : !service.installed ? (
-            service.installable ? (
-              <button onClick={onInstall} disabled={pending} className="btn btn-secondary">
-                Install
-              </button>
-            ) : null
-          ) : service.uninstallable ? (
-            <button
-              onClick={onUninstall}
-              disabled={pending}
-              className="btn btn-ghost"
-              title="Remove this service's installed files so you can reinstall cleanly"
-            >
-              Uninstall
-            </button>
-          ) : service.installable ? (
-            <button
-              onClick={onInstall}
-              disabled={pending}
-              className="btn btn-ghost"
-              title="Re-run the installer (update or repair)"
-            >
-              Reinstall
+          ) : !busy && !service.installed && service.installable ? (
+            <button onClick={onInstall} disabled={pending} className="btn btn-secondary">
+              Install
             </button>
           ) : null}
           <button onClick={onToggle} className="btn btn-ghost" aria-expanded={expanded}>
             {expanded ? 'Hide logs' : 'Logs'}
           </button>
-          <button
-            onClick={onExport}
-            className="btn btn-ghost"
-            title="Export as a self-contained package (.json with bundled scripts)"
-          >
-            <Upload size={13} /> Export
-          </button>
-          <button
-            onClick={onDelete}
-            disabled={
-              pending || service.status === 'running' || service.status === 'installing' || service.status === 'starting'
-            }
-            className="btn btn-ghost btn-danger"
-            title={`Remove ${service.name} from Services, its template too (Uninstall removes only its installed files). Stop it first.`}
-            aria-label={`Remove ${service.name} from Services`}
-          >
-            <Trash2 size={14} aria-hidden /> Remove
-          </button>
+          <MoreMenu label={`More for ${service.name}`} items={more} />
         </div>
       </div>
       {expanded && (
@@ -858,6 +840,49 @@ function ServiceCard({
       )}
     </div>
   );
+}
+
+/** A service's group in words, by its template's category (whatever case it is written in). */
+const CATEGORY_NAMES: Record<string, string> = {
+  automation: 'Automation',
+  browser: 'Browser',
+  custom: 'Your own',
+  llm: 'Language models',
+  speech: 'Speech',
+  telephony: 'Phone',
+};
+
+/** The heading a category's services are listed under: its name in words, else the category with a capital. */
+export function categoryName(category: string | null | undefined): string {
+  const raw = (category ?? '').trim();
+  if (!raw) return 'Other';
+  return CATEGORY_NAMES[raw.toLowerCase()] ?? raw[0].toUpperCase() + raw.slice(1);
+}
+
+/**
+ * A stopped service's trouble, said once: `cause` is what went wrong (its error, else what it last said as it died),
+ * and `after` what OAIY did about it, in a sentence (it gave up and Repair is the way on, or it is trying again).
+ * What the service said as it died is added to `after` only when the error does not say it already.
+ */
+export function crashWords(service: Pick<ServiceSnapshot, 'status' | 'error' | 'lastCrash' | 'restartAttempts' | 'needsRepair'>): { cause: string | null; after: string | null } {
+  const error = service.error?.trim() || null;
+  const crash = service.status !== 'running' ? service.lastCrash ?? null : null;
+  const detail = crash?.detail?.trim() || null;
+  const cause = error ?? detail;
+  if (!crash && !service.needsRepair) return { cause, after: null };
+  const tries = service.restartAttempts ?? 0;
+  const times = tries === 1 ? 'once' : `${tries} times`;
+  const code = crash && typeof crash.code === 'number' ? ` (exit code ${crash.code})` : '';
+  const what = service.needsRepair
+    ? tries > 0
+      ? `It stopped ${times} and OAIY gave up. Repair starts it afresh.`
+      : 'It stopped and OAIY gave up. Repair starts it afresh.'
+    : tries > 0
+      ? `It stopped${code}, and OAIY is starting it again: try ${tries}.`
+      : `It stopped${code}.`;
+  // (said already when the error carries the same words)
+  const more = detail && error && !error.includes(detail) ? ` It said: ${detail}` : '';
+  return { cause, after: what + more };
 }
 
 function StatusBadge({ status }: { status: ServiceStatus }) {

@@ -275,16 +275,16 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
   const ids = (input: Parameters<typeof firstRunSteps>[0]) => firstRunSteps(input).map((s) => s.id);
   const stateOf = (input: Parameters<typeof firstRunSteps>[0], id: string) => firstRunSteps(input).find((s) => s.id === id)?.state;
 
-  it('is the essentials only: welcome, your AI, the Agent, and continue with the Agent', () => {
-    expect(ids({ state: state(), plugins: [], catalog: null, guide: noAi })).toEqual(['welcome', 'ai', 'agent', 'handoff']);
+  it('is the essentials only: your AI, the Agent, and continue with the Agent (three steps, no welcome that asks for nothing)', () => {
+    expect(ids({ state: state(), plugins: [], catalog: null, guide: noAi })).toEqual(['ai', 'agent', 'handoff']);
   });
 
   it('shows the rest (plugins onward) once the person chooses it, or while the record’s place is in it', () => {
-    const rest = ['welcome', 'ai', 'agent', 'handoff', 'plugins', 'connect', 'done'];
+    const rest = ['ai', 'agent', 'handoff', 'plugins', 'connect', 'done'];
     expect(ids({ state: state(), plugins: [], catalog: null, guide: noAi, rest: true })).toEqual(rest);
     expect(ids({ state: state({}, { position: 'plugins' }), plugins: [], catalog: null, guide: noAi })).toEqual(rest);
     expect(ids({ state: state({}, { position: 'plugin:aokie' }), plugins: [], catalog: null, guide: noAi })).toEqual(rest);
-    expect(ids({ state: state({}, { position: 'handoff' }), plugins: [], catalog: null, guide: noAi })).toEqual(rest.slice(0, 4));
+    expect(ids({ state: state({}, { position: 'handoff' }), plugins: [], catalog: null, guide: noAi })).toEqual(rest.slice(0, 3));
     expect(inTheRest('connect')).toBe(true);
     expect(inTheRest('agent')).toBe(false);
     expect(inTheRest(null)).toBe(false);
@@ -292,7 +292,7 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
 
   it('adds each chosen plugin’s own setup once it is installed', () => {
     const input = { state: state({}, { chosenPlugins: ['aokie', 'missing'] }), plugins: [aokie()], catalog: null, guide: noAi, rest: true };
-    expect(ids(input)).toEqual(['welcome', 'ai', 'agent', 'handoff', 'plugins', 'plugin:aokie', 'connect', 'done']);
+    expect(ids(input)).toEqual(['ai', 'agent', 'handoff', 'plugins', 'plugin:aokie', 'connect', 'done']);
     const step = firstRunSteps(input).find((s) => s.id === 'plugin:aokie')!;
     expect(step.title).toBe('Set up Aokie Phone Bridge');
     expect(step.state).toBe('todo');
@@ -326,10 +326,20 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
     const at = (position: string, finished = false) => ({ state: state({}, { position, finished }), plugins: [], catalog: null, guide: noAi });
     expect(stateOf(at('agent'), 'agent')).toBe('todo');
     expect(stateOf(at('handoff'), 'agent')).toBe('done');
-    expect(stateOf(at('handoff'), 'welcome')).toBe('done');
     expect(stateOf(at('handoff'), 'handoff')).toBe('todo');
     expect(stateOf(at('handoff', true), 'handoff')).toBe('done');
-    expect(stateOf(at('welcome', true), 'agent')).toBe('done');
+    expect(stateOf(at('ai', true), 'agent')).toBe('done');
+  });
+
+  it('opens a record left on the old welcome step at your AI, which is now the first step', () => {
+    // (the desktop keeps the step's name: "welcome" from an older dashboard, or from "Run setup again" before this)
+    const steps = firstRunSteps({ state: state({}, { position: 'welcome' }), plugins: [], catalog: null, guide: noAi });
+    expect(currentStepId('welcome')).toBe('ai');
+    expect(steps.map((s) => s.id)).not.toContain('welcome');
+    expect(steps[firstRunPosition(steps, 'welcome')].id).toBe('ai');
+    // (and it is not taken for a step passed: the Agent step after it is still to do)
+    expect(steps.find((s) => s.id === 'agent')!.state).toBe('todo');
+    expect(inTheRest('welcome')).toBe(false);
   });
 
   it('resumes a record an older dashboard left at “engine” at your AI, and counts its skip there', () => {
@@ -337,7 +347,6 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
     expect(currentStepId('engine')).toBe('ai');
     expect(steps[firstRunPosition(steps, 'engine')].id).toBe('ai');
     expect(steps.find((s) => s.id === 'ai')!.state).toBe('skipped');
-    expect(steps.find((s) => s.id === 'welcome')!.state).toBe('done');
   });
 
   it('opens where it was, else on the first step not done; progress counts the steps between', () => {
@@ -345,12 +354,11 @@ describe('the first-run wizard: the essentials, then the Agent or the rest by ha
     expect(steps[firstRunPosition(steps, 'plugins')].id).toBe('plugins');
     expect(steps[firstRunPosition(steps, 'plugin:gone')].id).toBe('plugins');
     expect(steps.find((s) => s.id === 'connect')!.state).toBe('skipped');
-    expect(steps.find((s) => s.id === 'welcome')!.state).toBe('done');
     // Your AI and the Agent are done (passed); plugins not; connect was skipped, which is not done.
     expect(firstRunProgress(steps)).toEqual({ done: 2, total: 4 });
     const essentials = firstRunSteps({ state: state(), plugins: [], catalog: null, guide: noAi });
     expect(firstRunProgress(essentials)).toEqual({ done: 0, total: 2 });
-    expect(essentials[firstRunPosition(essentials, null)].id).toBe('welcome');
+    expect(essentials[firstRunPosition(essentials, null)].id).toBe('ai');
   });
 
   it('a connected app or a linked account completes the optional last step', () => {
@@ -420,11 +428,12 @@ describe('your AI: on this computer, or ChatGPT', () => {
     ...over,
   });
 
-  it('puts the recommended choice first and keeps the other', () => {
+  it('keeps the choices in one order, whatever is recommended (the recommended one is marked, not moved)', () => {
     expect(aiChoices(rec())).toEqual(['engine', 'chatgpt']);
-    expect(aiChoices(rec({ recommend: 'chatgpt' }))).toEqual(['chatgpt', 'engine']);
+    expect(aiChoices(rec({ recommend: 'chatgpt' }))).toEqual(['engine', 'chatgpt']);
+    expect(aiChoices(null)).toEqual(['engine', 'chatgpt']);
     // A provider last, where the desktop can keep it.
-    expect(aiChoices(rec({ recommend: 'chatgpt' }), true)).toEqual(['chatgpt', 'engine', 'provider']);
+    expect(aiChoices(rec({ recommend: 'chatgpt' }), true)).toEqual(['engine', 'chatgpt', 'provider']);
   });
 
   it('without a recommendation from the desktop: local if Engines has a model chosen, else ChatGPT', () => {

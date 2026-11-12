@@ -6,7 +6,7 @@
  * 760px window.
  * ========================================================================== */
 
-.panel.contacts-page { max-width: 1400px; gap: 14px; }
+/* (a list: as wide as the dashboard's lists run, workspace.css) */
 
 /* ---- the toolbar: search, how many, and what to do ------------------------------------ */
 
@@ -100,7 +100,7 @@
 /* ---- one person ---------------------------------------------------------------------------- */
 
 /* The panel fits the window below the toolbar, so its buttons are in view without scrolling the page. */
-.contacts-side { max-height: calc(100dvh - 78px - var(--dock-h, 54px) - var(--page-pad-t) - 66px); }
+.contacts-side { max-height: calc(100dvh - var(--topbar-h, 78px) - var(--dock-h, 0px) - var(--page-pad-t) - 66px); }
 .contacts-side .cal-side-body { display: flex; flex-direction: column; gap: 10px; }
 /* The body scrolls; what is in it keeps its height. */
 .contacts-side .cal-side-body > * { flex-shrink: 0; }
@@ -293,7 +293,7 @@
   }
   .contacts-side .contacts-savebar.is-dirty { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
 }
-@media (max-width: 760px) {
+@media (max-width: 700px) {
   .contacts-search { max-width: none; flex-basis: 100%; }
   .contacts-actions { width: 100%; margin-left: 0; }
   .contacts-actions > .btn-primary { margin-left: auto; }

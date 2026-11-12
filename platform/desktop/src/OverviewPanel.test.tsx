@@ -53,7 +53,7 @@ vi.mock('./api', () => ({
   setup: { get: (...a: unknown[]) => setupGetMock(...a), check: (...a: unknown[]) => setupCheckMock(...a) },
 }));
 
-import OverviewPanel from './OverviewPanel';
+import OverviewPanel, { repairLine, servicesNeedingRepair } from './OverviewPanel';
 import { invalidate, peek } from './useCached';
 import { resetModules } from './useModules';
 import { resetSetupState } from './useSetupState';
@@ -71,7 +71,7 @@ const modulesOn = (phone: boolean, calendar: boolean) => ({
   },
   etag: '"1-x"',
 });
-import { dismissGuide, reopenGuide } from './setupGuide';
+import { dismissGuide, noteSettled, reopenGuide, settledCardGone } from './setupGuide';
 import { describeLastBackup } from './BackupPanel';
 import type { BackupStatus } from './api';
 
@@ -581,7 +581,8 @@ describe('the Overview line about backups', () => {
     await act(async () => button('Back up')!.click());
     window.removeEventListener('oaiy:backup-asked', asked);
     expect(asked).toHaveBeenCalledTimes(1);
-    expect(onNavigate).toHaveBeenCalledWith('settings');
+    // (Settings, on its Backup tab)
+    expect(onNavigate).toHaveBeenCalledWith('backup');
   });
 
   it('turns into a nudge after 30 days, with a button that opens Settings', async () => {
@@ -593,7 +594,7 @@ describe('the Overview line about backups', () => {
     await mount();
     expect(text()).toContain('It has been 42 days since your last backup');
     await act(async () => button('Back up now')!.click());
-    expect(onNavigate).toHaveBeenCalledWith('settings');
+    expect(onNavigate).toHaveBeenCalledWith('backup');
   });
 
   it('says a restore waits for a restart', async () => {
@@ -602,7 +603,7 @@ describe('the Overview line about backups', () => {
     await mount();
     expect(text()).toContain('A restore is waiting for a restart');
     await act(async () => button('Open Settings')!.click());
-    expect(onNavigate).toHaveBeenCalledWith('settings');
+    expect(onNavigate).toHaveBeenCalledWith('backup');
   });
 
   it('shows no line, and does not break the panel, when the status cannot be read', async () => {
@@ -683,5 +684,127 @@ describe('A plugin waiting for its setup', () => {
     expect(alarms()).toContain('Aokie Phone Bridge has a problem');
     await act(async () => button('Open Plugins')!.click());
     expect(onNavigate).toHaveBeenCalledWith('plugins');
+  });
+});
+
+// What the page promises: "anything that needs you". A service OAIY gave up restarting is one (D3); OAIY not
+// answering at all is said once, with one "Try again" (A5); and what needs the owner comes under Today, before the
+// counts and before a setup card that asks for nothing (A6).
+describe('what needs the owner', () => {
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+  };
+  beforeEach(() => resetSetupState());
+  afterEach(() => resetSetupState());
+  const svc = (over: Record<string, unknown> = {}) => ({
+    id: 'oaiy-voice', name: 'OAIY Voice', description: 'Hears and speaks on calls.', category: 'Speech', status: 'running', port: 8783, installed: true, error: null, needsRepair: false, ...over,
+  });
+  const gaveUp = (over: Record<string, unknown> = {}) =>
+    svc({ status: 'errored', needsRepair: true, restartAttempts: 3, error: 'It stopped 3 times in a row: not enough GPU memory', lastCrash: { code: 1, at: '2026-11-12T08:00:00Z', detail: 'not enough GPU memory' }, ...over });
+  const tile = (label: string) => Array.from(host.querySelectorAll('.overview-tile')).find((t) => t.textContent?.includes(label))!;
+  const before = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  it('says a service that gave up and needs Repair by its name, with the way to Services, and colours its tile', async () => {
+    dismissGuide();
+    servicesMock.mockResolvedValue({ dataDir: 'C:\\d', services: [gaveUp(), svc({ id: 'browser', name: 'Browser', status: 'stopped' })] });
+    await mount();
+    const banner = host.querySelector('[data-testid=service-needs-repair]')!;
+    expect(banner.getAttribute('role')).toBe('alert');
+    expect(banner.textContent).toContain('OAIY Voice stopped and needs Repair.');
+    // Why, in the service's own words (its first line), under the plain sentence.
+    expect(banner.querySelector('.banner-detail')!.textContent).toBe('not enough GPU memory');
+    await act(async () => Array.from(banner.querySelectorAll('button')).find((b) => b.textContent?.includes('Open Services'))!.click());
+    expect(onNavigate).toHaveBeenCalledWith('services');
+    // The tile that counted "0/2" in the colour of two services merely stopped now says what is wrong.
+    expect(tile('Services running').classList.contains('is-alarm')).toBe(true);
+    expect(tile('Services running').textContent).toContain('0/2');
+    expect(tile('Services running').querySelector('.tile-alarm')!.textContent).toBe('1 needs Repair');
+    // And the page does not call itself ready.
+    expect(text()).not.toContain('Ready —');
+  });
+
+  it('says nothing of the kind for a service that is only stopped, or one that came back', async () => {
+    dismissGuide();
+    servicesMock.mockResolvedValue({ dataDir: 'C:\\d', services: [svc({ status: 'stopped' }), svc({ id: 'b', name: 'Browser', status: 'running', needsRepair: true })] });
+    await mount();
+    expect(host.querySelector('[data-testid=service-needs-repair]')).toBeNull();
+    expect(tile('Services running').classList.contains('is-alarm')).toBe(false);
+    expect(host.querySelector('.tile-alarm')).toBeNull();
+  });
+
+  it('counts and names several, and works them out from what the desktop says alone', () => {
+    const two = [gaveUp(), gaveUp({ id: 'reader', name: 'Invoice reader' })] as never[];
+    expect(servicesNeedingRepair([...two, svc({ status: 'stopped' }) as never, svc({ status: 'errored' }) as never])).toHaveLength(2);
+    expect(repairLine(two)).toBe('2 services stopped and need Repair: OAIY Voice, Invoice reader.');
+    expect(repairLine(two.slice(0, 1))).toBe('OAIY Voice stopped and needs Repair.');
+    expect(servicesNeedingRepair(null)).toEqual([]);
+  });
+
+  it('says OAIY is not answering once, with one “Try again”, and lets the figures stand back', async () => {
+    const down = Object.assign(new Error('OAIY isn’t answering. It may still be starting, or it has stopped.'), { status: 0 });
+    for (const read of [servicesMock, pluginsMock, providersMock, pairedMock, statusMock, setupGetMock]) read.mockRejectedValue(down);
+    await mount();
+    await settle();
+    // One notice: the banner. Not the setup card's "Setup could not be read: OAIY isn't answering…" with a second button.
+    expect(text().split('OAIY isn’t answering').length - 1).toBe(1);
+    expect(host.querySelector('.load-error')!.textContent).toContain('OAIY isn’t answering.');
+    expect(Array.from(host.querySelectorAll('button')).filter((b) => b.textContent?.includes('Try again'))).toHaveLength(1);
+    expect(text()).not.toContain('Setup could not be read');
+    expect(host.querySelectorAll('[role=alert]')).toHaveLength(1);
+    expect(host.querySelector('.panel')!.classList.contains('is-stale')).toBe(true);
+  });
+
+  it('still says the setup record could not be read when that alone failed, for another reason', async () => {
+    setupGetMock.mockRejectedValue(new Error('500: the setup file is damaged'));
+    await mount();
+    await settle();
+    expect(host.querySelector('.load-error')).toBeNull();
+    expect(text()).toContain('Setup could not be read: the setup file is damaged');
+    expect(host.querySelector('.panel')!.classList.contains('is-stale')).toBe(false);
+  });
+
+  it('puts what needs the owner under Today, This computer after it, and a setup card that asks for nothing last', async () => {
+    setupGetMock.mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: {} });
+    servicesMock.mockResolvedValue({ dataDir: 'C:\\d', services: [gaveUp()] });
+    updateStatusMock.mockResolvedValue({ ...noUpdate, state: 'available', latestVersion: '0.2.0' });
+    await mount();
+    await settle();
+    const section = (title: string) => Array.from(host.querySelectorAll('section')).find((s) => s.querySelector('.section-title')?.textContent === title)!;
+    const failed = Array.from(host.querySelectorAll('.banner-err')).find((b) => b.textContent?.includes('have failed'))!;
+    const repair = host.querySelector('[data-testid=service-needs-repair]')!;
+    const update = host.querySelector('.update-banner')!;
+    const setup = host.querySelector('.setup-guide')!;
+    expect(setup.textContent).toContain('You’re set up');
+    const order = [section('Today'), failed, repair, update, section('This computer'), setup];
+    for (let i = 0; i + 1 < order.length; i++) expect(before(order[i], order[i + 1])).toBe(true);
+  });
+
+  it('keeps the setup card with what needs the owner while it asks for something', async () => {
+    setupGetMock.mockResolvedValue({ firstRun: { finished: false, position: 'ai', skipped: [], chosenPlugins: [] }, plugins: {} });
+    await mount();
+    await settle();
+    const setup = host.querySelector('.setup-guide')!;
+    expect(setup.textContent).toContain('Continue setup');
+    const computer = Array.from(host.querySelectorAll('section')).find((s) => s.querySelector('.section-title')?.textContent === 'This computer')!;
+    expect(before(setup, computer)).toBe(true);
+  });
+
+  it('lets the settled card go by itself a day after setup settled, and brings it back when asked', async () => {
+    setupGetMock.mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: {} });
+    // Settled 25 hours ago, as this window noted it.
+    localStorage.setItem('oaiy.setupGuide.settledAt', String(Date.now() - 25 * 60 * 60 * 1000));
+    await mount();
+    await settle();
+    expect(host.querySelector('.setup-guide')).toBeNull();
+    await act(async () => button('Show the setup guide')!.click());
+    await settle();
+    expect(host.querySelector('.setup-guide')!.textContent).toContain('You’re set up');
+    // Within the day it stays.
+    expect(settledCardGone()).toBe(false);
+    noteSettled(true, Date.now() - 2 * 60 * 60 * 1000);
+    expect(settledCardGone()).toBe(false);
+    // Asking for something again forgets when it settled: the day starts afresh the next time.
+    noteSettled(false);
+    expect(localStorage.getItem('oaiy.setupGuide.settledAt')).toBeNull();
   });
 });

@@ -20,6 +20,7 @@ import {
   greetingOf,
   DEFAULT_GREETING,
   sayHours,
+  hoursWords,
   sayMinutes,
   sayRange,
   sayWeek,
@@ -224,6 +225,20 @@ describe('the week grid', () => {
     expect(sayMinutes(45)).toBe('45 min');
     expect(sayWeek(new Date(2026, 8, 28))).toBe('28 Sep – 4 Oct 2026');
     expect(sayWeek(new Date(2026, 9, 5))).toBe('5 – 11 Oct 2026');
+  });
+
+  it('says a count of minutes that is an hour or more in hours too, for a rule typed in minutes', () => {
+    // "Need at least 120 minutes’ notice (2 hours)."
+    expect(hoursWords(120)).toBe('2 hours');
+    expect(hoursWords(60)).toBe('1 hour');
+    expect(hoursWords(90)).toBe('1 hour 30 minutes');
+    expect(hoursWords(61)).toBe('1 hour 1 minute');
+    expect(hoursWords(1440)).toBe('1 day');
+    expect(hoursWords(2880)).toBe('2 days');
+    // Under an hour it is read as minutes as it is; and nothing for a box being typed in.
+    expect(hoursWords(45)).toBe('');
+    expect(hoursWords(0)).toBe('');
+    expect(hoursWords(Number.NaN)).toBe('');
   });
 });
 

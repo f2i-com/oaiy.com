@@ -1,8 +1,9 @@
-// Settings holds two features that arrived separately and must live on one page: "About and updates"
-// (a newer OAIY, and installing it) and "Backup and restore" (one encrypted file of the setup). This
-// checks they are both there, once each, in that order, that each asks only for its own status, and
-// that a control of one does not reach the other. Same convention as the other panels' tests: raw
-// react-dom/client + act, mocks by vi.hoisted.
+// Settings holds two features that arrived separately: "About and updates" (a newer OAIY, and installing it), on
+// the General tab, and "Backup and restore" (one encrypted file of the setup), on the Backup tab. This checks they
+// are both there, once each, each on its own tab, that each asks only for its own status, and that a control of one
+// does not reach the other; and that the folders and the token are the Storage tab's, with the words a person who
+// installs no service by hand needs. Same convention as the other panels' tests: raw react-dom/client + act, mocks
+// by vi.hoisted.
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -57,7 +58,7 @@ vi.mock('./api', async (importOriginal) => {
   };
 });
 
-import SettingsPanel from './SettingsPanel';
+import SettingsPanel, { BackupSettings, StorageSettings } from './SettingsPanel';
 import { ToastProvider } from './Toasts';
 import { invalidate } from './useCached';
 
@@ -99,11 +100,26 @@ const backupStatus = (over: Partial<BackupStatus> = {}): BackupStatus => ({
 let host: HTMLDivElement;
 let root: Root;
 
-async function mount() {
+/** The tabs to draw: General and Backup together (as one after the other in the window), or Storage. */
+async function mount(tabs: 'general+backup' | 'general' | 'backup' | 'storage' = 'general+backup') {
   await act(async () => {
     root.render(
       <ToastProvider>
-        <SettingsPanel />
+        {tabs.includes('general') && (
+          <div data-tab="general">
+            <SettingsPanel />
+          </div>
+        )}
+        {tabs.includes('backup') && (
+          <div data-tab="backup">
+            <BackupSettings />
+          </div>
+        )}
+        {tabs === 'storage' && (
+          <div data-tab="storage">
+            <StorageSettings />
+          </div>
+        )}
       </ToastProvider>,
     );
   });
@@ -147,17 +163,59 @@ afterEach(async () => {
 });
 
 describe('Settings holds both About and updates and Backup and restore', () => {
-  it('shows each section once, the updates first and the backup after it, each with its own controls', async () => {
+  it('shows each section once, the updates on General and the backup on its own tab, each with its own controls', async () => {
     await mount();
     const found = headings();
     expect(found.filter((t) => t === 'About and updates')).toHaveLength(1);
     expect(found.filter((t) => t === 'Backup and restore')).toHaveLength(1);
-    expect(found.indexOf('About and updates')).toBeLessThan(found.indexOf('Backup and restore'));
+    const on = (tab: string) => Array.from(host.querySelectorAll(`[data-tab=${tab}] h3.section-title`)).map((h3) => h3.textContent?.trim());
+    // General: setup, which OAIY this is, and the address other programs reach it at (it was at the foot of every page).
+    expect(on('general')).toEqual(['Setup', 'About and updates', 'Local API address']);
+    expect(on('backup')).toEqual(['Backup and restore']);
+    expect(host.querySelector('[data-tab=general] .api-address code')?.textContent).toBe('http://127.0.0.1:17972');
+    expect(button('Copy')).toBeTruthy();
     expect(button('Check for updates')).toBeTruthy();
     expect(button('Create backup')).toBeTruthy();
     // Each read its own status, and only its own.
     expect(h.updateStatus).toHaveBeenCalled();
     expect(h.backupStatus).toHaveBeenCalled();
+  });
+
+  it('a tab asks only for what it shows: General no backup, Backup no update, neither the folders', async () => {
+    await mount('general');
+    expect(h.updateStatus).toHaveBeenCalled();
+    expect(h.backupStatus).not.toHaveBeenCalled();
+    expect(h.appConfigGet).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    vi.clearAllMocks();
+    h.backupStatus.mockResolvedValue(backupStatus());
+    await mount('backup');
+    expect(h.backupStatus).toHaveBeenCalled();
+    expect(h.updateStatus).not.toHaveBeenCalled();
+    expect(h.appConfigGet).not.toHaveBeenCalled();
+  });
+
+  it('keeps the folders and the token on Storage, in words for someone who installs nothing by hand', async () => {
+    await mount('storage');
+    await settle();
+    expect(headings()).toEqual(['Data folder', 'Models folder', 'Additional model folders', 'Hugging Face token']);
+    const shown = () => {
+      // (what is in view: not what a closed "For service authors" holds)
+      const copy = host.cloneNode(true) as HTMLElement;
+      copy.querySelectorAll('details:not([open]) > :not(summary)').forEach((el) => el.remove());
+      return copy.textContent ?? '';
+    };
+    expect(shown()).toContain('Where OAIY keeps the models it downloads. Put it on a drive with room.');
+    expect(shown()).not.toMatch(/OAIY_MODELS_DIR|\$\{modelDirs\}|venv|binaries/);
+    // The variable names are there for someone who writes a service, behind a closed line.
+    const authors = host.querySelector<HTMLDetailsElement>('details.storage-authors')!;
+    expect(authors.open).toBe(false);
+    expect(authors.querySelector('summary')!.textContent).toBe('For service authors');
+    expect(authors.textContent).toContain('OAIY_MODELS_DIR');
+    expect(authors.textContent).toContain('${modelDirs}');
+    // The token is typed into a password field, and is never read back.
+    expect(host.querySelector<HTMLInputElement>('input[placeholder="hf_..."]')!.type).toBe('password');
   });
 
   it('a check for updates does not touch the backup, and a backup control does not touch the updater', async () => {
@@ -233,7 +291,7 @@ describe('restarting for a new data folder', () => {
   it('waits for a copy or move still running when Settings is opened again, and does not restart under it', async () => {
     h.appConfigGet.mockResolvedValue(pending);
     h.migrationStatus.mockResolvedValue({ running: true, mode: 'move', filesTotal: 10, filesDone: 3, bytesTotal: 100, bytesDone: 30, current: 'models/a.gguf', done: false, error: null });
-    await mount();
+    await mount('storage');
     await settle();
     expect(h.migrationStatus).toHaveBeenCalled();
     expect(button('Restart now')?.disabled).toBe(true);
@@ -243,7 +301,7 @@ describe('restarting for a new data folder', () => {
     h.appConfigGet.mockResolvedValue(pending);
     h.restart.mockResolvedValue(undefined);
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    await mount();
+    await mount('storage');
     await settle();
     await act(async () => {
       button('Restart now')!.click();
@@ -257,7 +315,7 @@ describe('restarting for a new data folder', () => {
   it('writes its path examples as this system does, not Windows drive letters everywhere', async () => {
     const { pathExamples } = await import('./platform');
     h.appConfigGet.mockResolvedValue(pending);
-    await mount();
+    await mount('storage');
     await settle();
     const placeholders = Array.from(host.querySelectorAll<HTMLInputElement>('.folder-change input')).map((i) => i.placeholder);
     const ex = pathExamples();
@@ -270,7 +328,7 @@ describe('restarting for a new data folder', () => {
     h.appConfigGet.mockResolvedValue(pending);
     h.restart.mockRejectedValue(new Error('Restarting has to wait. A phone call is live. Try again when it is finished.'));
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    await mount();
+    await mount('storage');
     await settle();
     await act(async () => {
       button('Restart now')!.click();

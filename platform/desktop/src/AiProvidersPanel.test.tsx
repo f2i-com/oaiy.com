@@ -146,7 +146,7 @@ describe('editing a provider (the fields the form does not show)', () => {
   it('preserves category, capabilities and the disabled state', async () => {
     await mount();
     await click(byLabel('Edit OpenAI'));
-    await setValue(field(/Display name/), 'OpenAI Prod');
+    await setValue(field(/^Name/), 'OpenAI Prod');
     await submitForm();
 
     expect(upsertMock).toHaveBeenCalledTimes(1);
@@ -192,9 +192,9 @@ describe('editing a provider (the fields the form does not show)', () => {
 describe('adding a provider', () => {
   it('refuses a duplicate id before any API call', async () => {
     await mount();
-    await click(container.querySelector<HTMLElement>('button.btn-secondary')!); // + Add provider
+    await click(Array.from(container.querySelectorAll<HTMLElement>('button')).find((b) => b.textContent?.trim() === 'Add provider')!); // + Add provider
     await setValue(field(/^ID/), 'openai');
-    await setValue(field(/Display name/), 'Dupe');
+    await setValue(field(/^Name/), 'Dupe');
     await setValue(field(/Base URL/), 'https://x.example');
     await submitForm();
 
@@ -204,6 +204,41 @@ describe('adding a provider', () => {
     );
     // The form stays open so the user can correct the id.
     expect(container.querySelector('form')).not.toBeNull();
+  });
+
+  it('asks for the name first and makes the id from it, until an id is typed', async () => {
+    await mount();
+    await click(Array.from(container.querySelectorAll<HTMLElement>('button')).find((b) => b.textContent?.trim() === 'Add provider')!);
+    // The name is the first field, and the one the keyboard starts in.
+    const fields = Array.from(container.querySelectorAll<HTMLInputElement>('form input[type="text"]'));
+    expect(fields[0]).toBe(field(/^Name/));
+    // The id follows the name as it is typed: lower case, a dash for anything that is not a letter or a digit.
+    await setValue(field(/^Name/), 'My Ollama box!');
+    expect(field(/^ID/).value).toBe('my-ollama-box');
+    await setValue(field(/^Name/), 'Café Modèles');
+    expect(field(/^ID/).value).toBe('cafe-modeles');
+    // A name that would take an id in use gets the next one free, so the first try is not a refusal.
+    await setValue(field(/^Name/), 'OpenAI');
+    expect(field(/^ID/).value).toBe('openai-2');
+    // An id typed by hand stays, whatever the name becomes; emptied, it follows the name again.
+    await setValue(field(/^ID/), 'mine');
+    await setValue(field(/^Name/), 'Something else');
+    expect(field(/^ID/).value).toBe('mine');
+    await setValue(field(/^ID/), '');
+    await setValue(field(/^Name/), 'Back again');
+    expect(field(/^ID/).value).toBe('back-again');
+
+    await setValue(field(/Base URL/), 'https://api.example.com');
+    await submitForm();
+    expect(upsertMock).toHaveBeenCalledWith(expect.objectContaining({ id: 'back-again', name: 'Back again' }));
+  });
+
+  it('never changes the id of a provider being edited', async () => {
+    await mount();
+    await click(byLabel('Edit OpenAI'));
+    await setValue(field(/^Name/), 'Renamed');
+    expect(field(/^ID/).value).toBe('openai');
+    expect(field(/^ID/).readOnly).toBe(true);
   });
 });
 
@@ -272,9 +307,9 @@ describe('save outcomes are reported honestly', () => {
   it('a provider that saves but whose key write fails reports a PARTIAL save', async () => {
     setKeyMock.mockRejectedValueOnce(new Error('401: invalid key'));
     await mount();
-    await click(container.querySelector<HTMLElement>('button.btn-secondary')!);
+    await click(Array.from(container.querySelectorAll<HTMLElement>('button')).find((b) => b.textContent?.trim() === 'Add provider')!);
     await setValue(field(/^ID/), 'newone');
-    await setValue(field(/Display name/), 'New One');
+    await setValue(field(/^Name/), 'New One');
     await setValue(field(/Base URL/), 'https://api.example.com');
     await setValue(field(/API key/), 'sk-abc');
     await submitForm();
@@ -288,9 +323,9 @@ describe('save outcomes are reported honestly', () => {
   it('a save that fails outright reports failure and keeps the form open', async () => {
     upsertMock.mockRejectedValueOnce(new Error('400: bad base url'));
     await mount();
-    await click(container.querySelector<HTMLElement>('button.btn-secondary')!);
+    await click(Array.from(container.querySelectorAll<HTMLElement>('button')).find((b) => b.textContent?.trim() === 'Add provider')!);
     await setValue(field(/^ID/), 'newone');
-    await setValue(field(/Display name/), 'New One');
+    await setValue(field(/^Name/), 'New One');
     await setValue(field(/Base URL/), 'https://api.example.com');
     await submitForm();
 

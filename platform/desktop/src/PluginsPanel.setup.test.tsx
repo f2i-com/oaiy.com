@@ -97,7 +97,7 @@ describe('a plugin card’s setup, from live checks', () => {
     );
     await render();
     expect(host.textContent).toContain('Aokie Phone Bridge');
-    expect(host.querySelector('.card-head .badge-ok[title="Set up the AI Receptionist: done"]')?.textContent).toBe('set up');
+    expect(host.querySelector('.card-head .badge-ok[title="Set up the AI Receptionist: done"]')?.textContent).toBe('Set up');
     expect(host.textContent).not.toContain('Finish setting up');
     expect(m.check).toHaveBeenCalledWith('aokie', 'consent', 'done');
     expect(m.check).toHaveBeenCalledWith('aokie', 'pair', 'done');
@@ -150,7 +150,7 @@ describe('a plugin unhealthy only because its setup is not done', () => {
     m.check.mockImplementation(async (_id: string, _step: string, which: string) => ({ passed: false, detail: which === 'when' ? '' : 'not yet' }));
     await turnUnhealthy();
     const badge = host.querySelector('.card-head > .badge:not([data-trust])');
-    expect(badge?.textContent).toBe('needs setup');
+    expect(badge?.textContent).toBe('Needs setup');
     expect(badge?.className).toContain('badge-pending');
     expect(host.querySelector('.service-card')?.className).toContain('service-card-starting');
     expect(host.textContent).toContain('Finish setting up Aokie Phone Bridge.');
@@ -162,7 +162,7 @@ describe('a plugin unhealthy only because its setup is not done', () => {
     m.setupGet.mockReset().mockResolvedValue({ firstRun: { finished: true, skipped: [], chosenPlugins: [] }, plugins: { aokie: { version: 1 } } });
     await turnUnhealthy();
     const badge = host.querySelector('.card-head > .badge:not([data-trust])');
-    expect(badge?.textContent).toBe('unhealthy');
+    expect(badge?.textContent).toBe('Unhealthy');
     expect(badge?.className).toContain('badge-err');
     expect(unhealthyToast()).toHaveLength(1);
   }, 10_000);

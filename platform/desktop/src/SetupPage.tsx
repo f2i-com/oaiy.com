@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Check, FolderOpen, Link2, Loader2, Package, Plug, ShieldCheck, Sparkles } from 'lucide-react';
+import { Check, Download, FolderOpen, Link2, Loader2, Package, Plug, ShieldCheck, Sparkles } from 'lucide-react';
 import {
   agentPreferences,
   appConfig,
@@ -36,8 +36,8 @@ import {
   withCodexAsItIs,
   type FirstRunStep,
 } from './setupFlow';
-import { AgentStep, HandoffStep, modelLineText, WelcomeStep, YourAiStep } from './SetupEssentials';
-import { answered, errorText, RetryLine, StepFooter, StepHeader, usePoll, WizardFrame } from './SetupParts';
+import { AgentStep, HandoffStep, modelLineText, YourAiStep } from './SetupEssentials';
+import { answered, errorText, RetryLine, StepFooter, StepHeader, usePoll, WizardFrame, type EngineAction } from './SetupParts';
 import { useToast } from './Toasts';
 import { useLiveSetup } from './useLiveSetup';
 import { refetchModules } from './useModules';
@@ -93,7 +93,17 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
 
   // The recommendation, or (a desktop without it, or one that cannot work it out now) local if Engines has a model chosen.
   const recommendation = answered(recAnswer, recError);
-  const given = recommendation ? recommendation : (recommendation === null || recError) && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
+  // Until the computer has said what it has, nothing is recommended: the engines take a while to start, and a guess
+  // made from their silence ("ChatGPT") was replaced a few seconds later ("On this computer"), with the chosen tile
+  // and the main button changing under the pointer. A guess is made only once something has answered (the catalogue),
+  // or after half a minute of nothing (engines that are not coming).
+  const [waitedLongEnough, setWaitedLongEnough] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setWaitedLongEnough(true), 30_000);
+    return () => window.clearTimeout(timer);
+  }, []);
+  const looking = !recommendation && !catalog && !waitedLongEnough;
+  const given = looking ? null : recommendation ? recommendation : (recommendation === null || recError) && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
   // (never ChatGPT where Codex is not installed: a first-timer was handed its sign-in, failing, with Next held)
   const rec = given && withCodexAsItIs(given, codexStatus);
 
@@ -132,6 +142,8 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** What there is to do for the language model offered on "Your AI" (download it; it is downloading): the footer's button. */
+  const [engineAction, setEngineAction] = useState<EngineAction | null>(null);
 
   /** Save the first-run part of the record (its place, skips, choices): on the newest record, one save after another. */
   const save = useCallback(async (change: Partial<FirstRunState> | ((now: FirstRunState) => Partial<FirstRunState>)) => {
@@ -256,10 +268,6 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
   let footer: ReactNode = null;
   const status = error ? <span className="card-warn">{error}</span> : current.state === 'done' ? <span className="setup-ok"><Check size={13} /> Done</span> : current.optional ? 'Optional' : null;
   switch (current.id) {
-    case 'welcome':
-      content = <WelcomeStep kicker={kicker} />;
-      footer = <StepFooter status={status} onNext={nextStep} nextLabel="Get started" />;
-      break;
     case 'ai': {
       const chosenReady = choice === 'engine' ? line.kind === 'chosen' : choice === 'chatgpt' ? codexOn : choice === 'provider' ? !!providerPick : false;
       // (the Agent's settings not readable now: said, with a way to ask again, rather than a choice missing)
@@ -280,29 +288,45 @@ function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: stri
             onOpenEngines={() => onNavigate('engines')}
             providerPick={providerPick}
             onProviderPick={prefs ? setPicked : undefined}
+            providerPending={prefs === undefined && !prefsError}
+            onEngineAction={setEngineAction}
           />
         </>
       );
+      // The footer's button is the next thing to do. On this computer with no model yet, that is the download, by
+      // the model's name and size; while it downloads, how far it is; and Next once there is a model.
+      const engine = choice === 'engine' && !chosenReady ? engineAction : null;
       const waiting =
-        choice === 'chatgpt'
+        !choice
+          ? rec
+            ? 'Choose one above to go on'
+            : 'Looking at this computer…'
+          : choice === 'chatgpt'
           ? codexStatus?.available === false
             ? 'Install the Codex app to use ChatGPT'
-            : 'Sign in with ChatGPT to use it'
-          : choice === 'provider' ? 'Connect a provider and choose its model' : 'Waiting for a language model in Engines';
+            : 'Sign in with ChatGPT above to use it'
+          : choice === 'provider'
+            ? 'Connect a provider above and choose its model'
+            : engine
+              ? 'Next opens when the download finishes. You can go on and come back.'
+              : 'Choose a language model in Engines to go on';
+      const goOn = () => {
+        if (!choice) return;
+        setBusy(true);
+        void commitAi(choice)
+          .then(nextStep, (e) => setError(`The Agent’s model was not saved: ${errorText(e)}`))
+          .finally(() => setBusy(false));
+      };
       footer = (
         <StepFooter
-          onBack={() => go(index - 1)}
+          onBack={index > 0 ? () => go(index - 1) : undefined}
           status={status ?? (chosenReady ? null : waiting)}
           onSkip={chosenReady ? undefined : skip}
-          onNext={() => {
-            if (!choice) return;
-            setBusy(true);
-            void commitAi(choice)
-              .then(nextStep, (e) => setError(`The Agent’s model was not saved: ${errorText(e)}`))
-              .finally(() => setBusy(false));
-          }}
-          nextDisabled={!chosenReady}
-          busy={busy}
+          onNext={engine?.kind === 'download' ? engine.run : goOn}
+          nextLabel={engine ? engine.label : 'Next'}
+          nextIcon={engine?.kind === 'download' ? <Download size={14} /> : engine ? <Loader2 size={14} className="spin" /> : undefined}
+          nextDisabled={engine ? engine.kind === 'downloading' : !chosenReady}
+          busy={busy || (engine?.busy ?? false)}
         />
       );
       break;
@@ -671,7 +695,7 @@ function ConnectStep({ kicker, state, paired, linked, onNavigate }: { kicker: st
 }
 
 function DoneStep({ kicker, steps, notInstalled, onPick }: { kicker: string; steps: FirstRunStep[]; notInstalled: string[]; onPick: (i: number) => void }) {
-  const counted = steps.filter((s) => s.id !== 'done' && s.id !== 'welcome' && s.id !== 'handoff');
+  const counted = steps.filter((s) => s.id !== 'done' && s.id !== 'handoff');
   const left = counted.filter((s) => s.state !== 'done');
   return (
     <div className="setup-done">

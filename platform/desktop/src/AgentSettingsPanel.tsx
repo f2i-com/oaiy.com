@@ -33,7 +33,7 @@ import { answered, errorText, RetryLine, usePoll } from './SetupParts';
 export default function AgentSettingsPanel({ onOpenEngines }: { onOpenEngines: () => void }) {
   const access = useControlSettings();
   return (
-    <div className="panel agent-settings">
+    <div className="panel is-form agent-settings">
       <section className="model-section">
         <h3 className="section-title">What the Agent may do</h3>
         <AgentMaySwitch control={access} />
@@ -238,7 +238,7 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
               </span>
               <span className="ai-choice-text">
                 <strong>An AI provider</strong>
-                <small className="ai-choice-fact">{providerPick ? `${providerPick.name} · ${providerPick.model}` : 'LM Studio, Ollama, or an API key (OpenAI, OpenRouter, Gemini).'}</small>
+                <small className="ai-choice-fact">{providerPick ? `${providerPick.name} · ${providerPick.model}` : 'LM Studio, Ollama, or an API key (OpenAI, OpenRouter, Google).'}</small>
               </span>
             </label>
             {source === 'provider' && (

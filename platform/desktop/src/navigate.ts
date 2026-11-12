@@ -43,6 +43,10 @@ export const NAV_VIEWS = [
   'providers',
   'plugins',
   'settings',
+  /** Settings, Backup; and Settings, Storage (the folders and the Hugging Face token). Each is a page the Agent's
+   *  `ui_open` names too (src-tauri/src/control/tools.rs `VIEWS`, held to this list by a test there). */
+  'backup',
+  'storage',
   'agent-settings',
 ] as const;
 export type NavView = (typeof NAV_VIEWS)[number];

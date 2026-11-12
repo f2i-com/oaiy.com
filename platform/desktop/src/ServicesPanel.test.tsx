@@ -43,7 +43,7 @@ vi.mock('./api', () => ({
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 vi.mock('./LogsViewer', () => ({ default: () => null }));
 
-import ServicesPanel from './ServicesPanel';
+import ServicesPanel, { categoryName, crashWords } from './ServicesPanel';
 import { invalidate, put } from './useCached';
 
 const service = (over: Record<string, unknown> = {}) => ({
@@ -204,5 +204,99 @@ describe('ServicesPanel start-with-the-app', () => {
     });
     expect(box()?.checked).toBe(false);
     expect(text()).toContain('disk full');
+  });
+});
+
+// The page as its owner reads it (A7): groups named in words, a row with the buttons pressed every day and the rest
+// behind "More", a stopped service's trouble said once, and where services are kept at the foot, closed, for
+// someone who writes one.
+describe('ServicesPanel in words for its owner', () => {
+  const menuItems = () => Array.from(document.body.querySelectorAll<HTMLButtonElement>('.more-menu [role=menuitem]'));
+  const rowButtons = () => Array.from(host.querySelectorAll<HTMLButtonElement>('.service-actions > button')).map((b) => b.textContent?.trim() || b.getAttribute('aria-label'));
+  const gaveUp = {
+    id: 'reader', name: 'Invoice reader', category: 'custom', status: 'errored', needsRepair: true, restartAttempts: 3, uninstallable: true, installable: true,
+    error: 'It stopped 3 times in a row: ModuleNotFoundError: No module named \'pdfplumber\'',
+    lastCrash: { code: 1, at: '2026-11-12T08:00:00Z', detail: 'ModuleNotFoundError: No module named \'pdfplumber\'' },
+  };
+
+  it('heads each group with its name in words, one group whatever case the category is written in', async () => {
+    listMock.mockResolvedValue({
+      ...SNAPSHOT,
+      services: [service({ id: 'a', name: 'A', category: 'speech' }), service({ id: 'b', name: 'B', category: 'Speech' }), service({ id: 'c', name: 'C', category: 'custom' }), service({ id: 'd', name: 'D', category: 'automation' }), service({ id: 'e', name: 'E', category: 'weather' })],
+    });
+    await mount();
+    expect(Array.from(host.querySelectorAll('.service-section > h3.section-title')).map((h) => h.textContent)).toEqual(['Automation', 'Speech', 'Weather', 'Your own', 'Add a service']);
+    expect(categoryName('custom')).toBe('Your own');
+    expect(categoryName('LLM')).toBe('Language models');
+    expect(categoryName('')).toBe('Other');
+  });
+
+  it('keeps Start and Logs on a stopped service’s row, with Uninstall, Export and Remove under More', async () => {
+    listMock.mockResolvedValue({ ...SNAPSHOT, services: [service({ uninstallable: true, installable: true })] });
+    await mount();
+    expect(rowButtons()).toEqual(['Start', 'Logs', 'More for Playwright Browser']);
+    expect(host.querySelector('.service-actions .btn-danger')).toBeNull();
+    const more = host.querySelector<HTMLButtonElement>('.more-button')!;
+    expect(more.getAttribute('aria-haspopup')).toBe('menu');
+    expect(more.getAttribute('aria-expanded')).toBe('false');
+    await act(async () => more.click());
+    expect(more.getAttribute('aria-expanded')).toBe('true');
+    expect(menuItems().map((b) => b.firstElementChild?.nextElementSibling?.firstChild?.textContent ?? b.textContent)).toEqual(['Uninstall', 'Export', 'Remove']);
+    expect(menuItems()[2].classList.contains('is-danger')).toBe(true);
+    // Escape closes it and gives the button the keyboard back.
+    await act(async () => menuItems()[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })));
+    expect(menuItems()).toEqual([]);
+    expect(document.activeElement).toBe(more);
+    // Export asks the desktop for the package.
+    const { services: api } = await import('./api');
+    vi.mocked(api.export).mockRejectedValue(new Error('not in this test'));
+    await act(async () => more.click());
+    await act(async () => menuItems()[1].click());
+    expect(api.export).toHaveBeenCalledWith('playwright-browser');
+    expect(menuItems()).toEqual([]);
+  });
+
+  it('offers Stop for a running service, and Remove under More only once it is stopped', async () => {
+    listMock.mockResolvedValue({ ...SNAPSHOT, services: [service({ status: 'running', uninstallable: true })] });
+    await mount();
+    expect(rowButtons()).toEqual(['Stop', 'Logs', 'More for Playwright Browser']);
+    await act(async () => host.querySelector<HTMLButtonElement>('.more-button')!.click());
+    const remove = menuItems().find((b) => b.textContent?.startsWith('Remove'))!;
+    expect(remove.disabled).toBe(true);
+    expect(remove.textContent).toContain('Stop it first');
+    expect(menuItems().some((b) => b.textContent?.startsWith('Uninstall'))).toBe(false);
+  });
+
+  it('says what went wrong once, then what OAIY did about it and the way on', async () => {
+    listMock.mockResolvedValue({ ...SNAPSHOT, services: [service(gaveUp)] });
+    await mount();
+    const card = host.querySelector('.service-card')!;
+    expect(card.textContent!.split('No module named').length - 1).toBe(1);
+    expect(card.querySelector('.service-crash')!.textContent).toBe('It stopped 3 times and OAIY gave up. Repair starts it afresh.');
+    expect(card.textContent).not.toMatch(/Exited with code|restart attempt|needs Repair —/);
+    expect(rowButtons()).toEqual(['Start', 'Repair', 'Logs', 'More for Invoice reader']);
+    // What it said as it died is added only where the error does not carry it already; a service still being
+    // started again says so, with its exit code.
+    expect(crashWords({ status: 'errored', error: 'It would not start', lastCrash: { code: 2, at: '', detail: 'port 8801 is taken' }, restartAttempts: 1, needsRepair: false })).toEqual({
+      cause: 'It would not start',
+      after: 'It stopped (exit code 2), and OAIY is starting it again: try 1. It said: port 8801 is taken',
+    });
+    expect(crashWords({ status: 'running', error: null, lastCrash: { code: 1, at: '', detail: 'old news' }, restartAttempts: 0, needsRepair: false })).toEqual({ cause: null, after: null });
+    expect(crashWords({ status: 'stopped', error: null, lastCrash: null, restartAttempts: 0, needsRepair: false })).toEqual({ cause: null, after: null });
+  });
+
+  it('puts where services are kept at the foot, closed, beside Add custom service and Import package', async () => {
+    await mount();
+    const sections = Array.from(host.querySelectorAll('.panel > section'));
+    const foot = sections[sections.length - 1];
+    expect(foot.querySelector('h3')!.textContent).toBe('Add a service');
+    expect(Array.from(foot.querySelectorAll('.form-actions > button')).map((b) => b.textContent?.trim())).toEqual(['Add custom service', 'Import package']);
+    const authors = foot.querySelector<HTMLDetailsElement>('details.services-authors')!;
+    expect(authors.open).toBe(false);
+    expect(authors.querySelector('summary')!.textContent).toBe('For service authors');
+    expect(authors.textContent).toContain('C:\\data');
+    // Nothing for a package's author stands before the services themselves.
+    expect(host.querySelector('.panel')!.firstElementChild!.textContent).not.toContain('templates');
+    expect(host.querySelector('.panel > .datadir-note')).toBeNull();
   });
 });

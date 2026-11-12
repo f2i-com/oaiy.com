@@ -1378,9 +1378,10 @@ export function formatBytes(n: number | null | undefined): string {
   return `${(n / 1e9).toFixed(1)} GB`;
 }
 
+/** A day and a time as this computer writes them, to the minute (nobody needs a backup's or a check's seconds). */
 export function formatTimestamp(iso: string | null | undefined): string {
   if (!iso) return '';
-  return new Date(iso).toLocaleString();
+  return new Date(iso).toLocaleString(undefined, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 export function formatSpeed(bps: number | null | undefined): string {
@@ -2247,7 +2248,7 @@ export interface EngineCatalogModel {
 export interface AddedModelFile {
   /** Its name in Engines. */
   name: string | null;
-  /** Its GGUF architecture ("qwen35", "llama"). */
+  /** Its GGUF architecture, as the file names it (a word for programs: never shown as it is). */
   architecture: string;
   /** The Agent can use its tools with it; otherwise it chats only. */
   tools: boolean;

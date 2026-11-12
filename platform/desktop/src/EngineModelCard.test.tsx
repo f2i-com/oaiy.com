@@ -14,7 +14,7 @@ vi.mock('./api', async (importOriginal) => {
   return { ...real, engines: { ...real.engines, download: m.download, plan: m.plan } };
 });
 
-import { EngineModelCard } from './SetupParts';
+import { addedFileLine, EngineModelCard } from './SetupParts';
 import type { EngineCatalog, EngineCatalogModel } from './api';
 
 const model = (over: Partial<EngineCatalogModel>): EngineCatalogModel => ({
@@ -149,6 +149,32 @@ describe('the engine model card, with nothing chosen in Engines', () => {
     await render({ catalog: catalog('gemma-3-4b') });
     expect(host.textContent).toContain('Chosen in Engines');
     expect(host.querySelector('.setup-chat-only')!.textContent).toContain('cannot use its tools with it');
+    // Said of that file, from what the engine reported of it (`tools`): no other model is named as the one to have.
+    expect(host.querySelector('.setup-chat-only')!.textContent).toBe(addedFileLine('gemma-3-4b', { tools: false }));
+    expect(addedFileLine('my-model', { tools: false })).toBe(
+      'The Agent chats with my-model but cannot use its tools with it, so it can answer but not work OAIY for you. Choose another language model in Engines to change that.',
+    );
+    expect(addedFileLine('my-model', { tools: true })).toBe('The Agent can use its tools with my-model, so it can work OAIY for you as well as chat.');
+    // And the hint under the box promises that, naming no model either.
+    expect(host.textContent).not.toMatch(/The engine runs/);
+  });
+
+  it('says so too when the Agent can use its tools with the file that was added', async () => {
+    invoke.mockImplementation(async (cmd) => {
+      if (cmd === 'pick_model_file') return 'E:\\models\\mine.gguf';
+      if (cmd === 'add_engine_model') return { name: 'mine', architecture: 'x', tools: true };
+      throw new Error(cmd);
+    });
+    await render();
+    expect(host.querySelector('.setup-own-model .form-hint')!.textContent).toBe(
+      'A language model in a .gguf file you already have (of a model split into files, the first). After you add it, OAIY says whether the Agent can use its tools with it.',
+    );
+    await click(button(/Choose…/));
+    await click(button(/Use this file/));
+    await render({ catalog: catalog('mine') });
+    const line = host.querySelector('.setup-chat-only')!;
+    expect(line.textContent).toBe('The Agent can use its tools with mine, so it can work OAIY for you as well as chat.');
+    expect(line.classList.contains('card-warn')).toBe(false);
   });
 
   it('says why a file was refused, and keeps what was typed', async () => {

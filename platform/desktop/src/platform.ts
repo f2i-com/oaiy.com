@@ -13,9 +13,12 @@ export function hostOS(nav: { userAgent?: string; platform?: string } | undefine
   return 'other';
 }
 
-/** Example folders for a path box, as this system writes them: a big drive's data, models and checkpoints folders. */
+/**
+ * Example folders for a path box, as this system writes them: a big drive's data and models folders, and another
+ * folder of models a person already has (in a person's words: "ckpts" was a word for those who train models).
+ */
 export function pathExamples(os: HostOS = hostOS()): { data: string; models: string; extra: string } {
-  if (os === 'windows') return { data: 'D:\\OAIY', models: 'E:\\models', extra: 'E:\\ckpts' };
-  if (os === 'macos') return { data: '/Volumes/Data/OAIY', models: '/Volumes/Data/models', extra: '/Volumes/Data/ckpts' };
-  return { data: '/mnt/data/OAIY', models: '/mnt/data/models', extra: '/mnt/data/ckpts' };
+  if (os === 'windows') return { data: 'D:\\OAIY', models: 'E:\\models', extra: 'E:\\more-models' };
+  if (os === 'macos') return { data: '/Volumes/Data/OAIY', models: '/Volumes/Data/models', extra: '/Volumes/Data/more-models' };
+  return { data: '/mnt/data/OAIY', models: '/mnt/data/models', extra: '/mnt/data/more-models' };
 }
