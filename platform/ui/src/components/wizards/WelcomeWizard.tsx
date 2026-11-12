@@ -18,182 +18,20 @@
  * explicitly clicks Add / Create — closing early is safe.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { ArrowRight, Check, FileText, Image as ImageIcon, MessageSquare, MousePointerClick, Play, Plug, Plus, Share2, Sparkles, X } from 'lucide-react';
+import { ArrowRight, Check, Cloud, FileText, Image as ImageIcon, MessageSquare, Monitor, MousePointerClick, Play, Plug, Plus, Server, Share2, Sparkles, X } from 'lucide-react';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
 import { markWizardCompleted } from '../../lib/wizardPrefs';
+import { SERVICE_PRESETS, listErrorWords, listPresetModels, noModelsWords, presetFields, type ListedModels, type PresetUse, type ServicePreset } from '../../lib/servicePresets';
 import Dialog from '../ui/Dialog';
 
-// -------------------------------------------------------------------
-// Service presets the wizard offers. A curated subset of ServicesTab's
-// TEMPLATE_PRESETS, picked for "most likely to get a brand-new user
-// running fast". Cloud (bring-your-own-key) presets are listed first.
-// -------------------------------------------------------------------
-interface WizardPreset {
-  id: string;
-  label: string;
-  icon: string;
-  /** 'image' presets build a Text → image_gen → Image starter flow. */
-  kind: 'chat' | 'image';
-  hint: string;
-  endpoint: string;
-  needsApiKey: boolean;
-  apiKeyConstant?: string;
-  apiKeyDocsUrl?: string;
-  fields: Omit<CustomService, 'id' | 'name' | 'endpoint'>;
-}
+type WizardPreset = ServicePreset;
+const PRESETS = SERVICE_PRESETS;
+/** A tile's line icon, as every other icon in the editor is one. */
+const PRESET_ICONS: Record<ServicePreset['icon'], typeof Cloud> = { cloud: Cloud, server: Server, plug: Plug, monitor: Monitor };
 
-const PRESETS: WizardPreset[] = [
-  {
-    id: 'openai-cloud',
-    label: 'OpenAI Cloud',
-    icon: '🤖',
-    kind: 'chat',
-    // OpenAI returns CORS headers on real responses (its SDK has a
-    // `dangerouslyAllowBrowser` flag for exactly this), so a browser BYOK call
-    // works. The key is stored locally in this browser, never sent to oaiy.com.
-    hint: 'api.openai.com chat — needs your OpenAI API key (stored locally in your browser).',
-    endpoint: 'https://api.openai.com/v1/chat/completions',
-    needsApiKey: true,
-    apiKeyConstant: 'OPENAI_API_KEY',
-    apiKeyDocsUrl: 'https://platform.openai.com/api-keys',
-    fields: {
-      method: 'POST',
-      // {{apiKeyRaw}} (not {{apiKey}}) — inside a quoted JSON string the value
-      // must be substituted RAW; {{apiKey}} JSON-escapes (adds quotes), which
-      // would yield `"Bearer "<key>""` → invalid JSON.
-      headers: '{"Authorization": "Bearer {{apiKeyRaw}}"}',
-      bodyTemplate:
-        '{\n  "model": "gpt-5.4-mini",\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
-      responseType: 'json',
-      responsePath: 'choices.0.message.content',
-      apiFormat: 'openai',
-      model: 'gpt-5.4-mini',
-      apiKeyConstant: 'OPENAI_API_KEY',
-      icon: '🤖',
-      nodeTypes: ['ai_llm', 'service_call'],
-    },
-  },
-  {
-    id: 'openai-image',
-    label: 'OpenAI GPT Image 2',
-    icon: '🎨',
-    kind: 'image',
-    hint: 'GPT Image 2 text-to-image — uses your OpenAI API key. Builds an image flow.',
-    endpoint: 'https://api.openai.com/v1/images/generations',
-    needsApiKey: true,
-    apiKeyConstant: 'OPENAI_API_KEY',
-    apiKeyDocsUrl: 'https://platform.openai.com/api-keys',
-    fields: {
-      method: 'POST',
-      headers: '{"Authorization": "Bearer {{apiKeyRaw}}"}',
-      bodyTemplate:
-        '{\n  "model": "gpt-image-2",\n  "prompt": {{input}},\n  "n": 1,\n  "size": "1024x1024"\n}',
-      responseType: 'json',
-      // GPT Image returns base64; the Image Generation node wraps it into a
-      // data: URL for display.
-      responsePath: 'data.0.b64_json',
-      apiFormat: 'openai',
-      model: 'gpt-image-2',
-      apiKeyConstant: 'OPENAI_API_KEY',
-      icon: '🎨',
-      nodeTypes: ['image_gen', 'service_call'],
-    },
-  },
-  {
-    id: 'anthropic',
-    label: 'Anthropic',
-    icon: '✨',
-    kind: 'chat',
-    hint: 'Claude /v1/messages — needs your Anthropic API key. Works in the browser.',
-    endpoint: 'https://api.anthropic.com/v1/messages',
-    needsApiKey: true,
-    apiKeyConstant: 'ANTHROPIC_API_KEY',
-    apiKeyDocsUrl: 'https://console.anthropic.com/settings/keys',
-    fields: {
-      method: 'POST',
-      // `anthropic-dangerous-direct-browser-access: true` is Anthropic's
-      // explicit opt-in for direct browser calls — without it the request is
-      // CORS-blocked.
-      headers: '{"anthropic-version": "2023-06-01", "x-api-key": "{{apiKeyRaw}}", "anthropic-dangerous-direct-browser-access": "true"}',
-      bodyTemplate:
-        '{\n  "model": "claude-sonnet-4-6",\n  "max_tokens": 4096,\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
-      responseType: 'json',
-      responsePath: 'content.0.text',
-      apiFormat: 'anthropic',
-      model: 'claude-sonnet-4-6',
-      apiKeyConstant: 'ANTHROPIC_API_KEY',
-      icon: '✨',
-      nodeTypes: ['ai_llm', 'service_call'],
-    },
-  },
-  {
-    id: 'ollama',
-    label: 'Ollama',
-    icon: '🦙',
-    kind: 'chat',
-    hint: 'Ollama /api/chat — defaults to llama3, no key needed.',
-    endpoint: 'http://localhost:11434/api/chat',
-    needsApiKey: false,
-    fields: {
-      method: 'POST',
-      headers: '{}',
-      bodyTemplate:
-        '{\n  "model": "llama3",\n  "messages": [{"role": "user", "content": {{input}}}],\n  "stream": false\n}',
-      responseType: 'json',
-      responsePath: 'message.content',
-      apiFormat: 'ollama',
-      model: 'llama3',
-      icon: '🦙',
-      nodeTypes: ['ai_llm', 'service_call'],
-    },
-  },
-  {
-    id: 'openai-compatible',
-    label: 'OpenAI-compatible',
-    icon: '🔌',
-    kind: 'chat',
-    hint: 'vLLM, llama-server, Ollama /v1, LM Studio /v1/chat/completions … (no key for local).',
-    endpoint: 'http://localhost:1234/v1/chat/completions',
-    needsApiKey: false,
-    fields: {
-      method: 'POST',
-      headers: '{}',
-      // Model embedded as a JSON string literal (not {{model}}) so editing the
-      // Model field in the properties panel visibly rewrites the body — see the
-      // handleFieldChange('model') branch in PropertiesPanel.tsx.
-      bodyTemplate:
-        '{\n  "model": "local-model",\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
-      responseType: 'json',
-      responsePath: 'choices.0.message.content',
-      apiFormat: 'openai',
-      model: 'local-model',
-      icon: '🔌',
-      nodeTypes: ['ai_llm', 'service_call'],
-    },
-  },
-  {
-    id: 'lm-studio',
-    label: 'LM Studio',
-    icon: '🖥️',
-    kind: 'chat',
-    hint: 'LM Studio /api/v1/chat — newer simple-input format. No key needed.',
-    endpoint: 'http://localhost:1234/api/v1/chat',
-    needsApiKey: false,
-    fields: {
-      method: 'POST',
-      headers: '{}',
-      bodyTemplate:
-        '{\n  "model": "local-model",\n  "input": {{input}}\n}',
-      responseType: 'json',
-      responsePath: '',
-      apiFormat: 'openai',
-      model: 'local-model',
-      icon: '🖥️',
-      nodeTypes: ['ai_llm', 'service_call'],
-    },
-  },
-];
+// The providers the wizard offers are lib/servicePresets.ts: where each is and how it is spoken to. None of them
+// names a model: the model is chosen here from the provider's own list, after Test.
 
 /** An image preset/service builds an image flow rather than a chat flow. */
 function isImageService(svc: Pick<CustomService, 'nodeTypes'>): boolean {
@@ -231,6 +69,11 @@ export interface WelcomeWizardProps {
    * OPENAI_API_KEY.
    */
   configuredKeyConstants?: string[];
+  /**
+   * The value of a key constant that is already set, for asking its provider which models it has when the key field
+   * is left blank to reuse it. Used for that request alone, and never shown.
+   */
+  resolveApiKey?: (constantName: string) => string | undefined;
   /** In OAIY's own window: its models are among `existingServices` (group `engine`), there already. */
   inOaiy?: boolean;
 }
@@ -238,8 +81,12 @@ export interface WelcomeWizardProps {
 type Step = 1 | 2 | 3 | 4;
 
 export default function WelcomeWizard(props: WelcomeWizardProps) {
-  const { isOpen, onClose, onSaveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants, inOaiy } = props;
+  const { isOpen, onClose, onSaveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants, resolveApiKey, inOaiy } = props;
   const [step, setStep] = useState<Step>(1);
+  // The model the service will run: chosen from the provider's own list, which Test asks for. None is written here.
+  const [use, setUse] = useState<PresetUse>('chat');
+  const [model, setModel] = useState<string>('');
+  const [listed, setListed] = useState<ListedModels | null>(null);
 
   // Form state for the service currently being configured. Starts with no
   // preset picked so the user explicitly chooses one (the form appears once
@@ -284,19 +131,51 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
       setTestMsg(null);
       setSavedServices([]);
       setFlowServiceId('');
+      setUse('chat');
+      setModel('');
+      setListed(null);
     }
   }, [isOpen]);
 
   // When the user picks a preset, default the form fields to the preset's
-  // example values. No-op when no preset is selected (empty "add another" form).
+  // own values. No-op when no preset is selected (empty "add another" form).
   useEffect(() => {
     if (!preset) return;
     setServiceName(`My ${preset.label}`);
-    setEndpoint(preset.endpoint);
+    setUse(preset.uses[0].use);
+    setEndpoint(preset.uses[0].endpoint);
     setApiKey('');
     setTestState('idle');
     setTestMsg(null);
+    setModel('');
+    setListed(null);
   }, [preset]);
+
+  // Another address or key is another server or account: what was listed is not its list.
+  const changeEndpoint = useCallback((value: string) => {
+    setEndpoint(value);
+    setListed(null);
+    setModel('');
+    setTestState('idle');
+    setTestMsg(null);
+  }, []);
+  const changeApiKey = useCallback((value: string) => {
+    setApiKey(value);
+    setListed(null);
+    setModel('');
+    setTestState('idle');
+    setTestMsg(null);
+  }, []);
+  // What to make with it (a provider that can do more than one thing): its address for that, and its models for that.
+  const changeUse = useCallback((next: PresetUse) => {
+    if (!preset) return;
+    const at = preset.uses.find((u) => u.use === next);
+    if (!at) return;
+    setUse(next);
+    setEndpoint(at.endpoint);
+    const models = listed?.byUse[next] ?? [];
+    setModel(models.length === 1 ? models[0] : '');
+  }, [preset, listed]);
 
   const close = useCallback(() => {
     markWizardCompleted();
@@ -306,41 +185,44 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
   // Escape and the overlay close it (and mark it done), as Skip does: the
   // Dialog calls `close`.
 
+  // Test asks the provider for its models: that it answers shows the address (and the key) work, and its list is
+  // what the Model field offers. (It was a bare probe of the address, and the model was whatever the wizard had
+  // written in: the starter flow then asked the person's server for a model it did not have.)
   const runTest = useCallback(async () => {
-    if (!endpoint) return;
+    if (!endpoint || !preset) return;
     setTestState('testing');
     setTestMsg(null);
-    const start = performance.now();
-    try {
-      // Cheap reachability probe — OPTIONS first, fall back to a tiny POST
-      // for servers (Ollama) that only answer POST. Not an API-correctness
-      // check; we just confirm the URL resolves.
-      let resp: Response;
-      try {
-        resp = await fetch(endpoint, { method: 'OPTIONS' });
-      } catch {
-        resp = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: '{}',
-        });
-      }
-      const ms = Math.round(performance.now() - start);
-      if (resp.status < 500) {
-        setTestState('ok');
-        setTestMsg(`Reachable — HTTP ${resp.status} (${ms} ms)`);
-      } else {
-        setTestState('err');
-        setTestMsg(`Server returned HTTP ${resp.status} (${ms} ms) — endpoint is up but unhappy.`);
-      }
-    } catch (e) {
-      const ms = Math.round(performance.now() - start);
+    setListed(null);
+    setModel('');
+    // The key typed here, or the one already saved under this provider's constant (used for this request, never shown).
+    const key = apiKey.trim() || (preset.apiKeyConstant ? resolveApiKey?.(preset.apiKeyConstant) ?? '' : '');
+    if (preset.needsApiKey && !key) {
       setTestState('err');
-      setTestMsg(`Couldn't reach ${endpoint} — ${(e as Error).message} (failed after ${ms} ms)`);
+      setTestMsg(`${preset.label} lists its models to a key: paste yours above, then Test.`);
+      return;
     }
-  }, [endpoint]);
+    try {
+      const found = await listPresetModels(preset, endpoint, key);
+      setListed(found);
+      const offered = found.byUse[use] ?? [];
+      const any = preset.uses.some((u) => (found.byUse[u.use] ?? []).length > 0);
+      if (!any) {
+        // It answered, and has nothing to run: said here, and nothing is built that could not run.
+        setTestState('err');
+        setTestMsg(noModelsWords(preset));
+        return;
+      }
+      setTestState('ok');
+      setTestMsg(`${preset.label} answers: ${found.total} model${found.total === 1 ? '' : 's'}. Choose the one to use.`);
+      if (offered.length === 1) setModel(offered[0]);
+    } catch (e) {
+      setTestState('err');
+      setTestMsg(listErrorWords(e, endpoint));
+    }
+  }, [endpoint, preset, apiKey, use, resolveApiKey]);
 
-  const formValid = !!preset && serviceName.trim() !== '' && endpoint.trim() !== '';
+  // A service is added once it has a model the provider listed: without one its first run could only fail.
+  const formValid = !!preset && serviceName.trim() !== '' && endpoint.trim() !== '' && model !== '' && (listed?.byUse[use] ?? []).includes(model);
 
   const resetForm = useCallback(() => {
     setPresetId('');
@@ -349,6 +231,8 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
     setApiKey('');
     setTestState('idle');
     setTestMsg(null);
+    setModel('');
+    setListed(null);
   }, []);
 
   // Build + persist the service currently in the form. Returns it (or null if
@@ -356,19 +240,20 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
   // so adding a second service that reuses an existing key constant can be
   // left blank.
   const commitCurrent = useCallback((): CustomService | null => {
-    if (!preset || !serviceName.trim() || !endpoint.trim()) return null;
+    if (!preset || !formValid) return null;
     const svc: CustomService = {
       id: uuidv4(),
       name: serviceName.trim(),
       endpoint: endpoint.trim(),
-      ...preset.fields,
+      // (with the model chosen from the provider's list: the body takes it as {{model}})
+      ...presetFields(preset, use, model),
     };
     onSaveService(svc);
     if (preset.needsApiKey && preset.apiKeyConstant && apiKey.trim()) {
       onSaveApiKey(preset.apiKeyConstant, apiKey.trim());
     }
     return svc;
-  }, [preset, serviceName, endpoint, apiKey, onSaveService, onSaveApiKey]);
+  }, [preset, formValid, serviceName, endpoint, use, model, apiKey, onSaveService, onSaveApiKey]);
 
   const addAnother = useCallback(() => {
     const svc = commitCurrent();
@@ -550,9 +435,14 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
           serviceName={serviceName}
           onServiceNameChange={setServiceName}
           endpoint={endpoint}
-          onEndpointChange={setEndpoint}
+          onEndpointChange={changeEndpoint}
           apiKey={apiKey}
-          onApiKeyChange={setApiKey}
+          onApiKeyChange={changeApiKey}
+          use={use}
+          onUseChange={changeUse}
+          model={model}
+          onModelChange={setModel}
+          listed={listed}
           testState={testState}
           testMsg={testMsg}
           onTest={runTest}
@@ -588,7 +478,7 @@ function WelcomeStep({ hasAnyService, inOaiy }: { hasAnyService: boolean; inOaiy
   const steps = [
     inOaiy
       ? 'Pick one of OAIY’s own models, or connect another AI service (OpenAI, Anthropic, Ollama, or any HTTP endpoint).'
-      : 'Connect one or more AI services (OpenAI chat, GPT Image, Anthropic, Ollama, or any HTTP endpoint).',
+      : 'Connect one or more AI services (OpenAI, Anthropic, Ollama, or any server that speaks OpenAI’s API), and choose the model each runs from its own list.',
     'Build a starter flow you can run right away.',
     'Show you where everything lives.',
   ];
@@ -638,6 +528,13 @@ function AddServiceStep(props: {
   onEndpointChange: (v: string) => void;
   apiKey: string;
   onApiKeyChange: (v: string) => void;
+  /** What the starter flow makes with it, where the provider can do more than one thing. */
+  use: PresetUse;
+  onUseChange: (use: PresetUse) => void;
+  /** The model chosen, from `listed` (the provider's own list, once Test has asked for it). */
+  model: string;
+  onModelChange: (v: string) => void;
+  listed: ListedModels | null;
   testState: 'idle' | 'testing' | 'ok' | 'err';
   testMsg: string | null;
   onTest: () => void;
@@ -650,9 +547,13 @@ function AddServiceStep(props: {
 }) {
   const {
     presets, presetId, onPresetChange, preset, serviceName, onServiceNameChange,
-    endpoint, onEndpointChange, apiKey, onApiKeyChange, testState, testMsg, onTest,
+    endpoint, onEndpointChange, apiKey, onApiKeyChange, use, onUseChange, model, onModelChange, listed,
+    testState, testMsg, onTest,
     services, savedThisRunIds, providedKeyConstants, onRemoveService,
   } = props;
+  const offered = listed?.byUse[use] ?? [];
+  // What the provider can do here, where it lists models for more than one thing (replies and pictures).
+  const usesListed = preset ? preset.uses.filter((u) => (listed?.byUse[u.use] ?? []).length > 0) : [];
 
   const keyAlreadyProvided =
     !!preset?.apiKeyConstant && providedKeyConstants.has(preset.apiKeyConstant);
@@ -689,9 +590,9 @@ function AddServiceStep(props: {
                       <X size={11} />
                     </button>
                   ) : svc.group === 'engine' ? (
-                    <span className="oaiy-pill ok" title="One of OAIY’s own models">in OAIY</span>
+                    <span className="oaiy-pill ok" title="One of OAIY’s own models">In OAIY</span>
                   ) : (
-                    <span className="oaiy-pill ok" title="Already saved">saved</span>
+                    <span className="oaiy-pill ok" title="Already saved">Saved</span>
                   )}
                 </span>
               );
@@ -709,6 +610,7 @@ function AddServiceStep(props: {
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
           {presets.map((p) => {
             const selected = p.id === presetId;
+            const Icon = PRESET_ICONS[p.icon];
             return (
               <button
                 key={p.id}
@@ -718,11 +620,11 @@ function AddServiceStep(props: {
                 className={choice(selected)}
                 title={p.hint}
               >
-                <span className="shrink-0 text-lg leading-none" aria-hidden="true">{p.icon}</span>
+                {/* (a line icon, as everywhere else in the editor: the tiles were emoji, and so was the node they made) */}
+                <span className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--r-sm)] ${selected ? 'bg-accent/15 text-accent' : 'bg-surface-tertiary text-content-secondary'}`} aria-hidden="true"><Icon size={15} /></span>
                 <span className="min-w-0">
-                  {/* (wrapped, not cut: "OpenAI GPT Image 2" is two lines in a third of the dialog) */}
                   <span className="block text-[12.5px] font-semibold leading-snug text-content-primary">{p.label}</span>
-                  {services.some((s) => s.endpoint === p.endpoint)
+                  {services.some((s) => p.uses.some((u) => u.endpoint === s.endpoint))
                     ? <span className="block text-[11px] text-signal-green">added</span>
                     : p.needsApiKey
                       ? <span className="block text-[11px] text-signal-amber">needs a key</span>
@@ -745,37 +647,11 @@ function AddServiceStep(props: {
               type="text"
               value={serviceName}
               onChange={(e) => onServiceNameChange(e.target.value)}
-              placeholder="My OpenAI"
+              placeholder="A name of your own"
               className="oaiy-input"
             />
           </label>
-          <div className="oaiy-field">
-            <label htmlFor="wizard-endpoint" className="oaiy-label">Endpoint URL</label>
-            <div className="flex gap-2">
-              <input
-                id="wizard-endpoint"
-                type="text"
-                value={endpoint}
-                onChange={(e) => onEndpointChange(e.target.value)}
-                placeholder="https://…"
-                className="oaiy-input mono flex-1"
-              />
-              <button
-                type="button"
-                onClick={onTest}
-                disabled={!endpoint || testState === 'testing'}
-                className="btn"
-                title="Probe the URL to confirm it's reachable"
-              >
-                {testState === 'testing' ? 'Testing…' : 'Test'}
-              </button>
-            </div>
-            {testMsg && (
-              <p className={testState === 'ok' ? 'oaiy-ok-text' : 'oaiy-error-text'}>
-                {testMsg}
-              </p>
-            )}
-          </div>
+          {/* (the key before Test, which needs it to ask the provider what it has) */}
           {preset.needsApiKey && (
             <div className="oaiy-field">
               <label htmlFor="wizard-api-key" className="oaiy-label">
@@ -791,7 +667,7 @@ function AddServiceStep(props: {
                 type="password"
                 value={apiKey}
                 onChange={(e) => onApiKeyChange(e.target.value)}
-                placeholder={keyAlreadyProvided ? 'Already saved — leave blank to reuse it' : 'sk-… (stored locally; never sent to oaiy.com)'}
+                placeholder={keyAlreadyProvided ? 'Already saved: leave blank to reuse it' : 'Your key (kept in this browser, never sent to oaiy.com)'}
                 autoComplete="off"
                 spellCheck={false}
                 className="oaiy-input mono"
@@ -805,6 +681,69 @@ function AddServiceStep(props: {
               </p>
             </div>
           )}
+          <div className="oaiy-field">
+            <label htmlFor="wizard-endpoint" className="oaiy-label">Address</label>
+            <div className="flex gap-2">
+              <input
+                id="wizard-endpoint"
+                type="text"
+                value={endpoint}
+                onChange={(e) => onEndpointChange(e.target.value)}
+                placeholder="https://…"
+                className="oaiy-input mono flex-1"
+              />
+              <button
+                type="button"
+                onClick={onTest}
+                disabled={!endpoint || testState === 'testing'}
+                className="btn"
+                title="Ask the provider for its models: that it answers shows the address and the key work"
+              >
+                {testState === 'testing' ? 'Testing…' : 'Test'}
+              </button>
+            </div>
+            {testMsg && (
+              <p className={testState === 'ok' ? 'oaiy-ok-text' : 'oaiy-error-text'} role="status">
+                {testMsg}
+              </p>
+            )}
+          </div>
+          {/* What to make with it, where its key lists models for more than one thing. */}
+          {usesListed.length > 1 && (
+            <div className="oaiy-field">
+              <span className="oaiy-label">Make</span>
+              <div className="flex gap-2" role="group" aria-label="What the starter flow makes">
+                {usesListed.map((u) => (
+                  <button key={u.use} type="button" aria-pressed={u.use === use} onClick={() => onUseChange(u.use)} className={`btn btn-sm ${u.use === use ? 'btn-primary' : ''}`}>
+                    {u.use === 'image' ? <><ImageIcon size={13} /> Pictures</> : <><MessageSquare size={13} /> Replies</>}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* The model: the provider's own list, once Test has asked for it. Nothing is filled in before. */}
+          <div className="oaiy-field">
+            <label htmlFor="wizard-model" className="oaiy-label">Model</label>
+            <select
+              id="wizard-model"
+              value={model}
+              onChange={(e) => onModelChange(e.target.value)}
+              disabled={offered.length === 0}
+              className="oaiy-select"
+            >
+              <option value="">
+                {offered.length > 0
+                  ? 'Choose a model'
+                  : testState === 'testing'
+                    ? `Asking ${preset.label} for its models…`
+                    : listed
+                      ? 'No models listed'
+                      : `Press Test to list ${preset.label}’s models`}
+              </option>
+              {offered.map((id) => <option key={id} value={id}>{id}</option>)}
+            </select>
+            {offered.length > 0 && !model && <p className="oaiy-help faint">The starter flow is built with the one you choose.</p>}
+          </div>
         </div>
       )}
     </>
@@ -888,7 +827,7 @@ function DoneStep() {
         Run, in the same toolbar, runs the whole chain. Its log is under the node's properties on the right.
       </TipCard>
       <TipCard icon={<Share2 size={17} />} title="Share, and run it from another AI">
-        Settings → General → <em>Sharing and remote runs</em> lets ChatGPT or Claude trigger this flow over HTTP.
+        Settings → General → <em>Sharing and remote runs</em> lets an AI assistant of yours trigger this flow over HTTP.
       </TipCard>
     </div>
   );

@@ -1,6 +1,7 @@
 {
  "name": "Image to image",
- "description": "A picture from pictures and a prompt: edit one picture, or combine several (up to 10). A vision model sees them and enhances the prompt into a full caption, FLUX 3 Klein (4 steps) makes the picture in the first one's shape, a vision model checks it and it is made again (up to 3 tries) when the check finds a problem. Inputs: Prompt (what to make or change), Pictures (a list of up to 10: URLs, data URLs or files; one picture alone also works; none makes a picture from the prompt). Answers the picture's file reference, whether it passed and each try's findings.",
+ "description": "A picture from pictures and a prompt: edit one, or combine several",
+ "notes": "A picture from pictures and a prompt: edit one picture, or combine several (up to 10). A vision model sees them and enhances the prompt into a full caption, FLUX 3 Klein (4 steps) makes the picture in the first one's shape, a vision model checks it and it is made again (up to 3 tries) when the check finds a problem. Inputs: Prompt (what to make or change), Pictures (a list of up to 10: URLs, data URLs or files; one picture alone also works; none makes a picture from the prompt). Answers the picture's file reference, whether it passed and each try's findings.",
  "tags": [
   "image",
   "example"
@@ -138,7 +139,7 @@
     "y": 262
    },
    "data": {
-    "label": "Make it (FLUX 3 Klein, 4 steps)",
+    "label": "Make it (4 steps)",
     "service": "engine:image:flux-3-image-klein-q4-4-step",
     "imageInputCount": 1,
     "matchPicture": true,
@@ -409,6 +410,6 @@
  ],
  "oaiyTool": {
   "name": "image_to_image",
-  "description": "Edit a picture, or combine up to 10 pictures into one, from an instruction (FLUX 3 Klein): the instruction is enhanced by a vision model that sees the pictures, the result is checked (the change made, the rest kept, exact text) and made again, up to 3 tries, until it passes. Pictures takes a list of pictures (data URLs or file references). Returns the picture's file reference and the review's findings."
+  "description": "Edit a picture, or combine up to 10 pictures into one, from an instruction: the instruction is enhanced by a vision model that sees the pictures, the result is checked (the change made, the rest kept, exact text) and made again, up to 3 tries, until it passes. Pictures takes a list of pictures (data URLs or file references). Returns the picture's file reference and the review's findings."
  }
 }

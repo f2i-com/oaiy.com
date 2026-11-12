@@ -2,7 +2,7 @@
     "id": "text_to_speech",
     "name": "Text to Speech",
     "description": "Turn text into speech: with OAIY's engine (a saved voice, or one described), or a speech service you add (ElevenLabs, OpenAI, Chatterbox, your own).",
-    "doc": "Generate natural-sounding speech from text.\n\n## Two modes\n\n**Internal** — DramaBox running natively in OAIY (no Python, no server). Realtime on a recent GPU. Connect a 5-15 s reference wav to the **voice** pin for voice cloning.\n\n**External** — drive any HTTP TTS endpoint via a request/response template. Presets ship for ElevenLabs, OpenAI, Chatterbox, and Qwen3; pick **Custom** to point at your own service.\n\n## Pins\n\n• **Text (in)** — what to say\n• **Description (in)** — optional voice-style hint (overrides the Voice Description field when connected)\n• **Voice (in)** — reference wav for voice cloning (Internal) or to fill `{{voiceRefPath}}` (External)\n• **Audio (out)** — playable media URL\n• **Path (out)** — absolute file path for Save Audio / FFmpeg / diffusion-video audio input",
+    "doc": "Generate natural-sounding speech from text.\n\n## Two modes\n\n**Internal** — DramaBox running natively in OAIY (no Python, no server). Realtime on a recent GPU. Connect a 5-15 s reference wav to the **voice** pin for voice cloning.\n\n**External** — drive any HTTP TTS endpoint via a request/response template. Presets ship for ElevenLabs, OpenAI, Chatterbox, and a speech server on port 8772; pick **Custom** to point at your own service.\n\n## Pins\n\n• **Text (in)** — what to say\n• **Description (in)** — optional voice-style hint (overrides the Voice Description field when connected)\n• **Voice (in)** — reference wav for voice cloning (Internal) or to fill `{{voiceRefPath}}` (External)\n• **Audio (out)** — playable media URL\n• **Path (out)** — absolute file path for Save Audio / FFmpeg / diffusion-video audio input",
     "icon": "mic",
     "color": "teal",
     "tags": [
@@ -68,7 +68,7 @@
             "name": "Mode",
             "type": "select",
             "default": "external",
-            "description": "Local TTS via an HTTP service (Chatterbox / Qwen3 TTS / Custom). The bundled DramaBox engine was removed in the local-first build.",
+            "description": "Speech from a server over HTTP: one of the two this computer can run, or your own.",
             "options": [
                 { "value": "external", "label": "Local HTTP service" }
             ],
@@ -138,7 +138,7 @@
                 { "value": "elevenlabs", "label": "ElevenLabs" },
                 { "value": "openai-tts", "label": "OpenAI TTS" },
                 { "value": "chatterbox-tts", "label": "Chatterbox TTS (local, port 8765)" },
-                { "value": "qwen3-tts", "label": "Qwen3 TTS (local, port 8772)" },
+                { "value": "qwen3-tts", "label": "Speech server on this computer (port 8772)" },
                 { "value": "custom", "label": "Custom" }
             ],
             "showIf": { "provider": "external", "service": "" }

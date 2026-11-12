@@ -33,8 +33,7 @@
    narrow-width rules below too. */
 .app-shell.in-oaiy-shell { grid-template-columns: minmax(0, 1fr); background: rgb(var(--color-bg-primary)); }
 .app-shell.in-oaiy-shell .oaiy-workspace { grid-template-rows: auto minmax(0, 1fr); }
-.app-shell.in-oaiy-shell .oaiy-topbar { min-height: 64px; padding-top: 8px; padding-bottom: 8px; }
-.oaiy-sections { display: flex; min-width: 0; align-items: center; gap: 10px; margin-bottom: 6px; }
+/* (its one row, 44 px: `.oaiy-topbar.one-row`, with the quiet tabs, at the foot of this file) */
 .oaiy-sections-new {
   display: inline-flex;
   flex: none;
@@ -187,7 +186,7 @@
 
   /* The dashboard's radii: a card, a control, a small chip. Prism Lab is the
      softer of the two themes; Paper Circuit squares them (below). */
-  --r-card: 11px;
+  --r-card: 10px;
   --r-ctl: 8px;
   --r-sm: 6px;
 
@@ -314,7 +313,7 @@
   --color-border-strong: 51 66 92;
   --dot: 38 52 77;
 
-  --r-card: 11px;
+  --r-card: 10px;
   --r-ctl: 8px;
   --r-sm: 6px;
 
@@ -2077,7 +2076,7 @@ select,
    under the fade to signal there is nothing further. In between -- the only
    case where content is actually hidden -- the fade lands on a real button and
    says so. */
-@media (width < 760px) {
+@media (width <= 700px) {
   .oaiy-actions {
     padding-right: 22px;
     -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
@@ -2381,7 +2380,7 @@ select,
   .oaiy-saved:not(.problem) { display: none; }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 700px) {
   .oaiy-workspace { grid-template-rows: 65px minmax(0, 1fr) auto; }
   .oaiy-dock { min-height: 56px; }
   .oaiy-topbar { padding: 0 10px 0 14px; }
@@ -2403,7 +2402,7 @@ select,
    the screen -- on an icon strip that could not be expanded OR dismissed,
    leaving 316px for a node canvas. A drawer gives the canvas the whole width
    and gives the rail its labels back, which the 74px version had to hide. */
-@media (width < 760px) {
+@media (width <= 700px) {
   .app-shell { grid-template-columns: minmax(0, 1fr); }
 
   .oaiy-sidebar {
@@ -2465,7 +2464,7 @@ select,
 
 /* The opener only exists below md; above it the rail is already on screen. */
 .oaiy-nav-open { display: none; flex: 0 0 auto; margin-right: 10px; }
-@media (width < 760px) { .oaiy-nav-open { display: inline-flex; } }
+@media (width <= 700px) { .oaiy-nav-open { display: inline-flex; } }
 
 
 
@@ -3394,12 +3393,12 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-rail-collapsed > button:last-child:hover { color: rgb(var(--color-text-primary)); }
 
-@media (width < 760px) {
+@media (width <= 700px) {
   .oaiy-rail { position: fixed; z-index: 50; top: 0; bottom: 0; left: 0; width: min(85vw, 256px); box-shadow: var(--shadow-lg); }
   .oaiy-rail-collapsed { display: none; }
 }
 .oaiy-rail-scrim { display: none; }
-@media (width < 760px) {
+@media (width <= 700px) {
   .oaiy-rail-scrim { position: fixed; z-index: 40; inset: 0; display: block; background: rgb(0 0 0 / 0.5); }
 }
 
@@ -3760,7 +3759,7 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-toolbar .btn { height: 32px; }
 .oaiy-toolbar .oaiy-pill { margin: 0 4px; }
-@media (width < 760px) {
+@media (width <= 700px) {
   .oaiy-tool > span { display: none; }
 }
 /* Top right, clear of the toolbar and the zoom controls at the canvas's foot. */
@@ -4672,7 +4671,7 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
 
 /* Phones need the document name as well as the actions. Give each its own
    row instead of collapsing the name to make room for a hidden action strip. */
-@media (width < 760px) {
+@media (width <= 700px) {
   .oaiy-workspace { grid-template-rows: auto minmax(0, 1fr) auto; }
   .oaiy-topbar { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 4px 8px; padding: 8px 12px 4px; }
   .oaiy-nav-open { margin: 0; }
@@ -4689,6 +4688,192 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
   .oaiy-dock { min-height: 56px; padding-bottom: env(safe-area-inset-bottom); }
   .oaiy-canvas-wrap .react-flow__controls { bottom: 88px !important; }
 }
-@media (width < 760px) and (max-height: 500px) {
+@media (width <= 700px) and (max-height: 500px) {
   .oaiy-canvas-wrap .react-flow__controls { top: 8px !important; bottom: auto !important; flex-direction: row; }
+}
+
+/* ---------- no text on the canvas under 11 px at zoom 1 ----------
+   A new flow opens zoomed out a little, and a node's small print (its kind, its status, the help under a field, set
+   at 9 to 10.5 px in about a hundred places) came out at 8.9 px on screen. Eleven is the floor for anything written
+   in a node or on an edge: the node cards' own small sizes are raised here in one place, whatever class set them
+   (the cards use Tailwind's `text-[10px]` and a few smaller), so a new card cannot go under it either. Long help is
+   not on the card at all: it is in the Properties panel, which has the room (GenericNode's onCard). */
+.react-flow__node :is([class*='text-[6px]'], [class*='text-[7px]'], [class*='text-[8px]'], [class*='text-[9px]'], [class*='text-[9.5px]'], [class*='text-[10px]'], [class*='text-[10.5px]']),
+.oaiy-node-body .text-\[10px\],
+.oaiy-node-kind,
+.oaiy-node-status.pill,
+.oaiy-unknown-node code,
+.react-flow__node.react-flow__node-default::before,
+.react-flow__node.react-flow__node-input::before,
+.oaiy-canvas-wrap .react-flow__edge-text { font-size: 11px; }
+/* (the kind's capitals are wide: a little less air between them at the larger size, so a card's head is as wide as it was) */
+.oaiy-node-kind { letter-spacing: 0.06em; }
+
+/* ---------- a kicker, a heading and a line of text, stacked: one rule ----------
+   Wherever the three stack (the top bar's "OAIY › FLOWS" over the project's name, a page's kicker over its title over
+   its description, a dialog's title over its line, the sidebar's name over its two lines), the letters of one line
+   are at least 9 px clear of the next line's, and a line's own height does not depend on which font drew it: a
+   kicker and a heading are 1.3 of their size, a line of text 1.5. They were 2 and 3 px apart as boxes, which left
+   6 and 7 px between the letters, and a kicker that read as part of the title under it. The same rule is the
+   Agent's (app/src/styles.css) and the dashboard's. */
+/* The dashboard's own numbers, so the three pieces of the window read as one: 6 px between the lines' boxes, and
+   each line's height in pixels, not a ratio (a fallback font with another shape cannot then close the gap): a small
+   label 10.5 px on a 14 px line, a page's heading 21 px on 28, its description 13 px on 18. */
+.oaiy-title > span { margin-bottom: 6px; line-height: 14px; }
+.oaiy-title h1, .oaiy-title input.oaiy-name, .oaiy-title .oaiy-name-flow { line-height: 24px; }
+.oaiy-page-titles { gap: 6px; }
+.oaiy-kicker { line-height: 14px; }
+.oaiy-page-titles h2 { font-size: 21px; line-height: 28px; }
+.oaiy-page-titles p { font-size: 13px; line-height: 18px; }
+.oaiy-dialog-titles { gap: 6px; }
+/* A dialog here and in the Agent: the same corner, title and line (they were 11 px, 15 px and 12.5 px here against
+   the Agent's 12, 17 and 13; both are now 12, 16 and 13, and their buttons 34 px tall). */
+.oaiy-dialog { border-radius: calc(var(--r-card) + 1px); }
+.oaiy-dialog-titles h2 { font-size: 16px; font-weight: 650; line-height: 22px; }
+.oaiy-dialog-titles p { font-size: 13px; line-height: 18px; }
+.oaiy-brand > strong { line-height: 1.1; }
+.oaiy-brand > span { margin-top: 8px; line-height: 1.4; }
+.oaiy-brand > small { margin-top: 9px; line-height: 1.4; }
+.oaiy-empty-title + .oaiy-empty-text { margin-top: 2px; }
+
+/* ---------- one small-type scale for the editor's own chrome ----------
+   Its small capitals (where the page is, a page's kicker, a field's name, a pill, a group's head) are 10.5 px, and a
+   count beside one is 10 px. They were 9, 9.5, 10 and 10.5 by turns, and one count came out at 7.6. */
+.oaiy-title > span, .oaiy-kicker, .oaiy-rail-group-head, .oaiy-pill, .oaiy-cat > button > span { font-size: 10.5px; }
+.oaiy-rail-group-head small, .oaiy-tab-count, .oaiy-tool > em, .oaiy-nav button > em, .oaiy-log-line > .oaiy-pill { font-size: 10px; }
+
+/* Properties: what the chosen node does, under its name: its own line, then the help that stood on its card. */
+.oaiy-props-about { display: flex; flex-direction: column; gap: 7px; border-bottom: 1px solid rgb(var(--color-border-secondary)); padding: 11px 14px 12px; }
+.oaiy-props-about p { margin: 0; color: rgb(var(--color-text-secondary)); font-size: 12px; line-height: 1.5; }
+.oaiy-props-about p.more { color: rgb(var(--color-text-faint)); }
+.oaiy-props-kind { font-size: 10.5px; line-height: 1.3; }
+.oaiy-props-head > div { gap: 4px; }
+
+/* A flow's line under its name in the rail: three lines before it is cut (one line cut every one of them short). */
+.oaiy-flow-text > small { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; white-space: normal; }
+/* A node's line in the palette: two lines before it is cut (on one, most stopped mid-word: "Mix an audio track
+   into a video wi…"). */
+.oaiy-node-text small { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; white-space: normal; }
+/* The rail with no flows yet: one quiet line (the canvas beside it carries the words and the button). */
+.oaiy-rail-none { margin: 0; padding: 14px 12px 6px; color: rgb(var(--color-text-faint)); font-size: 12px; line-height: 1.5; }
+
+/* ---------- the dashboard's measures, where the editor does the same thing ----------
+   The dashboard is the reference for the window's three pieces. Already the same here: a button 34 px high with an
+   8 px corner, a field 34 px, the small corner 6 px. Brought to it: the base text 14 px on a line of 1.5 (it was the
+   browser's 16), a card's corner 10 px (the token, above), a tab in a segmented bar 24 px high with a 6 px corner
+   (26), 16 px between cards (14), a form no wider than 920 px and a list up to 1400 px (both 1080), and in the
+   light theme a field that is white with a border (the grey fill read as a field that cannot be typed in). */
+:root.oaiy-app body { font-size: 14px; line-height: 1.5; }
+/* A segmented box (the rail's All / Flows / Macros): tabs 24 px high with 11 px at their sides and the small corner,
+   2 px between them and 2 px round them inside a 1 px border (30 px in all), 12.5 px words at weight 600. */
+.oaiy-seg { gap: 2px; padding: 2px; }
+.oaiy-seg > button { height: 24px; gap: 7px; border-radius: var(--r-sm); padding: 0 11px; font-size: 12.5px; font-weight: 600; }
+/* A chip: 20 px high, 11 px words in the body's face, a full pill (they were the mono face at 10 to 10.5 px). */
+.oaiy-pill, .oaiy-chip { height: 20px; padding: 0 8px; font-family: var(--font-body); font-size: 11px; line-height: 1; letter-spacing: 0; }
+.oaiy-log-line > .oaiy-pill { height: 16px; padding: 0 5px; font-size: 10px; }
+/* A page's name inside the editor: 16 px at weight 650 on a 22 px line, the window's own title size (at 21 px it
+   stood larger than the "Flows" above it); what is on a card 13 px, a hint 12.5 px. */
+.oaiy-page-titles h2 { font-size: 16px; font-weight: 650; line-height: 22px; letter-spacing: -0.01em; }
+.oaiy-card-text { font-size: 13px; }
+.oaiy-help { font-size: 12.5px; }
+.oaiy-input, .oaiy-select, .oaiy-textarea { font-size: 13px; }
+.oaiy-page-body { gap: 16px; }
+.oaiy-page-head, .oaiy-page-body { max-width: 1400px; }
+.oaiy-page.has-nav .oaiy-page-head, .oaiy-page.has-nav .oaiy-page-body { max-width: 920px; }
+:root.light .oaiy-input, :root.light .oaiy-select, :root.light .oaiy-textarea { border-color: rgb(var(--color-border-strong)); background: #fff; }
+/* On a phone a page's head stacks: its name and its line take the width, and its buttons go under them (side by
+   side, Data's description was squeezed into a column three words wide beside SQL and Refresh). */
+@media (width <= 700px) {
+  .oaiy-page-head { flex-direction: column; align-items: stretch; gap: 10px; padding: 16px 16px 12px; }
+  .oaiy-page-actions { justify-content: flex-start; }
+  .oaiy-page-body { padding: 0 16px 24px; }
+}
+/* An empty state: an icon, a line, a hint, and the action inside it (not in a card of its own beside it). */
+.oaiy-empty > .btn, .oaiy-empty > button.btn { margin-top: 8px; }
+
+/* ---------- in OAIY's window: ONE row of the editor's own, 44 px ----------
+   OAIY's header is right above it: the page's title ("Flows") and its tabs (Editor / Run history / On other
+   computers). Under that the editor drew a second segmented bar (New flow | Flows, Data, Queue, Packages, Settings)
+   and then a third row with the names and the icon buttons: 136 px before the canvas, two pill bars stacked, the
+   word "Flows" on every row and "Settings" twice with one icon. Now: New flow, the project and the flow with its
+   saved state, the sections as quiet text tabs (the open one underlined), and the icon buttons at the right, the
+   editor's own settings among them. The canvas starts right under it. */
+.app-shell.in-oaiy-shell .oaiy-topbar.one-row {
+  display: flex;
+  height: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  /* (30 px at the left: the window's title above starts there, so "Flows" and "New flow" share a left edge. In a
+     window of 1240 px or less the title is 24 px in and this page is under 1167 px wide; a page of 1019 to 1166 px
+     is either window and takes 30.) */
+  padding: 0 10px 0 30px;
+}
+@media (width < 1019px) { .app-shell.in-oaiy-shell .oaiy-topbar.one-row { padding-left: 24px; } }
+.oaiy-topbar.one-row > .oaiy-sections-new { height: 28px; border-radius: var(--r-ctl); padding: 0 11px; font-size: 12.5px; }
+.oaiy-topbar.one-row > .oaiy-title { display: flex; min-width: 0; flex: 0 1 auto; align-items: center; }
+.oaiy-topbar.one-row > .oaiy-title > div { display: flex; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }
+.oaiy-topbar.one-row .oaiy-title h1,
+.oaiy-topbar.one-row .oaiy-title input.oaiy-name,
+.oaiy-topbar.one-row .oaiy-title .oaiy-name-flow { min-height: 0; padding: 2px 5px; font-size: 14px; font-weight: 620; line-height: 20px; letter-spacing: -0.005em; }
+.oaiy-topbar.one-row .oaiy-title .oaiy-name-project { max-width: 168px; color: rgb(var(--color-text-secondary)); font-weight: 520; }
+.oaiy-topbar.one-row .oaiy-title .oaiy-name-flow { max-width: 220px; }
+.oaiy-topbar.one-row .oaiy-name-sep { display: inline; font-size: 14px; }
+.oaiy-topbar.one-row .oaiy-saved { margin-left: 2px; }
+.oaiy-topbar.one-row > .oaiy-actions { margin-left: auto; gap: 2px; padding: 0; -webkit-mask-image: none; mask-image: none; }
+.oaiy-quiet-tabs { display: flex; height: 100%; flex: none; align-items: stretch; gap: 2px; margin-left: 6px; border-left: 1px solid rgb(var(--color-border-secondary)); padding-left: 8px; }
+.oaiy-quiet-tabs > button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 0 9px;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.14s;
+}
+.oaiy-quiet-tabs > button:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-quiet-tabs > button.active { color: rgb(var(--color-text-primary)); }
+.oaiy-quiet-tabs > button.active::after { position: absolute; right: 9px; bottom: 0; left: 9px; height: 2px; border-radius: 2px 2px 0 0; background: rgb(var(--accent-primary)); content: ''; }
+.oaiy-quiet-tabs > button:focus-visible { border-radius: 6px; outline: 2px solid rgb(var(--accent-primary)); outline-offset: -3px; }
+/* As the window narrows, the row gives up words before it gives up controls: the saved state keeps its tick, the
+   project's name goes (the flow's stays), and New flow keeps its plus. */
+@media (width < 1040px) {
+  .oaiy-topbar.one-row .oaiy-saved:not(.problem) { overflow: hidden; width: 14px; gap: 0; color: transparent; }
+  .oaiy-topbar.one-row .oaiy-saved:not(.problem) > svg { flex: none; }
+}
+@media (width < 900px) {
+  /* (the project's name goes where a flow's is shown after it; with no flow open it is all the bar has to say) */
+  .oaiy-topbar.one-row .oaiy-title .oaiy-name-project:has(~ .oaiy-name-sep), .oaiy-topbar.one-row .oaiy-name-sep { display: none; }
+  .oaiy-topbar.one-row > .oaiy-sections-new { width: 28px; justify-content: center; padding: 0; }
+  .oaiy-topbar.one-row > .oaiy-sections-new > span { display: none; }
+  .oaiy-topbar.one-row .oaiy-title .oaiy-name-flow { max-width: 150px; }
+  .oaiy-quiet-tabs { margin-left: 0; padding-left: 4px; }
+  .oaiy-quiet-tabs > button { padding: 0 7px; }
+  .oaiy-quiet-tabs > button.active::after { right: 7px; left: 7px; }
+  .oaiy-topbar.one-row .oaiy-chip { display: none; }
+}
+
+/* ---------- in OAIY's window the editor is never a phone ----------
+   Its own view is the window less OAIY's sidebar: 686 px at the window's smallest (760 x 560), and under 760 px
+   for any window narrower than about 834 px. The phone rules (the flows rail lying over a dimmed canvas, finger-size
+   buttons, the names stacked) are for a phone in a browser. Here the rail stays a column of the page, folded to its
+   narrow strip until it is asked for (OAIYApp), nothing dims the canvas, and the bar is the one row above. */
+@media (width <= 700px) {
+  .app-shell.in-oaiy-shell .oaiy-rail { position: static; z-index: auto; width: 232px; box-shadow: none; }
+  .app-shell.in-oaiy-shell .oaiy-rail-collapsed { display: flex; }
+  .app-shell.in-oaiy-shell .oaiy-rail-scrim { display: none; }
+  .app-shell.in-oaiy-shell .oaiy-topbar.one-row > .oaiy-actions { width: auto; flex: none; grid-column: auto; gap: 0; padding: 0; scrollbar-width: none; }
+  .app-shell.in-oaiy-shell .oaiy-actions .oaiy-icon-btn { width: 30px; height: 30px; }
+  .app-shell.in-oaiy-shell .oaiy-topbar.one-row .oaiy-title .oaiy-name-flow,
+  .app-shell.in-oaiy-shell .oaiy-topbar.one-row .oaiy-title input.oaiy-name { width: auto; max-width: 168px; min-height: 0; font-size: 14px; font-weight: 620; color: rgb(var(--color-text-primary)); }
+  .app-shell.in-oaiy-shell .oaiy-topbar.one-row .oaiy-title .oaiy-name-flow { max-width: 130px; }
+  .app-shell.in-oaiy-shell .oaiy-canvas-wrap .react-flow__controls { bottom: 0 !important; }
+  .app-shell.in-oaiy-shell .oaiy-tool > span { display: none; }
 }

@@ -23,7 +23,7 @@ export const defaultLLMEndpoints: LLMEndpoint[] = [
     name: 'Local Ollama',
     description: 'Local LLM via Ollama',
     endpoint: 'http://localhost:11434/v1/chat/completions',
-    model: 'llama3',
+    model: '',
     requestFormat: 'openai',
     isLocal: true,
   },

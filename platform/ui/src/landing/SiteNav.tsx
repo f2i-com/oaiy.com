@@ -146,7 +146,7 @@ function ThemeToggle() {
       onClick={() => setTheme(isDark ? 'light' : 'dark')}
       className="oaiy-icon-btn"
       aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      title={isDark ? 'Paper Circuit' : 'Prism Lab'}
+      title={isDark ? 'Light theme' : 'Dark theme'}
     >
       {isDark ? (
         <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">

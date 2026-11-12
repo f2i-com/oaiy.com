@@ -26,6 +26,7 @@ import {
 } from '../../../utils/serviceRegistry';
 import EngineEndpointCard from './EngineEndpointCard';
 import { inOaiyWindow } from '../../../lib/oaiyWindow';
+import { listErrorWords, listServiceModels } from '../../../lib/servicePresets';
 import { useToast } from '../../Toast';
 import { useConfirmDialog } from '../../../hooks/useConfirmDialog';
 import Dialog from '../../ui/Dialog';
@@ -80,7 +81,7 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
       method: 'POST',
       headers: '{}',
       bodyTemplate:
-        '{\n  "model": "local-model",\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
+        '{\n  "model": {{model}},\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
       responseType: 'json',
       responsePath: 'choices.0.message.content',
       apiFormat: 'openai',
@@ -95,11 +96,10 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
       method: 'POST',
       headers: '{}',
       bodyTemplate:
-        '{\n  "model": "llama3",\n  "messages": [{"role": "user", "content": {{input}}}],\n  "stream": false\n}',
+        '{\n  "model": {{model}},\n  "messages": [{"role": "user", "content": {{input}}}],\n  "stream": false\n}',
       responseType: 'json',
       responsePath: 'message.content',
       apiFormat: 'ollama',
-      model: 'llama3',
       nodeTypes: ['ai_llm', 'service_call'],
     },
   },
@@ -111,10 +111,9 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
       method: 'POST',
       headers: '{}',
       bodyTemplate:
-        '{\n  "model": "llama3",\n  "prompt": {{input}},\n  "stream": false\n}',
+        '{\n  "model": {{model}},\n  "prompt": {{input}},\n  "stream": false\n}',
       responseType: 'json',
       responsePath: 'response',
-      model: 'llama3',
       nodeTypes: ['service_call'],
     },
   },
@@ -129,7 +128,7 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
       // CORS-blocked.
       headers: '{"anthropic-version": "2023-06-01", "x-api-key": "{{apiKeyRaw}}", "anthropic-dangerous-direct-browser-access": "true"}',
       bodyTemplate:
-        '{\n  "model": "claude-sonnet-4-6",\n  "max_tokens": 4096,\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
+        '{\n  "model": {{model}},\n  "max_tokens": 4096,\n  "messages": [{"role": "user", "content": {{input}}}]\n}',
       responseType: 'json',
       responsePath: 'content.0.text',
       apiFormat: 'anthropic',
@@ -151,8 +150,8 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
     },
   },
   {
-    id: 'openai-gpt-image',
-    label: 'OpenAI GPT Image 2',
+    id: 'openai-images',
+    label: 'OpenAI pictures',
     description: 'Text-to-image via OpenAI — needs your OpenAI API key. Drop it on an Image Generation node to render the picture.',
     fields: {
       method: 'POST',
@@ -163,22 +162,21 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
       // apply when the service is used through a raw Service Call node.
       headers: '{"Authorization": "Bearer {{apiKeyRaw}}"}',
       bodyTemplate:
-        '{\n  "model": "gpt-image-2",\n  "prompt": {{input}},\n  "n": 1,\n  "size": "1024x1024"\n}',
+        '{\n  "model": {{model}},\n  "prompt": {{input}},\n  "n": 1,\n  "size": "1024x1024"\n}',
       responseType: 'json',
       // GPT Image returns base64 (no URL option); the Image Generation node
       // wraps it into a data: URL for display. A raw Service Call returns the
       // base64 string itself.
       responsePath: 'data.0.b64_json',
       apiFormat: 'openai',
-      model: 'gpt-image-2',
       apiKeyConstant: 'OPENAI_API_KEY',
       nodeTypes: ['image_gen', 'service_call'],
       icon: '🎨',
     },
   },
   {
-    id: 'whisper',
-    label: 'Whisper transcription',
+    id: 'speech-to-text',
+    label: 'Speech to text server',
     description: 'POST audio data URL or base64',
     fields: {
       method: 'POST',
@@ -210,7 +208,9 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
   },
 ];
 
-export default function ServicesTab({ isOpen }: ServicesTabProps) {
+export default function ServicesTab({ isOpen, constants }: ServicesTabProps) {
+  // A saved key, by its name, for asking its provider which models it has (the form's List models). Never shown.
+  const keyOf = (name: string): string | undefined => (constants ?? []).find((c) => c.key === name && !!c.value)?.value;
   const [services, setServices] = useState<CustomService[]>(() => listAllServices());
   const [editing, setEditing] = useState<CustomService | null>(null);
   // `adding` is optionally a template id to seed the form with —
@@ -286,34 +286,44 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
         flush={mine.length > 0}
         actions={
           // One entry point: the form's template dropdown offers the
-          // provider-shaped starting points.
-          <button
-            type="button"
-            onClick={() => setAdding('blank')}
-            className="btn btn-primary btn-sm"
-            disabled={adding !== null || !!editing}
-          >
-            <Plus size={13} /> Add a service
-          </button>
+          // provider-shaped starting points. At the right of the card's heading row once there are services; with
+          // none, the one action is inside the empty state below (the dashboard's rule: not in both places).
+          mine.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => setAdding('blank')}
+              className="btn btn-primary btn-sm"
+              disabled={adding !== null || !!editing}
+            >
+              <Plus size={13} /> Add a service
+            </button>
+          ) : undefined
         }
       >
         {mine.length === 0 ? (
           <>
             <p className="oaiy-card-text">
-              A service is an HTTP endpoint with a body template, a response path and the pins it
-              takes and gives: text to text, image and text to image, audio to text, anything.
+              A service is a model or a program your nodes call: one on this computer, or one with a key.
               Every node in the palette's Services list calls one.
             </p>
-            <EmptyState icon={<Server size={24} />} title="No services yet">
-              Add one: its form starts from a template for Ollama, OpenAI, ComfyUI, Whisper and others,
-              with the body and response path filled in. {keptWhere}
+            <EmptyState
+              icon={<Server size={24} />}
+              title="No services yet"
+              action={
+                <button type="button" onClick={() => setAdding('blank')} className="btn btn-primary" disabled={adding !== null || !!editing}>
+                  <Plus size={14} /> Add a service
+                </button>
+              }
+            >
+              Add one: pick the closest template (Ollama, OpenAI, ComfyUI, a speech-to-text server and others), give
+              its address, and choose a model from the ones it lists. {keptWhere}
             </EmptyState>
           </>
         ) : (
           <>
             <p className="oaiy-card-text border-b border-edge-secondary px-4 py-3">
-              HTTP endpoints your nodes call. {keptWhere} Each offers the pins it declares
-              on the Service Call node, and on the nodes it is tagged for.
+              The models and programs your nodes call. {keptWhere} Each is offered on the
+              Service Call node, and on the nodes it is made for.
             </p>
             <ul className="oaiy-rows m-0 list-none p-0">
               {mine.map((svc) => (
@@ -350,6 +360,7 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
             isNew
             onSave={handleSave}
             onCancel={() => setAdding(null)}
+            keyOf={keyOf}
           />
         );
       })()}
@@ -360,6 +371,7 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
           isNew={false}
           onSave={handleSave}
           onCancel={() => setEditing(null)}
+          keyOf={keyOf}
         />
       )}
     </>
@@ -497,7 +509,7 @@ function ServiceRow({
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <span className="oaiy-row-title">{svc.name}</span>
           {svc.isBuiltIn ? (
-            <span className="oaiy-pill info" title="Bundled with OAIY — ready to use as-is. Customize makes an editable copy.">built-in</span>
+            <span className="oaiy-pill info" title="Bundled with OAIY — ready to use as-is. Customize makes an editable copy.">Built-in</span>
           ) : null}
           {/* The "Used for" tags: which node types list this service. */}
           {(svc.nodeTypes ?? []).map((tag) => (
@@ -585,11 +597,17 @@ export function ServiceForm({
   intro,
   footerStart,
   error,
+  keyOf,
 }: {
   initial: CustomService;
   isNew: boolean;
   onSave: (svc: CustomService) => void;
   onCancel: () => void;
+  /**
+   * The value of an API key by its name in Settings → API keys, for asking the provider which models it has
+   * (List models). Used for that request alone and never shown; without it a provider that needs a key says so.
+   */
+  keyOf?: (constantName: string) => string | undefined;
   /** The dialog's title (default: "Add a service" or "Edit <name>"). */
   title?: ReactNode;
   /** Shown at the top of the form, above its fields. */
@@ -643,6 +661,32 @@ export function ServiceForm({
   // for `value` keeps the select on the picked option.
   const [appliedTemplate, setAppliedTemplate] = useState('');
 
+  // The provider's own list of models, asked for when List models is pressed (as the welcome wizard's Test does):
+  // the Model field offers them, and nothing is written into it for the person.
+  const [listed, setListed] = useState<string[] | null>(null);
+  const [listing, setListing] = useState(false);
+  const [listSaid, setListSaid] = useState<{ text: string; ok: boolean } | null>(null);
+  async function listTheModels() {
+    if (!draft.endpoint.trim()) {
+      setListSaid({ text: 'Give the address first.', ok: false });
+      return;
+    }
+    setListing(true);
+    setListSaid(null);
+    try {
+      const found = await listServiceModels(draft, draft.apiKeyConstant ? keyOf?.(draft.apiKeyConstant) ?? '' : '');
+      setListed(found);
+      setListSaid(found.length
+        ? { text: `${found.length} model${found.length === 1 ? '' : 's'} listed: choose one, or type another.`, ok: true }
+        : { text: 'It answers, and lists no models yet: add one to it, then List models again.', ok: false });
+    } catch (e) {
+      setListed(null);
+      setListSaid({ text: listErrorWords(e, draft.endpoint), ok: false });
+    } finally {
+      setListing(false);
+    }
+  }
+
   function set<K extends keyof CustomService>(key: K, value: CustomService[K]) {
     setDraft((d) => ({ ...d, [key]: value }));
   }
@@ -684,7 +728,7 @@ export function ServiceForm({
   // Smart-sync Default Model into the body template:
   //  - Always set draft.model so the runtime gets it via `{{model}}` vars.
   //  - Additionally, if the current body has the OLD model name as a JSON
-  //    string literal (e.g. `"model": "llama3"` from the Ollama template),
+  //    string literal (a name written into the body by hand),
   //    rewrite it to the new model so the user sees the change reflected
   //    in the visible Body Template field, not just in the silent default.
   //  - Skip the textual rewrite when the new model is empty (would corrupt
@@ -719,7 +763,7 @@ export function ServiceForm({
       open
       onClose={() => void handleCancel()}
       title={title ?? (isNew ? 'Add a service' : `Edit ${initial.name}`)}
-      description={isNew ? 'An HTTP endpoint your nodes can call.' : undefined}
+      description={isNew ? 'A model or a program your nodes call.' : undefined}
       icon={<Server size={16} />}
       tone="accent"
       size="lg"
@@ -745,7 +789,7 @@ export function ServiceForm({
       {isNew && (
         <Row
           label="Start from a template"
-          hint="Fills in the body, the response path and the headers. Pick the closest; you can change everything after (Advanced opens to show what it filled in)."
+          hint="Fills in how the service is spoken to. Pick the closest: everything it fills in can be changed under Advanced."
         >
           <select
             value={appliedTemplate}
@@ -780,94 +824,62 @@ export function ServiceForm({
 
       {/* Always-visible required fields */}
       <div className="oaiy-form-grid">
-        <Row label="Name (required)">
+        <Row label="Name">
           <input
             ref={nameRef}
             type="text"
             value={draft.name}
             onChange={(e) => setName(e.target.value)}
             className="oaiy-input"
-            placeholder="My Local Ollama"
+            placeholder="A name of your own"
           />
         </Row>
 
-        <Row label="Endpoint URL (required)">
+        <Row label="Address">
           <input
             type="text"
             value={draft.endpoint}
-            onChange={(e) => set('endpoint', e.target.value)}
+            onChange={(e) => { set('endpoint', e.target.value); setListed(null); setListSaid(null); }}
             className="oaiy-input mono"
             placeholder="http://localhost:11434/v1/chat/completions"
           />
         </Row>
       </div>
 
+      {/* The model: the provider's own list (List models), or its name typed by hand for a service that lists none.
+          Nothing is filled in for the person. A service that takes no model leaves it empty. */}
       <Row
-        group
-        label="Icon"
-        hint="Shown on the palette tile and the dropped node's title bar. Pick one, or type any emoji or other character in the box."
+        label="Model"
+        hint={listSaid ? undefined : 'Which model the service runs. List models asks the service for the ones it has; leave it empty for a service that takes none.'}
       >
-        <div className="flex flex-col gap-2">
-          {/* Quick-pick grid — covers the common service shapes. */}
-          <div className="flex flex-wrap gap-1">
-            {[
-              '🤖', '💬', '🧠', '🪄',
-              '🎨', '🖼️', '📷', '✏️',
-              '🎬', '🎥', '📹', '🎞️',
-              '🎵', '🎶', '🎙️', '🔊',
-              '👁️', '🗣️', '📝', '🌐',
-              '🪝', '🔌', '⚡', '🛠️',
-            ].map((emoji) => {
-              const active = (draft.icon ?? '') === emoji;
-              return (
-                <button
-                  key={emoji}
-                  type="button"
-                  onClick={() => set('icon', emoji)}
-                  aria-pressed={active}
-                  className={`flex h-8 w-8 items-center justify-center rounded-[var(--r-sm)] border text-lg leading-none transition-colors ${
-                    active
-                      ? 'border-accent bg-accent/15'
-                      : 'border-transparent bg-surface-tertiary hover:border-edge-strong'
-                  }`}
-                  title={`Use ${emoji}`}
-                >
-                  {emoji}
-                </button>
-              );
-            })}
-            {draft.icon && (
-              <button
-                type="button"
-                onClick={() => set('icon', '')}
-                className="oaiy-icon-btn"
-                title="Clear the icon (use the default server glyph)"
-                aria-label="Clear the icon"
-              >
-                <X size={14} />
-              </button>
-            )}
-          </div>
-          {/* Free-text fallback — any emoji / UTF-8 glyph the picker omits. */}
-          <div className="flex items-center gap-2">
-            <span className="text-[12px] text-content-faint">Or your own:</span>
-            <input
-              type="text"
-              value={draft.icon ?? ''}
-              onChange={(e) => set('icon', e.target.value)}
-              className="oaiy-input"
-              style={{ width: 96 }}
-              placeholder="🪝"
-              maxLength={6}
-              aria-label="Icon"
-            />
-            {draft.icon && (
-              <span className="text-[12px] text-content-faint">
-                Preview <span className="text-lg">{draft.icon}</span>
-              </span>
-            )}
-          </div>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={draft.model ?? ''}
+            onChange={(e) => setModel(e.target.value)}
+            className="oaiy-input mono flex-1"
+            placeholder="the model's name, as your provider lists it"
+            list="service-form-models"
+            aria-label="Model"
+          />
+          <datalist id="service-form-models">
+            {(listed ?? []).map((id) => <option key={id} value={id} />)}
+          </datalist>
+          <button type="button" className="btn" onClick={() => void listTheModels()} disabled={listing} title="Ask the service which models it has">
+            {listing ? 'Asking…' : 'List models'}
+          </button>
         </div>
+        {listed && listed.length > 0 && (
+          <div className="flex flex-wrap gap-1.5" role="group" aria-label="The models it lists">
+            {listed.slice(0, 12).map((id) => (
+              <button key={id} type="button" aria-pressed={draft.model === id} onClick={() => setModel(id)} className={`btn btn-sm mono ${draft.model === id ? 'btn-primary' : ''}`}>
+                {id}
+              </button>
+            ))}
+            {listed.length > 12 && <span className="oaiy-help faint self-center">and {listed.length - 12} more: type its name</span>}
+          </div>
+        )}
+        {listSaid && <p className={listSaid.ok ? 'oaiy-ok-text' : 'oaiy-error-text'} role="status">{listSaid.text}</p>}
       </Row>
 
       {/* Used for section removed — services are now purely defined by
@@ -876,7 +888,9 @@ export function ServiceForm({
           this video" use cases, etc. No artificial node-type buckets. */}
 
       {/* Advanced disclosure — everything templates already filled in */}
-      <div>
+      {/* (the button says one word and the line beside it says what is behind it: as one long label it ran past the
+          dialog's edge on a phone) */}
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
         <button
           type="button"
           onClick={() => setShowAdvanced((v) => !v)}
@@ -884,8 +898,9 @@ export function ServiceForm({
           aria-expanded={showAdvanced}
         >
           {showAdvanced ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-          {showAdvanced ? 'Hide advanced' : 'Advanced: body, response path, headers, API key, pins, ID'}
+          {showAdvanced ? 'Hide advanced' : 'Advanced'}
         </button>
+        {!showAdvanced && <span className="oaiy-help faint min-w-0">What is sent, where the answer is, the API key, its own icon.</span>}
       </div>
 
       {showAdvanced && (
@@ -913,18 +928,7 @@ export function ServiceForm({
           </div>
 
           <div className="grid grid-cols-[1fr_auto] gap-3">
-            <Row
-              label="Default model"
-              hint="Syncs into the body template: as the {{model}} placeholder when it runs, and by rewriting any literal &quot;old-model&quot; string already in the body."
-            >
-              <input
-                type="text"
-                value={draft.model ?? ''}
-                onChange={(e) => setModel(e.target.value)}
-                className="oaiy-input mono"
-                placeholder="llama3"
-              />
-            </Row>
+            {/* (the model is above, with the address: the body takes it as {{model}}) */}
             <Row label="Method">
               <select
                 value={draft.method}
@@ -1184,8 +1188,78 @@ export function ServiceForm({
               className="oaiy-textarea"
               style={{ minHeight: 56 }}
               rows={2}
-              placeholder="Run `ollama serve` and `ollama pull llama3`"
+              placeholder="How to start it, for whoever opens this next"
             />
+          </Row>
+
+          {/* A picture of its own for the service: an extra, with the other extras under Advanced. Without one it has
+              the editor's own line icon, on the palette and on its node. */}
+          <Row
+            group
+            label="Its own icon (optional)"
+            hint="Shown on the palette tile and the node's title bar in place of the editor's own icon. Pick one, or type any character in the box."
+          >
+            <div className="flex flex-col gap-2">
+              {/* Quick-pick grid — covers the common service shapes. */}
+              <div className="flex flex-wrap gap-1">
+                {[
+                  '🤖', '💬', '🧠', '🪄',
+                  '🎨', '🖼️', '📷', '✏️',
+                  '🎬', '🎥', '📹', '🎞️',
+                  '🎵', '🎶', '🎙️', '🔊',
+                  '👁️', '🗣️', '📝', '🌐',
+                  '🪝', '🔌', '⚡', '🛠️',
+                ].map((emoji) => {
+                  const active = (draft.icon ?? '') === emoji;
+                  return (
+                    <button
+                      key={emoji}
+                      type="button"
+                      onClick={() => set('icon', emoji)}
+                      aria-pressed={active}
+                      className={`flex h-8 w-8 items-center justify-center rounded-[var(--r-sm)] border text-lg leading-none transition-colors ${
+                        active
+                          ? 'border-accent bg-accent/15'
+                          : 'border-transparent bg-surface-tertiary hover:border-edge-strong'
+                      }`}
+                      title={`Use ${emoji}`}
+                    >
+                      {emoji}
+                    </button>
+                  );
+                })}
+                {draft.icon && (
+                  <button
+                    type="button"
+                    onClick={() => set('icon', '')}
+                    className="oaiy-icon-btn"
+                    title="Clear the icon (use the default server glyph)"
+                    aria-label="Clear the icon"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+              {/* Free-text fallback — any emoji / UTF-8 glyph the picker omits. */}
+              <div className="flex items-center gap-2">
+                <span className="text-[12px] text-content-faint">Or your own:</span>
+                <input
+                  type="text"
+                  value={draft.icon ?? ''}
+                  onChange={(e) => set('icon', e.target.value)}
+                  className="oaiy-input"
+                  style={{ width: 96 }}
+                  placeholder="🪝"
+                  maxLength={6}
+                  aria-label="Icon"
+                />
+                {draft.icon && (
+                  <span className="text-[12px] text-content-faint">
+                    Preview <span className="text-lg">{draft.icon}</span>
+                  </span>
+                )}
+              </div>
+            </div>
           </Row>
         </div>
       )}

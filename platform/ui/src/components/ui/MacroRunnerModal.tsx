@@ -368,7 +368,7 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
                     {typeInfo.icon}
                   </span>
                   {input.name}
-                  {input.required && <span className="oaiy-pill err">required</span>}
+                  {input.required && <span className="oaiy-pill err">Required</span>}
                 </label>
 
                 {needsFilePicker(input.type) ? (

@@ -58,7 +58,7 @@ export default function EngineEndpointCard() {
 
   const pill = (
     <span className={status?.available ? 'oaiy-pill dot ok' : 'oaiy-pill dot'}>
-      {status?.available ? `connected${status.version ? ` · v${status.version}` : ''}` : notAsked ? 'not connected' : 'not reachable'}
+      {status?.available ? `Connected${status.version ? ` · v${status.version}` : ''}` : notAsked ? 'Not connected' : 'Not reachable'}
     </span>
   );
 

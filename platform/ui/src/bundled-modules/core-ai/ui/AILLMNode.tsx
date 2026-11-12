@@ -105,16 +105,16 @@ function useCallbackRefs(data: AILLMNodeData) {
 // oaiy-local is the exception — its model id is a stable manifest reference
 // owned by us (`qwen3-1.7b-q4-k-m`), not a vendor name that rotates.
 const AI_PROVIDERS: { value: AIProvider; label: string; endpoint: string; model: string; placeholder?: string; apiKeyConstant: string; requestFormat: string }[] = [
-  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1/chat/completions', model: '', placeholder: 'e.g. gpt-5.4-mini', apiKeyConstant: 'OPENAI_API_KEY', requestFormat: 'openai' },
-  { value: 'anthropic', label: 'Anthropic', endpoint: 'https://api.anthropic.com/v1/messages', model: '', placeholder: 'e.g. claude-sonnet-4-6', apiKeyConstant: 'ANTHROPIC_API_KEY', requestFormat: 'anthropic' },
-  { value: 'google', label: 'Google AI', endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: '', placeholder: 'e.g. gemini-2.5-flash', apiKeyConstant: 'GOOGLE_API_KEY', requestFormat: 'openai' },
-  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1/chat/completions', model: '', placeholder: 'e.g. anthropic/claude-sonnet-4-6', apiKeyConstant: 'OPENROUTER_API_KEY', requestFormat: 'openai' },
-  { value: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: '', placeholder: 'e.g. llama-3.3-70b-versatile', apiKeyConstant: 'GROQ_API_KEY', requestFormat: 'openai' },
-  { value: 'ollama', label: 'Ollama (Local)', endpoint: 'http://localhost:11434/v1/chat/completions', model: '', placeholder: 'e.g. llama3.2 (pulled name)', apiKeyConstant: '', requestFormat: 'openai' },
-  { value: 'lmstudio', label: 'LM Studio (Local)', endpoint: 'http://localhost:1234/v1/chat/completions', model: '', placeholder: 'e.g. local-model or the LM Studio-exposed id', apiKeyConstant: '', requestFormat: 'openai' },
-  { value: 'huggingface', label: 'HuggingFace LLM (Local)', endpoint: 'http://127.0.0.1:8774/v1/chat/completions', model: '', placeholder: 'e.g. Qwen/Qwen3.5-9B', apiKeyConstant: '', requestFormat: 'openai' },
-  { value: 'oaiy-local', label: 'OAIY Local', endpoint: 'oaiy-llm://local', model: 'qwen3-1.7b-q4-k-m', apiKeyConstant: '', requestFormat: 'openai' },
-  { value: 'custom', label: 'Custom', endpoint: '', model: '', placeholder: 'provider-specific model id', apiKeyConstant: '', requestFormat: 'openai' },
+  { value: 'openai', label: 'OpenAI', endpoint: 'https://api.openai.com/v1/chat/completions', model: '', placeholder: "the model's name, as your provider lists it", apiKeyConstant: 'OPENAI_API_KEY', requestFormat: 'openai' },
+  { value: 'anthropic', label: 'Anthropic', endpoint: 'https://api.anthropic.com/v1/messages', model: '', placeholder: "the model's name, as your provider lists it", apiKeyConstant: 'ANTHROPIC_API_KEY', requestFormat: 'anthropic' },
+  { value: 'google', label: 'Google AI', endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: '', placeholder: "the model's name, as your provider lists it", apiKeyConstant: 'GOOGLE_API_KEY', requestFormat: 'openai' },
+  { value: 'openrouter', label: 'OpenRouter', endpoint: 'https://openrouter.ai/api/v1/chat/completions', model: '', placeholder: "the model's name, as OpenRouter lists it (maker/model)", apiKeyConstant: 'OPENROUTER_API_KEY', requestFormat: 'openai' },
+  { value: 'groq', label: 'Groq', endpoint: 'https://api.groq.com/openai/v1/chat/completions', model: '', placeholder: "the model's name, as your provider lists it", apiKeyConstant: 'GROQ_API_KEY', requestFormat: 'openai' },
+  { value: 'ollama', label: 'Ollama (Local)', endpoint: 'http://localhost:11434/v1/chat/completions', model: '', placeholder: "a model you have pulled, as ollama list names it", apiKeyConstant: '', requestFormat: 'openai' },
+  { value: 'lmstudio', label: 'LM Studio (Local)', endpoint: 'http://localhost:1234/v1/chat/completions', model: '', placeholder: "the model's name, as LM Studio lists it", apiKeyConstant: '', requestFormat: 'openai' },
+  { value: 'huggingface', label: 'HuggingFace LLM (Local)', endpoint: 'http://127.0.0.1:8774/v1/chat/completions', model: '', placeholder: "the model's name, as the server lists it", apiKeyConstant: '', requestFormat: 'openai' },
+  { value: 'oaiy-local', label: 'OAIY Local', endpoint: 'oaiy-llm://local', model: '', placeholder: "the model's name, as OAIY lists it", apiKeyConstant: '', requestFormat: 'openai' },
+  { value: 'custom', label: 'Custom', endpoint: '', model: '', placeholder: "the model's name, as your provider lists it", apiKeyConstant: '', requestFormat: 'openai' },
 ];
 
 // =====================================================================
@@ -758,13 +758,6 @@ function OaiyMmprojPicker({ value, onChange }: OaiyMmprojPickerProps) {
       {error && (
         <div className="text-[10px] text-red-600 dark:text-red-400">{error}</div>
       )}
-      <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-tight">
-        Required when sending an image input. Wired today: Gemma 3,
-        Qwen 3.5 / 3.6 multimodal, and MiniCPM-V 4.6 (first-cut port —
-        load errors will name any tensor that needs a one-line patch).
-        Leave blank to auto-resolve the companion mmproj when the
-        Model name looks like a paired set (e.g. MiniCPM-V).
-      </p>
     </div>
   );
 }
@@ -1117,7 +1110,7 @@ function AILLMNode({ data }: AILLMNodeProps) {
                 placeholder={
                   AI_PROVIDERS.find(p => p.value === provider)?.placeholder ||
                   AI_PROVIDERS.find(p => p.value === provider)?.model ||
-                  'provider-specific model id'
+                  "the model's name, as your provider lists it"
                 }
                 value={data.model || ''}
                 onChange={handleModelChange}
@@ -1310,7 +1303,7 @@ function AILLMNode({ data }: AILLMNodeProps) {
                 onChange={handleEnableThinkingChange}
               />
               Enable Thinking
-              <span className="text-slate-600 dark:text-slate-400 text-[10px]">(Qwen 3.5, etc.)</span>
+              <span className="text-slate-600 dark:text-slate-400 text-[10px]">(for a model that can)</span>
             </label>
           </div>
 

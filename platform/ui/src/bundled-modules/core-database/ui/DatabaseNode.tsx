@@ -96,9 +96,6 @@ function DatabaseNode({ data }: DatabaseNodeProps) {
             />
           </div>
 
-          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
-            Stores what comes in on Data (any JSON) in this collection, kept between runs.
-          </p>
         </>
       )}
     </CollapsibleNodeWrapper>

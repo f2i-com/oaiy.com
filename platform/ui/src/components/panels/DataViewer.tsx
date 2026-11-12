@@ -641,7 +641,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
             ) : data.length === 0 ? (
               <div className="p-4">
                 <EmptyState icon={<Database size={24} />} title="No records">
-                  {selectedCollection ? 'This collection is empty.' : 'Pick a collection on the left, or query with SQL.'}
+                  {selectedCollection ? 'This collection is empty.' : 'Pick a collection, or query with SQL.'}
                 </EmptyState>
               </div>
             ) : (

@@ -206,7 +206,7 @@ export default function ConvertToMacroDialog({
                 disabled={!analysis.isValid}
               />
               <span className="oaiy-pill">{input.dataType}</span>
-              {input.required && <span className="oaiy-pill err">required</span>}
+              {input.required && <span className="oaiy-pill err">Required</span>}
             </div>
           ))}
         </div>

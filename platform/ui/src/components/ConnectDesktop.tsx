@@ -4,7 +4,7 @@ import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { connectDesktop, disconnectDesktop } from '../lib/desktopConnect';
 import { subscribeDesktopStatus, type DesktopInfo } from '../lib/desktopDetection';
 import { linkedByConnect, subscribeDesktopLink } from '../lib/desktopLink';
-import { connectLead, connectState, connectWords } from '../lib/connectWords';
+import { connectDetails, connectLead, connectState, connectSummary, connectWords } from '../lib/connectWords';
 
 /**
  * Connect: how a tab in a browser is linked to OAIY Desktop (lib/desktopConnect.ts).
@@ -70,9 +70,16 @@ export default function ConnectDesktop({ variant }: { variant: 'card' | 'compact
   return (
     <div className="oaiy-connect">
       {(connect || disconnect) && <div className="flex flex-wrap items-center gap-2">{connect}{disconnect}</div>}
+      {/* Two sentences before the button is pressed; the rest of what one request does is a click away. */}
       <p className="oaiy-help faint" style={{ marginTop: 6 }} data-connect-words={state.kind}>
-        {words}
+        {connectSummary(state)}
       </p>
+      {connectDetails(state) && (
+        <details className="oaiy-help faint" style={{ marginTop: 4 }} data-connect-details>
+          <summary className="cursor-pointer font-medium text-content-secondary">What Connect does</summary>
+          <p style={{ margin: '6px 0 0' }}>{connectDetails(state)}</p>
+        </details>
+      )}
       {said && (
         <p className="oaiy-error-text" role="status">
           {said}

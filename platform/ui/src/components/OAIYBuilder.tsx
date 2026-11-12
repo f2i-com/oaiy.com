@@ -972,8 +972,20 @@ export default function OAIYBuilder({
           x: bounds ? bounds.left + over + (bounds.width - over) / 2 : window.innerWidth / 2,
           y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
         });
+        // Where it lands: the middle of the canvas seen, or, with a node already there, the first free place to
+        // its right (a flow reads left to right), then a row down, as far as the canvas seen goes. Clicked nodes
+        // used to cascade diagonally, 36 px apart, each lying over most of the one before, and had to be dragged
+        // apart before anything could be read or wired. With no free place in view, the cascade is what is left.
+        const W = 280, H = 170, GAP = 28;
+        const taken = nodesRef.current.filter((n) => !n.parentId).map((n) => ({ x: n.position.x, y: n.position.y, w: n.measured?.width ?? W, h: n.measured?.height ?? H }));
+        const free = (x: number, y: number) => !taken.some((t) => x < t.x + t.w + GAP && x + W + GAP > t.x && y < t.y + t.h + GAP && y + H + GAP > t.y);
+        const end = bounds ? reactFlowInstance.current.screenToFlowPosition({ x: bounds.right, y: bounds.bottom }) : { x: position.x + 640, y: position.y + 400 };
+        let spot: { x: number; y: number } | null = null;
+        for (let y = position.y - 64; !spot && y + H <= end.y; y += H + GAP) {
+          for (let x = position.x - 128; !spot && x + W <= end.x; x += W + GAP) if (free(x, y)) spot = { x, y };
+        }
         const k = (clickAddOffsetRef.current++ % 8) * 36;
-        addNode(type, { x: position.x - 128 + k, y: position.y - 64 + k });
+        addNode(type, spot ?? { x: position.x - 128 + k, y: position.y - 64 + k });
       } else {
         addNode(type);
       }

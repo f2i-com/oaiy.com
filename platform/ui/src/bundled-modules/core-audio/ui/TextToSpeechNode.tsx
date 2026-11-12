@@ -80,7 +80,7 @@ const EXTERNAL_PRESETS: ExternalPreset[] = [
     },
     {
         id: 'qwen3-tts',
-        label: 'Qwen3 TTS (local, port 8772)',
+        label: 'Speech server on this computer (port 8772)',
         url: 'http://127.0.0.1:8772/tts',
         method: 'POST',
         headers: '{"Content-Type": "application/json"}',

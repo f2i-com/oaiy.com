@@ -6,6 +6,18 @@ import CollapsibleNodeWrapper, { type HandleConfig } from '../components/Collaps
 import { PropertyField, shouldShowProperty } from './fields/PropertyField';
 import { describeServiceId } from '../registry/serviceNames';
 
+/** The longest help a card shows under a field. */
+export const CARD_HELP_MOST = 72;
+
+/**
+ * A property as its node's card shows it: its help only where that is a short line. Long help (some of it three
+ * hundred characters, set small under the field) made a card a page of small print; it is in the Properties panel,
+ * which opens beside the canvas when the node is chosen and shows every property with all of its help.
+ */
+export function onCard<T extends { description?: string }>(property: T): T {
+  return property.description && property.description.length > CARD_HELP_MOST ? { ...property, description: undefined } : property;
+}
+
 // Icon components map - we use simple SVG icons to avoid lucide-react dependency
 const defaultIconSvg = (
   <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -283,7 +295,7 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
         {data.showBodyProperties !== false && regularProperties.map((prop) => (
           <PropertyField
             key={prop.id}
-            property={prop}
+            property={onCard(prop)}
             value={data[prop.id]}
             onChange={handlePropertyChange(prop.id)}
             allValues={allValues}
@@ -300,7 +312,7 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
               {advancedProperties.map((prop) => (
                 <PropertyField
                   key={prop.id}
-                  property={prop}
+                  property={onCard(prop)}
                   value={data[prop.id]}
                   onChange={handlePropertyChange(prop.id)}
                   allValues={allValues}

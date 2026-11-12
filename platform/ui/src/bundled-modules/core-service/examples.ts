@@ -223,14 +223,14 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     endpoint: 'http://localhost:11434/api/generate',
     method: 'POST',
     headers: '{}',
-    bodyTemplate: '{\n  "model": "llama3",\n  "system": {{system}},\n  "prompt": {{input}},\n  "stream": false\n}',
+    bodyTemplate: '{\n  "model": {{model}},\n  "system": {{system}},\n  "prompt": {{input}},\n  "stream": false\n}',
     responseType: 'json',
     responsePath: 'response',
     isBuiltIn: true,
     nodeTypes: ['service_call'],
-    model: 'llama3',
+    model: '',
     installHint:
-      'Install Ollama from https://ollama.com, then run `ollama serve` and `ollama pull llama3`. Default port 11434. For browser use set `OLLAMA_ORIGINS=*`.',
+      'Install Ollama from https://ollama.com, then run `ollama serve` and pull a model (`ollama pull`, with the name of the one you want). Default port 11434. For browser use set `OLLAMA_ORIGINS=*`.',
   },
   {
     id: 'ollama-chat',
@@ -241,15 +241,15 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     method: 'POST',
     headers: '{}',
     bodyTemplate:
-      '{\n  "model": "llama3",\n  "messages": [{"role": "system", "content": {{system}}}, {"role": "user", "content": {{input}}}]\n}',
+      '{\n  "model": {{model}},\n  "messages": [{"role": "system", "content": {{system}}}, {"role": "user", "content": {{input}}}]\n}',
     responseType: 'json',
     responsePath: 'choices.0.message.content',
     isBuiltIn: true,
     nodeTypes: ['ai_llm', 'service_call'],
-    model: 'llama3',
+    model: '',
     apiFormat: 'openai',
     installHint:
-      'Ollama from https://ollama.com — `ollama serve` + `ollama pull llama3`. OpenAI-compat endpoint at /v1/chat/completions. Set `OLLAMA_ORIGINS=*` for browser access.',
+      'Ollama from https://ollama.com — `ollama serve`, and `ollama pull` with the name of the model you want. OpenAI-compat endpoint at /v1/chat/completions. Set `OLLAMA_ORIGINS=*` for browser access.',
   },
   {
     id: 'lmstudio-chat',
@@ -260,7 +260,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     method: 'POST',
     headers: '{}',
     bodyTemplate:
-      '{\n  "model": "local-model",\n  "messages": [{"role": "system", "content": {{system}}}, {"role": "user", "content": {{input}}}]\n}',
+      '{\n  "model": {{model}},\n  "messages": [{"role": "system", "content": {{system}}}, {"role": "user", "content": {{input}}}]\n}',
     responseType: 'json',
     responsePath: 'choices.0.message.content',
     isBuiltIn: true,
@@ -375,7 +375,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Image', type: 'image' }],
     installHint:
-      'Works with InstructPix2Pix servers, SDXL inpaint webhooks, or any custom edit endpoint that accepts JSON {prompt, image}.',
+      'Works with InstructPix2Pix servers, inpainting webhooks, or any custom edit endpoint that accepts JSON {prompt, image}.',
   },
   {
     // ByteDance Lance, over the JSON API of the Lance server OAIY Desktop used
@@ -444,10 +444,10 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     // height/width toward 1080p for best quality (slower). The model keeps
     // warm after the first call.
     id: 'ltx2-text-to-video',
-    name: 'LTX-2.3 — Text → Video',
+    name: 'Video server — Text → Video',
     icon: '🎬',
     description:
-      "Lightricks LTX-2.3 distilled text-to-video (with audio) from an LTX-2.3 server you run yourself (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
+      "Text to video (with sound) from a video server you run yourself (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
     endpoint: 'http://127.0.0.1:17890/generate',
     method: 'POST',
     headers: '{}',
@@ -463,7 +463,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Video', type: 'video' }],
     installHint:
-      "For an LTX-2.3 server you run yourself: JSON API at http://127.0.0.1:17890/generate. Needs a ~32 GB GPU. OAIY no longer installs one — OAIY's own engine makes LTX video: add the model in OAIY → Engines.",
+      "For a video server you run yourself: JSON API at http://127.0.0.1:17890/generate. Needs a ~32 GB GPU. OAIY no longer installs one — OAIY's own engine makes video: add a model in OAIY → Engines.",
   },
 ];
 

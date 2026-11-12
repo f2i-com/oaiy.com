@@ -1,8 +1,8 @@
 {
   "id": "service_call",
   "name": "Service Call",
-  "description": "Call a local HTTP service with a templated request body. The connected input is substituted into the body template; the response is parsed and an optional path extracts the field you want.",
-  "doc": "**Service** is a generic HTTP caller — point it at any local engine you run yourself.\n\n**Pick a Service Preset** to fill the endpoint + method + body template + response path in one click (Ollama / LM Studio / ComfyUI / Whisper / generic). Manage your own presets in **Settings → Services** (web) or paste templates inline on the node.\n\n**Templating** — the connected `input` is available as:\n  - `{{input}}` — JSON-escaped + quoted (safe to drop into a JSON string slot)\n  - `{{inputRaw}}` — raw substitution (use when input is already a JSON object/array)\n  - `{{apiKey}}` — resolves the **API Key Constant**\n  - `{{model}}` — the **Model** field\n  - `{{system}}` — the **System Message** field (chat/LLM bodies)\n\n**Response Path** uses dot/bracket notation: `choices.0.message.content`, `data[0].url`, etc. Leave blank to return the parsed body whole.\n\n**Inline overrides win** — any field you fill on the node overrides the same field from the selected preset.",
+  "description": "Calls one of your services (a model or a program) with what comes in, and gives on its answer.",
+  "doc": "**Service** is a generic HTTP caller — point it at any local engine you run yourself.\n\n**Pick a Service Preset** to fill the endpoint + method + body template + response path in one click (Ollama / LM Studio / ComfyUI / a speech-to-text server / generic). Manage your own presets in **Settings → Services** (web) or paste templates inline on the node.\n\n**Templating** — the connected `input` is available as:\n  - `{{input}}` — JSON-escaped + quoted (safe to drop into a JSON string slot)\n  - `{{inputRaw}}` — raw substitution (use when input is already a JSON object/array)\n  - `{{apiKey}}` — resolves the **API Key Constant**\n  - `{{model}}` — the **Model** field\n  - `{{system}}` — the **System Message** field (chat/LLM bodies)\n\n**Response Path** uses dot/bracket notation: `choices.0.message.content`, `data[0].url`, etc. Leave blank to return the parsed body whole.\n\n**Inline overrides win** — any field you fill on the node overrides the same field from the selected preset.",
   "icon": "server",
   "color": "cyan",
   "tags": ["service", "http", "api", "integration", "ollama", "comfyui", "webhook"],
@@ -39,7 +39,7 @@
       "type": "string",
       "default": "",
       "placeholder": "Model name",
-      "description": "Model name sent to the service. Substituted into the body template as {{model}}; legacy templates with a literal model string are rewritten in place when this changes. Leave blank to inherit from the service preset."
+      "description": "The model this step asks the service for. Empty: the service's own."
     },
     {
       "id": "systemMessage",
@@ -48,7 +48,7 @@
       "default": "",
       "rows": 3,
       "placeholder": "You are a helpful assistant…",
-      "description": "Optional system prompt for chat/LLM services (llama.cpp, Ollama, OpenAI-compatible). Substituted into the body as {{system}} (JSON-escaped). The built-in chat presets already include a {\"role\":\"system\"} slot, so just fill this in; for a custom body add {\"role\": \"system\", \"content\": {{system}}}."
+      "description": "What the model is told before the prompt: its role, its tone. For chat services; others ignore it."
     },
     {
       "id": "endpoint",
@@ -56,7 +56,7 @@
       "type": "string",
       "default": "",
       "placeholder": "http://localhost:11434/api/generate",
-      "description": "Full URL to the service."
+      "description": "The service's address."
     },
     {
       "id": "method",
@@ -78,7 +78,7 @@
       "default": "",
       "rows": 6,
       "placeholder": "{\"prompt\": {{input}}, \"stream\": false}",
-      "description": "Request body. Use {{input}} (JSON-escaped) or {{inputRaw}} for raw substitution. Ignored for GET/HEAD."
+      "description": "What is sent. {{input}} is this step's input, quoted; {{inputRaw}} is the input as it is. Not sent with GET."
     },
     {
       "id": "responseType",
@@ -96,7 +96,7 @@
       "type": "string",
       "default": "",
       "placeholder": "choices.0.message.content",
-      "description": "Dot/bracket path to extract from the response. Blank = return the whole parsed body."
+      "description": "Where the answer is in what comes back (choices.0.message.content). Empty: all of it."
     },
     {
       "id": "headers",
@@ -105,7 +105,7 @@
       "default": "",
       "rows": 2,
       "placeholder": "{\"Authorization\": \"Bearer {{apiKey}}\"}",
-      "description": "HTTP headers as JSON. {{apiKey}} resolves the API Key Constant. Blank = Content-Type: application/json.",
+      "description": "Headers, as JSON. {{apiKey}} is the key named below. Empty: Content-Type: application/json.",
       "advanced": true
     },
     {
@@ -114,7 +114,7 @@
       "type": "string",
       "default": "",
       "placeholder": "Constant name (e.g. OPENAI_API_KEY)",
-      "description": "Name of a Project Constant whose value is the API key, accessible as {{apiKey}} in headers + body.",
+      "description": "The API key to use, by its name in Settings → API keys.",
       "advanced": true
     }
   ],

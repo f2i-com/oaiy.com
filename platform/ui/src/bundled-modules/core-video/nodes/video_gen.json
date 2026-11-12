@@ -75,7 +75,7 @@
             "type": "audio",
             "position": "left",
             "required": false,
-            "description": "Audio input for audio-guided video generation (LTX 2.3, etc.)"
+            "description": "Sound to make the video to, for a model that takes sound"
         }
     ],
     "outputs": [
@@ -112,20 +112,9 @@
             "id": "wan2gpModel",
             "showIf": { "property": "service", "notStartsWith": "engine:" },
             "name": "Wan2GP Model",
-            "type": "select",
-            "default": "ltx2_22B_distilled",
-            "options": [
-                { "value": "ltx2_22B_distilled", "label": "LTX Video 2.3 Distilled (22B)" },
-                { "value": "ltx2_22B", "label": "LTX Video 2.3 (22B)" },
-                { "value": "ltx2_19B", "label": "LTX Video 2.0 (19B)" },
-                { "value": "t2v", "label": "Wan 2.1 T2V (14B)" },
-                { "value": "t2v_1.3B", "label": "Wan 2.1 T2V (1.3B)" },
-                { "value": "i2v", "label": "Wan 2.1 I2V 480p" },
-                { "value": "i2v_720p", "label": "Wan 2.1 I2V 720p" },
-                { "value": "t2v_2_2", "label": "Wan 2.2 T2V" },
-                { "value": "hunyuan_t2v", "label": "Hunyuan Video T2V" }
-            ],
-            "description": "Model for Wan2GP video generation",
+            "type": "string",
+            "default": "",
+            "description": "The model's name, as your Wan2GP server lists it (the node's card lists them while the server runs). Empty: the server's own.",
             "showWhen": { "apiFormat": ["wan2gp"] }
         },
         {

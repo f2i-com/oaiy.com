@@ -82,59 +82,39 @@ export function shellNavItems(
   onSelect: (s: EditorSection) => void,
   badges: Partial<Record<EditorSection, ReactNode>> = {},
   features?: Readonly<Partial<Record<FeatureId, boolean>>>,
+  inOaiy = false,
 ): ShellNavItem[] {
-  return SECTIONS.filter((s) => s.id !== 'packages' || features?.packages !== false).map((s) => ({ ...s, active: section === s.id, onClick: () => onSelect(s.id), badge: badges[s.id] }));
+  return SECTIONS.filter((s) => s.id !== 'packages' || features?.packages !== false).map((s) => ({
+    ...s,
+    // In OAIY's window the page is already "Flows" (the window's title, and its sidebar) and its tab "Editor": the
+    // section that shows the canvas is called by what it shows, so the same word is not on three rows.
+    ...(inOaiy && s.id === 'workflows' ? { label: CANVAS_LABEL, hint: 'The open flow, on the canvas' } : {}),
+    active: section === s.id,
+    onClick: () => onSelect(s.id),
+    badge: badges[s.id],
+  }));
 }
-
-/* --------------------------------------------------------------- sections */
+/** What the canvas's section is called in OAIY's window (see shellNavItems). */
+export const CANVAS_LABEL = 'Canvas';
 
 /**
- * In OAIY's window the editor has no rail of its own (OAIY's sidebar is beside
- * it): its sections are the dashboard's segmented tabs at the top of the page,
- * with New flow first and Settings last.
+ * In OAIY's window: the editor's sections as quiet text tabs in its one row, after the flow's name. Words alone,
+ * the open one underlined: the dashboard's own tabs (Editor / Run history / On other computers) are the segmented
+ * bar right above, and a second bar of the same kind under it read as one control drawn twice.
  */
-export function ShellSections({
-  items,
-  onNewFlow,
-  onOpenSettings,
-  settingsActive,
-}: {
-  items: ShellNavItem[];
-  onNewFlow: () => void;
-  onOpenSettings: () => void;
-  settingsActive: boolean;
-}) {
-  const all = [...items, { ...SETTINGS_ITEM, active: settingsActive, onClick: onOpenSettings, badge: undefined }];
+export function ShellQuietTabs({ items }: { items: ShellNavItem[] }) {
   return (
-    <nav className="oaiy-sections" aria-label="Flow editor">
-      <button type="button" className="oaiy-sections-new" onClick={onNewFlow} title="Make a new flow">
-        <Plus size={14} />
-        <span>New flow</span>
-      </button>
-      <div className="oaiy-sections-tabs" role="tablist" aria-label="Sections">
-        {all.map((item) => {
-          const Icon = item.icon;
-          return (
-            <button
-              type="button"
-              role="tab"
-              key={item.id}
-              className={item.active ? 'active' : ''}
-              aria-selected={item.active}
-              aria-label={item.label}
-              title={`${item.label}: ${item.hint}`}
-              onClick={item.onClick}
-            >
-              <Icon size={14} />
-              <span>{item.label}</span>
-              {item.badge}
-            </button>
-          );
-        })}
-      </div>
+    <nav className="oaiy-quiet-tabs" role="tablist" aria-label="The editor's sections">
+      {items.map((item) => (
+        <button type="button" role="tab" key={item.id} className={item.active ? 'active' : ''} aria-selected={item.active} title={`${item.label}: ${item.hint}`} onClick={item.onClick}>
+          <span>{item.label}</span>
+          {item.badge}
+        </button>
+      ))}
     </nav>
   );
 }
+
 
 /* ------------------------------------------------------------------ sidebar */
 
@@ -206,7 +186,7 @@ export function ShellSidebar({
       <div className="oaiy-brand">
         <strong>OAIY</strong>
         <span>Orchestrate AI Yourself</span>
-        <small>Connect. Draw. Expose.</small>
+        <small>Connect. Draw. Run.</small>
       </div>
 
       <button className="oaiy-new" type="button" aria-label="New flow" onClick={andClose(onNewFlow)}>
@@ -297,7 +277,8 @@ export function ShellTopbar({
   theme,
   onSetTheme,
   actions,
-  sections,
+  lead,
+  tabs,
 }: {
   /** Opens the off-canvas nav. Only rendered below md, where the rail is not
    *  in the grid — above md the rail is always visible and needs no opener. */
@@ -315,11 +296,18 @@ export function ShellTopbar({
   /** Absent in OAIY's window, where the theme is OAIY's (its sidebar switches it). */
   onSetTheme?: (t: 'light' | 'dark') => void;
   actions?: ReactNode;
-  /** In OAIY's window: the sections' tabs, in the breadcrumb's place (OAIY's own header names the page). */
-  sections?: ReactNode;
+  /**
+   * In OAIY's window the bar is ONE row (OAIY's own header, with the page's title and tabs, is right above it):
+   * `lead` at its left (New flow), then the names and the saved state, then `tabs` (the sections, as quiet text
+   * tabs), and the icon buttons at the right. No breadcrumb: the window says where this is.
+   */
+  lead?: ReactNode;
+  tabs?: ReactNode;
 }) {
+  const oneRow = !!tabs;
   return (
-    <header className={sections ? 'oaiy-topbar has-sections' : 'oaiy-topbar'}>
+    <header className={oneRow ? 'oaiy-topbar one-row' : 'oaiy-topbar'}>
+      {lead}
       {onOpenNav && (
         <button
           type="button"
@@ -334,7 +322,7 @@ export function ShellTopbar({
         </button>
       )}
       <div className="oaiy-title">
-        {sections ?? (
+        {oneRow ? null : (
           <span>
             OAIY <ChevronRight size={12} /> {crumb}
           </span>
@@ -350,6 +338,7 @@ export function ShellTopbar({
           )}
         </div>
       </div>
+      {tabs}
       <div className="oaiy-actions">
         {/* One button, not two. A segmented pair spends double the width to
             say what one icon says, and in a topbar that already overflows on a
@@ -362,8 +351,9 @@ export function ShellTopbar({
           <button
             type="button"
             className="oaiy-icon-btn"
-            aria-label={theme === 'dark' ? 'Switch to the Paper Circuit light theme' : 'Switch to the Prism Lab dark theme'}
-            title={theme === 'dark' ? 'Switch to Paper Circuit' : 'Switch to Prism Lab'}
+            // (what it does, in a person's words: the design system's names for the two themes mean nothing here)
+            aria-label={theme === 'dark' ? 'Light theme' : 'Dark theme'}
+            title={theme === 'dark' ? 'Light theme' : 'Dark theme'}
             onClick={() => onSetTheme(theme === 'dark' ? 'light' : 'dark')}
           >
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}

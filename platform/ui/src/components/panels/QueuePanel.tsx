@@ -161,12 +161,12 @@ const StatusBadge = memo(function StatusBadge({ status }: { status: Job['status'
   };
 
   const labels: Record<Job['status'], string> = {
-    pending: 'waiting',
-    running: 'running',
-    awaiting_ai: 'awaiting AI',
-    completed: 'done',
-    failed: 'failed',
-    aborted: 'stopped',
+    pending: 'Waiting',
+    running: 'Running',
+    awaiting_ai: 'Awaiting AI',
+    completed: 'Done',
+    failed: 'Failed',
+    aborted: 'Stopped',
   };
 
   return <span className={tone[status]}>{labels[status]}</span>;
@@ -548,7 +548,7 @@ function QueuePanel({ onNavigateToFlow }: QueuePanelProps) {
       }
       actions={
         <span className={busy ? 'oaiy-pill dot accent live' : 'oaiy-pill dot ok'}>
-          {busy ? `running ${activeJobs.length}` : 'idle'}
+          {busy ? `Running ${activeJobs.length}` : 'Idle'}
         </span>
       }
       testId="queue-page"

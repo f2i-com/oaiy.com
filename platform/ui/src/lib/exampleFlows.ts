@@ -15,12 +15,15 @@ export interface ExampleFlow {
   /** The id it is stored under: its file's name. */
   id: string;
   name: string;
+  /** One line, for the rail: what the flow makes, with no step counts or model names. */
   description: string;
+  /** The flow's own notes: how it works step by step and what it was made with. Not the rail's line. */
+  notes: string;
   tags: string[];
   graph: Flow['graph'];
 }
 
-type Doc = { name?: unknown; description?: unknown; tags?: unknown; nodes?: unknown; edges?: unknown };
+type Doc = { name?: unknown; description?: unknown; notes?: unknown; tags?: unknown; nodes?: unknown; edges?: unknown };
 
 /** An example file as an example flow (`null` for one that is not a flow). */
 export function exampleFrom(path: string, doc: Doc): ExampleFlow | null {
@@ -30,6 +33,7 @@ export function exampleFrom(path: string, doc: Doc): ExampleFlow | null {
     id,
     name: typeof doc.name === 'string' && doc.name ? doc.name : id,
     description: typeof doc.description === 'string' ? doc.description : '',
+    notes: typeof doc.notes === 'string' ? doc.notes : '',
     tags: Array.isArray(doc.tags) ? doc.tags.filter((t): t is string => typeof t === 'string') : [],
     graph: { nodes: doc.nodes as Flow['graph']['nodes'], edges: (Array.isArray(doc.edges) ? doc.edges : []) as Flow['graph']['edges'] },
   };

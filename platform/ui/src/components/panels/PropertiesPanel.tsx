@@ -8,6 +8,7 @@ import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import { getCustomNodeDefinition } from '../../services/customNodeRegistry';
 import { getService, listAllServices } from '../../utils/serviceRegistry';
 import { listDesktopServices } from '../../lib/desktopServices';
+import { CARD_HELP } from '../../lib/nodeHelp';
 
 import { SWATCH_CLASS } from './nodeSwatches';
 
@@ -278,6 +279,14 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                     <div className="oaiy-props-id">{selectedNode.id}</div>
                 </div>
             </div>
+
+            {/* What the node does: its own line, and the help that used to stand on its card in small print. */}
+            {(definition.description || CARD_HELP[definition.id]) && (
+                <div className="oaiy-props-about" aria-label="About this node">
+                    {definition.description && <p>{definition.description}</p>}
+                    {(CARD_HELP[definition.id] ?? []).map((words) => <p key={words} className="more">{words}</p>)}
+                </div>
+            )}
 
             {/* The node's settings. */}
             <div className="oaiy-props-fields">

@@ -25,6 +25,7 @@ import {
   isSharingEnabled,
   setSharingEnabled,
 } from '../../lib/sharingPrefs';
+import { inOaiyWindow } from '../../lib/oaiyWindow';
 import {
   zippSandboxEnabled,
   zippSandboxSupported,
@@ -191,12 +192,19 @@ export default function SettingsPanel({
   const apiKeyConstants = constants.filter(c => c.category === 'api_key');
   const customConstants = constants.filter(c => c.category !== 'api_key');
 
+  // In OAIY's window the theme is OAIY's, so there is nothing to set under Appearance (the page held one sentence
+  // saying so): it is not listed there, and a kept "appearance" opens Services. The page is called what its button
+  // is, "Editor settings": the window has a Settings of its own.
+  const inOaiy = inOaiyWindow();
+  const pages = inOaiy ? ORDER.filter((id) => id !== 'appearance') : ORDER;
+  if (inOaiy && page === 'appearance') page = 'services';
+
   const nav = (
     <SubNav
-      label="Settings pages"
+      label={inOaiy ? 'Editor settings pages' : 'Settings pages'}
       active={page}
       onSelect={(id) => onPageChange(id as SettingsPage)}
-      items={ORDER.map((id) => ({
+      items={pages.map((id) => ({
         id,
         label: PAGES[id].label,
         icon: PAGES[id].icon,
@@ -220,7 +228,7 @@ export default function SettingsPanel({
 
   return (
     <SectionPage
-      kicker="Settings"
+      kicker={inOaiy ? 'Editor settings' : 'Settings'}
       title={PAGES[page].label}
       description={PAGES[page].copy}
       actions={actions}

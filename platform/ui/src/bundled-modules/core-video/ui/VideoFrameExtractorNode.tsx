@@ -228,7 +228,6 @@ function VideoFrameExtractorNode({ data }: VideoFrameExtractorNodeProps) {
               />
             </div>
           </div>
-          <p className="text-slate-500 dark:text-slate-400 text-[10px] m-0">Batch Size 0 takes every frame at once; more, that many at a time (less memory).</p>
 
           {/* Output format */}
           <div>

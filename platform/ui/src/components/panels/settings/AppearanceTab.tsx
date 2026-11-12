@@ -68,16 +68,16 @@ export default function AppearanceTab() {
             <span className="grid h-12 w-12 place-items-center rounded-[var(--r-ctl)] border border-[#cec8be] bg-[#f3f0e9] text-[#9c6a08]">
               <Sun size={22} />
             </span>
-            <span className="text-[13px] font-semibold text-content-primary">Paper Circuit</span>
-            <span className="text-[11.5px] text-content-faint">Light</span>
+            <span className="text-[13px] font-semibold text-content-primary">Light</span>
+            <span className="text-[11.5px] text-content-faint">Warm paper, blue ink</span>
             {theme === 'light' && <Check size={14} className="absolute right-2 top-2 text-accent" />}
           </button>
           <button type="button" onClick={() => setTheme('dark')} aria-pressed={theme === 'dark'} className={choice(theme === 'dark')}>
             <span className="grid h-12 w-12 place-items-center rounded-[var(--r-ctl)] border border-[#33425c] bg-[#070a12] text-[#98a6bd]">
               <Moon size={22} />
             </span>
-            <span className="text-[13px] font-semibold text-content-primary">Prism Lab</span>
-            <span className="text-[11.5px] text-content-faint">Dark</span>
+            <span className="text-[13px] font-semibold text-content-primary">Dark</span>
+            <span className="text-[11.5px] text-content-faint">Near black, violet light</span>
             {theme === 'dark' && <Check size={14} className="absolute right-2 top-2 text-accent" />}
           </button>
         </div>
@@ -147,7 +147,7 @@ export default function AppearanceTab() {
             </a>
           </div>
           <div className="flex items-center gap-2">
-            <span className="oaiy-pill dot accent live">running</span>
+            <span className="oaiy-pill dot accent live">Running</span>
             <span className="text-[12px] text-content-faint">Status</span>
           </div>
         </div>

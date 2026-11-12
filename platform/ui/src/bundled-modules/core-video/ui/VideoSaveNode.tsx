@@ -135,7 +135,6 @@ function VideoSaveNode({ data }: VideoSaveNodeProps) {
                         </div>
                     </div>
 
-                    <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">Saves each video that reaches it as the flow runs, and gives on where it went.</p>
                 </>
             )}
         </CollapsibleNodeWrapper>

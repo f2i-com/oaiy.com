@@ -20,7 +20,7 @@ const WHITELIST_PRESETS = [
   { label: 'Ollama', value: 'localhost:11434' },
   { label: 'LM Studio', value: 'localhost:1234' },
   { label: 'ComfyUI', value: 'localhost:8188' },
-  { label: 'Stable Diffusion', value: 'localhost:7860' },
+  { label: 'Picture server (port 7860)', value: 'localhost:7860' },
 ];
 
 export default function SecurityTab({ settings, onUpdateSettings, onShowToast }: SecurityTabProps) {

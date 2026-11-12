@@ -235,9 +235,6 @@ function InputFolderNode({ data }: InputFolderNodeProps) {
             </div>
           )}
 
-          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
-            Gives the list of the files it finds: each one's path, name, extension and size.
-          </p>
         </>
       )}
     </CollapsibleNodeWrapper>

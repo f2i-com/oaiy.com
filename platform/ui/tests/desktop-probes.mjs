@@ -449,7 +449,14 @@ await check('the words of each state: never connected sends nothing until presse
   assert.deepEqual([never.kind, connected.kind, offline.kind, address.kind, addressUp.kind], ['never', 'connected', 'connected', 'address', 'address']);
 
   const neverWords = W.connectWords(never);
-  assert.match(neverWords, /^Connect sends one request to http:\/\/127\.0\.0\.1:17972 \(GET \/api\/health\) to ask whether OAIY Desktop is running\. Until you press it this page sends nothing to your computer or your network\./);
+  // The two sentences a person needs before pressing it lead (and are all the card shows until "What Connect does" is opened).
+  assert.equal(W.connectSummary(never), 'Connect asks http://127.0.0.1:17972 whether OAIY Desktop is running. Until you press it, this page asks nothing of your computer or your network.');
+  assert.ok(neverWords.startsWith(`${W.connectSummary(never)} `) && neverWords.endsWith(W.connectDetails(never)), 'the tooltip is the two parts, whole');
+  assert.match(W.connectDetails(never), /^It is one request \(GET \/api\/health\)\./);
+  for (const state of [connected, offline, address, addressUp]) {
+    assert.equal(W.connectSummary(state), W.connectWords(state), 'a linked tab has no more to say than its card shows');
+    assert.equal(W.connectDetails(state), '');
+  }
   assert.match(neverWords, /may ask whether this site may connect to devices on your network/);
   assert.match(neverWords, /keeps the link: from then on the editor asks it again each time it opens and every 10 seconds while it is open, and reads its services\. Disconnect ends that\./, 'what one request leads to is said, not hidden');
   // What is refused until then, and what the check cannot see (F4): the address as written, not where a redirect or a name leads.
@@ -458,7 +465,7 @@ await check('the words of each state: never connected sends nothing until presse
   for (const [name, state] of [['connected', connected], ['offline', offline], ['address', address], ['address that answers', addressUp]]) {
     const words = W.connectWords(state);
     assert.match(words, /each time it opens and every 10 seconds while it is open/, name);
-    assert.doesNotMatch(words, /sends nothing|Until you press it|loads no picture/, `${name}: what is true of a tab that has never connected is not said of this one`);
+    assert.doesNotMatch(words, /sends nothing|asks nothing of your computer|Until you press it|loads no picture/, `${name}: what is true of a tab that has never connected is not said of this one`);
     assert.ok(words.includes(state.base), `${name}: it names where it asks`);
   }
   assert.match(W.connectWords(connected), /^Connected to http:\/\/127\.0\.0\.1:17972\. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, each time it opens and every 10 seconds while it is open\. Disconnect ends that\.$/);

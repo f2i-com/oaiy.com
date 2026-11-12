@@ -20,8 +20,8 @@ import { usePackageManager, type LoadedPackage, type ActivePackageFlow } from '.
 import { JobQueueProvider, useJobQueue } from '../contexts/JobQueueContext';
 import { ConfirmDialogProvider } from '../hooks/useConfirmDialog';
 import ImportMenu from './ImportMenu';
-import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellSections, shellNavItems, type EditorSection } from './chrome/ShellChrome';
-import { Bot, HelpCircle, PanelLeft, Plus, Share2 } from 'lucide-react';
+import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellQuietTabs, shellNavItems, CANVAS_LABEL, type EditorSection } from './chrome/ShellChrome';
+import { Bot, HelpCircle, PanelLeft, Plus, Share2, Wrench } from 'lucide-react';
 import AgentToolDialog from './dialogs/AgentToolDialog';
 import NewFlowDialog from './dialogs/NewFlowDialog';
 import { useTheme } from '../contexts/ThemeContext';
@@ -166,7 +166,8 @@ export default function OAIYApp() {
     // was drawn. From md up it is a docked column and should honour the
     // stored preference like any other week.
     try {
-      if (typeof window !== 'undefined' && window.innerWidth < 760) return false;
+      // (a phone in a browser: in OAIY's window a narrow view folds the rail without touching what is kept)
+      if (typeof window !== 'undefined' && window.innerWidth <= 700 && !inOaiyWindow()) return false;
       return localStorage.getItem(FLOWS_RAIL_KEY) !== 'collapsed';
     } catch {
       // Private mode / storage disabled — not a reason to fail to render.
@@ -183,8 +184,20 @@ export default function OAIYApp() {
   // Below md the left rail is off-canvas (see index.css "phone: the rail
   // becomes a drawer"). Above md it is a grid column and this stays false.
   const [navOpen, setNavOpen] = useState(false);
-  const isPhone = useMediaQuery('(width < 760px)');
+  // In OAIY's window the editor is never a phone: its view is the window less OAIY's sidebar, 686 px at the window's
+  // smallest and under 760 px for any window narrower than about 834 px, on a desktop with a mouse. There the flows
+  // rail folds to its narrow strip instead (below), and nothing lies over the canvas or dims it.
+  // (700 px and under is a phone, as in OAIY's dashboard: its smallest window, 760 x 560, is a desktop)
+  const narrow = useMediaQuery('(width <= 700px)');
+  const isPhone = narrow && !inOaiyWindow();
   useEffect(() => { if (!isPhone) setNavOpen(false); }, [isPhone]);
+  // The rail in a narrow OAIY window: folded until it is asked for, and opening it there is for now only (the
+  // kept preference is the wide window's, where the rail has room beside the canvas).
+  const railFolds = narrow && inOaiyWindow();
+  const [narrowRailOpen, setNarrowRailOpen] = useState(false);
+  useEffect(() => { if (!railFolds) setNarrowRailOpen(false); }, [railFolds]);
+  const railOpen = railFolds ? narrowRailOpen : flowsSidebarOpen;
+  const setRailOpen = useCallback((open: boolean | ((was: boolean) => boolean)) => (railFolds ? setNarrowRailOpen(open) : setFlowsSidebarOpen(open)), [railFolds]);
   // The section showing in the main area (Workflows, Data, Queue, Packages,
   // Settings) and, in Settings, its page. Each is a view, not a popup: the
   // canvas stays mounted beneath the others, so coming back to Workflows finds
@@ -661,13 +674,13 @@ export default function OAIYApp() {
       // advertise in their tooltip.
       if ((e.ctrlKey || e.metaKey) && key === 'b') {
         e.preventDefault();
-        setFlowsSidebarOpen((open) => !open);
+        setRailOpen((open) => !open);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [saveNow, addToast]);
+  }, [saveNow, addToast, setRailOpen]);
 
   // localStorage QuotaExceededError → sticky warning toast.
   //
@@ -697,7 +710,7 @@ export default function OAIYApp() {
 
   // The editor's sections: the web rail's entries, or in OAIY's window the
   // tabs at the top. One of them shows at a time, in the main area.
-  const navItems = shellNavItems(section, setSection, { queue: <QueueCount /> }, caps.features);
+  const navItems = shellNavItems(section, setSection, { queue: <QueueCount /> }, caps.features, followsOaiy);
   const newFlow = () => setNewFlowOpen(true);
   const openSettings = (page?: SettingsPage) => {
     if (page) setSettingsPage(page);
@@ -705,7 +718,7 @@ export default function OAIYApp() {
   };
   // The rail lists flows: it is there for the canvas and a flow's data.
   const railSection = section === 'workflows' || section === 'data';
-  const SECTION_LABEL: Record<EditorSection, string> = { workflows: 'Flows', data: 'Data', queue: 'Queue', packages: 'Packages', settings: 'Settings' };
+  const SECTION_LABEL: Record<EditorSection, string> = { workflows: followsOaiy ? CANVAS_LABEL : 'Flows', data: 'Data', queue: 'Queue', packages: 'Packages', settings: followsOaiy ? 'Editor settings' : 'Settings' };
 
   return (
     <JobQueueProvider
@@ -757,11 +770,17 @@ export default function OAIYApp() {
         <ShellTopbar
           navOpen={navOpen}
           onOpenNav={followsOaiy ? undefined : () => setNavOpen(true)}
-          sections={
+          // In OAIY's window: one row. New flow, the names and the saved state, the sections as quiet tabs, the
+          // icon buttons (the editor's own settings among them). OAIY's header above it has the title and the tabs.
+          lead={
             followsOaiy ? (
-              <ShellSections items={navItems} onNewFlow={newFlow} onOpenSettings={() => openSettings()} settingsActive={section === 'settings'} />
+              <button type="button" className="oaiy-sections-new" onClick={newFlow} title="Make a new flow" aria-label="New flow">
+                <Plus size={14} />
+                <span>New flow</span>
+              </button>
             ) : undefined
           }
+          tabs={followsOaiy ? <ShellQuietTabs items={navItems} /> : undefined}
           crumb={SECTION_LABEL[section]}
           theme={resolvedTheme}
           onSetTheme={followsOaiy ? undefined : setTheme}
@@ -788,8 +807,8 @@ export default function OAIYApp() {
                 <ShellIconAction
                   label="Toggle the flows rail"
                   title={`Show or hide the flows (${shortcut('B')})`}
-                  on={flowsSidebarOpen}
-                  onClick={() => setFlowsSidebarOpen(!flowsSidebarOpen)}
+                  on={railOpen}
+                  onClick={() => setRailOpen(!railOpen)}
                 >
                   <PanelLeft size={16} />
                 </ShellIconAction>
@@ -838,6 +857,18 @@ export default function OAIYApp() {
               >
                 <HelpCircle size={16} />
               </ShellIconAction>
+              {/* In OAIY's window the window has a Settings of its own (its sidebar's foot): the editor's is named
+                  for what it is and has another icon, here among the editor's own buttons. */}
+              {followsOaiy && (
+                <ShellIconAction
+                  label="Editor settings"
+                  title="Editor settings: the services, API keys and constants your flows use, and which addresses they may reach"
+                  on={section === 'settings'}
+                  onClick={() => (section === 'settings' ? setSection('workflows') : openSettings())}
+                >
+                  <Wrench size={16} />
+                </ShellIconAction>
+              )}
             </>
           }
         >
@@ -920,9 +951,9 @@ export default function OAIYApp() {
               onSaveMacro={handleSaveMacroChanges}
               onRevertMacro={handleRevertMacro}
               hasMacroBeenModified={hasMacroBeenModified}
-              isOpen={flowsSidebarOpen}
-              onClose={() => setFlowsSidebarOpen(false)}
-              onOpen={() => setFlowsSidebarOpen(true)}
+              isOpen={railOpen}
+              onClose={() => setRailOpen(false)}
+              onOpen={() => setRailOpen(true)}
               loadedPackages={loadedPackages}
               activePackageFlow={activePackageFlow}
               onSelectPackageFlow={handleSelectPackageFlow}
@@ -1175,6 +1206,9 @@ export default function OAIYApp() {
         configuredKeyConstants={(project.constants ?? [])
           .filter((c) => !!c.value && (c.isSecret || c.category === 'api_key'))
           .map((c) => c.key)}
+        // A key already saved, for asking its provider which models it has when the wizard's key field is left blank
+        // (the wizard chooses the model from that list; it writes none in). Used for that request, never shown.
+        resolveApiKey={(constantName) => (project.constants ?? []).find((c) => c.key === constantName && !!c.value)?.value}
         // (no toast: the wizard lists each service it adds)
         onSaveService={(svc) => saveService(svc)}
         onSaveApiKey={(constantName, value) => {

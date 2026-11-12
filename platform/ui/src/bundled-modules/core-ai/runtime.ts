@@ -741,7 +741,7 @@ async function chat(
     }
     if (!model) {
       throw new Error(
-        'AI chat: OAIY Local (GGUF) requires a model id (e.g. "qwen3-1.7b-q4-k-m") in the Model field',
+        'AI chat: OAIY Local (GGUF) needs a model: type its name in the Model field of the node, as OAIY lists it',
       );
     }
     // Image input → file paths for the engine. plugin-llm's vision_chat
@@ -793,9 +793,8 @@ async function chat(
     if (hasImages && !mmprojClean) {
       throw new Error(
         'AI chat: OAIY Local (GGUF) image input requires a Vision Projector (mmproj) path on the node. ' +
-        'Pick a companion `mmproj-*.gguf` in the AI LLM node advanced settings — supported today: ' +
-        'Gemma 3, Qwen 3.5 / 3.6 multimodal, and MiniCPM-V 4.6 (first-cut port; load errors will name ' +
-        'any tensor mismatches that need fixing).',
+        'Pick a companion `mmproj-*.gguf` in the AI LLM node advanced settings. A model whose companion file is not ' +
+        'supported says so as it loads.',
       );
     }
 
@@ -1357,7 +1356,7 @@ async function chat(
 
     // Claude-as-AI mode: yield for external AI response instead of calling the API
     if (ctx.useClaudeForAI && ctx.yieldForAI) {
-      ctx.log('info', `[AI] Claude-as-AI mode: yielding for external response`);
+      ctx.log('info', `[AI] assistant-as-AI mode: yielding for external response`);
 
       // Build history array from messageHistory if it's an array
       const historyArray = Array.isArray(messageHistory)
@@ -1390,7 +1389,7 @@ async function chat(
       }
 
       ctx.onNodeStatus?.(nodeId, 'completed');
-      ctx.log('success', `[AI] Chat completed (via Claude-as-AI)`);
+      ctx.log('success', `[AI] Chat completed (via assistant-as-AI)`);
       return cleaned;
     }
 

@@ -26,11 +26,29 @@ export function connectState(input: { linkedByConnect: boolean; addressGiven: bo
 
 const EACH = `each time it opens and every ${POLL_SECONDS} seconds while it is open`;
 
-/** The paragraph under the button (the card in Settings), and the button's tooltip in the sidebar. */
+/**
+ * What stands under the button in Settings: for a tab that has never connected, the two sentences a person needs
+ * before pressing it (what it asks, and that nothing is asked until then); for the others, all there is to say.
+ */
+export function connectSummary(state: ConnectState): string {
+  if (state.kind !== 'never') return connectWords(state);
+  return `Connect asks ${state.base} whether OAIY Desktop is running. Until you press it, this page asks nothing of your computer or your network.`;
+}
+
+/**
+ * The rest, for a tab that has never connected, under "What Connect does": the one request it is, the browser's own
+ * question, what the editor refuses to load until then, and what one answer leads to. '' for the other states.
+ */
+export function connectDetails(state: ConnectState): string {
+  if (state.kind !== 'never') return '';
+  return `It is one request (GET /api/health). Your browser may ask whether this site may connect to devices on your network: that question is this request. Until you connect, the editor also loads no picture, video or sound from an address on your computer or your network, judging by the address as written: a link that redirects there, or a name that points there, is left to your browser's own question. If the desktop answers, this browser keeps the link: from then on the editor asks it again ${EACH}, and reads its services. Disconnect ends that.`;
+}
+
+/** Everything said of a state, in one piece: the button's tooltip in the sidebar (the card shows it in the two parts above). */
 export function connectWords(state: ConnectState): string {
   switch (state.kind) {
     case 'never':
-      return `Connect sends one request to ${state.base} (GET /api/health) to ask whether OAIY Desktop is running. Until you press it this page sends nothing to your computer or your network. Your browser may ask whether this site may connect to devices on your network: that question is this request. Until you connect, the editor also loads no picture, video or sound from an address on your computer or your network, judging by the address as written: a link that redirects there, or a name that points there, is left to your browser's own question. If the desktop answers, this browser keeps the link: from then on the editor asks it again ${EACH}, and reads its services. Disconnect ends that.`;
+      return `${connectSummary(state)} ${connectDetails(state)}`;
     case 'connected':
       return state.available
         ? `Connected to ${state.base}. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, ${EACH}. Disconnect ends that.`

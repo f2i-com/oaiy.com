@@ -8,14 +8,17 @@ import type { ComfyUIImageInputConfig, SeedMode } from './ComfyUIWorkflowDialog'
 
 // API format info with default endpoints and API key constants
 const API_FORMATS: { value: ImageProvider | string; label: string; description: string; endpoint: string; model: string; isLocal?: boolean; apiKeyConstant: string; supportsImg2Img?: boolean }[] = [
-  { value: 'openai', label: 'OpenAI GPT Image', description: 'GPT Image 2 — state-of-the-art quality & text rendering', endpoint: 'https://api.openai.com/v1/images/generations', model: 'gpt-image-2', apiKeyConstant: 'OPENAI_API_KEY', supportsImg2Img: true },
-  { value: 'gemini-3-pro', label: 'Gemini 3 Pro', description: 'Best quality - 4K, thinking, grounding', endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent', model: 'gemini-3-pro-image-preview', apiKeyConstant: 'GOOGLE_API_KEY', supportsImg2Img: true },
-  { value: 'gemini-flash', label: 'Gemini 2.5 Flash', description: 'Fast image gen - optimized for speed', endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent', model: 'gemini-2.5-flash-preview-05-20', apiKeyConstant: 'GOOGLE_API_KEY', supportsImg2Img: true },
-  { value: 'gemini-2-flash', label: 'Gemini 2.0 Flash', description: 'Experimental image gen with Imagen 3', endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent', model: 'gemini-2.0-flash-exp', apiKeyConstant: 'GOOGLE_API_KEY', supportsImg2Img: true },
-  { value: 'wan2gp', label: 'Wan2GP (Qwen/Flux)', description: 'Local AI image gen via Wan2GP', endpoint: 'http://127.0.0.1:8773', model: 'qwen', isLocal: true, apiKeyConstant: '', supportsImg2Img: true },
+  { value: 'openai', label: 'OpenAI pictures', description: 'Pictures from a prompt, with your OpenAI key', endpoint: 'https://api.openai.com/v1/images/generations', model: '', apiKeyConstant: 'OPENAI_API_KEY', supportsImg2Img: true },
+  // (one entry for Google's picture API: which model is the node's Model field. A flow saved before names one of three ids,
+  // each an address with its model in it: those still run, and show as "saved in this flow", see isGeminiFormat.)
+  { value: 'gemini', label: 'Google (Gemini API)', description: "Google's picture models, with your Google key", endpoint: 'https://generativelanguage.googleapis.com/v1beta/models', model: '', apiKeyConstant: 'GOOGLE_API_KEY', supportsImg2Img: true },
+  { value: 'wan2gp', label: 'Wan2GP server', description: 'Pictures from a Wan2GP server on this computer', endpoint: 'http://127.0.0.1:8773', model: '', isLocal: true, apiKeyConstant: '', supportsImg2Img: true },
   { value: 'comfyui', label: 'ComfyUI', description: 'ComfyUI API - load workflow JSON file', endpoint: 'http://localhost:8188', model: '', isLocal: true, apiKeyConstant: '', supportsImg2Img: true },
   { value: 'custom', label: 'Custom', description: 'Custom API - connect Template for body, supports headers', endpoint: '', model: '', apiKeyConstant: '', supportsImg2Img: true },
 ];
+
+/** Google's picture API: as offered now (`gemini`), and under the ids a flow saved before carries (`gemini-…`, each an address of its own). */
+const isGeminiFormat = (format: string): boolean => format === 'gemini' || format.startsWith('gemini-');
 
 // Gemini aspect ratio options
 const GEMINI_ASPECT_RATIOS = [
@@ -202,9 +205,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
     const formatInfo = API_FORMATS.find(f => f.value === format);
     if (formatInfo) {
       onEndpointChangeRef.current?.(formatInfo.endpoint);
-      if (formatInfo.model) {
-        onModelChangeRef.current?.(formatInfo.model);
-      }
+      // (the model is the provider's own: another provider, and none is chosen yet)
+        onModelChangeRef.current?.('');
       if (formatInfo.apiKeyConstant) {
         onApiKeyConstantChangeRef.current?.(formatInfo.apiKeyConstant);
       }
@@ -213,7 +215,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
         onQualityChangeRef.current?.('auto');
         onOutputFormatChangeRef.current?.('png');
         onBackgroundChangeRef.current?.('auto');
-      } else if (format === 'gemini-flash' || format === 'gemini-2-flash' || format === 'gemini-3-pro') {
+      } else if (isGeminiFormat(format)) {
         onAspectRatioChangeRef.current?.('1:1');
         onOutputFormatChangeRef.current?.('png');
       }
@@ -320,7 +322,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
   const selectedFormat = API_FORMATS.find(f => f.value === apiFormat);
   const isLocal = selectedFormat?.isLocal || false;
   const isOpenAI = apiFormat === 'openai';
-  const isGemini = apiFormat === 'gemini-flash' || apiFormat === 'gemini-2-flash' || apiFormat === 'gemini-3-pro';
+  const isGemini = isGeminiFormat(apiFormat);
   const supportsImg2Img = selectedFormat?.supportsImg2Img || false;
 
   // Project constants for API key selection
@@ -522,6 +524,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                 {API_FORMATS.map((f) => (
                   <option key={f.value} value={f.value}>{f.label}</option>
                 ))}
+                {/* a provider id this flow was saved with and the list no longer offers: kept as it is, and said so */}
+                {!selectedFormat && apiFormat && <option value={apiFormat}>{apiFormat} (saved in this flow)</option>}
               </select>
             </div>
 
@@ -531,21 +535,17 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                 <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Model</label>
                 <select
                   className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-pink-500"
-                  value={data.wan2gpModel || 'qwen'}
+                  value={data.wan2gpModel || ''}
                   onChange={(e) => handleWan2gpModelChange(e.target.value)}
                   onMouseDown={(e) => e.stopPropagation()}
                 >
-                  {wan2gpImageModels.length > 0 ? (
-                    wan2gpImageModels.map(m => (
-                      <option key={m.id} value={m.id}>{m.name}</option>
-                    ))
-                  ) : (
-                    <>
-                      <option value="qwen">Qwen Image Edit Plus (20B)</option>
-                      <option value="flux2_klein_4b">Flux 2 Klein (4B)</option>
-                      <option value="flux2_klein_9b">Flux 2 Klein (9B)</option>
-                      <option value="z_image">Z-Image Turbo (6B)</option>
-                    </>
+                  {/* What the server lists, and nothing else: no list of names is kept here. One this flow was saved with stays chosen. */}
+                  <option value="">{wan2gpImageModels.length > 0 ? 'Choose a model' : 'No models listed: start the Wan2GP server'}</option>
+                  {wan2gpImageModels.map(m => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                  {data.wan2gpModel && !wan2gpImageModels.some(m => m.id === data.wan2gpModel) && (
+                    <option value={data.wan2gpModel}>{data.wan2gpModel} (saved in this flow)</option>
                   )}
                 </select>
               </div>
@@ -792,7 +792,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
                 <input
                   type="text"
                   className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-pink-500"
-                  placeholder={selectedFormat?.model || 'model-name'}
+                  placeholder="the model's name, as your provider lists it"
                   value={data.model || ''}
                   onChange={(e) => onModelChangeRef.current?.(e.target.value)}
                   onMouseDown={(e) => e.stopPropagation()}

@@ -263,7 +263,7 @@ const CoreVideoCompiler: ModuleCompiler = {
         const rawEndpoint = String(own.endpoint || preset?.endpoint || '');
         const isComfyEndpoint = rawEndpoint.includes(':8188') || rawEndpoint === projectSettings?.defaultVideoEndpoint;
         const endpoint = escapeString(isComfyEndpoint ? '' : rawEndpoint);
-        const wan2gpModel = escapeString(String(data.wan2gpModel || 'ltx2_22B_distilled'));
+        const wan2gpModel = escapeString(String(data.wan2gpModel || ''));
         const wan2gpSteps = data.wan2gpSteps != null ? Number(data.wan2gpSteps) : 8;
         const wan2gpDuration = data.wan2gpDuration != null ? Number(data.wan2gpDuration) : 5;
         const wan2gpVram = escapeString(String(data.wan2gpVram || 'auto'));

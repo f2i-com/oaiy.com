@@ -345,7 +345,7 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
               {manifest.author && <> · {manifest.author}</>}
             </p>
           </div>
-          <span className="oaiy-pill warn dot">unverified</span>
+          <span className="oaiy-pill warn dot">Unverified</span>
         </div>
         {manifest.description && (
           <p className="m-0 mt-2.5 text-[12.5px] leading-relaxed text-content-secondary">{manifest.description}</p>

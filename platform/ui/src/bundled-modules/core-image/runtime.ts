@@ -197,8 +197,10 @@ async function generateOpenAI(
   // Convert width/height to OpenAI size format
   const size = `${width}x${height}`;
 
+  // No model is written in: the node names one (its Model field, or its service's).
+  if (!model) throw new Error('Image: choose a model first: type its name in the Model field of the node, as your provider lists it');
   const body: Record<string, unknown> = {
-    model: model || 'dall-e-3',
+    model,
     prompt: prompt,
     n: 1,
     size: size,
@@ -236,11 +238,16 @@ async function generateOpenAI(
 async function generateGemini(
   prompt: string,
   endpoint: string,
-  apiKey: string
+  apiKey: string,
+  model = ''
 ): Promise<string> {
   ctx.log('info', `[ImageGen] Gemini request`);
 
-  const url = `${endpoint}?key=${apiKey}`;
+  // An address that names its model (a flow saved before had one of three) is used as it is; the address of Google's
+  // models takes the node's model.
+  const named = /:generateContent$/.test(endpoint);
+  if (!named && !model) throw new Error('Image: choose a model first: type its name in the Model field of the node, as Google lists it');
+  const url = `${named ? endpoint : `${endpoint.replace(/\/+$/, '')}/${encodeURIComponent(model)}:generateContent`}?key=${apiKey}`;
 
   const body: Record<string, unknown> = {
     contents: [{
@@ -835,7 +842,7 @@ async function generateWan2GP(
   baseUrl = await ensureWan2GPReady(baseUrl);
   const apiUrl = `${baseUrl}/generate/image`;
 
-  ctx.log('info', `[ImageGen] Wan2GP request to ${apiUrl}, model=${model || 'qwen'}`);
+  ctx.log('info', `[ImageGen] Wan2GP request to ${apiUrl}, model=${model || "the server's own"}`);
 
   const body: Record<string, unknown> = {
     prompt,
@@ -843,7 +850,8 @@ async function generateWan2GP(
     width,
     height,
     steps,
-    model: model || 'qwen',
+    // (none chosen: the server's own)
+    ...(model ? { model } : {}),
     seed: (seed != null && seed >= 0) ? seed : -1,
   };
 
@@ -993,7 +1001,7 @@ async function generate(
       case 'gemini-3-pro':
       case 'gemini-flash':
       case 'gemini-2-flash':
-        imageUrl = await generateGemini(finalPrompt, endpoint, apiKey);
+        imageUrl = await generateGemini(finalPrompt, endpoint, apiKey, model);
         break;
       case 'wan2gp':
         imageUrl = await generateWan2GP(

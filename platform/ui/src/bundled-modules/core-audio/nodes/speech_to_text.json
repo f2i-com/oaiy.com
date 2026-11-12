@@ -10,7 +10,7 @@
         "video",
         "transcription",
         "speech",
-        "whisper",
+        "dictation",
         "stt",
         "subtitles"
     ],

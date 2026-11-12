@@ -271,7 +271,7 @@ export function useApiBridge(
 
             // Submit the job with Claude-as-AI mode if requested
             if (useClaudeForAI) {
-              logger.debug('Claude-as-AI mode enabled for job');
+              logger.debug('assistant-as-AI mode enabled for job');
             }
 
             const jobId = manager.submit(

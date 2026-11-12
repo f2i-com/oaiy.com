@@ -145,7 +145,7 @@
       "name": "Video",
       "type": "video",
       "position": "left",
-      "description": "Optional video for models that support video understanding (MiniCPM-V 4.6 — up to 128 frames via stack_frames mode; future Qwen3-VL Video). The runtime extracts N evenly-spaced frames (controlled by 'Video Frames' below) and feeds them as image inputs through the existing vision-chat path. Ignored by text-only models."
+      "description": "Optional video, for a model that takes video. The runtime takes evenly spaced frames from it (how many is 'Video Frames' below) and gives them to the model as pictures. A model that reads text only ignores it."
     }
   ],
   "outputs": [
@@ -226,7 +226,7 @@
       "default": 8,
       "min": 1,
       "max": 128,
-      "description": "Number of frames to extract from the connected Video input. Frames are sampled evenly across the clip and fed to the vision tower one-per-image. MiniCPM-V 4.6 trained on up to 128 frames; most cases work well at 4–16. Ignored when no Video input is connected.",
+      "description": "How many frames to take from the connected Video input. They are taken evenly across the clip and given to the model one picture each; 4 to 16 suits most clips, and a model says how many it was made for. Ignored when no Video input is connected.",
       "advanced": true
     },
     {
@@ -239,7 +239,7 @@
         { "name": "GGUF", "extensions": ["gguf"] },
         { "name": "All Files", "extensions": ["*"] }
       ],
-      "description": "Path to a companion `mmproj-*.gguf` file. Required for vision input on the Internal (OAIY Local) provider — without it, attached images are rejected with a clear error. Today only Gemma 3 and Qwen 3.5 / 3.6 multimodal mmprojs are wired end-to-end through plugin-llm's vision_chat. External cloud providers ignore this field; they expect images as base64/url via the existing Image Format field.",
+      "description": "Path to a companion `mmproj-*.gguf` file. Needed for pictures on the Internal (OAIY Local) provider: without it, a picture is refused with a clear error, and a model whose companion file is not supported says so as it loads. Online providers ignore this field; they take pictures as base64 or a URL, by the Image Format field.",
       "showWhen": {
         "provider": ["oaiy-local"]
       }
@@ -258,7 +258,7 @@
       "type": "string",
       "default": "",
       "placeholder": "Use default from settings",
-      "description": "Model name (e.g., gpt-5.4-mini, claude-sonnet-4-6)",
+      "description": "The model's name, as your provider lists it",
       "showIf": { "property": "service", "equals": "" }
     },
     {
@@ -416,7 +416,7 @@
       "name": "Enable Thinking",
       "type": "boolean",
       "default": false,
-      "description": "Enable reasoning/thinking mode for models that support it (e.g. Qwen 3.5)",
+      "description": "Let the model think before it answers, where the model can",
       "advanced": true
     },
     {

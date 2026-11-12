@@ -643,7 +643,7 @@ async function textToSpeech(
 
         // Check if TTS service is running
         // Detect service name from port for better error messages
-        const serviceName = apiUrl.includes(':8772') ? 'Qwen3 TTS' : 'Chatterbox TTS';
+        const serviceName = apiUrl.includes(':8772') ? 'the speech server on port 8772' : 'Chatterbox TTS';
         await checkServiceAvailable(apiUrl, serviceName);
 
         // Get output path for saving the result

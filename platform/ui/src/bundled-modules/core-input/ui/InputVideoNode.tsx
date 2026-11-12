@@ -257,9 +257,6 @@ function InputVideoNode({ data }: InputVideoNodeProps) {
       )}
 
       {/* What it gives the flow */}
-      <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
-        Gives the video's file to the next step: Video Frames, Speech to Text, Video Save and the like.
-      </p>
     </CollapsibleNodeWrapper>
   );
 }

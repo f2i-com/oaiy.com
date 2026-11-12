@@ -315,7 +315,7 @@ export default function FlowsSidebar({
           <ChevronsRight size={16} />
         </button>
         <button type="button" onClick={onOpen} aria-hidden tabIndex={-1}>
-          Flows{flows.length > 0 ? ` · ${flows.length}` : ''}
+          Your flows{flows.length > 0 ? ` · ${flows.length}` : ''}
         </button>
       </div>
     );
@@ -396,7 +396,8 @@ export default function FlowsSidebar({
         <div className="oaiy-rail-head">
           <div className="oaiy-rail-title">
             <h2>
-              {loadedPackages && loadedPackages.size > 0 ? 'Your flows' : 'Flows'}
+              {/* (not "Flows": the section, the window's title in OAIY and this panel's own filter say that already) */}
+              Your flows
               <small>{flows.length}</small>
             </h2>
             <span className="oaiy-rail-tools">
@@ -481,7 +482,11 @@ export default function FlowsSidebar({
 
         {/* Flow List */}
         <div className="oaiy-rail-list">
-          {filteredFlows.length === 0 ? (
+          {filteredFlows.length === 0 && !query && !activeTag && activeCategory !== 'macros' ? (
+            // Nothing made yet: one quiet line here. The canvas beside it says "No flows yet" with the button, and
+            // the two said the same thing side by side.
+            <p className="oaiy-rail-none">None yet. New flow makes one, and Import brings one in.</p>
+          ) : filteredFlows.length === 0 ? (
             <div className="oaiy-empty bare">
               <FileText size={22} />
               <p className="oaiy-empty-title">
@@ -550,7 +555,7 @@ export default function FlowsSidebar({
                         </span>
                         {flow.remote && <Globe size={13} className="oaiy-flow-shared" aria-label="Shared with apps" />}
                         {running ? (
-                          <span className="oaiy-pill dot accent live" title="Running">running</span>
+                          <span className="oaiy-pill dot accent live" title="Running">Running</span>
                         ) : null}
                         <button
                           type="button"
@@ -604,7 +609,8 @@ export default function FlowsSidebar({
                           }
                         }}
                         aria-label={`Add the example flow: ${example.name}`}
-                        title={`Add it to your flows${example.description ? `\n${example.description}` : ''}`}
+                        // (the rail shows the one line; the flow's own notes, how it works step by step, are here to read)
+                        title={`Add it to your flows${example.notes || example.description ? `\n${example.notes || example.description}` : ''}`}
                       >
                         <Sparkles size={15} aria-hidden="true" />
                         <span className="oaiy-flow-text">

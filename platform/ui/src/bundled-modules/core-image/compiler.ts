@@ -106,7 +106,7 @@ const CoreImageCompiler: ModuleCompiler = {
         // For wan2gp, use wan2gpModel; otherwise use generic model field
         const model = escapeString(String(
           apiFormat === 'wan2gp'
-            ? (data.wan2gpModel || own.model || preset?.model || 'qwen')
+            ? (data.wan2gpModel || own.model || preset?.model || '')
             : (own.model || preset?.model || '')
         ));
         const apiKeyConstant = escapeString(String(

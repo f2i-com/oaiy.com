@@ -44,8 +44,8 @@
     "defaultModel": {
       "type": "string",
       "label": "Default Model",
-      "description": "Default model to use",
-      "default": "gpt-5.4-mini"
+      "description": "The model a new AI node starts with: its name, as your provider lists it. Empty: each node says which",
+      "default": ""
     },
     "ollamaEndpoint": {
       "type": "string",

@@ -86,7 +86,6 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
               onChange={(e: ChangeEvent<HTMLInputElement>) => data.onChange?.('path', e.target.value)}
               onMouseDown={(e) => e.stopPropagation()}
             />
-            <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5 mb-0">A whole path, like /Users/you/Pictures/lake.png (the format's ending is added if it has none)</p>
           </div>
 
           {/* Format Select */}
@@ -130,7 +129,6 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
             </div>
           </div>
 
-          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">Saves each picture that reaches it as the flow runs, and gives on where it went.</p>
         </>
       )}
     </CollapsibleNodeWrapper>

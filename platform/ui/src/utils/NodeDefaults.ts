@@ -17,8 +17,8 @@ import type { NodeType, ProjectSettings } from 'oaiy-core';
  * desktop's bundled TGI sidecar, which doesn't exist in the browser.
  */
 export const AI_PROVIDER_CONFIGS: Record<string, { endpoint: string; model: string; requestFormat: string }> = {
-  'ollama': { endpoint: 'http://localhost:11434/v1/chat/completions', model: 'llama3.2', requestFormat: 'openai' },
-  'lmstudio': { endpoint: 'http://localhost:1234/v1/chat/completions', model: 'local-model', requestFormat: 'openai' },
+  'ollama': { endpoint: 'http://localhost:11434/v1/chat/completions', model: '', requestFormat: 'openai' },
+  'lmstudio': { endpoint: 'http://localhost:1234/v1/chat/completions', model: '', requestFormat: 'openai' },
   'custom': { endpoint: '', model: '', requestFormat: 'openai' },
 };
 
@@ -182,6 +182,13 @@ export function getDefaultNodeData(type: NodeType, projectSettings?: ProjectSett
 }
 
 /**
+ * The model every AI LLM node was given when it was added, before a new node was given none (the defaults above
+ * name no model now: the person chooses one their provider lists). It is written here only to be recognised in a
+ * flow saved back then and taken out of it; nothing is given it any more.
+ */
+const SEEDED_MODEL_BEFORE = 'llama3.2';
+
+/**
  * The fields an AI LLM node was given from Ollama's defaults (`AI_PROVIDER_CONFIGS.ollama`) when it was added, left
  * out of one that has a service. Every AI LLM node added from the palette had them written in, a service picked or
  * not; on a node with a service they are hidden, and they won over the service when the flow ran. A flow saved
@@ -193,7 +200,8 @@ export function withoutProviderSeeds<T extends { type?: string; data?: Record<st
   return nodes.map((node) => {
     const data = node && typeof node === 'object' ? node.data : undefined;
     if (node?.type !== 'ai_llm' || !data || typeof data.service !== 'string' || !data.service.trim()) return node;
-    const seeded: Record<string, unknown> = { provider: 'ollama', model: ollama.model, endpoint: ollama.endpoint };
+    // (the model is the one earlier versions wrote in, SEEDED_MODEL_BEFORE: a new node is given none)
+    const seeded: Record<string, unknown> = { provider: 'ollama', model: SEEDED_MODEL_BEFORE, endpoint: ollama.endpoint };
     const stale = Object.keys(seeded).filter((key) => data[key] === seeded[key]);
     if (!stale.length) return node;
     const kept = { ...data };

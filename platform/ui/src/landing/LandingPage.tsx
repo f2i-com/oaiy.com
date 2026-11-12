@@ -347,7 +347,7 @@ function NodeGlyph({ icon }: { icon: 'image' | 'brain' | 'branch' | 'check' }) {
 /* ------------------------------------------------------------------ */
 
 const ENGINES = [
-  "OAIY's own engines (Desktop)", 'Ollama', 'LM Studio', 'llama.cpp', 'vLLM', 'ComfyUI', 'Stable Diffusion',
+  "OAIY's own engines (Desktop)", 'Ollama', 'LM Studio', 'llama.cpp', 'vLLM', 'ComfyUI',
   'OpenAI', 'Anthropic', 'Any OpenAI-compatible server', 'Any HTTP endpoint',
 ];
 

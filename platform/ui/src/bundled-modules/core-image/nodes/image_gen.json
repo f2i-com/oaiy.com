@@ -2,10 +2,10 @@
   "id": "image_gen",
   "name": "Image Gen",
   "description": "Make a picture from a prompt, or edit the pictures it is given: with OAIY's engine (its default picture model, or one you pick) or a service you add.",
-  "doc": "Generate AI images from text prompts.\n\nSupported APIs:\n• ComfyUI (Stable Diffusion, FLUX, etc.)\n• Any OpenAI-compatible image API (set the endpoint per node)\n\nFeatures:\n• Custom dimensions (width/height)\n• Negative prompts to avoid unwanted elements\n• Image-to-image with input images\n• Input image size limits for API compatibility\n\nTip: Set default API settings in Project Settings to avoid configuring each node.",
+  "doc": "Generate AI images from text prompts.\n\nSupported APIs:\n• ComfyUI (whichever picture models you run in it)\n• Any OpenAI-compatible image API (set the endpoint per node)\n\nFeatures:\n• Custom dimensions (width/height)\n• Negative prompts to avoid unwanted elements\n• Image-to-image with input images\n• Input image size limits for API compatibility\n\nTip: Set default API settings in Project Settings to avoid configuring each node.",
   "icon": "image",
   "color": "pink",
-  "tags": ["image", "generate", "ai", "comfyui", "stable-diffusion"],
+  "tags": ["image", "generate", "ai", "comfyui", "picture"],
   "flowplan": {
     "stepTypes": ["ai_image", "image_gen"],
     "fieldMapping": {
@@ -38,7 +38,7 @@
       "name": "Image",
       "type": "image",
       "position": "left",
-      "description": "A picture to start from (img2img, or an edit's reference), or a list of them (OAIY's engine: FLUX 3 Klein takes up to 10)",
+      "description": "A picture to start from (img2img, or an edit's reference), or a list of them where the model takes several (OAIY's engine says how many each of its models takes)",
       "showIf": { "property": "imageInputCount", "in": [1, 2, 3, 4] }
     },
     {

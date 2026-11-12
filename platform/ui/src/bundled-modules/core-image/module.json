@@ -32,10 +32,8 @@
       "description": "Default image generation API format",
       "default": "openai",
       "options": [
-        { "value": "openai", "label": "OpenAI GPT Image" },
-        { "value": "gemini-3-pro", "label": "Gemini 3 Pro" },
-        { "value": "gemini-flash", "label": "Gemini 2.5 Flash" },
-        { "value": "gemini-2-flash", "label": "Gemini 2.0 Flash" },
+        { "value": "openai", "label": "OpenAI pictures" },
+        { "value": "gemini", "label": "Google (Gemini API)" },
         { "value": "comfyui", "label": "ComfyUI (Local)" },
         { "value": "custom", "label": "Custom" }
       ]

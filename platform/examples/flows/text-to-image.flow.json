@@ -1,6 +1,7 @@
 {
  "name": "Text to image",
- "description": "A picture from a prompt: the prompt enhanced (a caption, or for a logo, poster or sign a layout of its parts and lettering, as OpenMOSS's enhancer writes them), the picture made with MOSS-Image (8 steps), checked by a vision model and made again (up to 3 tries) when the check finds a problem, the review's fix added to the prompt. Input: Prompt. Answers the picture's file reference, whether it passed and each try's findings.",
+ "description": "A picture from a prompt, checked and made again until it is right",
+ "notes": "A picture from a prompt: the prompt enhanced (a caption, or for a logo, poster or sign a layout of its parts and lettering, as OpenMOSS's enhancer writes them), the picture made with MOSS-Image (8 steps), checked by a vision model and made again (up to 3 tries) when the check finds a problem, the review's fix added to the prompt. Input: Prompt. Answers the picture's file reference, whether it passed and each try's findings.",
  "tags": [
   "image",
   "example"
@@ -42,7 +43,7 @@
     "y": 292
    },
    "data": {
-    "label": "MOSS-Image's prompt",
+    "label": "The picture model's prompt",
     "code": "// MOSS-Image's prompt from the enhancer's reply: a caption as it is, or a layout compiled to the model's one-line\n// form as OpenMOSS's compile_prompt.py does (boxes from the canvas's top-left in pixels, x then y, to boxes about its\n// centre, y then x, their edges enclosed), scaled to the picture's 1024 x 1024. A reply that is neither is a caption.\nconst SIZE = 1024;\nconst raw = String(reply == null ? '' : reply).trim().replace(/^```(?:json)?\\s*/i, '').replace(/```$/, '').trim();\nconst quoted = (t) => { const q = []; String(t).replace(/[\"\\u201C]([^\"\\u201D]{1,60})[\"\\u201D]/g, (all, x) => { q.push(x); return all; }); return q; };\nconst caption = (t) => ({ prompt: t, described: t, lettering: quoted(t), layout: false });\n// (a reply a bracket or two short, as a language model sometimes ends one, closed before it is read)\nconst closed = (t) => {\n  const open = [];\n  let inString = false, escaped = false;\n  for (const ch of t) {\n    if (inString) { if (escaped) escaped = false; else if (ch === '\\\\') escaped = true; else if (ch === '\"') inString = false; continue; }\n    if (ch === '\"') inString = true;\n    else if (ch === '{') open.push('}');\n    else if (ch === '[') open.push(']');\n    else if (ch === '}' || ch === ']') open.pop();\n  }\n  return t + open.reverse().join('');\n};\nconst read = (t) => { try { return JSON.parse(t); } catch { return null; } };\nconst at = raw.indexOf('{');\nconst draft = at < 0 ? null : read(raw.slice(at, raw.lastIndexOf('}') + 1)) || read(closed(raw.slice(at)));\nif (draft && typeof draft.caption === 'string' && !Array.isArray(draft.items)) return caption(draft.caption);\nif (!draft || !Array.isArray(draft.items) || !draft.summary || typeof draft.summary.caption !== 'string') {\n  // (JSON that cannot be read: its captions as one, never the JSON itself)\n  const said = [];\n  raw.replace(/\"caption\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"/g, (all, c) => { said.push(c.replace(/\\\\\"/g, '\"')); return all; });\n  return caption(at < 0 ? raw : said.join(' ') || raw);\n}\nconst sx = SIZE / (Number(draft.width) || SIZE), sy = SIZE / (Number(draft.height) || SIZE);\nconst edge = (v) => Math.min(Math.max(v, 0), SIZE);\nconst items = [];\nfor (const it of draft.items) {\n  if (!it || typeof it !== 'object' || !Array.isArray(it.bbox) || it.bbox.length !== 4 || typeof it.caption !== 'string' || !it.caption.trim()) continue;\n  const text = typeof it.text === 'string' && it.text.trim() ? it.text : null;\n  const label = ['object', 'character', 'text'].includes(it.label) ? it.label : text ? 'text' : 'object';\n  if (label === 'text' && !text) continue;\n  const [x1, y1, x2, y2] = it.bbox.map(Number);\n  if (![x1, y1, x2, y2].every(Number.isFinite)) continue;\n  const box = [Math.floor(edge(y1 * sy)) - SIZE / 2, Math.floor(edge(x1 * sx)) - SIZE / 2, Math.ceil(edge(y2 * sy)) - SIZE / 2, Math.ceil(edge(x2 * sx)) - SIZE / 2];\n  if (!(box[0] < box[2] && box[1] < box[3])) continue;\n  const item = { label, caption: it.caption };\n  if (text) item.text = text;\n  for (const k of ['tags', 'palette']) if (Array.isArray(it[k])) item[k] = it[k].filter((x) => typeof x === 'string');\n  item.bbox = box;\n  items.push(item);\n}\nif (!items.length) return caption(draft.summary.caption);\nconst summary = {};\nfor (const [k, v] of Object.entries(draft.summary)) if (['meta', 'canvas', 'caption', 'palette'].includes(k)) summary[k] = typeof v === 'string' && k !== 'caption' && k !== 'canvas' ? [v] : v;\nconst lettering = items.filter((i) => i.text).map((i) => i.text);\nreturn {\n  prompt: JSON.stringify({ summary, items, bbox_coord_space: 'abs_centralized', bbox_format: 'yxyx' }),\n  described: [summary.caption, ...items.map((i) => (i.text ? `The text \"${i.text}\": ${i.caption}` : i.caption))].join('\\n'),\n  lettering,\n  layout: true,\n};",
     "inputCount": 1,
     "inputNames": [
@@ -106,7 +107,7 @@
     "y": 129
    },
    "data": {
-    "label": "Make it (MOSS-Image, 8 steps)",
+    "label": "Make it (8 steps)",
     "service": "engine:image:moss-image-sft-q8-8-step-latest",
     "width": 1024,
     "height": 1024,
@@ -340,6 +341,6 @@
  ],
  "oaiyTool": {
   "name": "text_to_image",
-  "description": "Make a picture from a description: the prompt is enhanced, the picture made with MOSS-Image, then a vision model checks it (exact text, colours, objects, composition) and it is made again, up to 3 tries, until it passes. Returns the picture's file reference and the review's findings."
+  "description": "Make a picture from a description: the prompt is enhanced, the picture made, then a vision model checks it (exact text, colours, objects, composition) and it is made again, up to 3 tries, until it passes. Returns the picture's file reference and the review's findings."
  }
 }

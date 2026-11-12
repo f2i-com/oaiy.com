@@ -223,7 +223,7 @@ export function PackageBrowser({
                       )}
                     </div>
                     {isLoaded ? (
-                      <span className="oaiy-pill dot ok">loaded</span>
+                      <span className="oaiy-pill dot ok">Loaded</span>
                     ) : (
                       <button type="button" onClick={() => handleLoad(pkg)} className="btn btn-primary btn-sm">
                         Load

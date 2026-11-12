@@ -425,7 +425,7 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                             onMouseDown={(e) => e.stopPropagation()}
                         >
                             <option value="comfyui">ComfyUI</option>
-                            <option value="wan2gp">Wan2GP (LTX/Wan/Hunyuan)</option>
+                            <option value="wan2gp">Wan2GP server</option>
                         </select>
                     </div>
 
@@ -436,21 +436,17 @@ function VideoGenNode({ data }: VideoGenNodeProps) {
                                 <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Model</label>
                                 <select
                                     className="nodrag nowheel w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-orange-500"
-                                    value={data.wan2gpModel || 'ltx2_22B_distilled'}
+                                    value={data.wan2gpModel || ''}
                                     onChange={(e) => onWan2gpModelChangeRef.current?.(e.target.value)}
                                     onMouseDown={(e) => e.stopPropagation()}
                                 >
-                                    {wan2gpVideoModels.length > 0 ? (
-                                        wan2gpVideoModels.map(m => (
-                                            <option key={m.id} value={m.id}>{m.name}</option>
-                                        ))
-                                    ) : (
-                                        <>
-                                            <option value="ltx2_22B_distilled">LTX Video 2.3 Distilled (22B)</option>
-                                            <option value="ltx2_22B">LTX Video 2.3 (22B)</option>
-                                            <option value="t2v">Wan 2.1 T2V (14B)</option>
-                                            <option value="hunyuan_t2v">Hunyuan Video T2V</option>
-                                        </>
+                                    {/* What the server lists, and nothing else. One this flow was saved with stays chosen. */}
+                                    <option value="">{wan2gpVideoModels.length > 0 ? 'Choose a model' : 'No models listed: start the Wan2GP server'}</option>
+                                    {wan2gpVideoModels.map(m => (
+                                        <option key={m.id} value={m.id}>{m.name}</option>
+                                    ))}
+                                    {data.wan2gpModel && !wan2gpVideoModels.some(m => m.id === data.wan2gpModel) && (
+                                        <option value={data.wan2gpModel}>{data.wan2gpModel} (saved in this flow)</option>
                                     )}
                                 </select>
                             </div>

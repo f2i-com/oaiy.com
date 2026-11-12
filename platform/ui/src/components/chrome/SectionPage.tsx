@@ -15,6 +15,7 @@
  */
 import type { ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
+import { inOaiyWindow } from '../../lib/oaiyWindow';
 
 export interface SubNavItem {
   id: string;
@@ -79,13 +80,16 @@ export default function SectionPage({
   children: ReactNode;
   testId?: string;
 }) {
+  // In OAIY's window the page's group is not "Flows" again (the window's title is, right above, and its sidebar):
+  // the small label says which part of the Flows page this is, the flow editor.
+  const group = kicker === 'Flows' && inOaiyWindow() ? 'Flow editor' : kicker;
   return (
     <div className={nav ? 'oaiy-page has-nav' : 'oaiy-page'} data-testid={testId}>
       {nav}
       <div className={fill ? 'oaiy-page-main fill' : 'oaiy-page-main'}>
         <header className="oaiy-page-head">
           <div className="oaiy-page-titles">
-            <span className="oaiy-kicker">{kicker}</span>
+            <span className="oaiy-kicker">{group}</span>
             <h2>{title}</h2>
             {description && <p>{description}</p>}
           </div>
@@ -133,12 +137,14 @@ export function Card({
 }
 
 /** Nothing here yet: an icon, a line, and what to do about it. */
-export function EmptyState({ icon, title, children }: { icon?: ReactNode; title: ReactNode; children?: ReactNode }) {
+/** An empty state, as the dashboard's: an icon, a line, a hint, and the one action inside it (`action`). */
+export function EmptyState({ icon, title, children, action }: { icon?: ReactNode; title: ReactNode; children?: ReactNode; action?: ReactNode }) {
   return (
     <div className="oaiy-empty">
       {icon}
       <p className="oaiy-empty-title">{title}</p>
       {children && <p className="oaiy-empty-text">{children}</p>}
+      {action}
     </div>
   );
 }

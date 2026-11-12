@@ -107,9 +107,6 @@ function DatabaseQueryNode({ data }: DatabaseQueryNodeProps) {
             />
           </div>
 
-          <p className="text-slate-500 dark:text-slate-400 text-[10px] leading-snug m-0">
-            Gives the records in this collection that match the filter: the one connected to Filter, else this one.
-          </p>
         </>
       )}
     </CollapsibleNodeWrapper>
