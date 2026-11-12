@@ -74,6 +74,10 @@
 .in-oaiy .brand, .in-oaiy .theme-toggle { display: none; }
 /* (a choice about opening the page in a window of its own, said in OAIY's own window, where it is not one) */
 .in-oaiy .not-in-oaiy { display: none !important; }
+/* And the other way: a name this page goes by only in OAIY's window. There OAIY's own sidebar has an Overview and a
+   Settings already, so this page's are "Status" and "Engine settings". */
+.only-in-oaiy { display: none; }
+.in-oaiy .only-in-oaiy { display: inline; }
 * { box-sizing: border-box; }
 /* `hidden` wins over any display rule (icon buttons, overlays, cards). */
 [hidden] { display: none !important; }
@@ -125,7 +129,33 @@ h1 { font: 640 22px/1.2 var(--display); margin: 0 0 4px; letter-spacing: -.015em
 .rail-foot .theme-toggle { justify-self: start; justify-content: flex-start; margin-left: -8px; padding: 0 8px; }
 h2 { font: 640 14.5px/1.35 var(--display); margin: 0 0 12px; letter-spacing: -.005em; }
 h3 { font: 600 12px/1.3 var(--display); margin: 0 0 8px; color: var(--muted); letter-spacing: .02em; }
+/* Scrollbars as OAIY's dashboard has them (platform/desktop/src/styles.css): 10px, a rounded thumb in the theme's
+   own grey on nothing, in both themes. (With no rule here the page had the system's 15px light-grey one, the only
+   such bar in OAIY's window.) */
+:root { --scroll-thumb: #33425c; }
+:root[data-theme=light] { --scroll-thumb: #b3ab9f; }
+@media (prefers-color-scheme: light) { :root:not([data-theme=dark]) { --scroll-thumb: #b3ab9f; } }
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 3px solid transparent; border-radius: 8px; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+/* In OAIY's window the page's title is under the window's own ("Engines", 16px): a size smaller, never larger. */
+.in-oaiy h1 { font-size: 15px; line-height: 1.3; letter-spacing: -.005em; }
 .lede { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 0 0 20px; max-width: 78ch; }
+/* A page starts with one line on what it is, then what is on it. What is worth reading once (how something works)
+   is under the line, closed until asked for. */
+.lede-more { margin: -12px 0 18px; max-width: 78ch; color: var(--muted); font-size: 12.5px; }
+.lede-more > summary { width: fit-content; cursor: pointer; }
+.lede-more > summary:hover { color: var(--text); }
+.lede-more > .lede { margin: 8px 0 0; }
+/* In OAIY's window, where the frame is short (the window at its smallest leaves it about 460px), a page's line of
+   words gives its height to the page: the section's name in the bar below says where the person is. */
+@media (max-height: 560px) {
+  .in-oaiy .view > .lede, .in-oaiy .view > .lede-more { display: none; }
+  /* (the title keeps the room under it that its line of words gave it) */
+  .in-oaiy .view > h1 { margin-bottom: 14px; }
+}
 section.view { display: none; } section.view.on { display: block; }
 /* A page's parts are cards, as the dashboard's sections are: its surface, a hairline, its radius and shadow. */
 .block { border: 1px solid var(--line); border-radius: var(--r-card); background: var(--panel); box-shadow: var(--shadow-card); padding: 16px 18px 18px; margin-bottom: 14px; }
@@ -665,6 +695,8 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-top .f { display: grid; gap: 6px; font-size: 13px; }
 .dl-top .f > span:first-child { font: 600 12.5px var(--display); color: var(--text); display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; justify-content: flex-start; }
 .dl-top .f > span:first-child .muted { font: 400 12px var(--body); letter-spacing: 0; }
+/* (the folder a host says, in place of the field: a path as long as it is, broken where it must be) */
+.dl-top .f code { font: 12.5px var(--code); color: var(--text); overflow-wrap: anywhere; }
 .dl-free { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 .dl-free .meter { width: 120px; height: 6px; }
 /* The downloads: one card, a row each, its bar the same length in every row; a failed one in red with a red edge. */
@@ -729,7 +761,108 @@ dialog::backdrop { background: var(--backdrop); }
 /* No models yet: the dashboard's call-out, the primary's tint with its hairline and an edge of its colour. */
 .dl-empty-hint { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 16px 14px 18px; border: 1px solid color-mix(in srgb, var(--gpu) 35%, var(--line)); border-left: 3px solid var(--gpu); border-radius: var(--r-card); background: var(--gpu-soft); margin-bottom: 14px; font-size: 13px; line-height: 1.55; }
 .dl-empty-hint p { margin: 0; flex: 1; min-width: 220px; }
+/* The Overview's "Your models": a row a kind, its chosen model, how it stands, and one button. */
+.chosen { display: flex; flex-direction: column; }
+.chosen-row { display: grid; grid-template-columns: 130px minmax(0, 1fr) auto auto; align-items: center; gap: 8px 14px; padding: 10px 0; border-top: 1px solid var(--line); }
+.chosen-row:first-child { border-top: 0; padding-top: 0; }
+.chosen-row:last-child { padding-bottom: 0; }
+.chosen-kind { font-weight: 640; }
+.chosen-name { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.chosen-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 13px/1.4 var(--code); }
+.chosen-name small { font-size: 12px; }
+.chosen-row .btn { min-width: 84px; justify-content: center; }
+@media (max-width: 560px) {
+  .chosen-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .chosen-kind, .chosen-name { grid-column: 1 / -1; }
+  /* (how it stands at its own width, from the left: stretched across the row it read as a bar) */
+  .chosen-row > .chosen-name ~ * { justify-self: start; }
+  .chosen-row > .btn { justify-self: end; }
+}
 @media (prefers-reduced-motion: reduce) { .dl-card { transition: none; } }
+
+/* On paper a field is white inside its line, as the dashboard's are: the tinted fill read as a field switched off.
+   (`background-color`, never the shorthand: a select keeps its one arrow.) */
+:root[data-theme=light] input:not([type=checkbox]):not([type=radio]):not([type=range]), :root[data-theme=light] select, :root[data-theme=light] textarea { background-color: #fff; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme=dark]) input:not([type=checkbox]):not([type=radio]):not([type=range]), :root:not([data-theme=dark]) select, :root:not([data-theme=dark]) textarea { background-color: #fff; }
+}
+
+/* ---------- in OAIY's window: the sections are one quiet row at the top ----------
+   Under the window's own header, where the flow editor has the same row for its sections (platform/ui/src/index.css
+   `.oaiy-quiet-tabs` in its 44px bar): words alone, the open one underlined, no icons over labels and no box, on the
+   bar's ground with its line under it. The three groups stay groups (a hairline and a wider gap). How the page
+   stands (the model, media, Incognito) is at the row's right end, as chips of the dashboard's size (20px). The row
+   stays where it is while the page scrolls. A bar along the foot was a phone's, a third level of navigation far
+   from the other two. (Standing alone in a browser tab, and on a phone, the page keeps its rail and its foot bar.) */
+.row-break { display: none; }
+.in-oaiy { --pad: 30px; --row-h: 44px; }
+@media (max-width: 1018px) { .in-oaiy { --pad: 24px; } }
+@media (max-width: 626px) { .in-oaiy { --pad: 16px; } }
+.in-oaiy.dock { --dock-h: 0px; }
+.in-oaiy.dock .app { grid-template-rows: minmax(0, 1fr); }
+.in-oaiy.dock main { grid-area: 1 / 1; padding-top: calc(var(--row-h) + 20px); padding-bottom: 48px; }
+.in-oaiy.dock .sections {
+  position: fixed; z-index: 7; top: 0; right: 0; bottom: auto; left: 0;
+  display: flex; flex-wrap: wrap; align-content: flex-start; align-items: stretch; justify-content: flex-start; gap: 0 2px;
+  min-height: var(--row-h); padding: 0 0 0 calc(var(--pad) - 9px);
+  border-top: 0; border-bottom: 1px solid var(--line); border-radius: 0;
+  background: color-mix(in srgb, var(--panel) 91%, transparent); backdrop-filter: blur(18px); box-shadow: none;
+}
+.in-oaiy.dock .sections button {
+  flex: none; flex-direction: row; gap: 6px; max-width: none; height: calc(var(--row-h) - 1px); min-height: 0; margin: 0; padding: 0 9px;
+  border-radius: 0; background: transparent; color: var(--muted); font: 560 13px/1.2 var(--body); letter-spacing: 0;
+}
+.in-oaiy.dock .sections button svg, .in-oaiy.dock .sections.open .more svg { display: none !important; }
+.in-oaiy.dock .sections button:hover { background: transparent; color: var(--text); }
+.in-oaiy.dock .sections button[aria-current="page"], .in-oaiy.dock .sections.in-more:not(.open) .more, .in-oaiy.dock .sections.open .more { background: transparent; color: var(--text); font-weight: 640; }
+.in-oaiy.dock .sections button[aria-current="page"]::before { top: auto; right: 9px; bottom: 0; left: 9px; width: auto; height: 2px; border-radius: 2px 2px 0 0; background: var(--gpu); content: ""; }
+.in-oaiy.dock .sections button:focus-visible { border-radius: 6px; outline: 2px solid var(--gpu); outline-offset: -3px; }
+/* (the three groups: a hairline in a wider gap before Models and before Endpoints) */
+.in-oaiy.dock .sections button[data-first] { margin: 0 0 0 17px; }
+.in-oaiy.dock .sections button[data-first]::after { position: absolute; top: 30%; bottom: 30%; left: -9px; width: 1px; background: var(--line); content: ""; }
+/* (a section's count, and its red dot, beside its word) */
+.in-oaiy.dock .sections button .count, .in-oaiy.dock .sections button .fail-dot { position: static; margin: 0; }
+.in-oaiy.dock .sections .more .label::after { content: " \25BE"; }
+/* How the page stands, at the row's right end. */
+.in-oaiy.dock .rail-foot {
+  position: fixed; z-index: 8; top: 0; right: 12px; display: flex; height: var(--row-h); flex-wrap: nowrap; align-items: center; gap: 6px;
+  margin: 0; border: 0; padding: 0;
+}
+.in-oaiy.dock .rail-foot > .row, .in-oaiy.dock .incog { height: 20px; min-height: 20px; gap: 5px; padding: 0 8px; box-shadow: none; font-size: 11px; font-weight: 600; }
+.in-oaiy.dock .incog { padding-left: 5px; }
+/* (a chip's words are cut with an ellipsis before the chips would reach the sections' words: at the window's
+   default size the nine sections leave the three chips about 300px) */
+.in-oaiy.dock .rail-foot > .row > span:last-child { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1150px) { .in-oaiy.dock .rail-foot > .row { max-width: 104px; } }
+@media (max-width: 760px) { .in-oaiy.dock .rail-foot > .row { max-width: 84px; } }
+/* (a long page's own row of jumps stays under the sections' row, and a block it jumps to stops under both) */
+.in-oaiy.dock .jump { top: var(--row-h); }
+.in-oaiy.dock .view .block { scroll-margin-top: calc(var(--row-h) + 60px); }
+/* The row says which section is open, so the page does not say it again over its first line: its title is kept for
+   a screen reader (each section is still labelled by it) and not drawn; and on Status, where the first card is the
+   line ("Your models"), the line goes too. The page starts with what is on it. */
+.in-oaiy .view h1 { position: absolute; overflow: hidden; width: 1px; height: 1px; margin: -1px; clip-path: inset(50%); white-space: nowrap; }
+.in-oaiy #v-overview > .lede { display: none; }
+/* One main button a screen: while nothing is installed the banner's "Get models" is it, and the Language model
+   card does not offer a second one under it. */
+#v-overview:has(#first-run:not([hidden])) #llm-detail .row { display: none; }
+/* Too narrow for nine words and the chips (the window at its smallest gives the page 686px): the first four, and
+   More at the row's end opens the other five on a second line of the same row. Nothing in the first line moves. */
+@media (max-width: 1039px) {
+  .in-oaiy.dock .sections .more { display: flex; order: 1; }
+  .in-oaiy.dock .sections .row-break { display: block; order: 2; flex-basis: 100%; height: 0; }
+  .in-oaiy.dock .sections button[data-more] { display: none; order: 3; }
+  .in-oaiy.dock .sections.open button[data-more] { display: flex; }
+  .in-oaiy.dock .sections.open { padding-top: 0; border-radius: 0; }
+  /* The open section is one More holds: its word stands in More's place, underlined as the open tab is, so the row
+     always says which section is open. */
+  .in-oaiy.dock .sections.in-more:not(.open) .more .label[data-here] { font-size: 0; }
+  .in-oaiy.dock .sections.in-more:not(.open) .more .label[data-here]::after { content: attr(data-here) " \25BE"; font-size: 13px; }
+  .in-oaiy.dock .sections.in-more:not(.open) .more::before { position: absolute; right: 9px; bottom: 0; left: 9px; height: 2px; border-radius: 2px 2px 0 0; background: var(--gpu); content: ""; }
+  .in-oaiy.dock .sections button[data-view="get"] { margin-left: 0; }
+  .in-oaiy.dock .sections button[data-first][data-more] { margin-left: 17px; }
+  .in-oaiy.dock .sections:not(.open):has(button[data-more] .count:not([hidden]), button[data-more] .fail-dot:not([hidden])) .more::after { position: static; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--gpu); content: ""; }
+}
 </style>
 </head>
 <body>
@@ -740,16 +873,18 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="brand-name">OAIY<small>NVMe to RAM to GPU</small></div>
     </div>
     <nav class="sections" id="sections" aria-label="Sections">
-      <button data-view="overview" title="Overview" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg><span class="label">Overview</span></button>
+      <button data-view="overview" title="Overview" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg><span class="label"><span class="not-in-oaiy">Overview</span><span class="only-in-oaiy">Status</span></span></button>
       <button data-view="play" title="Playground"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l14 8-14 8z"/></svg><span class="label">Playground</span></button>
       <button data-view="gallery" title="Gallery"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><span class="label">Gallery</span><span class="count" id="gallery-count" hidden></span></button>
       <button data-view="models" title="Models" data-first><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
       <button data-view="get" title="Get models" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span><span class="fail-dot" id="get-failed" hidden></span></button>
       <button data-view="memory" title="Memory" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
       <button data-view="endpoints" title="Endpoints" data-first data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
-      <button data-view="settings" title="Settings" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
+      <button data-view="settings" title="Settings" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label"><span class="not-in-oaiy">Settings</span><span class="only-in-oaiy">Engine settings</span></span></button>
       <button data-view="logs" title="Logs" data-more><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="label">Logs</span></button>
       <button class="more" id="sections-more" title="All sections" aria-expanded="false" aria-controls="sections"><svg class="i-more" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg><svg class="i-less" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span class="label">More</span></button>
+      <!-- (in OAIY's window, where the sections are a row at the top: the line More's sections open on) -->
+      <i class="row-break" aria-hidden="true"></i>
     </nav>
     <div class="rail-foot">
       <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">Loads on use</span></div>
@@ -763,34 +898,35 @@ dialog::backdrop { background: var(--backdrop); }
   <main>
     <div class="banner" role="status"><strong>Incognito</strong><span>Nothing about requests is kept: no prompt cache, no history or logs, and generated media is deleted after it is delivered.</span></div>
     <!-- Overview -->
-    <section class="view on" id="v-overview">
-      <h1>Overview</h1>
-      <p class="lede" id="ov-lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
+    <section class="view on" id="v-overview" aria-labelledby="h-overview">
+      <h1 id="h-overview"><span class="not-in-oaiy">Overview</span><span class="only-in-oaiy">Status</span></h1>
+      <p class="lede">The models this computer runs, and whether each is ready.</p>
       <div class="dl-empty-hint" id="first-run" hidden><p><strong>No models yet.</strong> Get models downloads ready-to-run ones from Hugging Face (a chat model, pictures, speech and more) and sets them up for you.</p><button class="btn go" data-goto="get">Get models</button></div>
+      <!-- What its owner came for, first: for language, pictures and speech (and any other kind this computer has a
+           model of), which model is chosen, whether it is ready, and one button: Change, or Get one. (How weights
+           are kept in memory is said on Memory, and the addresses other apps call on Endpoints.) -->
       <div class="block">
-        <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
-        <div class="hw" id="hw"></div>
+        <h2>Your models</h2>
+        <div class="chosen" id="ov-chosen"><div class="empty">Reading…</div></div>
       </div>
       <div class="block" id="now-block" hidden>
         <h2>Now running</h2>
         <div id="now"></div>
       </div>
-      <div class="block cols">
-        <div>
-          <div class="spread"><h2>Language model</h2><span id="llm-tag"></span></div>
-          <div class="muted" id="llm-detail" style="margin:0 0 14px">Not running.</div>
-          <div class="row">
-            <button class="btn go" id="llm-start">Start</button>
-            <button class="btn" id="llm-restart">Restart</button>
-            <button class="btn warn" id="llm-stop">Stop</button>
-          </div>
-          <label class="check" style="margin-top:14px"><input type="checkbox" id="llm-autostart"><span>Start when OAIY opens <span class="muted small" id="llm-autostart-what"></span></span></label>
-          <p class="muted small" id="llm-note"></p>
+      <div class="block">
+        <div class="spread"><h2>Language model</h2><span id="llm-tag"></span></div>
+        <div class="muted" id="llm-detail" style="margin:0 0 14px">Not running.</div>
+        <div class="row">
+          <button class="btn go" id="llm-start">Start</button>
+          <button class="btn" id="llm-restart">Restart</button>
+          <button class="btn warn" id="llm-stop">Stop</button>
         </div>
-        <div>
-          <h2>Endpoints</h2>
-          <div id="ov-endpoints"></div>
-        </div>
+        <label class="check" style="margin-top:14px"><input type="checkbox" id="llm-autostart"><span>Start when OAIY opens <span class="muted small" id="llm-autostart-what"></span></span></label>
+        <p class="muted small" id="llm-note"></p>
+      </div>
+      <div class="block">
+        <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
+        <div class="hw" id="hw"></div>
       </div>
       <div class="block">
         <div class="spread"><h2>Recent media</h2><button class="btn quiet" id="open-outputs">Open output folder</button></div>
@@ -799,9 +935,9 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Playground -->
-    <section class="view" id="v-play">
+    <section class="view" id="v-play" aria-labelledby="h-play">
       <div class="play-head">
-        <div><h1>Playground</h1><p class="lede">Try each endpoint through the same routes other apps use.</p></div>
+        <div><h1 id="h-play">Playground</h1><p class="lede">Try each endpoint through the same routes other apps use.</p></div>
         <div class="ptabs" role="tablist">
           <button role="tab" aria-selected="true" data-tab="chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 01-11.6 7.1L4 20l1-4.6A8 8 0 1121 12z"/></svg>Chat</button>
           <button role="tab" aria-selected="false" data-tab="image"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg>Image</button>
@@ -1053,9 +1189,9 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Gallery -->
-    <section class="view" id="v-gallery">
-      <h1>Gallery</h1>
-      <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
+    <section class="view" id="v-gallery" aria-labelledby="h-gallery">
+      <h1 id="h-gallery">Gallery</h1>
+      <p class="lede">What this session made. Open one for its prompt and settings, or to use the prompt again. Incognito requests are never listed.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
         <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound effects</button><button data-f="model3d" aria-pressed="false">3D</button><button data-f="picture" aria-pressed="false">Picture tools</button><button data-f="active" aria-pressed="false">In progress</button>
@@ -1065,9 +1201,13 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Models -->
-    <section class="view" id="v-models" data-jump>
-      <h1>Models</h1>
-      <p class="lede">Pick a file or folder and OAIY reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
+    <section class="view" id="v-models" aria-labelledby="h-models" data-jump>
+      <h1 id="h-models">Models</h1>
+      <p class="lede">The models this computer has, by kind. Add a file or a folder and OAIY works out what it is.</p>
+      <details class="lede-more">
+        <summary>How a file is recognised</summary>
+        <p class="lede">OAIY reads a file's or a folder's headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
+      </details>
       <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <div class="block">
         <h2 data-jump="Add">Add a model</h2>
@@ -1078,14 +1218,18 @@ dialog::backdrop { background: var(--backdrop); }
             <button class="btn" id="add-detect">Check</button>
           </div>
           <div id="add-result"></div>
-          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth and Real-ESRGAN's RealESRGAN_x4plus.pth are the exceptions, read by oaiy's own reader, which runs nothing from the file.</p>
+          <p class="muted small" style="margin:0">A .gguf or .safetensors file, a model's folder, or a tokenizer.json. Check says what a file is before you add it.</p>
+          <details class="lede-more" style="margin:6px 0 0">
+            <summary>Which files it reads</summary>
+            <p class="muted small" style="margin:8px 0 0">Reads .gguf and .safetensors files (language, picture and video models, and their parts: vision projectors, LoRA adapters, text encoders, VAEs), model folders (diffusers folders, speech, sound and 3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; naf_release.pth and RealESRGAN_x4plus.pth are the exceptions, read by OAIY's own reader, which runs nothing from the file.</p>
+          </details>
         </div>
       </div>
       <div class="block">
         <div class="spread"><h2 data-jump="Your list">Your model list</h2><div class="row">
           <a class="btn" id="export-models" href="/api/models/export" download="oaiy-models.json">Export models</a>
           <button class="btn" type="button" id="import-models-btn">Import models</button><input type="file" id="import-models" accept="application/json,.json" hidden></div></div>
-        <p class="muted small" style="margin:0 0 14px">Export saves every model (language, image, video, speech, music, sound effect and 3D) with its parts, LoRAs, settings, defaults and memory settings to a JSON file. Import it on this computer or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
+        <p class="muted small" style="margin:0 0 14px">Export saves every model with its parts and settings to one file. Import brings it in on this computer or another: models merge by name, or replace the whole list, and a path that is not there comes in switched off and is listed.</p>
         <div class="model-search">
           <input type="search" id="model-search" placeholder="Search your models: a name, a type, a file or a folder" aria-label="Search your models" autocomplete="off" spellcheck="false">
           <span class="muted small" id="model-search-count"></span>
@@ -1103,18 +1247,28 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Get models -->
-    <section class="view" id="v-get">
-      <h1>Get models</h1>
-      <p class="lede">Ready-to-run models, downloaded from Hugging Face. Each goes into a folder of its own and is added to your models when it finishes. Pause any time: a download picks up where it stopped, even after a restart.</p>
+    <section class="view" id="v-get" aria-labelledby="h-get">
+      <h1 id="h-get">Get models</h1>
+      <p class="lede">Ready-to-run models from Hugging Face, added to your models when they finish. A paused download picks up where it stopped, even after a restart.</p>
       <div class="dl-top">
-        <label class="f"><span>Save models in</span>
+        <label class="f" id="dl-dir-field"><span>Save models in</span>
           <div class="pathfield"><input type="text" id="dl-dir" aria-label="Folder to save models in"><button class="btn" id="dl-browse">Browse</button><button class="btn" id="dl-dir-save" hidden>Use this folder</button></div>
           <span class="dl-free" id="dl-free"></span>
         </label>
-        <label class="f"><span>Hugging Face token <span class="muted small">(only for models whose licence you accept first)</span></span>
+        <!-- (in OAIY Desktop, which says where models are saved in its own Settings: no field here; the folder, and
+             where it is changed) -->
+        <div class="f" id="dl-dir-host" hidden><span>Models are saved in</span>
+          <span id="dl-dir-line" role="status"></span>
+          <span class="dl-free" id="dl-free-host"></span>
+        </div>
+        <label class="f" id="dl-token-field"><span>Hugging Face token <span class="muted small">(only for models whose licence you accept first)</span></span>
           <div class="pathfield"><input type="password" id="dl-token" autocomplete="off" placeholder="hf_… (read access)" aria-label="Hugging Face token"><button class="btn" id="dl-token-save">Save</button></div>
           <span class="muted small" id="dl-token-note">Create one at huggingface.co/settings/tokens. It stays on this computer.</span>
         </label>
+        <!-- (in OAIY Desktop, which keeps the token in its own Settings: no field here; whether one is set, and where) -->
+        <div class="f" id="dl-token-host" hidden><span>Hugging Face token <span class="muted small">(only for models whose licence you accept first)</span></span>
+          <span id="dl-token-line" role="status"></span>
+        </div>
       </div>
       <div class="dl-queue" id="dl-queue"></div>
       <div class="chips" id="dl-groups" role="toolbar" aria-label="Show"></div>
@@ -1122,9 +1276,16 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Memory -->
-    <section class="view" id="v-memory" data-jump>
-      <h1>Memory</h1>
-      <p class="lede" id="mem-lede">Choose where weights live for each kind of job. Keeping blocks on the GPU is fastest, keeping them in RAM costs one PCIe copy per block, and streaming from the SSD saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
+    <section class="view" id="v-memory" aria-labelledby="h-memory" data-jump>
+      <h1 id="h-memory">Memory</h1>
+      <!-- One line on what the page sets, then its controls. How OAIY runs a model larger than the GPU (it opened the
+           Overview, then this page, in two paragraphs over the controls) is closed until asked for. -->
+      <p class="lede">Where each kind of job keeps a model's weights: on the GPU, in RAM, or read from the SSD. Only speed and memory use change.</p>
+      <details class="lede-more">
+        <summary>How OAIY runs a model larger than the GPU</summary>
+        <p class="lede" id="ov-lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
+        <p class="lede" id="mem-lede">Choose where a model's weights are kept for each kind of job. On the GPU is fastest; in RAM is a little slower, as each part is copied to the GPU when it is used; read from the SSD is slowest, and saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
+      </details>
       <div class="block" id="mem-image"></div>
       <div class="block" id="mem-video"></div>
       <div class="block">
@@ -1159,9 +1320,14 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Endpoints -->
-    <section class="view" id="v-endpoints" data-jump>
-      <h1>Endpoints</h1>
-      <p class="lede">The API other apps call. Each route maps a path and method to a service and the dialect it speaks: OpenAI, or oaiy's job API for tools such as coder-cli.</p>
+    <section class="view" id="v-endpoints" aria-labelledby="h-endpoints" data-jump>
+      <h1 id="h-endpoints">Endpoints</h1>
+      <p class="lede">The addresses other apps call to use this computer's models, and how each one answers.</p>
+      <!-- The addresses to copy, first (they were on the Overview): what another app is given to reach each kind of model. -->
+      <div class="block">
+        <h2>Addresses</h2>
+        <div id="ov-endpoints"></div>
+      </div>
       <div class="block">
         <h2>Server</h2>
         <div class="grid-f">
@@ -1176,6 +1342,7 @@ dialog::backdrop { background: var(--backdrop); }
       </div>
       <div class="block">
         <div class="spread"><h2>Routes</h2><div class="row"><button class="btn quiet" id="routes-reset">Restore defaults</button><button class="btn" id="route-add">Add route</button></div></div>
+        <p class="muted small" style="margin-top:0">Each route maps a path and method to a service and the dialect it speaks: OpenAI, or oaiy's job API for tools such as coder-cli.</p>
         <div class="table-wrap"><table class="routes"><thead><tr><th>On</th><th>Path</th><th>Method</th><th>Serves</th><th>Dialect</th><th></th></tr></thead><tbody id="routes"></tbody></table></div>
         <p class="muted small">Image and video routes also own the paths below them, such as <code>/v1/videos/{id}/content</code> or <code>…/status</code> for the oaiy dialect.</p>
       </div>
@@ -1189,9 +1356,13 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Settings -->
-    <section class="view" id="v-settings" data-jump>
-      <h1>Settings</h1>
-      <p class="lede">Engine programs, generation defaults and where outputs go. Relative paths are relative to the folder holding the configuration file, so the whole folder can be moved to another machine.</p>
+    <section class="view" id="v-settings" aria-labelledby="h-settings" data-jump>
+      <h1 id="h-settings"><span class="not-in-oaiy">Settings</span><span class="only-in-oaiy">Engine settings</span></h1>
+      <p class="lede">The engines' programs, their defaults, and where what they make is kept.</p>
+      <details class="lede-more">
+        <summary>About the paths here</summary>
+        <p class="lede">Relative paths are relative to the folder holding the configuration file, so the whole folder can be moved to another machine.</p>
+      </details>
       <div class="block">
         <h2>Language model</h2>
         <div class="grid-f">
@@ -1201,7 +1372,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
           <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="numnull" placeholder="1"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
-          <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">Flash-Next sets conversations aside there. 0 = off, empty = the server's default.</small></label>
+          <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">A model that can set conversations aside keeps them there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
             <option value="auto">Auto: GPU, else CPU</option>
             <option value="webgpu">WebGPU (any GPU)</option>
@@ -1239,7 +1410,7 @@ dialog::backdrop { background: var(--backdrop); }
         </div>
         <div class="row" style="margin-top:4px; gap:10px 22px">
           <label class="check"><input type="checkbox" data-bind="llm.egpu.enabled"> Use the eGPU</label>
-          <label class="check" title="With OAIY's own engine on the card: a Qwen Image picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
+          <label class="check" title="With OAIY's own engine on the card: a picture is made on the card, its language model paused meanwhile (the card's memory is the picture's) and loaded again after. Pictures made while it is off, or while the card is not there, are made on this Mac."><input type="checkbox" data-bind="llm.egpu.images" id="egpu-images"> Make pictures on it too</label>
           <label class="check" title="With OAIY's own engine on the card: video, music, sound effects, speech and 3D models are made on the card, its language model paused meanwhile and loaded again after. Made while it is off, or while the card is not there, they are made on this Mac."><input type="checkbox" data-bind="llm.egpu.media" id="egpu-media"> Make video, music, sound effects, speech and 3D models on it too</label>
         </div>
         <p class="muted small" id="egpu-detail" style="white-space:pre-wrap; margin:14px 0 10px"></p>
@@ -1277,8 +1448,8 @@ dialog::backdrop { background: var(--backdrop); }
     </section>
 
     <!-- Logs -->
-    <section class="view" id="v-logs">
-      <h1>Logs</h1>
+    <section class="view" id="v-logs" aria-labelledby="h-logs">
+      <h1 id="h-logs">Logs</h1>
       <p class="lede">What OAIY's engines print, newest at the bottom.</p>
       <div class="tabs" role="tablist">
         <button role="tab" aria-selected="true" data-log="studio">Engines</button>
@@ -1579,10 +1750,19 @@ function renderJump(view) {
     return b;
   }));
 }
+// In OAIY's window two of this page's sections go by another name (the labels are in the markup, `only-in-oaiy`):
+// their tooltips follow.
+if (document.documentElement.classList.contains("in-oaiy")) {
+  for (const [view, name] of [["overview", "Status"], ["settings", "Engine settings"]]) { const b = $(`.sections button[data-view="${view}"]`); if (b) b.title = name; }
+}
 function show(view) {
   const moved = !$("#v-" + view)?.classList.contains("on");
   $$(".sections button[data-view]").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
   sections.classList.toggle("in-more", !!$(`.sections button[data-more][data-view="${view}"]`));
+  // Where the open section is one that More holds, the row names it in More's place (in OAIY's window, the CSS of
+  // `.in-oaiy.dock .sections.in-more`): "More" in bold did not say where the person was.
+  { const held = $(`.sections button[data-more][data-view="${view}"] .label`), word = $("#sections-more .label");
+    if (word) { if (held) word.dataset.here = held.innerText.trim() || held.textContent.trim(); else delete word.dataset.here; } }
   unfoldSections(false);
   $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
   renderJump(view);
@@ -1757,7 +1937,7 @@ function loraList(section, name, list, label = "LoRAs (optional; each with a str
   const rows = (list || []).map((l, i) => {
     const path = typeof l === "string" ? l : (l.path || ""), strength = typeof l === "string" ? 1 : (l.strength ?? 1);
     return `<div class="pathfield">
-      <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a Flash-Next .gguf)" : "LoRA .safetensors"}">
+      <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a .gguf)" : "LoRA .safetensors"}">
       <input type="number" step="0.05" min="-4" max="4" value="${esc(String(strength))}" data-lora="${section}|${esc(name)}|${i}|strength" title="Strength (1 = as trained)" style="width:6em;flex:none">
       <button class="btn quiet warn" type="button" data-lora-remove="${section}|${esc(name)}|${i}">Remove</button></div>`;
   }).join("");
@@ -1842,7 +2022,7 @@ function egpuTick(m) {
   return `<div class="row" style="gap:10px; align-items:center">
     <label class="check" title="${gguf ? `Chats with this model are answered by ${who}. When the card is not there, this Mac's GPU answers (Settings says with which model).` : "tinygrad's server reads GGUF files only."}"><input type="checkbox" data-egpu="${esc(m.name)}" ${m.egpu ? "checked" : ""} ${gguf || m.egpu ? "" : "disabled"}> On the eGPU (${own ? "WebGPU" : "tinygrad"}), when the card is there</label>
     ${m.egpu && !egpuOn() ? '<span class="muted small">The eGPU is switched off under Settings.</span>' : ""}
-    ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds (Qwen3.8-Flash-Next's) can be given far more, up to 262,144; one whose cache must all be on the card (a dense 27B) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${esc(m.egpu_ctx ?? "")}" placeholder="${esc(cfg?.llm?.egpu?.ctx ?? 8192)}"></label>` : ""}</div>`;
+    ${m.egpu && own ? `<label class="f" style="margin:0" title="The context this model is started with on the card: empty is the eGPU's (Settings). A model whose attention cache can be this Mac's past what the card holds can be given far more, up to 262,144; one whose cache must all be on the card (a large dense model) fills a 24 GB card at 32,768."><span class="small">Context on the eGPU</span><input type="number" min="512" step="1024" style="width:110px" data-egpuctx="${esc(m.name)}" value="${esc(m.egpu_ctx ?? "")}" placeholder="${esc(cfg?.llm?.egpu?.ctx ?? 8192)}"></label>` : ""}</div>`;
 }
 // Where a language model runs, for its row's head: on the eGPU where it is set to (and it is on), and what the card
 // is doing with it now.
@@ -1872,7 +2052,7 @@ function renderModels() {
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
     ${m.egpu && egpuOn() ? "" : `<div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>`}
-    <label class="check" title="Qwen3.5 and Qwen3.8 GGUFs that have a multi-token-prediction layer, and Qwen3.8-Flash-Next, on WebGPU: the layer drafts the next few tokens and the model checks them in one run. Experimental: on Qwen3.8 27B a third to two fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, holding about 0.3 GB more on the GPU; on Flash-Next two fifths to three fifths faster on lists, facts and code (79 to 94 tokens a second where 55 to 58) and a little faster on stories, with the same replies as without it, holding about 1 GB more."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
+    <label class="check" title="For a model file that has a multi-token-prediction layer: the layer drafts the next few tokens and the model checks them in one run. Experimental: a third to three fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, with the same replies as without it, holding 0.3 to 1 GB more on the GPU."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     ${egpuTick(m)}
     </details>
   </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
@@ -1904,7 +2084,7 @@ function renderModels() {
         + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder)
         + loraList("image", name, m.loras);
     return mediaItem("image", name, m, moss ? ((m.distill || "").trim() ? `MOSS-Image, ${m.steps || 8} passes` : "MOSS-Image") : flux3 ? "FLUX 3 Image Klein" : klein ? "FLUX.2 Klein 4B" : sdxl ? "SDXL" : "Qwen Image", miss, fields);
-  }).join("") : '<div class="empty">No image model yet. Add an SDXL checkpoint, a Qwen Image .gguf or .safetensors file, or a diffusers folder.</div>';
+  }).join("") : '<div class="empty">No image model yet. Get one under Get models, or add a checkpoint, a .gguf or .safetensors file, or a diffusers folder above: Check says what it is.</div>';
 
   const sp = Object.entries(cfg.media.speech?.models || {});
   $("#m-speech").innerHTML = sp.length ? sp.map(([name, m]) => {
@@ -1914,7 +2094,7 @@ function renderModels() {
       : field("VoiceDesign folder (speaks in described voices)", "speech", name, "design", m.design, {dir: true})
         + field("Base folder (speaks in saved voices)", "speech", name, "base", m.base, {dir: true});
     return mediaItem("speech", name, m, breeze ? "Breeze TTS 2" : "Qwen3-TTS", missingOf("speech", m), fields);
-  }).join("") : '<div class="empty">No speech model yet. Add a Qwen3-TTS VoiceDesign folder (and its Base folder to save voices), or a Breeze TTS 2 folder.</div>';
+  }).join("") : '<div class="empty">No speech model yet. Get one under Get models, or add a speech model\'s folder above (one that designs voices, and its base folder to save them).</div>';
 
   const mu = Object.entries(cfg.media.music?.models || {});
   $("#m-music").innerHTML = mu.length ? mu.map(([name, m]) => {
@@ -1925,7 +2105,7 @@ function renderModels() {
           <button class="btn" type="button" data-quantize="${esc(name)}">Make it</button></div>
           <span class="muted small">Written beside the model in about a minute, then used for every song. The original stays as it is.</span></div>`;
     return mediaItem("music", name, m, "MiniMax Music 3", missingOf("music", m), fields);
-  }).join("") : '<div class="empty">No music model yet. Add the MiniMax-Music3 folder.</div>';
+  }).join("") : '<div class="empty">No music model yet. Add a music model\'s folder above.</div>';
   $$("[data-quantize]").forEach(b => b.onclick = async () => {
     const name = b.dataset.quantize, quant = $(`[data-quant="${CSS.escape(name)}"]`).value;
     try { await api("/api/music/quantize", {method: "POST", body: {model: name, quant}}); toast(`Making the ${quant} language model; it is used as soon as it is written.`); refresh(); }
@@ -1936,7 +2116,7 @@ function renderModels() {
   $("#m-sound").innerHTML = sfx.length ? sfx.map(([name, m]) => {
     const fields = field("MOSS-SoundEffect folder", "sound", name, "path", m.path, {dir: true, missing: !(m.path || "").trim()});
     return mediaItem("sound", name, m, "MOSS-SoundEffect", missingOf("sound", m), fields);
-  }).join("") : '<div class="empty">No sound effect model yet. Add the MOSS-SoundEffect-v2.0 folder.</div>';
+  }).join("") : '<div class="empty">No sound effect model yet. Get one under Get models, or add its folder above.</div>';
 
   const m3d = Object.entries(cfg.media.model3d?.models || {});
   $("#m-model3d").innerHTML = m3d.length ? m3d.map(([name, m]) => {
@@ -1947,7 +2127,7 @@ function renderModels() {
       + field("BiRefNet folder: removes the background (optional, MIT)", "model3d", name, "matte", m.matte, {dir: true})
       + field("Real-ESRGAN weights: enlarges small pictures (optional, RealESRGAN_x4plus.pth, BSD-3-Clause)", "model3d", name, "upscaler", m.upscaler, {});
     return mediaItem("model3d", name, m, "Pixal3D", miss, fields);
-  }).join("") : '<div class="empty">No 3D model yet. Add the Pixal3D folder; the DINOv3 ViT-L/16 folder, NAF\'s naf_release.pth, BiRefNet and Real-ESRGAN are found when they sit beside it, or add them after.</div>';
+  }).join("") : '<div class="empty">No 3D model yet. Get one under Get models, or add its folder above: the parts it needs (among them naf_release.pth) are found when they sit beside it, or add them after.</div>';
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -1957,7 +2137,7 @@ function renderModels() {
       .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("")
       + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield="video|${esc(name)}|negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
     return mediaItem("video", name, m, familyName(m.family || name), miss, fields);
-  }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3 or LTX 2.5 .safetensors file.</div>';
+  }).join("") : '<div class="empty">No video model yet. Get one under Get models, or add a video model\'s .safetensors file above.</div>';
 
   renderPictureTools();
   renderFaceAge();
@@ -1991,7 +2171,7 @@ function renderModels() {
     l[k] = k === "strength" ? (el.value === "" || isNaN(Number(el.value)) ? 1 : Number(el.value)) : el.value; touch(); });
   $$("[data-lora-remove]").forEach(b => b.onclick = () => { const [s, n, i] = b.dataset.loraRemove.split("|"); modelLoras(s, n).splice(+i, 1); renderModels(); touch(); });
   $$("[data-lora-add]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.loraAdd.split("|");
-    pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json, or a Flash-Next .gguf LoRA)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
+    pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json, or a .gguf LoRA)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
   $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
   $$("[data-pin]").forEach(el => el.onchange = async () => {
     const model = el.dataset.pin, pin = el.checked;
@@ -2035,19 +2215,25 @@ function filterModels() {
       if (hit) { here++; shown++; first ??= item; }
     });
     $$(":scope > .empty", list).forEach(e => e.hidden = words.length > 0);
-    list.closest(".block").hidden = words.length > 0 && here === 0;
+    // A kind with no model has no section (and no word in the row of jumps): with nothing installed the page was a
+    // column of empty boxes, one a kind. A kind's section is there once it has a model.
+    list.closest(".block").hidden = entries.length === 0 || (words.length > 0 && here === 0);
   }
+  // The list's own tools (export, import, the search) are for a list: with no model there is none, and the page is
+  // the banner and "Add a model".
+  box.closest(".block").hidden = total === 0;
   // (the picture tools, two paths rather than models: their list folds away too unless a word is in them, where it
   // stayed under every search, empty boxes at the end of the results)
   const pic = $("#m-picture"), tools = cfg.media?.picture || {};
   if (pic) {
     const hay = ["picture tools background removal upscaling upscaler birefnet real-esrgan", tools.background, tools.upscaler].join(" ").toLowerCase();
-    pic.closest(".block").hidden = words.length > 0 && !words.every(w => hay.includes(w));
+    // (as a kind of model: there once one of its two is set)
+    pic.closest(".block").hidden = !(tools.background || tools.upscaler) || (words.length > 0 && !words.every(w => hay.includes(w)));
   }
   const age = $("#m-faceage"), check = cfg.media?.faceage || {};
   if (age) {
     const hay = ["age check faceage face mivolo yunet", check.model, check.detector, check.enabled === false ? "off" : ""].join(" ").toLowerCase();
-    age.closest(".block").hidden = words.length > 0 && !words.every(w => hay.includes(w));
+    age.closest(".block").hidden = !(check.model || check.detector) || (words.length > 0 && !words.every(w => hay.includes(w)));
   }
   $("#model-search-count").textContent = !words.length ? "" : shown ? `${shown} of ${total} model${total === 1 ? "" : "s"} · Enter goes to the first` : "No model matches";
   if ($("#v-models").classList.contains("on")) renderJump("models");
@@ -2175,7 +2361,7 @@ function renderMemory() {
     el.innerHTML = `<div class="spread"><h2>${kind === "image" ? "Image" : "Video"} jobs</h2><div class="seg" id="seg-${kind}"></div></div>
       <p class="muted" style="margin:0 0 12px">${(macMemory() ? tierHelpMac : tierHelp)[s.memory || "auto"]}</p>
       ${strip(s.memory || "auto", vcap, s.ram_gb ?? 32, example)}
-      <p class="muted small">Shown for a ${example} GB model (${kind === "image" ? "Qwen Image 2.1 in BF16" : "LTX 2.3 22B in BF16"}). Output is identical in every mode.</p>
+      <p class="muted small">Shown for a ${example} GB model. Output is identical in every mode.</p>
       <div class="grid-f" style="margin-top:6px">
         <label class="f"><span>${macMemory() ? "GPU memory cap" : "VRAM cap"} <b class="num" id="${kind}-vram-v">${capText(s)}</b></span><input type="range" min="0" max="${Math.round(gpuTotalGb(cfg.media.device))}" value="${s.vram_gb ?? Math.round(vcap)}" id="${kind}-vram"></label>
         <label class="f"><span>${macMemory() ? "Memory for weights" : "RAM for weights"} <b class="num" id="${kind}-ram-v">${s.ram_gb ?? 32} GB</b></span><input type="range" min="0" max="${Math.max(8, Math.round((state?.ram_total_mb || sys?.ram?.total_mb || 65536) / 1024))}" value="${s.ram_gb ?? 32}" id="${kind}-ram"></label>
@@ -2447,6 +2633,34 @@ function renderHardware() {
   morph(hw, made.content);
   $("#hw-note").textContent = sys?.gpus?.length ? "" : "";
 }
+// The Overview's first block, "Your models": for each kind of model, which one is chosen (the default, else the first
+// switched on), whether it is ready, and one button: Change (it is chosen under Models) or Get one (Get models).
+// Language, pictures and speech are always listed; video, music, sound effects and 3D once this computer has a model
+// of them. A language model's state is the engine's own (`llmLabel`: "Model ready", "Loads on use"…); another kind's
+// is whether it has the files it needs, and whether it is at work now.
+function renderChosen(llmLabel, llmTag) {
+  const box = $("#ov-chosen"), set = saved || cfg;
+  if (!box || !set) return;
+  const names = {llm: "Language", image: "Pictures", speech: "Speech", video: "Video", music: "Music", sound: "Sound effects", model3d: "3D models"};
+  const working = kind => (state?.media?.jobs || []).some(j => j.kind === kind && j.status === "in_progress");
+  const rows = Object.keys(names).map(kind => {
+    const list = kind === "llm" ? (set.llm?.models || []).filter(m => m.enabled !== false).map(m => [m.name, m])
+      : Object.entries(set.media?.[kind]?.models || {}).filter(([, m]) => m.enabled !== false);
+    if (!list.length && !["llm", "image", "speech"].includes(kind)) return "";
+    const wanted = kind === "llm" ? set.llm?.default_model : set.media?.[kind]?.default_model;
+    const [name, m] = list.find(([n]) => n === wanted) || list[0] || [];
+    const miss = name && kind !== "llm" ? missingOf(kind, m) : [];
+    const [said, tag] = !name ? ["None yet", ""] : kind === "llm" ? [llmLabel, llmTag] : miss.length ? ["Needs a file", "bad"] : working(kind) ? ["Working", "good"] : ["Ready", "good"];
+    // (OAIY's own chats on a paired computer's model, OAIY Network: said under this computer's own)
+    const p = kind === "llm" && name ? pairedDefault() : null;
+    return `<div class="chosen-row"><span class="chosen-kind">${names[kind]}</span>
+      <span class="chosen-name">${name ? `<strong>${esc(name)}</strong>` : '<span class="muted">No model yet</span>'}${p ? `<small class="muted">OAIY's chats use ${esc(p.model)} on ${esc(p.node_name)}</small>` : ""}</span>
+      <span class="tag ${tag}">${esc(said)}</span>
+      <button class="btn quiet" type="button" data-goto="${name ? "models" : "get"}" aria-label="${name ? `Change the ${names[kind].toLowerCase()} model` : `Get a ${names[kind].toLowerCase()} model`}">${name ? "Change" : "Get one"}</button></div>`;
+  }).join("");
+  // (written again only when it changes: read every 1.5 s, it would take the keyboard's place away)
+  if (box.dataset.was !== rows) { box.innerHTML = rows; box.dataset.was = rows; }
+}
 function renderState() {
   if (!state) return;
   const own = state.llm;
@@ -2483,9 +2697,16 @@ function renderState() {
   const away = p ? `<p class="small" style="margin:10px 0 0">${esc(`OAIY's chats on the engine (the Agent, flows and OAIY's chat route) use ${p.model} on ${p.node_name} (OAIY Network)${p.node_online ? "" : ", which is not answering now"}. This computer's gateway (${state.gateway_url}) and the Playground here answer with this computer's own model, unless that one is picked.`)}</p>` : "";
   // (written again only when it changes: an error's details opened would close at each read)
   if ($("#llm-detail").dataset.was !== said + away) { $("#llm-detail").innerHTML = said + away; $("#llm-detail").dataset.was = said + away; }
+  // With no language model there is nothing to start, restart or stop: the three are not drawn (they were three dead
+  // buttons under "Get models"), nor the tick for starting one when OAIY opens. They come back with a model.
+  $("#llm-start").closest(".row").hidden = none;
+  $("#llm-autostart").closest("label").hidden = none;
   $("#llm-start").disabled = none || lent || (!paused && (l.state === "ready" || l.state === "starting"));
   $("#llm-restart").disabled = none || lent || (l.state !== "ready" && !paused);
   $("#llm-stop").disabled = lent || l.state === "stopped";
+  // Only what can be done is drawn: Start while it is stopped, Restart and Stop while it runs (a filled Start that
+  // could not be pressed stood beside them), and none of the three while the card is lent to a media job.
+  for (const id of ["#llm-start", "#llm-restart", "#llm-stop"]) $(id).hidden = $(id).disabled;
   if (saved) {
     const models = saved.llm.models.filter(m => m.enabled !== false);
     const first = models.find(m => m.name === saved.llm.default_model) || models[0];
@@ -2497,6 +2718,7 @@ function renderState() {
     : standingIn ? "The default model runs on the eGPU: this computer's engine is standing in for it while the card does not answer. Stop stops both."
     : onCard && own.state === "failed" ? `This computer's engine could not stand in for the eGPU earlier: ${errorSummary(own.error || "it failed to start").replace(/^The /, "the ")}` : "";
   $("#foot-llm").className = "dot " + (lent || paused || none ? "" : l.state); $("#foot-llm-text").textContent = label;
+  renderChosen(label, lent || paused || none ? "" : l.state === "ready" ? "good" : l.state === "failed" ? "bad" : "");
   if (JSON.stringify(state.peers || []) !== peersSeen) { peersSeen = JSON.stringify(state.peers || []); if (cfg) { renderSelects(); renderModels(); } }
   renderPinTags();
   renderEgpu();
@@ -3244,8 +3466,8 @@ function addModel3d(job, route = "/api/play/model3d") {
   const input = fileUrl(`${route}/${job.id}/input`), glb = fileUrl(`${route}/${job.id}/content`);
   const rows = [["Faces", job.faces?.toLocaleString()], ["Vertices", job.vertices?.toLocaleString()], ["Size", job.bytes ? fmtSize(job.bytes) : null],
     ["Took", job.seconds_taken ? job.seconds_taken.toFixed(0) + " s" : null], ["Resolution", job.resolution], ["Seed", job.seed],
-    ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "birefnet" ? "removed (BiRefNet)" : job.matte === "background" ? "cut away" : null],
-    ["Enlarged", Array.isArray(job.upscaled) && job.upscaled[0] < job.upscaled[1] ? `${job.upscaled[0]} to ${job.upscaled[1]} px (Real-ESRGAN)` : null]].filter(([, v]) => v !== null && v !== undefined && v !== "");
+    ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "birefnet" ? "removed" : job.matte === "background" ? "cut away" : null],
+    ["Enlarged", Array.isArray(job.upscaled) && job.upscaled[0] < job.upscaled[1] ? `${job.upscaled[0]} to ${job.upscaled[1]} px` : null]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   const el = document.createElement("div"); el.className = "sp-item m3d-item";
   el.innerHTML = `<img src="${esc(input)}" alt="The picture, cut out">
     <div style="display:grid;gap:10px"><dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
@@ -3429,11 +3651,44 @@ async function refreshDownloads(full) {
     }
   }
 }
+// Where a host keeps the Hugging Face token (OAIY Desktop, in its Settings: the downloads say `token_host`), this page
+// has no field for it. One line says whether one is set, and where it is set: in OAIY's window a link, to an address of
+// this page's own that the window catches and never loads (embed.rs, `asked_view`) and shows its Settings → Storage
+// for; in a browser, where there is no window to ask, the words alone. A download that wants a token says the same.
+const tokenPlace = () => document.documentElement.classList.contains("in-oaiy") ? `<a href="/oaiy-window/show/storage">Settings → Storage</a>` : "OAIY Desktop’s Settings → Storage";
+// (`token_env`: the host has none and this computer's environment does, `HF_TOKEN`: it is in use, and nothing in
+// Settings shows it or removes it, so the line says where it comes from)
+const tokenLine = () => dl.token_env ? `A Hugging Face token comes from this computer’s environment (HF_TOKEN). To use another, set one in ${tokenPlace()}.`
+  : dl.token ? `A Hugging Face token is set. Change or remove it in ${tokenPlace()}.` : `No Hugging Face token is set. Set one in ${tokenPlace()}.`;
+const wantsToken = d => !!dl.token_host && !dl.token && /Hugging Face (access )?token/.test(d?.error || "");
+// Where a host says where models are saved (OAIY Desktop, the Models folder of its Settings: the downloads say
+// `dir_host`), this page has no field for it either: the folder, and where it is changed. Models downloaded to a
+// folder used before are still there and still work (each says where it is, `at`): said, so nobody looks for them in
+// the folder named here.
+const dirLine = () => {
+  const before = [...new Set(dl.models.filter(m => m.installed && m.at).map(m => m.at))];
+  const kept = before.length ? ` Models already in ${before.map(d => `<code>${esc(d)}</code>`).join(" and ")} stay there and keep working.` : "";
+  return `<code>${esc(dl.dir)}</code><br>Change the folder in ${tokenPlace()}.${kept}`;
+};
 function renderDownloads() {
   if (!dl) return;
+  // (a folder the host says is never one being typed here: the field's value follows it, for what a download is sent)
+  if (dl.dir_host) dlDirEdited = false;
   if (!dlDirEdited && $("#dl-dir").value !== dl.dir) { $("#dl-dir").value = dl.dir; pathEnds($("#v-get")); }
-  $("#dl-free").innerHTML = dl.free != null ? `<span>${dlSize(dl.free)} free on this drive</span>` : "";
+  const free = dl.free != null ? `<span>${dlSize(dl.free)} free on this drive</span>` : "";
+  $("#dl-free").innerHTML = dl.dir_host ? "" : free;
+  $("#dl-free-host").innerHTML = dl.dir_host ? free : "";
+  $("#dl-dir-field").hidden = !!dl.dir_host;
+  $("#dl-dir-host").hidden = !dl.dir_host;
+  // (written when what it says changes, not each second: the link keeps the keyboard's place)
+  const dirSays = dl.dir_host ? dirLine() : "";
+  if (dl.dir_host && $("#dl-dir-line").dataset.said !== dirSays) { $("#dl-dir-line").innerHTML = dirSays; $("#dl-dir-line").dataset.said = dirSays; }
   $("#dl-token").placeholder = dl.token ? "A token is saved (type a new one to replace it)" : "hf_… (read access)";
+  $("#dl-token-field").hidden = !!dl.token_host;
+  $("#dl-token-host").hidden = !dl.token_host;
+  // (written when what it says changes, not each second: the link keeps the keyboard's place)
+  const tokenSays = `${!!dl.token}:${!!dl.token_env}`;
+  if (dl.token_host && $("#dl-token-line").dataset.said !== tokenSays) { $("#dl-token-line").innerHTML = tokenLine(); $("#dl-token-line").dataset.said = tokenSays; }
   // (each part kept from one render to the next where it is what it was: the cards are read every second, and a
   // card written whole each time closed its open list of files, took the keyboard's place away, and lost a click)
   const groups = [{id: "recommended", name: "Recommended"}, {id: "all", name: "All"}, ...dl.groups];
@@ -3515,6 +3770,7 @@ function dlCard(m, group) {
   const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener">its page on huggingface.co</a>` : "its page on huggingface.co";
   const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>${dl.token
       ? `Accept its licence on ${page}, signed in as the account your saved token is from, before you download it.`
+      : dl.token_host ? `Accept its licence on ${page} (signed in) before you download it. ${tokenLine()}`
       : `Accept its licence on ${page} (signed in), then save a Hugging Face token (read access) above, before you download it.`}</span></div>` : "";
   let state = "", actions = "";
   // (a model the settings have, fetched again or partly there: its files are theirs, and a Cancel or Discard of it is
@@ -3538,7 +3794,7 @@ function dlCard(m, group) {
   } else if (d && d.status === "failed") {
     // (how far it got, and the room left where it goes: a full drive is the usual reason)
     const got = !d.total ? "" : d.done ? `${dlSize(d.done)} of ${dlSize(d.total)} downloaded` : `None of its ${dlSize(d.total)} downloaded yet`, room = dl.free != null ? `${dlSize(dl.free)} free on this drive` : "";
-    state = `<div class="err">${esc(d.error || "The download failed.")}</div>${got || room ? `<div class="line"><span>${[got, room].filter(Boolean).join(" · ")}</span></div>` : ""}`;
+    state = `<div class="err">${esc(d.error || "The download failed.")}${wantsToken(d) ? ` ${tokenLine()}` : ""}</div>${got || room ? `<div class="line"><span>${[got, room].filter(Boolean).join(" · ")}</span></div>` : ""}`;
     actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>${discard}`;
   } else if (m.installed || d?.status === "done") {
     state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>${d?.reused ? `<div class="line"><span>${dlSize(d.reused)} of it was on this computer already, used where it is</span></div>` : ""}${d?.lan ? `<div class="line"><span>${dlSize(d.lan)} came from ${esc((d.lan_from || []).join(", "))} over OAIY Network</span></div>` : ""}`;
@@ -3573,7 +3829,9 @@ async function dlAct(what, id) {
     // One that failed with nothing fetched, a drive without room, goes where the box says: that is how another is chosen)
     const d0 = m?.download;
     const going = d0 && (["paused", "queued"].includes(d0.status) || (d0.status === "failed" && d0.done > 0)) ? d0.dir : null;
-    if (what === "start" || what === "add") body.dir = going || (m?.at && m.partial ? m.at : $("#dl-dir").value.trim());
+    // (a model downloaded whole in a folder used before is added again from there: the box names where downloads go
+    // now, which in OAIY is the folder its Settings say and never the earlier one)
+    if (what === "start" || what === "add") body.dir = going || (m?.at && (m.partial || what === "add") ? m.at : $("#dl-dir").value.trim());
     if (what === "cancel" || what === "discard") {
       if (m?.at) body.dir = m.at;
       const r = await ask(what === "cancel"
