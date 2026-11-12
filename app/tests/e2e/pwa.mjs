@@ -496,7 +496,7 @@ try {
     await page.select('.model-picker select', 'mock-model');
     await page.waitForFunction(() => document.querySelector('.provider-row.selected')?.textContent.includes('mock-model'));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click());
-    await page.waitForFunction(() => document.querySelector('button[title="AI provider"]')?.textContent.includes('mock-model'));
+    await page.waitForFunction(() => document.querySelector('button.chip.model')?.textContent.includes('mock-model'));
     await page.type('.chat-input', 'Take your time.');
     await page.keyboard.press('Enter');
     for (let i = 0; i < 100 && !heldReplies.length; i++) await sleep(100);

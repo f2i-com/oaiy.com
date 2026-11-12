@@ -33,12 +33,18 @@ describe('what Settings says about how OAIY is found, in every state the page ca
   it('a tab that is not paired and holds nothing of OAIY: nothing is sent to look for it until Find OAIY is pressed, and that is all it says', () => {
     const state: OaiyState = { kind: 'tab', desktop: null, oaiy: NONE };
     const words = oaiyFoundWords(state);
-    expect(words).toMatch(/only when you press Find OAIY/);
-    expect(words).toMatch(/sends nothing to your computer or your network to look for it/);
-    expect(words).toMatch(/may ask you to allow it/);
+    // (two short sentences in the dialog: this is the second, in the words a person reads at a glance)
+    expect(words).toBe('Find OAIY looks for one on this computer; nothing is asked until you press it');
     expect(words).not.toContain(FOUND);
     expect(pairedTabWords(state)).toBeNull();
+    // (the browser's own question is said on the button, where it is met)
     expect(findOaiyTitle(state)).toMatch(/looks for OAIY only when you press this/);
+    expect(findOaiyTitle(state)).toMatch(/may ask you to allow it/);
+  });
+
+  it('a paired tab that holds nothing of OAIY says what the button does, and not that nothing is asked before it', () => {
+    const words = oaiyFoundWords({ kind: 'tab', desktop: DESK, oaiy: NONE });
+    expect(words).toBe('Find OAIY looks for one on this computer when you press it');
   });
 
   it('a tab that has found an OAIY: it asks it at that address each time it opens (and says with the key, or without), and how to stop that', () => {
@@ -50,7 +56,7 @@ describe('what Settings says about how OAIY is found, in every state the page ca
         expect(words).toMatch(/each time it opens/);
         expect(words).toMatch(/Forget OAIY, or clearing the address, ends that/);
         // What is true of a tab that holds nothing is not true of this one, and must not be said.
-        expect(words).not.toMatch(/sends nothing|only when you press|never/);
+        expect(words).not.toMatch(/sends nothing|nothing is asked|only when you press|never/);
         expect(findOaiyTitle(state)).toMatch(/also asks OAIY at .* each time it opens/);
         expect(findOaiyTitle(state)).not.toMatch(/only when you press this/);
       }
@@ -81,14 +87,14 @@ describe('what Settings says about how OAIY is found, in every state the page ca
       expect(words, name).toMatch(/whether or not OAIY is found/);
       expect(findOaiyTitle(state), name).toContain(`paired desktop at ${DESK}`);
       // The claim of a tab that is not paired is not made: a paired tab asks its desktop in the background, and says nothing goes out only when a button is pressed.
-      expect(oaiyFoundWords(state), name).not.toMatch(/sends nothing to your computer/);
+      expect(oaiyFoundWords(state), name).not.toMatch(/sends nothing to your computer|nothing is asked until you press it/);
       expect(findOaiyTitle(state), name).not.toMatch(/reaches out to your computer only/);
     }
   });
 
   it('the claim that nothing goes out is made in one state only: a tab that is not paired and holds nothing of OAIY', () => {
     for (const [name, state] of STATES) {
-      const claims = /sends nothing to your computer or your network/.test(said(state));
+      const claims = /nothing is asked until you press it|sends nothing to your computer or your network/.test(said(state));
       expect(claims, name).toBe(state.kind === 'tab' && !state.desktop && state.oaiy.kind === 'none');
     }
   });

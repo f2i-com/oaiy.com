@@ -36,7 +36,11 @@ export function oaiyStateOf(input: { own: boolean; desktop: string | null; disco
   return { kind: 'tab', desktop: input.desktop, oaiy };
 }
 
-/** The clause in Settings → Images, video and audio about how OAIY is found. */
+/**
+ * The sentence in Settings → Images, video and audio about how OAIY is found (it follows "… come from a media
+ * service."). Short where there is little to say: a tab that holds nothing says what the button does and that
+ * nothing is asked before it is pressed (the browser's own question, when it comes, is in the button's tooltip).
+ */
 export function oaiyFoundWords(state: OaiyState): string {
   if (state.kind === 'own') return 'OAIY is found on its own';
   const { oaiy, desktop } = state;
@@ -44,8 +48,8 @@ export function oaiyFoundWords(state: OaiyState): string {
     case 'none':
       // Only an unpaired tab has nothing else it sends: a paired one says what it keeps in touch with (pairedTabWords), and this says only what is true of OAIY.
       return desktop
-        ? 'OAIY is looked for only when you press Find OAIY, and your browser may ask you to allow it when you do'
-        : 'OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network to look for it, and your browser may ask you to allow it when you do';
+        ? 'Find OAIY looks for one on this computer when you press it'
+        : 'Find OAIY looks for one on this computer; nothing is asked until you press it';
     case 'found':
       return `OAIY was found at ${oaiy.origin}: this page asks it there each time it opens${oaiy.withKey ? ' (sending the key below)' : ''}, and now and then to follow the model chosen in OAIY's Engines. Forget OAIY, or clearing the address, ends that`;
     case 'typed':

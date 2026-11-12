@@ -52,7 +52,8 @@
   --incoming-bubble: var(--panel-2);
   --selected: color-mix(in srgb, var(--accent) 24%, transparent);
   --guide: color-mix(in srgb, var(--border) 85%, transparent);
-  --r-card: 11px;
+  /* (the dashboard's: a card 10 px, a button or a field 8, a tab or a small control 6) */
+  --r-card: 10px;
   --r-ctl: 8px;
   --r-sm: 6px;
   /* A message's bubble, and the corner by its speaker (squarer in Paper Circuit, as its cards are). */
@@ -155,6 +156,12 @@
   --syn-link: #1675b9;
   color-scheme: light;
 }
+/* Before the theme is said. public/boot-theme.js says it ahead of the first paint (the desktop's in OAIY's window,
+   the system's in a tab); where that file did not run, the starting screen's ground still follows the system, so a
+   light window is not painted dark first. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) { --bg: #f8f5ee; --text: #171717; --muted: #68645e; color-scheme: light; }
+}
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
@@ -165,6 +172,10 @@ html, body { overflow: hidden; overscroll-behavior: none; }
 .boot { margin: auto; color: var(--muted); }
 ::selection { background: color-mix(in srgb, var(--accent) 26%, transparent); }
 button, select, input, textarea { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-sm); }
+/* On paper a field is white with a border, as the dashboard's: the grey fill read as a field that cannot be typed
+   in. (No more specific than the rule above, so a field with a look of its own, the message box, the terminal's
+   line, keeps it.) */
+:where(:root[data-theme='light']) :is(input, select, textarea) { background-color: #fff; border-color: var(--strong-border); }
 /* Fields take the controls' radius, as the dashboard's do. */
 input, select, textarea { border-radius: var(--r-ctl); transition: border-color 0.14s, box-shadow 0.14s; }
 /* A menu: the page's own chevron, not the system's arrow, so it looks the same in both themes and beside the chips. */
@@ -244,7 +255,9 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .update-notice button { min-height: 28px; padding: 0 12px; }
 .update-notice .update-later { padding: 0; width: 28px; border-color: transparent; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; }
 /* Status pills, as the dashboard draws them: a soft fill, a 1px edge, and a lit dot. */
-.chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+/* The bar's chips, by the dashboard's measures: a small button's height (28 px; they are pressed), a chip's text
+   (11 px), a full pill. They were 30 px with 12 px text beside a bare 32 px gear. */
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 11px; font-weight: 600; white-space: nowrap; }
 /* (a chip's own display beats the hidden attribute: a chip hidden is not shown; the menus' own rule is below) */
 .chip[hidden] { display: none; }
 .chip:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
@@ -257,8 +270,9 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .chip.think[data-think='auto']::before { background: var(--accent); box-shadow: none; }
 .chip.think[data-think='off']::before { background: var(--muted); box-shadow: none; }
 /* The model: its name in the data voice, with a spark. */
-.chip:not(.toggle):not(.on-call) { font-family: var(--mono); font-size: 11.5px; font-weight: 500; color: var(--text); }
-.chip:not(.toggle):not(.on-call)::before { content: ''; flex: none; width: 13px; height: 13px; background: var(--accent); -webkit-mask: var(--spark) center / contain no-repeat; mask: var(--spark) center / contain no-repeat; }
+/* (in the body's type at the chips' size, as the two chips beside it are: it was set in the mono face at 11.5 px) */
+.chip:not(.toggle):not(.on-call) { font-size: 11px; font-weight: 600; color: var(--text); }
+.chip:not(.toggle):not(.on-call)::before { content: ''; flex: none; width: 12px; height: 12px; background: var(--accent); -webkit-mask: var(--spark) center / contain no-repeat; mask: var(--spark) center / contain no-repeat; }
 :root {
   --phone-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z'/%3E%3C/svg%3E");
   --think-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1V17h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z'/%3E%3C/svg%3E");
@@ -266,7 +280,7 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 }
 :root { --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E"); }
 :root { --check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E"); --spark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2l2.4 6.6L21 11l-6.6 2.4L12 20l-2.4-6.6L3 11l6.6-2.4z'/%3E%3C/svg%3E"); --gear: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z'/%3E%3C/svg%3E"); }
-.settings-button { display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 0; border-radius: var(--r-ctl); }
+.settings-button { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 0; border-radius: var(--r-ctl); }
 .settings-button::before { content: ''; width: 17px; height: 17px; background: currentColor; -webkit-mask: var(--gear) center / contain no-repeat; mask: var(--gear) center / contain no-repeat; }
 .settings-button:hover:not(:disabled) { border-color: transparent; background: var(--panel-2); color: var(--text); }
 .settings-button .label { display: none; }
@@ -285,7 +299,7 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .combo-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px; }
 .combo-group + .combo-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
 /* A group's label: the dashboard sidebar's small capitals, in the data voice. */
-.combo-group-label { display: flex; align-items: center; gap: 7px; padding: 7px 8px 4px; font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.combo-group-label { display: flex; align-items: center; gap: 7px; padding: 7px 8px 4px; font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .combo-count { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0; color: var(--faint); border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; line-height: 15px; }
 .combo-option { position: relative; display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: var(--r-ctl); cursor: pointer; color: var(--text); }
 .combo-option.active { background: var(--primary-soft); }
@@ -319,7 +333,7 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 @keyframes pulse { 50% { opacity: 0.3; } }
 
 /* The project picker, in the top bar. */
-.project-picker .combo-button { height: 32px; padding: 0 10px 0 8px; gap: 8px; max-width: 280px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface-soft); font-weight: 600; font-size: 13px; }
+.project-picker .combo-button { height: 34px; padding: 0 10px 0 8px; gap: 8px; max-width: 280px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface-soft); font-weight: 600; font-size: 13px; }
 .project-picker .combo-button:hover:not(:disabled), .project-picker.open .combo-button { border-color: var(--strong-border); background: var(--panel-2); }
 .project-picker .combo-pop { right: auto; width: 320px; }
 .project-icon { display: grid; place-items: center; width: 22px; height: 22px; border-radius: var(--r-sm); background: var(--primary-soft); color: var(--accent-text); flex: none; }
@@ -339,8 +353,10 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .center { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) min(240px, 34%); min-width: 0; min-height: 0; border-left: 1px solid var(--border); border-right: 1px solid var(--border); background: var(--panel); }
 .center:has(> .terminal.folded) { grid-template-rows: auto minmax(0, 1fr) auto; }
 /* Editor and Preview: the dashboard's segmented tabs. */
-.center-tabs { justify-self: start; display: inline-flex; gap: 2px; margin: 3px 10px; padding: 3px; border: 1px solid var(--border); border-radius: calc(var(--r-ctl) + 2px); background: var(--bg); }
-.center-tabs button { height: 28px; padding: 0 13px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+/* (a segmented box, by the dashboard's measures: tabs 24 px high with 11 px at their sides, 2 px between them and
+   2 px round them inside a 1 px border, 30 px in all; 12.5 px words at weight 600) */
+.center-tabs { justify-self: start; display: inline-flex; gap: 2px; margin: 3px 10px; padding: 2px; border: 1px solid var(--border); border-radius: calc(var(--r-ctl) + 2px); background: var(--bg); }
+.center-tabs button { height: 24px; padding: 0 11px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 600; }
 .center-tabs button:hover:not(:disabled) { background: var(--surface-soft); color: var(--text); }
 .center-tabs button.active { background: var(--primary-soft); color: var(--accent-text); }
 :root:not([data-theme='light']) .center-tabs button.active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent); }
@@ -348,17 +364,48 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .center-main { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); border-top: 1px solid var(--border); }
 .center-main > * { grid-area: 1 / 1; min-height: 0; }
 .center[data-pane='editor'] .preview, .center[data-pane='preview'] .editor { visibility: hidden; pointer-events: none; }
-.preview { display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
+/* (a container: its bar is laid out by the pane's own width, which is a phone's on a phone and often in the window too) */
+.preview { display: flex; flex-direction: column; min-height: 0; background: var(--bg); container: preview / inline-size; }
 .preview .pane-title { display: flex; align-items: center; gap: 8px; }
-.preview .pane-title::before { content: ''; flex: none; width: 12px; height: 2px; border-radius: 2px; background: var(--accent); box-shadow: var(--glow) var(--accent); }
-.preview .pane-title button { margin-left: auto; flex: none; height: 26px; white-space: nowrap; font-size: 12px; padding: 0 9px; text-transform: none; letter-spacing: 0; font-weight: 550; color: var(--muted); background: transparent; border-color: var(--border); }
-.preview .pane-title button:hover:not(:disabled) { color: var(--text); background: var(--hover); border-color: var(--strong-border); }
+.preview-kicker { display: inline-flex; align-items: center; gap: 8px; flex: none; white-space: nowrap; }
+.preview-kicker::before { content: ''; flex: none; width: 12px; height: 2px; border-radius: 2px; background: var(--accent); box-shadow: var(--glow) var(--accent); }
+.preview .pane-title > button { margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 6px; height: 26px; white-space: nowrap; font-size: 12px; padding: 0 9px; text-transform: none; letter-spacing: 0; font-weight: 550; color: var(--muted); background: transparent; border-color: var(--border); }
+.preview .pane-title > button .icon { flex: none; width: 13px; height: 13px; }
+.preview .pane-title > button:hover:not(:disabled) { color: var(--text); background: var(--hover); border-color: var(--strong-border); }
 /* (the full-screen button beside Reload, not halfway along the bar) */
-.preview .pane-title button + button { margin-left: 0; }
+.preview .pane-title > button + button { margin-left: 0; }
+/* A pane too narrow for the words: Reload and Full screen are their icons (named in their tooltips), and the tab or
+   the pane's own tabs already say "Preview". Narrower still, the note about the pane's size takes a line of its own. */
+@container preview (max-width: 700px) {
+  .preview-kicker { display: none; }
+  /* (a square: as tall as a button is here, which on a touch screen is taller) */
+  .preview .pane-title > button { aspect-ratio: 1; min-width: 28px; padding: 0; justify-content: center; }
+  .preview .pane-title > button .label { display: none; }
+  .preview.full .pane-title > button.preview-full { aspect-ratio: auto; padding: 0 9px; }
+  .preview.full .pane-title > button.preview-full .label { display: inline; }
+}
+@container preview (max-width: 600px) {
+  .preview .pane-title { flex-wrap: wrap; row-gap: 5px; }
+  .preview-size-said { order: 10; flex: 1 0 100%; }
+  /* (the status takes what is left of the first line and is cut there: at its own width a long one pushed the
+     Full screen button onto a line by itself) */
+  .preview .pane-title > .preview-status { flex: 1 1 0; }
+  .preview .pane-title > button { margin-left: 0; }
+  /* (the size picker gives the status its room: "error · last version kept" was cut at "k…" on a phone) */
+  .preview .pane-title > select.preview-size { flex: 0 1 100px; min-width: 0; width: 100px; }
+}
+/* Over a phone's whole screen the bar keeps the state and the way out, in words: the size picker goes (the screen
+   is the size), which is what cut "live · 00:10:56" to "live · 00:10…" beside "Leave full screen". */
+@container preview (max-width: 480px) {
+  .preview.full .pane-title > select.preview-size, .preview.full .preview-size-said { display: none; }
+}
 /* The preview over the whole screen, or OAIY's whole window where the screen cannot be had (below a notice and the dialogs). */
 .preview.full { position: fixed; inset: 0; z-index: 50; display: flex !important; visibility: visible; pointer-events: auto; }
 .preview.full .preview-frame { background: var(--bg); }
-.preview-status { text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-status { flex: 0 1 auto; min-width: 0; text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* (a state starts with a capital letter, as the dashboard's chips do: drawn so, the words themselves stay as the
+   checks and the tooltips have them) */
+.preview-status::first-letter { text-transform: uppercase; }
 .preview-status[data-kind='ok'] { color: var(--ok-text); }
 .preview-status[data-kind='error'] { color: var(--err); }
 .preview-status[data-kind='busy'] { color: var(--warn-text); }
@@ -376,7 +423,13 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .preview-size-input { width: 62px; padding: 0 6px; }
 .preview-size-custom { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }
 .preview-size-custom[hidden] { display: none; }
-.preview-size-note { font-size: 12px; text-transform: none; letter-spacing: 0; opacity: 0.7; }
+/* Beside the size picker: how far a chosen size is shrunk; or that the pane itself is phone-sized, with the Laptop size a press away. */
+.preview-size-said { display: inline-flex; align-items: center; gap: 7px; min-width: 0; font-size: 12px; font-weight: 500; text-transform: none; letter-spacing: 0; white-space: nowrap; }
+.preview-size-said[hidden] { display: none; }
+.preview-size-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.preview-size-offer { flex: none; height: 22px; min-height: 0; padding: 0 9px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border)); background: var(--primary-soft); color: var(--accent-text); font-size: 11.5px; font-weight: 650; text-transform: none; letter-spacing: 0; }
+.preview-size-offer:hover:not(:disabled) { border-color: var(--accent); }
+.preview-size-offer[hidden] { display: none; }
 /* A pane's header: the dashboard's small uppercase kicker, with its blue dash. */
 .pane-title { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 5px 12px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--panel); }
 .pane-title .muted { text-transform: none; letter-spacing: 0; }
@@ -456,6 +509,9 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .editor-icon .icon { width: 15px; height: 15px; }
 .editor-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .editor-head.empty .editor-title { font-family: var(--sans); font-size: 12.5px; }
+/* With no file open the pane says so once, in its middle: "No file open" stood in this bar and again under it, and
+   the bar held nothing else (the Editor tab above it, or below on a phone, names the pane). */
+.editor-head.empty { display: none; }
 .crumb-sep { color: var(--faint); opacity: 0.7; padding: 0 1px; }
 .crumb-sep:first-child { display: none; }
 .crumb-sep + .crumb { margin-left: 0; }
@@ -489,6 +545,8 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .editor-empty-icon .icon { width: 22px; height: 22px; stroke-width: 1.7; }
 .editor-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px 16px; margin: 14px 0 2px; padding: 0; list-style: none; font-size: 12px; }
 .editor-keys li { display: inline-flex; align-items: center; gap: 6px; }
+/* (keyboard shortcuts are for a keyboard: not on a phone or a tablet) */
+@media (max-width: 900px), (pointer: coarse) { .editor-keys { display: none; } }
 kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: var(--r-sm); background: var(--panel); color: var(--text); font: 600 11px/1.5 var(--mono); }
 .editor-empty-note { font-size: 11.5px; color: var(--faint); }
 
@@ -562,7 +620,7 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .contact-name { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .contact-number { font-size: 11.5px; color: var(--muted); }
 .contact-section { margin-top: 12px; }
-.contact-section h4 { margin: 0 0 4px; font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.contact-section h4 { margin: 0 0 4px; font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .contact-notes { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .contact-facts { margin: 4px 0 0; padding-left: 18px; }
 .contact-facts li { margin: 2px 0; overflow-wrap: anywhere; }
@@ -760,6 +818,9 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .msg.step { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; color: var(--muted); border-radius: 0; }
 .msg.step::after { content: ''; flex: 1; min-width: 12px; border-top: 1px solid var(--border); }
 .msg.step .step-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* (a step's words take a second line before they are cut: on one line a phone, and the chat pane of a 1024 px
+   window, showed half of them. Where they fit on one line, nothing changes.) */
+.msg.step .step-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; white-space: normal; }
 .msg.step .step-icon { flex: none; width: 14px; text-align: center; }
 .msg.step.started { color: var(--accent-text); }
 .msg.step.done { color: var(--ok-text); }
@@ -795,7 +856,7 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .tool > summary { flex-wrap: wrap; }
 .tool > summary .tool-prompt { flex-basis: 100%; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin: 0 0 1px 21px; color: var(--text); opacity: 0.8; font-size: 12px; white-space: normal; }
 .tool-detail { display: flex; flex-direction: column; gap: 10px; padding: 8px 10px 10px; border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
-.tool-section-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.tool-section-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .tool-raw { font-size: 10.5px; letter-spacing: 0; text-transform: none; font-weight: 500; color: var(--faint); background: none; border: 0; padding: 0; font-family: var(--mono); }
 .tool-args { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow: auto; }
 .tool-arg-row { display: grid; grid-template-columns: minmax(60px, max-content) minmax(0, 1fr); gap: 2px 10px; align-items: baseline; font-size: 12px; }
@@ -877,12 +938,19 @@ details.tool.auto summary .tool-name { font-style: italic; }
 .chat-empty-icon { display: grid; place-items: center; width: 44px; height: 44px; border-radius: calc(var(--r-card) + 1px); background: var(--accent-grad); color: var(--on-accent); box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 24%, transparent); }
 :root[data-theme='light'] .chat-empty-icon { box-shadow: 3px 3px 0 rgba(50, 42, 30, 0.14); }
 .chat-empty-icon .icon { width: 22px; height: 22px; }
-.chat-empty h2 { margin: 8px 0 0; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; }
+.chat-empty h2 { margin: 8px 0 0; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.3; }
 .chat-empty p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 /* (two across in the side pane too, so the welcome and its suggestions fit a laptop's window without scrolling) */
 .chat-suggestions { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 8px; width: 100%; margin-top: 12px; }
 .suggestion { display: flex; align-items: flex-start; min-height: 44px; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface-soft); color: var(--text); font-size: 12.5px; line-height: 1.4; text-align: left; box-shadow: var(--shadow-card); }
 .suggestion:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); background: var(--primary-soft); }
+/* No AI provider yet: the one thing to do, as the welcome's one filled button, with why under it. The suggestions
+   wait behind it, quieter: they fill the message box, and there is nothing to send to yet. */
+.chat-setup { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 100%; margin-top: 12px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: var(--r-card); background: var(--primary-soft); }
+.chat-setup button.primary { display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 16px; border-radius: var(--r-ctl); font-size: 13.5px; }
+.chat-setup button.primary .icon { width: 15px; height: 15px; }
+.chat-setup p { font-size: 12.5px; }
+.chat-empty.needs-setup .chat-suggestions { opacity: 0.6; }
 .chat-empty.quiet { gap: 6px; }
 .chat-empty.quiet .chat-empty-icon { width: 36px; height: 36px; border-radius: var(--r-card); background: var(--surface-soft); color: var(--faint); border: 1px solid var(--border); box-shadow: none; }
 .chat-empty.quiet .chat-empty-icon .icon { width: 18px; height: 18px; }
@@ -892,17 +960,22 @@ details.tool.auto summary .tool-name { font-style: italic; }
 dialog.settings { width: min(860px, 94vw); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: calc(var(--r-card) + 1px); padding: 18px 22px; box-shadow: var(--shadow); overscroll-behavior: contain; }
 dialog.settings > p.muted { margin: 0 0 4px; font-size: 12.5px; }
 /* Its sections: AI providers, the agent, and images, video and audio. */
-.settings-section { display: block; margin: 16px 0 4px; font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
-.agent-settings > strong { font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+/* A small label, a heading and a line of text, stacked: one rule, the dashboard's, and the flow editor's too. 6 px
+   between the lines' boxes, and each line's height in pixels (a small label 10.5 px on a 14 px line, a dialog's
+   title 16 on 22, a line of text 13 on 18), so a fallback font with another shape cannot close the gap. (A
+   section's small capitals sat 4 px over its first line, 7.8 px letter to letter; now 6 px and about 10.) */
+.settings-section { display: block; margin: 18px 0 6px; font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.agent-settings > strong { font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .agent-settings > p.muted { margin: 0; max-width: 72ch; font-size: 12.5px; line-height: 1.5; }
 /* Cancel and Save stay at the dialog's foot while the rest scrolls. */
 dialog.settings > .dialog-buttons { position: sticky; bottom: -18px; z-index: 2; margin: 16px -22px -18px; padding: 12px 22px 16px; border-top: 1px solid var(--border); background: var(--panel); }
 dialog::backdrop { background: var(--backdrop); }
 /* A dialog's title: one size in every dialog (Settings, the phone, the questions), the dashboard's page title a step down. */
-dialog h2 { margin: 0 0 4px; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+/* (a dialog's title is 16 px here and in the flow editor, its line 13 px, its buttons 34 px tall) */
+dialog h2 { margin: 0 0 6px; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; line-height: 22px; }
 /* Its buttons: the dashboard's, a little smaller than the text and firmer. */
 dialog button:not(.provider-pick) { font-size: 13px; font-weight: 600; }
-.dialog-buttons button { height: 32px; padding: 0 14px; border-radius: var(--r-ctl); }
+.dialog-buttons button { height: 34px; padding: 0 14px; border-radius: var(--r-ctl); }
 .form-buttons button, .window-picker button { height: 30px; padding: 0 12px; border-radius: var(--r-ctl); }
 /* (a plain one tints under the pointer, as the dashboard's secondary buttons do) */
 dialog button:not([class]):hover:not(:disabled), .dialog-buttons button:not(.primary):hover:not(:disabled) { background: var(--primary-soft); }
@@ -924,7 +997,7 @@ dialog button:not([class]):hover:not(:disabled), .dialog-buttons button:not(.pri
 .provider-form select, .provider-form input { min-width: 0; max-width: 100%; }
 /* (its help in the form's rhythm, not a paragraph's margins apart) */
 .provider-form > p { margin: 2px 0 0; font-size: 12.5px; line-height: 1.5; }
-.form-buttons, .dialog-buttons { display: flex; gap: 6px; justify-content: flex-end; }
+.form-buttons, .dialog-buttons { display: flex; gap: 8px; justify-content: flex-end; }
 .model-picker { display: flex; gap: 6px; }
 .model-picker select { flex: 1; min-width: 0; }
 .model-picker input { flex: 1; min-width: 0; }
@@ -932,6 +1005,7 @@ dialog button:not([class]):hover:not(:disabled), .dialog-buttons button:not(.pri
 /* (a note that warns says so: one that reports what was found or done is not coloured as a warning) */
 .form-note.warn { color: var(--warn-text); }
 /* Settings, where OAIY runs the Agent on something else (ChatGPT, one of its AI providers): where that is chosen. */
+.agent-elsewhere button.link { height: auto; padding: 0; border: 0; background: none; color: var(--accent-text); font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .agent-elsewhere { margin: 4px 0 8px; padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); border-radius: var(--r-ctl); background: color-mix(in srgb, var(--accent) 7%, var(--panel)); color: var(--text); font-size: 13px; line-height: 1.45; }
 
 /* ---------- any screen: tablets and phones ---------- */
@@ -1035,11 +1109,31 @@ dialog button:not([class]):hover:not(:disabled), .dialog-buttons button:not(.pri
   .chip.toggle.think { --glyph: var(--think-glyph); }
 }
 
+/* Narrower still: the model's chip is its spark alone (which provider and model is in its tooltip, and in Settings),
+   so the project's name is read whole instead of as one letter. "Set up AI…" keeps its words: it is what there is to do. */
+@media (max-width: 480px) {
+  button.chip.model { flex: none; width: 30px; height: 30px; min-height: 0; max-width: none; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+  button.chip.model .chip-words { display: none; }
+  button.chip.model::before { margin: 0; }
+  /* (none set up yet: the spark is lit, and the welcome's own button says the words; "Set up AI…" written out here
+     left the project one letter of its name) */
+  button.chip.model[data-source='none'] { border-color: var(--accent); background: var(--primary-soft); }
+}
+
 /* The preview's banner for errors the running app reported. */
 .preview-problem { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: color-mix(in srgb, var(--err) 16%, var(--panel)); border-bottom: 1px solid color-mix(in srgb, var(--err) 40%, transparent); font-size: 12px; }
 .preview-problem[hidden] { display: none; }
-.preview-problem-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.preview-problem button { font-size: 12px; padding: 2px 8px; }
+.preview-problem-icon { flex: none; display: inline-flex; color: var(--err); }
+.preview-problem-icon .icon { width: 15px; height: 15px; }
+/* Up to two lines: the file and the part a person can act on come first, so they are what is read (the whole of it is in the tooltip). */
+.preview-problem-text { flex: 1; min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; line-height: 1.4; overflow-wrap: anywhere; }
+.preview-problem button { flex: none; font-size: 12px; padding: 2px 8px; }
+/* A pane as narrow as a phone: the message has the width, and its two buttons the line under it. */
+@container preview (max-width: 600px) {
+  .preview-problem { flex-wrap: wrap; row-gap: 6px; }
+  .preview-problem-text { flex: 1 1 calc(100% - 30px); }
+  .preview-problem-icon + .preview-problem-text + button { margin-left: 23px; }
+}
 
 /* Media: the file viewer and the chat. */
 .media-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
@@ -1090,8 +1184,9 @@ dialog.modal[open]::backdrop, dialog.settings[open]::backdrop { animation: backd
 @keyframes modal-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
 @keyframes backdrop-in { from { opacity: 0; } }
 .modal-form { display: flex; flex-direction: column; gap: 14px; padding: 20px 22px 18px; }
-.modal-form h2 { margin: 0; font-size: 17px; font-weight: 650; }
-.modal-message { margin: -6px 0 0; color: var(--muted); font-size: 13px; }
+.modal-form h2 { margin: 0; font-size: 16px; font-weight: 650; line-height: 22px; }
+/* (a title and its line: the stacked-lines rule by .settings-section, 16 px on 22, 6 px, 13 px on 18) */
+.modal-message { margin: -4px 0 0; color: var(--muted); font-size: 13px; line-height: 18px; }
 .modal-field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .modal-field input { font-size: 14px; padding: 7px 10px; color: var(--text); }
 /* (one ring, the fields' own: an outline as well drew two) */
@@ -1109,9 +1204,9 @@ dialog.modal[open]::backdrop, dialog.settings[open]::backdrop { animation: backd
 .template-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .template-card input { position: absolute; opacity: 0; pointer-events: none; }
 .template-icon { font-size: 20px; line-height: 1.2; flex: none; width: 26px; text-align: center; }
-.template-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.template-text strong { font-size: 13.5px; font-weight: 600; }
-.template-description { font-size: 12px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.template-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.template-text strong { font-size: 13.5px; font-weight: 600; line-height: 1.3; }
+.template-description { font-size: 12px; line-height: 1.5; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .where { gap: 6px; }
 .where-option { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-ctl); cursor: pointer; transition: border-color 120ms, background 120ms; }
 .where-option:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
@@ -1132,7 +1227,7 @@ dialog.modal[open]::backdrop, dialog.settings[open]::backdrop { animation: backd
 dialog.modal { max-height: min(calc(100dvh - 32px), 880px); overflow: hidden; }
 dialog.modal[open] { display: flex; }
 .modal-form { flex: 1; min-width: 0; min-height: 0; padding: 0; gap: 0; }
-.modal-head { display: flex; flex-direction: column; gap: 4px; padding: 18px 22px 12px; }
+.modal-head { display: flex; flex-direction: column; gap: 6px; padding: 18px 22px 12px; }
 .modal-head .modal-message { margin: 0; }
 .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 14px; padding: 2px 22px 16px; }
 .modal-body .modal-error { margin: -6px 0 0; }
@@ -1208,8 +1303,18 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 
 /* The context meter in the Agent pane's title. */
 .chat-head-tools { margin-left: auto; display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
-.context-meter { display: inline-flex; align-items: center; gap: 7px; font: 500 10.5px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+/* The meter is a button: behind it, the model's size and what it was sent (out of the conversation). */
+.context-meter { display: inline-flex; align-items: center; gap: 7px; height: 24px; min-height: 0; padding: 0 7px; border: 1px solid transparent; border-radius: var(--r-sm); background: transparent; font: 500 10.5px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; cursor: pointer; }
+.context-meter:hover:not(:disabled), .context-meter[aria-expanded='true'] { border-color: var(--border); background: var(--surface-soft); color: var(--text); }
 .context-meter[hidden] { display: none; }
+.chat-head { position: relative; }
+.context-pop { position: absolute; z-index: 20; top: calc(100% + 4px); right: 10px; width: min(420px, calc(100% - 20px)); max-height: min(70vh, 520px); overflow: auto; display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--strong-border); border-radius: var(--r-card); background: var(--panel); box-shadow: var(--shadow); color: var(--text); font-size: 12.5px; font-weight: 400; line-height: 1.5; text-transform: none; letter-spacing: 0; }
+.context-pop[hidden] { display: none; }
+.context-pop-title { font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.context-pop-title:not(:first-child) { margin-top: 8px; }
+.context-pop p { margin: 0; }
+.context-pop-note { color: var(--muted); }
+.context-pop .prompt-view { font-size: 12px; color: var(--muted); }
 /* Beside it: the conversation cleared (its messages and the model's context). */
 .chat-clear { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; text-transform: none; letter-spacing: 0; white-space: nowrap; cursor: pointer; }
 .chat-clear .icon { width: 12px; height: 12px; }
@@ -1219,6 +1324,11 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .context-fill { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
 .context-meter[data-level='mid'] .context-fill { background: var(--warn); }
 .context-meter[data-level='high'] .context-fill { background: var(--err); }
+/* A provider's context size and agents: closed until asked for. */
+.provider-advanced > summary { width: fit-content; padding: 3px 6px 3px 2px; border-radius: var(--r-sm); cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.provider-advanced > summary:hover { color: var(--text); }
+.provider-advanced > label { margin-top: 8px; }
+.media-settings > p.media-now { color: var(--text); }
 .window-picker { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .window-picker input { width: 110px; }
 .window-note { font-size: 12px; color: var(--muted); }
@@ -1312,7 +1422,7 @@ select.chip.model.pick[data-state='offline'] { --dot: var(--muted); color: var(-
 /* A checkbox and its words on one line, the words wrapping beside it. */
 .phone-form label.row { flex-wrap: nowrap; align-items: flex-start; }
 .phone-form label.row input[type='checkbox'] { flex: none; margin-top: 3px; }
-.phone-form .phone-heading { margin: 8px 0 0; padding-top: 14px; border-top: 1px solid var(--border); font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.phone-form .phone-heading { margin: 8px 0 0; padding-top: 14px; border-top: 1px solid var(--border); font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .phone-form .phone-screening { display: flex; flex-direction: column; gap: 10px; }
 .phone-form .phone-screening[hidden] { display: none; }
 .phone-form label:not(.row) { display: flex; flex-direction: column; gap: 5px; color: var(--muted); }
@@ -1324,16 +1434,23 @@ select.chip.model.pick[data-state='offline'] { --dot: var(--muted); color: var(-
 
 /* ---------- inside OAIY's window: the dashboard's page, with its header height ---------- */
 .in-oaiy .brand { display: none; }
-.in-oaiy .topbar { min-height: 50px; padding: 8px 12px; }
+/* (The bar is right under the window's 48 px header, whose title starts 30 px in from the page's left edge, 24 px
+   in a window of 1240 px or less, where OAIY's sidebar is its narrow strip and this page is under 1167 px wide:
+   the bar's first item starts on that line, so "Agent" above and the project below share a left edge. A page of
+   1019 to 1166 px is either window; it takes 30.) */
+/* (44 px with its line, as the flow editor's row and the Engines page's row are: the three pages that sit under the
+   window's header start their own content at the same height. It was 49.) */
+.in-oaiy .topbar { box-sizing: border-box; height: 44px; min-height: 0; padding: 0 12px 0 30px; }
+@media (max-width: 1018px) { .in-oaiy .topbar { padding-left: 24px; } }
 @media (max-width: 900px) {
   /* A desktop window, not a phone: no zoom-proof 16px type, and the pane switcher at the top, under the bar. */
   .in-oaiy body { font-size: 14px; }
   .in-oaiy input, .in-oaiy select, .in-oaiy textarea, .in-oaiy .term-input, .in-oaiy .chat-input { font-size: 13.5px; }
   .in-oaiy button { min-height: 0; }
   .in-oaiy #app > .topbar { order: 0; }
-  .in-oaiy #app > .tabs { order: 1; gap: 2px; margin: 6px 10px; padding: 3px; border: 1px solid var(--border); border-radius: calc(var(--r-ctl) + 2px); background: var(--bg); align-self: flex-start; }
+  .in-oaiy #app > .tabs { order: 1; gap: 2px; margin: 6px 10px 6px 24px; padding: 2px; border: 1px solid var(--border); border-radius: calc(var(--r-ctl) + 2px); background: var(--bg); align-self: flex-start; }
   .in-oaiy #app > .workspace { order: 2; border-top: 1px solid var(--border); }
-  .in-oaiy .tabs button { flex: none; min-height: 28px; padding: 0 14px; border-radius: var(--r-sm); font-size: 12.5px; font-weight: 600; }
+  .in-oaiy .tabs button { flex: none; min-height: 24px; padding: 0 11px; border-radius: var(--r-sm); font-size: 12.5px; font-weight: 600; }
   .in-oaiy .tabs button:hover { background: var(--surface-soft); color: var(--text); }
   .in-oaiy .tabs button.active { background: var(--primary-soft); color: var(--accent-text); box-shadow: none; }
   .in-oaiy .chip { max-width: 30vw; }
@@ -1348,7 +1465,7 @@ select.chip.model.pick[data-state='offline'] { --dot: var(--muted); color: var(-
 
 /* ---- Outreach: the dialog that asks once, its card in the chat, its lines and its chip ---- */
 .outreach-plan-part { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.outreach-plan-part h3 { margin: 0; font: 650 10px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.outreach-plan-part h3 { margin: 0; font: 650 10.5px/14px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
 .outreach-plan-objective { margin: 0; font-size: 14px; line-height: 1.45; }
 .outreach-plan-sample { display: flex; gap: 8px; align-items: flex-start; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border)); border-radius: 4px 14px 14px 14px; background: color-mix(in srgb, var(--accent) 7%, var(--panel)); font-size: 14px; line-height: 1.45; }
 .outreach-plan-sample .icon { width: 14px; height: 14px; flex: none; margin-top: 3px; color: var(--accent-text); }

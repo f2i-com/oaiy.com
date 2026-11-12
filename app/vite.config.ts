@@ -56,7 +56,9 @@ const stampServiceWorker = {
     const dir = options.dir ?? 'dist';
     const hash = createHash('sha256');
     for (const name of Object.keys(bundle).sort()) hash.update(name);
-    for (const file of ['zipp/zipp_wasm.js', 'zipp/SOURCE.json']) {
+    // (softn/SOURCE.json too: a move to another SoftN runtime on the same ZIPP changes neither the bundle's file
+    // names nor the engine, and an installed Agent then served the old runtime-manifest.json and bridge from its cache)
+    for (const file of ['zipp/zipp_wasm.js', 'zipp/SOURCE.json', 'softn/SOURCE.json']) {
       try {
         hash.update(readFileSync(join('public', file)));
       } catch {

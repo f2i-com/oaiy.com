@@ -221,7 +221,7 @@ describe('the provider each kind of conversation runs on', () => {
     expect(modelChipText(chatgptProvider(DESK, 'project', ''))).toBe('ChatGPT · default model');
     expect(modelChipText(chatgptProvider(DESK, 'project', 'gpt-5.5'), 'sign in needed')).toBe('ChatGPT · sign in needed');
     expect(modelChipText(ENGINE_PROVIDER)).toBe('OAIY · Qwen3.8-Flash-Next');
-    expect(modelChipText(null)).toBe('Set up AI…');
+    expect(modelChipText(null)).toBe('Set up AI');
   });
 });
 

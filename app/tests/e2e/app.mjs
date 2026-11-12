@@ -175,7 +175,9 @@ try {
     await page.select('.model-picker select', 'mock-model');
     await page.waitForFunction(() => document.querySelector('.provider-row.selected')?.textContent.includes('mock-model'));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click());
-    await page.waitForFunction(() => document.querySelector('button[title="AI provider"]')?.textContent.includes('mock-model'));
+    await page.waitForFunction(() => document.querySelector('button.chip.model')?.textContent.includes('mock-model'));
+    // (the chip's tooltip says which provider and model, which is all there is of them where the chip is its icon alone)
+    expect((await page.$eval('button.chip.model', (b) => b.title)).startsWith('AI provider: '), await page.$eval('button.chip.model', (b) => b.title));
   });
 
   await check('the agent runs the shell and Python, and answers', async () => {
@@ -191,10 +193,19 @@ try {
   });
 
   await check("the model's context window is detected from the server, and a meter shows how full it is", async () => {
-    const log = await page.$eval('.chat-log', (e) => e.textContent);
-    expect(log.includes("mock-model: 131k tokens of context, from the server's model list.") && log.includes('compacted at 75%'), log.slice(0, 600));
     const meter = await page.$eval('.context-meter', (m) => ({ hidden: m.hidden, text: m.textContent }));
     expect(!meter.hidden && / \/ 131k$/.test(meter.text), JSON.stringify(meter));
+    // What the window is and where that came from is behind the meter (a click opens it), not a line of the conversation;
+    // so is what the model was sent for each step.
+    const log = await page.$eval('.chat-log', (e) => e.textContent);
+    expect(!log.includes('tokens of context') && !log.includes('Prompt ·'), `the conversation still carries the context note or a prompt line: ${log.slice(0, 600)}`);
+    expect(await page.$eval('.context-pop', (p) => p.hidden), 'what is behind the meter is open before it is asked for');
+    await page.click('.context-meter');
+    const behind = await page.$eval('.context-pop', (p) => ({ hidden: p.hidden, text: p.textContent, prompts: p.querySelectorAll('details.prompt-view').length }));
+    expect(!behind.hidden && behind.text.includes("mock-model: 131k tokens of context, from the server's model list.") && behind.text.includes('compacted at 75%'), JSON.stringify(behind).slice(0, 700));
+    expect(behind.prompts >= 1 && /as the model counted them|tokens of text/.test(behind.text), JSON.stringify(behind).slice(0, 700));
+    await page.keyboard.press('Escape');
+    expect(await page.$eval('.context-pop', (p) => p.hidden), 'Escape did not close what is behind the meter');
   });
 
   await check('sub-agents take tasks from a queue, and the chat shows each one live', async () => {
@@ -308,15 +319,15 @@ try {
   await check('the internet chip toggles the gate off and on', async () => {
     const chip = 'button[role="switch"]';
     await page.click(chip);
-    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'internet: off', {}, chip);
+    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'Internet: off', {}, chip);
     await page.click(chip);
-    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'internet: on', {}, chip);
+    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'Internet: on', {}, chip);
   });
 
   await check('/internet off closes the gate for the sandbox', async () => {
     await page.type('.chat-input', '/internet off');
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => document.querySelector('button[role="switch"]')?.textContent === 'internet: off');
+    await page.waitForFunction(() => document.querySelector('button[role="switch"]')?.textContent === 'Internet: off');
     const out = await terminal(page, 'curl -sS https://example.com', 'network gate is closed');
     expect(out.includes('was not contacted'), out);
   });
@@ -329,7 +340,7 @@ try {
     expect(out.includes('19.8'), out);
     const log = await page.$eval('.chat-log', (e) => e.textContent);
     expect(log.includes('What is the mean temperature?') && log.includes('saved in data/mean.txt'), `log: ${log.slice(0, 300)}`);
-    expect((await page.$eval('button[role="switch"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
+    expect((await page.$eval('button[role="switch"]', (e) => e.textContent)) === 'Internet: off', 'gate not remembered');
     // A saved chat shows its sub-agent tasks with their outcomes.
     const tasks = await page.$$eval('.agent-task', (rows) => rows.map((r) => r.className));
     expect(tasks.length === 2 && tasks.every((c) => c.includes('done')), `tasks after reload: ${tasks}`);

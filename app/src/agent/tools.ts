@@ -791,7 +791,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'softn_interact',
     description:
       'Use a SoftN app in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors the app raised. ' +
-      'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"} (a select that takes several: "value": ["<option>", "<option>"], exactly those chosen), {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
       'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 400} (a few hundred ms moves a step or two; a call holds keys 8 s at most in all). At most 20 actions a call. ' +
       'State carries over between calls until the app is changed or re-rendered.',
     parameters: {
@@ -817,7 +817,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'page_interact',
     description:
       'Use a web page in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors it raised. ' +
-      'Actions: {"click": "<button, link or clickable text, or a label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'Actions: {"click": "<button, link or clickable text, or a label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"} (a select that takes several: "value": ["<option>", "<option>"], exactly those chosen), {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
       'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 400} (a few hundred ms moves a step or two; a call holds keys 8 s at most in all). At most 20 actions a call. ' +
       'State carries over between calls until the page is changed or re-rendered.',
     parameters: {
@@ -1891,6 +1891,8 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
     const result = await ctx.preview.check({ kind: 'app', root });
     problems.push(...result.errors);
     lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
+    // (the frame kept the last version that started: what the page tools see is that one, not the files as they are now)
+    if (result.kept) lines.push('The preview still shows the last version that worked, because this one does not start: softn_inspect, softn_interact and preview_screenshot see that older version until the errors above are fixed.');
     if (!result.ok && result.errors.some((e) => /of null|is null|of undefined/.test(e)) && looksUpElements(ctx.vfs, root)) lines.push(ELEMENTS_HINT);
     if (result.warnings?.length) lines.push(`Warnings while it loaded (often a handler or name the logic does not define):\n${[...new Set(result.warnings)].slice(0, 8).map((w) => `- ${w}`).join('\n')}`);
   }

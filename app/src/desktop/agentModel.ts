@@ -247,7 +247,8 @@ export async function codexDefaultModel(desktop: { origin: string; token: string
 
 /** What the header's model chip says: which provider and model the Agent is on ("ChatGPT · gpt-5.5", "OAIY · Qwen3-8B"). */
 export function modelChipText(provider: ProviderConfig | null, problem = ''): string {
-  if (!provider) return 'Set up AI…';
+  // (no "…" after it: beside the other chips it read as a label cut short)
+  if (!provider) return 'Set up AI';
   if (problem) return `${provider.name} · ${problem}`;
   return `${provider.name} · ${provider.modelId || (provider.name === 'ChatGPT' ? 'default model' : 'no model')}`;
 }

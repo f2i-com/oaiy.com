@@ -283,6 +283,7 @@ describe('terminal output', () => {
     finish(outcome);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect((stop as unknown as { hidden: boolean }).hidden).toBe(true);
-    expect((input as unknown as { placeholder: string }).placeholder).toMatch(/^ls, grep/);
+    // (the ready hint again: a few commands to try, ending with the one that lists the rest, and not cut short with "…")
+    expect((input as unknown as { placeholder: string }).placeholder).toMatch(/^ls, .*, help$/);
   });
 });

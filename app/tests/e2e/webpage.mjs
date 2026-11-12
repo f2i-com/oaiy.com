@@ -190,6 +190,25 @@ await check('the agent uses the page like a person: listeners, on* attributes an
   expect(await frame().evaluate(() => document.getElementById('add').className === 'btn used'), 'the listener did not see its event');
 });
 
+await check('a select that takes several: every chosen option is said, and a list of options is chosen', async () => {
+  await write({ 'order/index.html': '<!doctype html><title>Order</title><h1>Order</h1><label for="t">Toppings</label><select id="t" multiple><option selected>Cheese</option><option>Ham</option><option selected>Olives</option><option>Basil</option></select><label for="s">Size</label><select id="s"><option>Small</option><option selected>Large</option></select>' });
+  const shown = await tool('page_inspect', { path: 'order/index.html' });
+  // (both of the two chosen, not only the first; a select that takes one reads as it did)
+  expect(shown.content.includes('[multi-select "Toppings" = "Cheese", "Olives" options: Cheese | Ham | Olives | Basil]') && shown.content.includes('[select "Size" = "Large" options: Small | Large]'), shown.content);
+  const chosen = await tool('page_interact', { path: 'order/index.html', actions: [{ select: 'Toppings', value: ['Ham', 'Basil'] }] });
+  expect(!chosen.isError && chosen.content.includes('chose "Ham", "Basil" in "Toppings"') && chosen.content.includes('[multi-select "Toppings" = "Ham", "Basil" options:'), chosen.content);
+  expect((await frame().evaluate(() => [...document.getElementById('t').selectedOptions].map((o) => o.textContent).join(','))) === 'Ham,Basil', 'the options chosen are not the list');
+  // one option by its name replaces the choice; an empty list clears it
+  const one = await tool('page_interact', { path: 'order/index.html', actions: [{ select: 'Toppings', value: 'Olives' }] });
+  expect(!one.isError && one.content.includes('[multi-select "Toppings" = "Olives" options:'), one.content);
+  const none = await tool('page_interact', { path: 'order/index.html', actions: [{ select: 'Toppings', value: [] }] });
+  expect(!none.isError && none.content.includes('chose nothing in "Toppings"') && none.content.includes('[multi-select "Toppings" = none chosen options:'), none.content);
+  // a list for a select that takes one is refused in words, and nothing changes
+  const refused = await tool('page_interact', { path: 'order/index.html', actions: [{ select: 'Size', value: ['Small', 'Large'] }] });
+  expect(refused.content.includes('"Size" takes one choice') && refused.content.includes('[select "Size" = "Large"'), refused.content);
+  await tool('page_check', { path: 'site' });
+});
+
 await check('screen sizes: the page lays out at the size chosen, and the screenshot is that size', async () => {
   const set = await tool('preview_viewport', { preset: 'phone' });
   expect(set.content.includes('390×844'), set.content);

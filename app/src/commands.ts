@@ -91,17 +91,21 @@ export function internetCommand(gate: NetGate, args: string[]): string {
  * computer, not "this tab"; and the Agent's model is OAIY's, not necessarily an AI provider of the person's.
  */
 export function helpText(inOaiy: boolean): string {
+  // Each command on a line of its own with what it does under it, and the closing sentence left to wrap by itself:
+  // in two columns, with line breaks written in, it came apart on a phone (a column of single words down the side).
   return `Commands:
-  /internet … (/net)   the network gate: on | off | allowlist | allow <host> | deny <host> | forget <host> | reset | status
-  /softn …             SoftN apps: new | import | export | check | preview | apps (/softn alone says what each does)
-  /clear               start a new conversation (the project's files stay)
-  /help                this list
+  /internet … (/net)
+      the network gate: on | off | allowlist | allow <host> | deny <host> | forget <host> | reset | status
+  /softn …
+      SoftN apps: new | import | export | check | preview | apps (/softn alone says what each does)
+  /clear
+      start a new conversation (the project's files stay)
+  /help
+      this list
 
 ${inOaiy
-    ? `Everything runs in this window, on this computer: files are kept in it, code runs on the Zipp VM in a Web Worker,
-and nothing leaves except requests to the Agent's model and what the network gate lets through.`
-    : `Everything runs in this tab: files live in the browser, code runs on the Zipp VM in a Web Worker,
-and nothing leaves except requests to your AI provider and what the network gate lets through.`}`;
+    ? `Everything runs in this window, on this computer: files are kept in it, code runs on the Zipp VM in a Web Worker, and nothing leaves except requests to the Agent's model and what the network gate lets through.`
+    : `Everything runs in this tab: files live in the browser, code runs on the Zipp VM in a Web Worker, and nothing leaves except requests to your AI provider and what the network gate lets through.`}`;
 }
 
 /** /help, for the window this page is in. */

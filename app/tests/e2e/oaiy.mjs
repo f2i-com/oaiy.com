@@ -244,7 +244,7 @@ try {
     expect(log.includes(`Found OAIY's engines at ${new URL(oaiyUrl).origin} (version 0.1.0).`) && !log.includes('oaiy-studio'), log.slice(0, 500));
     expect(log.includes('The agent chats with them (Settings → AI providers) and can make images, video, speech, music, sound effects and 3D models with them (Settings → Images, video and audio).'), log.slice(0, 500));
     expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
-    const chip = await page.$eval('button[title="AI provider"]', (b) => b.textContent);
+    const chip = await page.$eval('button.chip.model', (b) => b.textContent);
     expect(chip === 'OAIY · qwen3.8-27b', chip);
     await page.click('button.settings-button');
     await page.waitForSelector('dialog.settings[open]');

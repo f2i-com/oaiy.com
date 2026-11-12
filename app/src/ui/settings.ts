@@ -11,6 +11,7 @@ import type { AgentSettings } from '../settings';
 import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
+import { HERE, IN_WINDOW, KEPT_HERE } from './where';
 import { clear, h } from './dom';
 import { confirmAction } from './modal';
 import { findOaiyTitle, oaiyFoundWords, oaiyStateOf, pairedTabWords } from './linkWords';
@@ -65,6 +66,43 @@ const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKin
   { value: 'custom', label: 'Other OpenAI-compatible API (OpenRouter, Groq, …)', type: 'custom' },
 ];
 
+/** The kinds that are no product of their own ("Other local …", "Other … API"): one of them is told from another by where it is. */
+const NAMED_BY_ADDRESS = new Set(['local-other', 'custom']);
+
+/** An address's host as a person reads it ("localhost:8080"); '' for what is not an address. */
+export function hostOf(address: string | undefined): string {
+  try {
+    return address ? new URL(address).host : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * A provider's name until the person gives it one: the product's where the kind is one (Ollama, LM Studio, OAIY, an
+ * API by its company), and for any other server the host of its address. The kind's own words for those ("Other
+ * local OpenAI-compatible server") filled the header's chip at any width and said nothing of which server it is.
+ */
+export function defaultProviderName(kind: string, baseUrl: string | undefined): string {
+  const k = KINDS.find((x) => x.value === kind);
+  if (NAMED_BY_ADDRESS.has(kind)) return hostOf(baseUrl) || (kind === 'custom' ? 'API' : 'Local server');
+  return (k?.label ?? 'AI provider').replace(/ \(.*$/, '');
+}
+
+/** Whether a provider's name is one this dialog gave it (any kind's, or an address's host), so it follows the kind and the address still. */
+function nameIsDefault(name: string, baseUrl: string | undefined): boolean {
+  return !name || name === hostOf(baseUrl) || name === 'API' || name === 'Local server' || KINDS.some((x) => x.label.replace(/ \(.*$/, '') === name || x.label.startsWith(name));
+}
+
+/**
+ * A provider's name as the header's chip and the list show it: its own, or, for one saved with the kind's long
+ * words as its name (before names followed the address), the host of its address.
+ */
+export function providerLabel(p: Pick<ProviderConfig, 'name' | 'baseUrl'>): string {
+  const longDefault = KINDS.some((k) => NAMED_BY_ADDRESS.has(k.value) && k.label.replace(/ \(.*$/, '') === p.name);
+  return (longDefault && hostOf(p.baseUrl)) || p.name || hostOf(p.baseUrl) || '(unnamed)';
+}
+
 /** Whether the address typed is (at) the origin that was found: an empty one, or one that is not an address, is not. */
 export function addressOf(typed: string, origin: string): boolean {
   if (!typed.trim()) return false;
@@ -99,7 +137,7 @@ const OAIY_HELP_IN_WINDOW = 'OAIY serves chat, images and video. Settings → Im
  * that is paired keeps doing besides. `agentElsewhere`: what the Agent runs on where OAIY chose something other than its
  * engine for it (ChatGPT, one of the desktop's AI providers), said above the providers, which then are not what it runs on.
  */
-export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null; agentElsewhere?: string } = {}): Promise<SettingsResult | null> {
+export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null; agentElsewhere?: string; /** In OAIY's window: shows OAIY's own Settings page (where the Agent's AI is chosen). */ openOaiySettings?: () => void } = {}): Promise<SettingsResult | null> {
   return new Promise((resolve) => {
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
@@ -110,6 +148,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     // (typing a name, switching rows) does not lose them.
     const modelCache = new Map<string, ModelInfo[]>();
     const cacheKey = (p: ProviderConfig) => `${p.type}|${p.baseUrl ?? ''}|${p.apiKey ? p.apiKey.slice(-6) : ''}`;
+    /** The providers added while this dialog is open: nothing is asked of their servers until a button asks. */
+    const added = new Set<string>();
 
     // (named by its heading, as a screen reader says it when it opens)
     const dialog = h('dialog.settings', { 'aria-labelledby': 'settings-title' });
@@ -129,7 +169,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     const renderList = (focus?: ProviderConfig | 'add') => {
       clear(list);
       for (const p of providers) {
-        const label = p.name || '(unnamed)';
+        const label = providerLabel(p);
         const open = h(
           'button.provider-pick',
           { type: 'button', 'aria-pressed': String(p === editing), title: `Show ${label} in the form`, onclick: () => { editing = p; renderList(p); renderForm(); } },
@@ -151,6 +191,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         type: 'button',
         onclick: () => {
           const p: ProviderConfig = { id: newId(), type: 'local', serverKind: 'ollama', name: 'Ollama', apiKey: '', baseUrl: LOCAL_SERVERS.ollama.baseUrl };
+          added.add(p.id);
           providers.push(p);
           editing = p;
           activeId ??= p.id;
@@ -182,16 +223,26 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           delete p.followEngine;
           delete p.detectedContext;
         }
+        const named = nameIsDefault(p.name, p.baseUrl);
         p.type = k.type;
         p.serverKind = k.serverKind;
         p.baseUrl = defaultBaseUrl(k.type, k.serverKind);
-        if (!p.name || KINDS.some((x) => x.label.startsWith(p.name))) p.name = k.label.replace(/ \(.*$/, '');
+        if (named) p.name = defaultProviderName(k.value, p.baseUrl);
         renderList();
         // (drawn again for the new kind, with focus where it was)
         renderForm(true);
       } }, ...KINDS.map((k) => h('option', { value: k.value, selected: kindOf(p) === k.value }, k.label)));
-      const name = h('input', { value: p.name, oninput: () => { p.name = name.value; renderList(); } });
-      const base = h('input', { value: p.baseUrl ?? '', placeholder: defaultBaseUrl(p.type, p.serverKind), oninput: () => { p.baseUrl = base.value.trim() || undefined; } });
+      const name = h('input', { value: p.name, oninput: () => { p.name = name.value; renderList(); } }) as HTMLInputElement;
+      const base = h('input', { value: p.baseUrl ?? '', placeholder: defaultBaseUrl(p.type, p.serverKind), oninput: () => {
+        // A server named by its address keeps that name as the address is typed, until the person names it.
+        const follows = NAMED_BY_ADDRESS.has(kindOf(p)) && nameIsDefault(p.name, p.baseUrl);
+        p.baseUrl = base.value.trim() || undefined;
+        if (follows) {
+          p.name = defaultProviderName(kindOf(p), p.baseUrl);
+          name.value = p.name;
+          renderList();
+        }
+      } });
       const key = h('input', { type: 'password', value: p.apiKey, placeholder: p.type === 'local' ? 'usually none' : 'sk-…', oninput: () => { p.apiKey = key.value.trim(); } });
       // The model: a real dropdown of what the server lists, plus "Other…"
       // for a name typed by hand (a server that lists nothing, a new model).
@@ -244,7 +295,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       };
       const fetchModels = h('button', { onclick: () => void loadModels(false) }, 'List models');
       fillModels(modelCache.get(cacheKey(p)));
-      if (!modelCache.has(cacheKey(p)) && (p.type === 'local' || p.apiKey)) void loadModels(true);
+      // A provider that was saved is one the Agent already talks to: its models are listed as its form opens. One
+      // just added is asked nothing until List models (or Test, or Detect) is pressed: adding a provider asked this
+      // computer's Ollama for its models at once, in a dialog that says nothing on the computer is asked unasked.
+      if (!modelCache.has(cacheKey(p)) && !added.has(p.id) && (p.type === 'local' || p.apiKey)) void loadModels(true);
       const model = h('div.model-picker', modelSelect, custom);
       // The context window: what the server reports (Detect), or the person's own number.
       const windowNote = h('span.window-note');
@@ -297,21 +351,26 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       // (in OAIY's own window OAIY answers this page as it is: its gateway's list of sites is not for it)
       const help = p.type === 'local'
         ? p.serverKind === 'oaiy' && pageHost().kind === 'oaiy-window' ? OAIY_HELP_IN_WINDOW : LOCAL_SERVERS[p.serverKind ?? 'other']?.help
-        : p.type === 'anthropic' ? 'Your key is sent only to Anthropic, straight from this browser.' : 'Your key is sent only to this API, straight from this browser.';
+        : p.type === 'anthropic' ? `Your key is sent only to Anthropic, straight from ${HERE}.` : `Your key is sent only to this API, straight from ${HERE}.`;
       form.append(
         h('label', 'Kind', kind),
         h('label', 'Name', name),
         h('label', 'Address', base),
         h('label', 'API key', key),
         h('label', 'Model', model),
-        h('label', 'Context', h('div.window-picker', windowInput, detect, windowNote)),
-        h('label', 'Agents', h('div.window-picker', (() => {
-          const input = h('input', { type: 'number', min: 1, max: 8, value: p.parallelAgents ?? '', placeholder: p.type === 'local' ? '1' : '3', title: 'How many sub-agents may use this model at once. A local server usually answers one request at a time.', oninput: () => {
-            const v = Number(input.value);
-            p.parallelAgents = Number.isFinite(v) && v >= 1 ? Math.min(8, Math.floor(v)) : undefined;
-          } }) as HTMLInputElement;
-          return input;
-        })(), h('span.window-note', 'at once (sub-agents wait in a queue for their turn)'))),
+        // Closed until asked for: how much the model can read at once and how many agents share it are found or
+        // set by themselves, and a person choosing a provider needs neither. (Open where a size was typed: it shows.)
+        h('details.provider-advanced', { open: p.contextTokens !== undefined || p.parallelAgents !== undefined },
+          h('summary', 'Advanced'),
+          h('label', 'Context', h('div.window-picker', windowInput, detect, windowNote)),
+          h('label', 'Agents', h('div.window-picker', (() => {
+            const input = h('input', { type: 'number', min: 1, max: 8, value: p.parallelAgents ?? '', placeholder: p.type === 'local' ? '1' : '3', title: 'How many sub-agents may use this model at once. A local server usually answers one request at a time.', oninput: () => {
+              const v = Number(input.value);
+              p.parallelAgents = Number.isFinite(v) && v >= 1 ? Math.min(8, Math.floor(v)) : undefined;
+            } }) as HTMLInputElement;
+            return input;
+          })(), h('span.window-note', 'at once (sub-agents wait in a queue for their turn)'))),
+        ),
         h('div.form-buttons', fetchModels, test, remove),
         help ? h('p.muted', help) : '',
         note,
@@ -330,7 +389,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         : media.baseUrl ? 'set up by hand' : 'not set up';
       // What was found when this was drawn: typing another address drops it, and typing the address that was found again gives it back.
       const found = { discovered: media.discovered, endpoints: media.endpoints };
-      const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, oninput: () => {
+      const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, title: "OAIY's address, or any service that takes OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech", oninput: () => {
         media.baseUrl = address.value.trim();
         // The address is what makes this the OAIY that was found: another address, or none, is not that one any more (its routes may
         // differ), and a page that has forgotten it does not ask it again when it opens or send it the key. The same address, retyped, is.
@@ -422,7 +481,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${oaiyFoundWords(oaiyState)}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        // Two sentences: what this is for, and how OAIY is found (linkWords.ts says the second for each state the page
+        // can be in). Then what is set up now, on a line of its own. Which other services work is on the address field.
+        h('p.muted', `Pictures, video, speech, music, sound and 3D come from a media service. ${oaiyFoundWords(oaiyState)}.`),
+        h('p.muted.media-now', `Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         ...(pairedWords ? [h('p.muted.paired-note', pairedWords)] : []),
         h('div.provider-form',
           // Forget OAIY is for a tab: OAIY's own window finds OAIY again at every opening, so the button would do nothing there.
@@ -441,33 +503,51 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     };
     renderMedia();
 
-    // (Settings, as the gear says: its sections are the AI providers, the agent, and images, video and audio)
-    dialog.append(
-      h('h2', { id: 'settings-title' }, 'Settings'),
-      h('strong.settings-section', 'AI providers'),
-      ...(context.agentElsewhere
+    // (Settings, as the gear says: its sections are the AI providers, the agent, and images, video and audio. In OAIY's
+    // window they are the Agent's settings, by that name: the window has a Settings of its own, and which AI the Agent
+    // runs on is chosen there, in ONE place, which this dialog names before anything else.)
+    const chosenInOaiy = IN_WINDOW
+      ? [h('p.agent-elsewhere',
+          context.agentElsewhere
+            ? `The Agent runs on ${context.agentElsewhere}. Which AI it runs on is chosen in one place: OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar). The providers below are the Agent's own; it uses them when Settings → Agent says OAIY's engine.`
+            : "Which AI the Agent runs on is chosen in one place: OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar). The providers below are the Agent's own; it uses them when Settings → Agent says OAIY's engine.",
+          // (OAIY's Settings page takes this page's place in the window: this dialog closes, asking first if something
+          // here was changed)
+          ...(context.openOaiySettings ? [' ', h('button.link', { type: 'button', onclick: () => { context.openOaiySettings?.(); void leave(); } }, "Open OAIY's Settings")] : []),
+        )]
+      : context.agentElsewhere
         ? [h('p.agent-elsewhere', `The Agent runs on ${context.agentElsewhere}, as chosen in OAIY's Settings → Agent: change it there. The providers below are this page's own; the Agent uses them when it runs on OAIY's engine.`)]
-        : []),
-      h('p.muted', 'Keys are stored encrypted in this browser and sent only to their own provider. Sandboxed code never sees them.'),
+        : [];
+    dialog.append(
+      h('h2', { id: 'settings-title' }, IN_WINDOW ? 'Agent settings' : 'Settings'),
+      h('strong.settings-section', IN_WINDOW ? "The Agent's own AI providers" : 'AI providers'),
+      ...chosenInOaiy,
+      h('p.muted', `Keys are stored encrypted ${KEPT_HERE} and sent only to their own provider. Sandboxed code never sees them.`),
       h('div.settings-grid', list, form),
       h(
         'div.agent-settings',
         h('strong', 'Agent'),
-        h('label', 'Compact the conversation at ', (() => {
-          const input = h('input', { type: 'number', min: 40, max: 95, step: 5, value: Math.round(agent.compactAt * 100), oninput: () => {
-            const v = Number(input.value);
-            if (v >= 40 && v <= 95) agent.compactAt = v / 100;
-          } }) as HTMLInputElement;
-          return input;
-        })(), '% of the model\'s context (older turns are summarized; recent ones stay word for word)'),
-        h('label', 'Give each sub-agent ', (() => {
-          const input = h('input', { type: 'number', min: 4096, step: 4096, value: agent.subAgentTokens, oninput: () => {
-            const v = Number(input.value);
-            if (v >= 4096) agent.subAgentTokens = Math.floor(v);
-          } }) as HTMLInputElement;
-          input.style.width = '96px';
-          return input;
-        })(), ' tokens of context (at most the model\'s window)'),
+        // What it does by itself, in a sentence; the two numbers behind it are for someone tuning a small model, and
+        // closed until asked for (as a provider's context size and agents are, above).
+        h('p.muted', 'A long conversation is shortened by itself: older turns are summarized, recent ones stay word for word.'),
+        h('details.provider-advanced',
+          h('summary', 'Advanced'),
+          h('label', 'Shorten the conversation at ', (() => {
+            const input = h('input', { type: 'number', min: 40, max: 95, step: 5, value: Math.round(agent.compactAt * 100), oninput: () => {
+              const v = Number(input.value);
+              if (v >= 40 && v <= 95) agent.compactAt = v / 100;
+            } }) as HTMLInputElement;
+            return input;
+          })(), '% of what the model can read at once'),
+          h('label', 'Give each sub-agent ', (() => {
+            const input = h('input', { type: 'number', min: 4096, step: 4096, value: agent.subAgentTokens, oninput: () => {
+              const v = Number(input.value);
+              if (v >= 4096) agent.subAgentTokens = Math.floor(v);
+            } }) as HTMLInputElement;
+            input.style.width = '96px';
+            return input;
+          })(), ' tokens to read (at most what the model can)'),
+        ),
       ),
       mediaSection,
       h('div.dialog-buttons', h('button', { onclick: () => void leave() }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),

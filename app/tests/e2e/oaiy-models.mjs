@@ -223,6 +223,8 @@ try {
   await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("OAIY's engines are ready here"), { timeout: 15_000 });
   const menu = (cls) => page.$eval(`select.${cls}.pick`, (s) => ({ hidden: s.hidden, value: s.value, options: [...s.options].map((o) => o.textContent), shown: s.selectedOptions[0]?.textContent, state: s.dataset.state }));
   const log = (p = page) => p.$eval('.chat-log', (l) => l.textContent);
+/** What is behind the context meter: the model's window and where that came from (out of the conversation). */
+const contextSaid = (p = page) => p.$eval('.context-pop', (l) => l.textContent);
   const shown = (p, text) => p.waitForFunction((t) => document.querySelector('select.model.pick')?.selectedOptions[0]?.textContent === t, { timeout: 15_000 }, text).catch(async (e) => {
     throw new Error(`${e.message}\n${JSON.stringify(await p.$eval('select.model.pick', (s) => [...s.options].map((o) => o.textContent + (o.selected ? ' [selected]' : ''))))}`);
   });
@@ -242,7 +244,7 @@ try {
     expect(m.value === 'qwen3.8-27b' && m.shown === 'qwen3.8-27b · eGPU · ready', JSON.stringify(m));
     expect(m.options.includes('qwen3.5-9b · Mac') && m.options.includes('AI providers…'), JSON.stringify(m.options));
     expect(m.state === 'ready', 'the menu is not shown ready');
-    expect(await page.$eval('button[title="AI provider"]', (b) => b.hidden), 'the provider chip is still shown beside it');
+    expect(await page.$eval('button.chip.model', (b) => b.hidden), 'the provider chip is still shown beside it');
     expect(!(await page.$('select.egpu.pick')), 'a second menu, for the eGPU, is still there');
     // (OAIY's own window says what its engines offer, not their service's name or address)
     const text = await log();
@@ -306,7 +308,7 @@ try {
     await page.evaluate(() => window.dispatchEvent(new Event('focus')));
     await wait(1000);
     expect((await menu('model')).shown === 'Qwen3.8-Flash-Next · Desktop', `snapped back: ${JSON.stringify(await menu('model'))}`);
-    expect(await page.$eval('button[title="AI provider"]', (b) => b.hidden), 'the provider chip took the menu\'s place');
+    expect(await page.$eval('button.chip.model', (b) => b.hidden), 'the provider chip took the menu\'s place');
     // the desktop has settled it: read again, nothing new to say
     await backToFront();
     await wait(800);
@@ -321,7 +323,8 @@ try {
     });
     expect(network.chats.length === 1 && network.chats[0].model === 'Qwen3.8-Flash-Next' && chats.length === before, `remote ${JSON.stringify(network.chats.map((c) => c.model))}, local ${chats.length - before}`);
     // (the paired computer's window, as the desktop says it: no window of this Mac's model said for it)
-    expect(!(await log()).includes('qwen3.8-27b: 32.8k tokens of context'), 'the window said is not the model\'s that answers');
+    // (said behind the context meter, where it is kept now, as well as nowhere in the conversation)
+    expect(!(await log()).includes('qwen3.8-27b: 32.8k tokens of context') && !(await contextSaid()).includes('qwen3.8-27b: 32.8k tokens of context'), 'the window said is not the model\'s that answers');
   });
 
   await check('a paired computer whose engines stop is said so, muted, not as a failure; one just paired is in the menu when the window is back in front', async () => {
@@ -531,7 +534,7 @@ try {
       throw new Error(`${e.message}\nlog: ${(await log(p)).slice(-600)}`);
     });
     const text = await log(p);
-    expect(!text.includes('qwen3.8-27b: 32.8k tokens of context'), `the window of a model that did not answer was said: ${text.slice(-600)}`);
+    expect(!text.includes('qwen3.8-27b: 32.8k tokens of context') && !(await contextSaid(p)).includes('qwen3.8-27b: 32.8k tokens of context'), `the window of a model that did not answer was said: ${text.slice(-600)} || behind the meter: ${await contextSaid(p)}`);
     expect(text.includes("OAIY's engine default is now Qwen3.8-Flash-Next on Desktop") && !text.includes('as chosen in OAIY'), text.slice(-600));
     await context.close();
   });

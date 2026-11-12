@@ -23,6 +23,7 @@ import type { Callback } from '../callbacks';
 import type { Campaign, DoNotContact } from '../outreach';
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
+import { HERE } from '../ui/where';
 
 export interface ProjectMeta {
   id: string;
@@ -376,7 +377,7 @@ export class OpenProject {
       this.retries++;
       if (this.retries > 3 && Date.now() - this.lastErrorAt < 60_000) return;
       this.lastErrorAt = Date.now();
-      this.onError(`Saving ${failed.length === 1 ? failed[0].label : `${failed.length} files`} to this browser's storage failed: ${failed[0].error}.${this.retries <= 3 ? ' Trying again.' : ' Export the project to keep a copy.'}`);
+      this.onError(`Saving ${failed.length === 1 ? failed[0].label : `${failed.length} files`} to ${HERE}'s storage failed:${failed[0].error}.${this.retries <= 3 ? ' Trying again.' : ' Export the project to keep a copy.'}`);
       if (this.retries <= 3 && !this.timer) this.timer = setTimeout(() => void this.flush(), 2000 * this.retries);
     });
     return this.flushing;

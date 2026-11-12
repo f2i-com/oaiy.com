@@ -70,6 +70,8 @@ const ICONS: Record<string, { shapes: Shape[]; fill?: boolean }> = {
   eye: { shapes: [['path', 'M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z'], ['circle', 12, 12, 3]] },
   mic: { shapes: [['rect', 9, 2, 6, 12, 3], ['path', 'M19 10v1a7 7 0 0 1-14 0v-1'], ['line', 12, 18, 12, 22]] },
   refresh: { shapes: [['path', 'M3 12a9 9 0 0 1 15.5-6.3L21 8'], ['polyline', '21 3 21 8 16 8'], ['path', 'M21 12a9 9 0 0 1-15.5 6.3L3 16'], ['polyline', '3 21 3 16 8 16']] },
+  // (the preview over the whole screen: the four corners of it)
+  expand: { shapes: [['polyline', '15 3 21 3 21 9'], ['polyline', '9 21 3 21 3 15'], ['polyline', '21 15 21 21 15 21'], ['polyline', '3 9 3 3 9 3']] },
   flag: { shapes: [['path', 'M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z'], ['line', 4, 22, 4, 15]] },
   'arrow-down': { shapes: [['line', 12, 5, 12, 19], ['polyline', '19 12 12 19 5 12']] },
   activity: { shapes: [['polyline', '22 12 18 12 15 21 9 3 6 12 2 12']] },

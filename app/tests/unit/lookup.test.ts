@@ -97,8 +97,9 @@ describe('the Agent has no other way to look at OAIY as it loads', () => {
 
   it("the page reads its window once (pageHost), and asks the decisions above: nothing tests the page's address itself", () => {
     expect(naming(/\breadHost\(/)).toEqual([]);
-    // (and two that only choose their words by it: what a call to OAIY that got no answer says in OAIY's window, and /help)
-    expect(naming(/\bpageHost\(/)).toEqual(['agent/providers/aiProvider.ts', 'commands.ts', 'main.ts', 'ui/settings.ts']);
+    // (and three that only choose their words by it: what a call to OAIY that got no answer says in OAIY's window, /help,
+    // and ui/where.ts, which says "this computer" for "this browser" in OAIY's own window)
+    expect(naming(/\bpageHost\(/)).toEqual(['agent/providers/aiProvider.ts', 'commands.ts', 'main.ts', 'ui/settings.ts', 'ui/where.ts']);
     // (Not "any port of a host name": the origin OAIY serves from is matched exactly, once, in shared/capabilities/host.ts.)
     expect(naming(/hostname\s*===\s*'(oaiy|oaiyflows|botcomputer)\.localhost'/)).toEqual([]);
   });

@@ -46,7 +46,8 @@ import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './a
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
-import { oaiyProvider, openSettings } from './ui/settings';
+import { oaiyProvider, openSettings, providerLabel } from './ui/settings';
+import { HERE, KEPT_HERE } from './ui/where';
 import { TerminalPane } from './ui/terminal';
 import { Preview, type PreviewTarget } from './preview/preview';
 import { findPages, isPagePath } from './preview/page';
@@ -714,17 +715,33 @@ async function main(): Promise<void> {
     showView('agent');
   }
 
+  /** The welcome has said there is no provider (after the page's first look for one): from then on it follows the providers. */
+  let welcomed = false;
+  // (In OAIY's window the Agent's AI is chosen in OAIY's own Settings → Agent, and the welcome's button shows that
+  // page: the person's own press, through the control API's ui_open. Where the dashboard cannot be asked, and in a
+  // browser tab, it opens the Agent's own settings.)
+  const setUpProvider = (): void => {
+    if (IN_OAIY && control) void control.call('project', 'ui_open', { view: 'settings' }, AbortSignal.timeout(8_000)).then((r) => { if (r.isError) void editSettings(); }, () => void editSettings());
+    else void editSettings();
+  };
   const renderChips = () => {
-    gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
+    // (a provider set up since: the empty conversation's "set one up" goes)
+    if (welcomed) chat.needsProvider(agentProvider('project') ? null : setUpProvider);
+    // (a chip starts with a capital letter, as the dashboard's do)
+    gateChip.textContent =`Internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
     gateChip.setAttribute('aria-checked', String(gate.mode !== 'blocked'));
-    thinkingChip.textContent = `thinking: ${agentSettings.thinking}`;
+    thinkingChip.textContent = `Thinking: ${agentSettings.thinking}`;
     thinkingChip.dataset.think = agentSettings.thinking;
     thinkingChip.title = `Thinking ${agentSettings.thinking === 'auto' ? "as OAIY's engine is set (Engines → Think by default)" : agentSettings.thinking}: whether the model thinks before each step. Click for ${THINKING_NEXT[agentSettings.thinking]}. (Asked of OAIY's engine; of another local server only off; an online API is not asked.)`;
     // The model the person's own conversation runs on: the engine's (Settings), or ChatGPT's, as the desktop says.
     const p = agentProvider('project');
     const chatgpt = p?.id.startsWith('oaiy-chatgpt') ?? false;
-    providerChip.textContent = chatgpt ? modelChipText(p, chatgptProblem) : p ? `${p.name}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI…';
+    // (a server with no name of its own goes by where it is, "localhost:8080", not by its kind's long words)
+    const chipWords = chatgpt ? modelChipText(p, chatgptProblem) : p ? `${providerLabel(p)}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI';
+    // In a span: on a phone the chip is its icon alone (styles.css), and the words are in its tooltip and in Settings.
+    providerChip.replaceChildren(h('span.chip-words', chipWords));
+    providerChip.setAttribute('aria-label', p ? `AI provider: ${chipWords}` : 'Set up AI');
     providerChip.dataset.source = chatgpt ? 'chatgpt' : p ? (elsewhere() ? 'provider' : 'engine') : 'none';
     if (chatgpt && chatgptProblem) providerChip.dataset.state = 'problem';
     else delete providerChip.dataset.state;
@@ -736,7 +753,7 @@ async function main(): Promise<void> {
         : "The Agent runs on ChatGPT, through OAIY, as chosen in OAIY's Settings → Agent. Calls use a fast ChatGPT route of their own."
       : chosenThere
         ? `The Agent runs on ${chosenThere}, as chosen in OAIY's Settings → Agent: change it there.`
-        : 'AI provider';
+        : p ? `AI provider: ${chipWords} (click to change it in Settings)` : 'AI provider: none yet (click to set one up)';
     renderPickers(chatgpt ? null : p);
   };
 
@@ -1674,7 +1691,10 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null, agentElsewhere: elsewhere() || undefined });
+    // (in OAIY's window the dialog can show OAIY's own Settings, where the Agent's AI is chosen: the person's own
+    // press, through the control API's ui_open, as their conversation's Contact button opens the Contacts page)
+    const openOaiySettings = IN_OAIY && control ? (): void => void control!.call('project', 'ui_open', { view: 'settings' }, AbortSignal.timeout(8_000)).catch(() => undefined) : undefined;
+    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null, agentElsewhere: elsewhere() || undefined, openOaiySettings });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;
@@ -1716,12 +1736,21 @@ async function main(): Promise<void> {
     const w = contextWindow(p);
     const room = budgetFor(w.tokens, 6000).prompt;
     const from = w.source === 'server' ? `, from ${p.detectedContext?.how ?? 'the server'}` : w.source === 'known' ? ' (known for this model)' : ' (assumed: the server does not say; set it in Settings)';
-    chat.system(
-      `${p.modelId}: ${formatTokens(w.tokens)} tokens of context${from}. The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.` +
-        (room < 8000 ? `\nThat leaves little room to work in (about ${formatTokens(room)} tokens after the instructions and tools). A bigger window helps a lot${p.serverKind === 'ollama' ? ': start Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or more), then press Detect in Settings' : ''}.` : ''),
-      room < 8000 ? 'error' : 'info',
-    );
+    // How big the model's context is, and when the conversation is shortened: behind the meter at the top of the
+    // conversation (a click opens it), not a line in it. A person who asked for a shopping list did not ask this.
+    contextSaid = `${p.modelId}: ${formatTokens(w.tokens)} tokens of context${from}. The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.`;
+    // (while a phone conversation is shown instead, it is kept for when the project's own is shown again: showLastContext)
+    if (!viewing) chat.contextNote(contextSaid, w.tokens);
+    // Too little room to work in is something to act on, so that is said in the conversation.
+    if (room < 8000) {
+      chat.system(
+        `${p.modelId} can read ${formatTokens(w.tokens)} tokens at once, which leaves little room to work in (about ${formatTokens(room)} after the instructions and tools). A bigger window helps a lot${p.serverKind === 'ollama' ? ': start Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or more), then press Detect in Settings' : ''}.`,
+        'error',
+      );
+    }
   }
+  /** What was last said of the model's context, shown again behind the meter when the project's conversation is. */
+  let contextSaid = '';
 
   /** A free path for an upload: uploads/name, uploads/name-2, … */
   function freePath(dir: string, name: string): string {
@@ -1984,7 +2013,8 @@ async function main(): Promise<void> {
           p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
           await saveProviders(providers, activeId);
           windowsChecked.delete(`${p.id}|${p.modelId}`);
-          chat.system(`${p.modelId}: ${formatTokens(found.tokens)} tokens of context (from ${found.how}), now that the model is loaded.`);
+          contextSaid = `${p.modelId}: ${formatTokens(found.tokens)} tokens of context (from ${found.how}), now that the model is loaded. The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.`;
+          if (project === runProject && !viewing) chat.contextNote(contextSaid, found.tokens);
         }
       }
     }
@@ -2188,7 +2218,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
       return;
     }
     if (!(await mayLeaveRun())) return;
-    if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from this browser? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
+    if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from ${HERE}? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
     const doomed = project.meta.id;
     const others = (await listProjects()).filter((m) => m.id !== doomed && !m.incognito);
     const next = others[0] ?? (await createProject('untitled'));
@@ -2242,10 +2272,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
     installButton(install),
     h('button', { title: 'New empty project', onclick: async () => {
       if (!(await mayLeaveRun())) return;
-      const name = await askText({ title: 'New project', message: 'An empty project, kept in this browser.', label: 'Project name', value: 'untitled', ok: 'Create' });
+      const name = await askText({ title: 'New project', message: `An empty project, kept ${KEPT_HERE}.`, label: 'Project name', value: 'untitled', ok: 'Create' });
       if (name) await openProject(await createProject(name));
     } }, 'New'),
-    h('button', { title: 'Open a folder from this computer (a copy is kept in the browser)', onclick: async () => {
+    h('button', { title: IN_OAIY ? "Open a folder from this computer (a copy is kept in OAIY's own storage)" : 'Open a folder from this computer (a copy is kept in the browser)', onclick: async () => {
       if (canPickFolder()) await importing(() => importFolder());
       else fileInput('', true, (files) => importing(() => importFileList(files)));
     } }, 'Open folder…'),
@@ -2306,7 +2336,12 @@ A project can hold several apps, each in its own folder (any folder whose manife
     thinkingChip,
     providerChip,
     modelPick,
-    h('button.settings-button', { title: 'Settings: AI providers, the agent, and images, video and audio', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
+    // (in OAIY's window it is the AGENT's settings, by that name: the window's own Settings is in its sidebar, and a
+    // second "Settings" beside it read as the same thing)
+    h('button.settings-button', IN_OAIY
+      ? { title: "Agent settings: its own AI providers, how long a conversation is kept, and images, video and audio. Which AI the Agent runs on is in OAIY's Settings → Agent.", 'aria-label': 'Agent settings', onclick: () => void editSettings() }
+      : { title: 'Settings: AI providers, the agent, and images, video and audio', 'aria-label': 'Settings', onclick: () => void editSettings() },
+    '⚙', h('span.label', IN_OAIY ? ' Agent settings' : ' Settings')),
   );
   projectSelect.addEventListener('change', async () => {
     const meta = projectSelect.value === FRONT_DESK.id ? frontDesk.meta : (await listProjects()).find((m) => m.id === projectSelect.value);
@@ -2955,6 +2990,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   function showLastContext(): void {
     const c = lastContext.get(agent);
     if (c) chat.showContext(c.used, c.window);
+    // (and what was said of the model's context, behind the meter, which a conversation drawn again starts without)
+    if (c && contextSaid) chat.contextNote(contextSaid);
   }
 
   /** The person's message in a phone conversation: to its call going on, or their texts' agent (a flow's: its tasks'), first in line. */
@@ -3019,8 +3056,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       phoneChip.hidden = !!given;
       const state = !desktop ? 'off' : desktopProblem ? 'problem' : 'paired';
       phoneChip.dataset.state = state;
-      phoneChip.textContent = state === 'off' ? 'desktop: not paired' : state === 'problem' ? 'desktop: offline' : 'desktop: paired';
-      phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : state === 'paired' ? 'OAIY Desktop: this page is paired with it (click to see the pairing, or forget it)' : 'OAIY Desktop: pair this page with it';
+      // (not paired: the chip says what it does, as a browser tab that was never offered a desktop has no state to report)
+      phoneChip.textContent = state === 'off' ? 'Pair with OAIY Desktop' : state === 'problem' ? 'desktop: offline' : 'desktop: paired';
+      phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : state === 'paired' ? 'OAIY Desktop: this page is paired with it (click to see the pairing, or forget it)' : 'Pair this page with OAIY Desktop on this computer: its calendar, flows and settings then reach the agent here. Nothing is asked of your computer until you open this.';
       return;
     }
     phoneChip.hidden = false;
@@ -3500,9 +3538,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   // (and the paired computers' models: with none here, one of theirs may be the one to use, from the model menu)
   void Promise.all([modelKnown.then(() => networkRead), Promise.race([lookedFor, new Promise<void>((resolve) => setTimeout(resolve, WELCOME_WAITS_MS))])]).then(() => {
     if (agentProvider('project')) return;
-    chat.system(noProvider()
-      ? "Welcome! This computer's OAIY has no language model yet, and a paired computer's can run the Agent: choose one in the model menu at the top (or in OAIY's Engines → Other computers). The editor and terminal work without one."
-      : 'Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
+    if (noProvider()) {
+      chat.system("Welcome! This computer's OAIY has no language model yet, and a paired computer's can run the Agent: choose one in the model menu at the top (or in OAIY's Engines → Other computers). The editor and terminal work without one.");
+      return;
+    }
+    // No provider: the empty conversation leads with the one button that sets one up (Chat.needsProvider), and it
+    // goes when there is one (renderChips). A conversation that has already begun has no welcome to hold it, so
+    // there it is a note, as it was. (No list of servers by name: Settings lists the kinds it takes.)
+    welcomed = true;
+    if (!chat.needsProvider(setUpProvider)) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent. A model server on this computer keeps everything here; an online one is sent what you write. The editor and terminal work without one.');
   });
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the

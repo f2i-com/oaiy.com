@@ -17,6 +17,7 @@ import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
 import { icon } from './icons';
 import { confirmAction } from './modal';
+import { IN_WINDOW } from './where';
 import { mediaElement, mediaKind, type Media } from './media';
 import { linkedText, renderMarkdown } from './markdown';
 import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
@@ -66,6 +67,8 @@ function promptText(e: { system: string; turns: Turn[]; tools: string[] }): stri
 
 /** Steps after the one in progress that the checklist shows before folding the rest into "+N more". */
 const PLAN_UPCOMING = 4;
+/** How many steps' prompts are kept to read, behind the context meter. */
+const PROMPTS_KEPT = 12;
 
 /** A message of the person's longer than this (lines, or characters) is shown folded to its first lines. */
 const FOLD_LINES = 14;
@@ -152,7 +155,17 @@ export class ChatPane {
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
-  private readonly meter = h('span.context-meter', { title: "How much of the model's context the last step used, as the model counted it: its prompt (the conversation, the instructions and the tools' descriptions) and its reply. Older turns are summarized before it fills up." }, h('span.context-bar', this.meterFill), this.meterText);
+  private readonly meter = h('button.context-meter', { type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', 'aria-controls': 'context-pop', title: "How much the model can read at once, and how much of it the last step used. Click for the details: the model's size, and what it was sent." }, h('span.context-bar', this.meterFill), this.meterText) as HTMLButtonElement;
+  /**
+   * Behind the meter, a click away: what was said of the model's context (its size and where that came from, when the
+   * conversation is shortened) and what the model was sent for each step. Both stood in the conversation, a note
+   * after the first message and a "Prompt · 1 message · about 170 tokens" line over every reply, where they read as
+   * the agent's words to a person who had asked for neither.
+   */
+  private readonly contextPop = h('div.context-pop', { id: 'context-pop', role: 'dialog', 'aria-label': "The model's context", hidden: true });
+  private contextNotes: string[] = [];
+  private prompts: Array<{ label: string; counted: boolean; text: () => string }> = [];
+  private contextUsed: { used: number; window: number } | null = null;
   /** Beside the meter: the conversation started again (its messages gone, the context empty), asked first. The same as /clear. */
   private readonly clearButton = h('button.chat-clear', { type: 'button', title: CLEAR_TITLE, 'aria-label': 'Clear the conversation' }, icon('trash'), h('span', 'Clear')) as HTMLButtonElement;
   /** The agent's checklist for the current request, pinned above the log. */
@@ -278,6 +291,23 @@ export class ChatPane {
       if (this.contactTab) this.handlers.block?.(this.contactTab);
     });
     this.clearButton.addEventListener('click', () => void this.askToClear());
+    // The meter opens what is behind it; Escape, or a click anywhere else, closes it.
+    this.meter.addEventListener('click', () => this.openContext(this.contextPop.hidden));
+    // (Escape with the focus on the meter, where a click leaves it, or inside what it opened)
+    for (const el of [this.meter, this.contextPop] as HTMLElement[]) {
+      el.addEventListener('keydown', (e: KeyboardEvent) => {
+        if (e.key !== 'Escape' || this.contextPop.hidden) return;
+        e.stopPropagation();
+        this.openContext(false);
+        this.meter.focus();
+      });
+    }
+    document.addEventListener('pointerdown', (e) => {
+      if (this.contextPop.hidden) return;
+      const at = e.target as Node | null;
+      if (at && (this.contextPop.contains(at) || this.meter.contains(at))) return;
+      this.openContext(false);
+    });
     this.log.addEventListener('scroll', () => {
       this.follow.scrolled(this.log);
       this.showJump();
@@ -313,7 +343,7 @@ export class ChatPane {
       if (e.target === composer) this.input.focus();
     });
     this.element.append(
-      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), h('span.chat-head-tools', this.meter, this.clearButton)),
+      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), h('span.chat-head-tools', this.meter, this.clearButton), this.contextPop),
       this.sessionTabs,
       this.liveBar,
       this.planBox,
@@ -756,6 +786,53 @@ export class ChatPane {
     this.meterFill.style.width = `${Math.round(share * 100)}%`;
     this.meter.dataset.level = share > 0.9 ? 'high' : share > 0.7 ? 'mid' : 'low';
     this.meterText.textContent = `${formatTokens(used)} / ${formatTokens(window)}`;
+    this.contextUsed = { used, window };
+    this.drawContext();
+  }
+
+  /**
+   * Something about the model's context that is worth knowing and not worth a line of the conversation (its size and
+   * where that came from, when the conversation is shortened): kept behind the meter. `window` shows the meter where
+   * no step has been counted yet, so there is something to click.
+   */
+  contextNote(text: string, window?: number): void {
+    this.contextNotes = [...this.contextNotes.filter((n) => n !== text), text].slice(-4);
+    if (this.meter.hidden && window) this.showContext(0, window);
+    else this.drawContext();
+  }
+
+  /** Show or hide what is behind the meter. */
+  private openContext(open: boolean): void {
+    this.contextPop.hidden = !open;
+    this.meter.setAttribute('aria-expanded', String(open));
+    if (open) this.drawContext();
+  }
+
+  /** What is behind the meter, drawn as it changes (so it is there to read the moment it is opened). */
+  private drawContext(): void {
+    // (not under a prompt someone has opened to read: drawn again when it is next opened)
+    if (!this.contextPop.hidden && this.contextPop.querySelector('details[open]')) return;
+    const used = this.contextUsed;
+    const prompts = this.prompts.slice(-PROMPTS_KEPT).reverse();
+    this.contextPop.replaceChildren(
+      h('strong.context-pop-title', "The model's context"),
+      ...(used ? [h('p.context-pop-used', used.used ? `${formatTokens(used.used)} of ${formatTokens(used.window)} tokens used by the last step: what the model was sent, and its reply.` : `Room for ${formatTokens(used.window)} tokens. Nothing has been counted yet.`)] : []),
+      ...this.contextNotes.map((note) => h('p.context-pop-note', note)),
+      ...(prompts.length
+        ? [
+            h('strong.context-pop-title', 'What the model was sent'),
+            ...prompts.map((p, i) => {
+              const pre = h('pre');
+              const box = h('details.prompt-view', { title: 'What the model was sent for this step (click to read it)' }, h('summary', icon('file-text'), h('span', `${i === 0 ? 'Last step' : `${i + 1} steps ago`} · ${p.label}`)), pre);
+              // (written out only when opened: it is long)
+              box.addEventListener('toggle', () => {
+                if ((box as HTMLDetailsElement).open && !pre.textContent) pre.textContent = p.text();
+              });
+              return box;
+            }),
+          ]
+        : []),
+    );
   }
 
   /** A summary that replaced older turns for the model: a note that opens to show it. */
@@ -857,6 +934,12 @@ export class ChatPane {
 
   clearLog(): void {
     this.meter.hidden = true;
+    // (what is behind the meter is this conversation's: gone with it)
+    this.openContext(false);
+    this.contextNotes = [];
+    this.prompts = [];
+    this.contextUsed = null;
+    this.contextPop.replaceChildren();
     // (another conversation shown, or this one started again: an error here does not send what was written there)
     this.lastSent = null;
     this.lastPrompt = null;
@@ -917,6 +1000,22 @@ export class ChatPane {
     this.add(bubble, 'agent');
   }
 
+  /** Opens the settings where a provider is set up, while there is none (null: there is one, or it is not known yet). */
+  private setup: (() => void) | null = null;
+
+  /**
+   * There is no AI provider yet (`open` sets one up), or there is one now (null). The empty conversation then leads
+   * with that one button; a conversation that has begun says it when a message is sent.
+   */
+  needsProvider(open: (() => void) | null): boolean {
+    if (this.setup !== open) {
+      this.setup = open;
+      if (this.hero.isConnected) this.drawHero();
+    }
+    // (whether it is on screen: a conversation that has begun has no welcome to say it in)
+    return this.hero.isConnected && this.kind === 'own';
+  }
+
   /** The empty conversation's welcome: what it is for, and a few things to ask (they fill the box; nothing is sent). */
   private updateEmpty(): void {
     if (this.feed.querySelector('section.run, details.tool, .msg.user')) {
@@ -937,11 +1036,24 @@ export class ChatPane {
       return;
     }
     const s = SUGGESTIONS[this.own];
-    this.hero.className = `chat-empty own-${this.own}`;
+    this.hero.className = `chat-empty own-${this.own}${this.setup ? ' needs-setup' : ''}`;
+    const setup = this.setup;
     this.hero.append(
       h('span.chat-empty-icon', icon(OWN_ICON[this.own])),
       h('h2', s.title),
       h('p', s.text),
+      // No AI provider yet: the one thing to do first is the one button here (it was a note at the foot of the
+      // conversation, under suggestions that could not be sent to anything).
+      // In OAIY's window the Agent's AI is chosen in one place, OAIY's own Settings → Agent: the button goes there
+      // and the words name it (the Agent's own dialog is for its other settings).
+      ...(setup
+        ? [h('div.chat-setup',
+            h('button.primary', { type: 'button', onclick: () => setup() }, icon('sparkle'), h('span', IN_WINDOW ? "Choose the Agent's AI" : 'Set up an AI provider')),
+            h('p', IN_WINDOW
+              ? "Welcome! The Agent has no AI to run on yet. Choose one in OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar): a model on this computer keeps everything here; an online one is sent what you write. The editor and terminal work without one."
+              : 'Welcome! Set up an AI provider first: the agent needs a model to talk to. One on this computer keeps everything here; an online one is sent what you write. The editor and terminal work without one.'),
+          )]
+        : []),
       h('div.chat-suggestions', { role: 'group', 'aria-label': 'Suggestions' }, ...s.ideas.map((idea) => h('button.suggestion', { type: 'button', title: 'Put this in the message box (it is not sent until you send it)', onclick: () => this.suggest(idea) }, idea))),
     );
   }
@@ -1229,28 +1341,22 @@ export class ChatPane {
   }
 
   /** The last step's prompt, whose line takes the model's own count of it when the model answers. */
-  private lastPrompt: { said: HTMLElement; messages: string } | null = null;
+  private lastPrompt: { entry: { label: string; counted: boolean; text: () => string }; messages: string } | null = null;
 
-  /** What the model was sent for this step: folded, and written out only when opened (it is long). */
+  /**
+   * What the model was sent for this step: kept behind the meter (the last PROMPTS_KEPT steps), each written out
+   * only when opened (it is long). It is not a line of the conversation.
+   */
   private promptView(e: { system: string; turns: Turn[]; tools: string[] }): void {
+    // (a new step: what the model writes now is its own run of words, as it was when the prompt's line stood before it)
     this.current = null;
-    const chars = e.system.length + e.turns.reduce((n, t) => n + (t.role === 'user' ? t.text.length : t.role === 'assistant' ? t.text.length + JSON.stringify(t.calls).length : t.results.reduce((m, r) => m + r.content.length, 0)), 0);
-    const pre = h('pre');
-    const messages = `Prompt · ${e.turns.length} message${e.turns.length === 1 ? '' : 's'}`;
+    const chars =e.system.length + e.turns.reduce((n, t) => n + (t.role === 'user' ? t.text.length : t.role === 'assistant' ? t.text.length + JSON.stringify(t.calls).length : t.results.reduce((m, r) => m + r.content.length, 0)), 0);
+    const messages = `${e.turns.length} message${e.turns.length === 1 ? '' : 's'}`;
     // (an estimate of its words, until the model's own count comes with its answer: see `usage`, which the meter shows too)
-    const said = h('span', { title: "An estimate from the prompt's words, without the tools' descriptions: the model's own count replaces it when it answers" }, `${messages} · about ${formatTokens(Math.round(chars / 4))} tokens of text`);
-    const box = h(
-      'details.prompt-view',
-      { title: 'What the model was sent for this step (click to read it)' },
-      h('summary', icon('file-text'), said),
-      pre,
-    );
-    this.lastPrompt = { said, messages };
-    box.addEventListener('toggle', () => {
-      if ((box as HTMLDetailsElement).open && !pre.textContent) pre.textContent = promptText(e);
-    });
-    this.add(box, 'agent');
-    this.scroll();
+    const entry = { label: `${messages} · about ${formatTokens(Math.round(chars / 4))} tokens of text`, counted: false, text: () => promptText(e) };
+    this.prompts = [...this.prompts, entry].slice(-PROMPTS_KEPT);
+    this.lastPrompt = { entry, messages };
+    this.drawContext();
   }
 
   /**
@@ -1445,8 +1551,7 @@ export class ChatPane {
 
   /**
    * A tool's row, at the end: folded in with the calls just before it ("Used 3
-   * tools"), the prompts sent for those steps with them, or on its own when it
-   * is the first.
+   * tools"), or on its own when it is the first.
    */
   private addTool(card: HTMLElement): void {
     const box = this.sink ?? this.feed;
@@ -1456,28 +1561,21 @@ export class ChatPane {
       this.add(card, 'agent');
       return;
     }
-    // The prompts sent since the last row (oldest first), and what came before them.
-    const prompts: HTMLElement[] = [];
-    let before = body.lastElementChild as HTMLElement | null;
-    while (before?.matches('.prompt-view')) {
-      prompts.unshift(before);
-      before = before.previousElementSibling as HTMLElement | null;
-    }
+    // (the prompts sent for these steps are behind the meter, not among the rows)
+    const before = body.lastElementChild as HTMLElement | null;
     let group: HTMLElement | null = null;
     if (before?.matches('details.tool-group')) group = before;
     else if (before && this.groupable(before)) {
       group = this.toolGroup();
-      // The lone row, and the prompt sent for its step, go into the group.
-      const prompt = before.previousElementSibling;
-      const lone = prompt?.matches('.prompt-view') ? [prompt as HTMLElement, before] : [before];
-      lone[0].before(group);
-      group.lastElementChild!.append(...lone);
+      // The lone row goes into the group.
+      before.before(group);
+      group.lastElementChild!.append(before);
     }
     if (!group) {
       this.add(card, 'agent');
       return;
     }
-    group.lastElementChild!.append(...prompts, card);
+    group.lastElementChild!.append(card);
     this.updateGroup(group);
   }
 
@@ -1745,9 +1843,11 @@ export class ChatPane {
       case 'usage':
         // The model's count of the prompt it was sent (its tools' descriptions with it): what the meter counts too.
         if (this.lastPrompt && e.usage.inputTokens > 0) {
-          this.lastPrompt.said.textContent = `${this.lastPrompt.messages} · ${formatTokens(e.usage.inputTokens)} tokens, as the model counted them`;
-          this.lastPrompt.said.title = "The model's own count of what it was sent: the conversation, the instructions and the tools' descriptions";
+          // (the model's own count of what it was sent: the conversation, the instructions and the tools' descriptions)
+          this.lastPrompt.entry.label = `${this.lastPrompt.messages} · ${formatTokens(e.usage.inputTokens)} tokens, as the model counted them`;
+          this.lastPrompt.entry.counted = true;
           this.lastPrompt = null;
+          this.drawContext();
         }
         break;
       case 'check':

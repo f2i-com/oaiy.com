@@ -99,14 +99,14 @@ try {
   page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
   await page.goto(`${base}/?oaiy=${encodeURIComponent(oaiyUrl)}`);
   await page.waitForSelector('.tree-row', { timeout: 60_000 });
-  const chip = () => page.$eval('button[title="AI provider"]', (b) => b.textContent);
+  const chip = () => page.$eval('button.chip.model', (b) => b.textContent);
   const log = () => page.$eval('.chat-log', (e) => e.textContent);
 
   await check('an OAIY with no language model yet gives the page nothing to chat on', async () => {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Welcome! Set up an AI provider'), { timeout: 15_000 });
     const text = await log();
     expect(text.includes("Found OAIY's engines at") && !text.includes('chats with them'), text.slice(0, 400));
-    expect((await chip()) === 'Set up AI…', await chip());
+    expect((await chip()) === 'Set up AI', await chip());
   });
 
   await check('the model that arrives afterwards answers the first message', async () => {
@@ -121,8 +121,10 @@ try {
     expect(!text.includes('No AI provider is set up yet'), 'the page said there is no AI provider, with a model in OAIY');
     expect(text.includes(REPLY), text.slice(-400));
     expect(text.includes('The agent chats with them (Settings → AI providers).'), text.slice(0, 600));
-    // (the window said is that of the model that answers, found before it is said)
-    expect(text.includes(`${MODEL}: 32.8k tokens of context, from OAIY's engine.`), text.slice(0, 900));
+    // (the window said is that of the model that answers, found before it is said: behind the meter, not in the conversation)
+    const behind = await page.$eval('.context-pop', (p) => p.textContent);
+    expect(behind.includes(`${MODEL}: 32.8k tokens of context, from OAIY's engine.`), behind.slice(0, 900));
+    expect(!text.includes('tokens of context'), text.slice(0, 900));
     // (A provider that follows Engines names no model in its request: OAIY runs the one chosen there.)
     expect(chats.length >= 1 && chats[0].messages.some((m) => m.role === 'user' && JSON.stringify(m.content).includes('Hello, are you there?')), JSON.stringify(chats).slice(0, 300));
     expect((await chip()) === `OAIY · ${MODEL}`, await chip());
@@ -168,7 +170,7 @@ try {
     const again = await browser.newPage();
     await again.goto(`${base}/?oaiy=${encodeURIComponent(oaiyUrl)}`);
     await again.waitForSelector('.tree-row', { timeout: 60_000 });
-    await again.waitForFunction((want) => document.querySelector('button[title="AI provider"]')?.textContent === want, { timeout: 15_000 }, `OAIY · ${MODEL}`);
+    await again.waitForFunction((want) => document.querySelector('button.chip.model')?.textContent === want, { timeout: 15_000 }, `OAIY · ${MODEL}`);
     const text = await again.$eval('.chat-log', (e) => e.textContent);
     expect(!text.includes('Welcome! Set up an AI provider'), 'the welcome asks for a provider that is there');
     await again.close();

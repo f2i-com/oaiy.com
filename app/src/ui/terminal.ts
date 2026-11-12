@@ -15,7 +15,9 @@ import { icon } from './icons';
 const FOLDED = 'oaiy.terminal.folded';
 
 /** What the input says to type, and, while a command runs, how to stop it. */
-const READY = 'ls, grep -rn TODO ., python script.py, help…';
+// (examples, the last of them the command that lists the rest. It ended "help…", which read as a hint cut short;
+// kept this short so that neither OAIY's default window nor a phone cuts it.)
+const READY = 'ls, cat notes.md, node app.js, help';
 const BUSY = 'Running: Ctrl+C stops it. A command typed now runs next.';
 
 /** The shell's report, with the order its stdout and stderr were written in (runs of [fd, length], oldest first). */
@@ -91,7 +93,9 @@ export class TerminalPane {
       'div.pane-title.term-head',
       { title: 'An emulated shell on the Zipp VM, confined to the project' },
       h('span.pane-kicker', 'Terminal'),
-      h('span.term-about', 'emulated shell on the Zipp VM, confined to the project'),
+      // (short enough for the pane at OAIY's default window size, where the longer sentence was cut at "the pr…":
+      // the whole of it, with the Zipp VM, is the bar's tooltip)
+      h('span.term-about', 'an emulated shell, kept to the project'),
       this.where,
       this.toggle,
     );
