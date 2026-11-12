@@ -20,15 +20,20 @@
  * (phone, tablet, …) for responsive design; it is then scaled to fit the pane,
  * while the page inside lays out at the size chosen.
  *
- * A frame takes one app or page per load, so a change reloads it (after edits
- * settle); the page's in-memory state starts over, as it does in SoftN Studio.
+ * A web page's or a model's frame takes one per load, so a change reloads it
+ * (after edits settle) and the page's in-memory state starts over. A SoftN app's
+ * frame that says it takes a newer version in place (liveFrame.ts) is sent the
+ * files instead and keeps running; one that does not is opened afresh, as before.
  */
 import { zippBase } from '../sandbox/runner';
 import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
+import { icon } from '../ui/icons';
+import { onTheme, theme } from '../ui/theme';
 import { appFiles, appLabel, findApps, isSoftnApp, logicSyntax } from '../softn/softn';
 import { findPages, pageFiles, pageLabel } from './page';
 import { findModels, modelFiles, modelLabel } from './model';
+import { KEPT_STATUS, KEPT_TITLE, LiveFrame, engineMismatch, fitNote, frameSays, isLoadSyntaxError, plainProblem, updateSaid } from './liveFrame';
 import FACADE from './zippDom.guest.js?raw';
 
 export type PreviewTarget = { kind: 'app'; root: string } | { kind: 'page'; path: string } | { kind: 'model'; path: string };
@@ -40,6 +45,8 @@ export interface PreviewResult {
   warnings?: string[];
   /** When the render these errors belong to started. */
   at: number;
+  /** The newest version would not start, and the preview still shows the last one that worked (what inspect, act and screenshot then see). */
+  kept?: boolean;
 }
 
 /** Something the running app reported through the bridge. */
@@ -108,7 +115,7 @@ export const MAX_VIEWPORT = 3840;
 export type PreviewAction =
   | { click: string; nth?: number; times?: number }
   | { fill: string; value: string; nth?: number }
-  | { select: string; value: string; nth?: number }
+  | { select: string; value: string | string[]; nth?: number }
   | { key: string; times?: number; hold?: number }
   | { wait: number };
 
@@ -124,10 +131,12 @@ function zippBytes(): Promise<ArrayBuffer> {
 
 let softnEngine: Promise<ArrayBuffer> | null = null;
 /**
- * The engine a SoftN app's frame is given. SoftN's runtime takes the module from its parent and binds it with the
- * bindings of the ZIPP release it was built with, and another release's module does not fit them (the frame fails
- * with "Import … requires a callable"). The runtime's manifest names its engine by its digest: that is the Agent's
- * own engine when both are one release, and else the copy the runtime carries among its assets.
+ * The engine a SoftN app's frame is given: the Agent's own. SoftN's runtime takes the module from its parent and
+ * binds it with the bindings of the ZIPP release it was built with, and another release's module does not fit them
+ * (the frame fails with "Import … requires a callable"). The runtime's manifest names its engine by its digest, and
+ * from SoftN v0.0.35 the runtime carries no copy of it: where that is not the Agent's engine, nothing here can run
+ * the app, and the person is told which two releases to bring together (engineMismatch) rather than shown a frame
+ * that fails.
  */
 function softnZippBytes(): Promise<ArrayBuffer> {
   softnEngine ??= (async () => {
@@ -136,13 +145,9 @@ function softnZippBytes(): Promise<ArrayBuffer> {
         .then((r) => (r.ok ? r.json() : null))
         .catch(() => null);
     const [manifest, own] = await Promise.all([json(`${import.meta.env.BASE_URL}softn/runtime-manifest.json`), json(`${zippBase()}SOURCE.json`)]);
-    const wanted: unknown = manifest?.zipp?.sha256;
-    if (typeof wanted !== 'string' || own?.files?.['zipp_wasm_bg.wasm'] === wanted) return zippBytes();
-    const carried = Object.entries((manifest.files ?? {}) as Record<string, unknown>).find(([name, digest]) => digest === wanted && /^assets\/zipp_wasm_bg-[\w-]+\.wasm$/.test(name));
-    if (!carried) return zippBytes();
-    const r = await fetch(`${import.meta.env.BASE_URL}softn/${carried[0]}`);
-    if (!r.ok) throw new Error(`SoftN's Zipp engine could not be loaded (${r.status})`);
-    return r.arrayBuffer();
+    const mismatch = engineMismatch(manifest, own);
+    if (mismatch) throw new Error(mismatch);
+    return zippBytes();
   })();
   softnEngine.catch(() => (softnEngine = null));
   return softnEngine;
@@ -175,8 +180,12 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 const decoder = new TextDecoder('utf-8', { fatal: true });
-/** How long a render has to report an error before it counts as clean. */
+/** How long a render has to report an error before it counts as clean, in a frame that does not say when the app is drawn. */
 const SETTLE_MS = 2500;
+/** After the frame says the app is drawn, or answers an update: errors the drawing raised come another way (the bridge), a moment behind. */
+const DRAWN_GRACE_MS = 300;
+/** How long a frame that says when the app is drawn has to say so (or to report an error). */
+const OPEN_DEADLINE_MS = 20_000;
 /** A request's answer when the frame was re-rendered under it. */
 const RELOADED = 'the preview was re-rendered while this ran';
 
@@ -184,6 +193,8 @@ export const targetLabel = (target: PreviewTarget): string => (target.kind === '
 const sameTarget = (a: PreviewTarget | null, b: PreviewTarget | null): boolean =>
   !!a && !!b && a.kind === b.kind && (a.kind === 'app' ? a.root === (b as { root: string }).root : a.path === (b as { path: string }).path);
 const targetValue = (t: PreviewTarget): string => (t.kind === 'app' ? `app:${t.root}` : `${t.kind}:${t.path}`);
+/** Where an app folder's manifest is, in the project. */
+const manifestPath = (root: string): string => `/${root ? `${root}/` : ''}manifest.json`;
 
 type BridgeReply = Omit<PageReport, 'problems'> & { shot?: Omit<Shot, 'png'> & { png: ArrayBuffer } };
 
@@ -195,7 +206,10 @@ export class Preview {
   private readonly sizeWidth = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Width in CSS pixels' }) as HTMLInputElement;
   private readonly sizeHeight = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Height in CSS pixels' }) as HTMLInputElement;
   private readonly sizeCustom = h('span.preview-size-custom', this.sizeWidth, '×', this.sizeHeight);
-  private readonly sizeNote = h('span.preview-size-note', '');
+  /** Beside the size picker: how far a chosen size is shrunk; or, under "Fit pane", that the pane is phone-sized, with the Laptop size offered. */
+  private readonly sizeNoteText = h('span.preview-size-note', '');
+  private readonly sizeOffer = h('button.preview-size-offer', { type: 'button', title: `See the app at a laptop's size (${VIEWPORTS.laptop.width}×${VIEWPORTS.laptop.height}), scaled to fit the pane`, onclick: () => this.setViewport(VIEWPORTS.laptop) }, 'Laptop') as HTMLButtonElement;
+  private readonly sizeNote = h('span.preview-size-said', this.sizeNoteText, this.sizeOffer);
   /** What is shown: an app folder ('' is the project root), a page or a 3D model. */
   target: PreviewTarget | null = null;
   private readonly frameHost = h('div.preview-frame');
@@ -213,6 +227,12 @@ export class Preview {
   private waiters: Array<(r: PreviewResult) => void> = [];
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
   private frame: HTMLIFrameElement | null = null;
+  /** The SoftN app's frame shown now, with its port: a newer version of the same app is sent to it where it takes one (liveFrame.ts). */
+  private link: LiveFrame | null = null;
+  /** The newest version would not start and the frame kept the last one that worked: the banner and the status say so. */
+  private kept = false;
+  /** The logic files the last syntax check found broken: the banner names the file. */
+  private syntaxFiles: string[] = [];
   /** Problems the running app reported since it was last rendered. */
   problems: Problem[] = [];
   /** The render in progress collects the bridge's errors here. */
@@ -225,7 +245,8 @@ export class Preview {
   private busy = 0;
   /** A page the frame asked to open while a request was running: opened once it has answered. */
   private pendingPage: string | null = null;
-  private readonly banner = h('div.preview-problem');
+  private readonly banner = h('div.preview-problem', { role: 'alert' });
+  /** Up to two lines: what is wrong, the file first (the whole of it in the tooltip). */
   private readonly bannerText = h('span.preview-problem-text');
   private readonly fixButton = h('button.primary', { title: 'Send these errors to the agent and ask it to fix it' }, 'Fix with agent');
   /** Each page's localStorage, kept while OAIY is open (the frame starts afresh on every render). */
@@ -234,7 +255,8 @@ export class Preview {
   onFix: ((target: PreviewTarget, problems: Problem[]) => boolean) | null = null;
 
   /** Shows the preview over the whole screen (or OAIY's whole window, where the screen cannot be had), and back. */
-  private readonly fullButton = h('button.preview-full', { title: 'Show the app or page over the whole screen (Esc to leave)', onclick: () => this.setFull(!this.full) }, '⛶ Full screen');
+  private readonly fullLabel = h('span.label', 'Full screen');
+  private readonly fullButton = h('button.preview-full', { title: 'Show the app or page over the whole screen (Esc to leave)', 'aria-label': 'Full screen', onclick: () => this.setFull(!this.full) }, icon('expand'), this.fullLabel);
 
   /** Whether the preview fills the screen ([`Preview::setFull`]). */
   get full(): boolean {
@@ -249,7 +271,9 @@ export class Preview {
   setFull(on: boolean): void {
     if (on === this.full) return;
     this.element.classList.toggle('full', on);
-    this.fullButton.textContent = on ? '✕ Leave full screen' : '⛶ Full screen';
+    this.fullLabel.textContent = on ? 'Leave full screen' : 'Full screen';
+    this.fullButton.replaceChildren(icon(on ? 'x' : 'expand'), this.fullLabel);
+    this.fullButton.setAttribute('aria-label', this.fullLabel.textContent);
     this.fullButton.title = on ? 'Back to the pane (Esc)' : 'Show the app or page over the whole screen (Esc to leave)';
     if (on) {
       void this.element.requestFullscreen?.().catch(() => {
@@ -262,7 +286,16 @@ export class Preview {
   }
 
   constructor(private vfs: Vfs, private readonly projectId: () => string) {
-    const reload = h('button', { title: 'Render it again', onclick: () => this.render() }, '↻ Reload');
+    // (Reload starts the app or page over in a new frame, also where a change would have been taken in place)
+    const reload = h('button.preview-reload', { title: 'Start it again from the beginning', 'aria-label': 'Reload', onclick: () => this.render(true) }, icon('refresh'), h('span.label', 'Reload'));
+    // The app is told OAIY's own theme when it opens (not the system's, which can differ): a change of theme opens it again.
+    onTheme(() => {
+      if (this.target?.kind !== 'app' || !this.frame) return;
+      this.link?.close();
+      this.link = null;
+      this.stale = true;
+      if (this.visible) this.scheduleRender(50);
+    });
     // (the screen's full-screen mode left by Esc or otherwise: back in the pane; Esc in OAIY's window leaves its own)
     document.addEventListener('fullscreenchange', () => {
       if (!document.fullscreenElement && this.full) this.setFull(false);
@@ -296,7 +329,7 @@ export class Preview {
     this.sizeWidth.addEventListener('change', custom);
     this.sizeHeight.addEventListener('change', custom);
     this.banner.append(
-      h('span.preview-problem-icon', '⚠'),
+      h('span.preview-problem-icon', { 'aria-hidden': 'true' }, icon('alert')),
       this.bannerText,
       this.fixButton,
       h('button', { title: 'Hide until the next error', onclick: () => (this.banner.hidden = true) }, 'Dismiss'),
@@ -310,9 +343,11 @@ export class Preview {
     window.addEventListener('message', (event) => this.fromBridge(event));
     new ResizeObserver(() => this.layout()).observe(this.frameHost);
     this.frameHost.append(this.stage);
-    this.element.append(h('div.pane-title', 'Preview ', this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload, this.fullButton), this.banner, this.frameHost);
+    // (the status after the size picker, then Reload and Full screen at the right; on a narrow pane the two are their icons)
+    this.element.append(h('div.pane-title', h('span.preview-kicker', 'Preview'), this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload, this.fullButton), this.banner, this.frameHost);
     this.picker.hidden = true;
     this.sizeCustom.hidden = true;
+    this.sizeNote.hidden = true;
     this.showMessage('Open a web page (an .html file), a 3D model (a .glb file) or a SoftN app (/softn new) to see it here.');
   }
 
@@ -327,7 +362,11 @@ export class Preview {
     const pages = findPages(this.vfs);
     const models = findModels(this.vfs);
     const exists = (t: PreviewTarget | null) => !!t && (t.kind === 'app' ? apps.includes(t.root) : t.kind === 'model' ? models.includes(t.path) : pages.includes(t.path));
-    if (!exists(this.target))
+    // An app open in a frame that takes updates stays the target while its manifest is there but unreadable (half
+    // written, say): the frame keeps the last working version and says what is wrong, rather than the preview
+    // turning to some other page of the project.
+    const held = this.target?.kind === 'app' && !!this.link?.takes(this.target.root) && this.vfs.exists(manifestPath(this.target.root));
+    if (!exists(this.target) && !held)
       this.target = apps.length ? { kind: 'app', root: apps[0] } : pages.length ? { kind: 'page', path: pages[0] } : models.length ? { kind: 'model', path: models[0] } : this.target?.kind === 'app' ? this.target : null;
     clear(this.picker);
     const chosen = this.target ? targetValue(this.target) : '';
@@ -363,6 +402,9 @@ export class Preview {
 
   setVfs(vfs: Vfs): void {
     this.vfs = vfs;
+    // Another project: its app is another app (its own data), whatever its folder is called, so never an update of the one open.
+    this.link?.close();
+    this.link = null;
     this.target = null;
     this.refreshApps();
     this.stale = true;
@@ -445,7 +487,13 @@ export class Preview {
       this.scale = 1;
       this.stage.style.width = this.stage.style.height = '';
       if (frame) frame.style.width = frame.style.height = frame.style.transform = '';
-      this.sizeNote.textContent = '';
+      // A SoftN app in a pane this narrow is in its phone layout (a Sidebar is a Menu button, a wide Table is cards):
+      // said here, with the Laptop size a press away, so nobody takes the phone layout for the app's only one.
+      const note = this.target?.kind === 'app' && frame ? fitNote(this.frameHost.getBoundingClientRect().width) : '';
+      this.sizeNoteText.textContent = note;
+      this.sizeNoteText.title = note ? 'The preview pane is as narrow as a phone, so the app shows its phone layout: a side menu becomes a Menu button, and a wide table becomes cards. Choose Laptop to see the wide layout.' : '';
+      this.sizeOffer.hidden = !note;
+      this.sizeNote.hidden = !note;
       return;
     }
     const room = this.frameHost.getBoundingClientRect();
@@ -458,7 +506,11 @@ export class Preview {
       frame.style.height = `${size.height}px`;
       frame.style.transform = this.scale < 1 ? `scale(${this.scale})` : '';
     }
-    this.sizeNote.textContent = this.scale < 0.995 ? `${Math.round(this.scale * 100)}%` : '';
+    const shrunk = this.scale < 0.995 ? `${Math.round(this.scale * 100)}%` : '';
+    this.sizeNoteText.textContent = shrunk;
+    this.sizeNoteText.title = shrunk ? `Shown at ${shrunk} of its size, to fit the pane` : '';
+    this.sizeOffer.hidden = true;
+    this.sizeNote.hidden = !shrunk;
   }
 
   // --- what the frame says ----------------------------------------------------------
@@ -468,9 +520,18 @@ export class Preview {
     this.stage.append(h('div.empty', text));
   }
 
-  private setStatus(text: string, kind: 'ok' | 'busy' | 'error' = 'busy'): void {
+  private setStatus(text: string, kind: 'ok' | 'busy' | 'error' = 'busy', title = ''): void {
     this.status.textContent = text;
     this.status.dataset.kind = kind;
+    this.status.title = title;
+  }
+
+  /**
+   * An error as the status says it: the word alone, with what went wrong in its tooltip. The message itself is in
+   * the banner (an app's own errors) or, where nothing could be drawn, in the pane.
+   */
+  private failStatus(message: string): void {
+    this.setStatus('error', 'error', message);
   }
 
   private fromBridge(event: MessageEvent): void {
@@ -480,6 +541,14 @@ export class Preview {
       this.bridgeReady = true;
     } else if (data.type === 'bot:problem' && typeof data.message === 'string') {
       const problem: Problem = { level: data.level === 'warning' ? 'warning' : 'error', message: data.message.slice(0, 2000), at: Date.now() };
+      // The same failure the frame said on its port a moment ago (fromApp): one problem, in the console's fuller words.
+      const same = problem.level === 'error' ? this.problems.find((p) => this.fromPort.has(p) && problem.message.includes(p.message)) : undefined;
+      if (same) {
+        this.fromPort.delete(same);
+        same.message = problem.message;
+        this.showProblems();
+        return;
+      }
       this.problems.push(problem);
       if (this.problems.length > 100) this.problems.shift();
       if (this.collecting) {
@@ -506,19 +575,47 @@ export class Preview {
     }
   }
 
+  /** Problems the frame said on its port (an error while the app runs), which its console may say too. */
+  private readonly fromPort = new WeakSet<Problem>();
+
+  /**
+   * Something in the running app failed, as its frame says on the port (`error` with `phase: 'runtime'`): the app is
+   * still drawn, so this is a problem of a running app, in the banner with "Fix with agent", like the ones the
+   * bridge hears from the console.
+   */
+  private fromApp(reason: string): void {
+    if (!this.problems.some((p) => p.level === 'error' && p.message.includes(reason))) {
+      const problem: Problem = { level: 'error', message: reason.slice(0, 2000), at: Date.now() };
+      this.fromPort.add(problem);
+      this.problems.push(problem);
+      if (this.problems.length > 100) this.problems.shift();
+      if (this.collecting) {
+        this.collecting.errors.push(problem.message);
+        this.collecting.settle();
+      }
+    }
+    this.showProblems();
+  }
+
   private showProblems(): void {
     const errors = this.problems.filter((p) => p.level === 'error');
     if (!errors.length) {
       this.banner.hidden = true;
       return;
     }
-    const first = errors[errors.length - 1].message.split('\n')[0];
-    const what = this.target?.kind === 'page' ? 'page' : this.target?.kind === 'model' ? '3D model' : 'app';
-    this.bannerText.textContent = errors.length > 1 ? `${errors.length} errors in the ${what}. Latest: ${first}` : `The ${what} reported an error: ${first}`;
+    // The banner carries the message, on up to two lines: the file and the part a person can act on first. (It was
+    // one line that ended before that part, behind "[SoftN] Error loading script: SyntaxError:"; the status beside
+    // the size picker repeated it and was cut shorter still: now it says "error" and no more.)
+    // (while the last working version is kept, why the newest one does not start leads, whatever the running one says since)
+    const latest = ((this.kept && errors.find((p) => this.keptProblems.has(p))) || errors[errors.length - 1]).message;
+    const file = this.syntaxFiles.length === 1 && (this.kept || isLoadSyntaxError(latest)) ? this.syntaxFiles[0] : undefined;
+    const said = plainProblem(latest, file);
+    const more = errors.length > 1 && !this.kept ? ` (the last of ${errors.length} errors)` : '';
+    this.bannerText.textContent = `${this.kept ? 'Kept the last working version. ' : ''}${said}${more}`;
     this.bannerText.title = errors.map((p) => p.message).join('\n\n');
     this.fixButton.hidden = !this.onFix;
     this.banner.hidden = false;
-    this.setStatus(`error: ${first}`, 'error');
+    this.setStatus(this.kept ? KEPT_STATUS : 'error', 'error', this.kept ? KEPT_TITLE : errors.length > 1 ? `${errors.length} errors: the banner below says the latest` : 'The banner below says what is wrong');
   }
 
   private request(message: Record<string, unknown>, timeoutMs = 20_000): Promise<BridgeReply> {
@@ -668,26 +765,156 @@ export class Preview {
     this.layout();
   }
 
-  async render(): Promise<void> {
+  /**
+   * Show the target as its files are now. A SoftN app whose frame takes a newer version in place is sent the files,
+   * and goes on running. Everything else gets a new frame: a page, a model, another app, a frame that never said it
+   * takes updates, and `fresh` (Reload, and a change of theme, which an app is told only as it opens).
+   */
+  async render(fresh = false): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     const generation = ++this.generation;
     this.stale = false;
+    if (this.settleTimer) clearTimeout(this.settleTimer);
+    const target = this.target;
+    const link = this.link;
+    // (a manifest that is there and cannot be read, half-written say, goes to the frame too: it answers `kept`, and
+    // the last working app stays on screen with the problem said, where a new frame would show only "not an app".
+    // An app whose manifest is gone is not an app any more, and is said so as before.)
+    if (!fresh && link && this.frame && target?.kind === 'app' && link.takes(target.root) && (isSoftnApp(this.vfs, target.root) || this.vfs.exists(manifestPath(target.root)))) return this.updateApp(target.root, generation, link);
+    this.leaveFrame();
+    if (target?.kind === 'page') return this.renderPage(target.path, generation);
+    if (target?.kind === 'model') return this.renderModel(target.path, generation);
+    return this.renderApp(target?.root ?? '', generation);
+  }
+
+  /** The frame shown is being replaced: what waited on it is answered, and what it reported is put away with it. */
+  private leaveFrame(): void {
     // Requests to the frame being replaced: answered now, rather than never.
     for (const finish of [...this.requests.values()]) finish({ ok: false, page: '', error: RELOADED });
+    this.link?.close();
+    this.link = null;
+    this.kept = false;
+    this.syntaxFiles = [];
     this.bridgeReady = false;
     this.current = { ok: false, errors: [], at: Date.now() };
     this.problems = [];
     this.collecting = null;
     this.banner.hidden = true;
     this.frame = null;
-    if (this.settleTimer) clearTimeout(this.settleTimer);
-    const target = this.target;
-    if (target?.kind === 'page') return this.renderPage(target.path, generation);
-    if (target?.kind === 'model') return this.renderModel(target.path, generation);
-    return this.renderApp(target?.root ?? '', generation);
+  }
+
+  /**
+   * Errors found here rather than reported from inside the frame (a logic file that does not compile, a page's file
+   * that could not be loaded): in the banner with the others, so they are read whole and "Fix with agent" sends them.
+   */
+  private report(messages: string[]): void {
+    const line = (text: string) => text.split('\n')[0];
+    for (const message of messages) {
+      // (not a second time what the frame's bridge said already, worded a little differently)
+      const said = this.problems.some((p) => p.level === 'error' && (line(p.message).includes(line(message)) || line(message).includes(line(p.message))));
+      if (!said) this.problems.push({ level: 'error', message: message.slice(0, 2000), at: Date.now() });
+    }
+    this.showProblems();
+  }
+
+  /** The app's files as the frame takes them: its text files by path, and the rest (pictures, sounds, fonts) as base64. */
+  private appSource(root: string): { client: Record<string, string>; assets: Record<string, string> } {
+    const client: Record<string, string> = {};
+    const assets: Record<string, string> = {};
+    for (const [path, data] of appFiles(this.vfs, root)) {
+      if (path.startsWith('assets/')) {
+        assets[path] = toBase64(data);
+        continue;
+      }
+      try {
+        client[path] = decoder.decode(data);
+      } catch {
+        assets[path] = toBase64(data);
+      }
+    }
+    return { client, assets };
+  }
+
+  /** The problems that are a version the frame would not start (not something the running app raised). */
+  private readonly keptProblems = new WeakSet<Problem>();
+
+  /**
+   * A newer version of the app the frame has open, sent to it (the frame said `update: 1` when it opened). The answer
+   * says what became of it (liveFrame.ts): drawn again where it stood, started again, or kept as it was because the
+   * newest version does not start, in which case the last working app stays on screen and the banner says what is
+   * wrong. `reopen`, or no answer within the deadline, opens a new frame exactly as a frame without updates gets.
+   */
+  private async updateApp(root: string, generation: number, link: LiveFrame): Promise<void> {
+    this.current = { ok: false, errors: [], at: Date.now() };
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    // What the app reports from here on is the new version's; what it reported before is kept only where the
+    // version that reported it is still the one running (see below).
+    const earlier = this.problems.filter((p) => !this.keptProblems.has(p));
+    this.problems = [];
+    this.syntaxFiles = [];
+    this.collecting = {
+      errors,
+      warnings,
+      settle: () => {
+        if (generation !== this.generation) return;
+        this.failStatus(errors[errors.length - 1]);
+        this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
+      },
+    };
+    this.setStatus('updating…');
+    const syntax = logicSyntax(this.vfs, root).catch(() => []);
+    const { client, assets } = this.appSource(root);
+    const answer = await link.update(client, assets);
+    if (generation !== this.generation) return;
+    if (!answer || answer.outcome === 'reopen') {
+      this.leaveFrame();
+      return this.renderApp(root, generation);
+    }
+    const said = updateSaid(answer, new Date().toLocaleTimeString());
+    if (answer.outcome === 'kept') {
+      // The version on screen is the one from before, still running: what it reported still holds, and the newest
+      // version's problem leads.
+      const problem: Problem = { level: 'error', message: answer.problem ?? 'The newest version of the app would not start.', at: Date.now() };
+      this.keptProblems.add(problem);
+      this.kept = true;
+      this.problems = [...earlier, ...this.problems, problem];
+      errors.push(problem.message);
+      this.showProblems();
+      this.settle({ ok: false, errors: [...errors], warnings: [...warnings], kept: true });
+      // (the file the banner leads with, once the logic has been compiled here)
+      void syntax.then((found) => {
+        if (generation !== this.generation) return;
+        this.syntaxFiles = found.map((f) => f.file);
+        if (!this.banner.hidden) this.showProblems();
+      });
+      return;
+    }
+    this.kept = false;
+    // Nothing changed: the app is as it was, with whatever it had reported.
+    if (answer.outcome === 'unchanged') this.problems = [...earlier, ...this.problems];
+    // Errors the new version raised as it was drawn come from the bridge, a moment behind the answer.
+    const found = (await Promise.all([syntax, new Promise((r) => setTimeout(r, DRAWN_GRACE_MS))]))[0];
+    if (generation !== this.generation) return;
+    this.syntaxFiles = found.map((f) => f.file);
+    if (errors.length) {
+      if (!this.banner.hidden) this.showProblems();
+      return;
+    }
+    const broken = found.map((f) => `${f.file}: ${f.message}`);
+    const standing = this.problems.filter((p) => p.level === 'error').map((p) => p.message);
+    if (broken.length || standing.length) {
+      errors.push(...broken, ...standing);
+      this.report(broken);
+      this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
+      return;
+    }
+    this.banner.hidden = true;
+    this.setStatus(said.status, said.kind, said.title);
+    this.settle({ ok: true, errors: [], warnings: [...warnings] });
   }
 
   private renderModel(path: string, generation: number): void {
@@ -713,7 +940,7 @@ export class Preview {
         if (data?.type !== 'loaded') return;
         const all = [...new Set([...(data.errors ?? []), ...errors])];
         this.collecting = null;
-        if (all.length) this.setStatus(`error: ${all[all.length - 1]}`, 'error');
+        if (all.length) this.report(all);
         else this.setStatus(`shown · ${new Date().toLocaleTimeString()}`, 'ok');
         this.settle({ ok: all.length === 0, errors: all });
       };
@@ -774,7 +1001,7 @@ export class Preview {
         const all = [...new Set([...(data.errors ?? []), ...errors])];
         const warned = [...new Set([...(data.warnings ?? []), ...warnings])].filter((w) => !all.includes(w));
         this.collecting = null;
-        if (all.length) this.setStatus(`error: ${all[all.length - 1]}`, 'error');
+        if (all.length) this.report(all);
         else this.setStatus(`live · ${new Date().toLocaleTimeString()}`, 'ok');
         this.settle({ ok: all.length === 0, errors: all, warnings: warned });
       };
@@ -811,25 +1038,16 @@ export class Preview {
     // The runtime shows a logic syntax error inside the frame without
     // reporting it, so the logic is also compiled here, on Zipp.
     const syntax = logicSyntax(this.vfs, root).catch(() => []);
-    const client: Record<string, string> = {};
-    const assets: Record<string, string> = {};
-    for (const [path, data] of appFiles(this.vfs, root)) {
-      if (path.startsWith('assets/')) {
-        assets[path] = toBase64(data);
-        continue;
-      }
-      try {
-        client[path] = decoder.decode(data);
-      } catch {
-        assets[path] = toBase64(data);
-      }
-    }
+    const { client, assets } = this.appSource(root);
     let bytes: ArrayBuffer;
     try {
       bytes = await softnZippBytes();
     } catch (error) {
-      this.setStatus('failed', 'error');
-      this.settle({ ok: false, errors: [(error as Error).message] });
+      // Nothing can be drawn: why, and what to do about it, is said where the app would be.
+      const message = (error as Error).message;
+      this.failStatus(message);
+      this.showMessage(message);
+      this.settle({ ok: false, errors: [message] });
       return;
     }
     if (generation !== this.generation) return;
@@ -843,42 +1061,86 @@ export class Preview {
       warnings,
       settle: () => {
         if (generation !== this.generation) return;
-        this.setStatus(`error: ${errors[errors.length - 1]}`, 'error');
+        this.failStatus(errors[errors.length - 1]);
         this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
       },
     };
+    // (the file the banner leads with, when the logic does not compile)
+    void syntax.then((found) => {
+      if (generation !== this.generation) return;
+      this.syntaxFiles = found.map((f) => f.file);
+      if (!this.banner.hidden) this.showProblems();
+    });
     const onMessage = (event: MessageEvent) => {
       if (event.source !== frame.contentWindow || event.data?.type !== 'formlogic:ready') return;
       window.removeEventListener('message', onMessage);
       const channel = new MessageChannel();
+      // What this frame does past drawing the app once: saying when it is drawn, taking a newer version in place.
+      // (with the media `init` carries: an update leaves its media out while it is the same)
+      const link = new LiveFrame(root, channel.port1, frameSays(event.data), assets);
+      this.link = link;
+      // The app's first page is drawn: live, unless the logic does not compile or the drawing raised an error.
+      const opened = async () => {
+        const broken = (await syntax).map((f) => `${f.file}: ${f.message}`);
+        if (generation !== this.generation || errors.length) return;
+        if (broken.length) {
+          errors.push(...broken);
+          this.report(broken);
+          this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
+          return;
+        }
+        this.setStatus(`live · ${new Date().toLocaleTimeString()}`, 'ok');
+        this.settle({ ok: true, errors: [], warnings: [...warnings] });
+      };
       channel.port1.onmessage = (e: MessageEvent) => {
-        if (generation !== this.generation) return;
-        const data = e.data as { type?: string; reason?: string; id?: unknown };
-        if (data?.type === 'error') {
-          errors.push(data.reason || 'the app failed to load');
-          this.setStatus(`error: ${errors[errors.length - 1]}`, 'error');
+        // (the port outlives the render that opened it where the frame takes updates: its messages are this frame's
+        // for as long as it is the one shown)
+        if (this.link !== link) return;
+        const data = e.data as { type?: string; reason?: string; phase?: string; id?: unknown };
+        if (link.take(data)) return;
+        if (data?.type === 'shown') {
+          if (link.drawn) return;
+          link.drawn = true;
+          if (this.settleTimer) clearTimeout(this.settleTimer);
+          this.settleTimer = setTimeout(() => void opened(), DRAWN_GRACE_MS);
+        } else if (data?.type === 'error' && data.phase === 'runtime') {
+          // The app is drawn and something in it failed: a problem of a running app (the banner, "Fix with agent"),
+          // not an app that could not be opened.
+          link.drawn = true;
+          this.fromApp(data.reason || 'something in the app failed');
+        } else if (data?.type === 'error') {
+          // It did not open: nothing of it is shown, and there is nothing in this frame to update.
+          link.failed = true;
+          const reason = data.reason || 'the app failed to load';
+          if (generation !== this.generation) return;
+          errors.push(reason);
+          this.report([reason]);
           this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
         } else if (data?.type === 'call') {
           channel.port1.postMessage({ id: data.id, result: { error: 'This preview has no backend: server/ actions run only when the app is deployed.' } });
         }
       };
       frame.contentWindow!.postMessage(
-        { type: 'formlogic:init', client, assets, appId: `bot.computer-${this.projectId()}-${root || 'root'}`, dark: matchMedia('(prefers-color-scheme: dark)').matches, engine: 'zipp-web-python', zippWasm: bytes.slice(0) },
+        // dark: OAIY's own theme (the dashboard's choice in its window), which the system's setting need not be.
+        { type: 'formlogic:init', client, assets, appId: `bot.computer-${this.projectId()}-${root || 'root'}`, dark: theme() === 'dark', engine: 'zipp-web-python', zippWasm: bytes.slice(0) },
         '*',
         [channel.port2],
       );
-      this.settleTimer = setTimeout(async () => {
-        const problems = (await syntax).map((f) => `${f.file}: ${f.message}`);
-        if (generation !== this.generation || errors.length) return;
-        if (problems.length) {
-          errors.push(...problems);
-          this.setStatus(`error: ${problems[0]}`, 'error');
-          this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
-          return;
-        }
-        this.setStatus(`live · ${new Date().toLocaleTimeString()}`, 'ok');
-        this.settle({ ok: true, errors: [], warnings: [...warnings] });
-      }, SETTLE_MS);
+      // A frame that says when the app is drawn is believed, and given a while to say it; one that does not is
+      // counted as drawn once it has had time to report an error.
+      this.settleTimer = link.says.shown
+        ? setTimeout(() => {
+            if (generation !== this.generation || link.drawn || errors.length) return;
+            link.failed = true;
+            const message = `the app did not finish opening within ${OPEN_DEADLINE_MS / 1000} s`;
+            errors.push(message);
+            this.failStatus(message);
+            this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
+          }, OPEN_DEADLINE_MS)
+        : setTimeout(() => {
+            link.drawn = true;
+            void opened();
+          }, SETTLE_MS);
     };
     window.addEventListener('message', onMessage);
     setTimeout(() => {

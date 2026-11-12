@@ -563,14 +563,18 @@ export function formatFindings(findings: Finding[]): string {
   return findings.map((f) => `${f.level === 'error' ? 'ERROR' : 'warning'} ${f.file}: ${f.message}`).join('\n');
 }
 
-/** The smallest SoftN app: a page, its logic, and a manifest that lists them. */
+/**
+ * The smallest SoftN app: a page, its logic, and a manifest that lists them. Neither starter names a theme: an app
+ * that names none takes the theme of where it is shown, which in the preview is OAIY's own (a starter that said
+ * "dark" was a black app in a light window).
+ */
 export const SOFTN_BLANK: Array<[string, string]> = [
   ['manifest.json', `${JSON.stringify({ name: 'App', version: '1.0.0', main: MAIN_PAGE, files: { ui: [MAIN_PAGE], logic: ['main.js'] } }, null, 2)}\n`],
   [
     MAIN_PAGE,
     `<script src="main.js"></script>
 
-<App theme="dark">
+<App>
   <Container size="md">
     <Stack direction="vertical" gap="lg" padding="xl">
       <Heading level={1}>{title}</Heading>
@@ -589,7 +593,7 @@ export const SOFTN_STARTER: Array<[string, string]> = [
     MAIN_PAGE,
     `<script src="main.js"></script>
 
-<App theme="dark">
+<App>
   <Container size="sm">
     <Stack direction="vertical" gap="lg" padding="xl">
       <Heading level={1}>Tasks</Heading>

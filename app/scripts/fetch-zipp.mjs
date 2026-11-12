@@ -20,7 +20,9 @@
  *   node scripts/fetch-zipp.mjs --ensure   install unless public/zipp/ already holds it
  *
  * ZIPP_RELEASE_DIR=<dir> reads SHA256SUMS, the module and the kit from a
- * folder instead of GitHub (offline builds).
+ * folder instead of GitHub (offline builds). From GitHub, each file is asked
+ * of its API's asset address first and the plain download address second
+ * (release-download.mjs); a GITHUB_TOKEN or GH_TOKEN goes to the API alone.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -28,8 +30,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { unzipSync } from 'fflate';
+import { downloadReleaseFile } from './release-download.mjs';
 
-const RELEASE = 'v0.0.33';
+const RELEASE = 'v0.0.35';
 const VERSION = RELEASE.slice(1);
 const VARIANT = 'javascript-python-base';
 const LANGUAGES = ['javascript', 'python'];
@@ -37,7 +40,7 @@ const MODULE = `zipp-${VERSION}-${VARIANT}.wasm`;
 const KIT = `zipp-${VERSION}-wasm-embed-kit`;
 // The digest of the release's top-level SHA256SUMS, so a changed release file
 // cannot slip in under the same tag.
-const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || '88d207601cfdc4fa67925079b66965637b8ec80398152aad3be652ba945df1bc';
+const SUMS_SHA256 = process.env.ZIPP_SUMS_SHA256 || 'b08031a75c1073b4d111fe843c03ec56ae52ccda68abffef59311bec63fb793b';
 /** The installed files. */
 const FILES = ['zipp_wasm.js', 'zipp_wasm_bg.wasm', 'zipp_wasm.d.ts', 'LICENSE-APACHE'];
 /** The kit's files the install takes, by the name they are installed under. */
@@ -101,12 +104,10 @@ function customSections(bytes, name) {
   }
 }
 
+/** A release file: from ZIPP_RELEASE_DIR, or from GitHub (its API's asset address first, the plain download address second: release-download.mjs). Whatever the route, it is checked against the digests below. */
 async function fetchBytes(name) {
   if (process.env.ZIPP_RELEASE_DIR) return new Uint8Array(readFileSync(join(process.env.ZIPP_RELEASE_DIR, name)));
-  const url = `https://github.com/f2i-com/zipp.org/releases/download/${RELEASE}/${name}`;
-  const response = await fetch(url, { redirect: 'follow' });
-  if (!response.ok) throw new Error(`GET ${url}: HTTP ${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
+  return downloadReleaseFile({ repository: 'f2i-com/zipp.org', tag: RELEASE, name });
 }
 
 function installed() {

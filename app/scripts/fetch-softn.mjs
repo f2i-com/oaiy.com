@@ -11,18 +11,22 @@
  * The release zip must match its published SHA-256, pinned here. Its
  * hosted-runtime/ folder is installed whole: from v0.0.25 it carries no ONNX
  * or speech payloads (a SoftN app's local AI runs GGUF models on ZIPP).
- * SOFTN_RELEASE_DIR=<dir> reads the zip from a folder instead of GitHub.
+ * SOFTN_RELEASE_DIR=<dir> reads the zip from a folder instead of GitHub. From
+ * GitHub, the zip is asked of its API's asset address first and the plain
+ * download address second (release-download.mjs); a GITHUB_TOKEN or GH_TOKEN
+ * goes to the API alone.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installBridge } from './softn-bridge/install.mjs';
+import { downloadReleaseFile } from './release-download.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.32';
+const RELEASE = 'v0.0.39';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'de8a5dde7df9a9fdfd53934ad330b501609c824e4feed5f0b2d905d4be3a4c56';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'fbc0aa227c234bd0783019e2400f6b3e6ae8c10a876b0db9f0e0415fa3614e29';
 const PREFIX = 'hosted-runtime/';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -49,11 +53,9 @@ async function main() {
   if (process.env.SOFTN_RELEASE_DIR) {
     zip = readFileSync(join(process.env.SOFTN_RELEASE_DIR, ZIP));
   } else {
-    const url = `https://github.com/f2i-com/softn.com/releases/download/${RELEASE}/${ZIP}`;
-    console.log(`fetching ${url} (about 40 MB) ...`);
-    const response = await fetch(url, { redirect: 'follow' });
-    if (!response.ok) throw new Error(`GET ${url}: HTTP ${response.status}`);
-    zip = new Uint8Array(await response.arrayBuffer());
+    console.log(`fetching ${ZIP} from the softn.com ${RELEASE} release (about 32 MB) ...`);
+    // GitHub's API asset address first, the plain download address second; the digest below holds either way.
+    zip = await downloadReleaseFile({ repository: 'f2i-com/softn.com', tag: RELEASE, name: ZIP });
   }
   if (sha256(zip) !== ZIP_SHA256) throw new Error(`${ZIP} does not match its pinned SHA-256`);
   const entries = unzipSync(zip, { filter: (f) => f.name.startsWith(PREFIX) });

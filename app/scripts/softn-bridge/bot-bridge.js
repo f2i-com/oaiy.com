@@ -125,6 +125,11 @@
     if (tag === 'textarea') return `[text area "${labelOf(el)}" = "${el.value.slice(0, 200)}"]${disabled}`;
     if (tag === 'select') {
       const options = [...el.options].map((o) => clean(o.textContent)).slice(0, 12);
+      // One that takes several choices says every one chosen (only the first was said, so a second could not be checked).
+      if (el.multiple) {
+        const chosen = [...el.selectedOptions].map((o) => `"${clean(o.textContent)}"`);
+        return `[multi-select "${labelOf(el)}" = ${chosen.length ? chosen.join(', ') : 'none chosen'} options: ${options.join(' | ')}]${disabled}`;
+      }
       return `[select "${labelOf(el)}" = "${clean(el.selectedOptions[0]?.textContent)}" options: ${options.join(' | ')}]${disabled}`;
     }
     if (tag === 'a') return `[link "${clean(el.textContent) || labelOf(el)}"]`;
@@ -251,8 +256,23 @@
     }
     if (typeof action.select === 'string') {
       const el = find(action.select, 'select', action.nth);
-      const option = [...el.options].find((o) => clean(o.textContent).toLowerCase() === String(action.value).toLowerCase() || o.value === String(action.value));
-      if (!option) throw new Error(`"${labelOf(el)}" has no option "${action.value}"; its options: ${[...el.options].map((o) => clean(o.textContent)).join(' | ')}`);
+      const optionFor = (value) => {
+        const option = [...el.options].find((o) => clean(o.textContent).toLowerCase() === String(value).toLowerCase() || o.value === String(value));
+        if (!option) throw new Error(`"${labelOf(el)}" has no option "${value}"; its options: ${[...el.options].map((o) => clean(o.textContent)).join(' | ')}`);
+        return option;
+      };
+      // `value` as a list: the options chosen in a select that takes several (exactly those; an empty list, none).
+      const wanted = Array.isArray(action.value) ? action.value : [action.value];
+      if (el.multiple) {
+        const chosen = wanted.map(optionFor);
+        el.focus();
+        for (const option of el.options) option.selected = chosen.includes(option);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return chosen.length ? `chose ${chosen.map((o) => `"${clean(o.textContent)}"`).join(', ')} in "${labelOf(el)}"` : `chose nothing in "${labelOf(el)}"`;
+      }
+      if (wanted.length !== 1) throw new Error(`"${labelOf(el)}" takes one choice: give "value" one option, not a list of ${wanted.length} (a list is for a select that takes several)`);
+      const option = optionFor(wanted[0]);
       setValue(el, option.value);
       return `chose "${clean(option.textContent)}" in "${labelOf(el)}"`;
     }
@@ -280,7 +300,7 @@
       await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(action.wait, 0), 10_000)));
       return `waited ${action.wait} ms`;
     }
-    throw new Error(`unknown action ${JSON.stringify(action)}: use {click}, {fill, value}, {select, value}, {key} (with times or hold) or {wait}`);
+    throw new Error(`unknown action ${JSON.stringify(action)}: use {click}, {fill, value}, {select, value} (value a list where the select takes several), {key} (with times or hold) or {wait}`);
   };
   // A frame off screen gets no animation frames, so a timer also ends the wait.
   const settle = () =>

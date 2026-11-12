@@ -5,7 +5,7 @@ OAIY's sandbox gives guest programs synchronous file and network access (Node's 
 ## Status
 
 The bridge is in ZIPP since v0.0.22 (`crates/zipp-wasm`, with the boundary check `tests/node/app-bridge.cjs`), and
-OAIY installs v0.0.33 (`scripts/fetch-zipp.mjs`: from v0.0.26 a release publishes each engine as one `.wasm` that
+OAIY installs v0.0.35 (`scripts/fetch-zipp.mjs`: from v0.0.26 a release publishes each engine as one `.wasm` that
 carries its bindings in a `zipp.glue` section, installed as `zipp_wasm.js` beside the module).
 
 The sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
@@ -21,12 +21,14 @@ v0.0.23 (13 October 2026), on v0.0.24 (14 October 2026), on v0.0.25 (16 October 
 (7 November 2026).
 
 SoftN's hosted runtime is another matter: it takes the engine's module from the Agent and binds it with the
-bindings of the ZIPP release it was built with, so it is given that release's module and not necessarily the Agent's
-(`softnZippBytes` in `src/preview/preview.ts`: the Agent's own when the runtime's manifest names the same module, else
-the copy the runtime carries). SoftN v0.0.18 was built with ZIPP v0.0.21, v0.0.19 with v0.0.22, v0.0.20 with
+bindings of the ZIPP release it was built with, so the Agent's engine has to be that release's
+(`softnZippBytes` in `src/preview/preview.ts`: the Agent's own when the runtime's manifest names the same module;
+where it names another, the preview says which two releases to bring together, `engineMismatch` in
+`src/preview/liveFrame.ts`, and opens no frame. Through v0.0.34 the runtime carried a copy of its engine, which was
+given instead; from v0.0.35 it carries none, so the two pins move together). SoftN v0.0.18 was built with ZIPP v0.0.21, v0.0.19 with v0.0.22, v0.0.20 with
 v0.0.23, v0.0.21 with v0.0.24, v0.0.22 with v0.0.25, v0.0.23 with v0.0.26, v0.0.24 with v0.0.27, v0.0.25 and v0.0.26
-with v0.0.29, v0.0.27 to v0.0.31 with v0.0.32; v0.0.32, which OAIY installs (`scripts/fetch-softn.mjs`), with v0.0.33,
-the Agent's own, so the two share one module.
+with v0.0.29, v0.0.27 to v0.0.31 with v0.0.32, v0.0.32 to v0.0.38 with v0.0.33; v0.0.39, which OAIY installs
+(`scripts/fetch-softn.mjs`), with v0.0.35, the Agent's own, so the two share one module.
 
 ## The API (zipp-wasm)
 

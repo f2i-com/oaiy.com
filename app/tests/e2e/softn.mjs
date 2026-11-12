@@ -241,7 +241,9 @@ try {
     const result = JSON.stringify(requests[6].messages.at(-1));
     if (process.env.DUMP) console.log(requests[6].messages.at(-1).content);
     expect(/filled .*Buy bread/.test(result) && /clicked \[button \\"Add\\"\]/.test(result), result.slice(0, 600));
-    expect(result.includes('Buy bread') && result.includes('1 remaining') && result.includes('[button \\"Delete\\"]'), result.slice(0, 1200));
+    // "Buy milk", added by hand at the start, is still there: the edits since updated the app where it stood
+    // (SoftN v0.0.39's update in place), where each used to start it from nothing in a new frame.
+    expect(result.includes('Buy bread') && result.includes('Buy milk') && result.includes('2 remaining') && result.includes('[button \\"Delete\\"]'), result.slice(0, 1200));
     expect((await frameText(page)).includes('Buy bread'), 'the task is not in the preview');
   });
 
