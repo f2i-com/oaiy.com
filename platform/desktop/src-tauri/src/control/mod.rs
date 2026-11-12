@@ -79,6 +79,24 @@ pub fn set_navigator(navigator: Navigator) {
     let _ = NAVIGATOR.set(navigator);
 }
 
+/// Whether `view` is one of the dashboard's own pages by the name `ui_open` shows it by (`tools::VIEWS`): the only
+/// names an embedded page's asking is honoured for ([`show_view`]).
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn own_view(view: &str) -> bool {
+    tools::VIEWS.contains(&view)
+}
+
+/// One of the dashboard's own pages shown because a page in the window asked for it (the Engines page's link to
+/// Settings → Storage, `embed.rs`): the name alone goes to the dashboard, and only one of [`own_view`]'s. Whether it
+/// was shown.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn show_view(view: &str) -> bool {
+    match NAVIGATOR.get() {
+        Some(navigate) if own_view(view) => navigate(serde_json::json!({ "view": view })).is_ok(),
+        _ => false,
+    }
+}
+
 /// Who is asking, from `X-OAIY-Session`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Session {

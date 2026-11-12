@@ -15,13 +15,29 @@
 //! its projects in, which each page's webview has turned on ([`webkit_features`]).
 //!
 //! All three follow the dashboard's light or dark (`set_theme`): each starts
-//! in it and is told when it changes.
+//! in it and is told when it changes, and the ground under each (what shows
+//! before the page has drawn) is the dashboard's own for that theme ([`ground`]).
+//!
+//! A page is not laid over the dashboard before it has something to show: it is
+//! made, or brought to a new size, out of sight, and brought in once it has
+//! loaded and had a moment to draw (or a short while has passed), so a person
+//! sees the dashboard's "Opening…" and then the page, never a blank one
+//! ([`show_embedded`]).
+//!
+//! The keyboard is the dashboard's until a page is opened: making a webview
+//! takes it from nobody, opening a page gives it to the page, putting a page
+//! away gives it back, and Tab goes on from the dashboard's last stop into the
+//! page and from the page's last stop back to the dashboard's first (Shift+Tab
+//! the other way), where WebView2 would keep it going round inside one webview
+//! ([`keyboard`], Windows).
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::SeqCst};
+use std::time::{Duration, Instant};
 
 use percent_encoding::percent_decode_str;
 use tauri::http::{header, Request, Response, StatusCode};
-use tauri::webview::{NewWindowResponse, PageLoadEvent};
+use tauri::webview::{Color, NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, Url, WebviewBuilder, WebviewUrl};
 
 pub const AGENT_SCHEME: &str = "oaiy";
@@ -119,6 +135,20 @@ impl Page {
             Page::Flows => "embed-flows",
             Page::Engines => "embed-engines",
         }
+    }
+
+    /// Its place in [`Page::ALL`]: where what is kept for each page is kept.
+    fn slot(self) -> usize {
+        match self {
+            Page::Agent => 0,
+            Page::Flows => 1,
+            Page::Engines => 2,
+        }
+    }
+
+    /// The page as one number, for [`WANTED`] and [`SHOWN`]: one more than its place, so that 0 is no page.
+    fn mark(self) -> u8 {
+        self.slot() as u8 + 1
     }
 
     pub fn scheme(self) -> &'static str {
@@ -359,6 +389,18 @@ fn theme_script(mode: &str) -> String {
     format!("window.__oaiySetTheme ? window.__oaiySetTheme({mode:?}) : (window.__OAIY_THEME__ = {mode:?});")
 }
 
+/// The ground under a page, dark and light: the dashboard's own `--canvas`, the colour of the box a page is laid over
+/// (`.embedded-page` in `platform/desktop/src/styles.css`, where the two are said; a test holds these to that file).
+const GROUND_DARK: [u8; 3] = [0x08, 0x0d, 0x18];
+const GROUND_LIGHT: [u8; 3] = [0xf8, 0xf5, 0xee];
+
+/// What a page's webview shows where the page has drawn nothing yet (as it loads, or loads again): the dashboard's
+/// ground for the theme, not WebView2's white, which was a white window in a dark one for a frame or two.
+fn ground(mode: &str) -> Color {
+    let [r, g, b] = if mode == "light" { GROUND_LIGHT } else { GROUND_DARK };
+    Color(r, g, b, 255)
+}
+
 /// The dashboard's theme changed (or it has just started): the embedded pages follow.
 #[tauri::command]
 pub async fn set_theme<R: Runtime>(app: AppHandle<R>, mode: String) -> Result<(), String> {
@@ -372,6 +414,7 @@ pub async fn set_theme<R: Runtime>(app: AppHandle<R>, mode: String) -> Result<()
     }
     for page in Page::ALL {
         if let Some(webview) = app.get_webview(page.label()) {
+            let _ = webview.set_background_color(Some(ground(mode)));
             let _ = webview.eval(theme_script(mode));
         }
     }
@@ -477,6 +520,23 @@ fn own(page: Page, url: &Url) -> bool {
     own_at(&page.url(), url)
 }
 
+/// Where the Engines page goes to ask the window for one of the dashboard's pages: this path at its own address,
+/// then the page's name (`/oaiy-window/show/storage`, its link to Settings → Storage, where the Hugging Face token
+/// is kept). The engines' page has none of the desktop's API to ask with, and is given none for this.
+const SHOW_VIEW: &str = "/oaiy-window/show/";
+
+/// The name of the dashboard's page `url` asks the window to show, where it is such an asking: the Engines page's
+/// own address (`mine`: its scheme, host and port) and [`SHOW_VIEW`]. An asking is never loaded, whatever it names;
+/// what is shown for it is `control::show_view`'s to say (a page `ui_open` shows, by that name, and nothing else of
+/// the address is passed on).
+fn asked_view<'a>(page: Page, mine: &Url, url: &'a Url) -> Option<&'a str> {
+    let at_its_own = url.scheme() == mine.scheme() && url.host_str() == mine.host_str() && url.port_or_known_default() == mine.port_or_known_default();
+    if page != Page::Engines || !at_its_own {
+        return None;
+    }
+    url.path().strip_prefix(SHOW_VIEW)
+}
+
 /// Whether `url` is at the page's own address `mine`: its scheme, host and port (another port of 127.0.0.1 is another
 /// program's, which the window's script would hand the desktop's token), or a blob, data or blank page of its own.
 fn own_at(mine: &Url, url: &Url) -> bool {
@@ -494,26 +554,85 @@ fn own_at(mine: &Url, url: &Url) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64, seen: Option<Seen>) -> Result<(), String> {
     let page = Page::parse(&page).ok_or_else(|| format!("no embedded page called {page}"))?;
-    let asked = HIDES.load(std::sync::atomic::Ordering::SeqCst);
-    let _one = placing();
-    let placed = show_at(&app, &window, page, x, y, width, height);
-    if placed.is_ok() {
-        // Hidden since this was asked for (the person left the page while it was being made): put away again.
-        if HIDES.load(std::sync::atomic::Ordering::SeqCst) != asked {
-            if let Some(w) = app.get_webview(page.label()) {
-                let _ = w.hide();
+    let rect = [x.max(0.0), y.max(0.0), width.max(1.0), height.max(1.0)];
+    let mine = ASKS.fetch_add(1, SeqCst) + 1;
+    WANTED.store(page.mark(), SeqCst);
+    kept(&PLACE)[page.slot()] = Some(rect);
+    let opening = {
+        let _one = placing();
+        lay(&app, &window, page, rect)?
+    };
+    if opening {
+        // Out of sight for now: the dashboard's "Opening…" shows, in the theme, until the page has loaded and had a
+        // moment to draw (or the while it is given is up). Nothing is held meanwhile: whatever is asked next goes ahead.
+        let until = Instant::now() + OPENING_DEADLINE;
+        let mut loaded = None;
+        while ASKS.load(SeqCst) == mine {
+            let now = Instant::now();
+            if loaded.is_none() && LOADED[page.slot()].load(SeqCst) {
+                loaded = Some(now);
             }
-            return Ok(());
+            if now >= until || loaded.is_some_and(|at| now.duration_since(at) >= FIRST_PICTURE) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        note_placement(&app, &window, page, [x, y, width, height], seen);
+        let _one = placing();
+        if ASKS.load(SeqCst) == mine {
+            bring_in(&app, page)?;
+        }
     }
-    placed
+    // Asked otherwise since (the person left the page while it was being made, or asked for another): what was asked
+    // last holds. A page nobody wants now is put away; the same page asked for again is that asking's to show.
+    if ASKS.load(SeqCst) != mine {
+        let _one = placing();
+        if WANTED.load(SeqCst) != page.mark() {
+            put_away(&app, page);
+        }
+        return Ok(());
+    }
+    note_placement(&app, &window, page, [x, y, width, height], seen);
+    Ok(())
 }
 
-/// Each hide of the pages, counted: a page's first showing makes its webview, which takes a while, and a hide meanwhile
-/// found nothing to hide; the showing sees the count moved and hides the page it made (the editor was left over Run
-/// history otherwise).
-static HIDES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Each asking of the pages, counted, a show or a hide: a page's first showing makes its webview and waits for its
+/// first picture, which takes a while, and what is asked meanwhile is what holds. A hide then found nothing to hide
+/// (the editor was left over Run history), and a show answered late would lay one page over another: a showing goes on
+/// only while it is still the last thing asked.
+static ASKS: AtomicU64 = AtomicU64::new(0);
+/// The page asked for last, and the page laid over the dashboard now ([`Page::mark`]; 0 for none).
+static WANTED: AtomicU8 = AtomicU8::new(0);
+static SHOWN: AtomicU8 = AtomicU8::new(0);
+/// Whether each page's document has loaded: once is enough (a page that loads again is not taken away meanwhile).
+static LOADED: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+/// Where each page was asked for last (x, y, width, height), and the size each last had while it could draw.
+static PLACE: std::sync::Mutex<[Option<[f64; 4]>; 3]> = std::sync::Mutex::new([None; 3]);
+static DRAWN: std::sync::Mutex<[Option<(u32, u32)>; 3]> = std::sync::Mutex::new([None; 3]);
+
+/// How long a page that is opening may leave the dashboard's "Opening…" showing: after it, the page is laid over the
+/// dashboard loaded or not (on its ground, [`ground`]).
+const OPENING_DEADLINE: Duration = Duration::from_millis(1500);
+/// From a page's load, or its new size, to its first picture: what it is given to draw before it is brought in.
+const FIRST_PICTURE: Duration = Duration::from_millis(80);
+/// Whether a page opens out of sight and is brought in drawn. On Windows, where a webview made in place showed black
+/// and then WebView2's white before its page (measured: 60 to 150 ms). Elsewhere a page is laid in place as before:
+/// Linux packs a page into the window by its margins, which cannot put it out of sight, and neither has been looked at.
+const OPENS_OUT_OF_SIGHT: bool = cfg!(windows);
+
+fn kept<T>(of: &'static std::sync::Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+    of.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A size in whole pixels, to tell whether a page was last drawn at it.
+fn whole(rect: [f64; 4]) -> (u32, u32) {
+    (rect[2].round() as u32, rect[3].round() as u32)
+}
+
+/// Where a page of `rect`'s size is out of sight: left of the window by more than its own width (a child window is
+/// cut off at its window's edge). It is shown there, so it draws; a hidden webview draws nothing.
+fn out_of_sight(rect: [f64; 4]) -> LogicalPosition<f64> {
+    LogicalPosition::new(-(rect[2] + 64.0), rect[1])
+}
 
 /// What the dashboard's page saw as it measured the box (`EmbeddedPage.tsx`), for the log: its viewport in CSS
 /// pixels, how far it was scrolled, and the pixels of the screen to one of its own.
@@ -577,21 +696,41 @@ fn note_placement<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, pag
     );
 }
 
-fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+/// Lay `page` over the dashboard at `rect` (x, y, width, height), the other pages put away. Says whether it has still
+/// to be brought in ([`bring_in`]): a page that is being made, is still loading, or was never drawn at this size is
+/// put out of sight first, at its size and shown, so that it draws there ([`OPENS_OUT_OF_SIGHT`]).
+///
+/// The keyboard goes to the page as it comes to be shown, and not each time it is placed again: the dashboard says
+/// where its box is at every change of the window's size, and whenever a notice moves it, and each of those took the
+/// keyboard back from wherever the person had put it.
+fn lay<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page, rect: [f64; 4]) -> Result<bool, String> {
     for other in Page::ALL {
         if other != page {
-            if let Some(w) = app.get_webview(other.label()) {
-                let _ = w.hide();
-            }
+            put_away(app, other);
         }
     }
-    let (position, size) = (LogicalPosition::new(x.max(0.0), y.max(0.0)), LogicalSize::new(width.max(1.0), height.max(1.0)));
+    keyboard_joins(app, crate::update::gui::DASHBOARD_LABEL, 0);
+    let (position, size) = (LogicalPosition::new(rect[0], rect[1]), LogicalSize::new(rect[2], rect[3]));
     if let Some(webview) = app.get_webview(page.label()) {
-        place(&webview, position, size)?;
+        let here = SHOWN.load(SeqCst) == page.mark();
+        let as_it_was = LOADED[page.slot()].load(SeqCst) && kept(&DRAWN)[page.slot()] == Some(whole(rect));
+        if here || as_it_was || !OPENS_OUT_OF_SIGHT {
+            place(&webview, position, size)?;
+            kept(&DRAWN)[page.slot()] = Some(whole(rect));
+            if !here {
+                webview.show().map_err(|e| e.to_string())?;
+                SHOWN.store(page.mark(), SeqCst);
+                let _ = webview.set_focus();
+                let _ = webview.eval(theme_script(theme(app)));
+            }
+            return Ok(false);
+        }
+        place(&webview, out_of_sight(rect), size)?;
         webview.show().map_err(|e| e.to_string())?;
-        let _ = webview.set_focus();
         let _ = webview.eval(theme_script(theme(app)));
-        return Ok(());
+        // (the page put away just now may have had the keyboard: the dashboard's until this one is brought in)
+        keyboard_home(app);
+        return Ok(true);
     }
     if page == Page::Engines {
         if crate::engines::ui_url().is_none() {
@@ -603,7 +742,9 @@ fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page
             _ => "platform/ui/",
         }));
     }
-    let webview = window.add_child(builder(app, page), position, size).map_err(|e| e.to_string())?;
+    let at = if OPENS_OUT_OF_SIGHT { out_of_sight(rect) } else { position };
+    let webview = window.add_child(builder(app, page), at, size).map_err(|e| e.to_string())?;
+    keyboard_joins(app, page.label(), page.mark() as usize);
     // (made where it was asked for, but on Linux, where it is only packed into the window)
     if cfg!(target_os = "linux") {
         place(&webview, position, size)?;
@@ -611,7 +752,63 @@ fn show_at<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>, page: Page
     if page == Page::Agent {
         webkit_features(&webview, page);
     }
+    if OPENS_OUT_OF_SIGHT {
+        keyboard_home(app);
+        return Ok(true);
+    }
+    // (in place at once: a webview takes no keyboard by being made, [`builder`], so it is given it here)
+    kept(&DRAWN)[page.slot()] = Some(whole(rect));
+    SHOWN.store(page.mark(), SeqCst);
+    let _ = webview.set_focus();
+    Ok(false)
+}
+
+/// Bring a page that opened out of sight to where it was asked for last, drawn, and give it the keyboard: the person
+/// opened it.
+fn bring_in<R: Runtime>(app: &AppHandle<R>, page: Page) -> Result<(), String> {
+    let (Some(webview), Some(rect)) = (app.get_webview(page.label()), kept(&PLACE)[page.slot()]) else { return Ok(()) };
+    place(&webview, LogicalPosition::new(rect[0], rect[1]), LogicalSize::new(rect[2], rect[3]))?;
+    kept(&DRAWN)[page.slot()] = Some(whole(rect));
+    SHOWN.store(page.mark(), SeqCst);
+    let _ = webview.set_focus();
     Ok(())
+}
+
+/// Put a page away, where it is made (it goes on working: the agent answers texts and calls hidden).
+fn put_away<R: Runtime>(app: &AppHandle<R>, page: Page) {
+    if let Some(w) = app.get_webview(page.label()) {
+        let _ = w.hide();
+    }
+    let _ = SHOWN.compare_exchange(page.mark(), 0, SeqCst, SeqCst);
+}
+
+/// The keyboard back with the dashboard, where it is in a page that is not showing (a page put away keeps it
+/// otherwise, and every key goes to a page nobody can see). Asked on the main thread, after what was asked of the
+/// pages before it. On Windows, where it was seen; a Mac and Linux are as they were.
+fn keyboard_home<R: Runtime>(app: &AppHandle<R>) {
+    #[cfg(windows)]
+    {
+        let _ = app.run_on_main_thread(keyboard::home);
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
+/// A webview takes its place in the round Tab makes ([`keyboard`]): the dashboard's is place 0, a page's its
+/// [`Page::mark`]. Once each; on Windows.
+fn keyboard_joins<R: Runtime>(app: &AppHandle<R>, label: &str, place: usize) {
+    #[cfg(windows)]
+    {
+        let Some(webview) = app.get_webview(label) else { return };
+        if !keyboard::claim(place) {
+            return;
+        }
+        if let Err(e) = webview.with_webview(move |w| keyboard::join(w.controller(), place)) {
+            log::warn!("embed: {label} is not in Tab's round (its webview was not reached: {e})");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (app, label, place);
 }
 
 /// A page's webview put at `position`, `size` over the dashboard. On Linux Tauri packs a window's webviews into its
@@ -698,13 +895,21 @@ pub fn preload<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
         let _one = placing();
-        match window.add_child(builder(&app, Page::Agent), LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)) {
+        keyboard_joins(&app, crate::update::gui::DASHBOARD_LABEL, 0);
+        // (a pixel, and out of sight where that can be: it is hidden a moment after it is made)
+        let rect = [0.0, 0.0, 1.0, 1.0];
+        let at = if OPENS_OUT_OF_SIGHT { out_of_sight(rect) } else { LogicalPosition::new(0.0, 0.0) };
+        match window.add_child(builder(&app, Page::Agent), at, LogicalSize::new(1.0, 1.0)) {
             Ok(webview) => {
                 let _ = webview.hide();
                 if cfg!(target_os = "linux") {
                     let _ = place(&webview, LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0));
                 }
                 webkit_features(&webview, Page::Agent);
+                keyboard_joins(&app, Page::Agent.label(), Page::Agent.mark() as usize);
+                // The keyboard is the dashboard's as OAIY starts: a webview made here takes none ([`builder`]), and
+                // should WebView2 have given it one all the same, it goes back.
+                keyboard_home(&app);
             }
             Err(e) => log::warn!("the agent's page was not made at startup: {e}"),
         }
@@ -847,6 +1052,12 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     let made = if page == Page::Engines { made.on_download(engines_download) } else { made };
     made
         .additional_browser_args(BROWSER_ARGS)
+        // Being made takes the keyboard from nobody (wry gives a new webview the keyboard unless told not to: the
+        // agent's, made hidden as OAIY starts, had it, and no key reached the dashboard until someone clicked in it).
+        // A page is given it when it is shown ([`lay`], [`bring_in`]).
+        .focused(false)
+        // Where the page has drawn nothing yet, the dashboard's ground for the theme, kept in step by `set_theme`.
+        .background_color(ground(first))
         // A page that (re)loads starts in the theme it was made with: tell it the one now. The flow editor's is handed
         // the intent asked for while it loaded (a run's flow to open), and is told one at once after.
         .on_page_load(move |webview, payload| {
@@ -854,6 +1065,8 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
                 FLOWS_LOADED.store(payload.event() == PageLoadEvent::Finished, std::sync::atomic::Ordering::SeqCst);
             }
             if payload.event() == PageLoadEvent::Finished {
+                // (loaded: it may be brought in once it has had a moment to draw, `show_embedded`)
+                LOADED[page.slot()].store(true, SeqCst);
                 let _ = webview.eval(theme_script(theme(webview.app_handle())));
                 if page == Page::Flows {
                     if let Some(script) = PENDING_FLOWS_INTENT.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -863,6 +1076,13 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
             }
         })
         .on_navigation(move |url| {
+            // (the Engines page's link to one of the dashboard's pages: shown there, and nothing is loaded here)
+            if let Some(view) = asked_view(page, &page.url(), url) {
+                if !crate::control::show_view(view) {
+                    log::warn!("embed: {} asked the window for a page it does not have", page.label());
+                }
+                return false;
+            }
             if own(page, url) {
                 return true;
             }
@@ -876,6 +1096,14 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
             false
         })
         .on_new_window(move |url, _features| {
+            // (the Engines page's link to one of the dashboard's pages, opened with Shift, Ctrl or the middle button:
+            // shown in the window as a plain click shows it, never a window of its own on an address nothing serves)
+            if let Some(view) = asked_view(page, &page.url(), &url) {
+                if !crate::control::show_view(view) {
+                    log::warn!("embed: {} asked the window for a page it does not have", page.label());
+                }
+                return NewWindowResponse::Deny;
+            }
             // (a paired computer's result the engines' Playground opens, `/api/play/node/…`, is shown by the system's
             // browser on this computer, as this computer's own outputs are through /api/open-file: never a bare window
             // of the app's own with no way back)
@@ -930,18 +1158,268 @@ fn engines_download<R: Runtime>(webview: tauri::Webview<R>, event: tauri::webvie
 /// Hide the embedded pages (the dashboard shows one of its own).
 #[tauri::command]
 pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    HIDES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // One placing at a time, a hiding too: between a showing's last look at what is asked and the keyboard it gives the
+    // page, a hiding left the keyboard in a page out of sight; and one that stalled after it had forgotten which page
+    // shows could hide a page asked for again meanwhile, which then read as shown and was never shown.
+    let _one = placing();
+    ASKS.fetch_add(1, SeqCst);
+    WANTED.store(0, SeqCst);
+    SHOWN.store(0, SeqCst);
     for page in Page::ALL {
         if let Some(w) = app.get_webview(page.label()) {
             w.hide().map_err(|e| e.to_string())?;
         }
     }
+    // A page that had the keyboard keeps it hidden: back to the dashboard, to what was last used in it.
+    keyboard_home(&app);
     Ok(())
+}
+
+/// Tab's round through the window's webviews, and the keyboard's way home, on Windows.
+///
+/// Each webview is a WebView2 of its own, and WebView2 keeps Tab inside the one that has the keyboard: past its last
+/// stop it asks its host where to go next (`MoveFocusRequested`), and where the host says nothing it starts again at
+/// its own first stop. So Tab went round the dashboard and never into the page beside it, and from inside a page no
+/// key came back. Here the host answers: from the dashboard, on into the page that is showing (at its first stop for
+/// Tab, its last for Shift+Tab); from a page, on into the dashboard the same way. The order a person gets is the
+/// sidebar, the header, the page, the sidebar again.
+///
+/// What is not handled, and why:
+/// - Leaving OAIY for another program and coming back (Alt+Tab, the taskbar) lands the keyboard in the dashboard,
+///   also where it was in a page. That is wry's doing: it watches the window for the webview made first (the
+///   dashboard's), and gives that webview the keyboard whenever the window gets it back (wry 0.55.1,
+///   `src/webview2/mod.rs`, `parent_subclass_proc` on `WM_SETFOCUS`). Left as it is: undoing it means remembering
+///   which webview had the keyboard and moving it back after wry has moved it.
+/// - A Mac and Linux have none of this module, and no opening out of sight (`OPENS_OUT_OF_SIGHT`). They have what is
+///   not Windows' alone: a webview being made takes the keyboard from nobody (`focused(false)`), a page is given
+///   the keyboard when it comes to be shown and only then, and the ground under a page is the dashboard's
+///   (`ground`). Tab's round there is WKWebView's and WebKitGTK's own, and neither was run.
+/// - A dialog of a page's own keeps Tab inside it, as a dialog should; the round is back when it closes.
+///
+/// The calls are WebView2's own COM interfaces through `webview2-com`, the crate Tauri and wry are built on (named
+/// in Cargo.toml for this; the one copy, since Tauri hands out the controller as that crate's type). Everything here
+/// runs on the main thread, which is where a controller lives: `join` inside `with_webview`, `home` through
+/// `run_on_main_thread`, and the answer where WebView2 asks for it.
+#[cfg(windows)]
+mod keyboard {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::mem::ManuallyDrop;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    // Why the keyboard moves: by the program, by Tab, by Shift+Tab.
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Controller, ICoreWebView2MoveFocusRequestedEventHandler, COREWEBVIEW2_MOVE_FOCUS_REASON as Reason,
+        COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT as NEXT, COREWEBVIEW2_MOVE_FOCUS_REASON_PREVIOUS as PREVIOUS,
+        COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC as PROGRAMMATIC,
+    };
+    use webview2_com::MoveFocusRequestedEventHandler;
+
+    // Two of user32's, by name (a window's handle is a pointer): which of this thread's windows has the keyboard, and
+    // whether one window is inside another.
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetFocus() -> *mut c_void;
+        fn IsChild(parent: *mut c_void, window: *mut c_void) -> i32;
+    }
+
+    /// The places in the round: the dashboard's (0), then each page's (its `Page::mark`).
+    const PLACES: usize = 4;
+
+    thread_local! {
+        /// The webviews' controllers by place, on the main thread: the only one a controller is used on, and any
+        /// other finds none here and does nothing. Each is a reference held for as long as OAIY runs (a webview here
+        /// is never destroyed), and not let go as the thread ends, when WebView2 itself is on its way out.
+        static CONTROLLERS: RefCell<[Option<ManuallyDrop<ICoreWebView2Controller>>; PLACES]> =
+            const { RefCell::new([None, None, None, None]) };
+    }
+    static CLAIMED: [AtomicBool; PLACES] = [const { AtomicBool::new(false) }; PLACES];
+
+    /// Take `place` for a webview that is about to join: false where one has it already.
+    pub fn claim(place: usize) -> bool {
+        CLAIMED.get(place).is_some_and(|c| !c.swap(true, SeqCst))
+    }
+
+    /// The controller of the webview at `place`, where one has joined: a reference of the caller's own, let go as it
+    /// is dropped, so nothing of the table is held while WebView2 is called.
+    fn at(place: usize) -> Option<ICoreWebView2Controller> {
+        CONTROLLERS.with_borrow(|all| all.get(place)?.as_deref().cloned())
+    }
+
+    /// The webview whose controller this is joins the round at `place`: it is told who answers when Tab leaves it,
+    /// and its controller is kept. `controller` is the one Tauri hands out (`with_webview`), a reference of its own.
+    pub fn join(controller: ICoreWebView2Controller, place: usize) {
+        if place >= PLACES {
+            return;
+        }
+        let mut token = 0i64;
+        // SAFETY: a live controller on its own (the main) thread; WebView2 takes a reference of its own to the answer.
+        if let Err(e) = unsafe { controller.add_MoveFocusRequested(&answer(place), &mut token) } {
+            log::warn!("embed: WebView2 did not take the answer to Tab leaving a webview ({e}): Tab stays inside it");
+            return;
+        }
+        CONTROLLERS.with_borrow_mut(|all| all[place] = Some(ManuallyDrop::new(controller)));
+    }
+
+    /// Whether the window with the keyboard is `controller`'s webview: its frame (a child of OAIY's window), or
+    /// anything inside it.
+    fn has_keyboard(controller: &ICoreWebView2Controller, focus: *mut c_void) -> bool {
+        let mut frame = Default::default();
+        // SAFETY: a live controller, on its own thread, writes its window's handle.
+        if unsafe { controller.ParentWindow(&mut frame) }.is_err() || frame.0.is_null() {
+            return false;
+        }
+        // SAFETY: IsChild only reads.
+        focus == frame.0 || unsafe { IsChild(frame.0, focus) } != 0
+    }
+
+    /// The keyboard to the dashboard, where it is neither there nor in the page that is showing: in a page that was
+    /// put away, or in OAIY's window itself. Nothing where no window of OAIY's has the keyboard (another program
+    /// does: it is not taken from it). On the main thread.
+    pub fn home() {
+        let Some(dashboard) = at(0) else { return };
+        // SAFETY: GetFocus only reads.
+        let focus = unsafe { GetFocus() };
+        if focus.is_null() || has_keyboard(&dashboard, focus) {
+            return;
+        }
+        let shown = super::SHOWN.load(SeqCst) as usize;
+        if shown != 0 && at(shown).is_some_and(|page| has_keyboard(&page, focus)) {
+            return;
+        }
+        // SAFETY: a live controller, on its own thread.
+        let _ = unsafe { dashboard.MoveFocus(PROGRAMMATIC) };
+    }
+
+    /// Tab (or Shift+Tab) has left the webview at `place`: where the keyboard goes, by `reason`. From the dashboard,
+    /// into the page that is showing, where one is (else the dashboard keeps it, going round as before); from a
+    /// page, into the dashboard. None where it stays.
+    fn onward(place: usize, shown: usize, reason: Reason) -> Option<usize> {
+        if reason != NEXT && reason != PREVIOUS {
+            return None;
+        }
+        match place {
+            0 => (shown != 0).then_some(shown),
+            _ => Some(0),
+        }
+    }
+
+    /// What WebView2 calls when Tab leaves the webview at `place` (0 the dashboard, else a page): the keyboard goes
+    /// [`onward`], and WebView2 is told it was answered. Where it goes nowhere, nothing is said, and WebView2 starts
+    /// again at the webview's own first stop, as it always did.
+    fn answer(place: usize) -> ICoreWebView2MoveFocusRequestedEventHandler {
+        MoveFocusRequestedEventHandler::create(Box::new(move |_webview, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut reason = PROGRAMMATIC;
+            // SAFETY: WebView2's own arguments, in its own call, on its own thread.
+            if unsafe { args.Reason(&mut reason) }.is_err() {
+                return Ok(());
+            }
+            let Some(to) = onward(place, super::SHOWN.load(SeqCst) as usize, reason) else { return Ok(()) };
+            let Some(next) = at(to) else { return Ok(()) };
+            // SAFETY: as above, and `next` is a live controller on the same thread.
+            unsafe {
+                // (answered: WebView2 does not start again at this webview's own first stop)
+                let _ = args.SetHandled(true);
+                let _ = next.MoveFocus(reason);
+            }
+            Ok(())
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2MoveFocusRequestedEventArgs;
+
+        #[test]
+        fn tab_goes_from_the_dashboard_into_the_page_showing_and_from_a_page_back() {
+            // From the dashboard (place 0): into the page that is showing, by Tab or Shift+Tab; nowhere with none showing.
+            assert_eq!(onward(0, 2, NEXT), Some(2));
+            assert_eq!(onward(0, 3, PREVIOUS), Some(3));
+            assert_eq!(onward(0, 0, NEXT), None, "no page showing: the dashboard keeps the keyboard, as before");
+            // From a page: into the dashboard, whichever page is showing.
+            for page in 1..=3 {
+                assert_eq!(onward(page, page, NEXT), Some(0));
+                assert_eq!(onward(page, 0, PREVIOUS), Some(0), "a page that was put away with the keyboard gives it up too");
+            }
+            // The keyboard moved by the program is nobody's Tab.
+            assert_eq!(onward(1, 1, PROGRAMMATIC), None);
+        }
+
+        #[test]
+        fn a_call_with_nothing_to_read_is_answered_and_does_nothing() {
+            // The answer as WebView2 holds it, called through its own interface with no arguments at all.
+            let answer = answer(0);
+            // SAFETY: a COM object made here, called as WebView2 calls one, with nothing for it to read.
+            let called = unsafe { answer.Invoke(None::<&ICoreWebView2Controller>, None::<&ICoreWebView2MoveFocusRequestedEventArgs>) };
+            assert!(called.is_ok());
+            // There are four places in the round and no fifth, and no webview has joined in a test.
+            assert!(!claim(9), "there is no such place");
+            assert!(at(9).is_none() && at(0).is_none());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ground_under_a_page_is_the_dashboards_own_for_the_theme() {
+        // The dashboard says its ground once for each theme, `--canvas` in its stylesheet: under `:root` for the dark
+        // theme and under `:root[data-theme='light']` for the light. A page's webview is given the same.
+        let css = include_str!("../../src/styles.css").replace("\r\n", "\n");
+        let canvas = |opens: &str| -> String {
+            let from = css.find(&format!("\n{opens} {{\n")).unwrap_or_else(|| panic!("styles.css has a block that opens {opens:?}"));
+            let block = &css[from..from + css[from..].find("\n}\n").expect("the block closes")];
+            let at = block.find("--canvas:").unwrap_or_else(|| panic!("{opens:?} says --canvas"));
+            block[at + "--canvas:".len()..].split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+        };
+        let hex = |c: Color| format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
+        assert_eq!(hex(ground("dark")), canvas(":root"));
+        assert_eq!(hex(ground("light")), canvas(":root[data-theme='light']"));
+        // Opaque (WebView2 takes a colour whole or not at all), and dark where the theme is not said.
+        assert_eq!((ground("dark").3, ground("light").3), (255, 255));
+        assert_eq!(hex(ground("")), hex(ground("dark")));
+    }
+
+    #[test]
+    fn the_engines_page_asks_the_window_for_a_dashboard_page_at_an_address_that_is_never_loaded() {
+        let mine: Url = "http://127.0.0.1:17860/?in=oaiy&theme=light".parse().unwrap();
+        let asked = |page: Page, url: &str| asked_view(page, &mine, &url.parse::<Url>().unwrap()).map(str::to_string);
+        // Its link to Settings → Storage: an asking, by the page's name.
+        assert_eq!(asked(Page::Engines, "http://127.0.0.1:17860/oaiy-window/show/storage").as_deref(), Some("storage"));
+        // Anything under the path is an asking, and so is not loaded; which names are shown is the list `ui_open` uses.
+        assert_eq!(asked(Page::Engines, "http://127.0.0.1:17860/oaiy-window/show/plugin:demo:home?x=1#y").as_deref(), Some("plugin:demo:home"));
+        assert!(crate::control::own_view("storage") && crate::control::own_view("settings"));
+        for not_a_page in ["plugin:demo:home", "agent-settings", "", "storage/", "Storage", "../../etc"] {
+            assert!(!crate::control::own_view(not_a_page), "{not_a_page:?}");
+            assert!(!crate::control::show_view(not_a_page), "{not_a_page:?}");
+        }
+        // The page's own other addresses load as before; another program's port, another site and another page of
+        // the window are not askings.
+        assert_eq!(asked(Page::Engines, "http://127.0.0.1:17860/?in=oaiy#get"), None);
+        assert_eq!(asked(Page::Engines, "http://127.0.0.1:17860/api/oaiy-window/show/storage"), None);
+        assert_eq!(asked(Page::Engines, "http://127.0.0.1:17861/oaiy-window/show/storage"), None);
+        assert_eq!(asked(Page::Engines, "https://127.0.0.1:17860/oaiy-window/show/storage"), None);
+        assert_eq!(asked(Page::Engines, "http://example.com/oaiy-window/show/storage"), None);
+        assert_eq!(asked(Page::Agent, "http://127.0.0.1:17860/oaiy-window/show/storage"), None);
+    }
+
+    #[test]
+    fn a_page_opens_out_of_sight_at_its_own_size() {
+        let rect = [222.0, 48.0, 1058.4, 771.6];
+        assert_eq!(whole(rect), (1058, 772));
+        let at = out_of_sight(rect);
+        assert!(at.x + rect[2] < 0.0, "wholly left of the window's edge, where a child window is cut off");
+        assert_eq!(at.y, rect[1]);
+        // A page is one number where it is kept as one, and no page is none of them.
+        assert_eq!(Page::ALL.map(Page::mark), [1, 2, 3]);
+        assert_eq!(Page::ALL.map(Page::slot), [0, 1, 2]);
+        // It is given a while to load and a moment to draw, and the moment is the shorter.
+        assert!(FIRST_PICTURE < OPENING_DEADLINE && OPENING_DEADLINE <= Duration::from_secs(2));
+    }
 
     #[test]
     fn each_webview_is_given_the_embedder_policy_it_isolates_a_page_for() {

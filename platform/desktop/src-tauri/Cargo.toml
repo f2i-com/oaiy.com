@@ -32,6 +32,7 @@ gui = [
     "dep:tauri-build",
     "dep:webkit2gtk",
     "dep:gtk",
+    "dep:webview2-com",
 ]
 # The browser login of `oaiy-server` (design 4.7): the Argon2id password, the strength estimate and
 # the console. Enabled for the headless server and left off for the desktop, so the GUI carries the
@@ -239,6 +240,11 @@ windows-sys = { version = "0.61", features = [
     # How long ago the owner last used the computer (ring/presence.rs).
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
+# With the window: WebView2's own interfaces, typed, for Tab's round through the window's webviews (embed.rs, `mod
+# keyboard`). Already in the tree (tauri, wry), and it has to stay the one copy they build: Tauri hands out a
+# webview's controller as this crate's type, so with a second copy `keyboard::join` does not compile. Named here
+# because a crate cannot `use` an undeclared transitive dependency.
+webview2-com = { version = "0.38", optional = true }
 
 # An unoptimised Argon2 at 64 MiB and three passes takes seconds, and the estimate of a password
 # scans dictionaries: the tests that hash and judge would each wait for them. Only these crates are
