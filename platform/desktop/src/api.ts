@@ -863,6 +863,10 @@ export interface LinkStatus {
    *  they show up on the provider's website as "no desktop picked it up in
    *  time", which reads as a broken connection rather than a lane erroring. */
   relayError?: string;
+  /** Why the command lane is not used at all: the provider gives this link no
+   *  commands (a link made for AI alone), in its words. Neither an error nor a
+   *  lane listening; the lane rests until the link changes. */
+  relayNotUsed?: string;
   /** When this desktop last looked at the account's queued flow runs, and why
    *  it stopped if it did (a run it claimed and could not report on). */
   lastFlowRunAt?: string;

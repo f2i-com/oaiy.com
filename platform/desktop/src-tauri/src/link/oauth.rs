@@ -319,8 +319,91 @@ pub fn exchange_code(
             .unwrap_or("the provider refused the exchange");
         return Err(format!("HTTP {}: {msg}", status.as_u16()));
     }
+    read_token_response(&o.token_response, &value)
+}
 
-    let spec = &o.token_response;
+/// What a link code may be: what a person types or pastes from the provider's page, which the
+/// provider alone judges. Bounded so a mistake (a pasted page) is not sent as one.
+const MAX_LINK_CODE: usize = 128;
+
+/// Redeem a one-time link code at the provider, for a computer that cannot do the browser's part
+/// of the ceremony: a headless server, whose approval in a browser would redirect to its own
+/// loopback (`oaiy-server link --code`). The provider answers exactly as its token endpoint answers
+/// the browser ceremony's exchange, so what comes back is read as [`exchange_code`] reads it.
+///
+/// This is the whole request, in one place (the provider's side builds to it):
+///
+/// ```text
+/// POST {base}{auth.linkCode.path}                  FormLogic: /api/oauth/oaiy-link
+/// Content-Type: application/x-www-form-urlencoded
+///
+/// {auth.linkCode.codeField}=<the one-time code>    FormLogic: code
+/// &{auth.linkCode.deviceField}=<device label>      FormLogic: device_name; when there is a label
+/// ```
+///
+/// What the link may do (its scopes) is chosen on the site when the code is made, so nothing
+/// here asks for any.
+///
+/// Blocking and run once, by a command on the console: there is no runtime to colour async.
+/// A redirect is not followed: the code would go, in the clear or to another host, wherever it
+/// pointed.
+pub fn redeem_link_code(
+    descriptor: &ConnectorDescriptor,
+    base_url: &str,
+    code: &str,
+    device_label: Option<&str>,
+) -> Result<ExchangedCredential, String> {
+    let AuthSpec::Oauth2Pkce(o) = &descriptor.auth;
+    let spec = o
+        .link_code
+        .as_ref()
+        .ok_or_else(|| format!("{} does not link computers with a code", descriptor.name))?;
+    let code = code.trim();
+    if code.is_empty() || code.len() > MAX_LINK_CODE || code.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("that is not a link code: copy the code the site shows, and only the code".into());
+    }
+    let mut form: Vec<(&str, &str)> = vec![(spec.code_field.as_str(), code)];
+    if let (Some(field), Some(label)) = (spec.device_field.as_deref(), device_label.map(str::trim).filter(|l| !l.is_empty())) {
+        form.push((field, label));
+    }
+    let path = spec.path.as_str();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("could not build the link client: {e}"))?;
+    let resp = client
+        .post(join(base_url, path))
+        .form(&form)
+        .send()
+        .map_err(|e| format!("could not reach {base_url}: {}", super::net::unreachable(&e)))?;
+    let status = resp.status();
+    if status.is_redirection() {
+        let to = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).unwrap_or("elsewhere");
+        return Err(format!("the site sent the request to {to}: give that address (its origin) as --base-url"));
+    }
+    if status.as_u16() == 429 {
+        return Err("the site has had too many tries from this address: wait a minute and try again".into());
+    }
+    let value: serde_json::Value = super::net::read_json(resp)
+        .map_err(|e| format!("the site's answer is not one this computer reads (HTTP {}): {e}", status.as_u16()))?;
+    if !status.is_success() {
+        // The provider's own refusal (`{error: true, message, code}`), or an OAuth one
+        // (`{error, error_description}`): whichever says most.
+        let msg = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("error_description").and_then(|v| v.as_str()))
+            .or_else(|| value.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("the site refused the code");
+        return Err(format!("HTTP {}: {msg}", status.as_u16()));
+    }
+    read_token_response(&o.token_response, &value)
+}
+
+/// The credential and what goes with it, from a successful token response: the fields the
+/// descriptor names.
+fn read_token_response(spec: &super::descriptor::TokenResponseSpec, value: &serde_json::Value) -> Result<ExchangedCredential, String> {
     let pick = |field: &Option<String>| -> Option<String> {
         field
             .as_ref()
@@ -350,7 +433,7 @@ pub fn exchange_code(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::link::descriptor;
 
@@ -359,6 +442,91 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    /// What the site's token endpoint answers the browser ceremony's exchange with today
+    /// (`McpOAuthController::issueDesktopKey`), which a redeemed link code is answered with too.
+    pub(crate) fn token_exchange_answer() -> serde_json::Value {
+        serde_json::json!({
+            "access_token": "flk_linked_by_code",
+            "token_type": "Bearer",
+            "scope": "flows:read flows:write connector:relay",
+            "formlogic_api_key": "flk_linked_by_code",
+            "api_key_id": "key-1",
+            "desktop_connection_id": "dc-7f3a",
+            "device_name": "render-box",
+        })
+    }
+
+    #[test]
+    fn a_link_code_is_redeemed_as_one_request_and_answered_as_the_token_exchange_is() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|req| {
+            if req.line() == "POST /api/oauth/oaiy-link" {
+                Reply::ok(&token_exchange_answer().to_string())
+            } else {
+                Reply::status(404, r#"{"error":true,"message":"not found"}"#)
+            }
+        });
+        let d = formlogic();
+        let creds = redeem_link_code(&d, &format!("{}/", server.base), "  K7QM-2WXR-9DFT\n", Some(" Studio server ")).unwrap();
+        assert_eq!(creds.credential, "flk_linked_by_code");
+        assert_eq!(creds.account_id.as_deref(), Some("dc-7f3a"));
+        assert_eq!(creds.account_name.as_deref(), Some("render-box"));
+        assert_eq!(creds.granted_scopes.as_deref(), Some("flows:read flows:write connector:relay"));
+
+        let sent = server.requests();
+        assert_eq!(sent.len(), 1, "{:?}", server.lines());
+        assert_eq!(sent[0].header("content-type"), Some("application/x-www-form-urlencoded"));
+        let form = parse_query(&sent[0].body);
+        assert_eq!(form.get("code").map(String::as_str), Some("K7QM-2WXR-9DFT"), "trimmed");
+        assert_eq!(form.get("device_name").map(String::as_str), Some("Studio server"));
+        assert_eq!(form.len(), 2, "nothing else is sent: {form:?}");
+        assert!(sent[0].header("authorization").is_none(), "a code is its own credential");
+
+        // No name: the code alone.
+        redeem_link_code(&d, &server.base, "K7QM-2WXR-9DFT", None).unwrap();
+        let form = parse_query(&server.requests()[1].body);
+        assert_eq!(form.keys().collect::<Vec<_>>(), ["code"]);
+    }
+
+    #[test]
+    fn a_refused_code_says_why_and_a_redirect_is_not_followed() {
+        use crate::link::testkit::{Provider, Reply};
+        let d = formlogic();
+        // The site's refusal, in the token endpoint's shape: the same for an unknown, expired or used code.
+        let refused = Provider::start(|_| Reply::status(400, r#"{"error":"invalid_grant","error_description":"That code is not valid. Start again from FormLogic."}"#));
+        let e = redeem_link_code(&d, &refused.base, "AB12", None).unwrap_err();
+        assert!(e.contains("HTTP 400") && e.contains("That code is not valid"), "{e}");
+        // Its other JSON errors' shape.
+        let other = Provider::start(|_| Reply::status(403, r#"{"error":true,"message":"Linking by code is switched off","code":"disabled"}"#));
+        assert!(redeem_link_code(&d, &other.base, "AB12", None).unwrap_err().contains("switched off"));
+        let limited = Provider::start(|_| Reply::too_many(60, "slow down"));
+        assert!(redeem_link_code(&d, &limited.base, "AB12", None).unwrap_err().contains("too many tries"));
+        // A redirect would carry the code wherever it pointed: it is said, not followed.
+        let moved = Provider::start(|_| Reply::redirect(307, "https://elsewhere.example/api/oauth/oaiy-link"));
+        let e = redeem_link_code(&d, &moved.base, "AB12", None).unwrap_err();
+        assert!(e.contains("https://elsewhere.example"), "{e}");
+        assert_eq!(moved.requests().len(), 1);
+        // A success without a credential is not a link.
+        let empty = Provider::start(|_| Reply::ok(r#"{"device_name":"x"}"#));
+        assert!(redeem_link_code(&d, &empty.base, "AB12", None).unwrap_err().contains("credential"));
+    }
+
+    #[test]
+    fn what_is_not_a_code_is_not_sent() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let d = formlogic();
+        for not in ["", "   ", "AB 12", "AB\u{7}12", &"x".repeat(MAX_LINK_CODE + 1)] {
+            assert!(redeem_link_code(&d, &server.base, not, None).is_err(), "{not:?}");
+        }
+        assert!(server.requests().is_empty(), "{:?}", server.lines());
+        // A provider that has no codes says so.
+        let mut none = formlogic();
+        let AuthSpec::Oauth2Pkce(o) = &mut none.auth;
+        o.link_code = None;
+        assert!(redeem_link_code(&none, &server.base, "AB12", None).unwrap_err().contains("does not link computers with a code"));
     }
 
     #[test]

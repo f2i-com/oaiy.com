@@ -123,7 +123,9 @@ Two transports, neither a WebSocket.
 
 - Linking (`link/oauth.rs`): OAuth 2 code + PKCE with a loopback callback, `client_id
   oaiy-desktop`, scopes `flows:read/write`, `responses:read/write/manage`, `connector:relay`,
-  `aokie:realtime`; the key is stored in `<data>/link/account.json`.
+  `aokie:realtime`; the key is stored in `<data>/link/account.json`. A headless server links
+  with a one-time code instead (`oaiy-server link --code`, `POST /api/oauth/oaiy-link`), whose
+  answer is the token exchange's and which writes the same file.
 - Lanes, each a long-poll with the bearer and `instanceId`, driven by the descriptor
   `desktop/src-tauri/resources/connectors/formlogic.json`:
 
@@ -131,7 +133,7 @@ Two transports, neither a WebSocket.
 |---|---|---|
 | Heartbeat (45 s) | `link/heartbeat.rs` | `POST /api/v1/desktop-connections {desktopInstanceId, deviceName, capabilities}` |
 | Command relay | `link/relay.rs`, `ops.rs` | `GET …/connector-commands/pending`, `POST …/{id}/claim`, `…/{id}/complete` |
-| Encrypted AI tunnel | `ai/tunnel.rs`, `e2e.rs`, `chat_tools.rs` | `/api/v1/desktop-ai/{pubkey,pending,{id}/claim,{id}/frames,{id}/complete,{id}/input}` |
+| Encrypted AI tunnel (providers, models, chat; pictures, `image`: `ai/tunnel_pictures.rs`; one turn and one picture at a time, each on its own task, so either is claimed while the other runs; a chat request's `maxTokens` is the model's `max_tokens`; a streamed answer goes in a few frames a second, not one a token; a frame answered `409 {code: "cancelled"}` stops that request's work) | `ai/tunnel.rs`, `e2e.rs`, `chat_tools.rs` | `/api/v1/desktop-ai/{pubkey,pending,{id}/claim,{id}/frames,{id}/complete,{id}/input}` |
 | Encrypted flow relay | `link/sealed_flows.rs` | `/api/v1/desktop-flows/{pending,{id}/claim,{id}/complete}` |
 | Queued flow runs | `link/flow_runner.rs` | below |
 

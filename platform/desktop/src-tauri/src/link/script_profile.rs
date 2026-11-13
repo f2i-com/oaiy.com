@@ -441,6 +441,11 @@ impl ProfileCache {
 
     /// One conditional GET, and what it does to the cache.
     fn refresh(&self, account: &LinkedAccount, spec: &ScriptProfileSpec, data_dir: &Path) {
+        // A link the provider did not grant the profile's scope (one made for AI alone) holds no prelude, and so runs
+        // no logic and claims no engine: asking would only be refused, at every revalidation.
+        if spec.scope.as_deref().is_some_and(|scope| !account.grants(scope)) {
+            return;
+        }
         let (etag, generation) = {
             let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             (state.etag.clone(), state.generation)
@@ -989,7 +994,30 @@ mod tests {
     }
 
     fn spec() -> ScriptProfileSpec {
-        ScriptProfileSpec { path: "/api/v1/script-profile".into(), ttl_seconds: 300 }
+        ScriptProfileSpec { path: "/api/v1/script-profile".into(), ttl_seconds: 300, scope: None }
+    }
+
+    /// A link made for AI alone is never sent to ask for the profile, which the provider would refuse it; it holds
+    /// none. A link granted the scope, or one whose grant was never said, asks as before.
+    #[test]
+    fn a_link_without_the_profiles_scope_does_not_ask_for_it() {
+        let d = doc("var helper = 1;");
+        let (base, rx) = stub(vec![ok(&d, "abc123")]);
+        let dir = scratch("scope");
+        let scoped = ScriptProfileSpec { scope: Some("flows:read".into()), ..spec() };
+        let mut ai_only = account(base);
+        ai_only.granted_scopes = Some("connector:relay".into());
+        let cache = ProfileCache::new();
+        cache.poll(&ai_only, &scoped, &dir);
+        assert!(cache.load(&ai_only, &scoped, &dir).is_none());
+        assert!(cache.current().is_none());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "nothing was asked");
+
+        let mut granted = ai_only.clone();
+        granted.granted_scopes = Some("flows:read connector:relay".into());
+        assert!(ProfileCache::new().load(&granted, &scoped, &dir).is_some());
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().starts_with("GET /api/v1/script-profile "));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn scratch(tag: &str) -> PathBuf {

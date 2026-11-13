@@ -391,6 +391,28 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).toContain('Listening for commands');
   });
 
+  it('says a link made for AI alone does not use the command lane, rather than that it listens', async () => {
+    // The provider refuses such a link's commands for good, and the lane rests
+    // until the link changes: "Listening for commands · <the time it was told>"
+    // would be untrue, and an error would send the user to fix what works.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      grantedScopes: 'connector:relay',
+      relaySupported: true,
+      relayNotUsed: 'This computer is linked for AI only: it takes no connector or plugin commands.',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const text = container.textContent ?? '';
+    expect(text).toContain('Commands: not used by this AI-only link');
+    expect(text).not.toContain('Listening for commands');
+    expect(text).not.toContain('Not receiving commands');
+    expect(text).not.toContain('Connecting to the command lane');
+  });
+
   it('claims nothing about lanes the provider does not have', async () => {
     // A connector with no relay must read as ABSENT, not as pending — otherwise
     // it sits under a "connecting…" that is never going to resolve.

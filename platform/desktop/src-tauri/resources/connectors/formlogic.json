@@ -9,6 +9,11 @@
     "clientId": "oaiy-desktop",
     "authorizePath": "/oauth/authorize",
     "tokenPath": "/api/oauth/token",
+    "linkCode": {
+      "path": "/api/oauth/oaiy-link",
+      "codeField": "code",
+      "deviceField": "device_name"
+    },
     "callbackPath": "/callback",
     "deviceParam": "device",
     "extraAuthorizeParams": {
@@ -48,7 +53,8 @@
     "completePath": "/api/v1/desktop-flows/{id}/complete",
     "waitSeconds": 25,
     "batchLimit": 1,
-    "errorBackoffSeconds": 10
+    "errorBackoffSeconds": 10,
+    "scope": "flows:read"
   },
   "desktopAi": {
     "pubkeyPath": "/api/v1/desktop-ai/pubkey",
@@ -69,6 +75,7 @@
     "reservePath": "/api/v1/flow-runs",
     "queuedPath": "/api/v1/flow-runs/queued",
     "queuedIdleSeconds": 20,
+    "queueScope": "flows:read",
     "claimPath": "/api/v1/flow-runs/{id}/claim",
     "completePath": "/api/v1/flow-runs/{id}",
     "graphPath": "/api/v1/flows",
@@ -309,7 +316,8 @@
   },
   "scriptProfile": {
     "path": "/api/v1/script-profile",
-    "ttlSeconds": 300
+    "ttlSeconds": 300,
+    "scope": "flows:read"
   },
   "heartbeat": {
     "path": "/api/v1/desktop-connections",

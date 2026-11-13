@@ -349,6 +349,12 @@ fn spawn_inner(
             std::thread::sleep(Duration::from_secs(30));
             continue;
         };
+        // A link made without the queue's scope (one for AI alone) has no runs to take here:
+        // every look would be refused, and reported as a key to link again.
+        if spec.queue_scope.as_deref().is_some_and(|scope| !account.grants(scope)) {
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        }
         // A provider that only wants runs QUEUED names no claim lane, and this
         // desktop then does nothing here — which is correct, not an error.
         let Some(lane) = Lane::of(&spec) else {
@@ -1708,6 +1714,7 @@ mod tests {
             reserve_path: "/runs".into(),
             queued_path: None,
             queued_idle_seconds: 3,
+            queue_scope: None,
             claim_path: None,
             complete_path: None,
             graph_path: None,
@@ -1824,6 +1831,7 @@ mod tests {
             reserve_path: "/runs".into(),
             queued_path: Some("/runs/queued".into()),
             queued_idle_seconds: 3,
+            queue_scope: None,
             claim_path: Some("/runs/{id}/claim".into()),
             complete_path: Some("/runs/{id}".into()),
             graph_path: Some("/flows".into()),
@@ -2441,6 +2449,33 @@ mod tests {
     }
 
     const QUEUED: &str = "/api/v1/flow-runs/queued";
+
+    /// A link made for AI alone (`connector:relay`, a server linked with a code) is never refused the queue, because it
+    /// never asks for it; a link granted the queue's scope looks at it as before.
+    #[test]
+    fn a_link_made_for_ai_alone_does_not_look_at_the_queue() {
+        let looks = |tag: &str, granted: &str| {
+            let server = Provider::start(|req| {
+                if req.target.starts_with(QUEUED) { Reply::ok(r#"{"runs":[]}"#) } else { Reply::ok("{}") }
+            });
+            let (made, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| d.script_profile = None);
+            let mut account = made.account().unwrap();
+            account.granted_scopes = Some(granted.into());
+            let store = crate::link::store_for_tests(dir.clone(), Some(account));
+            spawn_inner(store.clone(), None, Box::leak(Box::new(Wake::new())));
+            std::thread::sleep(Duration::from_millis(1_500));
+            crate::link::testkit::stop_lane(&store);
+            let _ = std::fs::remove_dir_all(dir);
+            let lines = server.lines();
+            (lines.iter().filter(|l| l.contains(QUEUED)).count(), store.status())
+        };
+        let (ai_only, status) = looks("queue-ai-only", "connector:relay");
+        assert_eq!(ai_only, 0, "an AI-only link asked for the queue");
+        let said = serde_json::to_string(&status).unwrap();
+        assert!(!said.contains("link again"), "an AI-only link is not told to link again: {said}");
+        let (full, _) = looks("queue-full", "flows:read flows:write connector:relay");
+        assert!(full >= 1, "a link granted the queue looks at it");
+    }
 
     #[test]
     fn the_queue_is_looked_at_again_after_the_idle_time_the_descriptor_says() {

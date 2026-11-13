@@ -24,7 +24,7 @@
 //! module does not implement, and a node that is approved simply sits ready.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
@@ -141,6 +141,51 @@ pub fn display_fingerprint(hex: &str) -> String {
         .join(" ")
 }
 
+/// When the enrolment is next made, and when its record is next read back.
+struct Schedule {
+    next_register: Instant,
+    next_refresh: Instant,
+    /// Whether the provider has answered an enrolment with a record: what a read-back reads. One that does not offer
+    /// this link a node (a link made for AI alone, or a provider with nodes off) answered none, and reading back
+    /// nothing would be refused every [`REFRESH_INTERVAL`] until the next enrolment.
+    record: bool,
+}
+
+impl Schedule {
+    fn new(now: Instant) -> Self {
+        Self { next_register: now, next_refresh: now, record: false }
+    }
+
+    fn register_due(&self, now: Instant) -> bool {
+        now >= self.next_register
+    }
+
+    /// After an enrolment that came to `outcome`.
+    fn registered(&mut self, outcome: &Result<Option<DataNodeStatus>, String>, interval_seconds: u64, now: Instant) {
+        // A failed one (the provider away) is tried again in five minutes, not an hour: enrolment waits on it. A
+        // provider that does not offer a node is not a failure: it is asked again on the slow schedule.
+        let wait = if outcome.is_ok() { interval_seconds.max(60) } else { interval_seconds.clamp(60, 300) };
+        match outcome {
+            Ok(Some(_)) => self.record = true,
+            Ok(None) => self.record = false,
+            // (a failure says nothing of a record seen before: it is still read back)
+            Err(_) => {}
+        }
+        self.next_register = now + Duration::from_secs(wait);
+        // A register answers with the record too, so the read-back can wait its full interval rather than firing
+        // straight after.
+        self.next_refresh = now + REFRESH_INTERVAL;
+    }
+
+    fn refresh_due(&self, now: Instant) -> bool {
+        self.record && now >= self.next_refresh
+    }
+
+    fn refreshed(&mut self, now: Instant) {
+        self.next_refresh = now + REFRESH_INTERVAL;
+    }
+}
+
 /// Register on link, then keep the enrolment fresh.
 pub fn spawn(store: LinkHandle) {
     std::thread::spawn(move || {
@@ -151,15 +196,13 @@ pub fn spawn(store: LinkHandle) {
                 return;
             }
         };
-        let mut next_register = std::time::Instant::now();
-        let mut next_refresh = std::time::Instant::now();
+        let mut schedule = Schedule::new(Instant::now());
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let Some(account) = store.account() else {
                 // Unlinked: act promptly when a link next appears rather than
                 // inheriting an old timer.
-                next_register = std::time::Instant::now();
-                next_refresh = std::time::Instant::now();
+                schedule = Schedule::new(Instant::now());
                 continue;
             };
             let Some(spec) =
@@ -167,30 +210,23 @@ pub fn spawn(store: LinkHandle) {
             else {
                 continue;
             };
-            let now = std::time::Instant::now();
+            let now = Instant::now();
 
             // Registering is a WRITE and belongs on the slow schedule.
-            if now >= next_register {
+            if schedule.register_due(now) {
                 let registered = register(&account, &spec, &identity);
                 if registered.is_err() {
                     // The try after a failure is on a new client, not one that
                     // has seen the trouble.
                     HTTP.start_afresh();
                 }
-                // A failed one (the provider away) is tried again in five
-                // minutes, not an hour: enrolment waits on it. A provider that
-                // does not offer data nodes is not a failure: it is asked again
-                // on the slow schedule, and nothing is shown as wrong.
-                let wait = if registered.is_ok() { spec.interval_seconds.max(60) } else { spec.interval_seconds.clamp(60, 300) };
+                schedule.registered(&registered, spec.interval_seconds, now);
+                // (a provider that does not offer a node shows nothing as wrong)
                 match registered {
                     Ok(Some(status)) => store.note_data_node(Ok(status)),
                     Ok(None) => store.note_data_node_off(),
                     Err(e) => store.note_data_node(Err(e)),
                 }
-                next_register = now + Duration::from_secs(wait);
-                // A register answers with the record too, so the read-back can
-                // wait its full interval rather than firing straight after.
-                next_refresh = now + REFRESH_INTERVAL;
                 continue;
             }
 
@@ -198,12 +234,12 @@ pub fn spawn(store: LinkHandle) {
             // desktop learns the owner approved it. Left to the hourly
             // registration, an approval sat invisible for up to an hour —
             // which reads as the approval not having worked.
-            if now >= next_refresh {
+            if schedule.refresh_due(now) {
                 match refresh(&account, &spec) {
                     Some(status) => store.note_data_node(Ok(status)),
                     None => HTTP.start_afresh(),
                 }
-                next_refresh = now + REFRESH_INTERVAL;
+                schedule.refreshed(now);
             }
         }
     });
@@ -270,16 +306,21 @@ fn register(
 
 /// Whether the provider's answer means it does not offer data nodes at all (a
 /// FormLogic with the feature switched off answers 403 "not enabled"; one
-/// without the lane, 404), rather than refusing this desktop.
+/// without the lane, 404), or not to this link (403 `insufficient_scope`, RFC
+/// 6750's word for a key not granted what it asked: a link made for AI alone),
+/// rather than refusing this desktop. Either way there is nothing to enrol, and
+/// nothing wrong to report: it is asked again at the lane's own interval.
 fn offers_no_data_nodes(status: u16, payload: &Value) -> bool {
-    let said = [payload.get("message"), payload.pointer("/error/message"), payload.pointer("/error/code"), payload.get("code")]
+    let said = [payload.get("message"), payload.pointer("/error/message"), payload.pointer("/error/code"), payload.get("code"), payload.get("error")]
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
-    status == 404 || (status == 403 && (said.contains("not enabled") || said.contains("disabled") || said.contains("not available")))
+    status == 404
+        || (status == 403
+            && (said.contains("not enabled") || said.contains("disabled") || said.contains("not available") || said.contains("insufficient_scope")))
 }
 
 /// Read this desktop's node record back.
@@ -340,6 +381,40 @@ mod tests {
         // A refusal of this desktop is still an error.
         assert!(!offers_no_data_nodes(403, &json!({"message": "This key may not enrol a node."})));
         assert!(!offers_no_data_nodes(409, &json!({"message": "not enabled"})));
+        // A link made for AI alone, as FormLogic refuses one (DataNodeController, App AI §0.10): not offered to this
+        // link, which is no error to show and nothing to ask again for until the next interval.
+        assert!(offers_no_data_nodes(403, &json!({
+            "error": true, "code": "insufficient_scope",
+            "message": "This computer is linked for AI only: it cannot be a storage node. Link it with everything a desktop can do.",
+        })));
+        assert!(offers_no_data_nodes(403, &json!({"error": "insufficient_scope", "error_description": "scope"})));
+    }
+
+    /// The record is read back only while there is one: after an enrolment answered with a record, and never after
+    /// one the provider said it does not offer this link (a link made for AI alone), whose every read-back FormLogic
+    /// refused, every 45 seconds, until the next enrolment an hour later.
+    #[test]
+    fn a_record_is_read_back_only_while_there_is_one() {
+        let start = Instant::now();
+        let later = start + REFRESH_INTERVAL + Duration::from_secs(1);
+        let record = DataNodeStatus { fingerprint: "ab".into(), status: "pending".into(), approved: false, key_generation: 1, display_name: None };
+
+        let mut s = Schedule::new(start);
+        assert!(s.register_due(start), "the first thing is an enrolment");
+        s.registered(&Ok(None), 3600, start);
+        assert!(!s.refresh_due(later), "not offered: nothing to read back");
+        assert!(!s.register_due(later) && s.register_due(start + Duration::from_secs(3600)), "asked again in an hour");
+
+        s.registered(&Ok(Some(record)), 3600, start);
+        assert!(!s.refresh_due(start), "the enrolment answered with the record itself");
+        assert!(s.refresh_due(later), "and then it is read back, to see the owner's approval");
+        s.refreshed(later);
+        assert!(!s.refresh_due(later));
+
+        // A failed enrolment says nothing of the record: it is still read back, and enrolment is tried again sooner.
+        s.registered(&Err("the provider is away".into()), 3600, start);
+        assert!(s.refresh_due(later));
+        assert!(s.register_due(start + Duration::from_secs(300)));
     }
 
     #[test]

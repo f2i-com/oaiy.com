@@ -187,9 +187,13 @@ function LinkedAccount({ account, onDisconnect }: { account: LinkStatus; onDisco
                 Storage node: approved <code style={{ letterSpacing: '0.04em' }}>{groupFingerprint(node.fingerprint)}</code>
               </small>
             )}
-            {account.relaySupported && !account.relayError && (
+            {account.relaySupported && !account.relayError && (account.relayNotUsed ? (
+              // The provider gives this link no commands (made for AI alone): nothing is
+              // listening, and nothing is wrong.
+              <small className="link-line" title={account.relayNotUsed}>Commands: not used by this AI-only link</small>
+            ) : (
               <small className="link-line">{account.lastRelayAt ? `Listening for commands · ${clock(account.lastRelayAt)}` : 'Connecting to the command lane…'}</small>
-            )}
+            ))}
           </details>
         </span>
         <button className="btn-tiny btn-danger" onClick={onDisconnect}>

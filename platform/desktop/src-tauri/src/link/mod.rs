@@ -157,6 +157,17 @@ pub struct LinkedAccount {
     pub instance_id: Option<String>,
 }
 
+impl LinkedAccount {
+    /// Whether the provider granted this link `scope`, as it said when the link was made. A link
+    /// whose grant was never said (one kept before grants were, or from a provider that does not
+    /// say) is taken to have what it asked for, as it always was.
+    pub fn grants(&self, scope: &str) -> bool {
+        self.granted_scopes
+            .as_deref()
+            .is_none_or(|granted| granted.split_whitespace().any(|s| s == scope))
+    }
+}
+
 /// A stored file of the link that this build could not use, said in plain words.
 ///
 /// The file is KEPT as it is. It is not read as "not linked": an `account.json` that fails to
@@ -516,6 +527,11 @@ pub struct LinkStatus {
     pub last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_error: Option<String>,
+    /// Why the command lane is not used at all, when the provider said it gives this link no commands (a link made
+    /// for AI alone: `relay::Refused::NotGranted`), in the provider's words. Not an error, and not a lane listening:
+    /// the panel says so rather than "Listening for commands" at the moment it was told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_not_used: Option<String>,
     /// When this desktop last looked at the account's queued flow runs, and why
     /// it stopped if it did.
     ///
@@ -597,6 +613,7 @@ struct Inner {
     heartbeat_error: Option<String>,
     last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     relay_error: Option<String>,
+    relay_not_used: Option<String>,
     last_flow_run_at: Option<chrono::DateTime<chrono::Utc>>,
     flow_run_error: Option<String>,
     last_sealed_flow_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -641,7 +658,9 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
 /// holds a store with the fixture account of `formlogic.com` would send that
 /// provider a heartbeat and an enrolment, with a made-up key, from then until the
 /// last test ends. A test opens no connection beyond this machine. The trusted
-/// origin is set as `open_handle` sets it.
+/// origin is set as `open_handle` sets it. [`link_with_code`] opens its store
+/// this way too: the link command writes the link and ends, and the server
+/// started afterwards runs the workers.
 pub(crate) fn open_handle_without_workers(data_dir: PathBuf) -> LinkHandle {
     let store = load_store(data_dir);
     set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
@@ -671,6 +690,7 @@ fn load_store(data_dir: PathBuf) -> LinkHandle {
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            relay_not_used: None,
             last_flow_run_at: None,
             flow_run_error: None,
             last_sealed_flow_at: None,
@@ -689,6 +709,12 @@ impl LinkStore {
     /// clears the trusted origin and the provider's prelude that other tests read.
     pub(crate) fn drop_account_for_tests(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).account = None;
+    }
+
+    /// Link the store to `account` in place, as a new link would: for the tests of what a lane does when the link
+    /// changes under it.
+    pub(crate) fn set_account_for_tests(&self, account: LinkedAccount) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).account = Some(account);
     }
 }
 
@@ -711,6 +737,7 @@ pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>)
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            relay_not_used: None,
             last_flow_run_at: None,
             flow_run_error: None,
             last_sealed_flow_at: None,
@@ -754,6 +781,7 @@ impl LinkStore {
                 heartbeat_error: None,
                 last_relay_at: None,
                 relay_error: None,
+                relay_not_used: None,
                 last_flow_run_at: None,
                 flow_run_error: None,
                 heartbeat_supported: false,
@@ -788,6 +816,7 @@ impl LinkStore {
                     heartbeat_error: inner.heartbeat_error.clone(),
                     last_relay_at: inner.last_relay_at,
                     relay_error: inner.relay_error.clone(),
+                    relay_not_used: inner.relay_not_used.clone(),
                     last_flow_run_at: inner.last_flow_run_at,
                     flow_run_error: inner.flow_run_error.clone(),
                     heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
@@ -865,6 +894,17 @@ impl LinkStore {
             inner.last_relay_at = Some(chrono::Utc::now());
         }
         inner.relay_error = error;
+        // (a poll that came back, either way, is a lane in use again: a new link)
+        inner.relay_not_used = None;
+    }
+
+    /// Record that the provider gives this link no commands (`why`, in its words): the command lane rests until the
+    /// link changes. Neither an error nor a lane listening, so it clears both.
+    pub fn note_relay_not_used(&self, why: String) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.relay_error = None;
+        inner.last_relay_at = None;
+        inner.relay_not_used = Some(why);
     }
 
     /// Record the outcome of one look at the account's queued flow runs.
@@ -1095,6 +1135,7 @@ impl LinkStore {
             // would be shown against the next one that is linked.
             inner.last_relay_at = None;
             inner.relay_error = None;
+            inner.relay_not_used = None;
             inner.last_flow_run_at = None;
             inner.flow_run_error = None;
             inner.last_sealed_flow_at = None;
@@ -1311,6 +1352,74 @@ pub fn start_link(
     Ok(url)
 }
 
+/// Link the install whose data folder is `data_dir` with a one-time code its owner made on the
+/// provider's site, for a computer that cannot do the browser's part of [`start_link`]: a headless
+/// server, whose approval in a browser would redirect to its own loopback (`oaiy-server link
+/// --code`). The code is redeemed ([`oauth::redeem_link_code`]) and the same `link/account.json`
+/// the ceremony writes is written, so from its next start the server is an ordinary linked computer:
+/// it publishes its chat key and polls the lanes.
+///
+/// `connector_id` names the provider; none is the one connector here that links with a code.
+/// `device_name` is what the provider shows for this computer; none is its own name.
+///
+/// Refused before the code is spent when the install is already linked: one link per install, and
+/// a code redeemed for a link that is then not kept would leave a key on the provider's side that
+/// nothing here holds.
+pub fn link_with_code(
+    data_dir: PathBuf,
+    connector_id: Option<&str>,
+    base_url: &str,
+    code: &str,
+    device_name: Option<&str>,
+) -> Result<LinkedAccount, String> {
+    let descriptor = match connector_id {
+        Some(id) => descriptor::find(&data_dir, id).ok_or_else(|| format!("no connector named {id:?}"))?,
+        None => descriptor::load_all(&data_dir)
+            .into_iter()
+            .find(|d| {
+                let descriptor::AuthSpec::Oauth2Pkce(o) = &d.auth;
+                o.link_code.is_some()
+            })
+            .ok_or("no connector here links computers with a code")?,
+    };
+    let base = normalize_base(base_url)?;
+    let device = match device_name.map(str::trim) {
+        Some(name) if name.chars().any(char::is_control) => return Err("the device name must be plain text".into()),
+        Some(name) if !name.is_empty() => Some(name.chars().take(100).collect::<String>()),
+        _ => device_label(),
+    };
+    let store = open_handle_without_workers(data_dir);
+    if let Some(linked) = store.account() {
+        return Err(format!(
+            "this computer is already linked to {}: forget that link first (DELETE /api/link on the running server, or \
+             remove {ACCOUNT_FILE} from its data folder while it is stopped), then make a new code",
+            linked.base_url
+        ));
+    }
+    let creds = oauth::redeem_link_code(&descriptor, &base, code, device.as_deref())?;
+    let account = LinkedAccount {
+        connector_id: descriptor.id.clone(),
+        base_url: base,
+        credential: creds.credential,
+        account_id: creds.account_id,
+        account_name: creds.account_name,
+        granted_scopes: creds.granted_scopes,
+        linked_at: chrono::Utc::now(),
+        instance_id: Some(heartbeat::new_instance_id()),
+    };
+    store.persist(&account).map_err(|e| {
+        format!("the code was used, but this computer could not keep the link ({e}): remove the new connection on the site and make a new code")
+    })?;
+    set_linked_origin(Some(account.base_url.as_str()));
+    {
+        let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.account = Some(account.clone());
+        inner.error = None;
+        inner.attempt = LinkPhase::Linked;
+    }
+    Ok(account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1372,6 +1481,84 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(staged.is_empty(), "no copy of the key is left behind: {staged:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_grants_what_the_provider_said_and_an_old_one_what_it_asked_for() {
+        let mut a = account();
+        a.granted_scopes = Some("connector:relay".into());
+        assert!(a.grants("connector:relay"));
+        assert!(!a.grants("flows:read"));
+        a.granted_scopes = Some("flows:readwrite  connector:relay".into());
+        assert!(!a.grants("flows:read"), "a scope is a whole word");
+        assert!(a.grants("connector:relay"));
+        a.granted_scopes = None;
+        assert!(a.grants("flows:read"), "a link kept before grants were said is as it was");
+    }
+
+    /// The site's answer to a redeemed code: the token exchange's.
+    fn code_server() -> crate::link::testkit::Provider {
+        use crate::link::testkit::{Provider, Reply};
+        Provider::start(|req| {
+            if req.line() == "POST /api/oauth/oaiy-link" {
+                Reply::ok(&crate::link::oauth::tests::token_exchange_answer().to_string())
+            } else {
+                Reply::status(404, r#"{"error":true,"message":"not found"}"#)
+            }
+        })
+    }
+
+    #[test]
+    fn a_server_linked_with_a_code_keeps_the_link_the_browser_ceremony_keeps() {
+        let server = code_server();
+        let dir = crate::test_dirs::temp_path("oaiy-link-code");
+        std::fs::create_dir_all(&dir).unwrap();
+        let linked = link_with_code(dir.clone(), None, &format!("{}/", server.base), "K7QM-2WXR-9DFT", Some("Studio server")).unwrap();
+
+        // The ceremony's file, with the ceremony's fields, owner-only.
+        let file = dir.join("link").join("account.json");
+        crate::secret_file::testing::assert_private(&file);
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let mut fields: Vec<&String> = stored.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["accountId", "accountName", "baseUrl", "connectorId", "credential", "grantedScopes", "instanceId", "linkedAt"]);
+        assert_eq!(stored["connectorId"], "formlogic");
+        assert_eq!(stored["baseUrl"], server.base.as_str(), "the address as the ceremony keeps it, without its slash");
+        assert_eq!(stored["credential"], "flk_linked_by_code");
+        assert_eq!(stored["accountId"], "dc-7f3a");
+        assert_eq!(stored["accountName"], "render-box");
+        assert_eq!(stored["grantedScopes"], "flows:read flows:write connector:relay");
+        assert!(stored["instanceId"].as_str().unwrap().starts_with("oaiy-"), "{stored}");
+
+        // The server's next start reads it as its link.
+        assert_eq!(open_handle_without_workers(dir.clone()).account(), Some(linked));
+
+        // Linked already: refused before the new code is spent.
+        let asked = server.requests().len();
+        let refused = link_with_code(dir.clone(), None, &server.base, "ANOT-HERC-ODE1", None).unwrap_err();
+        assert!(refused.contains("already linked"), "{refused}");
+        assert_eq!(server.requests().len(), asked, "the code was not sent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_code_that_is_refused_keeps_nothing_and_a_bad_address_sends_nothing() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| {
+            Reply::status(400, r#"{"error":"invalid_grant","error_description":"That code is not valid. Start again from FormLogic."}"#)
+        });
+        let dir = crate::test_dirs::temp_path("oaiy-link-code-refused");
+        std::fs::create_dir_all(&dir).unwrap();
+        let refused = link_with_code(dir.clone(), None, &server.base, "K7QM-2WXR-9DFT", None).unwrap_err();
+        assert!(refused.contains("That code is not valid"), "{refused}");
+        assert!(!dir.join("link").join("account.json").exists());
+        // An address a key may not travel to, a connector that is not here, a name that is not plain text: refused
+        // before anything is sent.
+        assert!(link_with_code(dir.clone(), None, "http://example.com", "K7QM", None).is_err());
+        assert!(link_with_code(dir.clone(), Some("nowhere"), &server.base, "K7QM", None).unwrap_err().contains("no connector"));
+        assert!(link_with_code(dir.clone(), None, &server.base, "K7QM", Some("a\nb")).is_err());
+        assert_eq!(server.requests().len(), 1, "{:?}", server.lines());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1463,6 +1650,20 @@ mod tests {
         // The timestamp is what makes "no error" mean something: on a long poll,
         // a clean return is the only evidence the lane is alive at all.
         assert!(good.last_relay_at.is_some());
+
+        // A link the provider gives no commands: not an error, and not a lane listening since some moment.
+        s.note_relay(Some("claim refused: HTTP 500".into()));
+        s.note_relay_not_used("This computer is linked for AI only.".into());
+        let unused = s.status();
+        assert_eq!(unused.relay_not_used.as_deref(), Some("This computer is linked for AI only."));
+        assert!(unused.relay_error.is_none() && unused.last_relay_at.is_none(), "{unused:?}");
+        let wire = serde_json::to_value(&unused).unwrap();
+        assert_eq!(wire["relayNotUsed"], "This computer is linked for AI only.", "the panel's name for it");
+        assert!(wire.get("lastRelayAt").is_none(), "{wire}");
+        // A poll that comes back (the link is another) is a lane in use again.
+        s.note_relay(None);
+        let again = s.status();
+        assert!(again.relay_not_used.is_none() && again.last_relay_at.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1502,6 +1703,10 @@ mod tests {
         assert!(after.relay_error.is_none(), "a stale error must not outlive the link");
         assert!(after.last_relay_at.is_none());
         assert!(after.heartbeat_error.is_none());
+        // Nor a lane the last link was not given.
+        s.inner.lock().unwrap().account = Some(account());
+        s.note_relay_not_used("This computer is linked for AI only.".into());
+        assert!(s.unlink().relay_not_used.is_none(), "the next link's lane is not the last one's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
