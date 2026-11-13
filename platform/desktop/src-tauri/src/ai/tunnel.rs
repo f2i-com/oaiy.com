@@ -3218,9 +3218,15 @@ mod tests {
         assert!(began.starts_with("word0 ") && began.len() <= "word0 word1 word2 ".len(), "{first}");
         assert_eq!(first["role"], "assistant");
         assert_eq!(frames[0]["delta"]["oaiy_progress"], json!({ "prompt_done": 3, "prompt_total": 3 }), "{}", frames[0]);
-        // The last says why the model stopped and what it used, as the provider's last chunks did.
+        // The end says why the model stopped and what it used, as the provider's last chunks did: its last frame
+        // carries what it used, and why it stopped is in that frame or, where an interval ended between the
+        // provider's last two chunks (as it does on a slow machine), in the frame before it. Neither is lost.
         let last = &frames.last().unwrap()["delta"];
-        assert_eq!((&last["choices"][0]["finish_reason"], &last["usage"]["completion_tokens"]), (&json!("stop"), &json!(PIECES)), "{last}");
+        assert_eq!(last["usage"]["completion_tokens"], json!(PIECES), "{last}");
+        let stopped: Vec<(usize, &str)> = frames.iter().enumerate().filter_map(|(at, f)| f["delta"]["choices"][0]["finish_reason"].as_str().map(|why| (at, why))).collect();
+        assert_eq!(stopped.len(), 1, "why it stopped is said once: {stopped:?}");
+        assert_eq!(stopped[0].1, "stop");
+        assert!(stopped[0].0 + 2 >= frames.len(), "and at the end: frame {} of {}", stopped[0].0 + 1, frames.len());
         assert_eq!((&last["id"], &last["model"]), (&json!("cmpl-1"), &json!("flash")));
 
         // A few frames a second, where there was one a chunk. While the answer is written its frames are an interval
