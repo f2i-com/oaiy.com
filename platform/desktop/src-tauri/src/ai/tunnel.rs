@@ -3484,6 +3484,9 @@ mod tests {
         assert_eq!(refused["error"]["code"], "bad_request", "{refused}");
         assert_eq!(refused["kind"], "final", "an error ends a picture as its picture would: {refused}");
 
+        // The site has the first answer before its task lets go of the slot, and a poll made while the slot is
+        // held claims no picture: wait for it, as the other tests here do before they ask for the next one.
+        until("the picture slot", || tunnel.picture_slot.available_permits() == 1).await;
         assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 1);
         until("the disabled picture", || completed_as(&server, "disabled").is_some()).await;
         let refused = frame_of(&tunnel, &server, "disabled", 0x57);
