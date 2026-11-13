@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { runTool } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
+import { SOFTN_GUIDE_JAVASCRIPT, SOFTN_GUIDE_PYTHON } from '../../src/softn/guide.generated';
 import { checkEvents, componentEvents } from '../../src/softn/knowledge';
 import { findApps, handlersIn, resolveApp } from '../../src/softn/softn';
 import { Vfs } from '../../src/vfs/vfs';
@@ -9,6 +10,18 @@ const ctx = () => ({ vfs: new Vfs(), gate: new NetGate(), reads: new Map(), shel
 const call = async (c: ReturnType<typeof ctx>, name: string, input: Record<string, unknown> = {}) => runTool({ id: 'c', name, input }, c);
 
 describe('the SoftN reference harness', () => {
+  it('names the Agent’s own tools where SoftN’s guide names Studio’s, and the guide it points to for games opens', async () => {
+    // SoftN's guide is written for SoftN Studio's agent; the copy here is made by scripts/generate-softn-guide.mjs.
+    for (const guide of [SOFTN_GUIDE_JAVASCRIPT, SOFTN_GUIDE_PYTHON]) {
+      for (const studios of ['lookup_components', 'read_docs', 'check_app', 'run_app_function', 'Allow in preview']) expect(guide).not.toContain(studios);
+      expect(guide).toContain('`softn_docs` with topic "threejs-games" has complete examples');
+      expect(guide).toContain('`softn_components` on Scene3D lists every field');
+    }
+    const games = await call(ctx(), 'softn_docs', { topic: 'threejs-games' });
+    expect(games.isError).toBe(false);
+    expect(games.content).toContain('Scene3D');
+  });
+
   it('maps what there is: guide sections, published guides, components, examples', async () => {
     const map = await call(ctx(), 'softn_docs');
     expect(map.isError).toBe(false);

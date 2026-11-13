@@ -27,8 +27,8 @@ where it names another, the preview says which two releases to bring together, `
 `src/preview/liveFrame.ts`, and opens no frame. Through v0.0.34 the runtime carried a copy of its engine, which was
 given instead; from v0.0.35 it carries none, so the two pins move together). SoftN v0.0.18 was built with ZIPP v0.0.21, v0.0.19 with v0.0.22, v0.0.20 with
 v0.0.23, v0.0.21 with v0.0.24, v0.0.22 with v0.0.25, v0.0.23 with v0.0.26, v0.0.24 with v0.0.27, v0.0.25 and v0.0.26
-with v0.0.29, v0.0.27 to v0.0.31 with v0.0.32, v0.0.32 to v0.0.38 with v0.0.33; v0.0.39, which OAIY installs
-(`scripts/fetch-softn.mjs`), with v0.0.35, the Agent's own, so the two share one module.
+with v0.0.29, v0.0.27 to v0.0.31 with v0.0.32, v0.0.32 to v0.0.38 with v0.0.33; v0.0.39 and v0.0.40, the one
+OAIY installs (`scripts/fetch-softn.mjs`), with v0.0.35, the Agent's own, so the two share one module.
 
 ## The API (zipp-wasm)
 

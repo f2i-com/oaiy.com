@@ -34,11 +34,26 @@ const OAIY_PREVIEW = [
     'The preview grants no capabilities, so these calls fail there;',
   ],
 ];
-const forOaiy = (text) =>
-  OAIY_PREVIEW.reduce((out, [studio, oaiy]) => {
-    if (!out.includes(studio)) throw new Error(`guide.ts no longer says "${studio}": say what OAIY's preview does in its place`);
+// Where the guide names Studio's own tools, the Agent's: [Studio's words, OAIY's]. softn_docs reads a published
+// guide by its name and softn_components gives a component's fields. Studio's check_app warns of an attribute written
+// on an imported page's tag; softn_check is not known to, so that sentence ends before it.
+const OAIY_TOOLS = [
+  ['`read_docs("threejs-games")` has complete examples', '`softn_docs` with topic "threejs-games" has complete examples'],
+  ['`lookup_components` on Scene3D lists every field', '`softn_components` on Scene3D lists every field'],
+  ["lookup_components lists each component's events.", "softn_components lists each component's events."],
+  ['there are no props, no events and no `$emit`. check_app warns at each such use.', 'there are no props, no events and no `$emit`.'],
+];
+const STUDIO_ONLY = /\b(?:lookup_components|read_docs|check_app|run_app_function)\b/;
+const forOaiy = (text) => {
+  const said = [...OAIY_PREVIEW, ...OAIY_TOOLS].reduce((out, [studio, oaiy]) => {
+    if (!out.includes(studio)) throw new Error(`guide.ts no longer says "${studio}": say what OAIY has in its place`);
     return out.replaceAll(studio, oaiy);
   }, text);
+  // A tool of Studio's that SoftN's guide has come to name since: the Agent has none by that name.
+  const left = STUDIO_ONLY.exec(said);
+  if (left) throw new Error(`guide.ts names Studio's tool ${left[0]} ("…${said.slice(Math.max(0, left.index - 60), left.index + 60)}…"): add what the Agent has in its place to OAIY_TOOLS`);
+  return said;
+};
 const variants = {
   JAVASCRIPT: forOaiy(guide.buildGuide({ python: false, torch: false, backend: false, style: 'clean' })),
   PYTHON: forOaiy(guide.buildGuide({ python: true, torch: false, backend: false, style: 'clean' })),
