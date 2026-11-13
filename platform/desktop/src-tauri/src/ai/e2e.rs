@@ -915,6 +915,26 @@ mod tests {
         sessions.open_inbound(&desktop, "req-1", &eph, &seal(2)).unwrap();
     }
 
+    /// A list that was dropped has let go of its folder's lock, in this process. The lock belongs to the open file,
+    /// though, and a child another test is starting at that moment holds a copy of it until it runs its own
+    /// program: a list opened the instant the last one went can find the lock held for a few milliseconds more, and
+    /// answer "another OAIY process". A test that opens the folder again waits here for the lock to be free first.
+    fn released(path: &Path) {
+        let lock = path.parent().unwrap().join("desktop-e2e-spent.lock");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // No lock file: nothing ever held it.
+            let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock) else { return };
+            if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                // Let go of it by name, not only by closing: a copy of this file in a child would hold it on.
+                let _ = fs2::FileExt::unlock(&file);
+                return;
+            }
+            assert!(std::time::Instant::now() < give_up, "the dropped list's lock is still held after ten seconds");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn spent_boxes_outlive_a_restart_and_a_torn_write() {
         let dir = crate::secret_file::testing::TempDir::new("e2espent");
@@ -924,6 +944,7 @@ mod tests {
         assert!(!store.spend([1u8; 16]).unwrap());
         assert!(store.spend([2u8; 16]).unwrap());
         drop(store);
+        released(&path);
 
         // Part of a third entry, as a crash mid-write leaves.
         let mut bytes = std::fs::read(&path).unwrap();
@@ -935,6 +956,7 @@ mod tests {
         assert!(!store.spend([2u8; 16]).unwrap(), "read back");
         assert!(store.spend([3u8; 16]).unwrap(), "new, and written in step");
         drop(store);
+        released(&path);
         assert!(!SpentBoxes::load(path).spend([3u8; 16]).unwrap());
     }
 
@@ -952,6 +974,7 @@ mod tests {
         assert!(store.spend([2u8; 16]).unwrap());
         assert!(store.spend([3u8; 16]).unwrap());
         drop(store);
+        released(&path);
         let store = SpentBoxes::load(path);
         for entry in [[1u8; 16], [2u8; 16], [3u8; 16]] {
             assert!(!store.spend(entry).unwrap());
@@ -965,11 +988,12 @@ mod tests {
         let dir = crate::secret_file::testing::TempDir::new("e2espent-two");
         let path = dir.0.join(SPENT_KEYS_FILE);
         let first = SpentBoxes::load(path.clone());
-        let second = SpentBoxes::load(path);
+        let second = SpentBoxes::load(path.clone());
         assert!(first.spend([1u8; 16]).unwrap());
         assert!(second.spend([1u8; 16]).unwrap_err().contains("another OAIY process"));
         assert!(second.hold_now().unwrap_err().contains("another OAIY process"), "a lane asks this before it claims");
         drop(first);
+        released(&path);
         second.hold_now().unwrap();
         assert!(!second.spend([1u8; 16]).unwrap(), "and it reads what the first spent");
     }
