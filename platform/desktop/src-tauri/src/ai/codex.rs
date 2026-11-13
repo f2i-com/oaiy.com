@@ -669,6 +669,9 @@ fn safe_login_url(raw: Option<&str>) -> Option<String> {
 /// on shutdown.
 pub struct CodexAgent {
     codex_home: PathBuf,
+    /// The real CLI: starting it is what makes `codex_home` (spawn_codex), so a data folder with no such folder
+    /// has never started it. Not so for a connection a test supplies, which makes no folder.
+    home_made_by_starting: bool,
     connect: Connect,
     session: Mutex<Option<Arc<Session>>>,
     /// Live-call turns: one at a time, in the order they came.
@@ -680,7 +683,7 @@ pub struct CodexAgent {
 pub type CodexHandle = Arc<CodexAgent>;
 
 pub fn new_handle(data_dir: &Path) -> CodexHandle {
-    CodexAgent::with_connect(data_dir.join("ai").join("codex-home"), Arc::new(spawn_codex))
+    CodexAgent::made(data_dir.join("ai").join("codex-home"), Arc::new(spawn_codex), true)
 }
 
 /// For tests of the routes that ask what ChatGPT can do: the CLI is never there,
@@ -697,8 +700,13 @@ pub(crate) fn absent_for_tests() -> CodexHandle {
 
 impl CodexAgent {
     fn with_connect(codex_home: PathBuf, connect: Connect) -> CodexHandle {
+        Self::made(codex_home, connect, false)
+    }
+
+    fn made(codex_home: PathBuf, connect: Connect, home_made_by_starting: bool) -> CodexHandle {
         Arc::new(CodexAgent {
             codex_home,
+            home_made_by_starting,
             connect,
             session: Mutex::new(None),
             call_lane: Lane::default(),
@@ -761,6 +769,17 @@ impl CodexAgent {
         s.notify("initialized", json!({}))?;
         *slot = Some(s.clone());
         Ok(s)
+    }
+
+    /// Whether ChatGPT can be signed in here, known without starting anything. Signing in starts Codex, and
+    /// starting it makes its home folder, so a data folder with no Codex home has never been signed in.
+    ///
+    /// For a question nobody at this computer asked (a site listing its providers over the AI lane): `status()`
+    /// starts the person's own `codex` to learn that it is signed out, and a Codex started for the first time
+    /// fetches its plugins (81 MB, seen on a server that had never used ChatGPT). The panel, where a person is
+    /// looking at ChatGPT, asks `status()` as before.
+    pub fn may_be_signed_in(&self) -> bool {
+        !self.home_made_by_starting || self.codex_home.is_dir()
     }
 
     /// Sign-in state + whether the CLI is usable at all. Never errors: the panel
@@ -1355,6 +1374,35 @@ fn arguments_of(call: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A data folder that has never started Codex is known to be signed out without starting it: a site listing
+    /// this computer's providers asked `status()`, which started the person's own `codex` on a server that had
+    /// never used ChatGPT, and a first start of it fetches its plugins.
+    #[test]
+    fn a_data_folder_that_never_started_codex_is_signed_out_without_starting_it() {
+        let dir = crate::secret_file::testing::TempDir::new("codex-never-started");
+        let home = dir.0.join("ai").join("codex-home");
+        let starts = Arc::new(AtomicI64::new(0));
+        let counted = Arc::clone(&starts);
+        // An agent of the real CLI's kind: its home is made by starting it.
+        let agent = CodexAgent::made(
+            home.clone(),
+            Arc::new(move |_home: &Path| -> Result<Transport, CodexError> {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(CodexError::Unavailable("nothing is started in this test".into()))
+            }),
+            true,
+        );
+        assert!(!agent.may_be_signed_in());
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "and nothing was started to learn it");
+        // Once Codex has been started on this folder its home is there, and it is asked as before.
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(agent.may_be_signed_in());
+        assert!(!agent.status().connected);
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "asking is what starts it");
+        // A connection a test supplies makes no folder, so it is always asked.
+        assert!(absent_for_tests().may_be_signed_in());
+    }
 
     /// Codex not installed is said in words, not as the system's "No such file or directory (os error 2)"; any
     /// other failure to run it keeps the system's words.

@@ -1085,10 +1085,13 @@ impl AiTunnel {
         }
         // The managed ChatGPT connector, offered only when it is actually signed
         // in — listing it otherwise offers a guaranteed failure.
+        // Asked only where Codex has been started on this data folder before: asking starts it, and a
+        // site's listing is no reason to start a program its owner never used here (may_be_signed_in).
         let codex = self.sources.codex.clone();
-        if self.codex_catalog_probe
-            .check(Duration::from_secs(2), move || codex.status().connected)
-            .await
+        if codex.may_be_signed_in()
+            && self.codex_catalog_probe
+                .check(Duration::from_secs(2), move || codex.status().connected)
+                .await
         {
             rows.push(json!({
                 "id": crate::ai::codex::CODEX_PROVIDER_ID,
