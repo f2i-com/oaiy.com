@@ -18,7 +18,39 @@
 import { AIProviderError } from '../agent/providers/aiProvider';
 import { CHATGPT_SIGN_IN, signInNeeded } from '../agent/providers/chatgpt';
 import type { ProviderConfig } from '../agent/providers/types';
+import type { ThinksAs } from '../agent/protocol';
 import { OAIY_ENGINE_WINDOW } from '../agent/context';
+
+/**
+ * A provider on one of OAIY Desktop's routes, which hide the server behind them: what that server takes of a request's
+ * thinking, as far as the Agent can know it (protocol.ts thinkingFields).
+ */
+export type RoutedProvider = ProviderConfig & { thinksAs: ThinksAs };
+
+/** One of the desktop's AI providers as it lists them (`GET /api/ai/providers`), as far as the Agent reads them. */
+export interface DesktopAiProvider {
+  id: string;
+  protocol?: string;
+  /** The person marked it a server on this computer or their network (LM Studio, Ollama, llama.cpp). */
+  allowLocal?: boolean;
+}
+
+/** OAIY's own engine, as the desktop's gateway names it among its AI providers. */
+export const ENGINE_PROVIDER_ID = 'oaiy-engine';
+
+/**
+ * What the server behind one of the desktop's AI providers takes of a request's thinking (the desktop's gateway hands a
+ * request on as it is): OAIY's engine its own fields; a server the person marked local (LM Studio, Ollama, llama.cpp)
+ * the chat template's switch for off; an API (Anthropic's protocol, or any address not marked local) nothing. One the
+ * desktop has not listed (or its list not read yet) is not known.
+ */
+export function providerThinksAs(id: string, list: readonly DesktopAiProvider[] | null | undefined): ThinksAs {
+  if (id === ENGINE_PROVIDER_ID) return 'oaiy';
+  const p = list?.find((x) => x.id === id);
+  if (!p) return 'unknown';
+  if (p.protocol === 'anthropic') return 'none';
+  return p.allowLocal === true ? 'template' : 'none';
+}
 
 /** The person's choice, as the desktop keeps it. */
 export type AgentModel = EngineChoice | { source: 'chatgpt'; model?: string } | ProviderChoice;
@@ -130,13 +162,15 @@ export function codexBase(origin: string, route: string): string {
  * default once looked up; empty until then (the run looks it up first). A
  * call's route pins its own model, so its `modelId` only names it.
  */
-export function chatgptProvider(desktop: { origin: string; token: string }, kind: AgentKind, model: string | null | undefined): ProviderConfig {
+export function chatgptProvider(desktop: { origin: string; token: string }, kind: AgentKind, model: string | null | undefined): RoutedProvider {
   const route = kind === 'call' ? callRoute(model ?? undefined) : CODEX_ROUTE;
   return {
     id: `oaiy-chatgpt${kind === 'call' ? '-call' : ''}`,
     // Not `local` (that warms the model and sends llama.cpp's template switches) nor `openai` (its own host rules).
     type: 'custom',
     serverKind: 'other',
+    // (its effort is the connector's: a call's route pins it)
+    thinksAs: 'none',
     name: 'ChatGPT',
     apiKey: desktop.token,
     baseUrl: codexBase(desktop.origin, route),
@@ -153,12 +187,14 @@ export function chatgptProvider(desktop: { origin: string; token: string }, kind
  * desktop adds the provider's own). Every conversation, a call's too, runs on
  * the model chosen for it.
  */
-export function desktopProvider(desktop: { origin: string; token: string }, choice: ProviderChoice): ProviderConfig {
+export function desktopProvider(desktop: { origin: string; token: string }, choice: ProviderChoice, thinks: ThinksAs = 'unknown'): RoutedProvider {
   return {
     id: `oaiy-provider-${choice.provider}`,
     // As ChatGPT's: the desktop's gateway speaks OpenAI's API, whatever the server behind it is.
     type: 'custom',
     serverKind: 'other',
+    // (what that server takes of the thinking, as the desktop's list of its providers says: providerThinksAs)
+    thinksAs: thinks,
     name: choice.name || choice.provider,
     apiKey: desktop.token,
     baseUrl: codexBase(desktop.origin, choice.provider),
@@ -173,13 +209,15 @@ export function desktopProvider(desktop: { origin: string; token: string }, choi
  * the key, the worker's address and certificate stay the desktop's. Its window is the one its engine has, where the
  * desktop's catalogue says (`contextTokens`), else planned as an OAIY engine's; one request at a time.
  */
-export function workerProvider(desktop: { origin: string; token: string }, choice: EngineChoice, contextTokens?: number): ProviderConfig | null {
+export function workerProvider(desktop: { origin: string; token: string }, choice: EngineChoice, contextTokens?: number): RoutedProvider | null {
   const worker = workerModel(choice.model ?? '');
   if (!worker) return null;
   return {
     id: `oaiy-worker-${worker.node}`,
     type: 'custom',
     serverKind: 'other',
+    // (a paired computer's own OAIY engine: it takes OAIY's thinking fields, which the desktop carries to it as they are)
+    thinksAs: 'oaiy',
     name: choice.name ? `${choice.name} (OAIY Network)` : 'OAIY Network',
     apiKey: desktop.token,
     baseUrl: `${desktop.origin.replace(/\/+$/, '')}/api/network/nodes/${worker.node}/v1`,
@@ -192,13 +230,33 @@ export function workerProvider(desktop: { origin: string; token: string }, choic
 /**
  * The provider a conversation of `kind` runs on: the engine's (the app's own, as chosen in Settings, or a paired
  * worker's), ChatGPT's, or a desktop AI provider's. `workerWindow`: a paired worker's model's window, by its id, where
- * the desktop's catalogue says it.
+ * the desktop's catalogue says it. `providerThinks`: what the server behind a desktop AI provider takes of the
+ * thinking, by its id (providerThinksAs, from the desktop's list); unknown without it.
  */
-export function providerFor(kind: AgentKind, choice: AgentModel, engine: ProviderConfig | null, desktop: { origin: string; token: string } | null, codexDefault: string | null, workerWindow?: (id: string) => number | undefined): ProviderConfig | null {
+export function providerFor(kind: AgentKind, choice: AgentModel, engine: ProviderConfig | null, desktop: { origin: string; token: string } | null, codexDefault: string | null, workerWindow?: (id: string) => number | undefined, providerThinks?: (id: string) => ThinksAs): ProviderConfig | null {
   if (choice.source === 'engine') return (choice.model && desktop ? workerProvider(desktop, choice, workerWindow?.(choice.model)) : null) ?? engine;
   if (!desktop) return engine;
-  if (choice.source === 'provider') return desktopProvider(desktop, choice);
+  if (choice.source === 'provider') return desktopProvider(desktop, choice, providerThinks?.(choice.provider));
   return chatgptProvider(desktop, kind, choice.model ?? codexDefault);
+}
+
+/**
+ * The desktop's AI providers (`GET /api/ai/providers`: names, kinds, whether the person marked each local; never a key),
+ * for what the server behind the one the Agent runs on takes of its thinking; null when they could not be read.
+ */
+export async function readDesktopProviders(desktop: { origin: string; token: string }, signal?: AbortSignal, fetchImpl: Send = send): Promise<DesktopAiProvider[] | null> {
+  try {
+    const resp = await fetchImpl(`${desktop.origin}/api/ai/providers`, { headers: { authorization: `Bearer ${desktop.token}` }, signal });
+    if (!resp.ok) return null;
+    const body = (await resp.json()) as unknown;
+    const rows = isRecord(body) && Array.isArray(body.providers) ? body.providers.filter(isRecord) : null;
+    if (!rows) return null;
+    return rows
+      .filter((r) => typeof r.id === 'string' && r.id)
+      .map((r) => ({ id: String(r.id), ...(typeof r.protocol === 'string' ? { protocol: r.protocol } : {}), allowLocal: r.allowLocal === true }));
+  } catch {
+    return null;
+  }
 }
 
 /** The model Codex runs when none is named: the catalogue's `isDefault` row, else its first. */

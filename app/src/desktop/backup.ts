@@ -65,7 +65,7 @@ import type { ProviderConfig } from '../agent/providers/types';
 import { EMPTY_MEDIA, type MediaSettings } from '../agent/media';
 import type { NetGateSettings } from '../gate/netgate';
 import { PersonIndex } from '../phoneNumbers';
-import { DEFAULT_AGENT_SETTINGS, DEFAULT_MESSAGE_SETTINGS, loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders, type AgentSettings, type MessageSettings, type Settings } from '../settings';
+import { DEFAULT_AGENT_SETTINGS, DEFAULT_MESSAGE_SETTINGS, INSTRUCTIONS_MAX, loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders, thinkTokensOf, type AgentSettings, type MessageSettings, type Settings } from '../settings';
 
 /** What is sent to the desktop in one request. */
 export const PART_BYTES = 4 * 1024 * 1024;
@@ -758,13 +758,20 @@ function pickGate(v: Record<string, unknown>): Partial<NetGateSettings> {
   return out as Partial<NetGateSettings>;
 }
 
-/** How the Agent manages its work: two numbers, within their limits, and whether it thinks. */
+/**
+ * How the Agent manages its work: two numbers, within their limits, whether it thinks and how long, and the person's
+ * own instructions. (OAIY Desktop brings back only the keys its table lists: one it does not list never reaches here.)
+ */
 function pickAgent(v: Record<string, unknown>): Partial<AgentSettings> {
   const out: Record<string, unknown> = {};
   if (typeof v.compactAt === 'number' && Number.isFinite(v.compactAt) && v.compactAt >= 0.05 && v.compactAt <= 1) out.compactAt = v.compactAt;
   const tokens = whole(v.subAgentTokens, 1000, 10_000_000);
   if (tokens !== undefined) out.subAgentTokens = tokens;
   if (v.thinking === 'auto' || v.thinking === 'on' || v.thinking === 'off') out.thinking = v.thinking;
+  const think = thinkTokensOf(v.thinkTokens);
+  if (think !== undefined) out.thinkTokens = think;
+  const instructions = text(v.instructions, INSTRUCTIONS_MAX);
+  if (instructions !== undefined) out.instructions = instructions;
   return out as Partial<AgentSettings>;
 }
 

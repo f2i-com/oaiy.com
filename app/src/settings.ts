@@ -88,11 +88,41 @@ export interface AgentSettings {
    * as OAIY's engine is set (Think by default), else on or off whatever it says.
    */
   thinking: AgentThinking;
+  /**
+   * The most tokens the model thinks before each step of the person's own conversations, where it thinks (OAIY's
+   * engine): THINK_TOKENS_MIN to THINK_TOKENS_MAX, or 0 for no limit. A step asked to think harder (a video's script)
+   * may take four times as many, and a step always keeps room for its answer (see Agent's thinking).
+   */
+  thinkTokens: number;
+  /**
+   * The person's own instructions: given to every conversation of theirs (a project, the Front desk's runner, "Set up
+   * OAIY"), after OAIY's own; never to the phone's calls, texts or flows' tasks. A project may use its own instead.
+   */
+  instructions: string;
 }
 
 export type AgentThinking = 'auto' | 'on' | 'off';
 
-export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000, thinking: 'auto' };
+/** The thinking a step may take, in tokens, as the Agent's settings let it be set (0, no limit, aside). */
+export const THINK_TOKENS_MIN = 256;
+export const THINK_TOKENS_MAX = 32_768;
+/** The person's instructions are at most this long (the phone's are as long). */
+export const INSTRUCTIONS_MAX = 20_000;
+
+/** A thinking budget as kept: a whole number in range, or 0 (no limit); undefined for anything else. */
+export function thinkTokensOf(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isInteger(v) && (v === 0 || (v >= THINK_TOKENS_MIN && v <= THINK_TOKENS_MAX)) ? v : undefined;
+}
+
+export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000, thinking: 'auto', thinkTokens: 2048, instructions: '' };
+
+/** The Agent's settings as kept (from before a setting was added, too): the defaults where one is missing or not of its kind. */
+export function agentSettingsOf(kept: Partial<AgentSettings> | null | undefined): AgentSettings {
+  const out: AgentSettings = { ...DEFAULT_AGENT_SETTINGS, ...(kept ?? {}) };
+  out.thinkTokens = thinkTokensOf(out.thinkTokens) ?? DEFAULT_AGENT_SETTINGS.thinkTokens;
+  out.instructions = typeof out.instructions === 'string' ? out.instructions.slice(0, INSTRUCTIONS_MAX) : '';
+  return out;
+}
 
 /** OAIY Desktop on this computer, once paired: where it is and the token it gave. */
 export interface DesktopSettings {
@@ -163,7 +193,7 @@ export async function loadSettings(): Promise<Settings> {
     gate: (await get<NetGateSettings>('gate')) ?? { mode: 'open', allow: [], deny: [] },
     lastProjectId: (await get<string | null>('last-project')) ?? null,
     lastKeptProjectId: (await get<string | null>('last-kept-project')) ?? null,
-    agent: { ...DEFAULT_AGENT_SETTINGS, ...((await get<Partial<AgentSettings>>('agent-settings')) ?? {}) },
+    agent: agentSettingsOf(await get<Partial<AgentSettings>>('agent-settings')),
     media: await (async () => {
       const stored = await get<Omit<MediaSettings, 'apiKey'> & { apiKeySealed: Sealed | null }>('media');
       if (!stored) return { ...EMPTY_MEDIA };

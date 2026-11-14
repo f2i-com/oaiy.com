@@ -524,8 +524,9 @@ describe('a phone call answered by the agent', () => {
     await sessions.callEvent({ type: 'call.started', callId: 'call_7', from: '+61400000007' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_7', text: 'Hi' });
     await settled(sessions);
-    const body = fake.bodies[0] as { chat_template_kwargs?: unknown; tools: Array<{ function: { name: string } }> };
-    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    const body = fake.bodies[0] as { reasoning_effort?: unknown; tools: Array<{ function: { name: string } }> };
+    // (LOCAL is Ollama: told not to think as its OpenAI endpoint takes it, reasoning_effort "none")
+    expect(body.reasoning_effort).toBe('none');
     const names = body.tools.map((t) => t.function.name);
     expect(names).toEqual(expect.arrayContaining(['end_call', 'request_appointment', 'lookup_business_data', 'read_file']));
     expect(names).not.toContain('sandbox_shell');

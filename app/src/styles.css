@@ -269,6 +269,9 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 /* Thinking: lit when on, the accent's when the engine decides, unlit when off. */
 .chip.think[data-think='auto']::before { background: var(--accent); box-shadow: none; }
 .chip.think[data-think='off']::before { background: var(--muted); box-shadow: none; }
+/* Instructions: lit when the person's own are given, the accent's for the project's own, unlit when none are. */
+.chip.instr[data-instr='project']::before { background: var(--accent); box-shadow: none; }
+.chip.instr[data-instr='none']::before { background: var(--muted); box-shadow: none; }
 /* The model: its name in the data voice, with a spark. */
 /* (in the body's type at the chips' size, as the two chips beside it are: it was set in the mono face at 11.5 px) */
 .chip:not(.toggle):not(.on-call) { font-size: 11px; font-weight: 600; color: var(--text); }
@@ -1107,6 +1110,8 @@ dialog button:not([class]):hover:not(:disabled), .dialog-buttons button:not(.pri
   .chip.toggle.phone { --glyph: var(--phone-glyph); }
   .chip.toggle:not(.phone) { --glyph: var(--globe-glyph); }
   .chip.toggle.think { --glyph: var(--think-glyph); }
+  /* (the Instructions chip gives way, so the project keeps its name: its dialog is in the project menu, Instructions…) */
+  .chip.toggle.instr { display: none; }
 }
 
 /* Narrower still: the model's chip is its spark alone (which provider and model is in its tooltip, and in Settings),
@@ -1335,6 +1340,24 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .agent-settings { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
 .agent-settings label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .agent-settings input { width: 70px; }
+.agent-settings input[type='checkbox'] { width: auto; margin: 0; accent-color: var(--accent); }
+/* The person's own instructions: their words, a box as wide as the section, taller as they need. */
+.agent-settings label.agent-instructions { flex-direction: column; align-items: stretch; gap: 6px; margin-top: 4px; }
+.agent-settings label.agent-instructions > span { font-weight: 600; }
+.agent-settings textarea { width: 100%; min-height: 84px; resize: vertical; font-size: 13px; line-height: 1.5; }
+.agent-think { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.agent-think-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; }
+.agent-think > p.muted { margin: 0; max-width: 72ch; font-size: 12.5px; line-height: 1.5; }
+.agent-think input:disabled { opacity: 0.55; }
+/* The Instructions dialog: the project's own words under their choice, and the business's tools as a choice of their own. */
+.instructions-own { margin: -2px 0 2px 28px; }
+.instructions-own[hidden] { display: none; }
+.instructions-own textarea { width: 100%; min-height: 96px; resize: vertical; font-size: 13px; line-height: 1.5; }
+.instructions-business { display: flex; gap: 10px; align-items: flex-start; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--r-ctl); cursor: pointer; }
+.instructions-business:has(input:checked) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.instructions-business input { margin-top: 3px; accent-color: var(--accent); }
+.instructions-business > span { display: flex; flex-direction: column; gap: 1px; font-size: 13px; }
+.instructions-note { margin: 0; font-size: 12.5px; color: var(--muted); }
 .media-settings .provider-form { display: flex; flex-direction: column; gap: 6px; }
 .media-settings .provider-form label { display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 8px; }
 .media-settings .provider-form input { width: 100%; min-width: 0; }

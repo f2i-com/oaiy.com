@@ -471,6 +471,83 @@ mod tests {
         assert!(text.contains("\"tool_calls\"") && text.contains("get_weather"), "a tool call came back: {text:.600}");
     }
 
+    /// The Agent's thinking fields reach the provider as it sent them, through both of the gateway's paths (buffered and
+    /// streamed): OAIY Desktop hands an OpenAI-protocol request on as it is, its routing hint aside. (The Agent sends
+    /// them by what the desktop's list says of the provider: app/src/desktop/agentModel.ts providerThinksAs.)
+    #[tokio::test]
+    async fn the_agents_thinking_fields_reach_the_provider_unchanged() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let kept = seen.clone();
+        // A provider on this computer: it keeps each request's body, and answers the buffered one with a reply and the
+        // streamed one with an event stream.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+                let (head_end, length) = loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..at]).to_lowercase();
+                        let length = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        break (at + 4, length);
+                    }
+                };
+                while buf.len() < head_end + length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: Value = serde_json::from_slice(&buf[head_end..head_end + length]).unwrap();
+                let streamed = body.get("stream") == Some(&Value::Bool(true));
+                kept.lock().unwrap().push(body);
+                let answer = if streamed {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n".to_string()
+                } else {
+                    let json = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}", json.len())
+                };
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        let local = AiProvider {
+            id: "lan-box".into(),
+            name: "LAN box".into(),
+            category: None,
+            protocol: Protocol::OpenAi,
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: Some("some-model".into()),
+            capabilities: vec![],
+            enabled: true,
+            allow_local: true,
+            api_key: None,
+        };
+        let fields = json!({ "reasoning_effort": 25, "thinking": { "type": "enabled", "budget_tokens": 2048 }, "chat_template_kwargs": { "enable_thinking": false } });
+        let mut body = json!({ "model": "some-model", "messages": [{ "role": "user", "content": "hi" }], "provider": "lan-box" });
+        for (k, v) in fields.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        chat(&local, body.clone()).await.expect("the buffered request is answered");
+        let resp = chat_stream(&local, body).await.expect("the streamed request is answered");
+        let _ = resp.text().await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both requests reached the provider");
+        for sent in seen.iter() {
+            for (k, v) in fields.as_object().unwrap() {
+                assert_eq!(sent.get(k), Some(v), "{k} reached the provider as the Agent sent it: {sent}");
+            }
+            assert!(sent.get("provider").is_none(), "the routing hint is not handed on: {sent}");
+        }
+    }
+
     #[test]
     fn anthropic_is_not_streamable_but_openai_is() {
         assert!(!streamable(&anthropic_provider()));

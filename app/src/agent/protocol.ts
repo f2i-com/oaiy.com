@@ -102,6 +102,13 @@ export interface Reply {
 /** How hard a model thinks before it answers (OAIY's `reasoning_effort`). */
 export type Reasoning = 'none' | 'low' | 'medium' | 'high' | 'max';
 
+/**
+ * `low` as OAIY's engine is sent it: a number low on each of its scales (GLM's Low, Qwen's "keep your thinking brief",
+ * DeepSeek's own 1-100). The word "low" is 50 there, which an engine from before the bands moved took for GLM's High,
+ * with no brief thinking.
+ */
+export const LOW_EFFORT = 25;
+
 export interface RequestOptions {
   signal?: AbortSignal;
   sink?: StreamSink;
@@ -110,9 +117,15 @@ export interface RequestOptions {
   /**
    * How hard the model thinks first (OAIY's `reasoning_effort`). `none`: not at
    * all (a phone call cannot wait), also asked of other local servers through
-   * the chat template; APIs are not asked.
+   * the chat template; APIs are not asked. Undefined: as the engine is set.
    */
   reasoning?: Reasoning;
+  /**
+   * The most tokens the model may think before it answers, where it thinks (OAIY's `thinking.budget_tokens`; 0: no
+   * limit). With `reasoning` it is asked to think (`type: enabled`); without, the engine's own default says whether
+   * it thinks, and this caps it where it does. Not sent where it does not think (`none`), nor to any other server.
+   */
+  thinkBudget?: number;
 }
 
 function anthropicMessages(turns: Turn[]): unknown[] {
@@ -257,6 +270,59 @@ function decodeOpenAI(data: Record<string, unknown>): Reply {
   };
 }
 
+/**
+ * What the server behind a provider takes of a request's thinking:
+ * - `oaiy`: OAIY's engine, its own fields.
+ * - `effort`: Ollama, whose OpenAI endpoint turns thinking off for `reasoning_effort: "none"` (its documented switch;
+ *   it ignores the chat template's).
+ * - `lmstudio`: LM Studio, asked through the chat template, which it may not take from a request (its own setting for
+ *   the model is what it reads), so the chip says so.
+ * - `template`: another local server (llama.cpp, vLLM, one OAIY Desktop does not say the kind of): the chat template's
+ *   switch for off, `chat_template_kwargs`. (`reasoning_effort: "none"` is not sent blind: a vLLM refuses any but
+ *   low, medium and high.)
+ * - `none`: an online API, which is not asked.
+ * - `unknown`: the server cannot be told from here (a route of OAIY Desktop's whose server it does not say), so nothing
+ *   is sent.
+ */
+export type ThinksAs = 'oaiy' | 'effort' | 'lmstudio' | 'template' | 'none' | 'unknown';
+
+/**
+ * A provider, as far as its thinking goes: a route that hides its server (OAIY Network's to a worker, OAIY Desktop's to
+ * one of its AI providers) says what that server takes (`thinksAs`); any other is known by its own kind.
+ */
+export type ThinkingProvider = Pick<ProviderConfig, 'type' | 'serverKind'> & { thinksAs?: ThinksAs };
+
+/** What `provider`'s server takes of a request's thinking (see ThinksAs). */
+export function thinksAs(provider: ThinkingProvider): ThinksAs {
+  if (provider.thinksAs) return provider.thinksAs;
+  if (provider.serverKind === 'oaiy') return 'oaiy';
+  if (provider.type !== 'local') return 'none';
+  return provider.serverKind === 'ollama' ? 'effort' : provider.serverKind === 'lmstudio' ? 'lmstudio' : 'template';
+}
+
+/**
+ * What a Chat Completions request says of the model's thinking. OAIY's engine: `reasoning_effort` (`low` as
+ * LOW_EFFORT) and, where it may think, `thinking.budget_tokens` (with `type: enabled` where it is asked to think;
+ * without a type the engine's default says whether it does). Another local server: only that it must not think, as it
+ * takes that (Ollama `reasoning_effort: "none"`; the rest through the chat template, `enable_thinking: false`). An API,
+ * or a server that cannot be told: nothing.
+ */
+export function thinkingFields(provider: ThinkingProvider, options: Pick<RequestOptions, 'reasoning' | 'thinkBudget'>): Record<string, unknown> {
+  const { reasoning, thinkBudget } = options;
+  const kind = thinksAs(provider);
+  if (kind !== 'oaiy') {
+    if (reasoning !== 'none') return {};
+    if (kind === 'effort') return { reasoning_effort: 'none' };
+    return kind === 'template' || kind === 'lmstudio' ? { chat_template_kwargs: { enable_thinking: false } } : {};
+  }
+  if (reasoning === 'none') return { reasoning_effort: 'none' };
+  const budget = thinkBudget !== undefined && Number.isFinite(thinkBudget) ? { budget_tokens: Math.max(0, Math.floor(thinkBudget)) } : null;
+  return {
+    ...(reasoning ? { reasoning_effort: reasoning === 'low' ? LOW_EFFORT : reasoning } : {}),
+    ...(budget ? { thinking: reasoning ? { type: 'enabled', ...budget } : budget } : {}),
+  };
+}
+
 /** Send the conversation and read the whole reply, streaming it to `sink`. */
 export async function sendTurn(
   provider: ProviderConfig,
@@ -297,8 +363,7 @@ export async function sendTurn(
   // OpenAI's reasoning models take max_completion_tokens; other servers read max_tokens.
   if (isOpenAIHost(url)) body.max_completion_tokens = maxTokens;
   else body.max_tokens = maxTokens;
-  if (options.reasoning && provider.serverKind === 'oaiy') body.reasoning_effort = options.reasoning;
-  else if (options.reasoning === 'none' && provider.type === 'local') body.chat_template_kwargs = { enable_thinking: false };
+  Object.assign(body, thinkingFields(provider, options));
   const stream = new OpenAIStream(options.sink);
   const outcome = await postProviderStream(provider, url, body, {
     signal: options.signal,

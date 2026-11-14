@@ -14,12 +14,15 @@ import { PhoneLine } from './phoneLine';
 import { contactKey, desktopContacts } from './contacts';
 import { showContactCard, type ContactCardData } from './ui/contactCard';
 import { IdentityCache, identityNote } from './identity';
+import { businessFor, controlToolAllowed, controlToolResult, instructionsUse, keptInstructions, ownInstructions, type BusinessContext } from './instructions';
+import { instructionsDialog } from './ui/instructions';
 import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, type PhoneRules } from './outreach';
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
 import { personState } from './ui/chat/outreachCard';
 import { rememberComputers, rememberToolTitles } from './ui/chat/tools';
-import type { Reasoning, Turn } from './agent/protocol';
+import { thinksAs, type Reasoning, type Turn } from './agent/protocol';
+import { thinkingChoiceWords, thinkingReachNote } from './ui/chat/thinking';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore, type FlowTool } from './desktop/flowTools';
 import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
@@ -29,7 +32,7 @@ import { flowBuilderTools } from './desktop/flowBuilder';
 import { applyPendingRestore, installBackupHooks, opfsStorage } from './desktop/backup';
 import { answeringOn, installIntents } from './desktop/intents';
 import { ControlClient, withControlTools } from './desktop/mcp';
-import { ENGINE, codexDefaultModel, modelChipText, providerFor, readAgentModel, sameModel, workerModel, type AgentKind, type AgentModel } from './desktop/agentModel';
+import { ENGINE, codexDefaultModel, modelChipText, providerFor, providerThinksAs, readAgentModel, readDesktopProviders, sameModel, workerModel, type AgentKind, type AgentModel, type DesktopAiProvider } from './desktop/agentModel';
 import { SETUP_INSTRUCTIONS, controlNote } from './desktop/setupAgent';
 import { CHATGPT_SIGN_IN } from './agent/providers/chatgpt';
 import { AIProviderError } from './agent/providers/aiProvider';
@@ -258,6 +261,11 @@ async function main(): Promise<void> {
   let lookedAgainAt = 0;
   /** The language models of the computers the desktop uses over OAIY Network, as last read: the model menu offers them too. */
   let networkModels: NetworkModel[] = [];
+  /**
+   * The desktop's AI providers as last read, while the Agent runs on one of them: what kind of server each is, so a
+   * request says what that server takes of its thinking (providerThinksAs). Null before they have been read.
+   */
+  let desktopProviders: DesktopAiProvider[] | null = null;
   /** The last read of them (the welcome waits for it: with none here, a paired computer's may be the one to use). */
   let networkRead: Promise<void> = Promise.resolve();
   /**
@@ -336,12 +344,15 @@ async function main(): Promise<void> {
   /**
    * A conversation's tools with OAIY's control tools after them: all of them
    * for a project and "Set up OAIY", the read tools for the runner, none for a
-   * call, a text or a flow's task (desktop/mcp.ts). The app's own tools come
+   * call, a text or a flow's task (desktop/mcp.ts); of those, what `business`
+   * allows (none in an incognito project, none of the business's in a project
+   * whose business tools are off: instructions.ts). The app's own tools come
    * first and keep their names; no name reaches the model twice. With none
    * listed (no desktop, or an older one), the tools are exactly as they were.
    * One that removes something, and a plugin's command, ask the person first.
    */
-  const withControl =(kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, (question) => confirmAction(question), controlChanged, () => project.vfs);
+  const withControl = (kind: AgentKind, own: SessionTool[], business: BusinessContext): SessionTool[] =>
+    withControlTools(own, kind, () => control, builtInToolNames, (question) => confirmAction(question), controlChanged, () => project.vfs, (name) => controlToolAllowed(business, name), (name, result) => controlToolResult(business, name, result));
   /**
    * A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in; the engine's
    * model and whether it runs (the header's menu, and how its loading goes); the computers paired over OAIY Network
@@ -363,7 +374,8 @@ async function main(): Promise<void> {
    * The provider a conversation of `kind` runs on: the engine's (as chosen in Settings, followed as always), or ChatGPT's
    * when the desktop says so. A paired computer's model works in the window its engine has, where the desktop says it.
    */
-  const agentProvider = (kind: AgentKind): ProviderConfig | null => providerFor(kind, agentModel, activeProvider(), desktop, codexDefault, (id) => networkModels.find((m) => m.id === id)?.contextTokens);
+  const agentProvider = (kind: AgentKind): ProviderConfig | null =>
+    providerFor(kind, agentModel, activeProvider(), desktop, codexDefault, (id) => networkModels.find((m) => m.id === id)?.contextTokens, (id) => providerThinksAs(id, desktopProviders));
   /**
    * What a run with nothing to run on says. With computers paired that lend their language models, where to choose
    * one (this computer's OAIY may have none: its own window's first run, before a model is downloaded); else the
@@ -406,8 +418,9 @@ async function main(): Promise<void> {
     }
     engineLook = setTimeout(() => void lookAtEngine(), 10_000);
   }
-  /** What a conversation of `kind` is told besides its own instructions: about OAIY's tools, when it has them. */
-  const controlInstructions = (kind: AgentKind): string => (kind === 'setup' ? SETUP_INSTRUCTIONS : control?.listed(kind).length ? controlNote(kind) : '');
+  /** What a conversation of `kind` is told besides its own instructions: about OAIY's tools, when it has them (as `business` offers them). */
+  const controlInstructions = (kind: AgentKind, business: BusinessContext): string =>
+    kind === 'setup' ? SETUP_INSTRUCTIONS : control?.listed(kind).some((t) => controlToolAllowed(business, t.name)) ? controlNote(kind, business.control) : '';
   /**
    * What a conversation of `kind` runs on, brought up to date before its run. The choice may have changed in OAIY since
    * it was last read (a call does not wait for this, nor does anything while the desktop is away: the minute's read
@@ -652,15 +665,22 @@ async function main(): Promise<void> {
       agentSettings = { ...agentSettings, thinking: THINKING_NEXT[agentSettings.thinking] };
       void saveAgentSettings(agentSettings);
       renderChips();
-      chat.system(agentSettings.thinking === 'on'
-        ? 'Thinking on: the model thinks before each step from the next one on (slower, more careful).'
-        : agentSettings.thinking === 'off'
-          ? 'Thinking off: the model answers each step at once.'
-          : "Thinking as OAIY's engine is set (Engines → Think by default).");
+      // (as far as the model the person's conversations run on is told it: honestly, where its server is not asked)
+      const p = agentProvider('project');
+      chat.system(thinkingChoiceWords(agentSettings.thinking, p ? thinksAs(p) : 'oaiy', p ? providerLabel(p) : '', thinkLimitWords()));
     },
   });
-  /** What the person's own conversations ask of the model's thinking: none where it is off, the engine's own where auto. */
-  const chosenReasoning = (): Reasoning | undefined => (agentSettings.thinking === 'on' ? 'medium' : agentSettings.thinking === 'off' ? 'none' : undefined);
+  /** The most the model thinks before a step, in words: "at most 2,048 tokens", or "with no limit". */
+  const thinkLimitWords = (): string => (agentSettings.thinkTokens > 0 ? `at most ${agentSettings.thinkTokens.toLocaleString('en-US')} tokens` : 'with no limit');
+  /**
+   * What the person's own conversations ask of the model's thinking: none where it is off, the engine's own where auto,
+   * and briefly where on (`low`: OAIY's engine is told to keep its thinking brief). Where it thinks, its budget is the
+   * Agent's settings' (thinkTokens).
+   */
+  const chosenReasoning = (): Reasoning | undefined => (agentSettings.thinking === 'on' ? 'low' : agentSettings.thinking === 'off' ? 'none' : undefined);
+  // Whose instructions the open place's conversation takes (the person's, its own, or none), and, for a kept project,
+  // whether the business's tools are offered there: a click opens the Instructions dialog.
+  const instructionsChip = h('button.chip.toggle.instr', { 'aria-haspopup': 'dialog', onclick: () => void editInstructions() }) as HTMLButtonElement;
   const providerChip = h('button.chip.model', { title: 'AI provider', onclick: () => void editSettings() });
   // Where the Agent runs on OAIY's engine, the chip is a menu of the engine's language models instead: choosing one is
   // choosing it in Engines (the one model loaded, on a Mac's eGPU or on the Mac, as Engines sets it). See renderPickers.
@@ -731,11 +751,16 @@ async function main(): Promise<void> {
     gateChip.textContent =`Internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
     gateChip.setAttribute('aria-checked', String(gate.mode !== 'blocked'));
-    thinkingChip.textContent = `Thinking: ${agentSettings.thinking}`;
-    thinkingChip.dataset.think = agentSettings.thinking;
-    thinkingChip.title = `Thinking ${agentSettings.thinking === 'auto' ? "as OAIY's engine is set (Engines → Think by default)" : agentSettings.thinking}: whether the model thinks before each step. Click for ${THINKING_NEXT[agentSettings.thinking]}. (Asked of OAIY's engine; of another local server only off; an online API is not asked.)`;
     // The model the person's own conversation runs on: the engine's (Settings), or ChatGPT's, as the desktop says.
     const p = agentProvider('project');
+    thinkingChip.textContent = `Thinking: ${agentSettings.thinking}`;
+    thinkingChip.dataset.think = agentSettings.thinking;
+    // (and how much of it that model's server is told: all of it on OAIY's engine)
+    const reach = p ? thinksAs(p) : 'oaiy';
+    thinkingChip.dataset.reach = reach;
+    const reachNote = p ? thinkingReachNote(reach, providerLabel(p)) : '';
+    thinkingChip.title = `Thinking ${agentSettings.thinking === 'auto' ? "as OAIY's engine is set (Engines → Think by default)" : agentSettings.thinking === 'on' ? 'on, briefly' : 'off'}: whether the model thinks before each step${agentSettings.thinking === 'off' ? '' : `, ${thinkLimitWords()} (Agent settings)`}. Click for ${THINKING_NEXT[agentSettings.thinking]}.${reachNote ? ` (${reachNote})` : ''}`;
+    renderInstructionsChip();
     const chatgpt = p?.id.startsWith('oaiy-chatgpt') ?? false;
     // (a server with no name of its own goes by where it is, "localhost:8080", not by its kind's long words)
     const chipWords = chatgpt ? modelChipText(p, chatgptProblem) : p ? `${providerLabel(p)}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI';
@@ -756,6 +781,74 @@ async function main(): Promise<void> {
         : p ? `AI provider: ${chipWords} (click to change it in Settings)` : 'AI provider: none yet (click to set one up)';
     renderPickers(chatgpt ? null : p);
   };
+
+  /** The Instructions chip, for the place open now: whose instructions its conversation takes. */
+  function renderInstructionsChip(): void {
+    const meta = project?.meta;
+    const use = meta ? instructionsUse(meta) : 'mine';
+    const given = meta ? ownInstructions('project', meta, agentSettings.instructions) : agentSettings.instructions.trim();
+    instructionsChip.textContent = `Instructions: ${use === 'these' ? 'project' : use}`;
+    // (its dot: lit while the person's own are given here, the accent's for the project's own, unlit while none are)
+    instructionsChip.dataset.instr = !given ? 'none' : use === 'these' ? 'project' : 'mine';
+    const tools = !meta || project === frontDesk || meta.id === SETUP_PROJECT.id || businessFor('project', meta).tools;
+    instructionsChip.title = [
+      use === 'these'
+        ? 'This conversation takes instructions of its own, in place of yours.'
+        : use === 'none'
+          ? 'This conversation takes no instructions of yours.'
+          : given
+            ? 'This conversation takes your instructions (Agent settings → Your instructions).'
+            : 'This conversation takes your instructions, and none are written yet (Agent settings → Your instructions).',
+      meta?.incognito
+        ? "Incognito: no business tools or business details here, and none of OAIY's own tools."
+        : tools ? '' : "Business tools are off here: no phone, calendar, contacts or outreach, nor OAIY's tools for them.",
+      'Click to change.',
+    ].filter(Boolean).join(' ');
+  }
+
+  /** The Instructions dialog, for the place open now: its choice is kept with the project, and taken from the next step on. */
+  async function editInstructions(): Promise<void> {
+    const place = project;
+    if (!place) return;
+    const front = place === frontDesk;
+    const meta = place.meta;
+    const choice = await instructionsDialog({
+      place: front ? 'the Front desk' : `“${meta.name}”`,
+      current: meta.instructions,
+      mine: agentSettings.instructions,
+      // (the Front desk's agent runs the phone: its business is what it is for; "Set up OAIY" sets the business up; an
+      // incognito project has none of it)
+      businessTools: front || meta.id === SETUP_PROJECT.id || meta.incognito ? null : meta.businessTools !== false,
+      incognito: !!meta.incognito,
+    });
+    if (!choice || project !== place) return;
+    const toolsBefore = businessFor('project', place.meta).tools;
+    // (taken at once, the chip saying so, and kept with the project as it is written)
+    const saved = place.setMeta({
+      instructions: keptInstructions(choice.instructions),
+      ...(choice.businessTools === undefined ? {} : { businessTools: choice.businessTools ? undefined : false }),
+    });
+    renderChips();
+    try {
+      await saved;
+    } catch (error) {
+      chat.system(`This choice holds until the project is closed, but it could not be kept with the project: ${(error as Error).message}`, 'error');
+    }
+    const use = instructionsUse(place.meta);
+    const toolsNow = businessFor('project', place.meta).tools;
+    chat.system([
+      use === 'these'
+        ? 'Instructions here: its own, in place of yours, from the next step on.'
+        : use === 'none'
+          ? 'Instructions here: none of yours, from the next step on.'
+          : `Instructions here: yours${agentSettings.instructions.trim() ? '' : ' (none written yet: Agent settings → Your instructions)'}, from the next step on.`,
+      choice.businessTools === undefined || toolsNow === toolsBefore
+        ? ''
+        : toolsNow
+          ? "Business tools are offered here again: the phone, the calendar, the contacts and outreach, and OAIY's tools for them."
+          : "Business tools are off here: no phone, calendar, contacts or outreach, nor OAIY's tools for them.",
+    ].filter(Boolean).join(' '));
+  }
 
   /**
    * What the Agent runs on where OAIY chose it something other than its engine (ChatGPT, one of the desktop's AI
@@ -1193,22 +1286,28 @@ async function main(): Promise<void> {
     });
     return (given?: AgentKind): AgentOptions => {
       const kind = (): AgentKind => given ?? ownKind();
+      /** What this conversation is given of the business: the runner its note, a project its tools unless they are off there (none in incognito). */
+      const business = () => businessFor(kind(), place().meta);
       return {
         // Flows made tools, and speech to text: both run on OAIY Desktop.
         // The calendar's tools only while there is one (a plugin provides it).
         // The plugins' tools offered to the project's conversation (or, in the Front desk, to the runner).
         // Outreach where the person is (never a call, a text, a flow's task or "Set up OAIY").
-        // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
+        // The business's (the calendar's, the plugins', outreach) not in an incognito project, nor where the person
+        // turned them off.
+        // OAIY's own tools (its control API) after them, as this kind of conversation is offered them: none in an
+        // incognito project, and none of the business's (its calendar's settings, contacts, phone) where they are off.
         sessionTools: () => withControl(kind(), [
           ...(canDo('flowTools') ? flowSessionTools(flowStore.tools, () => desktop, flowStore.taken, () => place().vfs) : []),
-          ...(desktop ? [transcribe, ...(calendarOn() ? calendar : [])] : []),
+          ...(desktop ? [transcribe, ...(calendarOn() && business().tools ? calendar : [])] : []),
           ...(desktop && canDo('flowTools') ? flowBuilder : []),
           ...(runner() ? phone : []),
-          ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
-          ...(withPreview && phoneOn() && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
-        ]),
-        // With a phone, the runner and a project's agent know who answers it (what they write for customers says so).
-        instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', phoneOn() && (kind() === 'runner' || kind() === 'project') ? identityNote(identity.get()) : '', controlInstructions(kind())].filter(Boolean).join('\n\n'),
+          ...(withPreview && business().tools ? pluginTools(runner() ? 'runner' : 'project') : []),
+          ...(withPreview && phoneOn() && business().tools && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
+        ], business()),
+        // With a phone, the runner knows who answers it and for whom (what it writes for customers says so); a project
+        // is not told (its outreach tools say how to write for customers), and an incognito one knows nothing of it.
+        instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', phoneOn() && business().note ? identityNote(identity.get()) : '', controlInstructions(kind(), business())].filter(Boolean).join('\n\n'),
         toolHooks: () => toolHooks,
         vfs: place().vfs,
         gate,
@@ -1229,8 +1328,18 @@ async function main(): Promise<void> {
         // The person's own conversation: a reply they stopped is kept as far as it got, and the model told it was
         // stopped (a phone conversation's agents keep what the caller heard of a reply cut off, sessions.ts).
         keepStopped: given === undefined,
-        // (and thinks as the chat's thinking chip says)
-        ...(given === undefined ? { reasoning: chosenReasoning } : {}),
+        // Every conversation thinks at most as long as the Agent's settings say, where it thinks: a text and a flow's
+        // task as the engine is set (with no limit, a text's thought on a model that thinks by default ran on for
+        // minutes before its reply), a call not at all (it answers at once, sessions.ts).
+        thinkTokens: () => agentSettings.thinkTokens,
+        // (and the person's own thinks as the chat's thinking chip says, and is given the person's own instructions, or
+        // its project's: never a call, a text or a flow's task)
+        ...(given === undefined
+          ? {
+              reasoning: chosenReasoning,
+              personInstructions: () => ownInstructions(kind(), place().meta, agentSettings.instructions),
+            }
+          : {}),
         projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
         ...(withPreview ? { preview } : {}),
         compactAt: () => agentSettings.compactAt,
@@ -1635,6 +1744,8 @@ async function main(): Promise<void> {
       void endIncognitoSession(leaving);
     }
     await renderProjects();
+    // (whose instructions this place's conversation takes)
+    renderInstructionsChip();
     document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — OAIY`;
     // Outreach this conversation started, while it was not open: the lines after each person as one note, then its report.
     const pending = outreach?.pendingFor(meta.id);
@@ -2299,6 +2410,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
     h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
     h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
     h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
+    // (the Instructions chip's dialog: on a phone the chip gives way, and this is where it is)
+    h('button.instructions-item', { title: "Whose instructions this project's conversation takes (yours, its own, or none), and whether the business's tools are offered here", onclick: () => void editInstructions() }, 'Instructions…'),
     renameButton,
     deleteButton,
   );
@@ -2334,6 +2447,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     outreachChip,
     gateChip,
     thinkingChip,
+    instructionsChip,
     providerChip,
     modelPick,
     // (in OAIY's window it is the AGENT's settings, by that name: the window's own Settings is in its sidebar, and a
@@ -2622,9 +2736,24 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     // Codex's default, for a choice that names none (signed out: the chip says so).
     if (lookUp && next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
+    // On one of the desktop's AI providers: what kind of server it is, for what its requests say of their thinking.
+    if (next.source === 'provider') await followDesktopProviders(d, waitMs);
     if (!changed) return;
     renderChips();
     if (announce) chat.system(movedTo(next, was));
+  }
+
+  /**
+   * The desktop's AI providers read again (what kind of server each is: OAIY's engine, one the person marked as on this
+   * computer or network, an online API), for what a request to the one the Agent runs on says of its thinking. One not
+   * read is kept as it was; one never read leaves the server's kind unknown, and its requests say nothing of it.
+   */
+  async function followDesktopProviders(d: { origin: string; token: string }, waitMs: number): Promise<void> {
+    const list = await readDesktopProviders(d, AbortSignal.timeout(waitMs));
+    if (!list || d !== desktop) return;
+    const before = agentModel.source === 'provider' ? providerThinksAs(agentModel.provider, desktopProviders) : null;
+    desktopProviders = list;
+    if (agentModel.source === 'provider' && providerThinksAs(agentModel.provider, list) !== before) renderChips();
   }
 
   /**

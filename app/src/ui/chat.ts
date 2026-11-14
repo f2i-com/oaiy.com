@@ -43,6 +43,7 @@ import {
 } from './chat/transcript';
 import { outreachCard, outreachNoteElement, type OutreachHost } from './chat/outreachCard';
 import { Follow, anchorIndex, anchoredScrollTop } from './chat/scroll';
+import { thinkingLabel, thinkingStatus, type ThinkingCount } from './chat/thinking';
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
@@ -202,7 +203,8 @@ export class ChatPane {
   private quiet: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   /** A call's goodbye has been said (end_call), or the call ended: its agent's words from here are not said, until the next call. */
   private callOver: false | 'goodbye' | 'ended' = false;
-  private thinking: { box: HTMLElement; text: string } | null = null;
+  /** The model's thought being shown, and how many tokens of it the engine has counted, of its budget (OAIY's). */
+  private thinking: { box: HTMLElement; text: string; count?: ThinkingCount } | null = null;
   /** A tool call being written, shown as it streams until the call is whole. */
   private draft: { box: HTMLElement; body: HTMLElement; raw: string; json: boolean } | null = null;
   /** The tool the call being written is of, as the model named it at its start (a JSON draft does not say). */
@@ -1325,10 +1327,10 @@ export class ChatPane {
     if (!this.replaying) this.announce(first);
   }
 
-  /** The model's thinking stays shown once the reply moves on: it says why the model did what it did. */
+  /** The model's thinking stays shown once the reply moves on: it says why the model did what it did (and how long it was, where the engine counted it). */
   private doneThinking(): void {
     const label = this.thinking?.box.querySelector('.thinking-label');
-    if (label) label.textContent = 'What the model thought';
+    if (label) label.textContent = thinkingLabel(this.thinking?.count, false);
     this.thinking?.box.classList.remove('streaming');
     this.thinking = null;
   }
@@ -1786,11 +1788,12 @@ export class ChatPane {
         break;
       }
       case 'thinking':
-        this.setStatus('thinking…');
         if (!this.thinking) {
           const box = this.thoughtBox('', true);
           this.thinking = { box, text: '' };
         }
+        // (with how far it has gone, as its engine counted last: the thought's next words do not take that away)
+        this.setStatus(thinkingStatus(this.thinking.count));
         this.thinking.text += e.delta;
         {
           const thinking = this.thinking;
@@ -1802,6 +1805,19 @@ export class ChatPane {
           });
         }
         break;
+      case 'thinking_count': {
+        // (OAIY's engine counts the thought against its budget: "Thinking… 812 / 2,048 tokens" while it goes on)
+        const count = { used: e.used, budget: e.budget };
+        if (!e.done) this.setStatus(thinkingStatus(count));
+        // (a count before the thought's first words starts its box, which keeps it for them)
+        if (!this.thinking && !e.done) this.thinking = { box: this.thoughtBox('', true), text: '' };
+        if (this.thinking) {
+          this.thinking.count = count;
+          const label = this.thinking.box.querySelector('.thinking-label');
+          if (label) label.textContent = thinkingLabel(count, !e.done);
+        }
+        break;
+      }
       case 'prompt':
         this.promptView(e);
         // The model is asked: the agent is at work from here, before its first words (a local model can take a while:

@@ -32,6 +32,24 @@ export interface ProjectMeta {
   updated: number;
   /** A temporary project: nothing of it is kept (see the module note). */
   incognito?: boolean;
+  /**
+   * The person's instructions its conversation takes (the chat's Instructions chip): theirs from the Agent's settings
+   * (absent: the default), the text here instead, or none. Kept with the project (an incognito one's goes with it).
+   * Read through instructions.ts projectInstructions, never as it is: a file brought back may hold anything.
+   */
+  instructions?: ProjectInstructions;
+  /**
+   * Whether the business's tools are offered here: the phone's (plugins'), the calendar's and outreach, and OAIY's own
+   * tools for the business's data (instructions.ts BUSINESS_CONTROL_TOOLS) (absent: yes). An incognito project never
+   * has them, whatever this says, nor any of OAIY's own tools.
+   */
+  businessTools?: boolean;
+}
+
+/** Which of the person's instructions a project's conversation takes, and its own text (kept while another is chosen). */
+export interface ProjectInstructions {
+  use: 'mine' | 'these' | 'none';
+  text: string;
 }
 
 async function root(): Promise<FileSystemDirectoryHandle> {
@@ -426,6 +444,14 @@ export class OpenProject {
     this.meta = { ...this.meta, updated: Date.now() };
     await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta)).catch(() => {});
     return failed;
+  }
+
+  /** Its record changed (whose instructions its conversation takes, whether the business's tools are here): kept at once. */
+  async setMeta(change: Partial<Pick<ProjectMeta, 'instructions' | 'businessTools'>>): Promise<void> {
+    const next: ProjectMeta = { ...this.meta, ...change };
+    for (const key of Object.keys(change) as Array<keyof typeof change>) if (change[key] === undefined) delete next[key];
+    this.meta = next;
+    await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta));
   }
 
   async loadChat(): Promise<Turn[]> {

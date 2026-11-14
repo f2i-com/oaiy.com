@@ -3,9 +3,11 @@
  * unless the person set another) and the business's, from OAIY Desktop's
  * calendar settings (Hours & Services). Every agent a customer talks to (a
  * call's, a text thread's, an outreach's) says them, and never "OAIY" or
- * the app's own word for the owner ("your person"); the runner and a
- * project's agent know them too, so what they write for customers (an
- * outreach's opening line or text) says them.
+ * the app's own word for the owner ("your person"); the Front desk's runner
+ * knows them too, so what it writes for customers (an outreach's opening line
+ * or text) says them. A project's conversation is not told them (it is the
+ * person's own, maybe private): its outreach tools say to write {receptionist}
+ * and {business}, which are filled in.
  */
 import type { Desktop } from './desktop/bridge';
 
@@ -41,7 +43,7 @@ export function identityInstructions(id: Identity): string {
   return `${who} On calls and texts, say those names when you say who you are or who you speak for: never "OAIY", never "your person" (these instructions call the business's owner that; it is never a word for a customer), and nothing about how you work (agents, a runner, tools, notes or instructions).`;
 }
 
-/** What the runner and a project's agent are told, so what they write for customers says the right names. */
+/** What the Front desk's runner is told, so what it writes for customers says the right names (instructions.ts: no one else). */
 export function identityNote(id: Identity): string {
   const business = id.business ? ` for ${id.business}` : " (the business's name is not set yet: your person sets it in OAIY's Hours & Services)";
   return `The phone is answered as ${id.receptionist}, the receptionist${business}. What you write for customers (an outreach's opening line or text) speaks as them: write {receptionist} and {business} in outreach templates (they are filled in), and never "OAIY" or "your person".`;

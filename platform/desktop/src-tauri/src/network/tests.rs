@@ -25,6 +25,8 @@ struct Fake {
     slow: std::sync::atomic::AtomicBool,
     /// The language model chosen in its Engines (`tiny-llm` where none is set).
     llm: std::sync::Mutex<Option<String>>,
+    /// Each chat its engine was sent, as it reached it.
+    chats: std::sync::Mutex<Vec<Value>>,
 }
 
 impl Fake {
@@ -140,11 +142,18 @@ async fn fake_engines_with() -> (String, std::sync::Arc<Fake>) {
             }
         }))
         .route("/gw/files/images/2026-10-18/x/image-0001.png", get(|| async { ([("content-type", "image/png")], PNG) }))
-        .route("/gw/v1/chat/completions", post(|body: String| async move {
-            let asked: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            assert!(asked.get("model").is_none(), "the worker sends its engine no model: it answers with its chosen one");
-            let chunks = ["Hel", "lo"].iter().map(|t| format!("data: {}\n\n", json!({"choices": [{"delta": {"content": t}}]}))).collect::<String>() + "data: [DONE]\n\n";
-            ([("content-type", "text/event-stream")], chunks)
+        .route("/gw/v1/chat/completions", post({
+            let fake = fake.clone();
+            move |body: String| {
+                let fake = fake.clone();
+                async move {
+                    let asked: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    assert!(asked.get("model").is_none(), "the worker sends its engine no model: it answers with its chosen one");
+                    fake.chats.lock().unwrap().push(asked);
+                    let chunks = ["Hel", "lo"].iter().map(|t| format!("data: {}\n\n", json!({"choices": [{"delta": {"content": t}}]}))).collect::<String>() + "data: [DONE]\n\n";
+                    ([("content-type", "text/event-stream")], chunks)
+                }
+            }
         }));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (base, fake)
@@ -1435,6 +1444,38 @@ async fn saving_settings_keeps_the_connections_of_the_computers_using_it() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(worker.listening().map(|a| a.port()), Some(free));
     assert!(ask_on(&mut conn, "/worker/v1/health").await.is_err(), "the old listener's connection ended");
+    for n in [&worker, &primary] {
+        n.stop();
+    }
+}
+
+/// The Agent's thinking fields reach the worker's engine as it sent them: a chat on another computer's OAIY engine (OAIY
+/// Network) is told to think, how long, or not to, as one on this computer's is (app/src/agent/protocol.ts thinkingFields:
+/// a worker runs OAIY's engine).
+#[tokio::test]
+async fn the_agents_thinking_fields_reach_the_workers_engine_unchanged() {
+    let (engines, fake) = fake_engines_with().await;
+    let worker = node("worker-thinks", Role::Worker, Some(engines)).await;
+    let primary = node("primary-thinks", Role::Primary, None).await;
+    let node_id = pair(&primary, &worker).await;
+    let p = router(primary.clone());
+    let chat = format!("/api/network/nodes/{node_id}/v1/chat/completions");
+    let fields = json!({ "reasoning_effort": 25, "thinking": { "type": "enabled", "budget_tokens": 2048 } });
+    let mut asked = json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
+    for (k, v) in fields.as_object().unwrap() {
+        asked[k] = v.clone();
+    }
+    let (status, v) = call(&p, "POST", &chat, Some(asked)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // and "off"
+    let (status, v) = call(&p, "POST", &chat, Some(json!({ "stream": true, "reasoning_effort": "none", "messages": [{ "role": "user", "content": "hi" }] }))).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let chats = fake.chats.lock().unwrap().clone();
+    assert_eq!(chats.len(), 2, "both reached the worker's engine: {chats:?}");
+    for (k, v) in fields.as_object().unwrap() {
+        assert_eq!(chats[0].get(k), Some(v), "{k} reached the worker's engine as sent: {}", chats[0]);
+    }
+    assert_eq!(chats[1]["reasoning_effort"], "none");
     for n in [&worker, &primary] {
         n.stop();
     }

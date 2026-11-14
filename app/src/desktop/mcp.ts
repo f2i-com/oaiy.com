@@ -265,6 +265,8 @@ export interface ControlToolDeps {
   approve: (question: ControlQuestion) => Promise<boolean>;
   /** A change tool ran and did what it was asked (by its name on the desktop). */
   changed?: (tool: string) => void;
+  /** An answer as this conversation reads it (instructions.ts controlToolResult); as it came without it. */
+  shape?: (tool: string, result: ControlResult) => ControlResult;
 }
 
 /**
@@ -344,7 +346,8 @@ export function controlSessionTools(tools: ControlTool[], session: ControlSessio
           const allowed = await deps.approve({ title: `Allow ${name}?`, message, ok: 'Allow', ...(tool.destructive ? { danger: true } : {}) });
           if (!allowed) return `The person declined, so ${name} did not run (${message}). Do not try it again unless they ask.`;
         }
-        const result = await client.call(session, tool.name, input, signal);
+        const answered = await client.call(session, tool.name, input, signal);
+        const result = deps.shape ? deps.shape(tool.name, answered) : answered;
         const text = controlOutcome(result);
         // A tool that failed is read by the model as an error, and says what to do about it.
         if (result.isError) throw new Error(text || `${tool.name} failed`);
@@ -363,12 +366,16 @@ export function controlSessionTools(tools: ControlTool[], session: ControlSessio
  * (`builtIns`: the agent's built-in tools, which are not among `own`), and no
  * name reaches the model twice. With none listed for this kind (no desktop, an
  * older one, a call, a text or a flow's task) `own` comes back as it is.
+ * `allow`: which of them this conversation is offered (instructions.ts
+ * controlToolAllowed: none in an incognito project, none of the business's where
+ * its tools are off); every one without it. `shape`: their answers as this
+ * conversation reads them (instructions.ts controlToolResult).
  */
-export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, approve: ControlToolDeps['approve'], changed?: (tool: string) => void, files?: () => Vfs | null): SessionTool[] {
-  const listed = client()?.listed(session) ?? [];
+export function withControlTools(own: SessionTool[], session: ControlSession, client: () => ControlClient | null, builtIns: Iterable<string>, approve: ControlToolDeps['approve'], changed?: (tool: string) => void, files?: () => Vfs | null, allow?: (name: string) => boolean, shape?: ControlToolDeps['shape']): SessionTool[] {
+  const listed = (client()?.listed(session) ?? []).filter((t) => !allow || allow(t.name));
   if (!listed.length) return own;
   const taken = new Set([...builtIns, ...own.map((t) => t.spec.name)]);
-  return distinctTools([...withNodeCalls(own, listed, session, client, changed, files), ...controlSessionTools(listed, session, { client, taken, approve, changed })]);
+  return distinctTools([...withNodeCalls(own, listed, session, client, changed, files), ...controlSessionTools(listed, session, { client, taken, approve, changed, shape })]);
 }
 
 /** The longest a flow run on another computer is waited for (the desktop's flow_run with node takes up to 600 s). */

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, announcesWork, readingStatus, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
+import { Agent, HARDER_THINKING, announcesWork, readingStatus, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
 import { TOOLS, planAfter, planChanges, readPlan, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
@@ -442,19 +442,21 @@ describe('tool rules', () => {
     expect(agent.takeUnread()).toEqual([]);
   });
 
-  it('thinks harder while it works on a video script, and only asks OAIY for that', async () => {
+  it('thinks longer while it works on a video script, at the effort it was asked for, and only asks OAIY for that', async () => {
     const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video' };
     const script = { goal: 'a short film', items: [{ text: 'Write the script in video/film/script.md', status: 'active' }, { text: 'Make the clips', status: 'pending' }] };
-    for (const [serverKind, want] of [['oaiy', 'high'], ['ollama', undefined]] as const) {
+    for (const [serverKind, want] of [['oaiy', [512, 512 * HARDER_THINKING, 512 * HARDER_THINKING]], ['ollama', [undefined, undefined, undefined]]] as const) {
       const fake = fakeProvider('openai', [
         { calls: [{ name: 'update_plan', input: script }] },
         { calls: [{ name: 'append_file', input: { path: 'video/film/script.md', content: '## Premise\nA cat.' } }] },
         { text: 'done' },
       ]);
-      const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, serverKind, contextTokens: 32_000 }), projectSummary: () => '', media: () => media });
+      const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, serverKind, contextTokens: 32_000 }), projectSummary: () => '', media: () => media, thinkTokens: () => 512 });
       await agent.run('make a short film', () => {});
       // Not before there is a plan; while its step is the script, and after writing the script.
-      expect(fake.bodies.slice(0, 3).map((b) => b.reasoning_effort)).toEqual([undefined, want, want]);
+      expect(fake.bodies.slice(0, 3).map((b) => (b.thinking as { budget_tokens?: number } | undefined)?.budget_tokens)).toEqual(want);
+      // (and at the effort the conversation asks, none here, at every step: a harder one changed the engine's prompt)
+      expect(fake.bodies.slice(0, 3).map((b) => b.reasoning_effort)).toEqual([undefined, undefined, undefined]);
     }
   });
 

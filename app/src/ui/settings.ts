@@ -7,7 +7,7 @@ import { testProvider } from '../agent/providers/aiProvider';
 import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../agent/providers/providerConnection';
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
-import type { AgentSettings } from '../settings';
+import { DEFAULT_AGENT_SETTINGS, INSTRUCTIONS_MAX, THINK_TOKENS_MAX, THINK_TOKENS_MIN, type AgentSettings } from '../settings';
 import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
@@ -127,6 +127,44 @@ function kindOf(p: ProviderConfig): string {
 export function serviceWords(service: string, version: string): string {
   if (/^oaiy/i.test(service)) return `OAIY's engines${version ? ` (version ${version})` : ''}`;
   return `${service}${version ? ` ${version}` : ''}`;
+}
+
+/**
+ * How long the model may think before each step (the Agent's settings): a number of tokens, or no limit. Where it thinks
+ * (Thinking on, or auto where OAIY's engine thinks by default) it stops there and acts. Changes `agent` as it is set.
+ */
+export function thinkSetting(agent: AgentSettings): HTMLElement {
+  const kept = agent.thinkTokens > 0 ? agent.thinkTokens : DEFAULT_AGENT_SETTINGS.thinkTokens;
+  const inRange = (v: number) => Number.isInteger(v) && v >= THINK_TOKENS_MIN && v <= THINK_TOKENS_MAX;
+  const tokens = h('input.think-tokens', { type: 'number', min: THINK_TOKENS_MIN, max: THINK_TOKENS_MAX, step: 256, value: kept, style: 'width: 96px', 'aria-label': 'The most tokens of thinking before each step' }) as HTMLInputElement;
+  const unlimited = h('input', { type: 'checkbox', checked: agent.thinkTokens === 0 }) as HTMLInputElement;
+  const sync = () => {
+    tokens.disabled = unlimited.checked;
+  };
+  tokens.addEventListener('input', () => {
+    const v = Number(tokens.value);
+    if (!unlimited.checked && inRange(v)) agent.thinkTokens = v;
+  });
+  // (a number typed past the range is brought into it as the field is left: the field says what is kept, never a
+  // number that was kept on the way to it)
+  tokens.addEventListener('change', () => {
+    if (unlimited.checked) return;
+    const v = Number(tokens.value);
+    const kept = Number.isFinite(v) && tokens.value.trim() ? Math.min(THINK_TOKENS_MAX, Math.max(THINK_TOKENS_MIN, Math.round(v))) : agent.thinkTokens || DEFAULT_AGENT_SETTINGS.thinkTokens;
+    agent.thinkTokens = kept;
+    tokens.value = String(kept);
+  });
+  unlimited.addEventListener('change', () => {
+    const v = Number(tokens.value);
+    agent.thinkTokens = unlimited.checked ? 0 : inRange(v) ? v : kept;
+    sync();
+  });
+  sync();
+  return h(
+    'div.agent-think',
+    h('div.agent-think-row', h('label', 'Thinking: at most ', tokens, ' tokens before each step'), h('label.agent-think-unlimited', unlimited, ' No limit')),
+    h('p.muted', "Where the model thinks (Thinking on, or auto where OAIY's engine thinks by default), it stops there and acts. Replies to texts and flows' tasks keep to it too; a call never thinks. A video's script may take four times as much, and a step always keeps room for its answer."),
+  );
 }
 
 /** What the OAIY kind's help says in OAIY's own window: it reaches OAIY as it is, so nothing about letting a site in. */
@@ -527,6 +565,23 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       h(
         'div.agent-settings',
         h('strong', 'Agent'),
+        // The person's own instructions, for their own conversations (never the phone's).
+        h('label.agent-instructions', h('span', 'Your instructions'), (() => {
+          const input = h('textarea', {
+            rows: 4,
+            maxlength: INSTRUCTIONS_MAX,
+            spellcheck: true,
+            placeholder: 'How you like the Agent to work: what to call you, which language to answer in, how much to explain…',
+            oninput: () => {
+              agent.instructions = input.value;
+            },
+          }) as HTMLTextAreaElement;
+          input.value = agent.instructions ?? '';
+          return input;
+        })()),
+        h('p.muted', "For your own conversations with the Agent (your projects, the Front desk, Set up OAIY), after OAIY's own instructions: yours win where they differ on how to work or write. A project can use its own instead (Instructions, beside Thinking, or in the project menu). The phone's calls, texts and flows' tasks never get them."),
+        // How long the model may think before each step, where it thinks: it stops there and acts.
+        thinkSetting(agent),
         // What it does by itself, in a sentence; the two numbers behind it are for someone tuning a small model, and
         // closed until asked for (as a provider's context size and agents are, above).
         h('p.muted', 'A long conversation is shortened by itself: older turns are summarized, recent ones stay word for word.'),

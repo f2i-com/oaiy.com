@@ -1246,7 +1246,7 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       providers: [{ id: 'p-set', type: 'anthropic', name: 'Set', baseUrl: 'https://set.example/v1', modelId: 'model-set', followEngine: true, orgId: 'org-set', serverKind: 'ollama', contextTokens: 32000, parallelAgents: 3 }],
       activeProviderId: 'p-set',
       gate: { mode: 'allowlist', allow: ['set.example'], deny: ['bad.example'] },
-      agent: { compactAt: 0.6, subAgentTokens: 64000, thinking: 'on' as const },
+      agent: { compactAt: 0.6, subAgentTokens: 64000, thinking: 'on' as const, thinkTokens: 4096, instructions: 'set instructions for the agent' },
       media: { baseUrl: 'https://media.set.example/v1', enabled: false, imageModel: 'img-set', videoModel: 'vid-set', speechModel: 'speech-set', musicModel: 'music-set', soundModel: 'sound-set', model3dModel: 'model3d-set' },
       messages: { answer: true, calls: true, callBack: true, instructions: 'set instructions', callInstructions: 'set call instructions', callBackFilter: 'any', callBackLine: 'set line', country: 'NZ' },
     };
@@ -1255,7 +1255,7 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       providers: [{ id: 'p-empty', type: 'openai', name: '', baseUrl: '', modelId: '', followEngine: false, orgId: '', serverKind: '', contextTokens: 0, parallelAgents: 1 }],
       activeProviderId: 'p-empty',
       gate: { mode: 'open', allow: [] as string[], deny: [] as string[] },
-      agent: { compactAt: 0.05, subAgentTokens: 1000, thinking: 'off' as const },
+      agent: { compactAt: 0.05, subAgentTokens: 1000, thinking: 'off' as const, thinkTokens: 0, instructions: '' },
       media: { baseUrl: '', enabled: true, imageModel: '', videoModel: '', speechModel: '', musicModel: '', soundModel: '', model3dModel: '' },
       messages: { answer: false, calls: false, callBack: false, instructions: '', callInstructions: '', callBackFilter: 'answered', callBackLine: '', country: '' },
     };
@@ -1911,7 +1911,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     settings({
       providers: [{ id: 'p1', type: 'openai', name: 'Main', apiKey: KEY, baseUrl: 'https://api.openai.com/v1', contextTokens: 9000 }],
       gate: { mode: 'allowlist', allow: ['a.example'], deny: ['b.example'] },
-      agent: { compactAt: 0.5, subAgentTokens: 5000, thinking: 'auto' },
+      agent: { ...DEFAULT_AGENT_SETTINGS, compactAt: 0.5, subAgentTokens: 5000, thinking: 'auto', thinkTokens: 1024, instructions: 'Call me Sam.' },
       media: { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY, enabled: false, imageModel: 'mine' },
       messages: { ...DEFAULT_MESSAGE_SETTINGS, instructions: 'my own words', callInstructions: 'my call words', answer: false },
     });
@@ -1929,7 +1929,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     expect(s.messages).toMatchObject({ country: 'NZ', instructions: 'my own words', callInstructions: 'my call words', answer: false });
     expect(s.gate).toEqual({ mode: 'blocked', allow: ['a.example'], deny: ['b.example'] });
     expect(s.media).toMatchObject({ baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY, imageModel: 'img-x', enabled: false });
-    expect(s.agent).toEqual({ compactAt: 0.9, subAgentTokens: 5000, thinking: 'off' });
+    expect(s.agent).toEqual({ compactAt: 0.9, subAgentTokens: 5000, thinking: 'off', thinkTokens: 1024, instructions: 'Call me Sam.' });
     expect(s.providers[0]).toMatchObject({ id: 'p1', apiKey: KEY, contextTokens: 9000 });
   });
 
@@ -1945,7 +1945,7 @@ describe('the settings come back key by key, and only what the desktop let throu
     const { target, outcome } = await apply({
       messages: { answer: 'yes', instructions: 5, extra: 'x', callBackFilter: 'sometimes', callBack: true, calls: 1, callBackLine: 'x'.repeat(3000), country: 'AUSTRALIA!' },
       gate: { mode: 'wide-open', allow: ['ok.example', 5, 'x'.repeat(300)], evil: true },
-      agent: { compactAt: 7, subAgentTokens: 12.5, thinking: 'always', extra: 1 },
+      agent: { compactAt: 7, subAgentTokens: 12.5, thinking: 'always', thinkTokens: 100_000, instructions: 7, extra: 1 },
       media: { enabled: 'yes', imageModel: 42, endpoints: { images: 'http://attacker.example' }, imageModels: [{ id: 'x' }] },
       lastProjectId: 'p-evil',
       lastKeptProjectId: 'p-evil',
@@ -1956,11 +1956,32 @@ describe('the settings come back key by key, and only what the desktop let throu
     const s = target.settings as unknown as Record<string, unknown> & Settings;
     expect(s.messages).toEqual({ ...localSettings().messages, callBack: true });
     expect(s.gate).toEqual({ mode: 'allowlist', allow: ['ok.example'], deny: ['b.example'] });
-    expect(s.agent).toEqual({ compactAt: 0.5, subAgentTokens: 5000, thinking: 'auto' });
+    expect(s.agent).toEqual(localSettings().agent);
     expect(s.media).toEqual(localSettings().media);
     expect(s.lastProjectId).toBe('p-kept');
     expect(s.desktop).toEqual({ origin: 'http://127.0.0.1:17972', token: DESKTOP_TOKEN });
     expect(s).not.toHaveProperty('unknownSection');
+  });
+
+  it("keeps the thinking each step may take and the person's own instructions: exported, and taken back of their kind", async () => {
+    // Exported with the rest of the Agent's settings, and a kept project's own instructions with its record.
+    const storage = populated();
+    storage.put('projects/p-kept/project.json', JSON.stringify({ id: 'p-kept', name: 'Kept', created: 1, updated: 2, instructions: { use: 'these', text: 'Use metric units.' }, businessTools: false }));
+    storage.settings = settings({ agent: { ...DEFAULT_AGENT_SETTINGS, thinkTokens: 0, instructions: 'Answer in French.' } });
+    const target = new Collector();
+    await exportAgentStorage(storage, target, { includeKeys: false });
+    expect(JSON.parse(dec.decode(target.entries['idb/settings.json'])).agent).toMatchObject({ thinkTokens: 0, instructions: 'Answer in French.' });
+    expect(JSON.parse(dec.decode(target.entries['opfs/projects/p-kept/project.json']))).toMatchObject({ instructions: { use: 'these', text: 'Use metric units.' }, businessTools: false });
+    // Taken back where the desktop lets them through: no limit, a number in range, words of the person's.
+    const { target: back, outcome } = await apply({ agent: { thinkTokens: 0, instructions: 'Answer in French.' } });
+    expect(outcome.ok).toBe(true);
+    expect(back.settings.agent).toMatchObject({ compactAt: 0.5, thinkTokens: 0, instructions: 'Answer in French.' });
+    expect((await apply({ agent: { thinkTokens: 4096 } })).target.settings.agent).toMatchObject({ thinkTokens: 4096, instructions: 'Call me Sam.' });
+    // Not a budget the dialog could set, nor instructions longer than it takes: what is kept stays.
+    for (const wrong of [100, 255, 32_769, 2048.5, '2048', null]) {
+      const { target: kept } = await apply({ agent: { thinkTokens: wrong, instructions: 'x'.repeat(20_001) } });
+      expect([kept.settings.agent.thinkTokens, kept.settings.agent.instructions], String(wrong)).toEqual([1024, 'Call me Sam.']);
+    }
   });
 
   it('a provider comes in with the fields a provider has and no others, and one of an unknown kind does not come in', async () => {

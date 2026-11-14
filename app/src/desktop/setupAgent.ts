@@ -25,14 +25,25 @@ export const SETUP_INSTRUCTIONS = [
 export const PROJECT_CONTROL_NOTE =
   'OAIY itself: the OAIY tools (status, plugins_list, services_list, models_list and the rest) check and change OAIY on this computer: its engines and models, services, plugins and their settings, flows, and the calendar\'s settings. Use them when your person asks about or for OAIY itself. Call status first: when agentMayChange is false, they have switched off your changes, so do not try any; tell them the switch is "Let the Agent set up and change OAIY for you", in OAIY\'s Settings → Agent. For setting OAIY up step by step, the "Set up OAIY" conversation (in the project menu) is the place.';
 
+/**
+ * A project whose business tools are off (its Instructions dialog): OAIY's tools are there, but none of the business's
+ * (the calendar's settings, the contacts, the phone's settings and commands, the FormLogic link, the logs).
+ */
+export const PLAIN_CONTROL_NOTE =
+  'OAIY itself: the OAIY tools (status, plugins_list, services_list, models_list and the rest) check and change OAIY on this computer: its engines and models, services, plugins and flows. Use them when your person asks about or for OAIY itself. The business\'s tools are off in this project: nothing here reads or changes its calendar, contacts or phone; for those, your person turns them on in the project\'s Instructions. Call status first: when agentMayChange is false, they have switched off your changes, so do not try any; tell them the switch is "Let the Agent set up and change OAIY for you", in OAIY\'s Settings → Agent. For setting OAIY up step by step, the "Set up OAIY" conversation (in the project menu) is the place.';
+
 /** The Front desk's runner: it may look at OAIY, not change it. */
 export const RUNNER_CONTROL_NOTE =
   'You can look at how OAIY is set up (status and the other OAIY read tools), but not change it: changes to OAIY are made from your person\'s "Set up OAIY" conversation or a project.';
 
-/** What a conversation of `kind` is told about OAIY's tools, when it has them. */
-export function controlNote(kind: AgentKind): string {
+/**
+ * What a conversation of `kind` is told about OAIY's tools, when it has them: `control` as it is offered them
+ * (instructions.ts businessFor): all, all but the business's, or none (an incognito project, told nothing of them).
+ */
+export function controlNote(kind: AgentKind, control: 'all' | 'plain' | 'none' = 'all'): string {
   if (kind === 'setup') return SETUP_INSTRUCTIONS;
-  if (kind === 'project') return PROJECT_CONTROL_NOTE;
+  if (control === 'none') return '';
+  if (kind === 'project') return control === 'plain' ? PLAIN_CONTROL_NOTE : PROJECT_CONTROL_NOTE;
   if (kind === 'runner') return RUNNER_CONTROL_NOTE;
   return '';
 }

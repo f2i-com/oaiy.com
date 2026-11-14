@@ -27,6 +27,8 @@ import { imageMimeFor, viewImage, type ImagePart } from './images';
 export type AgentEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
+  /** How far the model has thought (OAIY's engine): tokens so far, the most it may (null: no limit), and whether it is done. */
+  | { type: 'thinking_count'; used: number; budget: number | null; done: boolean }
   /** What the model is about to be sent for its next step, to show: the system prompt, the conversation as sent, the tools' names. */
   | { type: 'prompt'; system: string; turns: Turn[]; tools: string[] }
   | { type: 'tool_start'; index: number; name: string }
@@ -226,6 +228,33 @@ const VIDEO_SCRIPT_BRIEF = `- Every video is made from a plan (update_plan first
 /** For the main agent of a video of several scenes: each scene made by a sub-agent, so its own conversation stays short (and each step quick). */
 const VIDEO_DELEGATE_GUIDE = `- A video of two or more scenes: once script.md, the character and prop references and the voices are made, hand the scenes to sub-agents with delegate, one task per scene, in the scenes' order (their clips are made one after another). Each task says: make scene N of video/NAME/script.md (its background, then shot by shot its start frame, end frame and clip, as the script and the steps above say), the reference images and voices to use (their paths), the file names to write, not to change the script or any other scene, and to report the files it made. Then check the reports, make again what a task did not finish (yourself, or in another task), and join the clips. A flagged picture you fix yourself.
 `;
+
+/**
+ * The person's own instructions as the system prompt ends with them: after everything OAIY says, marked as theirs,
+ * and winning where the two differ on how to work or write; never over what the tools do or the rules that keep
+ * people and their files safe.
+ */
+export function personInstructionsText(text: string): string {
+  return `The user's own instructions for you follow, as they wrote them. Follow them throughout. Where they differ from the instructions above on how to work or how to write (style, tone, language, length, format), theirs win. They do not change what your tools do or how to use them, nor the rules above that keep the user, their files and other people safe.
+<user_instructions>
+${text}
+</user_instructions>`;
+}
+
+/**
+ * The person's own instructions as a sub-agent is given them: what it writes, and how, follows them; but it works for
+ * the main agent and can ask the person nothing, so one that asks to be checked with first, or waited for, is taken as
+ * "do the task, and say in the report what they would need to agree to" (it would otherwise stop and ask nobody).
+ */
+export function helperInstructionsText(text: string): string {
+  return `The user gave the main agent these instructions of their own. Follow them in what you write and how (style, tone, language, length, format). You work for the main agent and cannot ask the user anything: where one of them asks you to check with the user first or to wait for them, do your task without asking, and say in your report what the user would need to agree to. They do not change what your tools do, nor the rules above that keep the user, their files and other people safe.
+<user_instructions>
+${text}
+</user_instructions>`;
+}
+
+/** A step asked to think harder (a video's script) may think this many times the person's budget. */
+export const HARDER_THINKING = 4;
 
 /** How a message the user sent while the agent worked reads to it. */
 const DURING_NOTE = '[The user sent this while you were working. Read it now and act on it as soon as you can: if it changes what you are doing, change course; if it asks a question, answer it and carry on.]';
@@ -471,6 +500,17 @@ export interface AgentOptions {
    * between steps (the chat's thinking chip), undefined leaving it to the engine (OAIY's Think by default).
    */
   reasoning?: Reasoning | (() => Reasoning | undefined);
+  /**
+   * The most tokens the model may think before a step, where it thinks (OAIY's engine; 0: no limit), as the person set
+   * it: a step asked to think harder (a video's script) may take HARDER_THINKING times as many, and none more than
+   * half of what the step may write, so its answer always has room. Undefined: the engine's own budget.
+   */
+  thinkTokens?: () => number;
+  /**
+   * The person's own instructions for this conversation (theirs, or its project's instead), as they are now: last in
+   * the system prompt, marked as theirs (`personInstructionsText`). Only the person's own conversations have them.
+   */
+  personInstructions?: () => string;
   /**
    * A conversation with a person (a phone call, a text thread): a reply in words is a whole
    * answer, so it is never asked to start work or carry on (on a call those asks were spoken aloud).
@@ -1172,9 +1212,13 @@ export class Agent {
     const request = read.includes('video') && !this.options.role ? this.requestText() : '';
     const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
     const base = discovering ? FOUND_PROMPT : `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}`;
+    // (the person's own last: they come after everything OAIY says, and say they win where the two differ)
+    const own = this.options.personInstructions?.().trim() ?? '';
     return `${base}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
 
-${this.instructions}` : ''}`;
+${this.instructions}` : ''}${own ? `
+
+${personInstructionsText(own)}` : ''}`;
   }
 
   /** The prompt's fixed part: the system prompt and the tool definitions. */
@@ -1280,6 +1324,8 @@ ${this.instructions}` : ''}`;
     signal?: AbortSignal,
   ): Promise<{ ok: boolean; text: string; files: string[] }> {
     const files = new Set<string>();
+    // The person's own instructions, framed for a helper that cannot ask them anything (helperInstructionsText).
+    const own = this.options.personInstructions?.().trim() ?? '';
     const child = new Agent({
       ...this.options,
       // (every file it wrote, whichever tool wrote it: code it ran, a picture it made, as well as write_file's)
@@ -1289,7 +1335,8 @@ ${this.instructions}` : ''}`;
       provider: () => provider,
       tools: this.usable.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
       guides: [...this.loadedGuides()],
-      role: `${SUB_AGENT_ROLE}\n\nYour task: ${task.title}`,
+      role: `${SUB_AGENT_ROLE}\n\nYour task: ${task.title}${own ? `\n\n${helperInstructionsText(own)}` : ''}`,
+      personInstructions: undefined,
       maxSteps: SUB_AGENT_STEPS,
       maxContext: contextTokens,
       subAgents: undefined,
@@ -1327,16 +1374,27 @@ ${this.instructions}` : ''}`;
   }
 
   /**
-   * Whether the model is working on a video's script: its plan's current step
-   * is about the script, or its last step wrote or read a script.md. It then
-   * thinks harder first, for a more complete story.
+   * What the model is asked of its thinking before this step, which may write `reply` tokens: how hard (as its
+   * conversation is set: the same at every step, so the engine reads on from the prompt it holds, where an effort it
+   * writes into the prompt's start would change it), and the most tokens it may think where it thinks (the person's
+   * budget, HARDER_THINKING times it on a video's script, and never more than half the reply, so the answer has room:
+   * a thought the length of the reply left none, and the step came back empty).
    */
-  /** How hard the model thinks before this step: harder on a video's script, never where thinking was turned off. */
-  private reasoning(): Reasoning | undefined {
+  private thinking(reply: number): { reasoning?: Reasoning; thinkBudget?: number } {
     const chosen = typeof this.options.reasoning === 'function' ? this.options.reasoning() : this.options.reasoning;
-    return chosen !== 'none' && this.writingScript() ? 'high' : chosen;
+    if (chosen === 'none') return { reasoning: 'none' };
+    const tokens = this.options.thinkTokens?.();
+    if (tokens === undefined || !Number.isFinite(tokens) || tokens < 0) return chosen ? { reasoning: chosen } : {};
+    const most = Math.max(1, Math.floor(reply / 2));
+    const asked = tokens === 0 ? most : this.writingScript() ? tokens * HARDER_THINKING : tokens;
+    return { ...(chosen ? { reasoning: chosen } : {}), thinkBudget: Math.min(asked, most) };
   }
 
+  /**
+   * Whether the model is working on a video's script: its plan's current step
+   * is about the script, or its last step wrote or read a script.md. It may
+   * then think longer first, for a more complete story.
+   */
   private writingScript(): boolean {
     if (!this.usable.some((t) => t.name === 'generate_video')) return false;
     const active = this.plan?.items.find((i) => i.status === 'active');
@@ -1496,6 +1554,8 @@ ${this.instructions}` : ''}`;
       provider: () => provider,
       tools: [...this.usable.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
       role: REVIEWER_ROLE,
+      // It judges a picture against its script and references, which carry what the person asked for.
+      personInstructions: undefined,
       maxSteps: REVIEW_STEPS,
       keepImages: REVIEW_KEEP_IMAGES,
       viewSize: REVIEW_VIEW_SIZE,
@@ -1671,7 +1731,9 @@ ${this.instructions}` : ''}`;
     let summary = '';
     for (const chunk of chunks) {
       const prompt = `${summary ? `The summary so far:\n${summary}\n\n` : ''}The conversation to ${summary ? 'add to it' : 'summarize'}:\n${chunk}\nWrite the ${summary ? 'updated ' : ''}summary.`;
-      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
+      // (no thinking first: an engine that thinks by default spent the summary's whole reply thinking, and it came back
+      // empty)
+      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), reasoning: 'none', sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
       if (!reply.text.trim()) throw new Error('the summary came back empty');
       summary = reply.text.trim();
     }
@@ -1712,13 +1774,14 @@ ${this.instructions}` : ''}`;
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
-          reasoning: this.reasoning(),
+          ...this.thinking(b.reply),
           sink: {
             text: (delta) => {
               this.streamed += delta;
               emit({ type: 'text', delta });
             },
             thinking: (delta) => emit({ type: 'thinking', delta }),
+            thinkingCount: (used, budget, done) => emit({ type: 'thinking_count', used, budget, done }),
             toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
             toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
             draft: (text, start) => emit({ type: 'tool_draft', text, start }),
@@ -1825,7 +1888,8 @@ ${this.instructions}` : ''}`;
       await sendTurn(provider, this.systemPrompt, sent, this.listed, {
         maxOutputTokens: WARM_TOKENS,
         signal: signal ? AbortSignal.any([signal, read.signal]) : read.signal,
-        reasoning: this.reasoning(),
+        // (asked as the step will be, so the prompt read is the one it is sent)
+        ...this.thinking(b.reply),
         sink: { text: done, thinking: done, toolStart: done, toolArgs: done, draft: done },
       });
     } catch {

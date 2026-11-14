@@ -34,6 +34,8 @@ export interface StreamSink {
   draft?(text: string, start: boolean): void;
   /** OAIY: how far the model has read the prompt (`done` of `total` tokens), `reused` read on from what it kept. */
   reading?(done: number, total: number, reused: number | null): void;
+  /** OAIY: the tokens the model has thought so far, of the most it may (`budget`; null: no limit), and whether its thought is over. */
+  thinkingCount?(used: number, budget: number | null, done: boolean): void;
 }
 
 function parseEvent(event: SSEEvent): Record<string, unknown> | null {
@@ -211,6 +213,11 @@ export class OpenAIStream {
     if (isRecord(payload.oaiy_progress)) {
       const p = payload.oaiy_progress;
       if (typeof p.prompt_done === 'number' && typeof p.prompt_total === 'number') this.sink?.reading?.(p.prompt_done, p.prompt_total, typeof p.cached_tokens === 'number' ? p.cached_tokens : null);
+    }
+    // OAIY counts the model's thought against its budget as it thinks, and says when the thought is over.
+    if (isRecord(payload.oaiy_thinking)) {
+      const t = payload.oaiy_thinking;
+      if (typeof t.used === 'number' && Number.isFinite(t.used)) this.sink?.thinkingCount?.(t.used, typeof t.budget === 'number' && Number.isFinite(t.budget) ? t.budget : null, t.done === true);
     }
     // The usage chunk (stream_options.include_usage) has an empty choices list.
     if (isRecord(payload.usage)) this.usage = payload.usage;
