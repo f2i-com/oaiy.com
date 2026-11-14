@@ -24,9 +24,9 @@ import { installBridge } from './softn-bridge/install.mjs';
 import { downloadReleaseFile } from './release-download.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.40';
+const RELEASE = 'v0.0.41';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '1555b931b4dc0b2a23338e6372b0c5b135b0b7bb42831baaf5692f8c6d6ddca0';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '696a67b875af1a07780bd058b68623af66d03afbfed7e4d3a943cad4b7b2bb2e';
 const PREFIX = 'hosted-runtime/';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
