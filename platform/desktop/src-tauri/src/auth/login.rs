@@ -1520,10 +1520,7 @@ impl LoginState {
         if self.owner_lock().is_some() {
             return None;
         }
-        Some(format!(
-            "oaiy-server: no owner login yet. Run 'sudo -u oaiy oaiy-server auth setup-code' and open {}/setup, or run 'sudo -u oaiy oaiy-server auth init' to set the password on the console.",
-            self.dash_origin
-        ))
+        Some(banner_text(&self.dash_origin, cfg!(windows)))
     }
 
     /// What the console's `status` says about the login: no secret in it.
@@ -1677,6 +1674,21 @@ impl LoginState {
             json!({ "by": "console", "sessions": revoked.len(), "devices": removed }),
         );
         (revoked.len(), removed)
+    }
+}
+
+/// What the start banner says to do when there is no owner, for this platform. A Linux install from the systemd unit runs the
+/// server as the `oaiy` user, whose data folder the console must open as that user (`sudo -u oaiy`); on Windows there is no such
+/// user and no sudo, and the console is run by the Windows user the server runs as.
+fn banner_text(dash_origin: &str, windows: bool) -> String {
+    if windows {
+        format!(
+            "oaiy-server: no owner login yet. In a terminal, as the Windows user this server runs as, run 'oaiy-server auth setup-code' and open {dash_origin}/setup, or run 'oaiy-server auth init' there to set the password on the console."
+        )
+    } else {
+        format!(
+            "oaiy-server: no owner login yet. Run 'sudo -u oaiy oaiy-server auth setup-code' and open {dash_origin}/setup, or run 'sudo -u oaiy oaiy-server auth init' to set the password on the console."
+        )
     }
 }
 
@@ -1913,5 +1925,21 @@ mod tests {
         let a = c.now_ms();
         let b = c.now_ms();
         assert!(a >= 1 && b >= a);
+    }
+
+    #[test]
+    fn the_start_banner_gives_the_advice_that_fits_the_platform() {
+        let origin = "http://127.0.0.1:17972";
+        let windows = banner_text(origin, true);
+        // Windows has no sudo and no `oaiy` user: the console is run by the user the server runs as.
+        assert!(!windows.contains("sudo") && !windows.contains("-u oaiy"), "{windows}");
+        assert!(windows.contains("'oaiy-server auth setup-code'") && windows.contains("'oaiy-server auth init'"), "{windows}");
+        assert!(windows.contains("http://127.0.0.1:17972/setup") && windows.contains("Windows user"), "{windows}");
+        // A Linux install from the systemd unit keeps its advice.
+        let unix = banner_text(origin, false);
+        assert!(unix.contains("'sudo -u oaiy oaiy-server auth setup-code'") && unix.contains("'sudo -u oaiy oaiy-server auth init'"), "{unix}");
+        assert!(unix.contains("http://127.0.0.1:17972/setup"), "{unix}");
+        // This build's own banner is the one for its platform.
+        assert_eq!(banner_text(origin, cfg!(windows)).contains("sudo"), !cfg!(windows));
     }
 }

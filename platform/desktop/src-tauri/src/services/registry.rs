@@ -600,6 +600,45 @@ pub struct Registry {
     /// Ids being uninstalled: their files are removed outside the lock ([`Registry::begin_uninstall`]), and nothing
     /// starts, installs or deletes them meanwhile.
     uninstalling: std::collections::HashSet<String>,
+    /// The processes a stop killed that had not exited when it stopped waiting for them, each reaped by a thread of its own
+    /// ([`kill_tree_and_reap`]): what an update waits for before the installer writes over their programs
+    /// ([`Registry::still_exiting`]).
+    exiting: Reaping,
+}
+
+/// A process OAIY killed that had not exited when the stop stopped waiting for it ([`REAP_GRACE`]): a thread of its own goes on
+/// waiting ([`kill_tree_and_reap`]), and this says when that wait has returned. Until then the process may still hold its program's
+/// file, which an update's installer cannot write over (Windows).
+#[derive(Clone, Debug)]
+pub struct StillExiting {
+    /// The service (or its install) and the process, for the log: "oaiy-voice (pid 4242)".
+    pub what: String,
+    reaped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StillExiting {
+    /// Whether it has exited: its reaping thread's wait returned.
+    pub fn gone(&self) -> bool {
+        self.reaped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The [`StillExiting`] the stops have left. What has exited is dropped whenever another is noted or they are asked for, so the
+/// list is never longer than what is being reaped.
+#[derive(Debug, Default)]
+struct Reaping(Vec<StillExiting>);
+
+impl Reaping {
+    /// What a kill left exiting, if anything ([`kill_tree_and_reap`]'s answer).
+    fn note(&mut self, still: Option<StillExiting>) {
+        self.0.retain(|e| !e.gone());
+        self.0.extend(still);
+    }
+
+    fn now(&mut self) -> Vec<StillExiting> {
+        self.0.retain(|e| !e.gone());
+        self.0.clone()
+    }
 }
 
 /// Read the explicit start-with-the-app list from a data dir.
@@ -755,20 +794,32 @@ fn is_safe_script_name(name: &str) -> bool {
 /// installs/starts it).
 fn reserved_script_names() -> &'static std::collections::HashSet<String> {
     static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
-    SET.get_or_init(|| {
-        let mut s = std::collections::HashSet::new();
-        for (name, _) in BUILTIN_SCRIPTS {
-            s.insert((*name).to_string());
+    SET.get_or_init(|| builtin_script_bodies().keys().cloned().collect())
+}
+
+/// What each name in [`reserved_script_names`] holds as compiled in: a built-in script's body, or the file a built-in template
+/// bundles.
+fn builtin_script_bodies() -> &'static HashMap<String, String> {
+    static BODIES: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    BODIES.get_or_init(|| {
+        let mut bodies = HashMap::new();
+        for (name, body) in BUILTIN_SCRIPTS {
+            bodies.insert((*name).to_string(), (*body).to_string());
         }
         for (_, body) in BUILTIN_TEMPLATES {
             if let Ok(t) = serde_json::from_str::<ServiceTemplate>(body) {
-                for k in t.files.keys() {
-                    s.insert(k.clone());
-                }
+                bodies.extend(t.files);
             }
         }
-        s
+        bodies
     })
+}
+
+/// Whether `body` is what the built-in seeds as `name` (line endings and the space around it aside): the built-in template's
+/// own copy of its file, read back from its seeded template at every start.
+fn is_builtin_body(name: &str, body: &str) -> bool {
+    let plain = |text: &str| text.replace("\r\n", "\n").trim().to_string();
+    builtin_script_bodies().get(name).is_some_and(|builtin| plain(builtin) == plain(body))
 }
 
 /// Seed every built-in template's bundled `files` from the COMPILED-IN source (trusted), so the
@@ -796,16 +847,25 @@ fn seed_builtin_template_files(scripts_dir: &Path) {
 /// (so a malicious import can't overwrite a trusted service's script — cross-service RCE) and
 /// any non-reserved name already owned by a DIFFERENT package (tracked via a `.<name>.owner`
 /// sidecar). Built-in templates' own files are seeded by `seed_builtin_template_files`, not here.
-fn materialize_package_files(scripts_dir: &Path, template_id: &str, files: &HashMap<String, String>) {
+///
+/// The built-in template's own files come through here too, at every start (its seeded copy in
+/// `templates/` carries them): those are what the seed wrote from the compiled-in source, so
+/// nothing is refused and nothing is said. What it refuses it logs, and answers.
+fn materialize_package_files(scripts_dir: &Path, template_id: &str, files: &HashMap<String, String>) -> Vec<String> {
+    let mut refused = Vec::new();
+    let mut refuse = |why: String| {
+        log::warn!("{why}");
+        refused.push(why);
+    };
     for (name, body) in files {
         if !is_safe_script_name(name) {
-            log::warn!("skipping package file with unsafe/hidden name: {name}");
+            refuse(format!("skipping package file with unsafe/hidden name: {name}"));
             continue;
         }
         if reserved_script_names().contains(name) {
-            log::warn!(
-                "template '{template_id}': refusing to overwrite built-in script '{name}'"
-            );
+            if !is_builtin_body(name, body) {
+                refuse(format!("template '{template_id}': refusing to overwrite built-in script '{name}'"));
+            }
             continue;
         }
         let target = scripts_dir.join(name);
@@ -819,9 +879,7 @@ fn materialize_package_files(scripts_dir: &Path, template_id: &str, files: &Hash
                 .map(str::trim)
                 != Some(template_id)
         {
-            log::warn!(
-                "template '{template_id}': refusing to overwrite script '{name}' owned by another package"
-            );
+            refuse(format!("template '{template_id}': refusing to overwrite script '{name}' owned by another package"));
             continue;
         }
         let snap = scripts_dir.join(format!(".{name}.seed"));
@@ -832,6 +890,7 @@ fn materialize_package_files(scripts_dir: &Path, template_id: &str, files: &Hash
             Err(e) => log::warn!("could not materialize package file {name}: {e}"),
         }
     }
+    refused
 }
 
 /// What the startup cleanup did with the templates of retired services.
@@ -1059,6 +1118,7 @@ impl Registry {
             template_errors,
             template_probes: HashMap::new(),
             uninstalling: Default::default(),
+            exiting: Reaping::default(),
         };
         registry.forget_retired_services();
         Ok(registry)
@@ -1082,6 +1142,7 @@ impl Registry {
             template_errors: Vec::new(),
             template_probes: HashMap::new(),
             uninstalling: Default::default(),
+            exiting: Reaping::default(),
         }
     }
 
@@ -1939,7 +2000,7 @@ impl Registry {
                 // Bounded: we're about to bind the same port, so it's worth
                 // waiting for the old server to actually go — but never
                 // forever (see kill_tree_and_reap).
-                None => kill_tree_and_reap(&old, RESPAWN_REAP_GRACE),
+                None => self.exiting.note(kill_tree_and_reap(&old, RESPAWN_REAP_GRACE, id)),
                 Some(_code) => { /* already exited — pid may be recycled, do not touch it */ }
             }
         }
@@ -1996,7 +2057,7 @@ impl Registry {
             // subprocesses); a plain kill of the direct child would orphan
             // them, so kill the whole process tree first, then reap the direct
             // child and clear the slot.
-            kill_tree_and_reap(&runner, REAP_GRACE);
+            self.exiting.note(kill_tree_and_reap(&runner, REAP_GRACE, id));
         }
         // Stop during an in-flight install: the live process tree is owned by
         // svc.installer (the script + its pip/curl/git children), NOT runner — so
@@ -2007,7 +2068,7 @@ impl Registry {
         // install, the exact collision start()/install_streaming() guard against.
         if svc.status == ServiceStatus::Installing {
             if let Some(installer) = &svc.installer {
-                kill_tree_and_reap(installer, REAP_GRACE);
+                self.exiting.note(kill_tree_and_reap(installer, REAP_GRACE, &format!("the install of {id}")));
             }
         }
         svc.set_status(ServiceStatus::Stopped, None);
@@ -2363,7 +2424,7 @@ impl Registry {
                 if let Some(old) = svc.runner.take() {
                     // The installer is about to overwrite the binary/venv this
                     // process has open, so wait for it — bounded, as in start().
-                    kill_tree_and_reap(&old, RESPAWN_REAP_GRACE);
+                    self.exiting.note(kill_tree_and_reap(&old, RESPAWN_REAP_GRACE, id));
                 }
             }
         }
@@ -2452,7 +2513,7 @@ impl Registry {
             return Err("no install is in progress for this service".into());
         }
         if let Some(installer) = &svc.installer {
-            kill_tree_and_reap(installer, REAP_GRACE);
+            self.exiting.note(kill_tree_and_reap(installer, REAP_GRACE, &format!("the install of {id}")));
         }
         svc.set_status(ServiceStatus::Stopped, Some("install cancelled".into()));
         Ok(())
@@ -2470,10 +2531,19 @@ impl Registry {
             // build running unmanaged.
             if let Some(svc) = self.services.get_mut(&id) {
                 if let Some(installer) = svc.installer.take() {
-                    kill_tree_and_reap(&installer, REAP_GRACE);
+                    self.exiting.note(kill_tree_and_reap(&installer, REAP_GRACE, &format!("the install of {id}")));
                 }
             }
         }
+    }
+
+    /// What the stops killed that had not exited yet when they stopped waiting ([`REAP_GRACE`]), each still being reaped by a
+    /// thread of its own; those that have exited since are forgotten. An update waits for these (bounded) before it starts the
+    /// installer, which cannot write over the program of a process that has not exited: the voice server, letting go of two
+    /// speech models on the GPU, outlived the stop's quarter of a second, and the installer stopped on its `oaiy-voice.exe`.
+    /// Read without waiting: the wait is the caller's, outside this registry's lock.
+    pub fn still_exiting(&mut self) -> Vec<StillExiting> {
+        self.exiting.now()
     }
 
     /// Create or replace a service template from a UI form. Writes to
@@ -2952,39 +3022,70 @@ fn status_words(svc: &ServiceRuntime) -> &'static str {
 /// loopback API — `/api/health` included, though it needs no lock — had no
 /// thread left to answer on. Bound the wait instead; the same reasoning the
 /// Unix branch of `kill_process_tree` above already spells out.
-fn kill_tree_and_reap(runner: &Arc<Runner>, grace: Duration) {
-    kill_process_tree(runner.pid);
+///
+/// A process still there at the end of `grace` is reaped by a thread of its
+/// own, and what is returned says when it has exited: `what` names it (the
+/// service), for the log of an update that waits for it before its installer
+/// writes over the program ([`Registry::still_exiting`]). None when it exited
+/// within the grace, or there was nothing left to wait on.
+fn kill_tree_and_reap(runner: &Arc<Runner>, grace: Duration, what: &str) -> Option<StillExiting> {
+    kill_tree_and_reap_with(runner, grace, what, kill_process_tree)
+}
+
+/// [`kill_tree_and_reap`], with the tree's kill given (the tests see what it was asked to kill).
+fn kill_tree_and_reap_with(runner: &Arc<Runner>, grace: Duration, what: &str, kill: impl Fn(u32)) -> Option<StillExiting> {
+    // Killed by its pid only while the process is still ours, the guard `start` and `repair` keep: one already reaped
+    // (an install kept for its logs, a service that crashed) has given its pid back, the system may have handed it to
+    // an unrelated program, and `taskkill /T /F` by that pid would end that program and everything it started. (On
+    // Unix the kill is of the process group, whose id is free again once the group is gone.)
+    if runner.check_exited().is_some() {
+        return None;
+    }
+    kill(runner.pid);
     // check_exited() is a non-blocking try_wait that also reaps, so the normal
     // case — the child is gone a few ms after the kill — never reaches the
     // handoff below and costs one poll.
     if wait_exited_bounded(grace, || runner.check_exited().is_some()) {
-        return;
+        return None;
     }
     // Still there. Move the `Child` OUT of the runner rather than handing the
     // Arc to a thread and calling `Runner::stop`: stop() holds the child mutex
     // across its untimed wait(), so a stubborn process would park every later
     // check_exited() / is_alive() on that mutex too — including stop_all()'s
     // second pass over an installer it has already killed once.
-    let child = runner.child.lock().ok().and_then(|mut g| g.take());
-    if let Some(mut child) = child {
-        // `Builder::spawn` rather than `thread::spawn`, whose Err is a PANIC.
-        // This runs with the global registry Mutex held by an axum handler, and
-        // a panic there POISONS it — after which every `registry.lock()` in
-        // http.rs returns Err and all service routes fail for the rest of the
-        // process. The slow path exists precisely for a machine under memory
-        // pressure, which is also when the OS is most likely to refuse a
-        // thread, so the two coincide. Failing to spawn leaks one Child; that
-        // is enormously better than bricking the registry.
-        let spawned = std::thread::Builder::new()
-            .name("oaiy-reap".into())
-            .spawn(move || {
-                let _ = child.kill();
-                // Reap so we don't leak a zombie. This is the call that may
-                // never return, which is why it isn't on the caller's thread.
-                let _ = child.wait();
-            });
-        if let Err(e) = spawned {
-            log::warn!("could not spawn a reaper thread for pid {}: {e}", runner.pid);
+    let child = runner.child.lock().ok().and_then(|mut g| g.take())?;
+    reap_on_its_own_thread(child, &format!("{what} (pid {})", runner.pid), |child| {
+        let _ = child.kill();
+        // Reap so we don't leak a zombie. This is the call that may
+        // never return, which is why it isn't on the caller's thread.
+        let _ = child.wait();
+    })
+}
+
+/// `reap` (the kill and the wait) on a thread of its own, and what says when it has returned. None, with a line in the log, when
+/// no thread could be had.
+fn reap_on_its_own_thread(mut child: std::process::Child, what: &str, reap: impl FnOnce(&mut std::process::Child) + Send + 'static) -> Option<StillExiting> {
+    let reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = reaped.clone();
+    // `Builder::spawn` rather than `thread::spawn`, whose Err is a PANIC.
+    // This runs with the global registry Mutex held by an axum handler, and
+    // a panic there POISONS it — after which every `registry.lock()` in
+    // http.rs returns Err and all service routes fail for the rest of the
+    // process. The slow path exists precisely for a machine under memory
+    // pressure, which is also when the OS is most likely to refuse a
+    // thread, so the two coincide. Failing to spawn leaks one Child; that
+    // is enormously better than bricking the registry.
+    let spawned = std::thread::Builder::new()
+        .name("oaiy-reap".into())
+        .spawn(move || {
+            reap(&mut child);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    match spawned {
+        Ok(_) => Some(StillExiting { what: what.to_string(), reaped }),
+        Err(e) => {
+            log::warn!("could not spawn a reaper thread for {what}: {e}");
+            None
         }
     }
 }
@@ -3651,6 +3752,38 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
     }
 
     #[test]
+    fn a_start_says_nothing_about_the_built_in_templates_own_files_and_still_refuses_another_body() {
+        // At every start the built-in template is loaded from its seeded copy in templates/, which carries its two install scripts:
+        // the very files the seed has just written from the compiled-in source. It said "refusing to overwrite built-in script"
+        // for each, twice a start, from a fresh folder on.
+        let data = std::env::temp_dir().join(format!("oaiy-seed-quiet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let registry = super::Registry::init(data.clone(), data.join("models"), Vec::new()).expect("a fresh folder");
+        drop(registry);
+        let scripts = data.join("scripts");
+        for (file, body) in super::BUILTIN_TEMPLATES {
+            let shipped: super::ServiceTemplate = serde_json::from_str(body).unwrap();
+            // As init reads it: the seeded copy on disk.
+            let seeded: super::ServiceTemplate = serde_json::from_str(&std::fs::read_to_string(data.join("templates").join(file)).unwrap()).unwrap();
+            assert!(!seeded.files.is_empty(), "{file} carries its scripts");
+            let refused = super::materialize_package_files(&scripts, &seeded.id, &seeded.files);
+            assert!(refused.is_empty(), "{file}: {refused:?}");
+            for (name, script) in &shipped.files {
+                let on_disk = std::fs::read_to_string(scripts.join(name)).unwrap();
+                assert_eq!(on_disk.replace("\r\n", "\n").trim(), script.replace("\r\n", "\n").trim(), "{name} is the built-in's");
+            }
+            // A template that names one of those files with another body is refused, and says so; the built-in's file stays.
+            let (name, _) = shipped.files.iter().next().unwrap();
+            let mut edited = shipped.files.clone();
+            edited.insert(name.clone(), "Write-Output 'not the built-in'".into());
+            let refused = super::materialize_package_files(&scripts, &shipped.id, &edited);
+            assert_eq!(refused, [format!("template '{}': refusing to overwrite built-in script '{name}'", shipped.id)]);
+            assert!(!std::fs::read_to_string(scripts.join(name)).unwrap().contains("not the built-in"));
+        }
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
     fn installed_marker_gates_installed_over_run_executable() {
         let data = std::env::temp_dir().join(format!("oaiy-marker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
@@ -3787,7 +3920,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         );
 
         let started = Instant::now();
-        super::kill_tree_and_reap(&runner, super::REAP_GRACE);
+        let still = super::kill_tree_and_reap(&runner, super::REAP_GRACE, "a sleeper");
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(2),
@@ -3797,6 +3930,146 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
             !runner.is_alive(),
             "the child slot must be empty on return, either reaped or handed off"
         );
+        // Handed off: its reaper says when it has gone, and it does go.
+        if let Some(still) = still {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !still.gone() {
+                assert!(Instant::now() < until, "{} was never reaped", still.what);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// A service's runner, a real child of this test: `cmd /C <windows…>` on Windows, `sh -c <unix>` elsewhere.
+    fn runner_for(windows: &[&str], unix: &str) -> Arc<super::Runner> {
+        let (command, args) = if cfg!(windows) {
+            (super::system32_exe("cmd.exe"), std::iter::once("/C").chain(windows.iter().copied()).map(str::to_string).collect())
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), unix.to_string()])
+        };
+        let env = std::collections::HashMap::new();
+        Arc::new(super::Runner::spawn(super::SpawnConfig { command: &command, args: &args, env: &env, cwd: None, stdin_pipe: false }).expect("spawn a child"))
+    }
+
+    #[test]
+    fn a_process_already_reaped_is_never_killed_by_its_old_pid() {
+        // An install kept for its logs, or a service that crashed: reaped, so its pid is the system's again, and may be an
+        // unrelated program's by the time an update's stop comes round. Nothing is killed by it.
+        let done = runner_for(&["exit", "0"], "exit 0");
+        let until = Instant::now() + Duration::from_secs(10);
+        while done.check_exited().is_none() {
+            assert!(Instant::now() < until, "a child that exits at once never did");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let asked = std::sync::Mutex::new(Vec::<u32>::new());
+        let still = super::kill_tree_and_reap_with(&done, super::REAP_GRACE, "an install kept for its logs", |pid| asked.lock().unwrap().push(pid));
+        assert!(still.is_none(), "nothing of it is left to wait for");
+        assert!(asked.lock().unwrap().is_empty(), "its old pid {} was killed: {:?}", done.pid, asked.lock().unwrap());
+
+        // One still running is ended by its pid, as before.
+        let live = runner_for(&["ping", "-n", "10", "127.0.0.1"], "sleep 10");
+        let asked = std::sync::Mutex::new(Vec::<u32>::new());
+        let still = super::kill_tree_and_reap_with(&live, super::REAP_GRACE, "a sleeper", |pid| {
+            asked.lock().unwrap().push(pid);
+            super::kill_process_tree(pid);
+        });
+        assert_eq!(*asked.lock().unwrap(), [live.pid]);
+        if let Some(still) = still {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !still.gone() {
+                assert!(Instant::now() < until, "{} was never reaped", still.what);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// A long-lived child of this test: `ping` for about `seconds` on Windows, `sleep` elsewhere.
+    fn sleeper(seconds: u32) -> std::process::Child {
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new(super::system32_exe("PING.EXE"));
+            c.args(["-n", &(seconds + 1).to_string(), "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg(seconds.to_string());
+            c
+        };
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        command.spawn().expect("spawn a sleeper")
+    }
+
+    #[test]
+    fn a_process_still_exiting_when_the_stop_stopped_waiting_says_when_it_has_exited() {
+        // The voice server killed by a stop, still letting go of its models on the GPU when the stop's quarter of a second is up: its
+        // reaper's kill and wait take a while. Here the wait is held 300 ms before it kills, which is that while.
+        let child = sleeper(30);
+        let pid = child.id();
+        let still = super::reap_on_its_own_thread(child, &format!("oaiy-voice (pid {pid})"), |child| {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = child.kill();
+            let _ = child.wait();
+        })
+        .expect("a reaper thread");
+        assert_eq!(still.what, format!("oaiy-voice (pid {pid})"));
+        assert!(!still.gone(), "still exiting while its reaper waits");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !still.gone() {
+            assert!(Instant::now() < until, "the reaper's wait returned and nothing said so");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn still_exiting_is_what_is_being_reaped_now_and_forgets_what_has_exited() {
+        let data = std::env::temp_dir().join(format!("oaiy-still-exiting-{}", std::process::id()));
+        let mut reg = super::Registry::empty(data.clone(), data.join("models"));
+        assert!(reg.still_exiting().is_empty(), "nothing stopped, nothing to wait for");
+        let flag = |gone: bool| Arc::new(std::sync::atomic::AtomicBool::new(gone));
+        let (voice, install) = (flag(false), flag(false));
+        reg.exiting.note(Some(super::StillExiting { what: "oaiy-voice (pid 41)".into(), reaped: voice.clone() }));
+        reg.exiting.note(Some(super::StillExiting { what: "the install of oaiy-voice (pid 42)".into(), reaped: install.clone() }));
+        reg.exiting.note(None);
+        install.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reg.still_exiting().iter().map(|e| e.what.as_str()).collect::<Vec<_>>(), ["oaiy-voice (pid 41)"]);
+        // What has exited is forgotten, not kept for every later update, nor for as long as OAIY runs: noting another drops it too.
+        assert_eq!(reg.exiting.0.len(), 1);
+        voice.store(true, std::sync::atomic::Ordering::SeqCst);
+        reg.exiting.note(Some(super::StillExiting { what: "llm (pid 43)".into(), reaped: flag(false) }));
+        assert_eq!(reg.exiting.0.iter().map(|e| e.what.as_str()).collect::<Vec<_>>(), ["llm (pid 43)"]);
+        reg.exiting.0[0].reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(reg.still_exiting().is_empty());
+        assert!(reg.exiting.0.is_empty());
+    }
+
+    #[test]
+    fn stopping_a_running_service_still_returns_at_once_and_leaves_nothing_exiting_when_it_went_at_once() {
+        // The update's wait is the update's own: a service's stop keeps its timing (the quarter of a second at most), and a process
+        // that went at the kill is nothing to wait for.
+        let data = std::env::temp_dir().join(format!("oaiy-stop-timing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let mut reg = super::Registry::empty(data.clone(), data.join("models"));
+        let (command, args) = if cfg!(windows) { (super::system32_exe("PING.EXE"), vec!["-n", "60", "127.0.0.1"]) } else { ("sleep".to_string(), vec!["60"]) };
+        let json = serde_json::json!({
+            "id": "sleeper", "name": "Sleeper", "description": "", "category": "test", "defaultPort": 0,
+            "run": { "command": command, "args": args }
+        });
+        let template: super::ServiceTemplate = serde_json::from_value(json).unwrap();
+        reg.services.insert("sleeper".into(), super::ServiceRuntime::new(template));
+        reg.start("sleeper").expect("the sleeper starts");
+        let runner = reg.services["sleeper"].runner.clone().expect("a runner");
+        assert!(runner.is_running());
+        let started = Instant::now();
+        reg.stop_all();
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(!runner.is_alive());
+        // Gone at the kill (the usual case), or still being reaped: either way it is gone soon after.
+        let until = Instant::now() + Duration::from_secs(10);
+        while !reg.still_exiting().is_empty() {
+            assert!(Instant::now() < until, "{:?}", reg.still_exiting());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

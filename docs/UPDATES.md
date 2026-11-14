@@ -169,7 +169,25 @@ save, and ends its turn, as quitting does.
    (above); the phone plugins are not moved to the end of the list because that list is
    quitting's too, and its order is the one that lets a phone plugin shut down cleanly before
    anything slow runs.
-5. The installer takes the verified bytes. On Windows that starts the installer and ends
+5. On Windows, what those stops ended is waited for until it has exited, 30 seconds at most in
+   all: a service whose process was still there when its stop stopped waiting for it (a quarter of
+   a second, so the services are not held up), the media engine's jobs, and an age check a site
+   sent, which runs the media engine on its own for up to two minutes (no new one starts once the
+   engines are stopped). A process still exiting holds its program's file, and on Windows the
+   installer cannot write over it ("Error opening file for writing
+   …\resources\engines\oaiy-voice.exe": the voice server, letting go of its speech models on the
+   GPU, took longer than that quarter of a second). Past the bound the update goes on, and the log
+   says what was still there. A Mac and Linux do not wait: the update replaces the app whole, and
+   a program still exiting is in nobody's way. Quitting does not wait: nothing writes over what it
+   stopped. A stop ends a service's process only while it is still OAIY's: one that already ended
+   (an install kept for its logs, a service that crashed) has given its number back to the system,
+   which may have handed it to another program.
+   The Windows installer waits too, before it writes any file (`windows/hooks.nsh` beside
+   `tauri.conf.json`, the `NSIS_HOOK_PREINSTALL` of Tauri's installer): during an update it tries
+   each program in `resources\engines` for writing every half second, 30 seconds at most, and then
+   goes on. It ends nothing. It is the new release's installer that has it, so it also covers an
+   update from a release older than this wait.
+6. The installer takes the verified bytes. On Windows that starts the installer and ends
    this process; the installer replaces OAIY and opens it again (the old tray icon may stay
    on screen until the mouse passes over it: OAIY does not remove it before the installer is
    started, so that a failed start leaves OAIY as it was). On Linux the AppImage is replaced
@@ -178,7 +196,13 @@ save, and ends its turn, as quitting does.
    removed, and OAIY restarts through its normal exit, starting the program the new app names.
    (Should macOS still refuse the move for a reason step 1 could not see, a protection of its
    own, say, the updater plugin asks for an administrator's password at this point; step 1 is
-   there so that this is not the usual way.)
+   there so that this is not the usual way.) The updater plugin is built without its `zip`
+   feature: what it adds (a zipped Windows installer, an AppImage packed in a `.tar.gz`) is no
+   format a release publishes or OAIY accepts (`update::target`); a Mac's `.app.tar.gz` is
+   unpacked whatever the feature says. Without it, `zip` 4.6.1 and its advisories
+   (RUSTSEC-2026-0367, -0368, -0369) are gone from the desktop's `Cargo.lock`; the same change
+   took `quinn-udp` from 0.5.15 to 0.5.16 for RUSTSEC-2026-0538 (a receive loop that could spin
+   after a truncated datagram), and with it the `windows-sys` versions a few crates resolve to.
 
 If a part will not stop, or the installer cannot be STARTED, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the

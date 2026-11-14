@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Download, ExternalLink, RefreshCw, RotateCw } from 'lucide-react';
-import { formatBytes, formatTimestamp, openExternal, updates, type UpdateStatus } from './api';
+import { formatBytes, formatTimestamp, openExternal, updates, type UpdateBlocker, type UpdateStatus } from './api';
 import { ask } from './ask';
 import LoadError from './LoadError';
 import ReleaseNotes from './ReleaseNotes';
@@ -78,6 +78,36 @@ function stateLine(s: UpdateStatus): string {
   }
 }
 
+/**
+ * The seconds left of OAIY's start-up wait, from the `starting` reason's words ("it can update in 85 seconds"), or null
+ * when that is not in the way or says no number ("OAIY is still starting up").
+ */
+export function startingSeconds(blockers: readonly UpdateBlocker[] | null | undefined): number | null {
+  const starting = blockers?.find((b) => b.code === 'starting');
+  const said = starting ? /\bin (\d+) seconds?\b/.exec(starting.message) : null;
+  return said ? Number(said[1]) : null;
+}
+
+/**
+ * The `starting` reason with its seconds as they are now: counted down here between the status's reads, as the button is.
+ * At 0, "in a moment": the status is being read again, and the button comes on with it.
+ */
+export function startingSaid(message: string, left: number): string {
+  return message.replace(/\bin (\d+) seconds?\b/, left > 0 ? `in ${left} ${left === 1 ? 'second' : 'seconds'}` : 'in a moment');
+}
+
+/** 85 → "1:25", 9 → "0:09". */
+function clock(seconds: number): string {
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+/** 85 → "1 minute 25 seconds", 60 → "1 minute", 9 → "9 seconds": the countdown as a screen reader says it (it read "1:25" as a time of day). */
+export function spokenWait(seconds: number): string {
+  const [minutes, rest] = [Math.floor(seconds / 60), seconds % 60];
+  const part = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  return [minutes > 0 ? part(minutes, 'minute') : '', rest > 0 || minutes === 0 ? part(rest, 'second') : ''].filter(Boolean).join(' ');
+}
+
 export default function UpdatesSection() {
   const { status: s, error: readError, refresh, apply } = useUpdateStatus();
   const [busy, setBusy] = useState<'check' | 'download' | 'install' | null>(null);
@@ -128,6 +158,32 @@ export default function UpdatesSection() {
     return () => window.clearInterval(id);
   }, [checkAllowedAt]);
   const waitToCheck = checkAllowedAt !== null ? Math.ceil((checkAllowedAt - now) / 1000) : 0;
+
+  // The one wait that ends by itself: OAIY started a moment ago (the `starting` reason, "it can update in 85 seconds",
+  // update/blockers.rs). Counted down on the button between the status's reads, and the status read again as it ends,
+  // so the button comes on then rather than at the next read. A person who sees only a button that is off takes it for
+  // a broken one.
+  const startingLeft = startingSeconds(s?.blockers);
+  const [restartAllowedAt, setRestartAllowedAt] = useState<number | null>(null);
+  useEffect(() => {
+    // (one reading of the clock for both, as for the check above: two, a moment apart, made 85 seconds read "1:26")
+    const t = Date.now();
+    setNow(t);
+    setRestartAllowedAt(startingLeft !== null ? t + startingLeft * 1000 : null);
+  }, [startingLeft, s]);
+  useEffect(() => {
+    if (restartAllowedAt === null) return;
+    const id = window.setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= restartAllowedAt) {
+        window.clearInterval(id);
+        void refresh();
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [restartAllowedAt, refresh]);
+  const waitToRestart = restartAllowedAt !== null ? Math.max(0, Math.ceil((restartAllowedAt - now) / 1000)) : 0;
 
   const setAutoCheck = async (enabled: boolean) => {
     setActionError(null);
@@ -270,6 +326,13 @@ export default function UpdatesSection() {
         {canRestart && (
           <button type="button" className="btn btn-primary" disabled={blocked || busy !== null} onClick={() => void restart()}>
             <RotateCw size={14} /> {retrying ? 'Try again' : 'Restart to update'}
+            {/* (only where the start-up wait is all that is in the way: with anything else, the list below says what) */}
+            {blocked && s.blockers.every((b) => b.code === 'starting') && waitToRestart > 0 && (
+              <>
+                <span className="update-wait-in" aria-hidden="true"> in {clock(waitToRestart)}</span>
+                <span className="sr-only"> in {spokenWait(waitToRestart)}</span>
+              </>
+            )}
           </button>
         )}
         {manualUrl && (
@@ -294,7 +357,7 @@ export default function UpdatesSection() {
           <span className="settings-label">{retrying ? 'Try again' : 'Restart to update'} is off because</span>
           <ul className="update-blockers" aria-label="Why OAIY cannot restart now">
             {s.blockers.map((b) => (
-              <li key={b.code}>{b.message}</li>
+              <li key={b.code}>{b.code === 'starting' && restartAllowedAt !== null ? startingSaid(b.message, waitToRestart) : b.message}</li>
             ))}
           </ul>
         </div>

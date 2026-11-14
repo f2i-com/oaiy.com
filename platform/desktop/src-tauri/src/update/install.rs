@@ -14,7 +14,14 @@
 //!    phone (the plugins) the CALLS are looked at once more, from the sources alone: the stops before it take
 //!    seconds, and a call may have begun. If one has, the parts already stopped are started again and the
 //!    update goes back to `ready`, nothing installed;
-//! 5. the installer is handed the verified bytes ([`Steps::hand_off`]), which on Windows starts the
+//! 5. what the stops ended is waited for until it has exited ([`Part::exiting`]), [`Steps::exit_wait`] at
+//!    most: a process still exiting holds its program's file, and on Windows the installer cannot write over
+//!    it ("Error opening file for writing …\resources\engines\oaiy-voice.exe": the voice server, letting go
+//!    of two speech models on the GPU, outlived the services' short reap). Past the bound the update goes on
+//!    and says in the log what was still there; the installer waits for those files once more itself
+//!    (`windows/hooks.nsh`). Only on Windows ([`exit_wait_here`]): on macOS and Linux the update replaces the
+//!    app whole (an `.app`, an AppImage), and a program still exiting is in nobody's way;
+//! 6. the installer is handed the verified bytes ([`Steps::hand_off`]), which on Windows starts the
 //!    installer and exits this process, so nothing after it runs.
 //!
 //! A part that will not stop, or a hand-off that fails, restarts the parts already stopped (last
@@ -31,13 +38,28 @@
 //! the services' kill timeouts), and a hang inside one is a follow-up (docs/UPDATES.md, "Not yet").
 //!
 //! The parts are the same list quitting uses ([`stop_best_effort`]): one order, defined in one place.
+//! Quitting does not wait for what it stopped to exit (step 5 is the update's own): nothing writes over
+//! its programs after a quit, and a quit keeps the timing it always had.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::blockers::Blocker;
 use super::updater::{InstallRefusal, Updater};
 use super::verify::VerifiedPackage;
+
+/// The most an update waits for what it stopped to exit before it hands the installer the bytes ([`Steps::exit_wait`]).
+pub const EXIT_WAIT: Duration = Duration::from_secs(30);
+
+/// The wait for what the stops ended, where this app runs: [`EXIT_WAIT`] on Windows, whose installer cannot write over a
+/// program still running; none on macOS and Linux, where the update replaces the app whole (an `.app`, an AppImage) and
+/// a program still exiting holds nothing in its way. Zero is no wait at all ([`perform`]).
+pub fn exit_wait_here() -> Duration {
+    if cfg!(windows) { EXIT_WAIT } else { Duration::ZERO }
+}
+
+/// How often [`await_exits`] asks again.
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 /// One thing the app runs that must be stopped before it exits, and started again if it does not.
 pub trait Part: Send + Sync {
@@ -48,6 +70,44 @@ pub trait Part: Send + Sync {
     /// Stopping this part ends a phone call (the plugins hold the phone). The calls are looked at again right before it.
     fn holds_calls(&self) -> bool {
         false
+    }
+    /// What `stop` ended that may not have exited yet, each with a way to tell when it has: asked by an update once every
+    /// part has stopped, which then waits for them ([`await_exits`]). A part whose stop waits for its processes itself has
+    /// none. Quitting never asks.
+    fn exiting(&self) -> Vec<Exiting> {
+        Vec::new()
+    }
+}
+
+/// A process a part's stop ended that may still be exiting when the stop returns: the voice server letting go of its models
+/// on the GPU after the services' reap stopped waiting for it, a media job's worker its own thread is still ending.
+pub struct Exiting {
+    what: String,
+    gone: Box<dyn Fn() -> bool + Send>,
+}
+
+impl Exiting {
+    /// `what` names it in the log; `gone` says, at once and without waiting, whether it has exited.
+    pub fn new(what: impl Into<String>, gone: impl Fn() -> bool + Send + 'static) -> Exiting {
+        Exiting { what: what.into(), gone: Box::new(gone) }
+    }
+
+    pub fn what(&self) -> &str {
+        &self.what
+    }
+}
+
+/// Wait until every one of `exiting` has exited, or `bound` has passed: what was still there at the end (nothing, when
+/// every one went). Returns as soon as the last one is gone.
+pub fn await_exits(exiting: Vec<Exiting>, bound: Duration) -> Vec<String> {
+    let deadline = Instant::now() + bound;
+    let mut left = exiting;
+    loop {
+        left.retain(|e| !(e.gone)());
+        if left.is_empty() || Instant::now() >= deadline {
+            return left.into_iter().map(|e| e.what).collect();
+        }
+        std::thread::sleep(EXIT_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -70,6 +130,8 @@ pub struct Steps<'a> {
     pub hand_off: &'a dyn Fn(&VerifiedPackage) -> Result<(), HandOffError>,
     /// The time (for how long the app has been up), so a test can set it.
     pub clock: &'a dyn Fn() -> Instant,
+    /// The most the update waits for what the parts' stops ended to exit before the hand-off ([`EXIT_WAIT`]).
+    pub exit_wait: Duration,
 }
 
 /// Why the installer did not take over.
@@ -136,7 +198,20 @@ pub fn perform(updater: &Updater, steps: &Steps) -> Outcome {
             return failed(updater, &unwind.stopped, format!("The update could not be installed: {} would not stop ({e}).", part.name()), None);
         }
     }
-    // 5. The installer takes over.
+    // 5. What the stops ended has exited, or the bound has passed: the installer cannot write over a program that is still running.
+    // (No bound, no wait: where nothing is written over a program, exit_wait_here.)
+    let exiting: Vec<Exiting> = if steps.exit_wait.is_zero() { Vec::new() } else { steps.parts.iter().flat_map(|part| part.exiting()).collect() };
+    if !exiting.is_empty() {
+        let waited = Instant::now();
+        log::info!("update: waiting for {} to exit", exiting.iter().map(Exiting::what).collect::<Vec<_>>().join(", "));
+        let left = await_exits(exiting, steps.exit_wait);
+        if left.is_empty() {
+            log::info!("update: everything it stopped has exited ({} ms)", waited.elapsed().as_millis());
+        } else {
+            log::warn!("update: {} had not exited after {} s; the installer is started all the same, and waits for its files itself", left.join(", "), steps.exit_wait.as_secs());
+        }
+    }
+    // 6. The installer takes over.
     log::info!("update: handing the installer {} bytes", package.len());
     let handed = (steps.hand_off)(&package);
     unwind.done = true;
@@ -245,11 +320,13 @@ mod tests {
         panic_start: bool,
         holds_calls: bool,
         after_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+        /// A process its stop ended, still exiting until the flag is set.
+        exits: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl Fakepart {
         fn new(name: &'static str, log: &Log) -> Fakepart {
-            Fakepart { name, log: log.clone(), fail_stop: false, fail_start: false, panic_stop: false, panic_start: false, holds_calls: name == "plugins", after_stop: None }
+            Fakepart { name, log: log.clone(), fail_stop: false, fail_start: false, panic_stop: false, panic_start: false, holds_calls: name == "plugins", after_stop: None, exits: None }
         }
     }
 
@@ -277,6 +354,10 @@ mod tests {
         fn holds_calls(&self) -> bool {
             self.holds_calls
         }
+        fn exiting(&self) -> Vec<Exiting> {
+            let Some(gone) = self.exits.clone() else { return Vec::new() };
+            vec![Exiting::new(format!("{}'s process", self.name), move || gone.load(std::sync::atomic::Ordering::SeqCst))]
+        }
     }
 
     fn parts(log: &Log) -> Vec<Fakepart> {
@@ -293,6 +374,11 @@ mod tests {
     }
 
     fn run_failing_with(u: &Updater, now: Instant, parts: &[Fakepart], log: &Log, flush: impl Fn() + 'static, failure: Option<HandOffError>) -> Outcome {
+        run_waiting(u, now, parts, log, flush, failure, EXIT_WAIT)
+    }
+
+    /// The sequence, waiting at most `exit_wait` for what the stops ended to exit.
+    fn run_waiting(u: &Updater, now: Instant, parts: &[Fakepart], log: &Log, flush: impl Fn() + 'static, failure: Option<HandOffError>, exit_wait: Duration) -> Outcome {
         let refs: Vec<&dyn Part> = parts.iter().map(|p| p as &dyn Part).collect();
         let hand_log = log.clone();
         let hand_off = move |package: &VerifiedPackage| {
@@ -303,7 +389,24 @@ mod tests {
             }
         };
         let clock = move || now;
-        perform(u, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
+        perform(u, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock, exit_wait })
+    }
+
+    /// What a stop does that leaves a process exiting for `after`: it says so in `log` as it exits, then sets `gone`.
+    fn exits_after(gone: &Arc<std::sync::atomic::AtomicBool>, after: Duration, log: &Log, what: &'static str) -> Arc<dyn Fn() + Send + Sync> {
+        let (gone, log) = (gone.clone(), log.clone());
+        Arc::new(move || {
+            let (gone, log) = (gone.clone(), log.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                log.lock().unwrap().push(format!("{what} exited"));
+                gone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        })
+    }
+
+    fn still_exiting() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
     }
 
     fn log_of(log: &Log) -> Vec<String> {
@@ -493,7 +596,7 @@ mod tests {
                 Ok(())
             };
             let clock = move || now;
-            perform(u, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
+            perform(u, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock, exit_wait: EXIT_WAIT })
         }));
         result.err().map(|payload| payload.downcast_ref::<String>().cloned().or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())
     }
@@ -664,8 +767,128 @@ mod tests {
         };
         let flush = || {};
         let clock = move || now;
-        let outcome = perform(&u, &Steps { flush: &flush, parts: &[], hand_off: &hand_off, clock: &clock });
+        let outcome = perform(&u, &Steps { flush: &flush, parts: &[], hand_off: &hand_off, clock: &clock, exit_wait: EXIT_WAIT });
         assert_eq!(outcome, Outcome::HandedOff);
         assert_eq!(*seen.lock().unwrap(), package("0.2.0").bytes());
+    }
+
+    #[test]
+    fn the_installer_is_handed_the_bytes_only_once_what_the_stops_ended_has_exited() {
+        // The reported failure: the services' stop kills the voice server and waits a quarter of a second, the voice server takes longer
+        // to let go of its models on the GPU, and the installer then cannot write over its program. Here it exits 300 ms after its stop.
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        let gone = still_exiting();
+        parts[3].exits = Some(gone.clone());
+        parts[3].after_stop = Some(exits_after(&gone, Duration::from_millis(300), &log, "the voice server"));
+        let started = Instant::now();
+        assert_eq!(run(&u, now, &parts, &log, || {}, false), Outcome::HandedOff);
+        assert_eq!(log_of(&log), ["stop engines", "stop script host", "stop plugins", "stop services", "the voice server exited", "hand off 12 bytes"]);
+        // Waited for it, and no longer than it took.
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(10), "{took:?}");
+    }
+
+    #[test]
+    fn a_process_that_does_not_exit_holds_the_installer_back_for_the_bound_and_no_longer() {
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        // Two parts whose processes never exit, and one that does: the bound is one for them all, not one each.
+        let (never, never_too, soon) = (still_exiting(), still_exiting(), still_exiting());
+        parts[0].exits = Some(never);
+        parts[3].exits = Some(never_too);
+        parts[1].exits = Some(soon.clone());
+        parts[1].after_stop = Some(exits_after(&soon, Duration::from_millis(50), &log, "the script host"));
+        let bound = Duration::from_millis(400);
+        let started = Instant::now();
+        assert_eq!(run_waiting(&u, now, &parts, &log, || {}, None, bound), Outcome::HandedOff);
+        let took = started.elapsed();
+        assert!(took >= bound && took < bound + Duration::from_secs(5), "the wait ends at its bound, and the installer is started all the same: {took:?}");
+        assert_eq!(log_of(&log).last().map(String::as_str), Some("hand off 12 bytes"));
+        assert!(!log_of(&log).iter().any(|l| l.starts_with("start ")), "nothing is started again: going on past the bound is not a failure");
+    }
+
+    #[test]
+    fn with_no_bound_the_installer_is_handed_the_bytes_without_waiting_and_only_windows_has_one() {
+        // macOS and Linux replace the app whole: a process still exiting holds nothing in the way, and waiting for one was only delay.
+        let (u, _, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        for part in &mut parts {
+            part.exits = Some(still_exiting());
+        }
+        let started = Instant::now();
+        assert_eq!(run_waiting(&u, now, &parts, &log, || {}, None, Duration::ZERO), Outcome::HandedOff);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(exit_wait_here(), if cfg!(windows) { EXIT_WAIT } else { Duration::ZERO });
+    }
+
+    #[test]
+    fn what_was_still_exiting_at_the_bound_is_named_and_what_had_exited_is_not() {
+        let gone = still_exiting();
+        let (g, never) = (gone.clone(), still_exiting());
+        let exiting = vec![
+            Exiting::new("oaiy-voice (pid 41)", move || g.load(std::sync::atomic::Ordering::SeqCst)),
+            Exiting::new("the media engine's jobs", move || never.load(std::sync::atomic::Ordering::SeqCst)),
+            Exiting::new("one that had exited already", || true),
+        ];
+        let setter = gone.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert_eq!(await_exits(exiting, Duration::from_millis(500)), ["the media engine's jobs"]);
+        assert!(started.elapsed() >= Duration::from_millis(500), "{:?}", started.elapsed());
+        // Everything gone at the first look: no wait at all; and nothing to wait for is nothing.
+        let started = Instant::now();
+        assert!(await_exits(vec![Exiting::new("gone", || true)], EXIT_WAIT).is_empty());
+        assert!(await_exits(Vec::new(), EXIT_WAIT).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn quitting_and_a_late_call_never_wait_for_what_was_stopped_to_exit() {
+        // Every part leaves a process that never exits: a wait would take the whole 30 s bound.
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        for part in &mut parts {
+            part.exits = Some(still_exiting());
+        }
+        let started = Instant::now();
+        let refs: Vec<&dyn Part> = parts.iter().map(|p| p as &dyn Part).collect();
+        stop_best_effort(&refs);
+        assert!(started.elapsed() < Duration::from_secs(5), "quitting keeps its timing: {:?}", started.elapsed());
+        // An update a call stops before the plugins puts back at once: it installs nothing, so it waits for nothing.
+        let (u, fake, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = self::parts(&log);
+        for part in &mut parts {
+            part.exits = Some(still_exiting());
+        }
+        let f = fake.clone();
+        parts[1].after_stop = Some(Arc::new(move || f.set(|s| s.calls = 1)));
+        let started = Instant::now();
+        assert!(matches!(run(&u, now, &parts, &log, || {}, false), Outcome::Refused(InstallRefusal::Blocked(_))));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_installer_waits_for_the_engines_programs_itself_and_ends_nothing() {
+        // The wait above runs in the OAIY being replaced; the installer is the new release, so it waits too: a hook of Tauri's NSIS
+        // installer, before any file is written. The configuration names it, the file is there, and it never ends a process.
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let hooks = conf["bundle"]["windows"]["nsis"]["installerHooks"].as_str().expect("bundle > windows > nsis > installerHooks");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(hooks);
+        let script = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(script.contains("!macro NSIS_HOOK_PREINSTALL"), "the hook Tauri runs before it writes any file");
+        assert!(script.contains(r"$INSTDIR\resources\engines"), "it waits for the programs OAIY runs from its engines folder");
+        assert!(script.contains("FileOpen"), "it tries each for writing, as the installer will");
+        let code: String = script.lines().map(|line| line.split(';').next().unwrap_or("")).collect::<Vec<_>>().join("\n").to_ascii_lowercase();
+        for ends in ["kill", "taskkill", "terminate", "nsexec", "execwait", "exec "] {
+            assert!(!code.contains(ends), "the installer's wait never ends or starts a process ({ends})");
+        }
     }
 }

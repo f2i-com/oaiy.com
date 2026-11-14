@@ -70,8 +70,11 @@ tauri-plugin-notification = { version = "2.0", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 # The desktop's own updates: the release feed, the download and its signature check (minisign,
 # against the public key in tauri.conf.json). Only its Rust API is used: no webview is given its
-# commands.
-tauri-plugin-updater = { version = "2", optional = true }
+# commands. Its default features but `zip`: that one opens a zipped Windows installer (with zip 4,
+# which has advisories fixed only in zip 9) and an AppImage packed in a .tar.gz, and a release
+# publishes neither: the NSIS setup.exe and the AppImage as they are, which OAIY alone accepts
+# (update::target), and a Mac's .app.tar.gz, which the plugin unpacks with or without the feature.
+tauri-plugin-updater = { version = "2", optional = true, default-features = false, features = ["rustls-tls", "system-proxy"] }
 # The updater plugin's own HTTP client is reqwest 0.13 (the desktop's is 0.12, below): its ClientBuilder is what
 # `configure_client` hands over, and the redirect policy for the plugin's reads (https only, few) is made with this one. It adds no
 # feature of its own: the client is the plugin's.

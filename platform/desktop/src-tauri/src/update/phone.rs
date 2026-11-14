@@ -631,7 +631,7 @@ mod process_tests {
         let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), crate::update::install::HandOffError> { panic!("the installer must not be started") };
         // The uptime the Fake gave the helper does not apply to the real probes: the clock is an hour after the start.
         let clock = move || now;
-        let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
+        let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock, exit_wait: crate::update::install::EXIT_WAIT });
         match outcome {
             crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["phoneCall"], "{blockers:?}"),
             other => panic!("{other:?}"),
@@ -973,7 +973,7 @@ mod process_tests {
         let parts: Vec<&dyn crate::update::install::Part> = vec![&engines, &plugins];
         let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), crate::update::install::HandOffError> { panic!("the installer must not be started") };
         let (flush, clock) = (|| {}, move || now);
-        let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
+        let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock, exit_wait: crate::update::install::EXIT_WAIT });
         match outcome {
             crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["phoneCall"], "{blockers:?}"),
             other => panic!("{other:?}"),

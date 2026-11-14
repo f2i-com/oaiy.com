@@ -530,15 +530,23 @@ pub fn provide_egpu(runtime: Option<oaiy_studio::EgpuRuntime>) {
     }
 }
 
-/// Stop the engines this desktop started (a studio that was already running is left running).
-pub fn stop() {
+/// Stop the engines this desktop started (a studio that was already running is left running), and give back the studio that
+/// was stopped. Its shutdown waits for the language model's server and the kept picture worker to exit, but only a few seconds
+/// for a media job's worker, which the job's own thread goes on ending: an update asks the studio until it has
+/// ([`media_jobs_ended`]) before its installer writes over `oaiy-media`.
+pub fn stop() -> Option<std::sync::Arc<oaiy_studio::Studio>> {
     // (taken out first, and stopped without the lock held: a shutdown can take seconds, and whatever asks whether the
     // engines were started here meanwhile must not wait for it)
-    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(running) = running {
-        log::info!("engines: stopping");
-        running.studio.shutdown();
-    }
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    log::info!("engines: stopping");
+    running.studio.shutdown();
+    Some(running.studio)
+}
+
+/// Whether a stopped studio's media jobs have all ended, their workers with them (each job's thread kills its worker and waits for
+/// it before the job ends).
+pub fn media_jobs_ended(studio: &oaiy_studio::Studio) -> bool {
+    !studio.media.busy()
 }
 
 #[cfg(test)]

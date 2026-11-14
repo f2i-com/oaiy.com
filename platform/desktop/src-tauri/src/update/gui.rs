@@ -320,7 +320,7 @@ fn run_install(app: &AppHandle, updater: &UpdaterHandle, update: Update) -> Outc
         })
     };
     let clock = std::time::Instant::now;
-    install::perform(updater, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
+    install::perform(updater, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock, exit_wait: install::exit_wait_here() })
 }
 
 /// What the installer replaces, as the plugin finds it: the app bundle on a Mac (the program's path taken two folders up), and
@@ -434,6 +434,8 @@ struct EnginesPart {
     /// Stopped for an update: the eGPU's server is waited for until it has let the card go (25 s at most), so the
     /// OAIY that starts next finds the card free. A quit waits a few seconds alone (the studio's own shutdown).
     for_update: bool,
+    /// The studio this stop stopped, asked until its media jobs' workers have exited ([`Part::exiting`]).
+    stopped: Mutex<Option<Arc<oaiy_studio::Studio>>>,
 }
 
 impl Part for EnginesPart {
@@ -442,15 +444,36 @@ impl Part for EnginesPart {
     }
 
     fn stop(&self) -> Result<(), String> {
+        // No age check starts its `oaiy-media` from now on: one that did after the update looked would hold the program
+        // the installer writes over. (Those running already are waited for, [`Part::exiting`].)
+        crate::ai::faceage::close(true);
         *self.started_here.lock().unwrap_or_else(|e| e.into_inner()) = crate::engines::started_here();
-        crate::engines::stop();
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = crate::engines::stop();
         if self.for_update && !oaiy_studio::await_egpu_let_go() {
             log::warn!("update: the eGPU's server had not let the card go within 25 s; the OAIY that starts next may wait for it");
         }
         Ok(())
     }
 
+    /// The studio's shutdown has waited for the language model's server and the kept picture worker to exit, and a few seconds
+    /// for a media job's: a job's worker it did not see go is still being ended by the job's own thread, and `oaiy-media` is one
+    /// of the programs the installer writes over.
+    fn exiting(&self) -> Vec<install::Exiting> {
+        let mut out = Vec::new();
+        // An age check a site sent runs its own `oaiy-media`, outside the studio (ai/faceage.rs), for up to two minutes.
+        if crate::ai::faceage::running() > 0 {
+            out.push(install::Exiting::new("the age checks' media engine (oaiy-media)", || crate::ai::faceage::running() == 0));
+        }
+        let Some(studio) = self.stopped.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return out };
+        if !crate::engines::media_jobs_ended(&studio) {
+            out.push(install::Exiting::new("the media engine's jobs (oaiy-media)", move || crate::engines::media_jobs_ended(&studio)));
+        }
+        out
+    }
+
     fn start(&self) -> Result<(), String> {
+        crate::ai::faceage::close(false);
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if !*self.started_here.lock().unwrap_or_else(|e| e.into_inner()) {
             return Ok(());
         }
@@ -460,7 +483,8 @@ impl Part for EnginesPart {
     }
 }
 
-/// The warm script host: one Node child that exits on a line, and starts again on the next request.
+/// The warm script host: one Node child that exits on a line, and starts again on the next request. Its stop waits for the child
+/// to exit (it kills and waits for one that has not after a few seconds), so it leaves nothing exiting.
 struct ScriptHostPart;
 
 impl Part for ScriptHostPart {
@@ -478,7 +502,8 @@ impl Part for ScriptHostPart {
     }
 }
 
-/// The plugins (Aokie holds the phone dongle: it gets its graceful shutdown before anything slow runs).
+/// The plugins (Aokie holds the phone dongle: it gets its graceful shutdown before anything slow runs). Each plugin's stop waits for
+/// its process to exit (it kills its tree and waits for one that has not after its grace), so it leaves nothing exiting.
 struct PluginsPart {
     host: Option<Arc<PluginHost>>,
     was_running: Mutex<Vec<String>>,
@@ -555,6 +580,15 @@ impl Part for ServicesPart {
         Ok(())
     }
 
+    /// A service's stop kills its process tree and waits a quarter of a second for it (`REAP_GRACE`, so the services' lock is not held
+    /// for longer); one still there then (the voice server, letting go of two speech models on the GPU) is reaped by a thread of its
+    /// own. Those, and any an earlier stop left still exiting: their programs are what the installer writes over.
+    fn exiting(&self) -> Vec<install::Exiting> {
+        let Some(registry) = &self.registry else { return Vec::new() };
+        let still = registry.lock().unwrap_or_else(|e| e.into_inner()).still_exiting();
+        still.into_iter().map(|process| install::Exiting::new(process.what.clone(), move || process.gone())).collect()
+    }
+
     fn start(&self) -> Result<(), String> {
         // The update did not happen: OAIY carries on, and a later quit is an ordinary one.
         *RELAUNCH_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -569,7 +603,7 @@ impl Part for ServicesPart {
 fn parts_for(app: &AppHandle, remember_for_relaunch: bool) -> Vec<Box<dyn Part>> {
     let registry = app.try_state::<RegistryHandle>().map(|r| r.inner().clone());
     vec![
-        Box::new(EnginesPart { app: app.clone(), started_here: Mutex::new(false), for_update: remember_for_relaunch }),
+        Box::new(EnginesPart { app: app.clone(), started_here: Mutex::new(false), for_update: remember_for_relaunch, stopped: Mutex::new(None) }),
         Box::new(ScriptHostPart),
         Box::new(PluginsPart { host: app.try_state::<Arc<PluginHost>>().map(|h| h.inner().clone()), was_running: Mutex::new(Vec::new()) }),
         Box::new(ServicesPart { registry, was_running: Mutex::new(Vec::new()), remember_for_relaunch }),

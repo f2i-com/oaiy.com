@@ -9,9 +9,60 @@
 //! is answered by the language model as before.
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub const TASK: &str = "face-age";
+
+/// The age checks' workers: how many run now, and whether one may start. Each is an `oaiy-media`, one of the programs an update's
+/// installer writes over, so an update closes the gate as it stops the engines and waits for those running (update/gui.rs
+/// `EnginesPart`).
+struct Gate {
+    running: AtomicUsize,
+    /// Set while OAIY stops for an update (or to quit): no worker starts after the update has looked.
+    closed: AtomicBool,
+}
+
+static GATE: Gate = Gate::new();
+
+impl Gate {
+    const fn new() -> Gate {
+        Gate { running: AtomicUsize::new(0), closed: AtomicBool::new(false) }
+    }
+
+    /// A worker counted from before it starts until it has ended; None while the gate is closed. The count is raised before
+    /// `closed` is read again, so either this check sees the stop and starts nothing, or the stop's look at the count sees it.
+    fn enter(&'static self) -> Option<Counted> {
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.running.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Counted(self))
+    }
+}
+
+/// One age check's worker, counted while it runs.
+struct Counted(&'static Gate);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How many age checks' workers are running now.
+pub fn running() -> usize {
+    GATE.running.load(Ordering::SeqCst)
+}
+
+/// While `closed`, no age check starts its worker (OAIY is stopping for an update); open again when what was stopped starts.
+pub fn close(closed: bool) {
+    GATE.closed.store(closed, Ordering::SeqCst);
+}
 /// As many pictures as the worker takes in a job.
 const MAX_PICTURES: usize = 16;
 /// Loading both models and reading a few pictures takes seconds on a CPU; past this the check did not happen.
@@ -136,6 +187,9 @@ async fn run_within(files: &Files, pictures: Vec<String>, limit: Duration) -> Re
     if request.len() > MAX_REQUEST {
         return Err(format!("the pictures come to more than the {} MiB the media engine reads in one check", MAX_REQUEST >> 20));
     }
+    // Counted while it runs, and not started at all while OAIY is stopping for an update: the installer writes over this
+    // program. (Held until the worker has been waited for, or killed by the drop of a check that ran out of time.)
+    let _counted = GATE.enter().ok_or("OAIY is restarting to update; the age check can be tried again in a minute")?;
     // (with the computer's environment, as the studio starts this same engine: from an AppImage it inherited the
     // AppImage's library paths and a working folder inside it)
     let mut std_cmd = oaiy_host_env::command(&files.worker);
@@ -245,6 +299,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("engines")).unwrap();
         d
+    }
+
+    #[test]
+    fn an_age_checks_worker_is_counted_while_it_runs_and_none_starts_while_oaiy_stops() {
+        // (a gate of this test's own: the one the checks use is the program's)
+        let gate: &'static Gate = Box::leak(Box::new(Gate::new()));
+        let count = || gate.running.load(Ordering::SeqCst);
+        let first = gate.enter().expect("open while OAIY runs");
+        assert_eq!(count(), 1);
+        // The update stops the engines: no other starts, and the one running is still counted, for the update to wait for.
+        gate.closed.store(true, Ordering::SeqCst);
+        assert!(gate.enter().is_none(), "one started after the update looked would hold the program the installer writes over");
+        assert_eq!(count(), 1, "one refused is not counted");
+        drop(first);
+        assert_eq!(count(), 0, "counted until its worker has ended");
+        // The update did not happen, and what it stopped is started again.
+        gate.closed.store(false, Ordering::SeqCst);
+        let again = gate.enter();
+        assert!(again.is_some() && count() == 1);
     }
 
     #[test]

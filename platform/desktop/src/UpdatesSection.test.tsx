@@ -30,7 +30,7 @@ vi.mock('./api', async (importOriginal) => {
   };
 });
 
-import UpdatesSection, { describeProgress } from './UpdatesSection';
+import UpdatesSection, { describeProgress, spokenWait, startingSaid, startingSeconds } from './UpdatesSection';
 import { invalidate } from './useCached';
 
 const RELEASES = 'https://github.com/f2i-com/oaiy.com/releases/latest';
@@ -164,6 +164,66 @@ describe('About and updates', () => {
     expect(text()).toContain('Version 0.2.0 is downloaded and its signature is checked.');
     expect(button('Restart to update')?.disabled).toBe(false);
     expect(button('Download')).toBeUndefined();
+  });
+
+  it('counts the start-up wait down on the button, and reads the status again as it ends', async () => {
+    vi.useFakeTimers();
+    try {
+      // (the words update/blockers.rs says them in)
+      const starting = { code: 'starting', message: 'OAIY started less than 2 minutes ago; it can update in 3 seconds.' };
+      await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers: [starting] }));
+      const restart = () => button('Restart to update');
+      expect(restart()?.disabled).toBe(true);
+      expect(restart()?.textContent).toContain('Restart to update in 0:03');
+      const reason = () => document.body.querySelector('[aria-label="Why OAIY cannot restart now"]')?.textContent;
+      expect(reason()).toBe('OAIY started less than 2 minutes ago; it can update in 3 seconds.');
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      expect(restart()?.textContent).toContain('in 0:02');
+      // The reason beside it counts down with the button, rather than keep the number of the last read.
+      expect(reason()).toBe('OAIY started less than 2 minutes ago; it can update in 2 seconds.');
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      expect(reason()).toBe('OAIY started less than 2 minutes ago; it can update in 1 second.');
+      // As it ends, the status is read again: here OAIY has nothing more in the way, and the button comes on.
+      h.status.mockResolvedValue(status({ state: 'ready', latestVersion: '0.2.0', blockers: [] }));
+      const before = h.status.mock.calls.length;
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      await act(async () => { await Promise.resolve(); });
+      expect(h.status.mock.calls.length).toBeGreaterThan(before);
+      expect(restart()?.disabled).toBe(false);
+      expect(restart()?.textContent).not.toContain(' in ');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts down from the seconds the status gave, however the clock moves between its readings', async () => {
+    // Each reading of the clock a millisecond after the last: read twice as the countdown starts, 3 seconds came out as 0:04.
+    let clockNow = 1_700_000_000_000;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => (clockNow += 1));
+    try {
+      const starting = { code: 'starting', message: 'OAIY started less than 2 minutes ago; it can update in 3 seconds.' };
+      await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers: [starting] }));
+      expect(button('Restart to update')?.textContent).toContain('Restart to update in 0:03');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('says the countdown in words to a screen reader, and "in a moment" once it is over', () => {
+    expect([spokenWait(85), spokenWait(60), spokenWait(61), spokenWait(9), spokenWait(1), spokenWait(120)]).toEqual(['1 minute 25 seconds', '1 minute', '1 minute 1 second', '9 seconds', '1 second', '2 minutes']);
+    const said = 'OAIY started less than 2 minutes ago; it can update in 85 seconds.';
+    expect(startingSaid(said, 2)).toBe('OAIY started less than 2 minutes ago; it can update in 2 seconds.');
+    expect(startingSaid(said, 0)).toBe('OAIY started less than 2 minutes ago; it can update in a moment.');
+  });
+
+  it('says no countdown where something else is in the way too, or no number is given', async () => {
+    const starting = { code: 'starting', message: 'OAIY started less than 2 minutes ago; it can update in 85 seconds.' };
+    await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers: [starting, { code: 'call', message: 'A phone call is in progress on OAIY’s own line.' }] }));
+    expect(button('Restart to update')?.textContent).not.toContain(' in ');
+    expect(startingSeconds([starting])).toBe(85);
+    expect(startingSeconds([{ code: 'starting', message: 'OAIY is still starting up. Try again in a minute.' }])).toBeNull();
+    expect(startingSeconds([{ code: 'call', message: 'in 5 seconds' }])).toBeNull();
+    expect(startingSeconds([])).toBeNull();
   });
 
   it('turns Restart to update off while anything is in the way, and names each thing beside it', async () => {

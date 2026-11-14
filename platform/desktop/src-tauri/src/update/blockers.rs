@@ -119,8 +119,10 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
         out.push(Blocker::new("backup", "A backup or a restore is running."));
     }
     if uptime < MIN_UPTIME {
-        let left = (MIN_UPTIME - uptime).as_secs().max(1);
-        out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} seconds.", MIN_UPTIME.as_secs() / 60)));
+        // Rounded up: the dashboard counts these seconds down and reads the status again at 0, so a part of a second left
+        // counted as none made it read too soon, find "1 seconds" still to go, and start again.
+        let left = (MIN_UPTIME - uptime).as_millis().div_ceil(1000).max(1);
+        out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} {}.", MIN_UPTIME.as_secs() / 60, if left == 1 { "second" } else { "seconds" })));
     }
     out
 }
@@ -496,6 +498,18 @@ mod tests {
         let blockers = compute(None, LONG);
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0].code, "starting");
+    }
+
+    #[test]
+    fn the_seconds_left_of_the_start_up_wait_are_rounded_up() {
+        // The dashboard counts them down and reads the status again at 0: a part of a second rounded away made that read
+        // come too soon, say a second was still left, and start the countdown over.
+        let said = |uptime: Duration| compute(Some(&Fake::default().read(false)), uptime).into_iter().find(|b| b.code == "starting").map(|b| b.message);
+        let left = |seconds: u64, millis: u64| said(MIN_UPTIME - Duration::from_secs(seconds) - Duration::from_millis(millis)).unwrap_or_default();
+        assert!(left(84, 200).ends_with("it can update in 85 seconds."), "{}", left(84, 200));
+        assert!(left(85, 0).ends_with("it can update in 85 seconds."), "{}", left(85, 0));
+        assert!(left(0, 1).ends_with("it can update in 1 second."), "{}", left(0, 1));
+        assert_eq!(said(MIN_UPTIME), None, "none once the wait is over");
     }
 
     #[test]

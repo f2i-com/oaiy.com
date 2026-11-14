@@ -1014,6 +1014,8 @@ code {
 /* Settings, Backup and restore: scrolled to from the Overview, a little room above it, its frame in view. */
 .backup-section { scroll-margin-top: 24px; }
 .update-blockers { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+/* "Restart to update in 1:25": the digits keep their width, so the button does not shift each second. */
+.update-wait-in { font-variant-numeric: tabular-nums; }
 .update-auto { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
 .update-banner { margin-bottom: 4px; }
 
