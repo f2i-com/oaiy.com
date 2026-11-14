@@ -439,10 +439,17 @@ impl Server {
     /// it off; "low".."max" or 1-100 turn it on), or DeepSeek's
     /// `thinking: {"type": "enabled"|"disabled"}`, else the server default.
     fn mode(&self, a: &crate::models::Active, body: &Json) -> Result<(Mode, u32), ApiError> {
-        let default = (if a.cfg.thinking { Mode::Thinking } else { Mode::Chat }, a.cfg.effort);
+        Self::mode_of(body, a.cfg.thinking, a.cfg.effort)
+    }
+
+    /// [`Self::mode`] for a server that thinks by default or not (`thinking`) at `effort`. A `thinking` that gives a
+    /// budget and no type (`{"budget_tokens": 2048}`, the Agent's "auto") leaves the default: it only caps a thought
+    /// where there is one.
+    fn mode_of(body: &Json, thinking: bool, effort: u32) -> Result<(Mode, u32), ApiError> {
+        let default = (if thinking { Mode::Thinking } else { Mode::Chat }, effort);
         if let Some(e) = body.get("reasoning_effort").filter(|v| !matches!(v, Json::Null)) {
             if matches!(e.as_str(), Some("none" | "minimal")) {
-                return Ok((Mode::Chat, a.cfg.effort));
+                return Ok((Mode::Chat, effort));
             }
             let effort = chat::parse_effort(e).ok_or_else(|| bad("reasoning_effort must be none, low, medium, high, max or 1-100"))?;
             return Ok((Mode::Thinking, effort));
@@ -536,20 +543,42 @@ impl Server {
         Ok((ids, images))
     }
 
-    /// Reasoning tokens a reply may spend before it has to answer:
-    /// `thinking.budget_tokens` when the request gives it (0: no limit),
-    /// else by effort: low 2,048, medium and high 8,192, 76-99 16,384, max
-    /// none. A model that goes round in circles then stops and acts.
-    fn think_budget(body: &Json, effort: u32) -> Option<usize> {
-        if let Some(n) = body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(Json::as_i64) {
-            return (n > 0).then_some(n as usize);
+    /// Reasoning tokens a reply of `max_tokens` may spend before it has to answer: `thinking.budget_tokens` when the
+    /// request gives it (0 or less: no limit), else by effort: 1-50 ("low") 2,048; 51-75 ("medium", "high") 8,192;
+    /// 76-99 16,384; 100 ("max") no limit. A model that goes round in circles then stops and acts.
+    ///
+    /// Whatever was asked, no limit too, a thought ends with room left for the answer: at most `max_tokens` less a
+    /// quarter of it (256 tokens at least) is thought. A budget at or past `max_tokens` (8,192 at the default effort,
+    /// with the default reply of 8,192, or a reply of 4,096) let the model think to the reply's last token: it ended
+    /// with nothing said.
+    fn think_budget(body: &Json, effort: u32, max_tokens: usize) -> Option<usize> {
+        let asked = match body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(Json::as_i64) {
+            Some(n) => (n > 0).then_some(n as usize),
+            None => match effort {
+                100.. => None,
+                76..=99 => Some(16_384),
+                51..=75 => Some(8_192),
+                _ => Some(2_048),
+            },
+        };
+        let room = max_tokens.saturating_sub((max_tokens / 4).max(256));
+        Some(asked.map_or(room, |n| n.min(room)))
+    }
+
+    /// The tokens a reply has room for: what it asked for, or less where its prompt leaves less of the context
+    /// (`max_seq`). [`Self::submit`] cuts the reply so.
+    fn reply_room(max_tokens: usize, max_seq: usize, prompt: usize) -> usize {
+        max_tokens.min(max_seq.saturating_sub(prompt))
+    }
+
+    /// A reply's thinking budget as `chat` sends it: in thinking mode, [`Self::think_budget`] of the room the reply
+    /// really has. Taken from what it asked for, a long prompt's reply (a prompt of 15,000 tokens in a context of
+    /// 16,384 leaves 1,384 of an 8,192 asked for) could think to its last token and say nothing.
+    fn reply_budget(body: &Json, mode: Mode, effort: u32, max_tokens: usize, max_seq: usize, prompt: usize) -> Option<usize> {
+        if mode != Mode::Thinking {
+            return None;
         }
-        match effort {
-            100.. => None,
-            76..=99 => Some(16_384),
-            51..=75 => Some(8_192),
-            _ => Some(2_048),
-        }
+        Self::think_budget(body, effort, Self::reply_room(max_tokens, max_seq, prompt))
     }
 }
 
@@ -637,10 +666,12 @@ impl Server {
                 code: "context_length_exceeded",
             });
         }
-        let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
+        let max_tokens = Self::reply_room(max_tokens, a.cfg.max_seq, prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx, forget, session: session.filter(|_| forget), wipe: false };
+        // (the words a thought cut off at its budget is closed with, in this model's own tokens)
+        let think_closing = if think_budget.is_some() { a.flavour.encode(crate::engines::job::THINK_CLOSING) } else { Vec::new() };
+        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, think_closing, sampling, cancel: Arc::clone(&cancel), events: tx, forget, session: session.filter(|_| forget), wipe: false };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -656,7 +687,7 @@ impl Server {
             let mut wiped = true;
             if let Some(a) = self.models.live() {
                 let (tx, rx) = mpsc::channel();
-                let job = Job { tools: Vec::new(), tool_precision: false, observer_context: String::new(), prompt: Vec::new(), images: Vec::new(), max_tokens: 0, think_budget: None,
+                let job = Job { tools: Vec::new(), tool_precision: false, observer_context: String::new(), prompt: Vec::new(), images: Vec::new(), max_tokens: 0, think_budget: None, think_closing: Vec::new(),
                     sampling: Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0, frequency_penalty: 0.0 },
                     cancel: Arc::new(AtomicBool::new(false)), events: tx, forget: true, session: Some(session.to_owned()), wipe: true };
                 a.jobs.send(job).map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -701,7 +732,8 @@ impl Server {
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
-        let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
+        // (from the room the reply really has: the prompt may leave it less than it asked for)
+        let think_budget = Self::reply_budget(&body, mode, effort, max_tokens, a.cfg.max_seq, n_prompt);
         let request_clock = Instant::now();
         let mut prefilled_at = None;
         let forget = self.forget(req, &body);
@@ -1379,14 +1411,88 @@ mod tests {
 
     #[test]
     fn reasoning_budgets_follow_the_effort_unless_the_request_gives_one() {
+        // (a reply long enough for every budget an effort gives)
+        const LONG: usize = 65_536;
         let none = Json::parse(br#"{}"#).unwrap();
-        assert_eq!(Server::think_budget(&none, 50), Some(2_048));
-        assert_eq!(Server::think_budget(&none, 75), Some(8_192));
-        assert_eq!(Server::think_budget(&none, 100), None);
+        assert_eq!(Server::think_budget(&none, 25, LONG), Some(2_048));
+        assert_eq!(Server::think_budget(&none, 50, LONG), Some(2_048));
+        assert_eq!(Server::think_budget(&none, 51, LONG), Some(8_192));
+        assert_eq!(Server::think_budget(&none, 75, LONG), Some(8_192));
+        assert_eq!(Server::think_budget(&none, 99, LONG), Some(16_384));
+        // max is no limit but the answer's room
+        assert_eq!(Server::think_budget(&none, 100, LONG), Some(LONG - LONG / 4));
         let given = Json::parse(br#"{"thinking":{"type":"enabled","budget_tokens":500}}"#).unwrap();
-        assert_eq!(Server::think_budget(&given, 50), Some(500));
+        assert_eq!(Server::think_budget(&given, 50, LONG), Some(500));
         let unlimited = Json::parse(br#"{"thinking":{"budget_tokens":0}}"#).unwrap();
-        assert_eq!(Server::think_budget(&unlimited, 50), None);
+        assert_eq!(Server::think_budget(&unlimited, 50, LONG), Some(LONG - LONG / 4));
+    }
+
+    /// A thought never takes the whole reply: a quarter of it (256 tokens at least) is left for the answer, whatever
+    /// the budget, no limit too. Measured before (Qwen3.5-4B on "medium", a reply of 4,096): it thought all 4,096
+    /// tokens, 940 s, and answered nothing.
+    #[test]
+    fn a_thought_leaves_room_for_the_answer() {
+        let none = Json::parse(br#"{}"#).unwrap();
+        let unlimited = Json::parse(br#"{"thinking":{"budget_tokens":0}}"#).unwrap();
+        let big = Json::parse(br#"{"thinking":{"type":"enabled","budget_tokens":100000}}"#).unwrap();
+        let small = Json::parse(br#"{"thinking":{"type":"enabled","budget_tokens":512}}"#).unwrap();
+        // the default effort's 8,192 in the default reply of 8,192, and in one of 4,096
+        assert_eq!(Server::think_budget(&none, 75, 8_192), Some(6_144));
+        assert_eq!(Server::think_budget(&none, 75, 4_096), Some(3_072));
+        // no limit, and a budget past the reply, alike
+        assert_eq!(Server::think_budget(&unlimited, 75, 4_096), Some(3_072));
+        assert_eq!(Server::think_budget(&big, 75, 16_384), Some(12_288));
+        // a short reply keeps 256 tokens for the answer, and one shorter than that has no room to think
+        assert_eq!(Server::think_budget(&small, 75, 600), Some(344));
+        assert_eq!(Server::think_budget(&small, 75, 200), Some(0));
+        // a budget inside the room is the budget
+        assert_eq!(Server::think_budget(&small, 75, 4_096), Some(512));
+        for max in [1, 256, 257, 1_000, 4_096, 8_192, 100_000] {
+            for body in [&none, &unlimited, &big, &small] {
+                let thought = Server::think_budget(body, 100, max).unwrap();
+                assert!(thought + (max / 4).max(256).min(max) <= max, "a reply of {max}: {thought} thought");
+            }
+        }
+    }
+
+    /// A long prompt leaves its reply less of the context than it asked for: the budget is taken from the room the
+    /// reply really has, so a thought still leaves the answer room (a prompt of 15,000 tokens in a context of 16,384
+    /// leaves 1,384 of the 8,192 asked for; budgeted from 8,192, the thought took all 1,384 and the answer was empty).
+    #[test]
+    fn a_reply_the_context_cuts_short_keeps_room_to_answer() {
+        assert_eq!(Server::reply_room(8_192, 16_384, 15_000), 1_384);
+        assert_eq!(Server::reply_room(4_096, 65_536, 2_000), 4_096, "where the context leaves more, what was asked");
+        assert_eq!(Server::reply_room(4_096, 16_384, 16_384), 0);
+        let unlimited = Json::parse(br#"{"thinking":{"budget_tokens":0}}"#).unwrap();
+        let on = Json::parse(br#"{"reasoning_effort":25,"thinking":{"type":"enabled","budget_tokens":2048}}"#).unwrap();
+        let none = Json::parse(br#"{}"#).unwrap();
+        for body in [&unlimited, &on, &none] {
+            let thought = Server::reply_budget(body, Mode::Thinking, 75, 8_192, 16_384, 15_000).unwrap();
+            assert!(thought + 256 <= 1_384, "a cut reply of 1,384: {thought} thought");
+            // not as it was: from the 8,192 asked for
+            assert!(thought < Server::think_budget(body, 75, 8_192).unwrap(), "{thought}");
+        }
+        assert_eq!(Server::reply_budget(&on, Mode::Thinking, 25, 8_192, 16_384, 15_000), Some(1_038));
+        // a reply the context does not cut: the budget asked for
+        assert_eq!(Server::reply_budget(&on, Mode::Thinking, 25, 8_192, 65_536, 2_000), Some(2_048));
+        // no thought, no budget
+        assert_eq!(Server::reply_budget(&on, Mode::Chat, 25, 8_192, 16_384, 15_000), None);
+    }
+
+    /// The Agent's requests: "on" is an effort and a budget, "auto" a budget alone (the server's default says whether
+    /// it thinks), "off" none. A budget alone never turns thinking on or off.
+    #[test]
+    fn a_budget_alone_leaves_the_servers_default_mode() {
+        let mode = |json: &[u8], thinking: bool| Server::mode_of(&Json::parse(json).unwrap(), thinking, 75).ok().unwrap();
+        let auto: &[u8] = br#"{"thinking":{"budget_tokens":2048}}"#;
+        assert_eq!(mode(auto, false), (Mode::Chat, 75));
+        assert_eq!(mode(auto, true), (Mode::Thinking, 75));
+        let on: &[u8] = br#"{"reasoning_effort":25,"thinking":{"type":"enabled","budget_tokens":2048}}"#;
+        assert_eq!(mode(on, false), (Mode::Thinking, 25));
+        assert_eq!(mode(br#"{"reasoning_effort":"none"}"#, true), (Mode::Chat, 75));
+        assert_eq!(mode(br#"{"reasoning_effort":"low"}"#, false), (Mode::Thinking, 50));
+        assert_eq!(mode(br#"{"thinking":{"type":"disabled","budget_tokens":2048}}"#, true), (Mode::Chat, 75));
+        assert!(Server::mode_of(&Json::parse(br#"{"reasoning_effort":"lots"}"#).unwrap(), true, 75).is_err());
     }
 
     #[test]

@@ -39,24 +39,62 @@ use crate::engines::job::{sample, Event, Finish, Job};
 
 /// A reply's reasoning budget, as the DeepSeek engine does it: count the tokens
 /// spent inside the `<think>` block the prompt opened and, at the budget, put the
-/// closing tag in place of the next one so a model going in circles stops and
-/// answers.
+/// closing words (`closing`, the job's `think_closing`) and then the closing tag in
+/// place of the next ones, so a model going in circles stops and answers.
 pub(crate) struct ThinkBudget {
     pub(crate) thinking: bool,
     end: Option<u32>,
+    /// `<think>`, where a thought the model opens itself is budgeted too (opens_with).
+    start: Option<u32>,
+    /// The reply has had its thought (the prompt's, or the model's own): a reply has one.
+    seen: bool,
     pub(crate) used: usize,
     pub(crate) budget: Option<usize>,
+    /// The words written before the tag when the budget runs out.
+    closing: Vec<u32>,
+    /// What is still to be written of them, the tag last, once it has.
+    writing: std::collections::VecDeque<u32>,
 }
 
 impl ThinkBudget {
     pub(crate) fn new(thinking: bool, end: Option<u32>, budget: Option<usize>) -> Self {
-        Self { thinking, end, used: 0, budget }
+        Self { thinking, end, start: None, seen: thinking, used: 0, budget, closing: Vec::new(), writing: std::collections::VecDeque::new() }
     }
 
-    /// `(token, forced)` — `forced` when the budget replaced the sampled token.
+    /// The words written into the thought before its tag at the budget (the job's `think_closing`).
+    pub(crate) fn closing(mut self, words: &[u32]) -> Self {
+        self.closing = words.to_vec();
+        self
+    }
+
+    /// `<think>`: a thought the model opens itself, where the prompt opened none, is budgeted from its next token, as one
+    /// the prompt opens is (where there is a budget). A `<think>` after the reply's thought is only a word.
+    pub(crate) fn opens_with(mut self, start: Option<u32>) -> Self {
+        self.start = start;
+        self
+    }
+
+    /// Whether the token just passed is one to say the count at (an `Event::Thinking`): the end of the thought, or
+    /// every [`THINKING_EVERY`] tokens of it, never while the closing words are written (the count stands still then).
+    pub(crate) fn reports(&self, was_thinking: bool) -> bool {
+        was_thinking && (!self.thinking || (self.writing.is_empty() && self.used.is_multiple_of(THINKING_EVERY)))
+    }
+
+    /// `(token, forced)` — `forced` when the budget replaced the sampled token. At the budget the closing words come
+    /// first, one a call, then the tag, which ends the thought.
     pub(crate) fn pass(&mut self, next: u32) -> (u32, bool) {
         if !self.thinking {
+            if !self.seen && self.start.is_some() && Some(next) == self.start {
+                self.seen = true;
+                self.thinking = self.budget.is_some();
+            }
             return (next, false);
+        }
+        if let Some(word) = self.writing.pop_front() {
+            if Some(word) == self.end {
+                self.thinking = false;
+            }
+            return (word, true);
         }
         if Some(next) == self.end {
             self.thinking = false;
@@ -65,8 +103,13 @@ impl ThinkBudget {
         self.used += 1;
         match (self.budget, self.end) {
             (Some(b), Some(end)) if self.used >= b => {
-                self.thinking = false;
-                (end, true)
+                self.writing.extend(self.closing.iter().copied());
+                self.writing.push_back(end);
+                let first = self.writing.pop_front().expect("the tag at least");
+                if first == end {
+                    self.thinking = false;
+                }
+                (first, true)
             }
             _ => (next, false),
         }
@@ -518,20 +561,21 @@ impl GlmEngine {
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
         let (mut pending, mut n) = (Vec::new(), 0usize);
         let opened = self.think_start.is_some() && prompt.last().copied() == self.think_start;
-        let mut budget = ThinkBudget::new(opened, self.think_end, job.think_budget);
+        let mut budget = ThinkBudget::new(opened, self.think_end, job.think_budget).closing(&job.think_closing).opens_with(self.think_start);
         let max_seq = self.model.config().context_length.min(self.kv.max_len);
 
         let decode = std::time::Instant::now();
         let finish = loop {
             let was_thinking = budget.thinking;
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
-            if forced && self.log {
+            // (said once, as the tag closes the thought: the closing words before it are forced too)
+            if forced && !budget.thinking && self.log {
                 eprintln!(
                     "  reasoning ended at its budget ({} tokens)",
                     job.think_budget.unwrap_or(0)
                 );
             }
-            if was_thinking && (!budget.thinking || budget.used.is_multiple_of(THINKING_EVERY)) {
+            if budget.reports(was_thinking) {
                 let _ = job.events.send(Event::Thinking {
                     used: budget.used,
                     budget: budget.budget,
@@ -679,5 +723,85 @@ impl GlmEngine {
             return Ok(t.to_host().data().to_vec());
         }
         Ok(t.data().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThinkBudget, THINKING_EVERY};
+
+    const END: u32 = 999;
+
+    /// What a budget makes of a model that would think on: each token passed, with whether it was forced and whether the
+    /// count was said after it.
+    fn run(mut budget: ThinkBudget, sampled: u32) -> Vec<(u32, bool, bool)> {
+        (0..sampled)
+            .map(|t| {
+                let was = budget.thinking;
+                let (next, forced) = budget.pass(t);
+                (next, forced, budget.reports(was))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn at_its_budget_a_thought_gets_the_closing_words_and_then_its_tag() {
+        // three tokens of thought; the third sampled is replaced by the first closing word, the next by the second, then
+        // the tag ends it, and what comes after is the model's own again
+        let budget = ThinkBudget::new(true, Some(END), Some(3)).closing(&[100, 101]);
+        let passed = run(budget, 7);
+        let tokens: Vec<u32> = passed.iter().map(|p| p.0).collect();
+        assert_eq!(tokens, [0, 1, 100, 101, END, 5, 6]);
+        let forced: Vec<bool> = passed.iter().map(|p| p.1).collect();
+        assert_eq!(forced, [false, false, true, true, true, false, false]);
+        // the count is said once, as the tag ends the thought
+        let said: Vec<bool> = passed.iter().map(|p| p.2).collect();
+        assert_eq!(said, [false, false, false, false, true, false, false]);
+    }
+
+    #[test]
+    fn without_closing_words_the_tag_alone_ends_it_as_before() {
+        let mut budget = ThinkBudget::new(true, Some(END), Some(3));
+        let tokens: Vec<u32> = (0..5).map(|t| budget.pass(t).0).collect();
+        assert_eq!(tokens, [0, 1, END, 3, 4]);
+        assert_eq!(budget.used, 3);
+    }
+
+    #[test]
+    fn the_count_is_not_said_again_for_each_closing_word() {
+        // a budget that is a multiple of the reporting step: the words written at it stand still on the count, which
+        // was said once for every step before and is said again only as the thought ends
+        let budget = ThinkBudget::new(true, Some(END), Some(THINKING_EVERY * 2)).closing(&[100, 101, 102]);
+        let passed = run(budget, (THINKING_EVERY * 2) as u32 + 6);
+        let said = passed.iter().filter(|p| p.2).count();
+        assert_eq!(said, 2, "the first step, and the end; never the words: {passed:?}");
+        assert_eq!(passed[THINKING_EVERY * 2 + 2].0, END);
+    }
+
+    const START: u32 = 998;
+
+    #[test]
+    fn a_thought_the_model_opens_itself_is_budgeted_from_its_next_token() {
+        // The prompt opened none: the model's own `<think>` opens it, and three tokens after it the budget closes it.
+        let mut budget = ThinkBudget::new(false, Some(END), Some(3)).closing(&[100]).opens_with(Some(START));
+        let tokens: Vec<u32> = [7, START, 1, 2, 3, 4, 5, START, 6].into_iter().map(|t| budget.pass(t).0).collect();
+        assert_eq!(tokens, [7, START, 1, 2, 100, END, 5, START, 6], "a `<think>` after the thought is only a word");
+        assert_eq!(budget.used, 3);
+        // Without a budget it is not cut.
+        let mut free = ThinkBudget::new(false, Some(END), None).opens_with(Some(START));
+        let tokens: Vec<u32> = [START, 1, 2, 3, 4].into_iter().map(|t| free.pass(t).0).collect();
+        assert_eq!(tokens, [START, 1, 2, 3, 4]);
+        // A thought the prompt opened and the model ended: another `<think>` opens nothing.
+        let mut ended = ThinkBudget::new(true, Some(END), Some(3)).opens_with(Some(START));
+        let tokens: Vec<u32> = [1, END, START, 2, 3, 4, 5].into_iter().map(|t| ended.pass(t).0).collect();
+        assert_eq!(tokens, [1, END, START, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_thought_the_model_ends_itself_gets_no_closing_words() {
+        let mut budget = ThinkBudget::new(true, Some(END), Some(10)).closing(&[100, 101]);
+        let tokens: Vec<u32> = [0, 1, END, 3].into_iter().map(|t| budget.pass(t).0).collect();
+        assert_eq!(tokens, [0, 1, END, 3]);
+        assert!(!budget.thinking);
     }
 }

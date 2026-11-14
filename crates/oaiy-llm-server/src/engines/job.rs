@@ -65,6 +65,13 @@ impl ImagePrep {
     }
 }
 
+/// The words written into a thought cut off at its budget, before its closing tag: the stop-thinking line the Qwen3
+/// technical report inserts at a thinking budget (arXiv 2505.09388, 4.3 "Thinking Budget"; the tag follows it there too).
+/// With the tag alone, a model cut off mid-thought went on reasoning in its answer, to the reply's end (a 4B model, 2,048
+/// tokens of thought, then the rest of a 4,096-token reply with no answer in it); told this, it answers from what it has
+/// thought.
+pub const THINK_CLOSING: &str = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
+
 pub struct Job {
     pub tools: Vec<oaiy_engine::json::Json>,
     pub tool_precision: bool,
@@ -75,6 +82,9 @@ pub struct Job {
     /// Reasoning tokens the reply may spend before it has to answer (when
     /// the prompt opens a `<think>` block); `None`: no limit.
     pub think_budget: Option<usize>,
+    /// What is written into the thought, before its closing tag, when `think_budget` runs out: [`THINK_CLOSING`] in the
+    /// model's own tokens (api.rs). Empty: the tag alone.
+    pub think_closing: Vec<u32>,
     pub sampling: Sampling,
     /// Set by the request side to stop early (a stop string, a closed
     /// connection).

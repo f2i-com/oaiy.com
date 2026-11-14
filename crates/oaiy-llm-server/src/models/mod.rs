@@ -230,11 +230,7 @@ impl Flavour {
                 // The same messages through `llm`'s GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
                 // DeepSeek options carry a 1-100 scale, so it is banded.
-                let effort = match opts.effort {
-                    0..=33 => crate::llm::ReasoningEffort::Low,
-                    34..=66 => crate::llm::ReasoningEffort::High,
-                    _ => crate::llm::ReasoningEffort::Max,
-                };
+                let effort = glm_effort(opts.effort);
                 let (out, images) = match marker {
                     Some(_) => dense_messages(msgs, *marker)?,
                     None => (llama_messages(msgs)?, Vec::new()),
@@ -262,6 +258,17 @@ impl Flavour {
                 })
             }
         }
+    }
+}
+
+/// The GLM template's effort for the 1-100 scale, banded as the words land on it (`chat::parse_effort`): 1-50 Low
+/// ("low" is 50), 51-75 High ("medium" and "high" are 75), above that Max ("max" is 100). Banded at thirds before,
+/// "low" read as High and "medium" as Max.
+pub(crate) fn glm_effort(effort: u32) -> crate::llm::ReasoningEffort {
+    match effort {
+        0..=50 => crate::llm::ReasoningEffort::Low,
+        51..=75 => crate::llm::ReasoningEffort::High,
+        _ => crate::llm::ReasoningEffort::Max,
     }
 }
 
@@ -1975,6 +1982,18 @@ fn startup_warm_profile(usage: Option<&Path>, tool_experts: bool) -> Option<(&Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GLM's three efforts as the words land on the 1-100 scale: "low" (50) and the Agent's brief thinking (25) are
+    /// Low, "medium" and "high" (75) High, "max" (100) Max.
+    #[test]
+    fn glm_reads_low_as_low_and_medium_as_high() {
+        use crate::llm::ReasoningEffort::{High, Low, Max};
+        let word = |w: &str| glm_effort(crate::dsv41::chat::parse_effort(&oaiy_engine::json::Json::str(w)).unwrap());
+        assert_eq!((word("low"), word("medium"), word("high"), word("max")), (Low, High, High, Max));
+        for (effort, want) in [(1, Low), (25, Low), (33, Low), (50, Low), (51, High), (66, High), (75, High), (76, Max), (99, Max), (100, Max)] {
+            assert_eq!(glm_effort(effort), want, "effort {effort}");
+        }
+    }
 
     #[test]
     fn a_context_someone_asked_for_is_served_and_the_default_is_as_it_was() {

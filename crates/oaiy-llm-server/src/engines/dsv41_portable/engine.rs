@@ -707,7 +707,9 @@ impl Engine {
         }
 
         let think_start = self.tok.special(crate::dsv41::chat::THINK_START);
-        let mut budget = crate::engines::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(crate::dsv41::chat::THINK_END), job.think_budget);
+        let mut budget = crate::engines::glm::ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(crate::dsv41::chat::THINK_END), job.think_budget)
+            .closing(&job.think_closing)
+            .opens_with(think_start);
         let mut parser = crate::dsv41::chat::StreamParser::new(if budget.thinking { crate::dsv41::chat::Mode::Thinking } else { crate::dsv41::chat::Mode::Chat });
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
         // (the tokens given out so far, read beside `give`, which counts them)
@@ -716,7 +718,7 @@ impl Engine {
         let mut choose = |logits: &[f32]| -> u32 {
             let was_thinking = budget.thinking;
             let (next, _forced) = budget.pass(sample(logits, &job.sampling, &mut rng));
-            if was_thinking && (!budget.thinking || budget.used.is_multiple_of(crate::engines::glm::THINKING_EVERY)) {
+            if budget.reports(was_thinking) {
                 let _ = job.events.send(Event::Thinking { used: budget.used, budget: budget.budget, done: !budget.thinking });
             }
             next

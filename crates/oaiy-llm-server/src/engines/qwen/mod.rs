@@ -118,6 +118,11 @@ pub fn chat_prompt(msgs: &[Json], opts: &Options) -> Result<Encoded, String> {
     chat_prompt_as(msgs, opts, Pictures::Qwen)
 }
 
+/// The highest effort (1-100) whose thinking the system message asks to keep brief: "low" (50) and under.
+pub(crate) const BRIEF_EFFORT: u32 = 50;
+/// What it asks, after the tools.
+pub(crate) const BRIEF_THINKING: &str = "Keep your thinking brief and focused.\n\n";
+
 /// [`chat_prompt_as`] for [`Pictures::None`]: `system` (its template's own, [`default_system`]) first where the
 /// conversation has no system message, as its template writes it. (One with tools has one: the API gives it one.)
 pub fn chatml_prompt(msgs: &[Json], opts: &Options, system: Option<&str>) -> Result<Encoded, String> {
@@ -189,7 +194,8 @@ pub fn chat_prompt_as(msgs: &[Json], opts: &Options, style: Pictures) -> Result<
                 for t in tools { prompt.push_str(&t.to_json()); prompt.push('\n'); }
                 prompt.push_str("</tools>\n\nCall functions with <tool_call>\n<function=FUNCTION_NAME>\n<parameter=PARAMETER_NAME>\nvalue\n</parameter>\n</function>\n</tool_call>. Supply every required parameter. Objects, arrays, numbers and booleans must be valid JSON; strings are literal text. No suffix after a function call.\n\n");
             }
-            if opts.mode == Mode::Thinking && opts.effort <= 33 { prompt.push_str("Keep your thinking brief and focused.\n\n"); }
+            // (a low effort, "low" itself 50: at 33 and under, as it was, no word reached it)
+            if opts.mode == Mode::Thinking && opts.effort <= BRIEF_EFFORT { prompt.push_str(BRIEF_THINKING); }
         }
         if role == "assistant" && style != Pictures::Qwen3Vl { prompt.push_str("<think>\n\n</think>\n\n"); }
         prompt.push_str(&text);
@@ -1409,15 +1415,23 @@ impl QwenEngine {
         let tok = hybrid.tokenizer()?;
         let eos = tok.token_id("<|im_end|>").ok_or("Qwen tokenizer lacks im_end")?;
         let think_end = tok.token_id("</think>");
-        let mut thinking = job.think_budget.is_some();
-        let mut generated = Vec::new(); let mut think_used = 0usize;
-        let mut stream = NativeStream { calls: self.calls, ..Default::default() };
-        // The reply's prose (past its thought, outside its tool calls, where code rightly repeats): its recent tokens,
-        // for its repeat, presence and frequency penalties (`crate::engines::job::penalize_reply`). Its thought is open
-        // where the prompt's last `<think>` has no `</think>` after it.
+        // The reply's thought is open where the prompt's last `<think>` has no `</think>` after it.
         let think_start = tok.token_id("<think>");
         let opened = job.prompt.iter().rposition(|&t| Some(t) == think_start);
         let mut in_thought = opened.is_some_and(|at| !job.prompt[at..].iter().any(|&t| Some(t) == think_end));
+        // A budget counts a thought the prompt opened. A reply that opens none (Qwen3-VL's template opens none, whatever
+        // the mode) is no thought, and is never cut: the closing words and the tag would be written into its answer.
+        let mut thinking = job.think_budget.is_some() && in_thought;
+        // Whether the reply has had its thought (the prompt's, or one the model opened itself): a reply has one.
+        let mut thought_seen = in_thought;
+        // At the budget: the closing words (the job's `think_closing`) and then `</think>`, one a step, in place of what the
+        // model would say; `closing` holds what is still to come of them.
+        let mut closing: std::collections::VecDeque<u32> = Default::default();
+        let mut closed = false;
+        let mut generated = Vec::new(); let mut think_used = 0usize;
+        let mut stream = NativeStream { calls: self.calls, ..Default::default() };
+        // The reply's prose (past its thought, outside its tool calls, where code rightly repeats): its recent tokens,
+        // for its repeat, presence and frequency penalties (`crate::engines::job::penalize_reply`).
         let (mut in_call, mut prose) = (false, std::collections::VecDeque::<u32>::new());
         let close = match self.calls { Calls::Qwen => "</tool_call>", Calls::Lfm2 => crate::engines::lfm2::CALL_END };
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
@@ -1498,7 +1512,22 @@ impl QwenEngine {
                 }
             }
             t_sample += clock.elapsed().as_secs_f64();
-            if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
+            // (a closing word the engine wrote: not counted as the model's thought, which the tag after them ends)
+            let mut written = false;
+            if thinking {
+                if let Some(word) = closing.pop_front() {
+                    next = word;
+                    written = Some(word) != think_end;
+                } else if !closed && job.think_budget.is_some_and(|n| think_used >= n) {
+                    if let Some(end) = think_end {
+                        closed = true;
+                        closing.extend(job.think_closing.iter().copied());
+                        closing.push_back(end);
+                        next = closing.pop_front().expect("the tag at least");
+                        written = next != end;
+                    }
+                }
+            }
             let stop = next == eos || Some(next) == tok.eos();
             // the check ran this token already where it is the next draft; else its rows from here on are undone
             let ran = !stop && pending.front().is_some_and(|(d, _)| *d == next);
@@ -1530,11 +1559,17 @@ impl QwenEngine {
                 let _ = job.events.send(Event::ToolPreview { text, start });
             }
             if thinking {
-                think_used += 1;
+                think_used += usize::from(!written);
                 if Some(next)==think_end {
                     thinking=false;
                     let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: true });
                 }
+            } else if !thought_seen && Some(next) == think_start {
+                // A thought the model opens itself, where the prompt opened none: budgeted from its next token, as one the
+                // prompt opens is (where the request has a budget). A `<think>` after the reply's thought is only a word.
+                thought_seen = true;
+                in_thought = true;
+                thinking = job.think_budget.is_some();
             }
             if thinking && generated.len() % 16 == 0 { let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: false }); }
             t_text += clock.elapsed().as_secs_f64();

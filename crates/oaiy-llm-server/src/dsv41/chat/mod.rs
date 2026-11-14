@@ -62,7 +62,9 @@ pub enum Mode {
 #[derive(Clone, Debug)]
 pub struct Options {
     pub mode: Mode,
-    /// Reasoning budget 1–100 (thinking mode only).
+    /// Reasoning effort 1–100 (thinking mode only): how hard the model is asked to think, not a count of tokens (the
+    /// API's `think_budget` caps those). Each template reads it its own way: DeepSeek's as the number, GLM's banded
+    /// (`models::glm_effort`), Qwen's asking for brief thinking at a low one.
     pub effort: u32,
     /// Drop reasoning from turns before the last user turn (ignored, as
     /// if false, when the conversation has tools).
@@ -76,7 +78,9 @@ impl Default for Options {
 }
 
 /// `"low"`, `"high"`, `"max"` or 1–100, as the reference accepts; OpenAI's
-/// `"medium"` maps to the default. `None` for anything else.
+/// `"medium"` maps to the default. `None` for anything else. On the 1–100
+/// scale "low" is 50, "medium" and "high" 75 and "max" 100: a client after
+/// less than "low" sends a number (OAIY's Agent sends 25 for brief thinking).
 pub fn parse_effort(v: &Json) -> Option<u32> {
     match v {
         Json::Str(s) => match s.as_str() {

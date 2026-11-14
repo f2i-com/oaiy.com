@@ -702,3 +702,136 @@ fn drafts_are_looked_up_where_the_last_tokens_came_before() {
     assert_eq!(lookup(&[1, 2, 3, 4, 5, 6], 4), None);
     assert_eq!(lookup(&[1], 4), None);
 }
+
+/// A low effort asks the model to keep its thinking brief: "low" itself (50) and the Agent's brief thinking (25), where
+/// no word reached it at 33 and under; "medium" (75) does not ask, nor a reply that does not think.
+#[test]
+fn a_low_effort_asks_for_brief_thinking() {
+    let msgs = Json::parse(br#"[{"role": "system", "content": "Be helpful."}, {"role": "user", "content": "hi"}]"#).unwrap();
+    let asks = |mode: Mode, effort: u32, style: Pictures| chat_prompt_as(msgs.as_array().unwrap(), &Options { mode, effort, drop_thinking: true }, style).unwrap().prompt.contains(BRIEF_THINKING);
+    let low = crate::dsv41::chat::parse_effort(&Json::str("low")).unwrap();
+    let medium = crate::dsv41::chat::parse_effort(&Json::str("medium")).unwrap();
+    for style in [Pictures::Qwen, Pictures::MiniCpmV] {
+        for effort in [1, 25, 33, low] {
+            assert!(asks(Mode::Thinking, effort, style), "{style:?} at {effort}");
+        }
+        for effort in [51, medium, 100] {
+            assert!(!asks(Mode::Thinking, effort, style), "{style:?} at {effort}");
+        }
+        assert!(!asks(Mode::Chat, 25, style), "{style:?} answering at once");
+    }
+    // (in the system message, after its text)
+    let prompt = chat_prompt(msgs.as_array().unwrap(), &Options { mode: Mode::Thinking, effort: 25, drop_thinking: true }).unwrap().prompt;
+    assert!(prompt.starts_with(&format!("<|im_start|>system\n{BRIEF_THINKING}Be helpful.<|im_end|>")), "{prompt}");
+}
+
+/// One request to the real engine on its fake model: `prompt` (a few tokens, then `tail`), a reply of `max_tokens`, a
+/// thinking budget and closing words; what it wrote, the counts of its thought it said, and whether it finished.
+fn run_fake(budget: Option<usize>, max_tokens: usize, think_closing: Vec<u32>, tail: &[u32]) -> (String, Vec<(usize, Option<usize>, bool)>, bool) {
+    run_fake_model(None, budget, max_tokens, think_closing, tail)
+}
+
+/// As `run_fake`, the model `stuck` in a run (FakeModel::stuck): it writes those tokens in turn, `<think>` among them if
+/// the run names it.
+fn run_fake_model(stuck: Option<(Vec<u32>, u32)>, budget: Option<usize>, max_tokens: usize, think_closing: Vec<u32>, tail: &[u32]) -> (String, Vec<(usize, Option<usize>, bool)>, bool) {
+    use crate::engines::job::{Event, Job, Sampling};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    let mut model = super::real::FakeModel::new(None, Arc::new(AtomicUsize::new(0)));
+    model.stuck = stuck;
+    let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false);
+    let (jobs, rx) = channel();
+    let thread = std::thread::spawn(move || engine.run(rx));
+    let (events, got) = channel();
+    let prompt: Vec<u32> = std::iter::once(super::real::IM).chain(20..40).chain(tail.iter().copied()).collect();
+    let sampling = Sampling { temperature: 0.0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0, frequency_penalty: 0.0, top_p: 1.0, top_k: 0, seed: 1 };
+    jobs.send(Job { tools: vec![], tool_precision: false, observer_context: String::new(), prompt, images: vec![], max_tokens, think_budget: budget, think_closing, sampling, cancel: Arc::new(AtomicBool::new(false)), events, forget: false, session: None, wipe: false }).unwrap();
+    drop(jobs);
+    let (mut text, mut counts, mut done) = (String::new(), Vec::new(), false);
+    for event in got {
+        match event {
+            Event::Text(t) => text.push_str(&t),
+            Event::Thinking { used, budget, done } => counts.push((used, budget, done)),
+            Event::Done { .. } => done = true,
+            Event::Error(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+    thread.join().unwrap();
+    (text, counts, done)
+}
+
+/// The real engine (its fake model) closes a thought at its budget: the thought's tokens, then the `</think>` the engine
+/// forces (it counts as the thought's last), said with the count; then the reply goes on to its answer. With no budget
+/// the model thinks on to the reply's end. The job's closing words come before the tag, and are not counted. (The
+/// prompt opens the thought, as a thinking template's does: it ends with `<think>`.)
+#[test]
+fn a_thinking_budget_cuts_the_thought_off_and_the_reply_goes_on() {
+    let open = [super::real::THINK];
+    let run = |budget: Option<usize>, max_tokens: usize, think_closing: Vec<u32>| run_fake(budget, max_tokens, think_closing, &open);
+    let words = |s: &str| s.split('.').filter(|w| !w.is_empty()).count();
+    // a budget of 5 in a reply of 12: five words of thought, the thought closed, and the other six the answer
+    let (text, counts, done) = run(Some(5), 12, vec![]);
+    assert!(done, "{text}");
+    let (thought, answer) = text.split_once("</think>").expect("the engine closed the thought");
+    assert_eq!((words(thought), words(answer)), (5, 6), "{text}");
+    assert_eq!(counts, [(6, Some(5), true)]);
+    // a longer budget is counted as it goes (every 16 tokens), and ends the thought where it says
+    let (text, counts, _) = run(Some(40), 60, vec![]);
+    assert_eq!(words(text.split_once("</think>").expect("closed").0), 40, "{text}");
+    assert_eq!(counts.first(), Some(&(16, Some(40), false)));
+    assert_eq!(counts.last(), Some(&(41, Some(40), true)));
+    // no budget: the model thinks on to the reply's end
+    let (text, counts, _) = run(None, 12, vec![]);
+    assert!(!text.contains("</think>") && counts.is_empty(), "{text}");
+    // closing words (the fake model's "90." and "91."): written at the budget, then the tag; the count is the thought's
+    // own, as without them, and the answer is what the reply has left
+    let (text, counts, done) = run(Some(5), 12, vec![90, 91]);
+    assert!(done, "{text}");
+    let (thought, answer) = text.split_once("</think>").expect("closed");
+    assert!(thought.ends_with("90.91."), "{text}");
+    assert_eq!((words(thought), words(answer)), (7, 4), "{text}");
+    assert_eq!(counts, [(6, Some(5), true)]);
+    // closing words where no budget is set are never written
+    let (text, _, _) = run(None, 12, vec![90, 91]);
+    assert!(!text.contains("</think>"), "{text}");
+}
+
+/// A reply whose prompt opens no thought (Qwen3-VL's template opens none, in thinking mode too), or one whose thought
+/// the prompt closed already, is no thought: a budget never cuts it, never writes the closing words or the tag into its
+/// answer, and says no count. Every request in thinking mode has a budget (api.rs), so each of these would have been cut.
+#[test]
+fn a_reply_with_no_open_thought_is_never_cut() {
+    let words = |s: &str| s.split('.').filter(|w| !w.is_empty()).count();
+    for tail in [&[][..], &[super::real::THINK, 50, 51, 3][..]] {
+        let (text, counts, done) = run_fake(Some(5), 12, vec![90, 91], tail);
+        assert!(done, "{tail:?}: {text}");
+        assert!(!text.contains("</think>") && counts.is_empty(), "{tail:?}: {text} {counts:?}");
+        assert_eq!(words(&text), 12, "{tail:?}: the whole reply is its answer: {text}");
+    }
+    // the same prompt with its thought open is cut at the budget
+    let (text, counts, _) = run_fake(Some(5), 12, vec![90, 91], &[super::real::THINK]);
+    assert!(text.contains("90.91.</think>") && counts == [(6, Some(5), true)], "{text} {counts:?}");
+}
+
+/// A thought the model opens itself, where the prompt opened none, is budgeted as one the prompt opens: counted from the
+/// token after its `<think>`, cut at the budget with the closing words and the tag, and said with the count. Without a
+/// budget it is not cut.
+#[test]
+fn a_thought_the_model_opens_itself_is_budgeted_too() {
+    use super::real::THINK;
+    // The prompt (21 tokens, no `<think>`) leaves the model at its run's second place: it opens a thought at once, then
+    // writes 50, 51, … in turn.
+    let stuck = || Some((vec![60, THINK, 50, 51, 52, 53, 54, 55, 56, 57], 99));
+    let (text, counts, done) = run_fake_model(stuck(), Some(5), 10, vec![90, 91], &[]);
+    assert!(done, "{text}");
+    let (thought, answer) = text.split_once("</think>").expect("the engine closed the model's own thought");
+    assert!(thought.ends_with("50.51.52.53.54.90.91."), "five words of thought, then the closing words: {text}");
+    assert_eq!(answer, "60.", "{text}");
+    // (its `<think>` is not counted; the tag is, as for a thought the prompt opens)
+    assert_eq!(counts, [(6, Some(5), true)]);
+    // no budget: it thinks on, and nothing is written into it
+    let (text, counts, _) = run_fake_model(stuck(), None, 10, vec![90, 91], &[]);
+    assert!(!text.contains("</think>") && !text.contains("90.91.") && counts.is_empty(), "{text}");
+}

@@ -20,6 +20,9 @@ pub(crate) const ARM: u32 = 77_778;
 pub(crate) const DISARM: u32 = 77_779;
 const FIRST: u32 = 4;
 const WORDS: u32 = 100;
+/// Its `<think>`: after its words, so their ids are as they were, and past its logits, so it never writes one (a prompt
+/// that ends with it opens the reply's thought, as a thinking template's does).
+pub(crate) const THINK: u32 = FIRST + WORDS;
 
 pub(crate) struct FakeModel {
     pub tok: Tokenizer,
@@ -39,7 +42,8 @@ impl FakeModel {
     pub fn new(panic_on: Option<u32>, forwarded: Arc<AtomicUsize>) -> Self {
         let mut tokens = vec!["<pad>".to_string(), "<|im_start|>".into(), "<|im_end|>".into(), "</think>".into()];
         for i in FIRST..FIRST + WORDS { tokens.push(format!("{i}.")); }
-        let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3], END).unwrap();
+        tokens.push("<think>".into());
+        let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3, THINK], END).unwrap();
         FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, aside: false }
     }
 
@@ -86,7 +90,10 @@ impl FakeModel {
             for x in &kv.v[slot].data()[..n] { eat(x.to_bits()); }
         }
         for t in kv.ssm_state.iter().chain(&kv.ssm_conv).flatten() { for x in t.data() { eat(x.to_bits()); } }
-        let mut logits = vec![0.0f32; (FIRST + WORDS) as usize];
+        // (`<think>` has a row only where a stuck model's run names it: a model that opens its own thought; every other
+        // model never writes one)
+        let rows = if self.stuck.as_ref().is_some_and(|(run, other)| run.contains(&THINK) || *other == THINK) { (THINK + 1) as usize } else { (FIRST + WORDS) as usize };
+        let mut logits = vec![0.0f32; rows];
         match &self.stuck {
             Some((run, other)) => {
                 logits[run[kv.len % run.len()] as usize] = 10.0;
@@ -94,7 +101,7 @@ impl FakeModel {
             }
             None => logits[(FIRST as u64 + h % WORDS as u64) as usize] = 1.0,
         }
-        Ok(Tensor::from_vec(logits, vec![(FIRST + WORDS) as usize]))
+        Ok(Tensor::from_vec(logits, vec![rows]))
     }
 }
 
@@ -151,7 +158,7 @@ impl Engine {
     fn send(&self, prompt: Vec<u32>, forget: bool, session: Option<&str>, wipe: bool, cancel: bool, max_tokens: usize) -> Reply {
         let (events, rx) = channel();
         let job = Job {
-            tools: vec![], tool_precision: false, observer_context: String::new(), prompt, images: vec![], max_tokens, think_budget: None,
+            tools: vec![], tool_precision: false, observer_context: String::new(), prompt, images: vec![], max_tokens, think_budget: None, think_closing: vec![],
             sampling: Sampling { temperature: 0.0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0,
                 presence_penalty: 0.0, frequency_penalty: 0.0, top_p: 1.0, top_k: 0, seed: 1 },
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(cancel)), events, forget, session: session.map(str::to_owned), wipe,
