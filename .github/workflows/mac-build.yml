@@ -269,8 +269,12 @@ jobs:
           npm ci
           npm run build:desktop
 
+      # Its build's heap peaks near Node's default limit on this runner (about 2 GB of a 7 GB Mac): v0.1.15's first run
+      # ran out of memory here and its second passed, on the same commit and image. Twice the room.
       - name: Install and build the flow editor
         working-directory: platform/ui
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: |
           npm ci
           npm run build
