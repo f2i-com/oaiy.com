@@ -40,6 +40,11 @@ import FACADE from './zippDom.guest.js?raw';
 
 export type PreviewTarget = { kind: 'app'; root: string } | { kind: 'page'; path: string } | { kind: 'model'; path: string };
 
+/** Where a page's or an app's localStorage is kept while OAIY is open: by the page's path, or the app's folder. */
+export function storageKey(target: PreviewTarget): string {
+  return target.kind === 'app' ? `app:${target.root}` : target.path;
+}
+
 export interface PreviewResult {
   ok: boolean;
   errors: string[];
@@ -572,8 +577,9 @@ export class Preview {
       if (page && this.requests.size) this.pendingPage = page;
       else if (page) this.setPage(page);
       else this.setStatus(`no page /${path} in the project`, 'error');
-    } else if (data.type === 'bot:storage' && this.target?.kind === 'page' && data.store && typeof data.store === 'object') {
-      this.storage.set(this.target.path, data.store as Record<string, string>);
+    } else if (data.type === 'bot:storage' && this.target && this.target.kind !== 'model' && data.store && typeof data.store === 'object') {
+      // (a web page's, from the facade; a SoftN app's, from the bridge's stand-in for the frame's localStorage)
+      this.storage.set(storageKey(this.target), data.store as Record<string, string>);
     } else if (data.type === 'bot:dialog' && typeof data.message === 'string') {
       this.setStatus(`${data.kind ?? 'alert'}: ${data.message.slice(0, 120)}`, 'ok');
     }
@@ -1012,7 +1018,7 @@ export class Preview {
         this.settle({ ok: all.length === 0, errors: all, warnings: warned });
       };
       frame.contentWindow!.postMessage(
-        { type: 'webpage:init', files: pageFiles(this.vfs, path), page: path, glue, wasm: bytes.slice(0), facade: FACADE, storage: this.storage.get(path) ?? {} },
+        { type: 'webpage:init', files: pageFiles(this.vfs, path), page: path, glue, wasm: bytes.slice(0), facade: FACADE, storage: this.storage.get(storageKey({ kind: 'page', path })) ?? {} },
         '*',
         [channel.port2],
       );
@@ -1080,6 +1086,9 @@ export class Preview {
     const onMessage = (event: MessageEvent) => {
       if (event.source !== frame.contentWindow || event.data?.type !== 'formlogic:ready') return;
       window.removeEventListener('message', onMessage);
+      // The app's localStorage as it was left, for the bridge's stand-in (the frame has no origin, and the browser's own
+      // store refused every write: a snake game saving its best score failed at every step), before the app is sent.
+      frame.contentWindow?.postMessage({ __botComputer: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
       const channel = new MessageChannel();
       // What this frame does past drawing the app once: saying when it is drawn, taking a newer version in place.
       // (with the media `init` carries: an update leaves its media out while it is the same)

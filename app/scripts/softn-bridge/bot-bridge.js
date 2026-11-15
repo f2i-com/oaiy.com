@@ -30,6 +30,57 @@
     }
   };
 
+  // --- localStorage ---------------------------------------------------------------
+  // The frame has an opaque origin, so the browser's localStorage throws on every touch, and SoftN's runtime refused
+  // every write the app's script made (to the script, ZIPP's bare "host bridge call failed": a snake game saving its
+  // best score failed at every step, and the model could not see why). A store of its own stands in, before the
+  // runtime's scripts run: kept by OAIY while it is open (bot:storage), as a web page's is, and given back to the next
+  // frame of the same app (bot:storage-init). A frame that has a store of its own keeps it.
+  (() => {
+    try {
+      const own = window.localStorage;
+      own.setItem('__bot_probe__', '1');
+      own.removeItem('__bot_probe__');
+      return;
+    } catch {
+      /* none here: the stand-in below */
+    }
+    let data = new Map();
+    const save = () => post({ type: 'bot:storage', store: Object.fromEntries(data) });
+    const store = {
+      get length() {
+        return data.size;
+      },
+      key: (i) => (Number.isInteger(i) && i >= 0 && i < data.size ? [...data.keys()][i] : null),
+      getItem: (key) => (data.has(String(key)) ? data.get(String(key)) : null),
+      setItem: (key, value) => {
+        data.set(String(key), String(value));
+        save();
+      },
+      removeItem: (key) => {
+        if (data.delete(String(key))) save();
+      },
+      clear: () => {
+        data = new Map();
+        save();
+      },
+    };
+    try {
+      Object.defineProperty(window, 'localStorage', { configurable: true, enumerable: true, get: () => store });
+    } catch {
+      return;
+    }
+    window.addEventListener('message', (event) => {
+      const message = event.data;
+      if (event.source !== parentWindow || !message || message.__botComputer !== true || message.type !== 'bot:storage-init') return;
+      if (!message.store || typeof message.store !== 'object') return;
+      // (what the app wrote since the frame opened stays: the store kept is the older)
+      for (const [key, value] of Object.entries(message.store)) {
+        if (typeof value === 'string' && !data.has(key)) data.set(key, value);
+      }
+    });
+  })();
+
   // --- scrolling ----------------------------------------------------------------
   // A SoftN app taller than the preview scrolls in it: SoftN's App fills the window with its overflow hidden, so
   // what lay past the window's bottom was cut off and could not be reached. Its own layout is kept (its height the

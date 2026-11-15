@@ -193,6 +193,40 @@ try {
     expect(text.includes('Groceries'), text);
   });
 
+  await check("an app's localStorage takes what it writes in the sandboxed preview, and keeps it for the app's next render", async () => {
+    // The frame has no origin, so the browser's own store throws: SoftN refused every write, and a game saving its best
+    // score failed at every step ("host bridge call failed"). The bridge's stand-in takes it, and OAIY keeps it.
+    const wrote = await appFrame(page).evaluate(() => {
+      try {
+        localStorage.setItem('softn:tasks:best', '7');
+        return { ok: true, read: localStorage.getItem('softn:tasks:best'), length: localStorage.length };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    });
+    expect(wrote.ok && wrote.read === '7' && wrote.length >= 1, JSON.stringify(wrote));
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/>Groceries</>Shopping</" index.html'), 'after the write');
+    expect(/live/.test(status), status);
+    const kept = await appFrame(page).evaluate(() => localStorage.getItem('softn:tasks:best'));
+    expect(kept === '7', `after the next render: ${kept}`);
+    // and the app's own script writes through it: from Zipp, by SoftN's bridge, under SoftN's prefix for the app
+    await afterRender(page, () => terminal(page, `echo 'localStorage.setItem("seen", "yes")' >> main.js`), 'a script that writes');
+    const seen = await appFrame(page).evaluate(() => {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+      const key = keys.find((k) => k.endsWith(':seen'));
+      return { key, value: key ? localStorage.getItem(key) : null };
+    });
+    expect(seen.value === 'yes' && seen.key.startsWith('softn:'), JSON.stringify(seen));
+    await afterRender(page, () => terminal(page, `sed -i '/localStorage.setItem("seen"/d' main.js`), 'the line taken out');
+    // (the page went on: no error came of it)
+    const problems = await page.$eval('.preview', (p) => p.querySelector('.preview-problem')?.hidden === false);
+    expect(!problems, 'the preview reports a problem');
+    // (the title as the checks after this one know it)
+    const back = await afterRender(page, () => terminal(page, 'sed -i "s/>Shopping</>Groceries</" index.html'), 'the title back');
+    expect(/live/.test(back), back);
+  });
+
   await check('a link in the app to another site is shown over it, and opened only when the person says so, once it has been shown a moment', async () => {
     const frame = appFrame(page);
     // A link as an app's page has one; the frame hands on the person's click on it (SoftN's links/1).
