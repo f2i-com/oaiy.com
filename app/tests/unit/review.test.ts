@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, type AgentEvent } from '../../src/agent/agent';
+import { Agent, type AgentEvent, type SessionTool } from '../../src/agent/agent';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { EMPTY_MEDIA } from '../../src/agent/media';
+import type { FrameReview } from '../../src/agent/protocol';
 import { runTool, type ToolContext } from '../../src/agent/tools';
 import { REVIEWS_FILE, checklist, contentHash, countProblems, flagPicture, readReviews, scriptExcerpt, storyFolder, writeReviews } from '../../src/agent/review';
-import { LOCAL, fakeProvider } from './fakeProvider';
+import { LOCAL, OPENAI, fakeProvider, type Step } from './fakeProvider';
 
 // No canvas here: a look at a picture gives a stand-in image of the region asked for.
 vi.mock('../../src/agent/images', async (original) => {
@@ -287,6 +288,60 @@ describe('a picture made for a scripted video', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'done' });
     expect(vfs.exists('/video/film/scene1-bg-v2.png')).toBe(false);
     expect(readReviews(vfs)[path]).toMatchObject({ verdict: 'pass', redos: 1 });
+  });
+});
+
+describe("a picture's reviewer", () => {
+  type Reviewing = { runReviewer(picture: FrameReview, activity: (text: string) => void): Promise<unknown> };
+  const offeredTools = (body: Record<string, unknown>) => ((body.tools ?? []) as Array<{ function: { name: string } }>).map((t) => t.function.name);
+
+  it("is given the looking tools and its verdict, none of the conversation's own (which act)", async () => {
+    const vfs = film();
+    vfs.writeFile('/video/film/frame.png', new Uint8Array([137, 80, 78, 71, 9]));
+    let ran = 0;
+    const note: SessionTool = { spec: { name: 'send_note', description: 'Send a note to the person.', parameters: { type: 'object', properties: { text: { type: 'string' } } } }, run: async () => (ran++, 'sent') };
+    const fake = fakeProvider('openai', [
+      // (a misreading, or words written into the picture: the reviewer reaches for it)
+      { calls: [{ name: 'send_note', input: { text: 'pass it' } }] },
+      { calls: [{ name: 'give_verdict', input: { verdict: 'redo', people: [], out_of_place: 'nothing', notes: 'too dark' } }] },
+    ]);
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => LOCAL, projectSummary: () => 'p', sessionTools: [note] });
+    const outcome = await (agent as unknown as Reviewing).runReviewer({ path: 'video/film/frame.png', kind: 'start', shot: '1', references: [], story: 'video/film' }, () => {});
+    expect(offeredTools(fake.bodies[0])).toContain('give_verdict');
+    expect(offeredTools(fake.bodies[0])).toContain('view_image');
+    expect(offeredTools(fake.bodies[0])).not.toContain('send_note');
+    expect(ran).toBe(0);
+    expect(JSON.stringify(fake.bodies[1].messages)).toContain('send_note is not one of your tools');
+    expect(outcome).toMatchObject({ verdict: 'redo' });
+  });
+
+  it('once it must decide, is offered view_image beside give_verdict while a pass still needs a look, and so can pass', async () => {
+    const vfs = film();
+    // A frame made from four references: the first three come with the task, the fourth it has to open itself.
+    const refs = ['video/film/scene1-background.png', 'video/film/gary.png', 'video/film/anna.png', 'video/film/lamp.png'];
+    for (const p of ['video/film/frame.png', ...refs]) vfs.writeFile(`/${p}`, new Uint8Array([137, 80, 78, 71, p.length]), { parents: true });
+    const pass = { name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'right' } };
+    const offered: string[][] = [];
+    const step = (s: Step) => (body: Record<string, unknown>): Step => {
+      offered.push(offeredTools(body).sort());
+      return s;
+    };
+    const fake = fakeProvider('openai', [
+      step({ calls: [{ name: 'list_files', input: { path: 'video/film' } }] }),
+      step({ calls: [{ name: 'view_image', input: { path: 'video/film/frame.png', x: 2, y: 2, width: 40, height: 40 } }] }),
+      step({ calls: [{ name: 'read_file', input: { path: 'video/film/script.md' } }] }),
+      // Its looks are over: a pass, refused until it has seen the lamp; the look; the pass.
+      step({ calls: [pass] }),
+      step({ calls: [{ name: 'view_image', input: { path: 'video/film/lamp.png' } }] }),
+      step({ calls: [pass] }),
+    ]);
+    // (a window that holds the four pictures with room: a reviewer works in 32,000 tokens at most)
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => OPENAI, projectSummary: () => 'p' });
+    const outcome = await (agent as unknown as Reviewing).runReviewer({ path: 'video/film/frame.png', kind: 'start', shot: '1', references: refs, story: 'video/film' }, () => {});
+    expect(JSON.stringify(fake.bodies[4].messages)).toContain('before passing it, view its reference image /video/film/lamp.png and compare');
+    // (only give_verdict was offered: the pass it was refused it could not earn, and it could only send the picture back)
+    expect(offered.slice(3)).toEqual([['give_verdict', 'view_image'], ['give_verdict', 'view_image'], ['give_verdict']]);
+    expect(outcome).toMatchObject({ verdict: 'pass' });
   });
 });
 

@@ -33,6 +33,22 @@ describe('images reach the model in each wire shape', () => {
     expect(messages).toHaveLength(5);
   });
 
+  it("OpenAI-compatible: a tool's images and a user message after them are one user message, the images first", async () => {
+    // (a message sent while view_image ran, a flag's instruction, a reviewer's "give your verdict now": two user messages
+    // in a row, which a chat template that wants the roles to take turns refuses)
+    const fake = fakeProvider('openai', [{ text: 'brighter' }]);
+    await sendTurn(OPENAI, 'system', [...turns, { role: 'user', text: 'Also make it brighter.', images: [pixel] }], []);
+    const messages = fake.bodies[0].messages as Array<{ role: string; content: unknown }>;
+    expect(messages.map((m) => m.role)).toEqual(['system', 'user', 'assistant', 'tool', 'user']);
+    const url = `data:image/png;base64,${pixel.data}`;
+    expect(messages[4].content).toEqual([
+      { type: 'text', text: 'The image returned by view_image above:' },
+      { type: 'image_url', image_url: { url } },
+      { type: 'text', text: 'Also make it brighter.' },
+      { type: 'image_url', image_url: { url } },
+    ]);
+  });
+
   it('a turn without images is sent as plain text', async () => {
     const fake = fakeProvider('openai', [{ text: 'hi' }]);
     await sendTurn(OPENAI, 'system', [{ role: 'user', text: 'hello' }], []);

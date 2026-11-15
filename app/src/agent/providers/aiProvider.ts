@@ -72,8 +72,8 @@ export type AIFailureKind = 'timeout' | 'cancelled' | 'rate-limited' | 'http' | 
 /**
  * A request that did not produce a reply, and why. The kinds are distinct
  * because they are recovered from differently: a timeout is retried, a rate
- * limit is retried after `retryAfterMs`, a cancellation is nothing at all,
- * an HTTP failure is read.
+ * limit (or an overload that passes) is retried after `retryAfterMs`, a
+ * cancellation is nothing at all, an HTTP failure is read.
  */
 export class AIProviderError extends Error {
   readonly kind: AIFailureKind;
@@ -446,11 +446,16 @@ async function providerRequest<T>(
       const detail = providerMessage(text);
       // OAIY's ChatGPT connector, signed out: where to sign in, said plainly (nothing else is tried instead).
       if (signInNeeded(text)) throw new AIProviderError('http', CHATGPT_SIGN_IN, { status: resp.status, detail: detail ?? text });
-      throw new AIProviderError(
-        'http',
-        describeConnectionError(kindForStatus(resp.status), { ...errorContext(provider, url), detail }, resp.status),
-        { status: resp.status, detail: detail ?? text, code: providerCode(text) },
-      );
+      const code = providerCode(text);
+      const said = describeConnectionError(kindForStatus(resp.status), { ...errorContext(provider, url), detail }, resp.status);
+      // An overload that passes, said with a status: waited for and asked again as a rate limit is (and as the same
+      // overload said inside a stream is). Anthropic's 529 overloaded_error; OAIY's engine busy with other pictures (503
+      // `busy`); a 503 that says it is overloaded, or when to come back. Not a 503 that will not pass by waiting (OAIY's
+      // model worker stopped: `unavailable`).
+      const retryAfterMs = parseRetryAfter(resp.headers.get('retry-after'));
+      const overloaded = resp.status === 529 || (resp.status === 503 && code !== 'unavailable' && (code === 'busy' || retryAfterMs !== undefined || /overloaded/i.test(text)));
+      if (overloaded) throw new AIProviderError('rate-limited', said, { status: resp.status, retryAfterMs, detail: detail ?? text, code });
+      throw new AIProviderError('http', said, { status: resp.status, detail: detail ?? text, code });
     }
     touch();
     return await read(resp, controller.signal, touch);

@@ -781,10 +781,22 @@ function requestIndex(turns: Turn[]): number {
   return -1;
 }
 
+/** Text cut to about `max` characters: its start and its end kept, and the cut marked with what it left out. */
+function headAndTail(text: string, max: number, why: string): string {
+  if (text.length <= max) return text;
+  const head = Math.ceil(max / 2);
+  const tail = Math.floor(max / 2);
+  return `${text.slice(0, head)}\n[… ${text.length - head - tail} characters left out here ${why} …]\n${text.slice(text.length - tail)}`;
+}
+
+/** The least of a message the last step of trimming keeps: its first and last few hundred characters. */
+const MIN_KEPT_MESSAGE = 1000;
+
 /**
  * The last resort when a summary cannot make room (or is not enough): old
- * tool output shrinks, then everything but the recent turns; the
- * conversation's shape never changes.
+ * tool output shrinks, then everything but the recent turns, and last a
+ * message too big for the room on its own; the conversation's shape never
+ * changes.
  */
 function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[] {
   const turns = withoutOldImages(allTurns, keepImages);
@@ -809,7 +821,36 @@ function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[]
     const lastTool = out[out.length - 1];
     if (estimateChars(out) > maxChars && lastTool?.role === 'tool') out[out.length - 1] = { role: 'tool', results: lastTool.results.map((r) => (r.content.length > limit * 2 ? { ...r, content: `${r.content.slice(0, limit * 2)}\n[cut to fit the model's context: read less at a time]` } : r)) };
   }
+  // Still over: a message too big for the room on its own (a log or a document pasted in, the request among them), the
+  // biggest first. Its start and its end are kept, the cut marked: sent whole, it was refused, then compacted (there was
+  // nothing to compact), sent and refused again, and again on each Try again.
+  const cut = new Set<number>();
+  for (let over = estimateChars(out) - maxChars; over > 0; over = estimateChars(out) - maxChars) {
+    let at = -1;
+    for (const [i, t] of out.entries()) {
+      if (t.role !== 'user' || t.summary || cut.has(i) || t.text.length <= MIN_KEPT_MESSAGE) continue;
+      if (at < 0 || t.text.length > (out[at] as Extract<Turn, { role: 'user' }>).text.length) at = i;
+    }
+    if (at < 0) break;
+    cut.add(at);
+    const turn = out[at] as Extract<Turn, { role: 'user' }>;
+    // (the marker's own words counted too)
+    out[at] = { ...turn, text: headAndTail(turn.text, Math.max(MIN_KEPT_MESSAGE, turn.text.length - over - 200), "to fit the model's context") };
+  }
   return out;
+}
+
+/**
+ * Whether a request was refused as too long for the model, and the window the server says it has. By its code, whatever
+ * its words (context_length_exceeded: OpenAI's, and OAIY's engine's, a prompt its pictures take past the context among
+ * them); otherwise by its words, on a status servers refuse a prompt with, or in an error inside a stream (an older
+ * llama.cpp says so there, once the reply has begun).
+ */
+function contextOverflow(error: AIProviderError): { overflow: boolean; tokens: number | null } {
+  if (error.kind !== 'http') return { overflow: false, tokens: null };
+  const said = overflowWindow(`${error.message} ${error.detail ?? ''}`);
+  if (error.code === 'context_length_exceeded') return { overflow: true, tokens: said.tokens };
+  return error.status === undefined || [400, 413, 422, 500].includes(error.status) ? said : { overflow: false, tokens: null };
 }
 
 const sleep = (ms: number, signal?: AbortSignal) =>
@@ -852,6 +893,12 @@ export class Agent {
     this.failingApps.clear();
     this.toolContext.reads.clear();
     this.toolContext.shell = { cwd: '/', env: {} };
+    // A flag given to the conversation before and not fixed yet goes first again, with the person's words: the new
+    // conversation is given it whole (as the flags still waiting are), instead of being pushed to fix a picture it was
+    // never told about. And a video's script is checked against the new conversation's request, not the old one's.
+    if (this.activeFlag && !this.flagFixed(this.activeFlag.path)) this.flags.unshift(this.activeFlag);
+    this.activeFlag = null;
+    this.scriptsChecked.clear();
   }
 
   /** The checklist from the latest update_plan. */
@@ -1108,8 +1155,13 @@ export class Agent {
 
   /** Every tool this agent may use, listed or found. */
   private get usable(): ToolSpec[] {
-    // A sub-agent gets its list from its parent, media tools included (a call, a short list of its own).
-    if (this.options.tools) return [...this.options.tools, ...this.sessionToolList.map((t) => t.spec)];
+    // A sub-agent gets its list from its parent, media tools and the conversation's own tools included (a call, a short
+    // list of its own). Its own session tools join only those the list lacks (one that came since): a task listed each of
+    // them twice, and a provider that wants each name once (Anthropic) refuses that.
+    if (this.options.tools) {
+      const listed = new Set(this.options.tools.map((t) => t.name));
+      return [...this.options.tools, ...this.sessionToolList.map((t) => t.spec).filter((spec) => !listed.has(spec.name))];
+    }
     const provider = this.options.provider();
     // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
@@ -1267,14 +1319,21 @@ export class Agent {
     const names = new Set(this.usable.map((t) => t.name));
     const topics = guideTopics(names);
     const loaded = this.loadedGuides();
-    // (where the tools are found, the guides are results and the request is in view: the prompt stays the same)
+    // (where the tools are found, the guides are results and the request is in view, until a summary takes its turn: the
+    // prompt stays the same)
     const discovering = this.discovering;
     // The video guide holds the media one.
     const read = discovering ? [] : (['document', 'app', 'web', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
     const guides = read.map((t) => `\n\nThe ${t} guide:\n${this.guideText(t, names)}`).join('');
-    // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
-    const request = read.includes('video') && !this.options.role ? this.requestText() : '';
-    const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
+    // The request stays in view, word for word: for a video, however long the work (as a reference, not a step to take);
+    // and for any work once its turn was summarized to make room, so the model reads the request, not a paraphrase of it
+    // (whole, unless too long for the window: its start and its end then, the cut marked).
+    const video = read.includes('video') && !this.options.role;
+    const summarized = this.requestOutOfView();
+    const request = video || summarized ? this.requestWords(true) : '';
+    const quoted = summarized ? headAndTail(request, video ? Math.max(4000, this.quoteRoom()) : this.quoteRoom(), "to fit the model's context") : request.length > 4000 ? `${request.slice(0, 4000)} […]` : request;
+    const why = [summarized ? 'the part of the conversation it was in was summarized to make room' : '', video ? "the script and everything made follow it; the guide's rules only fill in what it leaves open" : ''].filter(Boolean).join('; ');
+    const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (${why}):\n"""\n${quoted}\n"""` : '';
     const base = discovering ? FOUND_PROMPT : `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}`;
     // (the person's own last: they come after everything OAIY says, and say they win where the two differ)
     const own = this.options.personInstructions?.().trim() ?? '';
@@ -1484,6 +1543,17 @@ ${personInstructionsText(own)}` : ''}`;
     else r.whole = true;
   }
 
+  /** For a reviewer: the looks a pass still needs (the whole picture, references not seen), as give_verdict asks for them. */
+  private looksMissing(): string[] {
+    const r = this.reviewing;
+    if (!r) return [];
+    const unseen = r.references.filter((ref) => !r.seen.has(ref));
+    return [
+      !r.whole ? `view the whole picture (/${r.path})` : '',
+      unseen.length ? `view its reference image${unseen.length === 1 ? '' : 's'} ${unseen.map((u) => `/${u}`).join(', ')} and compare` : '',
+    ].filter(Boolean);
+  }
+
   private takeVerdict(call: ToolCall): ToolResult {
     const verdict = call.input.verdict;
     const notes = typeof call.input.notes === 'string' ? call.input.notes.trim() : '';
@@ -1503,15 +1573,8 @@ ${personInstructionsText(own)}` : ''}`;
     if (verdict === 'pass' && this.reviewing?.flagged) return error('the user flagged this picture as wrong, so it cannot pass: look again, closer, until you find what is wrong, then give verdict redo saying what the remake should fix');
     if (verdict === 'pass') {
       // A pass is only as good as the looking behind it.
-      const r = this.reviewing;
-      if (r) {
-        const unseen = r.references.filter((ref) => !r.seen.has(ref));
-        const missing = [
-          !r.whole ? `view the whole picture (/${r.path})` : '',
-          unseen.length ? `view its reference image${unseen.length === 1 ? '' : 's'} ${unseen.map((u) => `/${u}`).join(', ')} and compare` : '',
-        ].filter(Boolean);
-        if (missing.length) return error(`before passing it, ${missing.join('; ')}`);
-      }
+      const missing = this.looksMissing();
+      if (missing.length) return error(`before passing it, ${missing.join('; ')}`);
       const problems = countProblems(people);
       if (!nothingOut) problems.push(`out of place: ${outOfPlace}`);
       if (problems.length) return error(`it cannot pass with what you found: ${problems.join('; ')}. Give verdict redo, saying what the remake should fix.`);
@@ -1617,6 +1680,10 @@ ${personInstructionsText(own)}` : ''}`;
       ...this.options,
       provider: () => provider,
       tools: [...this.usable.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
+      // None of the conversation's own tools: they act (a flow's tool, a message sent, OAIY's controls), and a reviewer
+      // only looks; a misreading, or words written into a picture, could make it use them. (The person's flows in front of
+      // its looking tools still apply: they are the person's rules for those tools, a guard on read_file among them.)
+      sessionTools: [],
       role: REVIEWER_ROLE,
       // It judges a picture against its script and references, which carry what the person asked for.
       personInstructions: undefined,
@@ -1754,8 +1821,11 @@ ${personInstructionsText(own)}` : ''}`;
     if (keepFrom >= view.length) return;
     while (keepFrom > 0 && view[keepFrom]?.role === 'tool') keepFrom--;
     const old = view.slice(0, keepFrom);
-    // Nothing old enough to summarize (one huge recent step, or only the last summary): trimming handles it.
-    if (!old.length || (old.length === 1 && old[0].role === 'user' && old[0].summary)) return;
+    // Nothing old enough to summarize: only the request being worked on (with what the user added while it ran) and OAIY's
+    // own notes, the last summary among them (one huge recent step, or a summary just made). Summarized, the request was
+    // read from then on as a paraphrase, for a model request and often a longer prompt; trimming makes the room instead.
+    const asked = requestIndex(view);
+    if (old.every((t, i) => t.role === 'user' && (t.automatic || t.summary || i >= asked))) return;
     emit({ type: 'status', message: `Summarizing ${old.length} earlier turns to make room in the context…` });
     let summary: string;
     let how: 'summary' | 'trimmed' = 'summary';
@@ -1763,7 +1833,7 @@ ${personInstructionsText(own)}` : ''}`;
       summary = await this.summarize(old, provider, b, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
-      summary = this.mechanicalSummary(old);
+      summary = this.mechanicalSummary(old, start);
       how = 'trimmed';
     }
     const note: Turn = {
@@ -1773,7 +1843,8 @@ ${personInstructionsText(own)}` : ''}`;
       text: `[OAIY] The conversation before this point (${old.length} turns) was summarized to fit the model's context.\n<project>\n${this.options.projectSummary()}\n</project>\n\n${summary}`,
     };
     this.turns.splice(start + keepFrom, 0, note);
-    const after = this.estimate(this.view()) + b.fixed;
+    // (the instructions now quote the request, if it was among the turns summarized: counted with them)
+    const after = this.estimate(this.view()) + this.budget(provider).fixed;
     emit({ type: 'compact', turns: old.length, before, after, how });
   }
 
@@ -1804,11 +1875,17 @@ ${personInstructionsText(own)}` : ''}`;
     return summary;
   }
 
-  /** Without the model: the requests, the files touched, the plan. */
-  private mechanicalSummary(old: Turn[]): string {
-    const requests = old.filter((t): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic).map((t) => `- ${t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '').slice(0, 300)}`);
+  /**
+   * Without the model: the requests before the one being worked on (each cut short; that one, with what the user added
+   * while it ran, the instructions quote whole: requestOutOfView), the files touched, the plan. `from`: where `old`
+   * starts in the conversation.
+   */
+  private mechanicalSummary(old: Turn[], from: number): string {
+    const asked = requestIndex(this.turns);
+    const requests = old.filter((t, i): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic && !t.summary && (asked < 0 || from + i < asked)).map((t) => `- ${t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '').slice(0, 300)}`);
     const touched = new Set<string>();
-    for (const t of old) if (t.role === 'assistant') for (const c of t.calls) if (typeof c.input.path === 'string' && /write|edit|delete/.test(c.name)) touched.add(c.input.path);
+    // (append_file among them: long documents are written with it)
+    for (const t of old) if (t.role === 'assistant') for (const c of t.calls) if (typeof c.input.path === 'string' && /write|edit|delete|append/.test(c.name)) touched.add(c.input.path);
     const earlier = old.find((t) => t.role === 'user' && t.summary) as Extract<Turn, { role: 'user' }> | undefined;
     return [
       earlier ? `Earlier summary:\n${earlier.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}` : '',
@@ -1835,8 +1912,12 @@ ${personInstructionsText(own)}` : ''}`;
       this.streamed = '';
       try {
         const finish = this.options.finish;
-        const tools = finish && this.finishing ? this.usable.filter((t) => t.name === finish.tool) : this.listed;
+        // (finishing, the finishing tool alone; and for a reviewer view_image beside it while a pass still needs a look it
+        // gives: a pass refused for a reference not looked at could otherwise only be sent back, or refused until the run
+        // stopped without a verdict)
+        const tools = finish && this.finishing ? this.usable.filter((t) => t.name === finish.tool || (t.name === 'view_image' && this.looksMissing().length > 0)) : this.listed;
         if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
+        let thought = false;
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
@@ -1846,7 +1927,10 @@ ${personInstructionsText(own)}` : ''}`;
               this.streamed += delta;
               emit({ type: 'text', delta });
             },
-            thinking: (delta) => emit({ type: 'thinking', delta }),
+            thinking: (delta) => {
+              thought = true;
+              emit({ type: 'thinking', delta });
+            },
             thinkingCount: (used, budget, done) => emit({ type: 'thinking_count', used, budget, done }),
             toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
             toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
@@ -1855,10 +1939,18 @@ ${personInstructionsText(own)}` : ''}`;
             reading: (done, total, reused) => emit({ type: 'status', message: readingStatus(done, total, reused) }),
           },
         });
-        // The provider's own count calibrates the next estimate.
+        // A reply that came whole, through no stream (a server that ignores `stream`, or one asked again without it when its
+        // stream could not be read): shown as a streamed one is, its thought first (the chat draws a reply as it streams).
+        if (!thought && reply.thinking) emit({ type: 'thinking', delta: reply.thinking });
+        if (!this.streamed && reply.text) emit({ type: 'text', delta: reply.text });
+        // The provider's own count calibrates the next estimate, from a prompt of text alone: a picture costs what the
+        // server makes of it (256 tokens to Gemma in OAIY's engine, some 765 at OpenAI; IMAGE_TOKENS in the estimate), and
+        // counted in characters it doubled the ratio, so that text was then taken for half its size and compaction came late.
         if (reply.usage.inputTokens > 200) {
-          const ratio = (this.fixedChars() + estimateChars(sent, this.charsPerToken)) / reply.usage.inputTokens;
-          if (ratio > 1 && ratio < 10) this.charsPerToken = ratio;
+          if (!sent.some(hasImages)) {
+            const ratio = (this.fixedChars() + estimateChars(sent, this.charsPerToken)) / reply.usage.inputTokens;
+            if (ratio > 1 && ratio < 10) this.charsPerToken = ratio;
+          }
           emit({ type: 'context', used: reply.usage.inputTokens + reply.usage.outputTokens, window: b.window });
         }
         return reply;
@@ -1866,7 +1958,7 @@ ${personInstructionsText(own)}` : ''}`;
         lastError = error;
         if (!(error instanceof AIProviderError)) throw error;
         // Too long for the server: it often says how long it can take. Compact and try once more.
-        const overflow = error.kind === 'http' && (error.status === 400 || error.status === 413 || error.status === 422 || error.status === 500) ? overflowWindow(`${error.message} ${error.detail ?? ''}`) : { overflow: false, tokens: null };
+        const overflow = contextOverflow(error);
         if (overflow.overflow && !overflowRetried) {
           overflowRetried = true;
           if (overflow.tokens && overflow.tokens < b.window) {
@@ -2156,14 +2248,39 @@ ${personInstructionsText(own)}` : ''}`;
     ].join('\n\n');
   }
 
-  /** The request being worked on, as the user wrote it, with what they added while it ran. */
+  /** The request being worked on, as the user wrote it, with what they added while it ran (its first 8,000 characters). */
   private requestText(): string {
+    const text = this.requestWords();
+    return text.length > 8000 ? `${text.slice(0, 8000)} […]` : text;
+  }
+
+  /** The same, whole; `bare`: without the guides given with it where the tools are found (OAIY's words, not the user's). */
+  private requestWords(bare = false): string {
     const at = requestIndex(this.turns);
     if (at < 0) return '';
     const own = (t: Turn) => (t.role === 'user' ? t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '') : '');
+    const first = bare ? own(this.turns[at]).replace(/\n\n\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide follows[\s\S]*$/, '') : own(this.turns[at]);
     const later = this.turns.slice(at + 1).filter((t) => t.role === 'user' && !t.automatic && t.text.startsWith(DURING_PREFIX)).map((t) => own(t).replace(/^\[[^\]]*\]\n\n/, ''));
-    const text = [own(this.turns[at]), ...later.map((t) => `Then, while you worked: ${t}`)].join('\n\n').trim();
-    return text.length > 8000 ? `${text.slice(0, 8000)} […]` : text;
+    return [first, ...later.map((t) => `Then, while you worked: ${t}`)].join('\n\n').trim();
+  }
+
+  /**
+   * Whether the request being worked on was summarized to make room: its turn is before the summary the model's view
+   * starts at. The instructions then quote it (systemPrompt). Not after a fresh start (a new call, read from there on by
+   * design), nor in a conversation with a person, whose words are answered as they come.
+   */
+  private requestOutOfView(): boolean {
+    if (this.options.conversation) return false;
+    const start = viewStart(this.turns);
+    const first = this.turns[start];
+    const at = requestIndex(this.turns);
+    return at >= 0 && at < start && first?.role === 'user' && !!first.summary;
+  }
+
+  /** The most of a summarized request the instructions quote, in characters: about a sixth of the window. */
+  private quoteRoom(): number {
+    const provider = this.options.provider();
+    return provider ? Math.max(2000, Math.floor(this.window(provider) * 0.15 * this.charsPerToken)) : 8000;
   }
 
   /** Messages a run ended before it could read: to send as the next request. */
@@ -2359,6 +2476,9 @@ ${personInstructionsText(own)}` : ''}`;
         // (Counted once a step: three of the same write in one reply were "told each time" when they were told nothing.)
         let unchangedStop: { path: string; times: number } | null = null;
         const unchangedHere = new Set<string>();
+        // The errors this step's calls got: one counts once a step toward the same failure in a row (three edits of an
+        // unread file, refused in the same words in one reply, stopped the run before the model had seen any of them).
+        const failedHere = new Set<string>();
         for (const [index, asked] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
@@ -2453,8 +2573,11 @@ ${personInstructionsText(own)}` : ''}`;
             sincePlan = 0;
           }
           emit({ type: 'tool_result', result });
-          if (result.isError && result.content === lastFailure) failures++;
+          if (result.isError && failedHere.has(result.content)) {
+            /* counted for this step already */
+          } else if (result.isError && result.content === lastFailure) failures++;
           else failures = result.isError ? 1 : 0;
+          if (result.isError) failedHere.add(result.content);
           lastFailure = result.isError ? result.content : '';
         }
         callIndex = reply.calls.length;

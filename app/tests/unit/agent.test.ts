@@ -713,6 +713,25 @@ describe('tool rules', () => {
     expect(events.filter((e) => e.type === 'status' && /Fixed the flagged/.test(e.message))).toHaveLength(2);
   });
 
+  it('gives a new conversation (/new) the flag the one before had not fixed, whole, with what the person said', async () => {
+    const { vfs, agent, emit } = setup(OPENAI);
+    vfs.writeFile('/pics/a.png', 'first try', { parents: true });
+    flagPicture(vfs, 'pics/a.png', 'three arms');
+    agent.flag('pics/a.png', 'three arms');
+    // The first conversation takes the flag, and does not get to it before the person moves on.
+    fakeProvider('openai', [{ text: 'I will look at it.' }, { text: 'Hmm.' }, { text: 'Later.' }, { text: 'Later.' }, { text: 'Later.' }]);
+    await agent.run('make the film', emit);
+    agent.reset();
+    const fake = fakeProvider('openai', [{ text: 'Roses are red.' }, { text: 'Still roses.' }, { text: 'Done.' }]);
+    const events: AgentEvent[] = [];
+    await agent.run('write a two-line poem', (e) => events.push(e));
+    // It is told of the flag, with the person's words, before it is asked to fix it (it was pushed to fix a picture it had
+    // never been told about, in a conversation about something else).
+    expect(JSON.stringify(fake.bodies[0].messages)).toContain('The user flagged /pics/a.png as wrong: \\"three arms\\". Fix it before anything else');
+    const nudges = events.filter((e) => e.type === 'nudge').map((e) => (e as Extract<AgentEvent, { type: 'nudge' }>).message);
+    for (const nudge of nudges) expect(nudge).toContain('/pics/a.png');
+  });
+
   it("keeps the user's request in view for a video, does not write the same script twice, and checks it against the request before making anything", async () => {
     const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
     const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
@@ -753,6 +772,28 @@ describe('tool rules', () => {
     expect(fake.bodies.length).toBeGreaterThanOrEqual(6);
     // It was not made: the check came instead.
     expect(vfs.exists('/video/fox/fox.png')).toBe(false);
+  });
+
+  it('checks a script against the request of a new conversation (/new), not only against the one before', async () => {
+    const vfs = new Vfs();
+    const media = ['generate_image', 'generate_video'].map((name) => ({ name, description: name, parameters: { type: 'object', properties: {} } }));
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => OPENAI, projectSummary: () => 'Project: demo', tools: [...TOOLS, ...media], guides: ['video'] });
+    const picture = { calls: [{ name: 'generate_image', input: { prompt: 'an animal', path: 'video/film/animal.png' } }] };
+    const checked = 'Not made yet. Before the first picture, clip or voice, check the script against what the user asked for.';
+    fakeProvider('openai', [{ calls: [{ name: 'write_file', input: { path: 'video/film/script.md', content: '## Premise\nA fox finds a key.' } }] }, picture, { text: 'Checked.' }]);
+    await agent.run('A video of a fox who finds a key.', () => {});
+    agent.reset();
+    // The same script, rewritten for a new request: checked against that request before a picture is made.
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'read_file', input: { path: 'video/film/script.md' } }] },
+      { calls: [{ name: 'write_file', input: { path: 'video/film/script.md', content: '## Premise\nA cat finds a ball.' } }] },
+      picture,
+      { text: 'Checked.' },
+    ]);
+    await agent.run('A video of a cat who finds a ball.', () => {});
+    const told = JSON.stringify(fake.bodies[3]?.messages ?? '');
+    expect(told).toContain(checked);
+    expect(told).toContain('A video of a cat who finds a ball.');
   });
 
   it('tells the model it is going round in circles when it writes a file in full a third time', async () => {
@@ -921,6 +962,25 @@ describe('tool rules', () => {
     await agent.run('save the notes', emit);
     expect(fake.bodies).toHaveLength(2);
     expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it('tells the model of the same error three times in one reply, and stops only at the third step that fails so', async () => {
+    // Three edits of a file it has not read, in one reply: each refused in the same words. The run stopped "the same step
+    // failed three times" before the model had seen any of them.
+    const edit = (old_string: string, new_string: string) => ({ name: 'edit_file', input: { path: 'src/app.js', old_string, new_string } });
+    const three = { calls: [edit('"hello"', '"hi"'), edit('greeting', 'salutation'), edit('console.log', 'console.info')] };
+    const { events, agent, emit } = setup(OPENAI);
+    const fake = fakeProvider('openai', [three, { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] }, { text: 'Read it first; done.' }]);
+    await agent.run('rename things', emit);
+    expect(fake.bodies).toHaveLength(3);
+    expect(JSON.stringify(fake.bodies[1].messages)).toContain('read /src/app.js before you edit it');
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Read it first; done.' });
+    // Three steps in a row that fail the same way still stop the run.
+    const again = setup(OPENAI);
+    const stuck = fakeProvider('openai', [three, { calls: [edit('"hello"', '"hi"')] }, three, { text: 'never asked' }]);
+    await again.agent.run('rename things', again.emit);
+    expect(stuck.bodies).toHaveLength(3);
+    expect(again.events.at(-1)).toMatchObject({ type: 'error', message: 'The same step failed three times in a row, so the run stopped. Say how to proceed.' });
   });
 
   it("tells a reply stopped for writing a whole file again what it wrote, not that it nested a call", () => {

@@ -2,8 +2,12 @@
 // (agent/providers/aiProvider.ts): OAIY's engines in OAIY's own window, a server by its name, a paired computer's.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { describeConnectionError } from '@oaiy/shared/providers/errors';
+import { Agent, type AgentEvent } from '../../src/agent/agent';
 import { AIProviderError, postProviderJSON } from '../../src/agent/providers/aiProvider';
 import type { ProviderConfig } from '../../src/agent/providers/types';
+import { NetGate } from '../../src/gate/netgate';
+import { Vfs } from '../../src/vfs/vfs';
+import { ANTHROPIC, OPENAI, fakeProvider } from './fakeProvider';
 
 const ENGINE = 'http://127.0.0.1:17999/v1/chat/completions';
 
@@ -73,5 +77,57 @@ describe("the Agent's own calls", () => {
     expect(failed instanceof AIProviderError && failed.kind).toBe('network');
     // (this file's page is not OAIY's window: no desktop was given before it was first read)
     expect((failed as Error).message).toContain('This page could not reach http://127.0.0.1:17999');
+  });
+});
+
+describe('an overload said with a status, before any stream', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+  const engine: ProviderConfig = { id: 'p1', type: 'local', serverKind: 'oaiy', name: 'OAIY', apiKey: '', baseUrl: 'http://127.0.0.1:17999', modelId: 'qwen3.8-27b' };
+  // (Anthropic's when it is overloaded; OAIY's engine's when several conversations send it pictures at once, and when its
+  // model worker has stopped, crates/oaiy-llm-server/src/api.rs)
+  const overloaded = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+  const busy = { error: { message: 'the server is busy decoding other pictures: try again shortly', type: 'invalid_request_error', code: 'busy' } };
+  const stopped = { error: { message: 'the model worker has stopped', type: 'invalid_request_error', code: 'unavailable' } };
+
+  it('is a rate limit, waited for (as long as it asks) and asked again; a worker that stopped is not', async () => {
+    const failure = async (provider: ProviderConfig, status: number, body: unknown, headers: Record<string, string> = {}) => {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } })));
+      const error = (await postProviderJSON(provider, ENGINE, {}, {}).catch((e: unknown) => e)) as AIProviderError;
+      return { kind: error.kind, status: error.status, wait: error.retryAfterMs };
+    };
+    expect(await failure(ANTHROPIC, 529, overloaded)).toEqual({ kind: 'rate-limited', status: 529, wait: undefined });
+    expect(await failure(engine, 503, busy)).toEqual({ kind: 'rate-limited', status: 503, wait: undefined });
+    expect(await failure(OPENAI, 503, { error: { message: 'The engine is currently overloaded, please try again later', type: 'server_error' } })).toEqual({ kind: 'rate-limited', status: 503, wait: undefined });
+    expect(await failure(engine, 503, { error: { message: 'starting' } }, { 'retry-after': '2' })).toEqual({ kind: 'rate-limited', status: 503, wait: 2000 });
+    // (no wait brings it back)
+    expect(await failure(engine, 503, stopped)).toEqual({ kind: 'http', status: 503, wait: undefined });
+    expect(await failure(engine, 500, { error: { message: 'engine crashed' } })).toEqual({ kind: 'http', status: 500, wait: undefined });
+  });
+
+  it("is waited for by the Agent, which asks again, as it does for the same overload inside a stream", async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    for (const [wire, provider, error] of [
+      ['anthropic', ANTHROPIC, { status: 529, body: JSON.stringify(overloaded) }],
+      ['openai', engine, { status: 503, body: JSON.stringify(busy) }],
+    ] as const) {
+      const fake = fakeProvider(wire, [{ error }, { text: 'ok' }]);
+      const events: AgentEvent[] = [];
+      const run = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => provider, projectSummary: () => 'p' }).run('hi', (e) => events.push(e));
+      // (the wait passes on the test's clock)
+      for (let i = 0; i < 40 && fake.bodies.length < 2; i++) await vi.advanceTimersByTimeAsync(500);
+      await run;
+      expect(fake.bodies, wire).toHaveLength(2);
+      expect(events.some((e) => e.type === 'status' && e.message === 'The provider is busy; retrying in 5 s'), wire).toBe(true);
+      expect(events.at(-1), wire).toMatchObject({ type: 'done', text: 'ok' });
+    }
+    // A worker that stopped: said at once.
+    const fake = fakeProvider('openai', [{ error: { status: 503, body: JSON.stringify(stopped) } }, { text: 'never asked' }]);
+    const events: AgentEvent[] = [];
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => engine, projectSummary: () => 'p' }).run('hi', (e) => events.push(e));
+    expect(fake.bodies).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('the model worker has stopped') });
   });
 });

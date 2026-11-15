@@ -2,9 +2,10 @@
  * One agent request, in either wire shape: Anthropic Messages, or the
  * OpenAI-compatible Chat Completions that OpenAI, Ollama, LM Studio,
  * llama.cpp and most gateways speak. Always streamed; a server that ignores
- * `stream` and answers with JSON is read the same way.
+ * `stream` and answers with JSON is read the same way, and one whose stream
+ * cannot be read is asked once more without streaming.
  */
-import { AIProviderError, isOpenAIHost, isRecord, postProviderStream, sanitizeCount, type SSEEvent } from './providers/aiProvider';
+import { AIProviderError, isOpenAIHost, isRecord, postProviderJSON, postProviderStream, sanitizeCount, type SSEEvent } from './providers/aiProvider';
 import { providerEndpoints } from './providers/providerConnection';
 import { AnthropicStream, OpenAIStream, type StreamSink } from './providers/stream';
 import type { ProviderConfig } from './providers/types';
@@ -175,7 +176,12 @@ function openAIMessages(system: string, turns: Turn[]): unknown[] {
   const out: unknown[] = [{ role: 'system', content: system }];
   for (const turn of turns) {
     if (turn.role === 'user') {
-      out.push({ role: 'user', content: turn.images?.length ? [{ type: 'text', text: turn.text }, ...turn.images.map(openAIImage)] : turn.text });
+      const content = turn.images?.length ? [{ type: 'text', text: turn.text }, ...turn.images.map(openAIImage)] : turn.text;
+      // Right after a tool's pictures (a user message of their own, below): one user message, the pictures first. Two in
+      // a row, a chat template that wants the roles to take turns refuses (wellFormed joins the conversation's own).
+      const last = out[out.length - 1] as { role: string; content: unknown };
+      if (last.role === 'user' && Array.isArray(last.content)) last.content = [...last.content, ...(typeof content === 'string' ? [{ type: 'text', text: content }] : content)];
+      else out.push({ role: 'user', content });
       continue;
     }
     else if (turn.role === 'assistant') {
@@ -336,6 +342,29 @@ export function proseFields(provider: ThinkingProvider, options: Pick<RequestOpt
   return options.plainProse && thinksAs(provider) === 'oaiy' ? { repeat_penalty: 1 } : {};
 }
 
+/**
+ * POST a request for a streamed reply, its events to `onEvent`. One that could not be read as a stream (a gateway that
+ * labels a whole JSON reply as text, a stream with an event that is not JSON: AIProviderError.streamFault) is asked once
+ * more without streaming, and read whole: the server did answer, and asked again as it was it answered the same way.
+ */
+async function postStreamed(
+  provider: ProviderConfig,
+  url: string,
+  body: Record<string, unknown>,
+  options: RequestOptions,
+  onEvent: (event: SSEEvent) => void,
+): Promise<{ streamed: true } | { streamed: false; data: Record<string, unknown> }> {
+  try {
+    return await postProviderStream(provider, url, body, { signal: options.signal, timeoutMs: options.timeoutMs, onEvent });
+  } catch (error) {
+    if (!(error instanceof AIProviderError) || !error.streamFault) throw error;
+    const whole: Record<string, unknown> = { ...body, stream: false };
+    // (it goes with a stream only: OpenAI refuses it without one)
+    delete whole.stream_options;
+    return { streamed: false, data: await postProviderJSON(provider, url, whole, { signal: options.signal, timeoutMs: options.timeoutMs }) };
+  }
+}
+
 /** Send the conversation and read the whole reply, streaming it to `sink`. */
 export async function sendTurn(
   provider: ProviderConfig,
@@ -358,11 +387,7 @@ export async function sendTurn(
       messages: anthropicMessages(turns),
     };
     const stream = new AnthropicStream(options.sink);
-    const outcome = await postProviderStream(provider, url, body, {
-      signal: options.signal,
-      timeoutMs: options.timeoutMs,
-      onEvent: (event: SSEEvent) => stream.accept(event),
-    });
+    const outcome = await postStreamed(provider, url, body, options, (event) => stream.accept(event));
     return decodeAnthropic(outcome.streamed ? stream.result() : outcome.data, stream.parseErrors);
   }
   const body: Record<string, unknown> = {
@@ -378,10 +403,6 @@ export async function sendTurn(
   else body.max_tokens = maxTokens;
   Object.assign(body, thinkingFields(provider, options), proseFields(provider, options));
   const stream = new OpenAIStream(options.sink);
-  const outcome = await postProviderStream(provider, url, body, {
-    signal: options.signal,
-    timeoutMs: options.timeoutMs,
-    onEvent: (event: SSEEvent) => stream.accept(event),
-  });
+  const outcome = await postStreamed(provider, url, body, options, (event) => stream.accept(event));
   return decodeOpenAI(outcome.streamed ? stream.result() : outcome.data);
 }

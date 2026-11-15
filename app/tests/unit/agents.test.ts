@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, type AgentEvent } from '../../src/agent/agent';
+import { Agent, type AgentEvent, type SessionTool } from '../../src/agent/agent';
 import { TaskQueue } from '../../src/agent/queue';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
-import { OPENAI, fakeProvider, type Step } from './fakeProvider';
+import { ANTHROPIC, OPENAI, fakeProvider, type Step } from './fakeProvider';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -158,6 +158,26 @@ describe('sub-agents', () => {
     await agent.run('write two pages', emit);
     const states = (events.filter((e) => e.type === 'agent_task') as Array<Extract<AgentEvent, { type: 'agent_task' }>>).filter((t) => t.activity === 'starting' || t.state === 'done').map((t) => `${t.title} ${t.state}`);
     expect(states.slice(0, 2)).toEqual(['Page A running', 'Page B running']);
+  });
+
+  it("list each tool once, the conversation's own among them, and run those (Anthropic refuses a tool name twice)", async () => {
+    const sent: string[] = [];
+    const note: SessionTool = { spec: { name: 'send_note', description: 'Send a note to the person.', parameters: { type: 'object', properties: { text: { type: 'string' } } } }, run: async (input) => (sent.push(String(input.text)), 'sent') };
+    const fake = fakeProvider('anthropic', [
+      { calls: [{ name: 'delegate', input: { tasks: [{ title: 'Write a.txt', instructions: 'Write a.txt with the letter a, and say so.' }] } }] },
+      { calls: [{ name: 'send_note', input: { text: 'writing a.txt' } }] },
+      { text: 'Report: said so.' },
+      { text: 'All done.' },
+    ]);
+    const events: AgentEvent[] = [];
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ANTHROPIC, projectSummary: () => 'p', sessionTools: [note] }).run('split it', (e) => events.push(e));
+    const names = (body: Record<string, unknown>) => (body.tools as Array<{ name: string }>).map((t) => t.name);
+    expect(fake.bodies).toHaveLength(4);
+    for (const body of fake.bodies) expect(names(body).filter((n, i, all) => all.indexOf(n) !== i)).toEqual([]);
+    // The task has the conversation's tool, once, and it runs.
+    expect(names(fake.bodies[1]).filter((n) => n === 'send_note')).toEqual(['send_note']);
+    expect(sent).toEqual(['writing a.txt']);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'All done.' });
   });
 
   it('a sub-agent cannot delegate, and a bad task list is refused', async () => {

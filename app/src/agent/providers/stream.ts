@@ -58,7 +58,11 @@ function streamError(error: unknown): AIProviderError {
   const message = typeof record.message === 'string' && record.message ? record.message : typeof error === 'string' ? error : 'The provider reported an error mid-reply.';
   if (/overloaded|rate_limit/i.test(type)) return new AIProviderError('rate-limited', `The provider is overloaded: ${message}`);
   if (signInNeeded(type)) return new AIProviderError('http', CHATGPT_SIGN_IN, { detail: message });
-  return new AIProviderError('http', `The provider stopped its reply with an error: ${message}`, { detail: message });
+  // Its code as the server gives it, so the error is read as one sent before the stream: a number is the status it would
+  // have answered with (an older llama.cpp's 400, for a prompt past its context), a word the code (context_length_exceeded).
+  const status = typeof record.code === 'number' && Number.isInteger(record.code) ? record.code : undefined;
+  const code = typeof record.code === 'string' && record.code.trim() ? record.code.trim().slice(0, 80) : undefined;
+  return new AIProviderError('http', `The provider stopped its reply with an error: ${message}`, { detail: message, status, code });
 }
 
 const closedEarly = () => new AIProviderError('network', 'The connection closed before the reply was complete.');
@@ -189,7 +193,11 @@ interface CallInProgress {
 export class OpenAIStream {
   private text = '';
   private refusal = '';
+  /** What the model thought (`reasoning_content`): kept with the reply, as a reply sent whole keeps it. */
+  private reasoning = '';
   private calls: CallInProgress[] = [];
+  /** A server's index whose call was followed by another whole call at the same index: where that one went. */
+  private moved = new Map<number, number>();
   private finishReason: string | null = null;
   private usage: Record<string, unknown> | null = null;
   private done = false;
@@ -230,7 +238,10 @@ export class OpenAIStream {
     }
     if (typeof delta.refusal === 'string') this.refusal += delta.refusal;
     const reasoning = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : typeof delta.reasoning === 'string' ? delta.reasoning : '';
-    if (reasoning) this.sink?.thinking?.(reasoning);
+    if (reasoning) {
+      this.reasoning += reasoning;
+      this.sink?.thinking?.(reasoning);
+    }
     if (Array.isArray(delta.tool_calls)) {
       for (const raw of delta.tool_calls) if (isRecord(raw)) this.readCall(raw);
     }
@@ -239,14 +250,22 @@ export class OpenAIStream {
 
   private readCall(raw: Record<string, unknown>): void {
     const id = typeof raw.id === 'string' ? raw.id : '';
+    const fn = isRecord(raw.function) ? raw.function : {};
     // Calls are told apart by `index`. A server that leaves it out sends each
     // call whole, or continues the last one: a new id is a new call.
-    let index = typeof raw.index === 'number' ? raw.index : -1;
+    let index = typeof raw.index === 'number' ? (this.moved.get(raw.index) ?? raw.index) : -1;
     if (index < 0) index = id && !this.calls.some((c) => c.id === id) ? this.calls.length : Math.max(this.lastIndex, 0);
+    // A call's first fragment (its name, with an id of its own) at an index whose call already has a name and another
+    // id: a server that sends each call whole at the same index. A new call, and the index's later fragments are its own
+    // (the two were merged into one call, its arguments two objects run together, and neither ran).
+    const there = this.calls[index];
+    if (typeof raw.index === 'number' && id && typeof fn.name === 'string' && fn.name && there?.name && there.id && there.id !== id) {
+      index = this.calls.length;
+      this.moved.set(raw.index, index);
+    }
     this.lastIndex = index;
     const call = (this.calls[index] ??= { id: '', name: '', args: '', announced: false });
     if (id) call.id = id;
-    const fn = isRecord(raw.function) ? raw.function : {};
     // A name arrives whole, in the call's first fragment; later fragments carry arguments only.
     if (typeof fn.name === 'string' && fn.name && !call.name) call.name = fn.name;
     if (!call.announced && call.name) {
@@ -275,6 +294,7 @@ export class OpenAIStream {
             role: 'assistant',
             content: this.text,
             ...(this.refusal ? { refusal: this.refusal } : {}),
+            ...(this.reasoning ? { reasoning_content: this.reasoning } : {}),
             ...(calls.length > 0 ? { tool_calls: calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.args } })) } : {}),
           },
           finish_reason: this.finishReason,

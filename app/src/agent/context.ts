@@ -157,14 +157,20 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
   return null;
 }
 
-/** A context-overflow error from the server, with the window it states when it does. */
+/**
+ * A context-overflow error from the server, with the window it states when it does. An OAIY engine from before it worded
+ * a prompt its pictures take past the context as it words one of text (an engine already installed keeps its words) said
+ * "the prompt with its pictures (N tokens) is past the context (M)" (Gemma, GLM) or "images exceed configured context"
+ * (Qwen, MiniCPM-V).
+ */
 export function overflowWindow(message: string): { overflow: boolean; tokens: number | null } {
-  const overflow = /context (length|size|window)|maximum context|too many tokens|exceeds? (the )?(available )?context|prompt is too long|reduce the length|n_ctx|input.*too long/i.test(message);
+  const overflow = /context (length|size|window)|maximum context|too many tokens|exceeds? (the )?(available |configured )?context|past the context|prompt is too long|reduce the length|n_ctx|input.*too long/i.test(message);
   if (!overflow) return { overflow: false, tokens: null };
   const stated =
     /maximum context length is (\d+)/i.exec(message) ??
     /context (?:size|length|window)(?: of| is|:)? \(?(\d{3,7})\)?/i.exec(message) ??
     /available context size \((\d+)/i.exec(message) ??
+    /past the context \((\d+)\)/i.exec(message) ??
     /n_ctx(?:_slot)?\s*[=:]\s*(\d+)/i.exec(message) ??
     /(\d{4,7}) tokens? (?:maximum|limit)/i.exec(message);
   return { overflow: true, tokens: stated ? Number(stated[1]) : null };
