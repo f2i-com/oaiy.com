@@ -126,6 +126,8 @@ export interface RequestOptions {
    * it thinks, and this caps it where it does. Not sent where it does not think (`none`), nor to any other server.
    */
   thinkBudget?: number;
+  /** A reply that is prose to be read as it is written (a summary): no repeat penalty on it (proseFields). */
+  plainProse?: boolean;
 }
 
 function anthropicMessages(turns: Turn[]): unknown[] {
@@ -323,6 +325,17 @@ export function thinkingFields(provider: ThinkingProvider, options: Pick<Request
   };
 }
 
+/**
+ * What a request says of its prose's repeat penalty: none, to OAIY's engine, for a reply that is prose to be read as it
+ * is written (`plainProse`: a summary, where the same names rightly come again and again). The engine's penalty on a
+ * reply's prose (the person's setting, 1.1 over its last 256 tokens) made Nanbeige 4.3 33B's summary of a conversation
+ * three times as long as asked, its sentences twice as long and its small words half as many: word salad; with none,
+ * plain English in half the time. Nothing to any other server: an API refuses a field it does not know.
+ */
+export function proseFields(provider: ThinkingProvider, options: Pick<RequestOptions, 'plainProse'>): Record<string, unknown> {
+  return options.plainProse && thinksAs(provider) === 'oaiy' ? { repeat_penalty: 1 } : {};
+}
+
 /** Send the conversation and read the whole reply, streaming it to `sink`. */
 export async function sendTurn(
   provider: ProviderConfig,
@@ -363,7 +376,7 @@ export async function sendTurn(
   // OpenAI's reasoning models take max_completion_tokens; other servers read max_tokens.
   if (isOpenAIHost(url)) body.max_completion_tokens = maxTokens;
   else body.max_tokens = maxTokens;
-  Object.assign(body, thinkingFields(provider, options));
+  Object.assign(body, thinkingFields(provider, options), proseFields(provider, options));
   const stream = new OpenAIStream(options.sink);
   const outcome = await postProviderStream(provider, url, body, {
     signal: options.signal,

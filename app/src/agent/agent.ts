@@ -336,6 +336,26 @@ export function unlistedCalls(said: string, listed: Set<string>, usable: Set<str
 }
 
 /**
+ * What the model is told of a tool call OAIY's engine could not take (`tool_contract_error`), other than one cut off or
+ * one of a tool not listed: what was wrong with it, in the engine's words, read as a sentence where it can be ("tool
+ * edit_file: $: missing path; required arguments: ["path","old_string","new_string"]" is "called edit_file without
+ * path"). Asked again with no word, Nanbeige 4.3 33B with its thinking on wrote the same call without its path, and the
+ * run ended on the error.
+ */
+export function contractNote(said: string): string {
+  const schema = /tool ([\w.-]+): (\$[^:;]*): ([^;]+); required arguments: \[([^\]]*)\]/.exec(said);
+  if (schema) {
+    const [, tool, at, what, required] = schema;
+    const needs = [...required.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    const missing = at === '$' ? /^missing (.+)$/.exec(what.trim()) : null;
+    const wrong = missing ? `without ${missing[1]}` : `with ${at === '$' ? '' : `${at.replace(/^\$\.?/, '')}: `}${what.trim()}`;
+    return `[OAIY] Your last reply called ${tool} ${wrong}, so nothing in it ran. Call it again with every parameter it needs${needs.length ? ` (${needs.join(', ')})` : ''}, each as its tool describes it.`;
+  }
+  const reason = /tool_contract_error: ([\s\S]*?)(?:; no tool from this batch was executed|$)/.exec(said)?.[1]?.trim();
+  return `[OAIY] Your last reply's tool call could not be run, so nothing in it ran${reason ? ` (${reason.slice(0, 300)})` : ''}. Write the call again as its tool describes it.`;
+}
+
+/**
  * What the model is told of a reply OAIY's engine stopped because it kept repeating itself (`generation_repetition`):
  * what it repeated and how many times, as the engine quotes it ("repeating the same 4 tokens ("dirs.indexOf(", 32
  * times: 128 tokens) in a tool call"), and that nothing in it ran; where it was a call written inside itself, that it is
@@ -1776,8 +1796,8 @@ ${personInstructionsText(own)}` : ''}`;
     for (const chunk of chunks) {
       const prompt = `${summary ? `The summary so far:\n${summary}\n\n` : ''}The conversation to ${summary ? 'add to it' : 'summarize'}:\n${chunk}\nWrite the ${summary ? 'updated ' : ''}summary.`;
       // (no thinking first: an engine that thinks by default spent the summary's whole reply thinking, and it came back
-      // empty)
-      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), reasoning: 'none', sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
+      // empty; and no repeat penalty on its prose, which made a summary word salad three times as long as asked)
+      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), reasoning: 'none', plainProse: true, sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
       if (!reply.text.trim()) throw new Error('the summary came back empty');
       summary = reply.text.trim();
     }
@@ -1805,7 +1825,9 @@ ${personInstructionsText(own)}` : ''}`;
   private async request(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<Reply> {
     let lastError: unknown;
     let overflowRetried = false;
-    let callRetried = false;
+    // (a call the server could not read is asked again twice, told each time what was wrong: Nanbeige 4.3 33B with its
+    // thinking on left a call's path out twice in a row, and wrote it whole on a third try about half the time)
+    let callRetries = 0;
     let repeatRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
@@ -1866,8 +1888,8 @@ ${personInstructionsText(own)}` : ''}`;
         // A tool call the server could not read (OAIY's tool_contract_error): nothing ran, and another sample usually reads.
         // It quotes the call, which may name view_image: that is not the model refusing images.
         const unreadableCall = /tool_contract_error/.test(said);
-        if (unreadableCall && !callRetried) {
-          callRetried = true;
+        if (unreadableCall && callRetries < 2) {
+          callRetries++;
           // (a tool found but called by its name, where the server takes only the listed ones: asked again, through use_tool)
           const unlisted = this.discovering ? unlistedCalls(said, new Set(this.listed.map((t) => t.name)), new Set(this.usable.map((t) => t.name))) : [];
           if (unlisted.length) {
@@ -1877,6 +1899,9 @@ ${personInstructionsText(own)}` : ''}`;
             // A reply that stopped inside its call (OAIY's engine at the reply's limit, a large file written whole):
             // asked again as it was, the model wrote the same file from its start and stopped in the same place.
             this.turns.push({ role: 'user', text: `[OAIY] Your last reply stopped before its tool call was complete (a reply holds about ${formatTokens(b.reply)} tokens), so nothing ran. Keep each call smaller: write a large file in parts (write_file with the first part, then append_file for each next part).`, automatic: true });
+          } else {
+            // Any other call it could not take (a required parameter left out, a value of the wrong kind): what was wrong.
+            this.turns.push({ role: 'user', text: contractNote(said), automatic: true });
           }
           emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
           continue;

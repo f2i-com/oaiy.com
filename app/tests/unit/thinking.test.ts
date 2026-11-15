@@ -3,7 +3,7 @@
 // the thought as the chat shows it.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, HARDER_THINKING, type AgentEvent } from '../../src/agent/agent';
-import { LOW_EFFORT, sendTurn, thinkingFields, thinksAs, type Reasoning } from '../../src/agent/protocol';
+import { LOW_EFFORT, proseFields, sendTurn, thinkingFields, thinksAs, type Reasoning } from '../../src/agent/protocol';
 import { OpenAIStream } from '../../src/agent/providers/stream';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 import { EMPTY_MEDIA } from '../../src/agent/media';
@@ -255,10 +255,15 @@ describe("the Agent's steps", () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Read them all.' });
     const summaries = fake.bodies.filter(summarizing);
     expect(summaries.length).toBeGreaterThanOrEqual(1);
-    for (const body of summaries) expect([body.reasoning_effort, body.thinking]).toEqual(['none', undefined]);
+    // and with no repeat penalty on its prose (the person's own setting made a summary word salad), which the steps keep
+    for (const body of summaries) expect([body.reasoning_effort, body.thinking, body.repeat_penalty]).toEqual(['none', undefined, 1]);
     expect(events.some((e) => e.type === 'compact' && e.how === 'summary')).toBe(true);
     // (its steps think as the chip says, within half of the 2,800 tokens each may write in a window of 14,000)
-    for (const body of fake.bodies.filter((b) => !summarizing(b))) expect([body.reasoning_effort, body.thinking]).toEqual([LOW_EFFORT, { type: 'enabled', budget_tokens: 1400 }]);
+    for (const body of fake.bodies.filter((b) => !summarizing(b))) expect([body.reasoning_effort, body.thinking, body.repeat_penalty]).toEqual([LOW_EFFORT, { type: 'enabled', budget_tokens: 1400 }, undefined]);
+    // another server is asked nothing of it: an API refuses a field it does not know
+    for (const other of [LOCAL, OPENAI, { ...LOCAL, serverKind: 'lmstudio' as const }]) expect(proseFields(other, { plainProse: true })).toEqual({});
+    expect(proseFields(ENGINE, { plainProse: true })).toEqual({ repeat_penalty: 1 });
+    expect(proseFields(ENGINE, {})).toEqual({});
   });
 });
 

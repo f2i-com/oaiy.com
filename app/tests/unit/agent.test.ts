@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, HARDER_THINKING, announcesWork, readingStatus, repetitionNote, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
+import { Agent, HARDER_THINKING, announcesWork, contractNote, readingStatus, repetitionNote, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
 import { TOOLS, browserHint, planAfter, planChanges, readPlan, runTool, runawayNesting, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
@@ -998,6 +998,27 @@ describe('tool rules', () => {
     await run('delete_file', { path: 'old.md' });
     expect((await run('write_file', { path: 'old.md', content: 'fresh' })).isError).toBeFalsy();
     expect((await run('write_file', { path: 'old.md', content: 'fresh again' })).isError).toBeFalsy();
+  });
+
+  it("tells a model whose call the engine refused what was wrong with it when it asks again", async () => {
+    // Nanbeige 4.3 33B with its thinking on wrote edit_file without its path, was asked again with no word, wrote the
+    // same, and the run ended on the error.
+    const said = 'tool_contract_error: tool edit_file: $: missing path; required arguments: ["path","old_string","new_string"]; no tool from this batch was executed';
+    const refused = { error: { status: 422, body: JSON.stringify({ error: { message: said, type: 'server_error', code: 'tool_contract_error' } }) } };
+    fakeProvider('openai', [refused, refused, (body) => ({ text: JSON.stringify(body.messages).includes('called edit_file without path') ? 'told' : 'not told' })]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('fix the page', emit);
+    // asked again twice, told each time: the third try is taken
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    // a third refusal in a row ends the run, saying why
+    const thrice = fakeProvider('openai', [refused, refused, refused, { text: 'never asked' }]);
+    const again = setup(OPENAI);
+    await again.agent.run('fix the page', again.emit);
+    expect(again.events.at(-1)).toMatchObject({ type: 'error' });
+    expect(thrice.bodies).toHaveLength(3);
+    expect(contractNote(said)).toBe('[OAIY] Your last reply called edit_file without path, so nothing in it ran. Call it again with every parameter it needs (path, old_string, new_string), each as its tool describes it.');
+    expect(contractNote('tool_contract_error: tool read_file: $.offset: expected "integer"; required arguments: ["path"]; no tool from this batch was executed')).toContain('called read_file with offset: expected "integer", so nothing in it ran');
+    expect(contractNote('tool_contract_error: unexpected suffix after tool call; no tool from this batch was executed')).toBe("[OAIY] Your last reply's tool call could not be run, so nothing in it ran (unexpected suffix after tool call). Write the call again as its tool describes it.");
   });
 
   it('an unreadable view_image call is not the model refusing images', async () => {
