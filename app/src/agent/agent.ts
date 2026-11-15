@@ -188,6 +188,13 @@ const SAME_STEP_STOP = 6;
  * of a local model's time.
  */
 const UNCHANGED_WRITE_STOP = 3;
+/** A part a run appended to a file: how it begins and how long it is (writtenAlready). */
+interface AppendedPart { head: string; length: number }
+/**
+ * The input keys whose numbers say which part of something a call reads (a page of a file, its characters), kept in the
+ * same-step signature where other numbers (a wait) are set aside: paging through a log of numbers is no step repeated.
+ */
+const PLACE_KEYS = new Set(['offset', 'limit', 'char_start', 'char_count', 'line', 'page', 'start_line', 'end_line']);
 /**
  * Replies cut off at the output limit in the middle of a tool call, this many in a row, stop the run: each is told to
  * write a large file in parts, and one that is cut off again has not done so.
@@ -335,16 +342,19 @@ export function unlistedCalls(said: string, listed: Set<string>, usable: Set<str
  * one; where it was in a tool call, to write a large file in parts. An engine that quotes nothing is told the rest.
  */
 export function repetitionNote(said: string): string {
-  const quoted = /repeating the same (?:token|\d+ tokens) \(("(?:[^"\\]|\\.)*"), (\d+) times/.exec(said);
+  const quoted = /repeating the same (token|(\d+) tokens) \(("(?:[^"\\]|\\.)*"), (\d+) times/.exec(said);
   let unit: string | null = null;
   try {
-    unit = quoted ? (JSON.parse(quoted[1]) as string) : null;
+    unit = quoted ? (JSON.parse(quoted[3]) as string) : null;
   } catch {
     unit = null;
   }
   const inCall = / in a tool call\b/.test(said);
-  const nested = unit !== null && [...unit].reduce((depth, c) => depth + ('([{'.includes(c) ? 1 : ')]}'.includes(c) ? -1 : 0), 0) > 0;
-  const what = unit !== null && quoted ? `writing ${quoted[1]} over and over (${quoted[2]} times in a row)` : 'writing the same thing over and over';
+  // A call written inside itself is a short turn (the engine judges up to 64 tokens so), quoted whole: a long one's quote
+  // is its start and end (a file written twice), whose brackets say nothing.
+  const tokens = quoted ? (quoted[2] === undefined ? 1 : Number(quoted[2])) : Infinity;
+  const nested = unit !== null && tokens <= 64 && !unit.includes('…') && [...unit].reduce((depth, c) => depth + ('([{'.includes(c) ? 1 : ')]}'.includes(c) ? -1 : 0), 0) > 0;
+  const what = unit !== null && quoted ? `writing ${quoted[3]} over and over (${quoted[4]} times in a row)` : 'writing the same thing over and over';
   return `[OAIY] Your last reply was stopped because it kept ${what}${inCall ? ' inside its tool call' : ''}, so nothing in it ran or was written. Do not write that again: write that part another way${nested ? ' (it is a call or an index written inside itself again and again: work it out in steps, with a variable or a loop)' : ''}.${inCall ? ' Keep each call small: write a large file in parts (write_file with the first part, then append_file for each next part).' : ''}`;
 }
 
@@ -995,8 +1005,9 @@ export class Agent {
   private repeatedStep(calls: ToolCall[], results: ToolResult[], wrote: boolean): number {
     // (an ordinal too: "the 4th time" after "the 3rd" is the same note)
     const numbersAside = (text: string) => text.replace(/\d+(\.\d+)?(st|nd|rd|th)?/g, '#');
-    // (a call's number values aside, not the digits in its names: big1.txt and big2.txt are other files)
-    const valuesAside = (input: unknown) => JSON.stringify(input, (_, v: unknown) => (typeof v === 'number' ? '#' : v));
+    // (a call's number values aside, not the digits in its names: big1.txt and big2.txt are other files; nor where it reads:
+    // offset 401 is another page than offset 1, however alike their lines are, numbers aside)
+    const valuesAside = (input: unknown) => JSON.stringify(input, (key, v: unknown) => (typeof v === 'number' && !PLACE_KEYS.has(key) ? '#' : v));
     const signature = JSON.stringify([calls.map((c) => [c.name, wrote ? c.input : valuesAside(c.input)]), results.map((r) => numbersAside(r.content))]);
     this.sameStep = signature === this.sameStep.signature ? { signature, count: this.sameStep.count + 1 } : { signature, count: 1 };
     return this.sameStep.count;
@@ -2070,7 +2081,7 @@ ${personInstructionsText(own)}` : ''}`;
    * A write that would only repeat what the file already holds (the model
    * going round in circles): not made, and the model told where it is.
    */
-  private writtenAlready(call: ToolCall): string | null {
+  private writtenAlready(call: ToolCall, appended: Map<string, AppendedPart[]>): string | null {
     if (call.name !== 'append_file' && call.name !== 'write_file') return null;
     const { path, content } = call.input;
     if (typeof path !== 'string' || typeof content !== 'string') return null;
@@ -2085,8 +2096,15 @@ ${personInstructionsText(own)}` : ''}`;
     }
     const next = 'If it is complete, mark its plan step done with update_plan and go on to the next step; if something is still missing, read the file to see where it ends and add only what is missing (edit_file to change a part).';
     if (call.name === 'write_file' && text === content) return `Not written: /${normalizePath(path)} already holds exactly this. ${next}`;
+    // A part appended again: one this run appended to the file before, still in it, that begins as this one does and is
+    // about as long (written again, it is seldom word for word). Not any part whose start is somewhere in the file: data
+    // that repeats (a map's rows, a CSV's) begins as what is already there, and was left out, the file half written.
     const part = content.trim();
-    if (call.name === 'append_file' && part.length >= 80 && text.includes(part.slice(0, 400))) return `Not added: this part is already in /${normalizePath(path)} (you wrote it before). ${next}`;
+    if (call.name === 'append_file' && part.length >= 80) {
+      const head = part.slice(0, 400);
+      const again = (appended.get(normalizePath(path)) ?? []).some((before) => before.head === head && Math.abs(before.length - part.length) <= Math.max(before.length, part.length) / 5 && text.includes(head));
+      if (again) return `Not added: you appended this part to /${normalizePath(path)} before, and it is in the file. ${next}`;
+    }
     return null;
   }
 
@@ -2197,9 +2215,11 @@ ${personInstructionsText(own)}` : ''}`;
     let sincePlan = 0;
     // Progress, for deciding whether asking to carry on is still worth it.
     const changedThisRun = new Set<string>();
-    // How many times each file was written in full, this run; and written with what it already held.
+    // How many times each file was written in full, this run; written with what it already held (once a step at most); and
+    // the parts appended to it (for writtenAlready).
     const rewrites = new Map<string, number>();
     const unchangedWrites = new Map<string, number>();
+    const appended = new Map<string, AppendedPart[]>();
     // Replies cut off in the middle of a tool call, in a row.
     let cutOff = 0;
     let idleNudges = 0;
@@ -2311,7 +2331,9 @@ ${personInstructionsText(own)}` : ''}`;
         }
         cutOff = 0;
         // A file written again with what it already held, a third time: the path, to stop the run once the step is told.
+        // (Counted once a step: three of the same write in one reply were "told each time" when they were told nothing.)
         let unchangedStop: { path: string; times: number } | null = null;
+        const unchangedHere = new Set<string>();
         for (const [index, asked] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
@@ -2335,10 +2357,11 @@ ${personInstructionsText(own)}` : ''}`;
             }
           }
           const guideNote = allowed && !stopped ? this.guideFirst(call) : null;
-          const unchanged = allowed && !stopped && !guideNote ? this.writtenAlready(call) : null;
+          const unchanged = allowed && !stopped && !guideNote ? this.writtenAlready(call, appended) : null;
           const scriptCheck = guideNote ?? unchanged ?? (allowed && !stopped ? this.scriptCheck(call, changedThisRun) : null);
-          if (unchanged && typeof call.input.path === 'string') {
+          if (unchanged && typeof call.input.path === 'string' && !unchangedHere.has(normalizePath(call.input.path))) {
             const path = normalizePath(call.input.path);
+            unchangedHere.add(path);
             const times = (unchangedWrites.get(path) ?? 0) + 1;
             unchangedWrites.set(path, times);
             if (times >= UNCHANGED_WRITE_STOP) unchangedStop = { path, times };
@@ -2367,6 +2390,14 @@ ${personInstructionsText(own)}` : ''}`;
                     ? this.readGuide(call)
                     : await runTool(call, this.toolContext);
           if (flowNote) result.content = `${flowNote}\n${result.content}`;
+          // The parts this run appended to each file, as they went in (a file written anew or deleted starts again).
+          if (!result.isError && !stopped && !scriptCheck && !(allowed && hooks.instead) && typeof call.input.path === 'string') {
+            const path = normalizePath(call.input.path);
+            if (call.name === 'append_file' && typeof call.input.content === 'string') {
+              const part = call.input.content.trim();
+              appended.set(path, [...(appended.get(path) ?? []), { head: part.slice(0, 400), length: part.length }]);
+            } else if (call.name === 'write_file' || call.name === 'delete_file') appended.delete(path);
+          }
           if (call.name === 'write_file' && !result.isError && typeof call.input.path === 'string') {
             const path = normalizePath(call.input.path);
             const times = (rewrites.get(path) ?? 0) + 1;

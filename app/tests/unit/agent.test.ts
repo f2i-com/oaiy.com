@@ -618,9 +618,10 @@ describe('tool rules', () => {
   });
 
   it("counts a look whose numbers alone change as the same step, where a step that writes is not", async () => {
-    // a longer wait each step (24 s, 25 s, …) for what does not come: the same look, numbers aside
+    // a longer wait each step (24 s, 25 s, …) for what does not come, or a listing a level deeper of a tree no deeper: the
+    // same look, numbers aside (not a place in a file: paging on is reading on, as its own test says)
     let n = 0;
-    const look = () => ({ calls: [{ name: 'read_file', input: { path: 'src/app.js', char_start: 1000 + n++ } }] });
+    const look = () => ({ calls: [{ name: 'list_files', input: { path: '/', depth: 3 + n++ } }] });
     const fake = fakeProvider('openai', Array.from({ length: 8 }, () => look));
     const { agent, events, emit } = setup(OPENAI);
     await agent.run('look at the app', emit);
@@ -871,6 +872,66 @@ describe('tool rules', () => {
     expect(repetitionNote('generation_repetition: the reply went on repeating the same 13 tokens (265 tokens of them) and was stopped')).toMatch(/^\[OAIY\] Your last reply was stopped because it kept writing the same thing over and over, so nothing in it ran or was written\. Do not write that again: write that part another way\.$/);
   });
 
+  it('pages through a file of numbers as other steps, not the same one', async () => {
+    // A sensor log, every row the same shape with its numbers aside: page 3 was told "nothing has changed", page 6 stopped.
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    const rows = Array.from({ length: 4000 }, (_, i) => `${1_700_000_000 + i * 60},${(20 + 5 * Math.sin(i)).toFixed(2)},${40 + (i % 30)}`);
+    vfs.writeFile('/data.csv', `${rows.join('\n')}\n`);
+    const fake = fakeProvider('openai', [
+      ...Array.from({ length: 10 }, (_, k) => ({ calls: [{ name: 'read_file', input: { path: 'data.csv', offset: 1 + 400 * k } }] })),
+      { text: 'Read all of it: the mean temperature is 20.0.' },
+    ]);
+    await agent.run('read data.csv and tell me the mean temperature', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done' });
+    expect(JSON.stringify(fake.bodies.map((b) => b.messages))).not.toContain('This step is the same as');
+  });
+
+  it('appends the next rows of data that begin as the file does, and refuses only a part it appended before', async () => {
+    // A 20 x 40 level map in two parts, as the Agent asks a model to write a large file: the second part's first rows are
+    // the same as the first part's, and the part was refused as "already in" the file, which was left at 20 rows.
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    const wall = '  [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],';
+    const open = '  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],';
+    const part1 = ['const LEVEL = [', wall, ...Array<string>(19).fill(open)].join('\n') + '\n';
+    const part2 = [...Array<string>(19).fill(open), wall, '];'].join('\n') + '\n';
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'write_file', input: { path: 'level.js', content: part1 } }] },
+      { calls: [{ name: 'append_file', input: { path: 'level.js', content: part2 } }] },
+      // the same part again, and again with its first row left out: what a model going round in circles appends
+      { calls: [{ name: 'append_file', input: { path: 'level.js', content: part2 } }] },
+      { calls: [{ name: 'append_file', input: { path: 'level.js', content: part2.slice(part2.indexOf('\n') + 1) } }] },
+      { text: 'Done: the level is 40 rows, walled.' },
+    ]);
+    await agent.run('write level.js: a 20 by 40 level map, walled all round', emit);
+    expect(vfs.readText('/level.js')).toBe(part1 + part2);
+    const told = fake.bodies.map((b) => JSON.stringify(b.messages));
+    expect(told[2]).not.toContain('Not added');
+    expect(told[3]).toContain('Not added: you appended this part to /level.js before, and it is in the file.');
+    expect(told[4]).toContain('Not added: you appended this part to /level.js before');
+    // two refusals are told, not stopped
+    expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it('counts the same unchanged write in one reply once', async () => {
+    // Three of the same write in one reply stopped the run, "told each time", when it had been told nothing.
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    vfs.writeFile('/notes.md', '# Notes\n\nThe first draft.\n');
+    const same = { name: 'write_file', input: { path: 'notes.md', content: '# Notes\n\nThe first draft.\n' } };
+    const fake = fakeProvider('openai', [{ calls: [same, same, same] }, { text: 'Done.' }]);
+    await agent.run('save the notes', emit);
+    expect(fake.bodies).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it("tells a reply stopped for writing a whole file again what it wrote, not that it nested a call", () => {
+    // What the engine says of a 1,471-token file (its brackets balanced) written again into its write_file: its quote is
+    // the file's start and end, whose brackets say nothing.
+    const said = String.raw`generation_repetition: the reply went on repeating the same 1471 tokens ("function collides(shape, x, y) {\n  return shape.some((row, d…ds.               \n", 2 times: 3070 tokens) in a tool call and was stopped`;
+    const note = repetitionNote(said);
+    expect(note).toContain('2 times in a row) inside its tool call');
+    expect(note).not.toContain('written inside itself');
+  });
+
   it('finds a call written inside itself without end in what a tool would write, and nothing in code or data that repeats', () => {
     // what Nanbeige 4.3 33B wrote into tetris.html, its line 238 6,831 characters long
     const runaway = `function rotate(shape) {\n  const dirs = [[0,1],[1,0]];\n  const start = dirs.indexOf(dirsInv[${'dirs.indexOf('.repeat(513)}`;
@@ -907,6 +968,36 @@ describe('tool rules', () => {
     expect(past.content).toBe('[/game.html has 3 lines, so there is nothing from line 9 on. Its last line is 3.]');
     vfs.writeFile('/long.js', `a\n${'x'.repeat(7000)}`);
     expect((await run('read_file', { path: 'long.js', offset: 4 })).content).toBe('[/long.js has 2 lines, so there is nothing from line 4 on. Its last line is 2, 7000 characters long: read it with char_start.]');
+    // ending with a line break, as files do: the long line before the empty last one is named
+    vfs.writeFile('/long2.js', `a\n${'x'.repeat(7000)}\n`);
+    expect((await run('read_file', { path: 'long2.js', offset: 5 })).content).toBe('[/long2.js has 3 lines, so there is nothing from line 5 on. Its last line is 3; line 2 is 7000 characters long: read it with char_start.]');
+  });
+
+  it('lets the agent replace a file it knows whole after reading part of it, and still not one it has seen only part of', async () => {
+    const vfs = new Vfs();
+    const ctx = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} } };
+    const run = (name: string, input: Record<string, unknown>) => runTool({ id: 'c', name, input }, ctx);
+    const page = Array.from({ length: 40 }, (_, i) => `<p>line ${i + 1}</p>`).join('\n');
+    // written whole, ten lines of it read (as Nanbeige 4.3 33B did), then written again: its own file, known in full
+    expect((await run('write_file', { path: 'page.html', content: page })).isError).toBeFalsy();
+    await run('read_file', { path: 'page.html', offset: 20, limit: 10 });
+    await run('read_file', { path: 'page.html', char_start: 40, char_count: 30 });
+    expect((await run('write_file', { path: 'page.html', content: `${page}\n<p>more</p>` })).isError).toBeFalsy();
+    // a file it did not write, seen in part: refused until all of it is read, by lines or by characters
+    vfs.writeFile('/notes.md', page);
+    await run('read_file', { path: 'notes.md', offset: 1, limit: 5 });
+    expect((await run('write_file', { path: 'notes.md', content: 'new' })).content).toContain('read all of /notes.md before replacing it');
+    await run('read_file', { path: 'notes.md', char_start: 0, char_count: 100_000 });
+    expect((await run('write_file', { path: 'notes.md', content: 'new' })).isError).toBeFalsy();
+    // and changed by someone else since it was known whole: read again first, as before
+    vfs.writeFile('/notes.md', 'theirs');
+    expect((await run('write_file', { path: 'notes.md', content: 'mine' })).content).toContain('changed since you read it');
+    // seen in part, deleted, written anew: the new file is its own, known in full
+    vfs.writeFile('/old.md', page);
+    await run('read_file', { path: 'old.md', offset: 3, limit: 2 });
+    await run('delete_file', { path: 'old.md' });
+    expect((await run('write_file', { path: 'old.md', content: 'fresh' })).isError).toBeFalsy();
+    expect((await run('write_file', { path: 'old.md', content: 'fresh again' })).isError).toBeFalsy();
   });
 
   it('an unreadable view_image call is not the model refusing images', async () => {

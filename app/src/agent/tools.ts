@@ -1045,14 +1045,22 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const key = normalizePath(need(input, 'path'));
       if (imageMimeFor(key) && !/\.svg$/i.test(key)) throw new Error(`/${key} is an image: look at it with view_image`);
       const text = vfs.readText(`/${key}`);
+      // Editing needs a read; replacing needs the whole file read. What the agent knows of the file as it is now, whole
+      // (it wrote or read all of it, and it has not changed since), a read of part of it takes nothing from: Nanbeige 4.3
+      // 33B wrote a file whole, read ten lines of it, and was refused when it wrote the file again.
+      const knownWhole = ctx.reads.get(key) === vfs.version(`/${key}`) && !ctx.reads.has(`${key}#partial`);
+      const readAs = (whole: boolean) => {
+        ctx.reads.set(key, vfs.version(`/${key}`));
+        if (whole) ctx.reads.delete(`${key}#partial`);
+        else if (!knownWhole) ctx.reads.set(`${key}#partial`, 1);
+      };
       if (typeof input.char_start === 'number') {
         const start = Math.max(0, Math.floor(input.char_start));
         const count = Math.min(Math.max(1, typeof input.char_count === 'number' ? Math.floor(input.char_count) : READ_CHARS), READ_CHARS);
         const slice = text.slice(start, start + count);
         const lineNo = text.slice(0, start).split('\n').length;
-        // A part of the file: enough to edit it, not to replace it.
-        ctx.reads.set(key, vfs.version(`/${key}`));
-        if (start > 0 || start + slice.length < text.length) ctx.reads.set(`${key}#partial`, 1);
+        // A part of the file: enough to edit it, not to replace it (the whole of it, read so, is read).
+        readAs(start === 0 && slice.length === text.length);
         return `[characters ${start}-${start + slice.length} of ${text.length}, starting on line ${lineNo}]\n${slice}${start + slice.length < text.length ? `\n[continue with char_start ${start + slice.length}]` : ''}`;
       }
       const lines = text.split('\n');
@@ -1061,8 +1069,10 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       // (past the end: said so, where it was a TypeError, three of which in a row stopped a run whose model looked for
       // the end of a line that ran on for 6,831 characters)
       if (offset > lines.length) {
-        const last = lines[lines.length - 1];
-        return `[/${key} has ${lines.length} line${lines.length === 1 ? '' : 's'}, so there is nothing from line ${offset} on. Its last line is ${lines.length}${last.length > LINE_CHARS ? `, ${last.length} characters long: read it with char_start` : ''}.]`;
+        // (the last line with text: a file that ends with a line break has an empty one after it)
+        const at = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 2 : lines.length - 1;
+        const long = lines[at].length > LINE_CHARS ? `${at + 1 === lines.length ? ',' : `; line ${at + 1} is`} ${lines[at].length} characters long: read it with char_start` : '';
+        return `[/${key} has ${lines.length} line${lines.length === 1 ? '' : 's'}, so there is nothing from line ${offset} on. Its last line is ${lines.length}${long}.]`;
       }
       const slice = lines.slice(offset - 1, offset - 1 + limit);
       let charAt = 0;
@@ -1077,11 +1087,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         })
         .join('\n');
       if (body.length > READ_CHARS) body = `${body.slice(0, READ_CHARS)}\n[cut at ${READ_CHARS} characters]`;
-      const whole = offset === 1 && slice.length === lines.length && body.length <= READ_CHARS && !linesCut;
-      // Editing needs a read; replacing needs the whole file read.
-      ctx.reads.set(key, vfs.version(`/${key}`));
-      if (!whole) ctx.reads.set(`${key}#partial`, 1);
-      else ctx.reads.delete(`${key}#partial`);
+      readAs(offset === 1 && slice.length === lines.length && body.length <= READ_CHARS && !linesCut);
       const more = offset - 1 + slice.length < lines.length ? `\n[lines ${offset}-${offset - 1 + slice.length} of ${lines.length}; continue with offset ${offset + slice.length}]` : '';
       return body + more;
     }
@@ -1175,7 +1181,9 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       }
       refuseRunaway(content);
       vfs.writeFile(`/${key}`, content, { parents: true });
+      // (it knows all it wrote: a mark of a part read before, of a file deleted since, is gone with it)
       ctx.reads.set(key, vfs.version(`/${key}`));
+      ctx.reads.delete(`${key}#partial`);
       return `wrote /${key} (${content.split('\n').length} lines)`;
     }
     case 'append_file': {
@@ -1223,6 +1231,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const key = normalizePath(need(input, 'path'));
       vfs.remove(`/${key}`, true);
       ctx.reads.delete(key);
+      ctx.reads.delete(`${key}#partial`);
       return `deleted /${key}`;
     }
     case 'grep': {
