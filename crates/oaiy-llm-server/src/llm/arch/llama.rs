@@ -107,6 +107,12 @@ impl LlamaModel {
         self.chain.split(other, from)
     }
 
+    /// What its devices keep between runs let go: the chained steps' copies of the cache and a run's vectors on each
+    /// ([`crate::llm::chain::decode::ChainDecoder::let_go`]), made again from the host's rows at the next run.
+    pub fn let_go_of_spare(&self) {
+        self.chain.let_go(&*self.backend);
+    }
+
     pub fn new_kv_cache(&self, max_len: usize) -> KvCache {
         KvCache::new(
             &*self.backend,

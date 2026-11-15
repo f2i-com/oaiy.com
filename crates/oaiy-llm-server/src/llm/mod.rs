@@ -304,6 +304,49 @@ impl Model {
         }
     }
 
+    /// What a model whose steps are chained on its devices keeps there between runs let go: its copies of the cache and
+    /// a run's vectors (the dense Llama's, Qwen3's and Gemma 3's: [`crate::llm::chain::decode::ChainDecoder::let_go`]),
+    /// made again from the host's rows at the next run. Nothing for the others.
+    pub fn let_go_of_spare(&self) {
+        match self {
+            Self::Llama(m) => m.let_go_of_spare(),
+            Self::Qwen3(m) => m.let_go_of_spare(),
+            Self::Gemma3(m) => m.let_go_of_spare(),
+            _ => {}
+        }
+    }
+
+    /// The bytes one position of a GPU's copy of the cache takes, where its steps are chained there: half of
+    /// [`Self::kv_bytes_per_position`]'s where the copy is held as f16 halves, as `llm::chain::decode` holds a dense Llama's
+    /// and Qwen3's when the device attends halves (`make_state`: no layer keeps a window, which Gemma 3's local layers do),
+    /// else all of it. Counted as f32, a context nobody set was half what the GPU had room for: Qwen3's 14B got 32,768
+    /// where 65,536 had room.
+    pub fn device_bytes_per_position(&self, chain: &dyn ggml_rs::DeviceChain) -> u64 {
+        let cfg = self.config();
+        let halves = matches!(self, Self::Llama(_) | Self::Qwen3(_))
+            && chain.halves_only(cfg.n_heads, cfg.n_kv_heads, cfg.head_dim)
+            && chain.halves_few_rows(cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+        if halves { self.kv_bytes_per_position() / 2 } else { self.kv_bytes_per_position() }
+    }
+
+    /// The bytes one position of the cache [`Self::new_kv_cache`] makes takes: each layer's K and V row in f32, as
+    /// that makes them (a recurrent layer's placeholder of one value, a Gemma 4's layers each at its own heads and
+    /// width). That cache is made whole for its length at the start, so this times the context is what it takes
+    /// before the first token.
+    pub fn kv_bytes_per_position(&self) -> u64 {
+        let cfg = self.config();
+        let values: usize = if let Self::Qwen35(m) = self {
+            m.attention_layers.iter().map(|&a| if a { cfg.n_kv_heads * cfg.head_dim } else { 1 }).sum()
+        } else if let Self::Gemma4Moe(m) = self {
+            (0..cfg.n_layers).zip(&m.blocks).map(|(i, b)| b.attn_k.shape()[0] / cfg.layer_head_dim(i) * cfg.layer_head_dim(i)).sum()
+        } else if cfg.head_dim_swa.is_some() || cfg.kv_heads_per_layer.is_some() {
+            (0..cfg.n_layers).map(|i| cfg.layer_kv_heads(i) * cfg.layer_head_dim(i)).sum()
+        } else {
+            cfg.n_layers * cfg.n_kv_heads * cfg.head_dim
+        };
+        2 * 4 * values as u64
+    }
+
     /// Take last-position logits from a `[seq, vocab]` tensor and bring them
     /// onto the host (always CPU storage, ready for sampling).
     pub fn last_logits(&self, logits: &Tensor) -> Tensor {

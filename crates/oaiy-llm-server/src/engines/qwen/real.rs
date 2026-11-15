@@ -42,6 +42,9 @@ pub(crate) struct FakeModel {
     pub lead: Option<(usize, Vec<u32>)>,
     /// Its conversations set aside whole, as a dense Llama's are, rather than parked.
     pub aside: bool,
+    /// The rows its "GPU" has room for: a run that would hold more fails as a card of wgpu's own does when its copy
+    /// of the cache cannot grow ("wgpu error: Out of Memory").
+    pub room: Option<usize>,
 }
 
 impl FakeModel {
@@ -52,7 +55,7 @@ impl FakeModel {
         tokens.push("<tool_call>".into());
         tokens.push("f(".into());
         let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3, THINK], END).unwrap();
-        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, lead: None, aside: false }
+        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, lead: None, aside: false, room: None }
     }
 
     fn mix(t: u32, pos: u32, salt: u32, j: u32) -> f32 {
@@ -65,6 +68,7 @@ impl FakeModel {
 
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Result<Tensor, String> {
         if self.panic_on.is_some_and(|p| tokens.contains(&p)) { panic!("injected: the device failed in the middle of a request"); }
+        if self.room.is_some_and(|rows| kv.len + tokens.len() > rows) { panic!("wgpu error: Out of Memory"); }
         // Arm or disarm the failure of the next restore (park's fixture) on this, the engine's, thread.
         if tokens.contains(&ARM) { crate::engines::qwen::park::fixtures::INJECT_PANIC.with(|f| f.set(true)); }
         if tokens.contains(&DISARM) { crate::engines::qwen::park::fixtures::INJECT_PANIC.with(|f| f.set(false)); }
@@ -154,6 +158,16 @@ impl Engine {
         let forwarded = Arc::new(AtomicUsize::new(0));
         let model = FakeModel { aside: true, ..FakeModel::new(None, forwarded.clone()) };
         let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false);
+        let (tx, rx) = channel();
+        let thread = std::thread::spawn(move || engine.run(rx));
+        Engine { tx: Some(tx), thread: Some(thread), forwarded }
+    }
+
+    /// An engine whose model's "GPU" has room for `rows` rows of its cache, no more.
+    pub fn start_with_room(rows: usize) -> Self {
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let model = FakeModel { room: Some(rows), ..FakeModel::new(None, forwarded.clone()) };
+        let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false).park_up_to(0);
         let (tx, rx) = channel();
         let thread = std::thread::spawn(move || engine.run(rx));
         Engine { tx: Some(tx), thread: Some(thread), forwarded }
@@ -494,6 +508,42 @@ mod tests {
         assert_eq!(back.reuse.unwrap().1, "ram", "{back:?}");
         let cold = Engine::start(0, None).ask(&next_a, MAX);
         assert_eq!(back.words, cold.words);
+    }
+
+    #[test]
+    fn a_prompt_the_gpus_have_no_room_for_is_answered_as_past_the_context_and_the_engine_goes_on() {
+        // A card of wgpu's own says it has no room through its error handler ("wgpu error: Out of Memory"): that was not
+        // read as no room, so the request was not asked again, and it failed as "native Qwen inference failed", which
+        // ended OAIY's Agent's run (Nanbeige 4.3 33B over two RTX 5090s, a conversation past 32,768 tokens).
+        let e = Engine::start_with_room(32_768);
+        let prompt = Chat::new(30, 40_000).prompt();
+        let refused = e.ask(&prompt, MAX);
+        let said = refused.error.expect("refused");
+        assert!(said.starts_with(crate::api::NO_ROOM), "{said}");
+        // what it needed, and as the window the room its copy had before it had to grow (a power of two), in the words
+        // OAIY's Agent reads a window from
+        assert!(said.contains(&format!("at {} positions", prompt.len() + 1)), "{said}");
+        assert!(said.contains("maximum context length is 32768 tokens"), "{said}");
+        // asked once more from the start first (what the model keeps on its cards let go): its prompt read twice
+        assert!(e.forwarded.load(Ordering::Relaxed) >= 2 * 31_000, "{}", e.forwarded.load(Ordering::Relaxed));
+        // and the engine goes on: a conversation within the room is answered
+        let next = e.ask(&Chat::new(31, 2_000).prompt(), MAX);
+        assert!(next.done && next.error.is_none(), "{next:?}");
+    }
+
+    #[test]
+    fn a_reply_that_outgrows_the_gpus_room_is_answered_as_past_the_context() {
+        // The prompt fits, and the reply passes the room partway: no word is taken back, the request is not asked again
+        // (its words were sent), and it ends past the context, the window the room before it had to grow.
+        let e = Engine::start_with_room(32_768);
+        let mut chat = Chat::new(40, 31_000);
+        while chat.prompt().len() < 32_740 {
+            chat.messages[0].push(1_234);
+        }
+        let reply = e.ask(&chat.prompt(), 200);
+        assert!(!reply.done && !reply.words.is_empty(), "{reply:?}");
+        let said = reply.error.expect("stopped partway");
+        assert!(said.starts_with(crate::api::NO_ROOM) && said.contains("maximum context length is 32768 tokens"), "{said}");
     }
 
     #[test]

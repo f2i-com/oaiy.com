@@ -78,7 +78,28 @@ pub(crate) fn others(o: &Options, devices: &[usize], first: &ggml_rs_wgpu::WgpuB
         Some(rest) => {
             let mut taken = vec![first.adapter().pci_bus_id.clone()];
             rest.into_iter()
-                .filter_map(|d| ggml_rs_wgpu::WgpuBackend::nth(d, budget).ok())
+                // One that cannot be opened is asked twice more, two seconds apart, and said in the log if it still
+                // cannot: on a computer whose first GPU also drives its screen, that GPU refused a device ("Parent device
+                // is lost") while another program held one there (another of OAIY's engines among them), and a model meant
+                // for two cards was left on one, with no word of why, its context more than that card had room for.
+                .filter_map(|d| {
+                    let mut tries = 0;
+                    loop {
+                        match ggml_rs_wgpu::WgpuBackend::nth(d, budget) {
+                            Ok(b) => break Some(b),
+                            Err(e) if tries < 2 && e.contains("lost") => {
+                                tries += 1;
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                            }
+                            Err(e) => {
+                                if !o.silent {
+                                    eprintln!("oaiy-llm-server: GPU {d} could not be opened for a model's later layers ({e}): another program holding a device on that GPU can keep it from being opened; the model stays on one GPU");
+                                }
+                                break None;
+                            }
+                        }
+                    }
+                })
                 .filter(|b| {
                     let at = b.adapter().pci_bus_id.clone();
                     !taken.contains(&at) && {

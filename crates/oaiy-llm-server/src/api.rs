@@ -131,6 +131,33 @@ pub(crate) fn past_context(tokens: impl std::fmt::Display, max_seq: usize) -> St
     format!("{}{tokens} tokens, and the model's maximum context length is {max_seq} tokens here", PAST_CONTEXT)
 }
 
+/// What a run the GPUs had no room for is answered with (`engines::qwen`, when letting go of what the model keeps on
+/// them and asking once more did not make room): past the context as a prompt of text past it is (code
+/// `context_length_exceeded`), the context the conversation's cache had room for before it had to grow (`fits`) as the
+/// model's maximum length, in the words clients look for, so that OAIY's Agent takes it as its window, compacts and goes
+/// on. It was "native Qwen inference failed", which ended the Agent's run.
+pub(crate) const NO_ROOM: &str = "the GPUs have no room beside what else is on them for this conversation's cache at ";
+
+pub(crate) fn no_room_context(needed: usize, fits: usize) -> String {
+    format!("{NO_ROOM}{needed} positions, and the model's maximum context length is {fits} tokens here while they hold what they do")
+}
+
+/// The code an engine's error goes to its client with: a run the GPUs had no room for as a prompt past the context
+/// ([`no_room_context`]), a guard's or the tool contract's as theirs, anything else the server's own.
+fn error_code(e: &str) -> &'static str {
+    if e.starts_with(NO_ROOM) {
+        "context_length_exceeded"
+    } else if e.contains(TOOL_CONTRACT_CODE) {
+        TOOL_CONTRACT_CODE
+    } else if e.contains(crate::guards::repetition::CODE) {
+        crate::guards::repetition::CODE
+    } else if e.contains(crate::guards::observer::CODE) {
+        crate::guards::observer::CODE
+    } else {
+        "server_error"
+    }
+}
+
 /// A request's pictures refused, as the client is told: past the context ([`past_context`]) as a prompt of text past it
 /// is, with the code `context_length_exceeded`; anything else as a request the server cannot take.
 fn image_refusal(message: String) -> ApiError {
@@ -1074,7 +1101,9 @@ impl Server {
                 }
                 let mut send = |v: Json| s.send(format!("data: {}\n\n", v.to_json()).as_bytes());
                 if let Some(e) = &error {
-                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(TOOL_CONTRACT_CODE) { TOOL_CONTRACT_CODE } else if e.contains(crate::guards::repetition::CODE) { crate::guards::repetition::CODE } else if e.contains(crate::guards::observer::CODE) { crate::guards::observer::CODE } else { "server_error" }))]))]));
+                    let code = error_code(e);
+                    let kind = if code == "context_length_exceeded" { "invalid_request_error" } else { "server_error" };
+                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str(kind)), ("code", Json::str(code))]))]));
                 } else {
                     if !tool_calls.is_empty() {
                         send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(closed)?;
@@ -1102,11 +1131,13 @@ impl Server {
                     return Ok(false);
                 }
                 if let Some(e) = error {
-                    let repetition = e.contains(crate::guards::repetition::CODE);
-                    let observer = e.contains(crate::guards::observer::CODE);
-                    let tool_contract = e.contains(TOOL_CONTRACT_CODE);
-                    return Err(ApiError { status: if repetition || observer || tool_contract { 422 } else { 500 }, message: e,
-                        code: if tool_contract { TOOL_CONTRACT_CODE } else if repetition { crate::guards::repetition::CODE } else if observer { crate::guards::observer::CODE } else { "server_error" } });
+                    let code = error_code(&e);
+                    let status = match code {
+                        "context_length_exceeded" => 400,
+                        "server_error" => 500,
+                        _ => 422,
+                    };
+                    return Err(ApiError { status, message: e, code });
                 }
                 let mut message = vec![
                     ("role".to_string(), Json::str("assistant")),
@@ -1209,9 +1240,12 @@ impl Server {
                     break;
                 }
                 Event::Error(e) => {
-                    let Some(mut s) = sse.take() else { return Err(ApiError { status: 500, message: e, code: "server_error" }) };
+                    // (a run the GPUs had no room for as a prompt past the context: `error_code`)
+                    let past = e.starts_with(NO_ROOM);
+                    let (status, code, kind) = if past { (400, "context_length_exceeded", "invalid_request_error") } else { (500, "server_error", "server_error") };
+                    let Some(mut s) = sse.take() else { return Err(ApiError { status, message: e, code }) };
                     // The stream has begun: the error goes in it, as a chat's does, and the stream ends.
-                    let error = Json::obj([("error", Json::obj([("message", Json::str(&e)), ("type", Json::str("server_error")), ("code", Json::str("server_error"))]))]);
+                    let error = Json::obj([("error", Json::obj([("message", Json::str(&e)), ("type", Json::str(kind)), ("code", Json::str(code))]))]);
                     let _ = s.send(format!("data: {}\n\n", error.to_json()).as_bytes());
                     let _ = s.send(b"data: [DONE]\n\n");
                     let _ = s.finish();
@@ -1561,6 +1595,19 @@ mod tests {
         let Err(e) = crate::engines::qwen::prepare_images(std::slice::from_ref(&rec), vec![1, 9, 2], 9, &cfg, false, 500) else { panic!("past the context") };
         assert!(e.contains("is 578 tokens, and the model's maximum context length is 500 tokens here"), "{e}");
         assert_eq!(image_refusal(e).code, "context_length_exceeded");
+    }
+
+    /// A run the GPUs had no room for goes to the client as a prompt past the context, the room it had as the window, so
+    /// that OAIY's Agent compacts and goes on: as "native Qwen inference failed" (code server_error) its run ended.
+    #[test]
+    fn a_run_the_gpus_had_no_room_for_goes_out_as_past_the_context() {
+        let said = no_room_context(40_823, 32_768);
+        assert_eq!(said, "the GPUs have no room beside what else is on them for this conversation's cache at 40823 positions, and the model's maximum context length is 32768 tokens here while they hold what they do");
+        assert_eq!(error_code(&said), "context_length_exceeded");
+        // the others as they were
+        assert_eq!(error_code("native Qwen inference failed"), "server_error");
+        assert_eq!(error_code("tool_contract_error: missing function tag; no tool from this batch was executed"), TOOL_CONTRACT_CODE);
+        assert_eq!(error_code(&format!("{}: the reply went on repeating", crate::guards::repetition::CODE)), crate::guards::repetition::CODE);
     }
 }
 

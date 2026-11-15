@@ -13,11 +13,35 @@ use crate::quantized::QuantizedTensor;
 use crate::tensor::Tensor;
 
 /// Whether a caught panic is a device saying it has no room for a buffer (the card's adapter refuses one so:
-/// "MemoryError: Allocation of 512.00 MB failed"), and not anything else gone wrong: only that is answered by letting
-/// go of what is kept and asking again, or by a smaller cache. Any other panic is passed on as it came.
+/// "MemoryError: Allocation of 512.00 MB failed"; a card of wgpu's own, through its error handler: "wgpu error: Out of
+/// Memory"), and not anything else gone wrong: only that is answered by letting go of what is kept and asking again,
+/// or by a smaller cache. Any other panic is passed on as it came, a device that was lost among them (nothing on it is
+/// there to ask again with). wgpu's had not been read so: an RTX 5090 whose conversation outgrew its room failed every
+/// request after with "native Qwen inference failed", and OAIY's Agent ended the run.
 pub fn no_room(panic: &(dyn Any + Send)) -> bool {
     let said = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
-    said.contains("MemoryError") || said.contains("Allocation of") || said.contains("no room")
+    let refused = said.contains("MemoryError") || said.contains("Allocation of") || said.contains("no room") || said.contains("Out of Memory") || said.contains("Not enough memory left");
+    refused && !said.contains("device was lost")
+}
+
+#[cfg(test)]
+mod no_room_tests {
+    use super::no_room;
+
+    fn caught(said: &'static str) -> Box<dyn std::any::Any + Send> {
+        std::panic::catch_unwind(move || -> () { std::panic::panic_any(said.to_string()) }).unwrap_err()
+    }
+
+    #[test]
+    fn a_card_that_has_no_room_is_told_from_other_failures() {
+        // tinygrad's adapter, and a card of wgpu's own through its error handler (ggml-rs-wgpu: "wgpu error: {e}")
+        assert!(no_room(caught("MemoryError: Allocation of 512.00 MB failed").as_ref()));
+        assert!(no_room(caught("wgpu error: Out of Memory").as_ref()));
+        assert!(no_room(caught("wgpu error: Not enough memory left.").as_ref()));
+        // a device that was lost is not one to ask again, whatever it said after
+        assert!(!no_room(caught("webgpu: the device was lost (Unknown: reset): Out of Memory").as_ref()));
+        assert!(!no_room(caught("index out of bounds: the len is 3 but the index is 7").as_ref()));
+    }
 }
 
 /// An f32 vector held by a [`DeviceChain`]'s device: the backend's own buffer behind it.

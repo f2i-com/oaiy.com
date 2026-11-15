@@ -53,6 +53,11 @@ impl std::fmt::Debug for Gemma3Model {
 }
 
 impl Gemma3Model {
+    /// What its device keeps between runs let go ([`crate::llm::chain::decode::ChainDecoder::let_go`]).
+    pub fn let_go_of_spare(&self) {
+        self.chain.let_go(&*self.backend);
+    }
+
     pub fn from_gguf(g: &GgufFile, backend: Arc<dyn Backend>) -> Result<Self> {
         let config = ModelConfig::from_gguf(g)?;
         let tokenizer = Tokenizer::from_gguf(g)?;

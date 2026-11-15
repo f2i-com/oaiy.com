@@ -391,11 +391,31 @@ impl GlmEngine {
                 self.reset();
             }
             self.forgetting = job.forget;
-            let r = self.generate(&job);
-            if let Err(e) = r {
+            // A panic in a run (a card with no room for its cache's copy, "wgpu error: Out of Memory") ended this thread,
+            // and every request after failed until the engine was started again (Gemma 3 12B, 24,507 tokens into a
+            // prompt). Caught: what the model keeps on its devices let go, and a run they had no room for answered as a
+            // prompt past the context (`api::no_room_context`), so that OAIY's Agent compacts and goes on; any other as
+            // the failure it was.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            let error = match r {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(p) => {
+                    let needed = self.kv.len.max(job.prompt.len()) + 1;
+                    self.model.let_go_of_spare();
+                    let said = p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("a panic");
+                    Some(if ggml_rs::chain::no_room(p.as_ref()) {
+                        crate::api::no_room_context(needed, crate::models::device_rows(needed) / 2)
+                    } else {
+                        format!("the model's run failed: {said}")
+                    })
+                }
+            };
+            if let Some(e) = error {
                 // The state's position is unknown after a failure: start clean.
+                if self.log { eprintln!("  {e}"); }
                 self.reset();
-                let _ = job.events.send(Event::Error(e.to_string()));
+                let _ = job.events.send(Event::Error(e));
             }
             if job.forget {
                 // An incognito request keeps its state (in memory only) for the next incognito request of its session

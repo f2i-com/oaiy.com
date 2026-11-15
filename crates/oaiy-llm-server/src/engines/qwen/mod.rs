@@ -789,6 +789,11 @@ impl Hybrid {
         if let Self::Qwen35(Model::Qwen35(m)) = self {
             m.chain.let_go_of_spare(m, cache);
         }
+        // (a dense Llama's copies of the cache on its cards, made again from the host's rows: Nanbeige 4.3's, two cards'.
+        // Nothing was let go of it, so a run its cards had no room for failed again as it was asked again)
+        if let (Self::Qwen35(Model::Llama(m)), true) = (self, cache) {
+            m.let_go_of_spare();
+        }
     }
 
     fn warms(&self) -> bool {
@@ -1063,20 +1068,30 @@ impl QwenEngine {
             }
             self.replying = false;
             let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            let no_room = |r: &std::thread::Result<Result<(), String>>| r.as_ref().is_err_and(|p| ggml_rs::chain::no_room(p.as_ref()));
+            // (the positions the run needed when it found no room: the prompt, or as far as its reply had gone)
+            let needed = self.kv.len.max(job.prompt.len()) + 1;
             // A GPU that had no room while the prompt was read (no word of the reply sent): what the model keeps on it
             // between requests let go, its cache's copy too, and the request run once more from the start. Left as it
             // was, every request after failed the same way until the engine was started again.
-            if result.as_ref().is_err_and(|p| ggml_rs::chain::no_room(p.as_ref())) && !self.replying {
+            if no_room(&result) && !self.replying {
                 if self.log { eprintln!("  Qwen: the GPU had no room for this request; what the model keeps there between requests let go, and the request run again"); }
                 self.kv.reset(); self.covered.clear();
                 self.model.let_go_of_spare(true);
                 result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
             }
+            // Still no room, or none partway through the reply: the conversation is longer than its cache's copy has room
+            // for on the GPUs beside what else is on them now (another program's, the screen's). Said as a prompt past
+            // the context is, the context what the copy held before it had to grow (it grows to a power of two), so that
+            // OAIY's Agent takes that as its window, compacts its conversation and goes on. It was "native Qwen inference
+            // failed", and the run ended there.
+            let past = no_room(&result).then(|| crate::api::no_room_context(needed, crate::models::device_rows(needed) / 2));
+            if let (Some(said), true) = (&past, self.log) { eprintln!("  Qwen: {said}"); }
             // (a picture's prompt keeps vectors of its own on the GPU: let go, for the text prompts that come after)
             if !job.images.is_empty() || result.is_err() {
                 self.model.let_go_of_spare(result.is_err());
             }
-            let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("native Qwen inference failed".into()) };
+            let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some(past.unwrap_or_else(|| "native Qwen inference failed".into())) };
             if let Some(e) = error { self.kv.reset(); self.covered.clear(); let _ = job.events.send(Event::Error(e)); }
             if job.forget {
                 // An incognito request keeps its state for the next incognito request of

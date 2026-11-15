@@ -365,6 +365,27 @@ impl ChainDecoder {
         self.later.get().is_some()
     }
 
+    /// What its devices keep between runs let go: each one's copy of the cache and a run's vectors, then the device's
+    /// own spare. The next run makes its copy again from the host's rows (all of them: it is a copy of no cache now).
+    /// After a device had no room for a run, the copies as they were, grown for the conversation so far, left it none
+    /// to run anything in: the engine asked again and failed the same way.
+    pub(crate) fn let_go(&self, backend: &dyn Backend) {
+        let parts = [(Some(backend), self.state.get()), (self.later.get().map(|(other, _)| other.as_ref()), self.later_state.get())];
+        for (b, st) in parts {
+            let (Some(b), Some(Some(st))) = (b, st) else { continue };
+            let Some(chain) = b.chain() else { continue };
+            {
+                let mut g = st.kv.lock().unwrap_or_else(|p| p.into_inner());
+                g.layers = Vec::new();
+                g.out = chain.vec(1);
+                g.cap = 0;
+                g.owner = 0;
+            }
+            st.run_vecs.lock().unwrap_or_else(|p| p.into_inner()).0.clear();
+            chain.let_go_of_spare();
+        }
+    }
+
     /// Each device's part in the order the layers go through them: its backend and its state there.
     fn parts<'s>(&'s self, backend: &'s dyn Backend, m: &Dense<'_>) -> Option<Vec<(&'s dyn Backend, &'s ChainState)>> {
         let to = self.later.get().map_or(m.cfg.n_layers, |(_, from)| *from);

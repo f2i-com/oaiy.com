@@ -513,10 +513,12 @@ pub(crate) fn dense_context(ctx: usize, asked: bool, model_max: usize) -> usize 
     if asked && ctx != 0 { most } else { most.min(DENSE_CTX) }
 }
 
-/// What a model whose cache is sized by its context is served with when nobody has said and its GPUs have the room
-/// for that cache: 65,536 positions (the model's own maximum at most). OAIY's Agent, its instructions and OAIY's
-/// tools beside them, takes some 19,000 tokens before a word of the conversation: in [`DENSE_CTX`]'s 16,384 it
-/// refused every request, and the person asked for "like 64000 by default".
+/// What a model whose cache is sized by its context is served with when nobody has said and there is room for that
+/// cache (its GPUs' own figures for their memory, and for a cache the host keeps, the computer's: [`cache_room`]):
+/// 65,536 positions (the model's own maximum at most), else the most there is room for, [`DENSE_CTX`] at least. OAIY's
+/// Agent, its instructions and OAIY's tools beside them, takes some 19,000 tokens before a word of the conversation: in
+/// [`DENSE_CTX`]'s 16,384 it refused every request, and the person asked for "like 64000 by default", and again for
+/// the dense families ("it should allow for 65000 context tokens by default if the hardware allows it").
 pub(crate) const AUTO_CTX: usize = 65536;
 
 /// The context nobody gave: from `most` (the model's maximum at most) down in steps of 4,096 to the first that `fits`
@@ -532,6 +534,50 @@ pub(crate) fn auto_context(base: usize, model_max: usize, most: usize, fits: imp
         }
     }
     (base, n < most.min(model_max))
+}
+
+/// Whether a cache of `bytes` that is made whole at the start has room: on its GPU, where `gpu` is what the GPU's own
+/// figure for its memory says of those bytes and `spare` more beside what is there now (None on the CPU, which has no
+/// other place for it); and in the computer's memory, where the cache's own K and V are (a GPU's chained runs make
+/// their copy of the rows from them), in half of what is free now (`host_free`) once `spare` is taken off it: the
+/// other half is the system's and the other programs'.
+pub(crate) fn room_for(bytes: u64, spare: u64, gpu: Option<bool>, host_free: u64) -> bool {
+    gpu.unwrap_or(true) && host_free.saturating_sub(spare) / 2 >= bytes
+}
+
+/// The rows a GPU's copy of a cache the host makes whole is grown to for `positions`: the next power of two (its chained
+/// runs' `reserve`, `llm::chain::decode`'s and `llm::chain::gemma4`'s), not the context, so a context of 24,576 has the
+/// GPU hold 32,768 rows once a conversation comes near it. Measured for the context itself, Gemma 3 12B was given 24,576
+/// on a 32 GB card, and its GPU ran out of memory 24,507 tokens into a prompt.
+pub(crate) fn device_rows(positions: usize) -> usize {
+    positions.next_power_of_two().max(256)
+}
+
+/// [`room_for`] the cache `model` makes whole at its length ([`crate::llm::Model::new_kv_cache`]) beside it on its
+/// backend: the dense families', and any model's on the CPU. Its GPU is asked for its chained runs' copy as it grows
+/// ([`device_rows`], as that copy holds a row: [`crate::llm::Model::device_bytes_per_position`]); the computer for the
+/// host's, in f32. None where its GPU says nothing of its memory (a Mac's) or refuses a vector as it is asked for
+/// (tinygrad's adapter), or the computer says nothing of its own.
+fn cache_room(model: &crate::llm::Model, spare: u64) -> impl Fn(usize) -> Option<bool> + '_ {
+    let backend = model.backend().as_ref();
+    let row = model.kv_bytes_per_position();
+    move |positions| {
+        let gpu = match backend.chain() {
+            Some(c) if c.refuses_at_once() || !c.room_known() => return None,
+            Some(c) => Some(c.has_room(model.device_bytes_per_position(c).saturating_mul(device_rows(positions) as u64).saturating_add(spare))),
+            None if backend.name() == "cpu" => None,
+            None => return None,
+        };
+        Some(room_for(row.saturating_mul(positions as u64), spare, gpu, host_free()?))
+    }
+}
+
+/// The computer's memory free now, in bytes.
+fn host_free() -> Option<u64> {
+    #[cfg(feature = "webgpu")]
+    return ggml_rs_wgpu::host_memory().map(|(free, _)| free as u64);
+    #[cfg(not(feature = "webgpu"))]
+    None
 }
 
 /// a vision tower made on its GPU now and the host's copy of its matrices let go (`MmProj::
@@ -928,9 +974,9 @@ impl Models {
         }
         let (n, said) = auto_context(base, model_max, most, fits);
         if n > base {
-            self.say(format!("{name}: its context is {n} positions, what its GPUs have room for its cache in ({} at most where nobody sets one)", most.min(model_max)));
+            self.say(format!("{name}: its context is {n} positions, what there is room for its cache in ({} at most where nobody sets one)", most.min(model_max)));
         } else if said {
-            self.say(format!("{name}: its GPUs have room for its cache at {base} positions, not more: its context is {base}"));
+            self.say(format!("{name}: there is room for its cache at {base} positions, not more: its context is {base}"));
         }
         n
     }
@@ -1664,21 +1710,32 @@ impl Models {
                     Ok(mm)
                 }).transpose()?
             } else { None };
-            let mut max_seq = self.dense_context(model.config().context_length);
-            if let crate::llm::Model::Qwen35(m) = &model {
-                // (longer where nobody set it and a GPU that says what it holds has the room: `context_fits`; a card
-                // that says so only by refusing measures it below, for the context as it is)
-                max_seq = self.auto_context(&spec.name, max_seq, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare()));
-                match m.chain.context_room(m, max_seq) {
-                    Some(0) => self.say(format!("{}: the GPU has no room for its attention cache at 4,096 positions beside its weights", spec.name)),
-                    Some(room) if room < max_seq => {
-                        self.say(format!("{}: the GPU holds its attention cache for {room} positions beside its weights and a prompt's work: its context here is {room}, not {max_seq}", spec.name));
-                        max_seq = room;
+            // (a block: `whole` borrows the model, which the engine takes below)
+            let max_seq = {
+                let base = self.dense_context(model.config().context_length);
+                // (a cache made whole at the start, the host's: on the CPU, and a model the chain does not run, Qwen3-VL's)
+                let whole = cache_room(&model, self.activations_spare());
+                let on_cpu = model.backend().chain().is_none();
+                match &model {
+                    crate::llm::Model::Qwen35(m) => {
+                        // (longer where nobody set it and a GPU that says what it holds has the room: `context_fits`; a
+                        // card that says so only by refusing measures it below, for the context as it is; on the CPU the
+                        // computer's memory for the cache, which is made whole there)
+                        let mut ctx = self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, |n| m.chain.context_fits(m, n, self.activations_spare()).or_else(|| if on_cpu { whole(n) } else { None }));
+                        match m.chain.context_room(m, ctx) {
+                            Some(0) => self.say(format!("{}: the GPU has no room for its attention cache at 4,096 positions beside its weights", spec.name)),
+                            Some(room) if room < ctx => {
+                                self.say(format!("{}: the GPU holds its attention cache for {room} positions beside its weights and a prompt's work: its context here is {room}, not {ctx}", spec.name));
+                                ctx = room;
+                            }
+                            Some(_) => self.say(format!("{}: the GPU holds its attention cache for all {ctx} positions", spec.name)),
+                            None => {}
+                        }
+                        ctx
                     }
-                    Some(_) => self.say(format!("{}: the GPU holds its attention cache for all {max_seq} positions", spec.name)),
-                    None => {}
+                    _ => self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, whole),
                 }
-            }
+            };
             let mut cfg = self.base_cfg(spec, max_seq);
             // (LFM2 reads no pictures: its own picture token stands in, never met)
             cfg.image_token_id = Some(tok.token_id("<|image_pad|>").or_else(|| lfm2.then(|| tok.token_id("<image>")).flatten()).ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?);
@@ -1741,6 +1798,10 @@ impl Models {
             // f32 cache there, where one card held 16,384).
             #[allow(unused_mut)]
             let mut split_ctx: Option<usize> = None;
+            // (meant for two GPUs, its context more than one has room for, and left on one: the other could not be
+            // opened, or took none of it)
+            #[allow(unused_mut)]
+            let mut alone = false;
             #[cfg(feature = "webgpu")]
             if let (crate::llm::Model::Llama(m), Some(b)) = (&mut model, backend.as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>()) {
                 let (layers, model_max) = (m.config.n_layers, m.config.context_length);
@@ -1751,6 +1812,7 @@ impl Models {
                 let spare = self.activations_spare();
                 let (used, budget) = b.usage();
                 if used + cache(want, layers) + spare > budget {
+                    alone = true;
                     if let Some(other) = crate::engines::backend::others(o, &devices, b).into_iter().next() {
                         let from = layers / 2;
                         let fits = |ctx: usize| used / 2 + cache(ctx, from.max(layers - from)) + spare <= budget.min(other.usage().1);
@@ -1762,6 +1824,7 @@ impl Models {
                         if m.split_onto(Arc::new(other), from) {
                             self.say(format!("{}: its layers from {from} on and its head on the {name} at {at}, each card its layers' cache: {ctx} positions", spec.name));
                             split_ctx = Some(ctx);
+                            alone = false;
                         } else {
                             self.say(format!("{}: its later layers could not go to the {name} at {at}: it stays on one card", spec.name));
                         }
@@ -1784,8 +1847,25 @@ impl Models {
             }
             drop(gguf);
             let tok = Arc::new(model.tokenizer().clone());
-            // Bound the initial KV allocation, as for dense Qwen3.5: a full context of an 8B model is gigabytes.
-            let max_seq = split_ctx.unwrap_or_else(|| self.dense_context(model.config().context_length));
+            // The cache is made whole for the context at the start (an 8B's is gigabytes): where nobody set one, the most
+            // up to AUTO_CTX the model's GPU and the computer have room for (`cache_room`), DENSE_CTX at least. It was
+            // DENSE_CTX on one card whatever the room, where the Engines page said 65,536 where the GPUs have room.
+            let max_seq = split_ctx.unwrap_or_else(|| {
+                let base = self.dense_context(model.config().context_length);
+                // Meant for two GPUs and left on one: a context the person gave is more than this one has room for its
+                // cache in, so the most it has room for, said (as the room is unknown, as given). Served as given, the
+                // conversation that outgrew the card failed ("native Qwen inference failed"): OAIY's own window kept
+                // the second GPU from being opened, and Nanbeige 4.3 33B's 65,000 were on one card.
+                if alone && self.opts.ctx_asked && self.opts.ctx != 0 {
+                    let (n, said) = auto_context(DENSE_CTX.min(base), model.config().context_length, base, cache_room(&model, self.activations_spare()));
+                    if said && n < base {
+                        self.say(format!("{}: meant for two GPUs and left on one, which has room for its cache at {n} positions, not the {base} asked for: its context here is {n}", spec.name));
+                        return n;
+                    }
+                    return base;
+                }
+                self.auto_context(&spec.name, base, model.config().context_length, AUTO_CTX, cache_room(&model, self.activations_spare()))
+            });
             let mut cfg = self.base_cfg(spec, max_seq);
             if let Some([temp, top_p, repeat]) = sampling {
                 cfg.temperature = temp.unwrap_or(cfg.temperature);
@@ -2034,6 +2114,46 @@ mod tests {
         assert_eq!(auto_context(DENSE_CTX, QWEN, 32_768, |_| Some(true)), (32_768, true));
         assert_eq!(auto_context(8192, 8192, AUTO_CTX, |_| Some(true)), (8192, false));
         assert_eq!(auto_context(DENSE_CTX, DENSE_CTX, AUTO_CTX, |_| Some(true)), (DENSE_CTX, false));
+    }
+
+    #[test]
+    fn a_cache_made_whole_needs_room_on_its_gpu_and_in_the_computers_memory() {
+        const GB: u64 = 1_000_000_000;
+        // An 8B dense model's f32 cache (36 layers, 8 KV heads of 128): 294,912 bytes a position, 19.3 GB at 65,536.
+        let row = 2 * 4 * 36 * 8 * 128;
+        let cache = |positions: u64| row * positions;
+        // A GPU with room, and a computer with 130 GB free: the default's most.
+        assert!(room_for(cache(65_536), 2 * GB, Some(true), 130 * GB));
+        // The GPU without room: none, whatever the computer has.
+        assert!(!room_for(cache(65_536), 2 * GB, Some(false), 130 * GB));
+        // The host keeps the cache's own rows: half of what is free, the spare taken off first, at most.
+        assert!(room_for(cache(65_536), 2 * GB, Some(true), 2 * cache(65_536) + 2 * GB));
+        assert!(!room_for(cache(65_536), 2 * GB, Some(true), 2 * cache(65_536) + 2 * GB - 2));
+        // The CPU (no GPU to ask): the computer's memory alone. With 16 GB free it holds 20,480 of it, not 24,576.
+        assert!(room_for(cache(20_480), 2 * GB, None, 16 * GB));
+        assert!(!room_for(cache(24_576), 2 * GB, None, 16 * GB));
+        // So the default steps down to what fits there, as on a GPU.
+        let fits = |n: usize| Some(room_for(cache(n as u64), 2 * GB, None, 16 * GB));
+        assert_eq!(auto_context(DENSE_CTX, 131_072, AUTO_CTX, fits), (20_480, true));
+    }
+
+    #[test]
+    fn a_gpu_is_asked_for_the_rows_its_copy_of_the_cache_grows_to() {
+        const GB: u64 = 1_000_000_000;
+        // A power of two, never fewer than 256: a context of 24,576 has the GPU hold 32,768 rows near its end.
+        assert_eq!(device_rows(24_576), 32_768);
+        assert_eq!(device_rows(32_768), 32_768);
+        assert_eq!(device_rows(65_536), 65_536);
+        assert_eq!(device_rows(100), 256);
+        // As a GPU with `room` bytes free beside the weights answers: the copy at its rows and the spare.
+        let on_gpu = |row: u64, room: u64| move |n: usize| Some(room_for(row * n as u64, 2 * GB, Some(row * device_rows(n) as u64 + 2 * GB <= room), 130 * GB));
+        // Gemma 3 12B (786,432 bytes a position) on a 32 GB card, 20.6 GB free beside its weights: its copy at 32,768
+        // rows is 25.8 GB, so 16,384. Counting the context alone gave it 24,576, and the card ran out of memory near it.
+        assert_eq!(auto_context(DENSE_CTX, 131_072, AUTO_CTX, on_gpu(786_432, 20_600_000_000)), (DENSE_CTX, true));
+        // Qwen3-VL 8B (294,912 bytes a position), 22.6 GB free: all 65,536 (19.3 GB).
+        assert_eq!(auto_context(DENSE_CTX, 262_144, AUTO_CTX, on_gpu(294_912, 22_600_000_000)), (AUTO_CTX, true));
+        // A 14B (327,680 bytes a position), 16 GB free: not 53,248 (its copy would be 65,536 rows, 21.5 GB) but 32,768.
+        assert_eq!(auto_context(DENSE_CTX, 131_072, AUTO_CTX, on_gpu(327_680, 16 * GB)), (32_768, true));
     }
 
     #[test]
