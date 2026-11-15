@@ -1512,10 +1512,11 @@ impl QwenEngine {
                     let other = if turned < TURNS && !cycle.whole() && !in_call { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
                     let Some(other) = other else {
                         if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
-                        // (the turn as the run goes on, the token it would have taken last: at its limit, as the run
-                        // began, `f(` and not `(f`)
-                        let turn: Vec<u32> = generated[generated.len().saturating_sub(cycle.period - 1)..].iter().copied().chain([next]).collect();
-                        let turn = tok.decode(&turn);
+                        // (the run's first copy, as it began: `f(` and not `(f`, `{"key":"ArrowRight"},` and not
+                        // `Right"},{"key":"Arrow`, a file from its start; the run's `span - 1` tokens before `next` are
+                        // all in `generated`)
+                        let first = (generated.len() + 1).saturating_sub(cycle.span);
+                        let turn = tok.decode(&generated[first..(first + cycle.period).min(generated.len())]);
                         if self.log { eprintln!("  Qwen: the reply repeated the same {} tokens for {} tokens{}: stopped", cycle.period, cycle.span, if in_call { " in a tool call" } else { "" }); }
                         return Err(crate::guards::repetition::stopped(cycle, &turn, in_call));
                     };
@@ -1594,7 +1595,8 @@ impl QwenEngine {
             } else {
                 // (a greedy request's next rows read back whole where a run nears its limit, for the guard to have
                 // another token to take than the run's: the model's pick alone has none)
-                let pick = greedy && !(self.cycles && (cycles.near(turned, 16) || cycles.nested_near(16, opens)));
+                // (not in a tool call, where a run is stopped and never turned: no other token is wanted there)
+                let pick = greedy && (in_call || !(self.cycles && (cycles.near(turned, 16) || cycles.nested_near(16, opens))));
                 // its drafts, then the token and them in one check; else the token alone
                 if let Some((at, asked)) = last_check.take().filter(|_| looks_up) {
                     lookup_k = if drafts_taken - at == asked { lookup_most() } else { LOOKUP_DRAFTS.min(lookup_most()) };

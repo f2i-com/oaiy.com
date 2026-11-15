@@ -571,13 +571,13 @@ impl Server {
         max_tokens.min(max_seq.saturating_sub(prompt))
     }
 
-    /// A reply's thinking budget as `chat` sends it: in thinking mode, [`Self::think_budget`] of the room the reply
-    /// really has. Taken from what it asked for, a long prompt's reply (a prompt of 15,000 tokens in a context of
-    /// 16,384 leaves 1,384 of an 8,192 asked for) could think to its last token and say nothing.
-    fn reply_budget(body: &Json, mode: Mode, effort: u32, max_tokens: usize, max_seq: usize, prompt: usize) -> Option<usize> {
-        if mode != Mode::Thinking {
-            return None;
-        }
+    /// A reply's thinking budget as `chat` sends it: [`Self::think_budget`] of the room the reply really has. Taken from
+    /// what it asked for, a long prompt's reply (a prompt of 15,000 tokens in a context of 16,384 leaves 1,384 of an
+    /// 8,192 asked for) could think to its last token and say nothing. In chat mode too: a budget counts only a thought
+    /// there is, and there a thought the model opens itself (a template that opens none, a model that thinks when asked
+    /// not to) went on with no budget and no closing words to the reply's last token, the Agent's "auto" budget given or
+    /// not.
+    fn reply_budget(body: &Json, effort: u32, max_tokens: usize, max_seq: usize, prompt: usize) -> Option<usize> {
         Self::think_budget(body, effort, Self::reply_room(max_tokens, max_seq, prompt))
     }
 }
@@ -733,7 +733,7 @@ impl Server {
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
         // (from the room the reply really has: the prompt may leave it less than it asked for)
-        let think_budget = Self::reply_budget(&body, mode, effort, max_tokens, a.cfg.max_seq, n_prompt);
+        let think_budget = Self::reply_budget(&body, effort, max_tokens, a.cfg.max_seq, n_prompt);
         let request_clock = Instant::now();
         let mut prefilled_at = None;
         let forget = self.forget(req, &body);
@@ -1467,16 +1467,19 @@ mod tests {
         let on = Json::parse(br#"{"reasoning_effort":25,"thinking":{"type":"enabled","budget_tokens":2048}}"#).unwrap();
         let none = Json::parse(br#"{}"#).unwrap();
         for body in [&unlimited, &on, &none] {
-            let thought = Server::reply_budget(body, Mode::Thinking, 75, 8_192, 16_384, 15_000).unwrap();
+            let thought = Server::reply_budget(body, 75, 8_192, 16_384, 15_000).unwrap();
             assert!(thought + 256 <= 1_384, "a cut reply of 1,384: {thought} thought");
             // not as it was: from the 8,192 asked for
             assert!(thought < Server::think_budget(body, 75, 8_192).unwrap(), "{thought}");
         }
-        assert_eq!(Server::reply_budget(&on, Mode::Thinking, 25, 8_192, 16_384, 15_000), Some(1_038));
+        assert_eq!(Server::reply_budget(&on, 25, 8_192, 16_384, 15_000), Some(1_038));
         // a reply the context does not cut: the budget asked for
-        assert_eq!(Server::reply_budget(&on, Mode::Thinking, 25, 8_192, 65_536, 2_000), Some(2_048));
-        // no thought, no budget
-        assert_eq!(Server::reply_budget(&on, Mode::Chat, 25, 8_192, 16_384, 15_000), None);
+        assert_eq!(Server::reply_budget(&on, 25, 8_192, 65_536, 2_000), Some(2_048));
+        // the Agent's "auto" (a budget alone) on a server in chat mode: the same budget, for a thought the model opens
+        // itself (it had none, and thought to the reply's last token)
+        let auto = Json::parse(br#"{"thinking":{"budget_tokens":2048}}"#).unwrap();
+        assert_eq!(Server::mode_of(&auto, false, 75).ok().map(|(mode, _)| mode), Some(Mode::Chat));
+        assert_eq!(Server::reply_budget(&auto, 75, 8_192, 65_536, 2_000), Some(2_048));
     }
 
     /// The Agent's requests: "on" is an effort and a budget, "auto" a budget alone (the server's default says whether

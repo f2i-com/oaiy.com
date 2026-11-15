@@ -356,6 +356,9 @@ mod tests {
         let reply = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST], END).ask(&prompt, 3_000);
         assert_eq!(reply.error.as_deref(), Some("generation_repetition: the reply went on repeating the same token (\"f(\", 128 times: 128 tokens) in a tool call and was stopped"));
         assert_eq!(reply.calls, format!("<tool_call>{}", "f(".repeat(127)), "the call as written, up to the run's 128th");
+        // a turn of three tokens, whose limit (128) is no multiple of it: quoted as the run began, not as it was cut
+        let three = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST, FIRST, FIRST + 1], END).ask(&prompt, 3_000);
+        assert_eq!(three.error.as_deref(), Some("generation_repetition: the reply went on repeating the same 3 tokens (\"4.5.f(\", 42 times: 128 tokens) in a tool call and was stopped"));
         // outside a call: turned from a turn past its limit (where the other token ends the reply), as a run is
         let turned = Engine::start_stuck(&[NEST], END, true).ask(&prompt, 3_000);
         assert!(turned.done && turned.error.is_none(), "{:?}", turned.error);

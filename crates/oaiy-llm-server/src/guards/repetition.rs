@@ -173,6 +173,11 @@ impl CycleGuard {
             if self.run[period] == 0 || self.run[period] + 1 + period + margin < Self::least_at(period, turned) {
                 return false;
             }
+            // (a run of a shorter period too is that period's, by its limit, as in `over`: a run of one token was near
+            // at its multiples' 2,048 tokens, 2,000 before its own limit of 4,096)
+            if (1..period).any(|d| period % d == 0 && self.run[d] + d >= self.run[period] + period) {
+                return false;
+            }
             self.run[period] + 1 + period + margin >= self.limit_here(period, turned)
         })
     }
@@ -496,6 +501,21 @@ mod tests {
         let mut guard = CycleGuard::default();
         (0..10_000u32).for_each(|i| guard.push(i));
         assert!(!guard.near(0, 16));
+    }
+
+    #[test]
+    fn a_run_of_one_or_two_tokens_is_near_only_its_own_limit() {
+        // (its multiples, periods 4 to 15 at 2,048 tokens, were taken for it: near from 2,031, over at 4,095)
+        for unit in [vec![5u32], vec![10, 11]] {
+            let mut guard = CycleGuard::default();
+            let mut written = 0;
+            while !guard.near(0, 16) {
+                assert!(guard.over(unit[written % unit.len()], 0).is_none(), "{unit:?}: over before near, at {written}");
+                guard.push(unit[written % unit.len()]);
+                written += 1;
+            }
+            assert_eq!(written, 4096 - 1 - 16, "{unit:?}");
+        }
     }
 
     #[test]
