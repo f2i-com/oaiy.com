@@ -1370,7 +1370,7 @@ dialog::backdrop { background: var(--backdrop); }
           <label class="f"><span>Reply limit (tokens)</span><input type="number" data-bind="llm.max_tokens" data-type="int"></label>
           <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
-          <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="numnull" placeholder="1"><small class="help">1 = off; 1.1 stops a reply looping on a phrase.</small></label>
+          <label class="f"><span>Repeat penalty</span><input type="number" step="0.05" min="1" max="2" data-bind="llm.repeat_penalty" data-type="numnull" placeholder="1"><small class="help">1 = off. Above it, words a reply has just used are made less likely: 1.1 makes long answers ramble, with their small words left out. The engine stops a reply that loops without it.</small></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
           <label class="f"><span data-mac="Conversations in memory (GB)">Conversations in RAM (GB)</span><input type="number" step="0.5" min="0" data-bind="llm.park_gb" data-type="numnull" placeholder="8"><small class="help">A model that can set conversations aside keeps them there. 0 = off, empty = the server's default.</small></label>
           <label class="f"><span>Runs on</span><select data-bind="llm.backend">
