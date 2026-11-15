@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, HARDER_THINKING, announcesWork, readingStatus, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
-import { TOOLS, planAfter, planChanges, readPlan, settlePlan } from '../../src/agent/tools';
+import { Agent, HARDER_THINKING, announcesWork, readingStatus, repetitionNote, unlistedCalls, type AgentEvent } from '../../src/agent/agent';
+import { TOOLS, browserHint, planAfter, planChanges, readPlan, runTool, runawayNesting, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { OpenAIStream } from '../../src/agent/providers/stream';
@@ -587,6 +587,36 @@ describe('tool rules', () => {
     expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('the same calls with the same results 6 times in a row') });
   });
 
+  it('tells a script run in code_run that reached for a page where a page is tested, and says nothing of any other error', () => {
+    // As Nanbeige 4.3 33B did with Thinking off: a web game's script run in code_run, again and again.
+    for (const said of ['ReferenceError: document is not defined\n at <anonymous>', 'ERROR: setInterval is not defined (in anonymous)', 'ReferenceError: window is not defined']) {
+      expect(browserHint(said), said).toMatch(/^(document|setInterval|window) belongs to a browser: code_run runs scripts with no page.*page_check.*softn_check/);
+    }
+    for (const said of ['ReferenceError: score is not defined', 'SyntaxError: unterminated template literal', 'ReferenceError: myDocument is not defined', '']) {
+      expect(browserHint(said), said).toBeNull();
+    }
+  });
+
+  it('stops the same step at its sixth even where the plan\'s reminder falls among them', async () => {
+    // As Nanbeige 4.3 33B did with Thinking off: the same code_run with the same error, 11 times, the twelfth step
+    // since the plan last changed having been given the plan's reminder, which made it read as another step.
+    const plan = { goal: 'a game', items: [{ text: 'Write and test the game', status: 'active' }] };
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan }] },
+      ...Array.from({ length: 8 }, (_, i) => ({ calls: [{ name: 'read_file', input: { path: `part${i}.txt` } }] })),
+      ...Array.from({ length: 12 }, () => ({ calls: [{ name: 'read_file', input: { path: 'same.txt' } }] })),
+    ]);
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    for (let i = 0; i < 8; i++) vfs.writeFile(`/part${i}.txt`, `part ${'abcdefgh'[i]}\n`);
+    vfs.writeFile('/same.txt', 'ReferenceError: global is not defined\n');
+    await agent.run('make a game', emit);
+    // the plan's reminder came with the twelfth step after the plan: the fourth of the same ones
+    expect(JSON.stringify(fake.bodies[13].messages)).toContain('12 steps since the plan last changed');
+    // and the sixth of them stopped the run: 1 + 8 + 6 requests
+    expect(fake.bodies).toHaveLength(15);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('6 times in a row') });
+  });
+
   it("counts a look whose numbers alone change as the same step, where a step that writes is not", async () => {
     // a longer wait each step (24 s, 25 s, …) for what does not come: the same look, numbers aside
     let n = 0;
@@ -733,6 +763,50 @@ describe('tool rules', () => {
     expect(JSON.stringify(fake.bodies[3].messages)).toContain('This is the 3rd time you wrote /notes.md in full for this request. Do not write it again');
   });
 
+  it('stops a run that writes a file again with what it already holds, the third time', async () => {
+    // a model writing the same file over and over: each write of a large one is minutes of a local model's time
+    const write = { calls: [{ name: 'write_file', input: { path: 'notes.md', content: '# Notes\n\nThe first draft.\n' } }] };
+    const fake = fakeProvider('openai', Array.from({ length: 10 }, () => write));
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    await agent.run('write notes', emit);
+    // written once, told twice that it holds exactly that, and stopped at the third
+    expect(vfs.readText('/notes.md')).toBe('# Notes\n\nThe first draft.\n');
+    expect(JSON.stringify(fake.bodies[2].messages)).toContain('Not written: /notes.md already holds exactly this');
+    expect(fake.bodies).toHaveLength(4);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('kept writing /notes.md with what it already holds (3 times this run') });
+  });
+
+  it('counts a result whose ordinal alone changes (the 3rd try, the 4th) as the same step', async () => {
+    const ordinal = (n: number) => `${n}${['th', 'st', 'nd', 'rd'][n] ?? 'th'}`;
+    let n = 0;
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    const fake = fakeProvider('openai', Array.from({ length: 9 }, () => () => {
+      n++;
+      vfs.writeFile('/status.txt', `Waiting for the server: the ${ordinal(n)} try failed.\n`);
+      return { calls: [{ name: 'read_file', input: { path: 'status.txt' } }] };
+    }));
+    await agent.run('wait for the server', emit);
+    expect(fake.bodies).toHaveLength(6);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('6 times in a row') });
+  });
+
+  it('stops a run whose replies are cut off in the middle of a call three times in a row', async () => {
+    const big = (path: string) => ({ calls: [{ name: 'write_file', input: { path, content: 'let x = 1;\n'.repeat(60) } }], cut: true });
+    const fake = fakeProvider('openai', Array.from({ length: 6 }, () => big('big.js')));
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    await agent.run('write a big file', emit);
+    expect(JSON.stringify(fake.bodies[1].messages)).toContain('your reply was cut off at the output limit');
+    expect(fake.bodies).toHaveLength(3);
+    expect(vfs.exists('/big.js')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: expect.stringContaining('cut off at its output limit in the middle of a tool call 3 times in a row') });
+    // a reply whose calls ran in between starts the count again
+    const again = fakeProvider('openai', [big('a.js'), big('a.js'), { calls: [{ name: 'write_file', input: { path: 'a.js', content: 'let a = 1;\n' } }] }, big('b.js'), big('b.js'), { text: 'Done.' }]);
+    const other = setup(OPENAI);
+    await other.agent.run('write two files', other.emit);
+    expect(again.bodies).toHaveLength(6);
+    expect(other.events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
+  });
+
   it('announces work only with a promise, not a question', () => {
     expect(announcesWork("Okay! Let's make it. I'll plan the script first.")).toBe(true);
     expect(announcesWork('Right away!')).toBe(true);
@@ -751,6 +825,88 @@ describe('tool rules', () => {
     events.length = 0;
     await agent.run('again', emit);
     expect(events.at(-1)).toMatchObject({ type: 'error' });
+  });
+
+  it('a reply that stopped inside its call is asked again with word to write a large file in parts', async () => {
+    // OAIY's engine at a reply's limit in the middle of a write_file: asked again as it was, the model wrote the
+    // same file from its start and stopped in the same place.
+    const stopped = { error: { status: 422, body: JSON.stringify({ error: { message: 'tool_contract_error: incomplete Qwen tool call; no tool from this batch was executed. The model wrote: "<tool_call>\\n<function=write_file>…"', code: 'tool_contract_error' } }) } };
+    fakeProvider('openai', [stopped, (body) => ({ text: JSON.stringify(body.messages).includes('Your last reply stopped before its tool call was complete') ? 'told' : 'not told' })]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a big page', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    // A call that could not be read for another reason is asked again without it.
+    const unreadable = { error: { status: 422, body: JSON.stringify({ error: { message: 'tool_contract_error: missing function tag; no tool from this batch was executed', code: 'tool_contract_error' } }) } };
+    fakeProvider('openai', [unreadable, (body) => ({ text: JSON.stringify(body.messages).includes('stopped before its tool call') ? 'told' : 'not told' })]);
+    const other = setup(OPENAI);
+    await other.agent.run('go', other.emit);
+    expect(other.events.at(-1)).toMatchObject({ type: 'done', text: 'not told' });
+  });
+
+  it('a reply the engine stopped for repeating itself is asked again, told what it repeated', async () => {
+    // Nanbeige 4.3 33B with its thinking off wrote `dirs.indexOf(` over and over into a file; asked again as it was, it
+    // wrote the file into the same run again.
+    const said = 'generation_repetition: the reply went on repeating the same 4 tokens ("dirs.indexOf(", 32 times: 128 tokens) in a tool call and was stopped';
+    const stopped = { error: { status: 422, body: JSON.stringify({ error: { message: said, type: 'server_error', code: 'generation_repetition' } }) } };
+    fakeProvider('openai', [stopped, (body) => ({ text: JSON.stringify(body.messages).includes('Your last reply was stopped because it kept writing') ? 'told' : 'not told' })]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a game', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'told' });
+    // asked again once: stopped twice, the run stops
+    const fake = fakeProvider('openai', [stopped, stopped, { text: 'never asked' }]);
+    const twice = setup(OPENAI);
+    await twice.agent.run('make a game', twice.emit);
+    expect(twice.events.at(-1)).toMatchObject({ type: 'error', retry: true });
+    expect(fake.bodies).toHaveLength(2);
+  });
+
+  it('tells the model what it repeated, as the engine quotes it', () => {
+    const said = 'generation_repetition: the reply went on repeating the same 4 tokens ("dirs.indexOf(", 32 times: 128 tokens) in a tool call and was stopped';
+    expect(repetitionNote(said)).toBe('[OAIY] Your last reply was stopped because it kept writing "dirs.indexOf(" over and over (32 times in a row) inside its tool call, so nothing in it ran or was written. Do not write that again: write that part another way (it is a call or an index written inside itself again and again: work it out in steps, with a variable or a loop). Keep each call small: write a large file in parts (write_file with the first part, then append_file for each next part).');
+    // in its words, with the engine's escapes: nothing of calls or nesting
+    const prose = repetitionNote('generation_repetition: the reply went on repeating the same token ("ha\\n", 4096 times: 4096 tokens) and was stopped');
+    expect(prose).toContain('kept writing "ha\\n" over and over (4096 times in a row), so nothing in it ran');
+    expect(prose).not.toMatch(/tool call|in parts|inside itself/);
+    // an engine that quotes nothing (OAIY before it did)
+    expect(repetitionNote('generation_repetition: the reply went on repeating the same 13 tokens (265 tokens of them) and was stopped')).toMatch(/^\[OAIY\] Your last reply was stopped because it kept writing the same thing over and over, so nothing in it ran or was written\. Do not write that again: write that part another way\.$/);
+  });
+
+  it('finds a call written inside itself without end in what a tool would write, and nothing in code or data that repeats', () => {
+    // what Nanbeige 4.3 33B wrote into tetris.html, its line 238 6,831 characters long
+    const runaway = `function rotate(shape) {\n  const dirs = [[0,1],[1,0]];\n  const start = dirs.indexOf(dirsInv[${'dirs.indexOf('.repeat(513)}`;
+    expect(runawayNesting(runaway)).toEqual({ unit: 'dirs.indexOf(', times: 513, line: 3 });
+    expect(runawayNesting(`x = ${'f('.repeat(32)}`)).toEqual({ unit: 'f(', times: 32, line: 1 });
+    // 31 in a row is let be; data and code that repeat close what they open
+    expect(runawayNesting(`x = ${'f('.repeat(31)}`)).toBeNull();
+    expect(runawayNesting(`const keys = [${'{"key":"ArrowRight"},'.repeat(600)}];`)).toBeNull();
+    expect(runawayNesting(`const map = [${'0,'.repeat(2000)}];`)).toBeNull();
+    // nesting closed again (a parser's test), and a file with much left open but nothing repeating, are none
+    expect(runawayNesting(`${'['.repeat(40)}1${']'.repeat(40)}`)).toBeNull();
+    expect(runawayNesting(Array.from({ length: 40 }, (_, i) => `function f${i}(a) {`).join('\n'))).toBeNull();
+  });
+
+  it('writes nothing that nests a call in itself without end, and reads past a file\'s end as said, not as a TypeError', async () => {
+    const vfs = new Vfs();
+    const ctx = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} } };
+    const run = (name: string, input: Record<string, unknown>) => runTool({ id: 'c', name, input }, ctx);
+    const runaway = `<script>\nconst start = ${'dirs.indexOf('.repeat(100)}`;
+    for (const [name, input] of [['write_file', { path: 'game.html', content: runaway }], ['append_file', { path: 'game.html', content: runaway }]] as const) {
+      const result = await run(name, input);
+      expect(result.isError, name).toBe(true);
+      expect(result.content).toContain('nothing was written: what you wrote repeats "dirs.indexOf(" 100 times in a row on its line 2');
+      expect(vfs.exists('/game.html')).toBe(false);
+    }
+    expect((await run('write_file', { path: 'game.html', content: '<p>one</p>\n<p>two</p>\n' })).isError).toBeFalsy();
+    await run('read_file', { path: 'game.html' });
+    const edit = await run('edit_file', { path: 'game.html', old_string: '<p>two</p>', new_string: `<p>${'f('.repeat(40)}</p>` });
+    expect(edit.isError).toBe(true);
+    expect(vfs.readText('/game.html')).toBe('<p>one</p>\n<p>two</p>\n');
+    // past the end: what the file has, where three TypeErrors in a row stopped a run
+    const past = await run('read_file', { path: 'game.html', offset: 9, limit: 5 });
+    expect(past.isError).toBeFalsy();
+    expect(past.content).toBe('[/game.html has 3 lines, so there is nothing from line 9 on. Its last line is 3.]');
+    vfs.writeFile('/long.js', `a\n${'x'.repeat(7000)}`);
+    expect((await run('read_file', { path: 'long.js', offset: 4 })).content).toBe('[/long.js has 2 lines, so there is nothing from line 4 on. Its last line is 2, 7000 characters long: read it with char_start.]');
   });
 
   it('an unreadable view_image call is not the model refusing images', async () => {

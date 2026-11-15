@@ -10,6 +10,8 @@ export interface Step {
   calls?: Array<{ name: string; input: Record<string, unknown> }>;
   /** (OpenAI wire) Stream the text up to character `at`, then wait for `until` before the rest. */
   hold?: { at: number; until: Promise<void> };
+  /** (OpenAI wire) Cut off at the output limit: the last call's arguments only half sent, and the reply's end says so. */
+  cut?: boolean;
 }
 
 export const ANTHROPIC: ProviderConfig = { id: 'a', type: 'anthropic', name: 'Anthropic', apiKey: 'k', modelId: 'model-under-test' };
@@ -46,13 +48,15 @@ function anthropicStream(step: Step, n: number): string {
 function openAIStream(step: Step, n: number): string {
   const events: Array<Record<string, unknown> | '[DONE]'> = [];
   for (const piece of step.text?.match(/.{1,7}/gs) ?? []) events.push({ choices: [{ index: 0, delta: { content: piece } }] });
-  for (const [i, call] of (step.calls ?? []).entries()) {
+  const calls = step.calls ?? [];
+  for (const [i, call] of calls.entries()) {
     events.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `call_${n}_${i}`, type: 'function', function: { name: call.name, arguments: '' } }] } }] });
-    for (const piece of JSON.stringify(call.input).match(/.{1,9}/gs) ?? []) {
+    const json = JSON.stringify(call.input);
+    for (const piece of (step.cut && i === calls.length - 1 ? json.slice(0, Math.floor(json.length / 2)) : json).match(/.{1,9}/gs) ?? []) {
       events.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: piece } }] } }] });
     }
   }
-  events.push({ choices: [{ index: 0, delta: {}, finish_reason: step.calls?.length ? 'tool_calls' : 'stop' }] });
+  events.push({ choices: [{ index: 0, delta: {}, finish_reason: step.cut ? 'length' : calls.length ? 'tool_calls' : 'stop' }] });
   events.push({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } });
   events.push('[DONE]');
   return sse(events);

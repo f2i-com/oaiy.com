@@ -729,6 +729,7 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'code_run',
+    // (what a script that reaches for a page is told: browserHint below)
     description:
       'Run JavaScript or Python on the Zipp VM, sandboxed in a Worker, to compute, transform data or answer with code. Paths are project-relative ("/" is the root). ' +
       'JavaScript: Node-style require("fs"|"path"), fs.readFileSync/writeFileSync/readdirSync/statSync, fs.walkSync, fs.grepSync, global fetch(), process.argv; top-level await works; the last expression\'s value is returned as `result`. ' +
@@ -862,6 +863,59 @@ export const TOOLS: ToolSpec[] = [
     parameters: { type: 'object', required: ['url'], properties: { url: str, max_chars: int } },
   },
 ];
+
+/**
+ * What code_run says of a script that reached for a page, or null: it runs scripts with no page, no browser and no
+ * timers, and a model with its thinking off ran a web game's script there eight times over, each time another
+ * thing "not defined" (document, setInterval, …), never trying the page's own tools.
+ */
+export function browserHint(output: string): string | null {
+  const missing = /\b(document|window|navigator|localStorage|sessionStorage|requestAnimationFrame|cancelAnimationFrame|HTMLElement|HTMLCanvasElement|Image|Audio|alert|location|setInterval|setTimeout|clearInterval|clearTimeout) is not defined\b/.exec(output);
+  if (!missing) return null;
+  return `${missing[1]} belongs to a browser: code_run runs scripts with no page, no browser and no timers, so running a page's script here only finds what is missing. Test a web page in the preview (page_check, page_interact, preview_screenshot) and a SoftN app with softn_check and softn_interact.`;
+}
+
+/** The times in a row a part that opens more brackets than it closes may come in what a tool writes ([`runawayNesting`]). */
+const NESTED_RUN = 32;
+
+/** Whether text opens more brackets (`(`, `[`, `{`) than it closes. */
+function opensMore(text: string): boolean {
+  let depth = 0;
+  for (const c of text) depth += c === '(' || c === '[' || c === '{' ? 1 : c === ')' || c === ']' || c === '}' ? -1 : 0;
+  return depth > 0;
+}
+
+/**
+ * A part of `text` that nests a call or an index inside itself again and again (`dirs.indexOf(dirs.indexOf(…`): what
+ * repeats (1 to 32 characters on one line, opening more brackets than it closes), how many times in a row
+ * ([`NESTED_RUN`] and more), and the line of `text` it starts on; or null. A reply that ran away writes one (Nanbeige 4.3
+ * 33B with its thinking off wrote `dirs.indexOf(` 513 times into a file, which was saved; then wrote the whole file again
+ * into the same run). No code means one, and nothing after it can close it, where data that repeats (a list's item, a
+ * map's cells) closes what it opens. (OAIY's own engine stops such a reply itself; this is for the others.) Looked for
+ * only where the text opens that many more brackets than it closes.
+ */
+export function runawayNesting(text: string): { unit: string; times: number; line: number } | null {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 40 || c === 91 || c === 123) depth++;
+    else if (c === 41 || c === 93 || c === 125) depth--;
+  }
+  if (depth < NESTED_RUN) return null;
+  for (const m of text.matchAll(new RegExp(`([^\\n]{1,32}?)\\1{${NESTED_RUN - 1},}`, 'g'))) {
+    const unit = m[1];
+    if (opensMore(unit)) return { unit, times: m[0].length / unit.length, line: text.slice(0, m.index).split('\n').length };
+  }
+  return null;
+}
+
+/** Refuses what a write would put in a file where it nests a call in itself without end ([`runawayNesting`]). */
+function refuseRunaway(text: string): void {
+  const run = runawayNesting(text);
+  if (run) {
+    throw new Error(`nothing was written: what you wrote repeats ${JSON.stringify(run.unit)} ${run.times} times in a row on its line ${run.line}, a call or an index written inside itself again and again, which nothing after it can close (a reply that ran away). Write that part another way: in steps, with a variable or a loop. Write a large file in parts (write_file with the first part, then append_file for each next part).`);
+  }
+}
 
 function cut(text: string, max = OUTPUT_CHARS): string {
   if (text.length <= max) return text;
@@ -1004,6 +1058,12 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const lines = text.split('\n');
       const offset = typeof input.offset === 'number' ? Math.max(1, Math.floor(input.offset)) : 1;
       const limit = typeof input.limit === 'number' ? Math.min(Math.max(1, input.limit), READ_LINES) : READ_LINES;
+      // (past the end: said so, where it was a TypeError, three of which in a row stopped a run whose model looked for
+      // the end of a line that ran on for 6,831 characters)
+      if (offset > lines.length) {
+        const last = lines[lines.length - 1];
+        return `[/${key} has ${lines.length} line${lines.length === 1 ? '' : 's'}, so there is nothing from line ${offset} on. Its last line is ${lines.length}${last.length > LINE_CHARS ? `, ${last.length} characters long: read it with char_start` : ''}.]`;
+      }
       const slice = lines.slice(offset - 1, offset - 1 + limit);
       let charAt = 0;
       for (let i = 0; i < offset - 1; i++) charAt += lines[i].length + 1;
@@ -1113,6 +1173,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         requireFreshRead(ctx, key, 'replace');
         if (ctx.reads.has(`${key}#partial`)) throw new Error(`read all of /${key} before replacing it, or use edit_file`);
       }
+      refuseRunaway(content);
       vfs.writeFile(`/${key}`, content, { parents: true });
       ctx.reads.set(key, vfs.version(`/${key}`));
       return `wrote /${key} (${content.split('\n').length} lines)`;
@@ -1120,6 +1181,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'append_file': {
       const key = normalizePath(need(input, 'path'));
       const content = need(input, 'content');
+      refuseRunaway(content);
       const before = vfs.exists(`/${key}`) ? vfs.readText(`/${key}`) : '';
       // A fresh read stays fresh (the agent knows what it added), and a new file is known in full.
       const fresh = ctx.reads.get(key) === vfs.version(`/${key}`);
@@ -1135,6 +1197,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const oldString = need(input, 'old_string');
       const newString = need(input, 'new_string');
       requireFreshRead(ctx, key, 'edit');
+      refuseRunaway(newString);
       const text = vfs.readText(`/${key}`);
       if (!oldString) throw new Error('old_string is empty');
       let oldText = oldString;
@@ -1200,6 +1263,8 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const report: Record<string, unknown> = { ok: exitCode === 0, exit_code: exitCode, stdout: cut(stdout), stderr: cut(stderr), elapsed_ms: outcome.elapsedMs };
       if (outcome.result?.value !== undefined) report.result = cut(outcome.result.value);
       if (outcome.timedOut) report.timed_out = true;
+      const hint = browserHint(`${stderr}\n${stdout}`);
+      if (hint) report.hint = hint;
       reportChanges(report, host.changes);
       return JSON.stringify(report, null, 1);
     }

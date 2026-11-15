@@ -181,6 +181,18 @@ const SAME_CHECK_LIMIT = 3;
  */
 const SAME_STEP_NOTE = 3;
 const SAME_STEP_STOP = 6;
+/**
+ * A write that would leave a file as it is (write_file with what it holds, append_file with a part it has) is not made,
+ * and the model is told so; the run stops at the third such write of one file. A model that writes a file again after
+ * being told twice that it holds exactly that is not reading its results, and each write of a large file is minutes
+ * of a local model's time.
+ */
+const UNCHANGED_WRITE_STOP = 3;
+/**
+ * Replies cut off at the output limit in the middle of a tool call, this many in a row, stop the run: each is told to
+ * write a large file in parts, and one that is cut off again has not done so.
+ */
+const CUT_OFF_STOP = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
 const KEEP_IMAGE_TURNS = 3;
 /**
@@ -314,6 +326,26 @@ const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
 export function unlistedCalls(said: string, listed: Set<string>, usable: Set<string>): string[] {
   const names = [...said.matchAll(/unknown tool ([A-Za-z0-9_.-]+)|<function=([A-Za-z0-9_.-]+)>|"name":\s*"([A-Za-z0-9_.-]+)"/g)].map((m) => m[1] ?? m[2] ?? m[3]);
   return [...new Set(names)].filter((n) => usable.has(n) && !listed.has(n));
+}
+
+/**
+ * What the model is told of a reply OAIY's engine stopped because it kept repeating itself (`generation_repetition`):
+ * what it repeated and how many times, as the engine quotes it ("repeating the same 4 tokens ("dirs.indexOf(", 32
+ * times: 128 tokens) in a tool call"), and that nothing in it ran; where it was a call written inside itself, that it is
+ * one; where it was in a tool call, to write a large file in parts. An engine that quotes nothing is told the rest.
+ */
+export function repetitionNote(said: string): string {
+  const quoted = /repeating the same (?:token|\d+ tokens) \(("(?:[^"\\]|\\.)*"), (\d+) times/.exec(said);
+  let unit: string | null = null;
+  try {
+    unit = quoted ? (JSON.parse(quoted[1]) as string) : null;
+  } catch {
+    unit = null;
+  }
+  const inCall = / in a tool call\b/.test(said);
+  const nested = unit !== null && [...unit].reduce((depth, c) => depth + ('([{'.includes(c) ? 1 : ')]}'.includes(c) ? -1 : 0), 0) > 0;
+  const what = unit !== null && quoted ? `writing ${quoted[1]} over and over (${quoted[2]} times in a row)` : 'writing the same thing over and over';
+  return `[OAIY] Your last reply was stopped because it kept ${what}${inCall ? ' inside its tool call' : ''}, so nothing in it ran or was written. Do not write that again: write that part another way${nested ? ' (it is a call or an index written inside itself again and again: work it out in steps, with a variable or a loop)' : ''}.${inCall ? ' Keep each call small: write a large file in parts (write_file with the first part, then append_file for each next part).' : ''}`;
 }
 
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
@@ -961,7 +993,8 @@ export class Agent {
    * run stops. A 33B clicked an app's Ride, waited 24 s, then 25 s, … 30 s, on a ride whose pace stayed 0.0.
    */
   private repeatedStep(calls: ToolCall[], results: ToolResult[], wrote: boolean): number {
-    const numbersAside = (text: string) => text.replace(/\d+(\.\d+)?/g, '#');
+    // (an ordinal too: "the 4th time" after "the 3rd" is the same note)
+    const numbersAside = (text: string) => text.replace(/\d+(\.\d+)?(st|nd|rd|th)?/g, '#');
     // (a call's number values aside, not the digits in its names: big1.txt and big2.txt are other files)
     const valuesAside = (input: unknown) => JSON.stringify(input, (_, v: unknown) => (typeof v === 'number' ? '#' : v));
     const signature = JSON.stringify([calls.map((c) => [c.name, wrote ? c.input : valuesAside(c.input)]), results.map((r) => numbersAside(r.content))]);
@@ -1829,14 +1862,20 @@ ${personInstructionsText(own)}` : ''}`;
           if (unlisted.length) {
             const which = unlisted.length === 1 ? `${unlisted[0]} is not one of your listed tools` : `${unlisted.join(', ')} are not among your listed tools`;
             this.turns.push({ role: 'user', text: `[OAIY] ${which}, so none of that reply's calls ran. Run ${unlisted.length === 1 ? 'it' : 'each'} with use_tool: {"name": "${unlisted[0]}", "arguments": {its parameters}}; call the listed ones (find_tools among them) by their own names.`, automatic: true });
+          } else if (/tool_contract_error: (incomplete|missing closing)/.test(said)) {
+            // A reply that stopped inside its call (OAIY's engine at the reply's limit, a large file written whole):
+            // asked again as it was, the model wrote the same file from its start and stopped in the same place.
+            this.turns.push({ role: 'user', text: `[OAIY] Your last reply stopped before its tool call was complete (a reply holds about ${formatTokens(b.reply)} tokens), so nothing ran. Keep each call smaller: write a large file in parts (write_file with the first part, then append_file for each next part).`, automatic: true });
           }
           emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
           continue;
         }
-        // A reply OAIY's engine stopped because it kept repeating itself (generation_repetition): another sample
-        // usually does not.
+        // A reply OAIY's engine stopped because it kept repeating itself (generation_repetition): asked again once, told
+        // what it repeated. (Asked again as it was, Nanbeige 4.3 33B with its thinking off wrote the same file into the
+        // same `dirs.indexOf(dirs.indexOf(…` again.)
         if (/generation_repetition/.test(said) && !repeatRetried) {
           repeatRetried = true;
+          this.turns.push({ role: 'user', text: repetitionNote(said), automatic: true });
           emit({ type: 'status', message: 'The model got stuck repeating itself; asking again' });
           continue;
         }
@@ -2158,8 +2197,11 @@ ${personInstructionsText(own)}` : ''}`;
     let sincePlan = 0;
     // Progress, for deciding whether asking to carry on is still worth it.
     const changedThisRun = new Set<string>();
-    // How many times each file was written in full, this run.
+    // How many times each file was written in full, this run; and written with what it already held.
     const rewrites = new Map<string, number>();
+    const unchangedWrites = new Map<string, number>();
+    // Replies cut off in the middle of a tool call, in a row.
+    let cutOff = 0;
     let idleNudges = 0;
     let progressAtNudge = { done: -1, changed: -1, acted: -1 };
     this.checkedRoots.clear();
@@ -2261,8 +2303,15 @@ ${personInstructionsText(own)}` : ''}`;
             emit({ type: 'tool_result', result });
           }
           this.turns.push({ role: 'tool', results });
+          if (++cutOff >= CUT_OFF_STOP) {
+            emit({ type: 'error', message: `The model's reply was cut off at its output limit in the middle of a tool call ${cutOff} times in a row, so the run stopped. Ask for a smaller step (a large file written in parts), or say "continue" to let it try again.` });
+            return;
+          }
           continue;
         }
+        cutOff = 0;
+        // A file written again with what it already held, a third time: the path, to stop the run once the step is told.
+        let unchangedStop: { path: string; times: number } | null = null;
         for (const [index, asked] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
@@ -2285,7 +2334,15 @@ ${personInstructionsText(own)}` : ''}`;
               flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
             }
           }
-          const scriptCheck = allowed && !stopped ? this.guideFirst(call) ?? this.writtenAlready(call) ?? this.scriptCheck(call, changedThisRun) : null;
+          const guideNote = allowed && !stopped ? this.guideFirst(call) : null;
+          const unchanged = allowed && !stopped && !guideNote ? this.writtenAlready(call) : null;
+          const scriptCheck = guideNote ?? unchanged ?? (allowed && !stopped ? this.scriptCheck(call, changedThisRun) : null);
+          if (unchanged && typeof call.input.path === 'string') {
+            const path = normalizePath(call.input.path);
+            const times = (unchangedWrites.get(path) ?? 0) + 1;
+            unchangedWrites.set(path, times);
+            if (times >= UNCHANGED_WRITE_STOP) unchangedStop = { path, times };
+          }
           const result: ToolResult = stopped
             ? stopped
             : finding
@@ -2346,6 +2403,14 @@ ${personInstructionsText(own)}` : ''}`;
         }
         callIndex = reply.calls.length;
         for (const c of changes) changedThisRun.add(c.path);
+        const stop = await this.autoCheck(reply.calls, results, changes, emit);
+        // (read from what the tools and the automatic check said, before the notes below are added to it: a step
+        // given the plan's reminder read as another step, and a call repeated with the same result 11 times was
+        // stopped only at the 11th)
+        const same = this.repeatedStep(reply.calls, results, changes.length > 0 || reply.calls.some((c) => c.name === 'update_plan'));
+        if (same >= SAME_STEP_NOTE && results.length) {
+          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls (numbers aside), and the same results. Nothing has changed, so running them again, or waiting longer, will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If what they show is not what the app should do (a value that should change and does not), read the code that should change it and fix that. If you cannot, stop and tell the user what is wrong.`;
+        }
         // Many steps on one plan step without the plan moving: where the work is, and what to do about it.
         const openStep = planThisRun ? this.plan?.items.findIndex((i) => i.status === 'active') ?? -1 : -1;
         if (openStep >= 0 && !reply.calls.some((c) => c.name === 'update_plan') && ++sincePlan >= DRIFT_STEPS && results.length) {
@@ -2362,11 +2427,6 @@ ${personInstructionsText(own)}` : ''}`;
             results[results.length - 1].content += '\n\n[OAIY] This is a task with several steps, and there is no plan yet. Call update_plan now with the goal and the steps that break it down (mark what is already done), then carry on.';
           }
         }
-        const stop = await this.autoCheck(reply.calls, results, changes, emit);
-        const same = this.repeatedStep(reply.calls, results, changes.length > 0 || reply.calls.some((c) => c.name === 'update_plan'));
-        if (same >= SAME_STEP_NOTE && results.length) {
-          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls (numbers aside), and the same results. Nothing has changed, so running them again, or waiting longer, will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If what they show is not what the app should do (a value that should change and does not), read the code that should change it and fix that. If you cannot, stop and tell the user what is wrong.`;
-        }
         this.turns.push({ role: 'tool', results });
         if (stop) {
           emit({ type: 'error', message: stop });
@@ -2374,6 +2434,10 @@ ${personInstructionsText(own)}` : ''}`;
         }
         if (same >= SAME_STEP_STOP) {
           emit({ type: 'error', message: `The agent ran the same calls with the same results ${same} times in a row without changing anything, so the run stopped. Say how to proceed, or "continue" to let it try again.` });
+          return;
+        }
+        if (unchangedStop) {
+          emit({ type: 'error', message: `The model kept writing /${unchangedStop.path} with what it already holds (${unchangedStop.times} times this run, told each time), so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
         // Its finishing tool has done its job: nothing more to ask the model.
