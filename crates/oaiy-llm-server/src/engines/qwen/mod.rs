@@ -472,7 +472,9 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
     let count = prompt.iter().filter(|&&t| t == image_id).count();
     if count != records.len() { return Err("image placeholder count does not match image blocks".into()); }
     let side = cfg.image_size / cfg.patch_size / 2;
-    if prompt.len().saturating_add(count.saturating_mul(side*side-1)) >= max_seq { return Err("images exceed configured context".into()); }
+    // (worded as a prompt of text past the context is, which a client reads: the prompt with each marker its picture's tokens)
+    let tokens = prompt.len().saturating_add(count.saturating_mul(side*side-1));
+    if tokens >= max_seq { return Err(crate::api::past_context(tokens, max_seq)); }
     let vc = crate::llm::VisionConfig { image_size: cfg.image_size, patch_size: cfg.patch_size, mean: cfg.mean, std: cfg.std };
     let mut ids = Vec::new(); let mut images = Vec::new(); let mut records = records.iter();
     for id in prompt {
@@ -533,7 +535,8 @@ pub fn prepare_minicpmv(records: &[Json], prompt: Vec<u32>, image_id: u32, m: &M
                 }
             }
         }
-        if ids.len() >= max_seq { return Err("images exceed configured context".into()); }
+        // (as much of the prompt as is counted when a picture takes it past the context; worded as one of text past it is)
+        if ids.len() >= max_seq { return Err(crate::api::past_context(format!("at least {}", ids.len()), max_seq)); }
     }
     Ok((ids, images))
 }

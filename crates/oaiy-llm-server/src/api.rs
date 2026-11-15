@@ -120,6 +120,27 @@ fn bad(message: impl Into<String>) -> ApiError {
     ApiError { status: 400, message: message.into(), code: "invalid_request" }
 }
 
+/// The start of [`past_context`]'s words: how [`image_refusal`] knows them.
+const PAST_CONTEXT: &str = "the prompt with its pictures is ";
+
+/// A prompt its pictures take past the context (`max_seq`), in the words [`Server::submit`] refuses a prompt of text
+/// with (OpenAI's, which clients look for): OAIY's Agent compacts its conversation and asks again, where "past the
+/// context" it took for another error, and ended the run. `tokens`: the prompt with its pictures, or as much of it as was
+/// counted when it passed the context. [`image_refusal`] sends it with its code.
+pub(crate) fn past_context(tokens: impl std::fmt::Display, max_seq: usize) -> String {
+    format!("{}{tokens} tokens, and the model's maximum context length is {max_seq} tokens here", PAST_CONTEXT)
+}
+
+/// A request's pictures refused, as the client is told: past the context ([`past_context`]) as a prompt of text past it
+/// is, with the code `context_length_exceeded`; anything else as a request the server cannot take.
+fn image_refusal(message: String) -> ApiError {
+    if message.starts_with(PAST_CONTEXT) {
+        ApiError { status: 400, message, code: "context_length_exceeded" }
+    } else {
+        bad(message)
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -514,16 +535,16 @@ impl Server {
         // (each vision config below is set with its token: a model with no token has none of them)
         let Some(image) = a.cfg.image_token_id else { return Err(no_vision()) };
         if let Some(m) = &a.cfg.minicpmv {
-            return crate::engines::qwen::prepare_minicpmv(records, prompt, image, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_minicpmv(records, prompt, image, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(image_refusal);
         }
         if let Some(vc) = &a.cfg.qwen_vision {
-            return crate::engines::qwen::prepare_images(records, prompt, image, vc, self.local_images, a.cfg.max_seq).map_err(bad);
+            return crate::engines::qwen::prepare_images(records, prompt, image, vc, self.local_images, a.cfg.max_seq).map_err(image_refusal);
         }
         if let Some(gv) = &a.cfg.gemma_vision {
-            return gemma_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+            return gemma_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
         }
         if let Some(gv) = &a.cfg.glm_vision {
-            return glm_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(bad);
+            return glm_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
         }
         let Some(vc) = &a.cfg.vision else { return Err(no_vision()) };
         let mut preps = Vec::with_capacity(records.len());
@@ -607,7 +628,7 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
         ids.push(gv.close);
     }
     if ids.len() >= max_seq {
-        return Err(format!("the prompt with its pictures ({} tokens) is past the context ({max_seq})", ids.len()));
+        return Err(past_context(ids.len(), max_seq));
     }
     Ok((ids, images))
 }
@@ -634,7 +655,7 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
         ids.extend(std::iter::repeat_n(image_id, tokens));
     }
     if ids.len() >= max_seq {
-        return Err(format!("the prompt with its pictures ({} tokens) is past the context ({max_seq})", ids.len()));
+        return Err(past_context(ids.len(), max_seq));
     }
     Ok((ids, images))
 }
@@ -1512,6 +1533,34 @@ mod tests {
         assert_eq!(m[0].get("content").and_then(Json::as_str), Some(""));
         let body = Json::parse(br#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"none","tools":[{"type":"function","function":{"name":"f"}}]}"#).unwrap();
         assert_eq!(Server::messages(&body).ok().unwrap().len(), 1);
+    }
+
+    /// A prompt its pictures take past the context is refused as one of text is, in OpenAI's words and with its code, so
+    /// a client compacts its conversation and asks again: OAIY's Agent read "past the context" and "images exceed
+    /// configured context" as other errors, and ended its run on them.
+    #[test]
+    fn a_prompt_its_pictures_take_past_the_context_is_refused_as_one_of_text_is() {
+        let refused = image_refusal(past_context(70_000, 65_536));
+        assert_eq!((refused.status, refused.code), (400, "context_length_exceeded"));
+        assert_eq!(refused.message, "the prompt with its pictures is 70000 tokens, and the model's maximum context length is 65536 tokens here");
+        // anything else a picture is refused for is a request the server cannot take, as it was
+        let other = image_refusal("image 1: not a picture".into());
+        assert_eq!((other.status, other.code), (400, "invalid_request"));
+        // Gemma 4's: the prompt with a picture of 256 soft tokens, in a context of 200
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let gv = GemmaVision { patch: 16, max_soft_tokens: crate::models::GEMMA_SOFT_TOKENS, open: 7, close: 8 };
+        let rec = Json::obj([("url", Json::Str(png.into()))]);
+        let Err(e) = gemma_images(std::slice::from_ref(&rec), vec![1, 9], 9, &gv, false, 200) else { panic!("past the context") };
+        assert!(e.contains("is 259 tokens, and the model's maximum context length is 200 tokens here"), "{e}");
+        assert_eq!(image_refusal(e).code, "context_length_exceeded");
+        // Qwen's, before a picture is read: one of 24 x 24 tokens (768 pixels, patches of 16 merged two by two)
+        let cfg = crate::llm::MmProjConfig {
+            image_size: 768, patch_size: 16, embedding_dim: 1152, n_layers: 27, n_heads: 16, head_dim: 72, ff_dim: 4304,
+            layer_norm_eps: 1e-6, projector: crate::llm::ProjectorKind::Qwen3Vl, mean: [0.5; 3], std: [0.5; 3],
+        };
+        let Err(e) = crate::engines::qwen::prepare_images(std::slice::from_ref(&rec), vec![1, 9, 2], 9, &cfg, false, 500) else { panic!("past the context") };
+        assert!(e.contains("is 578 tokens, and the model's maximum context length is 500 tokens here"), "{e}");
+        assert_eq!(image_refusal(e).code, "context_length_exceeded");
     }
 }
 
