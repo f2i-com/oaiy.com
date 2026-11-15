@@ -9,12 +9,14 @@
  *
  * Open is a button, not a link: a link is followed by a middle click, a drag to the tab bar or its
  * context menu too, none of which wait. It waits OPEN_SETTLE_MS from when the address is shown
- * (OpenGate), so a run of presses meant for the app never reaches it. The keyboard comes to the bar
- * itself, never to Open, and only from the app's frame (where the link was clicked).
+ * (OpenGate), so a run of presses meant for the app never reaches it, and twice as long for an address
+ * that took another's place. The keyboard comes to the bar itself, never to Open, and only from the
+ * app's frame (where the link was clicked); a keyboard's press of Open waits OPEN_SETTLE_MS from when
+ * Open was given the focus as well, so a Tab and a Space meant for the app open nothing.
  */
 import { h } from '../ui/dom';
 import { icon } from '../ui/icons';
-import { OpenGate, shownName, type OutsideLink } from './outsideLink';
+import { OPEN_SETTLE_MS, OpenGate, shownName, type OutsideLink } from './outsideLink';
 
 export class LinkBar {
   readonly element: HTMLDivElement;
@@ -32,6 +34,7 @@ export class LinkBar {
       {
         type: 'button',
         onpointerdown: () => this.gate.press(performance.now()),
+        onfocus: () => this.gate.focus(performance.now()),
         onclick: (event: MouseEvent) => this.open(event),
       },
       'Open link',
@@ -63,16 +66,21 @@ export class LinkBar {
     return this.element.hidden ? null : this.link;
   }
 
-  /** Shows `link`, in place of any shown before; Open waits from now. */
+  /**
+   * Shows `link`, in place of any shown before; Open waits from now. One that takes the place of another address shown
+   * says so and waits twice as long: the app's code can post a link with no click, and one swapped in while the person
+   * read the first and moved to Open was the one opened.
+   */
   show(link: OutsideLink): void {
+    const replaced = !this.element.hidden && this.link !== null && this.link.href !== link.href;
     this.link = link;
-    this.lead.textContent = link.kind === 'mail' ? 'This app wants to write to' : link.kind === 'phone' ? 'This app wants to call' : 'This app links to';
+    this.lead.textContent = `${replaced ? 'The app changed this link. ' : ''}${link.kind === 'mail' ? 'This app wants to write to' : link.kind === 'phone' ? 'This app wants to call' : 'This app links to'}`;
     this.name.textContent = shownName(link.name);
     this.name.title = link.name;
     this.address.textContent = link.href;
     this.kindIcon.replaceChildren(icon(link.kind === 'mail' ? 'message' : link.kind === 'phone' ? 'phone' : 'globe'));
     this.openButton.textContent = link.kind === 'mail' ? 'Write email' : link.kind === 'phone' ? 'Call' : 'Open link';
-    this.gate.arm(performance.now());
+    this.gate.arm(performance.now(), replaced ? 2 * OPEN_SETTLE_MS : OPEN_SETTLE_MS);
     this.element.hidden = false;
     // (the keyboard to the bar where it was in the app's frame, or nowhere: a page typing elsewhere is not taken from)
     const at = document.activeElement;

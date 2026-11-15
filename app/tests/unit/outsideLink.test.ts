@@ -19,6 +19,15 @@ describe('outsideLinkOf: what a previewed SoftN app hands its page when a link i
     expect(outsideLinkOf(`mailto:${many},hidden@evil.example`)?.name).toContain('hidden@evil.example');
   });
 
+  it("names every address a mail goes to: its query's to, cc and bcc as well as the path's", () => {
+    const mail = outsideLinkOf('mailto:support@bank.example?to=billing@evil.example&CC=a@evil.example&bcc=spy@evil.example&subject=Refund');
+    expect(mail?.name).toBe('support@bank.example, billing@evil.example, a@evil.example, spy@evil.example');
+    expect(outsideLinkOf('mailto:?to=someone%2Btag@example.com')?.name).toBe('someone+tag@example.com');
+    for (const value of ['mailto:a@example.com?cc=%0Ab@evil.example', 'mailto:a@example.com?bcc=not-an-address', 'mailto:?subject=Hi']) {
+      expect(outsideLinkOf(value), value).toBeNull();
+    }
+  });
+
   it('shows a long name by its end, which says where it goes', () => {
     const host = `${'a'.repeat(60)}.${'b'.repeat(60)}.example.com`;
     expect(shownName(host)).toMatch(/^….*\.example\.com$/);
@@ -81,6 +90,29 @@ describe('OpenGate: the bar opens nothing a press meant for the app reaches', ()
     gate.arm(0);
     expect(gate.click(OPEN_SETTLE_MS - 1, true)).toBe(false);
     expect(gate.click(2 * OPEN_SETTLE_MS, true)).toBe(true);
+  });
+
+  it('times a click from the keyboard from when Open was given the focus as well', () => {
+    // The bar takes the focus from the app's frame: a Tab and a Space typed for the app reached Open and opened.
+    const gate = new OpenGate();
+    gate.arm(0);
+    gate.focus(5000);
+    expect(gate.click(5050, true)).toBe(false);
+    expect(gate.click(5050 + 2 * OPEN_SETTLE_MS, true)).toBe(true);
+    // A pointer's click is timed from its own press, whatever focus its press gave Open.
+    gate.arm(0);
+    gate.focus(OPEN_SETTLE_MS + 10);
+    gate.press(OPEN_SETTLE_MS + 10);
+    expect(gate.click(OPEN_SETTLE_MS + 60, false)).toBe(true);
+  });
+
+  it("waits as long as it is told for an address that took another's place", () => {
+    const gate = new OpenGate();
+    gate.arm(0, 2 * OPEN_SETTLE_MS);
+    gate.press(OPEN_SETTLE_MS + 50);
+    expect(gate.click(OPEN_SETTLE_MS + 100, false)).toBe(false);
+    gate.press(4 * OPEN_SETTLE_MS);
+    expect(gate.click(4 * OPEN_SETTLE_MS + 50, false)).toBe(true);
   });
 
   it('waits again for each newer address', () => {

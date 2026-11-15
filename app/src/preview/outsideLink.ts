@@ -108,19 +108,27 @@ export function outsideLinkOf(value: unknown, ownOrigin?: string): OutsideLink |
     return { href: url.href, kind: 'web', name: url.host };
   }
   if (url.protocol === 'mailto:' || url.protocol === 'tel:') {
-    let target: string;
+    // What a person is shown is every address it goes to: the path's, and a mail's query's `to`, `cc` and `bcc`, which a
+    // mail client sends to as well (the bar named the path's alone).
+    const parts: string[] = [];
     try {
-      target = decodeURIComponent(url.pathname);
+      parts.push(decodeURIComponent(url.pathname));
+      if (url.protocol === 'mailto:') {
+        for (const field of url.search.slice(1).split('&')) {
+          const at = field.indexOf('=');
+          if (at > 0 && /^(to|cc|bcc)$/i.test(field.slice(0, at))) parts.push(decodeURIComponent(field.slice(at + 1)));
+        }
+      }
     } catch {
       return null;
     }
-    // A line break written into the address (`%0A`) is a way to add to the mail's headers: refused, not trimmed away.
-    if (!printable(target)) return null;
-    target = target.trim();
-    if (target === '') return null;
-    if (url.protocol === 'tel:') return { href: url.href, kind: 'phone', name: target };
-    const names = mailNames(target);
-    return names === null ? null : { href: url.href, kind: 'mail', name: names };
+    // A line break written into an address (`%0A`) is a way to add to the mail's headers: refused, not trimmed away.
+    if (!parts.every(printable)) return null;
+    const given = parts.map((part) => part.trim()).filter((part) => part !== '');
+    if (!given.length) return null;
+    if (url.protocol === 'tel:') return { href: url.href, kind: 'phone', name: given[0] };
+    const names = given.map(mailNames);
+    return names.some((name) => name === null) ? null : { href: url.href, kind: 'mail', name: names.join(', ') };
   }
   return null;
 }
@@ -150,11 +158,21 @@ export class OpenGate {
   private readyAt = Number.POSITIVE_INFINITY;
   /** When the press under way began, if it began once Open was ready (-Infinity for one that began too soon). */
   private pressedAt: number | null = null;
+  /** When Open last had the keyboard's focus given it. */
+  private focusedAt = Number.NEGATIVE_INFINITY;
 
-  /** An address is shown: Open waits from now. */
-  arm(now: number): void {
-    this.readyAt = now + OPEN_SETTLE_MS;
+  /** An address is shown: Open waits `wait` from now (longer for one that took another's place). */
+  arm(now: number, wait = OPEN_SETTLE_MS): void {
+    this.readyAt = now + wait;
     this.pressedAt = null;
+  }
+
+  /**
+   * Open is given the focus: a click of the keyboard's waits OPEN_SETTLE_MS from now as well. The bar takes the focus
+   * from the app's frame, so a Tab and a Space typed for the app reached Open and opened what the app had posted.
+   */
+  focus(now: number): void {
+    this.focusedAt = now;
   }
 
   /** A pointer's press of Open begins. */
@@ -174,7 +192,7 @@ export class OpenGate {
   click(now: number, ownPress: boolean): boolean {
     const began = ownPress ? now : (this.pressedAt ?? now);
     this.pressedAt = null;
-    if (began < this.readyAt) {
+    if (began < (ownPress ? Math.max(this.readyAt, this.focusedAt + OPEN_SETTLE_MS) : this.readyAt)) {
       this.readyAt = Math.max(this.readyAt, now + OPEN_SETTLE_MS);
       return false;
     }
