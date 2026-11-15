@@ -273,8 +273,15 @@ export function usesPython(vfs: Vfs, root = ''): boolean {
   return appFiles(vfs, root).some(([p]) => /\.py$/i.test(p) && !p.startsWith('server/'));
 }
 
+/**
+ * The writing guide for the app at `root`: Python's where it is an app whose logic is Python, else JavaScript's. With no
+ * app there yet, a new one is written in JavaScript (Python only where the person asks for it, as the Agent's
+ * instructions say): a project's own .py files had chosen it before there was an app, and every new project has one (the
+ * starter's hello.py), so the first app of each was given the Python guide ("this project's logic language"), and a model
+ * wrote its game's logic in main.py and tested it in code_run's Python.
+ */
 export function guideFor(vfs: Vfs, root = ''): string {
-  return usesPython(vfs, root) ? SOFTN_GUIDE_PYTHON : SOFTN_GUIDE_JAVASCRIPT;
+  return findApps(vfs).includes(root) && usesPython(vfs, root) ? SOFTN_GUIDE_PYTHON : SOFTN_GUIDE_JAVASCRIPT;
 }
 
 /**
@@ -459,6 +466,21 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
       }
     }
     if (TEXT_EXT.test(path) && vfs.stat(inApp(root, path))?.size === 0) warn(path, 'empty file');
+    // A page's value in quotes is text: `content="Best {best}"` shows "Best {best}" as it is written. A model's snake
+    // game showed "Best {best}" and "Speed {level}/10", and it played the game again and again to see them change.
+    if (/\.html$/i.test(path)) {
+      const text = vfs.readText(inApp(root, path));
+      for (const m of text.matchAll(/\s([A-Za-z_@:][\w:.-]*)="([^"\n]*\{\s*[A-Za-z_$][\w$.]*\s*\}[^"\n]*)"/g)) {
+        const [, attr, value] = m;
+        const line = text.slice(0, m.index).split('\n').length;
+        const expr = value
+          .split(/(\{\s*[A-Za-z_$][\w$.]*\s*\})/)
+          .filter((p) => p !== '')
+          .map((p) => (/^\{[\s\S]*\}$/.test(p) ? p.slice(1, -1).trim() : JSON.stringify(p)))
+          .join(' + ');
+        err(path, `line ${line}: ${attr}="${value}" is shown as it is written: a value in quotes is text, and {…} is read only outside quotes. Write ${attr}={${expr}}`);
+      }
+    }
   }
   if (present.has('permission.json')) {
     try {

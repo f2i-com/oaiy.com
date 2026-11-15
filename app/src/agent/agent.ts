@@ -9,11 +9,12 @@
 import { beforeVerdict } from './hookVerdict';
 import type { NetGate } from '../gate/netgate';
 import { AIProviderError } from './providers/aiProvider';
+import { CHATGPT_SIGN_IN } from './providers/chatgpt';
 import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit, overflowWindow } from './context';
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type FrameReview, type Reasoning, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ToolContext } from './tools';
+import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, SENT_CODE_FILE, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
 import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
@@ -181,6 +182,8 @@ const SAME_CHECK_LIMIT = 3;
  */
 const SAME_STEP_NOTE = 3;
 const SAME_STEP_STOP = 6;
+/** The pause before a request the server failed of its own ([`serverFailure`]) is sent again. */
+const SERVER_RETRY_MS = 3000;
 /**
  * A write that would leave a file as it is (write_file with what it holds, append_file with a part it has) is not made,
  * and the model is told so; the run stops at the third such write of one file. A model that writes a file again after
@@ -378,6 +381,58 @@ export function repetitionNote(said: string): string {
   return `[OAIY] Your last reply was stopped because it kept ${what}${inCall ? ' inside its tool call' : ''}, so nothing in it ran or was written. Do not write that again: write that part another way${nested ? ' (it is a call or an index written inside itself again and again: work it out in steps, with a variable or a loop)' : ''}.${inCall ? ' Keep each call small: write a large file in parts (write_file with the first part, then append_file for each next part).' : ''}`;
 }
 
+/**
+ * The error of a failed code_run or sandbox_shell run when it is in the code the model sent as text, not in a file of the
+ * project, as "line 8: NameError: name 'exec' is not defined"; or null. Zipp's Python says where an error was raised at
+ * the end of its first line, naming code given as text __main__.py (__botcomputer_main__.py where the project has a
+ * __main__.py of its own) and a project file by its path. Its JavaScript says <anonymous> of every place, a file required
+ * as much as the code sent, so code_run's JavaScript counts only where it loads nothing. A module the shell runs with -m
+ * (json.tool) is the shell's own text, not the model's.
+ */
+export function sentCodeError(call: ToolCall, result: ToolResult): string | null {
+  if (!result.isError || (call.name !== 'code_run' && call.name !== 'sandbox_shell')) return null;
+  // (the tool's report, with a flow's note before it or OAIY's notes after it)
+  const start = result.content.search(/^\{$/m);
+  const end = start < 0 ? -1 : result.content.indexOf('\n}', start);
+  if (end < 0) return null;
+  let stderr: unknown;
+  try {
+    stderr = (JSON.parse(result.content.slice(start, end + 2)) as { stderr?: unknown }).stderr;
+  } catch {
+    return null;
+  }
+  if (typeof stderr !== 'string') return null;
+  const raised = [...stderr.matchAll(/^([A-Za-z_][\w.]*): (.*) \(([^()\n]+?):(\d+)(?::\d+)?\)$/gm)].at(-1);
+  if (raised) {
+    if (!SENT_CODE_FILE.test(raised[3])) return null;
+    if (call.name === 'sandbox_shell' && /\s-m\s*[\w.]/.test(String(call.input.command ?? ''))) return null;
+    // (an error without words is "ValueError:  (__main__.py:2)")
+    return `line ${raised[4]}: ${raised[1]}${raised[2].trim() ? `: ${raised[2].trim()}` : ''}`.slice(0, 300);
+  }
+  const code = call.input.code;
+  if (call.name !== 'code_run' || typeof code !== 'string' || call.input.file !== undefined || /^py/i.test(String(call.input.language ?? ''))) return null;
+  if (/\b(?:require|import|eval|Function|readFileSync|readFile)\b/.test(code)) return null;
+  const thrown = [...stderr.matchAll(/^((?:[A-Z][A-Za-z]*)?Error|[A-Z][A-Za-z]*Exception): (.+?)(?: \(in [^()\n]*\))?$/gm)].at(-1);
+  return thrown ? `${thrown[1]}: ${thrown[2]}`.slice(0, 300) : null;
+}
+
+/**
+ * What a step the same as the ones before it is told, [`SAME_STEP_NOTE`] of them in a row on (`calls`: as they ran, one
+ * to a result). Where each of its errors is in code the model sent as text ([`sentCodeError`]), that, plainly, with the
+ * error's line: told to "read the file the error points to and edit it", Nanbeige 4.3 33B sent code_run the same script
+ * six times, the error in that script.
+ */
+function sameStepNote(same: number, calls: ToolCall[], results: ToolResult[]): string {
+  const head = `[OAIY] This step is the same as the ${same - 1} before it: the same calls (numbers aside), and the same results.`;
+  const sent = results.flatMap((result, i) => (result.isError ? [{ tool: calls[i]?.name ?? result.name, error: calls[i] ? sentCodeError(calls[i], result) : null, hinted: /^ "hint": /m.test(result.content) }] : []));
+  if (sent.length && sent.every((s) => s.error)) {
+    const tools = [...new Set(sent.map((s) => s.tool))].join(' and ');
+    const errors = [...new Set(sent.map((s) => s.error!.replace(/[.!]+$/, '')))].slice(0, 3).join('; ');
+    return `${head} The error is in the code you sent to ${tools}, not in a file of the project: ${errors}. Running that code again gives the same error, so change that code before you run it again${sent.some((s) => s.hinted) ? ' (the hint in its result says what to use instead)' : ''}. If you cannot, stop and tell the user what is wrong.`;
+  }
+  return `${head} Nothing has changed, so running them again, or waiting longer, will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If what they show is not what the app should do (a value that should change and does not), read the code that should change it and fix that. If you cannot, stop and tell the user what is wrong.`;
+}
+
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
 const guideLoaded = (topic: GuideTopic) => `[OAIY] The ${topic} guide is now in your instructions`;
 /** The note that a guide's text follows (in a result or the request, where the tools are found: see LISTED). */
@@ -477,7 +532,7 @@ const WEB_FILE = /\.html?$/i;
 const APP_3D = `- A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the page's markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
 `;
 
-const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names its main page as "main". A new app is written as HTML: index.html (with pages/*.html), its logic in main.js (or main.py) named with <script src>. An app made before has ui/*.ui pages and logic/*.logic (or .py) files and works the same: edit whichever an app has, keeping its names. A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
+const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names its main page as "main". A new app is written as HTML: index.html (with pages/*.html), its logic in JavaScript in main.js named with <script src> (in Python, main.py, only when the user asks for Python, whatever else is in the project). An app made before has ui/*.ui pages and logic/*.logic (or .py) files and works the same: edit whichever an app has, keeping its names. A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link.
 ${APP_3D}- The app is done when it renders without errors and softn_interact shows it working.
 `;
@@ -494,7 +549,7 @@ const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, im
  * The app and web guides in brief, where the tools are found (`AgentOptions.discoverTools`): a local model's, which reads
  * each guide's every token where a cloud model's provider caches them; the rules the same, their words fewer.
  */
-const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main page as "main" (keep it true). A new app is HTML: index.html (and pages/*.html), its logic in main.js (or main.py) named with <script src>; an older app's ui/*.ui and logic/*.logic files work the same: edit whichever it has, keeping its names. Each app has its own folder: to rebuild one or base a new one on it (or on a .softn the user attached, unpacked into its own folder; softn_import unpacks any in the project), write the new app in a new folder and leave the original as it is; to change one, edit its folder. Do not guess the language: softn_docs (no arguments: the map; topic "guide": read it before your first app; search: how something is done), softn_components (exact props and events), softn_examples (working apps to read or copy). OAIY checks the app after each change and adds the outcome to the step's result: fix its errors first. softn_inspect shows what the page displays, softn_interact uses the app like a person and reports its errors, preview_screenshot shows how it looks (fix what looks wrong), preview_viewport sets the screen size. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link. The user watches it in a live preview.
+const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main page as "main" (keep it true). A new app is HTML: index.html (and pages/*.html), its logic in JavaScript in main.js named with <script src> (in Python, main.py, only when the user asks for Python); an older app's ui/*.ui and logic/*.logic files work the same: edit whichever it has, keeping its names. Each app has its own folder: to rebuild one or base a new one on it (or on a .softn the user attached, unpacked into its own folder; softn_import unpacks any in the project), write the new app in a new folder and leave the original as it is; to change one, edit its folder. Do not guess the language: softn_docs (no arguments: the map; topic "guide": read it before your first app; search: how something is done), softn_components (exact props and events), softn_examples (working apps to read or copy). OAIY checks the app after each change and adds the outcome to the step's result: fix its errors first. softn_inspect shows what the page displays, softn_interact uses the app like a person and reports its errors, preview_screenshot shows how it looks (fix what looks wrong), preview_viewport sets the screen size. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link. The user watches it in a live preview.
 - The app is done when it renders without errors and softn_interact shows it working.
 `;
 
@@ -853,13 +908,39 @@ function contextOverflow(error: AIProviderError): { overflow: boolean; tokens: n
   return error.status === undefined || [400, 413, 422, 500].includes(error.status) ? said : { overflow: false, tokens: null };
 }
 
+/**
+ * Whether a failed request is the server's own failure, one that may pass: said with a status of 500 or more, or inside
+ * its stream with no status. OAIY's engine, its GPU out of room for Nanbeige 4.3 33B's prompt, said only "native Qwen
+ * inference failed" (code server_error) inside its stream, and an unattended run ended there. Not a client's error (a
+ * status under 500), nor one waiting does not mend (OAIY's model worker stopped: 503 `unavailable`; a server without
+ * the method: 501; ChatGPT signed out), nor one `request` reads otherwise (by its code here; by its words there).
+ */
+function serverFailure(error: AIProviderError): boolean {
+  if (error.kind !== 'http' || error.message === CHATGPT_SIGN_IN) return false;
+  if (error.code && /^(unavailable|context_length_exceeded|tool_contract_error|generation_repetition|observer_review_failed)$/.test(error.code)) return false;
+  return error.status === undefined || (error.status >= 500 && error.status !== 501);
+}
+
+/** A failure's reason in a few words, for a status line: the server's own, or its status. */
+function failureWords(error: AIProviderError): string {
+  const words = (error.detail ?? '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (words && words.length <= 160) return words;
+  return error.status ? `status ${error.status}` : words ? `${words.slice(0, 157)}…` : 'no reason given';
+}
+
+/** Wait `ms`; Stop (`signal`) ends the wait at once, before it or during it, as a cancellation. */
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
+    const stop = () => {
       clearTimeout(timer);
       reject(new AIProviderError('cancelled', 'Stopped.'));
-    }, { once: true });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', stop);
+      resolve();
+    }, ms);
+    if (signal?.aborted) stop();
+    else signal?.addEventListener('abort', stop, { once: true });
   });
 
 export class Agent {
@@ -1906,7 +1987,9 @@ ${personInstructionsText(own)}` : ''}`;
     // thinking on left a call's path out twice in a row, and wrote it whole on a third try about half the time)
     let callRetries = 0;
     let repeatRetried = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    let serverRetries = 0;
+    // (each kind of failure below has a bound of its own; this one ends a step that meets several)
+    for (let attempt = 0; attempt < 6; attempt++) {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
       this.streamed = '';
@@ -1918,9 +2001,11 @@ ${personInstructionsText(own)}` : ''}`;
         const tools = finish && this.finishing ? this.usable.filter((t) => t.name === finish.tool || (t.name === 'view_image' && this.looksMissing().length > 0)) : this.listed;
         if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
         let thought = false;
+        const varied = this.varyNext;
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
+          varied,
           ...this.thinking(b.reply),
           sink: {
             text: (delta) => {
@@ -1943,6 +2028,8 @@ ${personInstructionsText(own)}` : ''}`;
         // stream could not be read): shown as a streamed one is, its thought first (the chat draws a reply as it streams).
         if (!thought && reply.thinking) emit({ type: 'thinking', delta: reply.thinking });
         if (!this.streamed && reply.text) emit({ type: 'text', delta: reply.text });
+        // (sampled anew once: the steps after it as the server samples them)
+        if (varied) this.varyNext = false;
         // The provider's own count calibrates the next estimate, from a prompt of text alone: a picture costs what the
         // server makes of it (256 tokens to Gemma in OAIY's engine, some 765 at OpenAI; IMAGE_TOKENS in the estimate), and
         // counted in characters it doubled the ratio, so that text was then taken for half its size and compaction came late.
@@ -2022,6 +2109,19 @@ ${personInstructionsText(own)}` : ''}`;
         }
         if ((error.kind === 'timeout' || error.kind === 'network') && attempt < 1) {
           emit({ type: 'status', message: 'The request failed; retrying once' });
+          continue;
+        }
+        // The server's own failure, which may pass: asked again after a pause; failing so again, asked once more with the
+        // conversation compacted (a shorter prompt needs less of a GPU's room); then the run ends on it, to be tried again.
+        if (serverFailure(error) && serverRetries < 2 && !overflow.overflow && !limit && !unreadableCall && !/generation_repetition/.test(said)) {
+          serverRetries++;
+          if (serverRetries === 1) {
+            emit({ type: 'status', message: `The provider failed (${failureWords(error)}); retrying in ${SERVER_RETRY_MS / 1000} s` });
+            await sleep(SERVER_RETRY_MS, signal);
+          } else {
+            emit({ type: 'status', message: `The provider failed again (${failureWords(error)}); compacting the conversation and retrying once more` });
+            await this.compact(provider, this.budget(provider), emit, signal);
+          }
           continue;
         }
         throw error;
@@ -2143,6 +2243,13 @@ ${personInstructionsText(own)}` : ''}`;
 
   /** What the model has written of the reply it is writing now ('' between requests): kept if the run is stopped. */
   private streamed = '';
+  /**
+   * The next request is to be sampled anew (`varied`: a temperature of 1 and a seed of its own, where the server can be
+   * asked): set when a step's result is told it is the same as the ones before it ([`SAME_STEP_NOTE`]), used by one
+   * request. Told what was wrong and how to change it, Nanbeige 4.3 33B (its thinking off) still sent the same failing
+   * script again and again: at its server's temperature it wrote the same call.
+   */
+  private varyNext = false;
   /** Messages the user sent while a run was going, for the model's next step (`note`: how it reads, when not the usual way). */
   private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[]; note?: string }> = [];
   /** Sub-agents working for this one now (a delegated task, a picture's review), with how the user's messages read to each. */
@@ -2454,6 +2561,8 @@ ${personInstructionsText(own)}` : ''}`;
         acted += reply.calls.length;
         lastSaid = '';
         const results: ToolResult[] = [];
+        // (the calls as they ran, one to a result: a found tool's through use_tool, one a flow changed)
+        const ran: ToolCall[] = [];
         stepResults = results;
         changes = [];
         // A reply cut off at the output limit mid-call: the call is incomplete, so say why rather than run it.
@@ -2562,6 +2671,7 @@ ${personInstructionsText(own)}` : ''}`;
           // A picture for a scripted video is reviewed before anything else is made.
           if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
           results.push(result);
+          ran.push(call);
           // softn_check keeps the record of failing apps current, as the automatic check does.
           if (result.check) {
             this.checkedRoots.add(result.check.root);
@@ -2588,7 +2698,9 @@ ${personInstructionsText(own)}` : ''}`;
         // stopped only at the 11th)
         const same = this.repeatedStep(reply.calls, results, changes.length > 0 || reply.calls.some((c) => c.name === 'update_plan'));
         if (same >= SAME_STEP_NOTE && results.length) {
-          results[results.length - 1].content += `\n\n[OAIY] This step is the same as the ${same - 1} before it: the same calls (numbers aside), and the same results. Nothing has changed, so running them again, or waiting longer, will not change what they say. If they report errors, fix them now: read the file the error points to and edit it. If what they show is not what the app should do (a value that should change and does not), read the code that should change it and fix that. If you cannot, stop and tell the user what is wrong.`;
+          results[results.length - 1].content += `\n\n${sameStepNote(same, ran, results)}`;
+          // (and its next step sampled anew: told what to change, a model at its server's temperature wrote the same call)
+          this.varyNext = true;
         }
         // Many steps on one plan step without the plan moving: where the work is, and what to do about it.
         const openStep = planThisRun ? this.plan?.items.findIndex((i) => i.status === 'active') ?? -1 : -1;

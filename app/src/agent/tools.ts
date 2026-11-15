@@ -729,11 +729,13 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'code_run',
-    // (what a script that reaches for a page is told: browserHint below)
+    // (what a script that reaches for a page is told: browserHint below; one that reaches for exec: execHint. What the
+    // Python part says was tried on Zipp's engine with the file map host.ts gives it: sentCode.test.ts)
     description:
       'Run JavaScript or Python on the Zipp VM, sandboxed in a Worker, to compute, transform data or answer with code. Paths are project-relative ("/" is the root). ' +
       'JavaScript: Node-style require("fs"|"path"), fs.readFileSync/writeFileSync/readdirSync/statSync, fs.walkSync, fs.grepSync, global fetch(), process.argv; top-level await works; the last expression\'s value is returned as `result`. ' +
-      'Python 3 subset (math, json, re, collections, itertools, dataclasses, statistics, fractions, hashlib; no pip, no csv module): open() sees the project files matched by `files` (default: the project\'s files up to 2 MiB each, 16 MiB in all) and files it writes are saved back. ' +
+      'Python 3 subset (math, json, re, csv, collections, itertools, dataclasses, statistics, fractions, hashlib; no pip, and no exec, eval, compile, importlib.util or runpy): open() sees the project files matched by `files` (default: the project\'s files up to 2 MiB each, 16 MiB in all) and files it writes are saved back. ' +
+      'Python `code` runs at the project root, where a project module imports by its path (from apps.game import main loads /apps/game/main.py; sys.path changes nothing); a script run with `file` imports the modules beside it by name, and one named test_*.py runs its test_ functions as pytest does. ' +
       'Network requests go through the /internet gate and only reach sites that allow cross-origin requests from a browser.',
     parameters: {
       type: 'object',
@@ -875,6 +877,68 @@ export function browserHint(output: string): string | null {
   return `${missing[1]} belongs to a browser: code_run runs scripts with no page, no browser and no timers, so running a page's script here only finds what is missing. Test a web page in the preview (page_check, page_interact, preview_screenshot) and a SoftN app with softn_check and softn_interact.`;
 }
 
+/** The names Zipp's Python gives code it was given as text (code_run's `code`, python -c, a pipe), where it says an error was raised. */
+export const SENT_CODE_FILE = /^(?:__main__\.py|__botcomputer_main__\.py|<stdin>|<string>)$/;
+
+/**
+ * What code_run or sandbox_shell says of Python that reached for exec, eval or compile (`stderr`: its errors), or null.
+ * The sandbox's Python (Zipp's) has none of them, nor importlib.util or runpy: Nanbeige 4.3 33B, loading a snake game's
+ * main.py to test it, sent code_run a script that exec'd its text six times over, told each time to fix "the file the
+ * error points to". `source`: the code or command that ran, for the module it was after (a quoted path to a .py file).
+ * What it says to do instead was tried on Zipp's engine (sentCode.test.ts): code given as text runs at the project root,
+ * where a project file imports by its path; a script run as a file, or `python -c` in a folder, imports the modules beside
+ * it by name; a file named test_*.py runs its test_ functions as pytest does; a syntax error is reported on import.
+ */
+export function execHint(stderr: string, source: string, tool: 'code_run' | 'sandbox_shell'): string | null {
+  const missing = /NameError: name '(exec|eval|compile)' is not defined(?: \(([^()\n]+?):(\d+)(?::\d+)?\))?/.exec(stderr);
+  if (!missing) return null;
+  // (the shell's own py_compile and compileall call compile())
+  const checker = tool === 'sandbox_shell' ? /-m\s*(py_compile|compileall)\b/.exec(source) : null;
+  if (checker) return `python -m ${checker[1]} needs compile(), which this sandbox's Python does not have, so it cannot run here. To check that a file parses, import it (a syntax error is reported with its file and line) or run it.`;
+  const [, called, where, line] = missing;
+  // Called in a file of the project rather than in the code sent: that file, and the module for the example.
+  const inFile = !!where && !SENT_CODE_FILE.test(where);
+  const wanted = /["'`]\/?((?:[A-Za-z_]\w*\/)*)([A-Za-z_]\w*)\.py["'`]/.exec(source) ?? (inFile && where.includes('/') ? /^\/?((?:[A-Za-z_]\w*\/)*)([A-Za-z_]\w*)\.py$/.exec(where) : null);
+  // (a module, not __main__ or a package's __init__; else an example)
+  const [dir, name] = wanted && !/^__\w+__$/.test(wanted[2]) ? [wanted[1].replace(/\/$/, ''), wanted[2]] : ['apps/game', 'main'];
+  const byPath = dir ? `from ${dir.replace(/\//g, '.')} import ${name}` : `import ${name}`;
+  const file = `/${dir ? `${dir}/` : ''}${name}.py`;
+  const beside = `/${dir ? `${dir}/` : ''}test_${name}.py`;
+  const how = tool === 'code_run'
+    ? `code given as text runs at the project's root, where a project file imports by its path (${byPath} loads ${file}; changing sys.path does not change where imports are found). Or write the test as a file beside the module, named test_*.py (${beside}, which can import ${name}), and run it with code_run's file: its test_ functions run as pytest runs them.`
+    : `python FILE imports the modules beside FILE by name, and python -c imports those of the working folder (${dir ? `cd /${dir}, then ` : ''}import ${name}); from the project's root a project file imports by its path (${byPath}). A file named test_*.py run with python runs its test_ functions as pytest runs them.`;
+  const why = inFile ? `, and ${where} calls ${called} on its line ${line}: write that part without it. To load another file's code, import it as a module:` : `, so a script cannot run another file's code from its text. Import the module instead:`;
+  return `exec, eval and compile do not exist in this sandbox's Python (nor do importlib.util and runpy)${why} ${how}`;
+}
+
+/**
+ * What code_run's (or the shell's) Python is told when code given as text cannot import a module of the project by its
+ * name (`ModuleNotFoundError: No module named 'main'`): it is the project's file of that name, and code given as text runs
+ * at the project's root, where changing sys.path does nothing, so it imports by its path. Told only that the error was in
+ * its code, Nanbeige 4.3 33B sent `sys.path.insert(0, "/apps/snake"); importlib.import_module("main")` six times, and three
+ * more after its conversation was compacted. `filesNamed`: the project's files of a name (`main.py`), as paths from its
+ * root; the one sys.path was pointed at where there are several. Null where the module is no file of the project, or the
+ * import that failed is a project file's own.
+ */
+export function moduleHint(stderr: string, source: string, tool: 'code_run' | 'sandbox_shell', filesNamed: (file: string) => string[]): string | null {
+  const missing = /ModuleNotFoundError: No module named '([A-Za-z_]\w*)'(?: \(([^()\n]+?):\d+(?::\d+)?\))?/.exec(stderr);
+  if (!missing) return null;
+  const [, name, where] = missing;
+  if (where && !SENT_CODE_FILE.test(where)) return null;
+  const found = filesNamed(`${name}.py`).map((p) => p.replace(/^\/+/, ''));
+  if (!found.length) return null;
+  const pointed = /sys\.path\.(?:insert|append)\([^)]*?["'`]\/?([^"'`]+?)\/?["'`]\s*\)/.exec(source)?.[1];
+  const path = found.find((p) => p === `${pointed}/${name}.py`) ?? found[0];
+  const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  // (a folder whose names are Python's imports by its path; another, such as my-game, only beside it)
+  const byPath = /^[A-Za-z_]\w*(\/[A-Za-z_]\w*)*$/.test(dir) ? `from ${dir.replace(/\//g, '.')} import ${name}` : null;
+  const beside = `/${dir ? `${dir}/` : ''}test_${name}.py`;
+  if (tool === 'sandbox_shell') {
+    return `${name} is the project's /${path}. python -c imports the modules of its working folder by name: cd /${dir} first, then import ${name}${byPath ? `; or, from the project's root, ${byPath}` : ''}. Changing sys.path does not change where imports are found here.`;
+  }
+  return `${name} is the project's /${path}. Code given to code_run as text runs at the project's root, and changing sys.path does not change where imports are found here: ${byPath ? `import it by its path, ${byPath}. Or ` : ''}write the test as a file beside it (${beside}, which imports ${name} by name) and run that file with code_run's file.`;
+}
+
 /** The times in a row a part that opens more brackets than it closes may come in what a tool writes ([`runawayNesting`]). */
 const NESTED_RUN = 32;
 
@@ -925,6 +989,16 @@ function cut(text: string, max = OUTPUT_CHARS): string {
 }
 
 /** A project file's bytes, or an error naming it. */
+/** The project's files of a name (`main.py`), as paths from its root: what [`moduleHint`] looks a module up in. */
+function pyFilesNamed(vfs: Vfs): (file: string) => string[] {
+  return (file) =>
+    vfs
+      .walk('/', { limit: 50_000 })
+      .entries.filter((e) => e.type === 'file' && (e.path.replace(/^\/+/, '') === file || e.path.endsWith(`/${file}`)))
+      .map((e) => e.path.replace(/^\/+/, ''))
+      .slice(0, 20);
+}
+
 function projectBytes(vfs: Vfs, path: string): Uint8Array {
   if (vfs.stat(`/${path}`)?.type !== 'file') throw new Error(`/${path} does not exist`);
   return vfs.readBytes(`/${path}`);
@@ -1258,6 +1332,14 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const file = typeof input.file === 'string' ? normalizePath(input.file) : undefined;
       const language = typeof input.language === 'string' ? input.language : file?.endsWith('.py') ? 'python' : 'javascript';
       const lang = /^py/i.test(language) ? 'python' : 'js';
+      // Both: one of them runs, and the file was run with the code never read. Nanbeige 4.3 33B sent a test of its game
+      // as code with file: its main.py, which ran, printed nothing and said ok; 28 tests over, none of them ever ran.
+      if (file !== undefined && typeof input.code === 'string' && input.code.trim()) {
+        const dir = file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '';
+        const name = (file.split('/').pop() ?? file).replace(/\.(py|m?js)$/i, '');
+        const byPath = lang === 'python' && /^[A-Za-z_]\w*(\/[A-Za-z_]\w*)*$/.test(dir) && /^[A-Za-z_]\w*$/.test(name) ? `: from ${dir.replace(/\//g, '.')} import ${name}` : '';
+        throw new Error(`code_run takes code or file, not both: given both, it runs the file and never reads the code. To test /${file}, send the code alone${byPath ? ` (it imports the file by its path${byPath})` : ''}, or write the test as a file beside it and send that file alone.`);
+      }
       const source = file !== undefined ? vfs.readText(`/${file}`) : need(input, 'code');
       const outcome = await host.runProgram({
         lang,
@@ -1272,7 +1354,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const report: Record<string, unknown> = { ok: exitCode === 0, exit_code: exitCode, stdout: cut(stdout), stderr: cut(stderr), elapsed_ms: outcome.elapsedMs };
       if (outcome.result?.value !== undefined) report.result = cut(outcome.result.value);
       if (outcome.timedOut) report.timed_out = true;
-      const hint = browserHint(`${stderr}\n${stdout}`);
+      const hint = browserHint(`${stderr}\n${stdout}`) ?? (lang === 'python' ? execHint(stderr, source, 'code_run') ?? (file === undefined ? moduleHint(stderr, source, 'code_run', pyFilesNamed(vfs)) : null) : null);
       if (hint) report.hint = hint;
       reportChanges(report, host.changes);
       return JSON.stringify(report, null, 1);
@@ -1282,18 +1364,24 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const host = new SandboxHost(vfs, ctx.gate, 'sandbox_shell', timeoutMs);
       host.signal = ctx.signal;
       const cwd = vfs.stat(ctx.shell.cwd)?.type === 'dir' ? ctx.shell.cwd : '/';
-      const outcome = await runInSandbox({ lang: 'shell', source: need(input, 'command'), cwd, env: ctx.shell.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs, signal: ctx.signal });
+      const command = need(input, 'command');
+      const outcome = await runInSandbox({ lang: 'shell', source: command, cwd, env: ctx.shell.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs, signal: ctx.signal });
       const shell = outcome.result?.shell;
       const report: Record<string, unknown> = {};
+      let errors: string;
       if (shell && !outcome.timedOut && !outcome.result?.error) {
         ctx.shell.cwd = shell.cwd;
         ctx.shell.env = shell.env;
+        errors = shell.stderr;
         Object.assign(report, { exit_code: shell.exit_code, stdout: cut(shell.stdout), stderr: cut(shell.stderr), cwd: shell.cwd });
       } else {
         const { stdout, stderr, exitCode } = summarize(outcome);
+        errors = stderr;
         Object.assign(report, { exit_code: exitCode || 1, stdout: cut(stdout), stderr: cut(stderr), cwd });
         if (outcome.timedOut) report.timed_out = true;
       }
+      const hint = execHint(errors, command, 'sandbox_shell') ?? (/\bpython3?\s+-c\b/.test(command) ? moduleHint(errors, command, 'sandbox_shell', pyFilesNamed(vfs)) : null);
+      if (hint) report.hint = hint;
       reportChanges(report, host.changes);
       return JSON.stringify(report, null, 1);
     }

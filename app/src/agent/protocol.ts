@@ -129,6 +129,8 @@ export interface RequestOptions {
   thinkBudget?: number;
   /** A reply that is prose to be read as it is written (a summary): no repeat penalty on it (proseFields). */
   plainProse?: boolean;
+  /** A step after the same step again and again: sampled anew where the server can be asked (variedFields). */
+  varied?: boolean;
 }
 
 function anthropicMessages(turns: Turn[]): unknown[] {
@@ -343,6 +345,18 @@ export function proseFields(provider: ThinkingProvider, options: Pick<RequestOpt
 }
 
 /**
+ * What a request asks of its sampling where its step came after the same step again and again (`varied`): a temperature
+ * of 1 and a seed of its own, to OAIY's engine and to other local servers, so that a model that writes the same call at
+ * the server's own temperature samples another. Nanbeige 4.3 33B (its thinking off) sent code_run the same failing script
+ * six times, each step's result saying what was wrong and how to change it, and three more after its conversation was
+ * compacted. Nothing to an API: OpenAI's reasoning models refuse a temperature.
+ */
+export function variedFields(provider: ThinkingProvider, options: Pick<RequestOptions, 'varied'>): Record<string, unknown> {
+  if (!options.varied || (thinksAs(provider) !== 'oaiy' && provider.type !== 'local')) return {};
+  return { temperature: 1, seed: Math.floor(Math.random() * 2 ** 31) };
+}
+
+/**
  * POST a request for a streamed reply, its events to `onEvent`. One that could not be read as a stream (a gateway that
  * labels a whole JSON reply as text, a stream with an event that is not JSON: AIProviderError.streamFault) is asked once
  * more without streaming, and read whole: the server did answer, and asked again as it was it answered the same way.
@@ -401,7 +415,7 @@ export async function sendTurn(
   // OpenAI's reasoning models take max_completion_tokens; other servers read max_tokens.
   if (isOpenAIHost(url)) body.max_completion_tokens = maxTokens;
   else body.max_tokens = maxTokens;
-  Object.assign(body, thinkingFields(provider, options), proseFields(provider, options));
+  Object.assign(body, thinkingFields(provider, options), proseFields(provider, options), variedFields(provider, options));
   const stream = new OpenAIStream(options.sink);
   const outcome = await postStreamed(provider, url, body, options, (event) => stream.accept(event));
   return decodeOpenAI(outcome.streamed ? stream.result() : outcome.data);

@@ -29,11 +29,15 @@ const script = [
   { text: 'Wrote note B in notes/b.txt.' },
   { calls: [{ name: 'update_plan', input: { goal: 'Two notes', items: [{ text: 'Note A', status: 'done' }, { text: 'Note B', status: 'done' }, { text: 'Read them over', status: 'done' }] } }] },
   { text: 'Both notes are written.' },
-  // "Say hello.": the provider fails once (a server error, not retried by itself), then answers when asked again.
+  // "Say hello.": the provider fails once (a server error), and is asked again by itself after a pause: answered.
   { fail: 503 },
   { text: 'Hello again: it worked the second time.' },
-  // "Fail once more.": fails; the next message is answered, and the first one's Try again is gone with it.
-  { fail: 503 },
+  // "Say goodbye.": fails as a model worker that stopped does (not asked again by itself: waiting does not mend it);
+  // answered when the person tries again.
+  { fail: 503, code: 'unavailable' },
+  { text: 'Goodbye: it worked when tried again.' },
+  // "Fail once more.": fails so again; the next message is answered, and the first one's Try again is gone with it.
+  { fail: 503, code: 'unavailable' },
   { text: 'The next one is answered.' },
   // "Write a long essay.": its reply begins, then waits (the person presses Stop); "Just say hi." is a request of its own.
   { text: 'Here is the first part of the essay', hold: true },
@@ -70,7 +74,7 @@ const model = createHttpServer((req, res) => {
     if (step.fail) {
       res.statusCode = step.fail;
       res.setHeader('content-type', 'application/json');
-      return res.end(JSON.stringify({ error: { message: 'the model is loading' } }));
+      return res.end(JSON.stringify({ error: { message: 'the model is loading', ...(step.code ? { code: step.code } : {}) } }));
     }
     res.setHeader('content-type', 'text/event-stream');
     // (the reply's words so far, and no end: the page stops it)
@@ -224,17 +228,29 @@ try {
     expect((await terminal(page, 'cat notes/a.txt notes/b.txt', 'AB')).includes('AB'), 'the notes are not there');
   });
 
-  await check('a run the provider failed offers Try again, which carries on without sending the request twice', async () => {
+  await check('a run the provider failed with a server error is asked again by itself after a pause, and carries on without sending the request twice', async () => {
     const before = requests.length;
     await page.type('.chat-input', 'Say hello.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('it worked the second time'), { timeout: 30_000 });
+    expect(requests.length === before + 2, `requests: ${requests.length - before}`);
+    const asked = JSON.stringify(requests.at(-1).messages).split('Say hello.').length - 1;
+    expect(asked === 1, `the request was sent ${asked} times in the retried conversation`);
+    const offered = await page.$$eval('.chat-log button.retry', (b) => b.filter((x) => x.textContent.includes('Try again')).length);
+    expect(offered === 0, `${offered} Try again buttons: the run should have gone on by itself`);
+  });
+
+  await check('a run the provider failed in a way waiting does not mend offers Try again, which carries on without sending the request twice', async () => {
+    const before = requests.length;
+    await page.type('.chat-input', 'Say goodbye.');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => [...document.querySelectorAll('.chat-log button.retry')].some((b) => b.textContent.includes('Try again')), { timeout: 30_000 }).catch(async () => {
       throw new Error(`no Try again button:\n${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-400)}`);
     });
     await page.evaluate(() => [...document.querySelectorAll('.chat-log button.retry')].find((b) => b.textContent.includes('Try again')).click());
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('it worked the second time'), { timeout: 30_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('it worked when tried again'), { timeout: 30_000 });
     expect(requests.length === before + 2, `requests: ${requests.length - before}`);
-    const asked = JSON.stringify(requests.at(-1).messages).split('Say hello.').length - 1;
+    const asked = JSON.stringify(requests.at(-1).messages).split('Say goodbye.').length - 1;
     expect(asked === 1, `the request was sent ${asked} times in the retried conversation`);
   });
 
