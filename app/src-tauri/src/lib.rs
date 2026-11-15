@@ -50,9 +50,10 @@ fn belongs_to_app(url: &Url, dev: Option<&Url>) -> bool {
     same_site(url, &app_url()) || dev.is_some_and(|d| same_site(url, d)) || matches!(url.scheme(), "blob" | "data" | "about")
 }
 
-/// A link that leaves the app: to the system browser (or mail client).
+/// A link that leaves the app: to the system browser (or mail client, or phone: a previewed SoftN app's link to a
+/// number, which the preview opens when the person says so).
 fn open_outside<R: Runtime>(app: &AppHandle<R>, url: &Url) {
-    if matches!(url.scheme(), "http" | "https" | "mailto") {
+    if matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
         let _ = app.opener().open_url(url.as_str(), None::<&str>);
     }
 }

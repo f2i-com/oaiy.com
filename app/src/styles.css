@@ -412,7 +412,21 @@ select.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px
 .preview-status[data-kind='ok'] { color: var(--ok-text); }
 .preview-status[data-kind='error'] { color: var(--err); }
 .preview-status[data-kind='busy'] { color: var(--warn-text); }
-.preview-frame { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.preview-frame { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
+/* A link out of the app, over it (linkBar.ts): where it goes, the whole address, and Open only when the person says so. */
+.preview-link-bar { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5; width: min(32rem, calc(100% - 24px)); display: flex; align-items: flex-start; gap: 10px; padding: 12px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-card); box-shadow: var(--shadow-card); outline: none; }
+.preview-link-bar[hidden] { display: none; }
+.preview-link-bar:focus-visible { box-shadow: 0 0 0 2px var(--focus), var(--shadow-card); }
+.preview-link-icon { flex: none; display: inline-flex; margin-top: 2px; color: var(--muted); }
+.preview-link-icon .icon, .preview-link-close .icon { width: 15px; height: 15px; }
+.preview-link-text { flex: 1; min-width: 0; }
+.preview-link-lead { margin: 0; font-size: 13px; line-height: 1.4; }
+.preview-link-name { font-weight: 600; overflow-wrap: anywhere; }
+.preview-link-address { margin: 2px 0 0; max-height: 4.2em; overflow-y: auto; font: 11px/1.4 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.preview-link-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+.preview-link-actions button { font-size: 12px; }
+.preview-link-close { flex: none; display: inline-flex; padding: 3px; background: none; border: 0; color: var(--muted); }
+.preview-link-close:hover { color: var(--text); background: var(--hover); }
 .preview-stage { flex: 1; align-self: stretch; min-width: 0; min-height: 0; display: flex; position: relative; }
 .preview-stage iframe { flex: 1; border: 0; background: #fff; width: 100%; height: 100%; }
 .preview-stage > .empty { margin: auto; max-width: 440px; padding: 24px; text-align: center; line-height: 1.55; font-size: 13px; }

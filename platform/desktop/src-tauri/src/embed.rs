@@ -501,7 +501,8 @@ pub fn agent_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>
 /// A link that leaves an embedded page: to the system browser. (On Linux through `xdg-open` with the computer's
 /// environment, where OAIY runs from an AppImage: the shell plugin's opener hands it the AppImage's libraries.)
 fn open_outside<R: Runtime>(app: &AppHandle<R>, url: &Url) {
-    if matches!(url.scheme(), "http" | "https" | "mailto") {
+    // (a phone number too: a SoftN app's link to one, which the Agent's preview opens when the person says so)
+    if matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
         #[cfg(target_os = "linux")]
         {
             let _ = app;

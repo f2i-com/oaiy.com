@@ -193,6 +193,46 @@ try {
     expect(text.includes('Groceries'), text);
   });
 
+  await check('a link in the app to another site is shown over it, and opened only when the person says so, once it has been shown a moment', async () => {
+    const frame = appFrame(page);
+    // A link as an app's page has one; the frame hands on the person's click on it (SoftN's links/1).
+    await frame.evaluate(() => {
+      const a = document.createElement('a');
+      a.id = 'outside-link';
+      a.href = 'https://example.com/docs?from=app';
+      a.textContent = 'Docs';
+      document.querySelector('.softn-app').prepend(a);
+    });
+    await page.evaluate(() => {
+      window.__opened = [];
+      window.open = (url, target, features) => {
+        window.__opened.push([String(url), target, features]);
+        return null;
+      };
+    });
+    await frame.click('#outside-link');
+    await page.waitForSelector('.preview-link-bar:not([hidden])', { timeout: 10_000 });
+    const said = await page.$eval('.preview-link-bar', (e) => e.innerText);
+    expect(/This app links to\s+example\.com/.test(said) && said.includes('https://example.com/docs?from=app'), `the bar: ${said}`);
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT.replace('.png', '-outside-link.png') });
+    // Pressed at once, as a press meant for the app would land: nothing opens.
+    await page.click('.preview-link-bar button.primary');
+    expect((await page.evaluate(() => window.__opened.length)) === 0, 'a press as the bar appeared opened the link');
+    await new Promise((r) => setTimeout(r, 800));
+    await page.click('.preview-link-bar button.primary');
+    const opened = await page.evaluate(() => window.__opened);
+    expect(opened.length === 1 && opened[0][0] === 'https://example.com/docs?from=app' && opened[0][1] === '_blank' && opened[0][2] === 'noopener,noreferrer', `opened: ${JSON.stringify(opened)}`);
+    expect(await page.$eval('.preview-link-bar', (e) => e.hidden), 'the bar stayed after Open');
+    // The app is where it was: the click took the preview nowhere.
+    expect((await frameText(page)).includes('Groceries'), 'the app left the preview');
+    // Escape puts a newer one away, and leaves full screen alone.
+    await frame.click('#outside-link');
+    await page.waitForSelector('.preview-link-bar:not([hidden])', { timeout: 10_000 });
+    await page.keyboard.press('Escape');
+    expect(await page.$eval('.preview-link-bar', (e) => e.hidden), 'Escape left the bar up');
+    await frame.evaluate(() => document.getElementById('outside-link')?.remove());
+  });
+
   await check('a broken app is reported in the preview and by /softn check', async () => {
     const status = await afterRender(page, () => terminal(page, 'cp main.js /tmp.bak && echo "function broken( {" >> main.js'), 'broken logic');
     expect(/error/.test(status), `status: ${status}`);

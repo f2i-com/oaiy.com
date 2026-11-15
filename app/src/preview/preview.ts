@@ -34,6 +34,8 @@ import { appFiles, appLabel, findApps, isSoftnApp, logicSyntax } from '../softn/
 import { findPages, pageFiles, pageLabel } from './page';
 import { findModels, modelFiles, modelLabel } from './model';
 import { KEPT_STATUS, KEPT_TITLE, LiveFrame, engineMismatch, fitNote, frameSays, isLoadSyntaxError, plainProblem, updateSaid } from './liveFrame';
+import { LinkBar } from './linkBar';
+import { outsideLinkOf } from './outsideLink';
 import FACADE from './zippDom.guest.js?raw';
 
 export type PreviewTarget = { kind: 'app'; root: string } | { kind: 'page'; path: string } | { kind: 'model'; path: string };
@@ -214,6 +216,8 @@ export class Preview {
   target: PreviewTarget | null = null;
   private readonly frameHost = h('div.preview-frame');
   private readonly stage = h('div.preview-stage');
+  /** A link in the app to another site, a mail address or a number, shown over it until the person opens it or not. */
+  private readonly linkBar = new LinkBar();
   private viewportSize: (Viewport & { preset?: string }) | null = null;
   private scale = 1;
   /** When the frame last changed size: the page's resize handlers run a moment later. */
@@ -342,7 +346,7 @@ export class Preview {
     });
     window.addEventListener('message', (event) => this.fromBridge(event));
     new ResizeObserver(() => this.layout()).observe(this.frameHost);
-    this.frameHost.append(this.stage);
+    this.frameHost.append(this.stage, this.linkBar.element);
     // (the status after the size picker, then Reload and Full screen at the right; on a narrow pane the two are their icons)
     this.element.append(h('div.pane-title', h('span.preview-kicker', 'Preview'), this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload, this.fullButton), this.banner, this.frameHost);
     this.picker.hidden = true;
@@ -803,6 +807,8 @@ export class Preview {
     this.problems = [];
     this.collecting = null;
     this.banner.hidden = true;
+    // (a link the frame being replaced handed on is not the new one's to open)
+    this.linkBar.hide();
     this.frame = null;
   }
 
@@ -1118,6 +1124,11 @@ export class Preview {
           this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
         } else if (data?.type === 'call') {
           channel.port1.postMessage({ id: data.id, result: { error: 'This preview has no backend: server/ actions run only when the app is deployed.' } });
+        } else if (data?.type === 'link') {
+          // A link the person clicked in the app to another site, a mail address or a number (SoftN's `links/1`): shown
+          // over the app, and opened only when they say so. Anything that is no such address is let go.
+          const outside = outsideLinkOf((data as { href?: unknown }).href, location.origin);
+          if (outside) this.linkBar.show(outside);
         }
       };
       frame.contentWindow!.postMessage(
