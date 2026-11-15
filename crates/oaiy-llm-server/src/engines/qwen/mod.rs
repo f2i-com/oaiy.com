@@ -1498,13 +1498,26 @@ impl QwenEngine {
             // anywhere once a whole turn has passed with none. Each time halves what the next run is let be. A reply
             // turned so `TURNS` times is stopped. A greedy request's rows near a run's limit are read back whole
             // (`CycleGuard::near`, below), so it is turned as another is; one whose row is still the model's pick
-            // alone (no other token to take) is stopped.
-            if let Some(cycle) = cycles.over(next, turned).filter(|_| self.cycles) {
-                if cycle.past >= cycle.period || tok.decode(&[next]).contains([',', ';', '\n']) {
-                    let other = if turned < TURNS { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
+            // alone (no other token to take) is stopped. A long block written again whole (a file's second copy in
+            // the call that writes it) is stopped at once: turned, the copy would stay in the file. So is any run in a
+            // tool call: turned, the call closed with the run in what it wrote (a 33B with its thinking off wrote
+            // `dirs.indexOf(` 513 times into a file, was turned, closed the call and saved the file so, then wrote the
+            // file again into the same run). A short run that opens more than it closes (`f(f(f(`) is one after 32
+            // turns (`CycleGuard::nested`), where its run's own limit is far longer. Stopped, the reply says what it
+            // repeated (`repetition::stopped`), which OAIY's Agent tells the model.
+            let opens = |turn: &[u32]| crate::guards::repetition::opens_more(&tok.decode(turn));
+            let found = if self.cycles { cycles.over(next, turned).or_else(|| cycles.nested(next, opens)) } else { None };
+            if let Some(cycle) = found {
+                if in_call || cycle.whole() || cycle.past >= cycle.period || tok.decode(&[next]).contains([',', ';', '\n']) {
+                    let other = if turned < TURNS && !cycle.whole() && !in_call { logits.sample_but(next, &job.sampling, &mut rng) } else { None };
                     let Some(other) = other else {
                         if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
-                        return Err(format!("{}: the reply went on repeating the same {} tokens ({} tokens of them) and was stopped", crate::guards::repetition::CODE, cycle.period, cycle.span));
+                        // (the turn as the run goes on, the token it would have taken last: at its limit, as the run
+                        // began, `f(` and not `(f`)
+                        let turn: Vec<u32> = generated[generated.len().saturating_sub(cycle.period - 1)..].iter().copied().chain([next]).collect();
+                        let turn = tok.decode(&turn);
+                        if self.log { eprintln!("  Qwen: the reply repeated the same {} tokens for {} tokens{}: stopped", cycle.period, cycle.span, if in_call { " in a tool call" } else { "" }); }
+                        return Err(crate::guards::repetition::stopped(cycle, &turn, in_call));
                     };
                     turned += 1;
                     if self.log { eprintln!("  Qwen: the reply repeated the same {} tokens for {} tokens: turned from it ({turned} of {TURNS})", cycle.period, cycle.span); }
@@ -1581,7 +1594,7 @@ impl QwenEngine {
             } else {
                 // (a greedy request's next rows read back whole where a run nears its limit, for the guard to have
                 // another token to take than the run's: the model's pick alone has none)
-                let pick = greedy && !(self.cycles && cycles.near(turned, 16));
+                let pick = greedy && !(self.cycles && (cycles.near(turned, 16) || cycles.nested_near(16, opens)));
                 // its drafts, then the token and them in one check; else the token alone
                 if let Some((at, asked)) = last_check.take().filter(|_| looks_up) {
                     lookup_k = if drafts_taken - at == asked { lookup_most() } else { LOOKUP_DRAFTS.min(lookup_most()) };

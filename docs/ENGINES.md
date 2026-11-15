@@ -270,18 +270,33 @@ OpenAI's.
   A model can write the same few tokens over and over and not stop: the 27B, testing a
   game through a tool, filled the call's list with `{"key":"ArrowRight"},` until it was
   cut off. The engine watches every reply, a tool call's payload too, for its last tokens
-  being the same every 1 to 64 tokens, and lets such a run be until it is longer than
-  what a reply means to write is (64 turns and 512 tokens; 3,072 tokens of a run of one
-  to three tokens, which data is made of). Past that it has the model pick another token
-  than the run's next, at the run's comma or line end where it has one, which closes a
-  list: the same request then ended as a readable call of 74 actions in 14 s, where
-  unguarded it ran to its 6,000-token limit and was unreadable. Each time halves what
-  the reply's next run is let be (a model turned from an item may go on with the same
-  item spelt another way). A reply turned three times that goes back to its run is
-  stopped with `generation_repetition` (HTTP 422, or the stream's error), which OAIY's
-  Agent answers by asking once more.
+  being the same every 1 to 8,192 tokens, and lets such a run be until it is longer than
+  what a reply means to write is: up to 64 tokens a turn, 128 turns and 2,048 tokens
+  (4,096 of a run of one to three tokens); from 65 to 1,024, eight turns and 1,024 tokens
+  where the turn is made of many kinds of token (a function written again), 32 turns and
+  4,096 tokens where it is made of a few (a map's row of cells, which is data). A turn of
+  up to 64 tokens that opens more brackets than it closes (`f(f(f(`, a call written
+  inside itself) is a run after 32 turns and 128 tokens: no data is made of one, and
+  nothing after it can close it. Nanbeige 4.3 33B with its thinking off wrote
+  `dirs.indexOf(` 513 times into a Tetris file under the run's own limit of 2,048 tokens,
+  twice. Past its limit, in the reply's words or its thought, the engine has the model
+  pick another token than the run's next, at the run's comma or line end where it has
+  one (where a list closes). Each time halves what the reply's next run is let be (a
+  model turned from an item may go on with the same item spelt another way). A reply
+  turned three times that goes back to its run is stopped with `generation_repetition`
+  (HTTP 422, or the stream's error). So, at once, is a run in a tool call: turned, the
+  call would close with the run in what it writes (the 33B's file was saved with its 513
+  copies, and it then wrote the whole file again into the same run; the 27B's list,
+  turned, closed as a call of 74 actions, the same key over and over, where now the model
+  is told what it repeated). So is a block of more than 1,024
+  tokens of many kinds written again whole (a file's second copy), 128 tokens into its
+  third copy. Unguarded, each ran to the reply's limit. The error says what
+  repeated, quoted as JSON writes a string, how many times, and whether in a tool call
+  (`… repeating the same 4 tokens ("dirs.indexOf(", 32 times: 128 tokens) in a tool call
+  and was stopped`); OAIY's Agent asks once more and tells the model what it repeated.
   `--repetition-guard off` turns it off. The engine's `repeat_penalty` and the other
-  penalties are not applied by this engine's sampler.
+  penalties apply to the reply's prose alone: not its thought, never inside a tool call,
+  where code rightly repeats.
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
   instead of once per chunk (~6× faster here than chunked prefill), up to 20,480 tokens a
   pass (`--layered-max`); a longer prompt splits into equal passes, and a pass that runs out

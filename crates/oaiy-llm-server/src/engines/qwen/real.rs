@@ -23,6 +23,10 @@ const WORDS: u32 = 100;
 /// Its `<think>`: after its words, so their ids are as they were, and past its logits, so it never writes one (a prompt
 /// that ends with it opens the reply's thought, as a thinking template's does).
 pub(crate) const THINK: u32 = FIRST + WORDS;
+/// A tool call's opening, and a call opened inside itself (`f(`): after `<think>`, so the ids before are as they were,
+/// and written only where a stuck model's run or lead names them.
+pub(crate) const CALL: u32 = THINK + 1;
+pub(crate) const NEST: u32 = THINK + 2;
 
 pub(crate) struct FakeModel {
     pub tok: Tokenizer,
@@ -34,6 +38,8 @@ pub(crate) struct FakeModel {
     /// A model stuck in a run: whatever it has read, its likeliest next token is the next of these in turn, and its
     /// next likeliest the other one (the end of the reply, or a word after which it goes back to its run).
     pub stuck: Option<(Vec<u32>, u32)>,
+    /// What a stuck model writes first, before its run: from the cache's length given (a prompt's), these in turn.
+    pub lead: Option<(usize, Vec<u32>)>,
     /// Its conversations set aside whole, as a dense Llama's are, rather than parked.
     pub aside: bool,
 }
@@ -43,8 +49,10 @@ impl FakeModel {
         let mut tokens = vec!["<pad>".to_string(), "<|im_start|>".into(), "<|im_end|>".into(), "</think>".into()];
         for i in FIRST..FIRST + WORDS { tokens.push(format!("{i}.")); }
         tokens.push("<think>".into());
+        tokens.push("<tool_call>".into());
+        tokens.push("f(".into());
         let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![1, 2, 3, THINK], END).unwrap();
-        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, aside: false }
+        FakeModel { tok, width: 4, panic_on, forwarded, stuck: None, lead: None, aside: false }
     }
 
     fn mix(t: u32, pos: u32, salt: u32, j: u32) -> f32 {
@@ -90,9 +98,10 @@ impl FakeModel {
             for x in &kv.v[slot].data()[..n] { eat(x.to_bits()); }
         }
         for t in kv.ssm_state.iter().chain(&kv.ssm_conv).flatten() { for x in t.data() { eat(x.to_bits()); } }
-        // (`<think>` has a row only where a stuck model's run names it: a model that opens its own thought; every other
-        // model never writes one)
-        let rows = if self.stuck.as_ref().is_some_and(|(run, other)| run.contains(&THINK) || *other == THINK) { (THINK + 1) as usize } else { (FIRST + WORDS) as usize };
+        // (`<think>` and the tokens after it have a row only where a stuck model's run or lead names them: a model that
+        // opens its own thought, or a call; every other model never writes one)
+        let named = self.stuck.iter().flat_map(|(run, other)| run.iter().chain([other])).chain(self.lead.iter().flat_map(|(_, lead)| lead)).copied().max();
+        let rows = ((FIRST + WORDS) as usize).max(named.map_or(0, |t| t as usize + 1));
         let mut logits = vec![0.0f32; rows];
         match &self.stuck {
             Some((run, other)) => {
@@ -100,6 +109,11 @@ impl FakeModel {
                 logits[*other as usize] = 5.0;
             }
             None => logits[(FIRST as u64 + h % WORDS as u64) as usize] = 1.0,
+        }
+        if let Some((from, lead)) = &self.lead {
+            if let Some(&first) = kv.len.checked_sub(*from).and_then(|at| lead.get(at)) {
+                logits[first as usize] = 20.0;
+            }
         }
         Ok(Tensor::from_vec(logits, vec![rows]))
     }
@@ -111,6 +125,10 @@ pub(crate) fn new_kv(max: usize) -> KvCache { kv_like_flash(max) }
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Reply {
     pub words: Vec<u32>,
+    /// What it wrote of tool calls (the engine holds them back from its text), as the previews of them said.
+    pub calls: String,
+    /// Its text as the engine streamed it (`words` read from it up to the first that is not a word).
+    pub text: String,
     /// (cached tokens, source, common) as the engine reported them.
     pub reuse: Option<(usize, &'static str, usize)>,
     pub error: Option<String>,
@@ -146,6 +164,16 @@ impl Engine {
         Self::start_with(0, None, Some((run.to_vec(), other)), guard)
     }
 
+    /// One whose model writes `lead` first (its reply's, after a prompt of `prompt` tokens), then is stuck in `run`.
+    pub fn start_stuck_after(prompt: usize, lead: &[u32], run: &[u32], other: u32) -> Self {
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let model = FakeModel { stuck: Some((run.to_vec(), other)), lead: Some((prompt, lead.to_vec())), ..FakeModel::new(None, forwarded.clone()) };
+        let engine = QwenEngine::new(Hybrid::Fake(Box::new(model)), None, 65536, false).park_up_to(0).repetition_guard(true);
+        let (tx, rx) = channel();
+        let thread = std::thread::spawn(move || engine.run(rx));
+        Engine { tx: Some(tx), thread: Some(thread), forwarded }
+    }
+
     fn start_with(budget: usize, panic_on: Option<u32>, stuck: Option<(Vec<u32>, u32)>, guard: bool) -> Self {
         let forwarded = Arc::new(AtomicUsize::new(0));
         let model = FakeModel { stuck, ..FakeModel::new(panic_on, forwarded.clone()) };
@@ -171,12 +199,15 @@ impl Engine {
             match event {
                 Event::CacheReuse { cached, source, common } => reply.reuse = Some((cached, source, common)),
                 Event::Text(t) => text.push_str(&t),
+                Event::ToolPreview { text, .. } => reply.calls.push_str(&text),
                 Event::Error(e) => reply.error = Some(e),
                 Event::Done { .. } => reply.done = true,
                 _ => {}
             }
         }
-        reply.words = text.split('.').filter(|w| !w.is_empty()).map(|w| w.parse().unwrap()).collect();
+        // (a stuck model's `f(` is no word: read up to it)
+        reply.words = text.split('.').filter(|w| !w.is_empty()).map_while(|w| w.parse().ok()).collect();
+        reply.text = text;
         reply
     }
 
@@ -290,6 +321,48 @@ mod tests {
         assert!(e.ask(&prompt, 20_000).error.is_some());
         let again = e.ask(&prompt, 40);
         assert_eq!((again.words.len(), again.error), (40, None));
+    }
+
+    /// A model that writes a long block again whole (a file's second copy in the call that writes it; its words of many
+    /// kinds, no shorter run among them): stopped in the third copy, saying why, and not turned (another word there
+    /// would leave the copy in the file). Left alone it wrote to the reply's last token.
+    #[test]
+    fn a_reply_that_writes_a_long_block_again_is_stopped_in_its_third_copy() {
+        let mut x = 7u32;
+        let block: Vec<u32> = (0..1100)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                FIRST + x % WORDS
+            })
+            .collect();
+        let prompt: Vec<u32> = std::iter::once(IM).chain(20..40).collect();
+        let left = Engine::start_stuck(&block, END, false).ask(&prompt, 3_000);
+        assert_eq!((left.words.len(), left.done, left.error.is_none()), (3_000, true, true), "unguarded: to the reply's limit");
+        let reply = Engine::start_stuck(&block, END, true).ask(&prompt, 3_000);
+        let error = reply.error.expect("stopped");
+        assert!(error.contains(crate::guards::repetition::CODE) && error.contains("repeating the same 1100 tokens"), "{error}");
+        assert_eq!(reply.words.len(), 2 * 1100 + crate::guards::repetition::CycleGuard::INTO - 1, "its two copies and the third's first words");
+    }
+
+    /// A model that writes a call inside itself again and again in a tool call's arguments (a 33B with its thinking off
+    /// wrote `dirs.indexOf(` 513 times into a file, was turned at the run's limit, closed the call and saved the file
+    /// so): stopped at 32 turns of the run (`CycleGuard::nested`; 128 tokens of a one-token turn), not turned, saying
+    /// what it repeated and that it was in a call. Outside a call the same run is turned from, as a run is.
+    #[test]
+    fn a_reply_nesting_a_call_in_itself_in_a_tool_call_is_stopped_saying_what_it_wrote() {
+        let prompt: Vec<u32> = std::iter::once(IM).chain(20..40).collect();
+        let reply = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST], END).ask(&prompt, 3_000);
+        assert_eq!(reply.error.as_deref(), Some("generation_repetition: the reply went on repeating the same token (\"f(\", 128 times: 128 tokens) in a tool call and was stopped"));
+        assert_eq!(reply.calls, format!("<tool_call>{}", "f(".repeat(127)), "the call as written, up to the run's 128th");
+        // outside a call: turned from a turn past its limit (where the other token ends the reply), as a run is
+        let turned = Engine::start_stuck(&[NEST], END, true).ask(&prompt, 3_000);
+        assert!(turned.done && turned.error.is_none(), "{:?}", turned.error);
+        assert_eq!(turned.text, "f(".repeat(128));
+        // and left alone, it writes to the reply's limit
+        let left = Engine::start_stuck(&[NEST], END, false).ask(&prompt, 500);
+        assert_eq!(left.text, "f(".repeat(500));
     }
 
     #[test]

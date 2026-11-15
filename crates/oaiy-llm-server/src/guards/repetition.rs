@@ -33,15 +33,19 @@ impl Guard {
 /// `{"key":"ArrowRight"},` until it was stopped (a list no penalty on prose reaches, and nothing else ended it before
 /// the reply's 64,000 tokens).
 ///
-/// A run is the reply's last tokens being the same every `period` tokens, 1,024 at most. What a reply means to write
+/// A run is the reply's last tokens being the same every `period` tokens, 8,192 at most. What a reply means to write
 /// repeats too (a map's rows of zeros, a table's rules), so a run is let be until it is longer than such things are:
 /// [`CycleGuard::limit`]. Past that, [`CycleGuard::over`] says of the token sampled next whether it is the run's
-/// next, and the caller has the model pick another, which ends a list where its next item was the same again.
+/// next, and the caller has the model pick another, which ends a list where its next item was the same again. A
+/// block longer than [`CycleGuard::LONG`] written again whole ([`Cycle::whole`]) is not turned from but stopped:
+/// another token in the middle of a file's second copy would leave the copy in the file, broken. A short run that
+/// opens more brackets than it closes (`f(f(f(`, [`CycleGuard::nested`]) has a limit of its own, far shorter: no data
+/// is made of it. (The engine stops, rather than turns, any run in a tool call: what the call writes would keep it.)
 pub(crate) struct CycleGuard {
     /// The last [`CycleGuard::MOST`] tokens, the newest last.
     last: std::collections::VecDeque<u32>,
     /// For each period, how many of the newest tokens are each the token that period before it.
-    run: [usize; CycleGuard::MOST + 1],
+    run: Vec<usize>,
 }
 
 /// A run past its limit that the token sampled would go on: its period, its length with that token, and how far
@@ -53,19 +57,39 @@ pub(crate) struct Cycle {
     pub past: usize,
 }
 
+impl Cycle {
+    /// A block of more than [`CycleGuard::LONG`] tokens written again whole (a file, a call): stopped, not turned.
+    pub fn whole(&self) -> bool {
+        self.period > CycleGuard::LONG
+    }
+}
+
 impl Default for CycleGuard {
     fn default() -> Self {
-        Self { last: Default::default(), run: [0; Self::MOST + 1] }
+        Self { last: std::collections::VecDeque::with_capacity(Self::MOST), run: vec![0; Self::MOST + 1] }
     }
 }
 
 impl CycleGuard {
-    /// The longest period watched: a function or a test written again and again, a few hundred tokens a turn (a 33B
-    /// writing code into a tool call at 0.6 did so until its reply's 8,192 tokens, where 64 was watched).
-    pub const MOST: usize = 1024;
+    /// The longest period watched: a file or a call written again whole, a few thousand tokens a turn. (A function or
+    /// a test written again and again is a few hundred: a 33B writing code into a tool call at 0.6 did so until its
+    /// reply's 8,192 tokens, where 64 was watched; with 1,024 watched, a file written again went on to the reply's
+    /// limit as before.)
+    pub const MOST: usize = 8192;
 
     /// The longest period [`Self::limit`] gives its limit alone; a longer one's is [`Self::limit_of`]'s.
     pub const SHORT: usize = 64;
+
+    /// The longest period judged by its turns ([`Self::limit_of`]: eight of a turn of many tokens). A longer one of many
+    /// tokens is a block written again whole, which nothing a reply means to write is: let be its second copy and
+    /// [`Self::INTO`] tokens of a third.
+    pub const LONG: usize = 1024;
+
+    /// How far into a long block's third copy it is let go.
+    pub const INTO: usize = 128;
+
+    /// The turns a run that opens more brackets than it closes is let be ([`Self::nested`]), and 128 tokens at least.
+    pub const NESTED: usize = 32;
 
     /// The tokens a run of `period` may be before it is taken for one without end: 128 of its turns and 2,048 tokens
     /// at least, or 4,096 tokens of a run of one to three tokens. What a reply means to write repeats for that long:
@@ -79,53 +103,88 @@ impl CycleGuard {
     /// The limit of a run of `period` whose turn is `turn`: [`Self::limit`] up to [`Self::SHORT`] tokens a turn; past
     /// that, by what the turn is made of. A few tokens over and over (a map's row of cells, `0` and `,`) is data, let be
     /// 32 turns and 4,096 tokens at least; a turn of many (a function written again) is a run without end after eight
-    /// turns and 1,024 tokens: no code means the same block of 65 tokens or more eight times in a row.
+    /// turns and 1,024 tokens: no code means the same block of 65 tokens or more eight times in a row. A turn of many
+    /// longer than [`Self::LONG`] (a file written again whole) is one after its second copy and [`Self::INTO`] tokens:
+    /// eight such turns would be more than a reply holds.
     pub fn limit_of(period: usize, turn: &[u32]) -> usize {
         if period <= Self::SHORT {
             return Self::limit(period);
         }
+        Self::limit_by(period, Self::many(turn.iter().copied()))
+    }
+
+    /// [`Self::limit_of`] past [`Self::SHORT`] tokens a turn, of a turn of `many` tokens (more than eight) or of few.
+    fn limit_by(period: usize, many: bool) -> usize {
+        match (many, period > Self::LONG) {
+            (true, true) => 2 * period + Self::INTO,
+            (true, false) => (8 * period).max(1024),
+            (false, _) => (32 * period).max(4096),
+        }
+    }
+
+    /// Whether a turn is made of more than eight tokens.
+    fn many(turn: impl IntoIterator<Item = u32>) -> bool {
         let mut seen: Vec<u32> = Vec::with_capacity(9);
-        for &t in turn {
+        for t in turn {
             if !seen.contains(&t) {
                 seen.push(t);
                 if seen.len() > 8 {
-                    return (8 * period).max(1024);
+                    return true;
                 }
             }
         }
-        (32 * period).max(4096)
+        false
     }
 
-    /// The newest `period` tokens: a run's turn.
-    fn turn(&self, period: usize) -> Vec<u32> {
-        let n = self.last.len();
-        self.last.range(n - period..).copied().collect()
+    /// The limit of the run of `period` the newest tokens are in ([`Self::limit_of`], its turn read where it lies), in a
+    /// reply turned from a run `turned` times already: halved each time, down to eight turns of the run. (A long
+    /// block's is never turned from, so never halved.)
+    fn limit_here(&self, period: usize, turned: usize) -> usize {
+        if period > Self::LONG {
+            let n = self.last.len();
+            return Self::limit_by(period, Self::many(self.last.range(n - period..).copied()));
+        }
+        let limit = if period <= Self::SHORT {
+            Self::limit(period)
+        } else {
+            let n = self.last.len();
+            Self::limit_by(period, Self::many(self.last.range(n - period..).copied()))
+        };
+        (limit >> turned.min(8)).max(8 * period)
+    }
+
+    /// The least [`Self::limit_here`] a run of `period` can have, whatever its turn is made of: a run shorter is none,
+    /// and what it is made of (and its divisors) is read only past that.
+    fn least_at(period: usize, turned: usize) -> usize {
+        if period > Self::LONG {
+            return 2 * period + Self::INTO;
+        }
+        let least = if period <= Self::SHORT { Self::limit(period) } else { (8 * period).max(1024) };
+        (least >> turned.min(8)).max(8 * period)
     }
 
     /// Whether a run is within `margin` tokens of its limit, so that [`Self::over`] may soon say so of a token: a
     /// greedy request's rows are then read back whole, as the model's pick alone (made on its GPU) leaves no other
     /// token to take, and the reply would be stopped where it could have been turned. `margin` covers the rows a
-    /// check of drafts made before this was asked.
+    /// check of drafts made before this was asked. (A long block's run is stopped, not turned: not asked of.)
     pub fn near(&self, turned: usize, margin: usize) -> bool {
         let n = self.last.len();
-        (1..=Self::MOST.min(n)).any(|period| {
-            // (a long turn's limit is at least 1,024 tokens: what it is made of read only for a run that long)
-            let least = if period <= Self::SHORT { Self::limit(period) } else { (8 * period).max(1024) };
-            if self.run[period] == 0 || self.run[period] + 1 + period + margin < (least >> turned.min(8)).max(8 * period) {
+        (1..=Self::LONG.min(n)).any(|period| {
+            if self.run[period] == 0 || self.run[period] + 1 + period + margin < Self::least_at(period, turned) {
                 return false;
             }
-            let limit = (Self::limit_of(period, &self.turn(period)) >> turned.min(8)).max(8 * period);
-            self.run[period] + 1 + period + margin >= limit
+            self.run[period] + 1 + period + margin >= self.limit_here(period, turned)
         })
     }
 
     /// The token is the reply's next.
     pub fn push(&mut self, token: u32) {
-        let n = self.last.len();
-        for period in 1..=Self::MOST {
-            self.run[period] = if period <= n && self.last[n - period] == token { self.run[period] + 1 } else { 0 };
+        // (each period's run against the token that far back, the newest first; a period longer than the reply so far
+        // has had no run, and has none)
+        for (run, &before) in self.run[1..].iter_mut().zip(self.last.iter().rev()) {
+            *run = if before == token { *run + 1 } else { 0 };
         }
-        if n == Self::MOST {
+        if self.last.len() == Self::MOST {
             self.last.pop_front();
         }
         self.last.push_back(token);
@@ -137,21 +196,100 @@ impl CycleGuard {
     /// that goes on with the same item spelt another way has shown what it is doing, and is not given as long again.
     pub fn over(&self, next: u32, turned: usize) -> Option<Cycle> {
         let n = self.last.len();
-        (1..=Self::MOST.min(n)).find_map(|period| {
-            if self.last[n - period] != next {
+        (1..=Self::MOST.min(n)).zip(self.last.iter().rev()).find_map(|(period, &before)| {
+            if before != next {
                 return None;
             }
             let span = self.run[period] + 1 + period;
-            // (a long turn's limit is at least 1,024 tokens: what it is made of, and its divisors, read only past that)
-            let least = if period <= Self::SHORT { Self::limit(period) } else { (8 * period).max(1024) };
-            if span < (least >> turned.min(8)).max(8 * period) {
+            if span < Self::least_at(period, turned) {
                 return None;
             }
-            let shorter = (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span);
-            let limit = (Self::limit_of(period, &self.turn(period)) >> turned.min(8)).max(8 * period);
-            (!shorter && span >= limit).then(|| Cycle { period, span, past: span - limit })
+            // (a run of a shorter period too is that period's: asked first, as a run of one token is a run of every
+            // period, and what each is made of would be read for nothing)
+            if (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span) {
+                return None;
+            }
+            let limit = self.limit_here(period, turned);
+            (span >= limit).then(|| Cycle { period, span, past: span - limit })
         })
     }
+
+    /// The limit of a run of `period` that opens more than it closes: [`Self::NESTED`] turns, and 128 tokens at least
+    /// (a parser's test nesting arrays 32 deep is let be).
+    fn nested_limit(period: usize) -> usize {
+        (Self::NESTED * period).max(128)
+    }
+
+    /// Whether `next` would go on a run of a short turn (up to [`Self::SHORT`] tokens) that opens more brackets than it
+    /// closes, at [`Self::nested_limit`] or past it: a call or an index written inside itself again and again (`f(f(f(`,
+    /// `a[b[a[b[`), which no code or data means past a few levels, and which nothing after it can make whole. Its own
+    /// limit, under [`Self::limit`]'s: a 33B with its thinking off wrote `dirs.indexOf(` 513 times (2,052 tokens, that
+    /// limit) into a file, twice. `opens` says of a turn whether it opens more than it closes ([`opens_more`] of it
+    /// written out); it is asked only of a run that long.
+    pub fn nested(&self, next: u32, opens: impl Fn(&[u32]) -> bool) -> Option<Cycle> {
+        let n = self.last.len();
+        (1..=Self::SHORT.min(n)).zip(self.last.iter().rev()).find_map(|(period, &before)| {
+            if before != next {
+                return None;
+            }
+            let span = self.run[period] + 1 + period;
+            let limit = Self::nested_limit(period);
+            if span < limit {
+                return None;
+            }
+            // (a run of a shorter period too is that period's, as in `over`)
+            if (1..period).any(|d| period % d == 0 && self.last[n - d] == next && self.run[d] + 1 + d >= span) {
+                return None;
+            }
+            let turn: Vec<u32> = self.last.range(n - period..).copied().collect();
+            opens(&turn).then(|| Cycle { period, span, past: span - limit })
+        })
+    }
+
+    /// Whether a run that opens more than it closes is within `margin` tokens of its limit: [`Self::near`] for
+    /// [`Self::nested`]'s runs.
+    pub fn nested_near(&self, margin: usize, opens: impl Fn(&[u32]) -> bool) -> bool {
+        let n = self.last.len();
+        (1..=Self::SHORT.min(n)).any(|period| {
+            if self.run[period] == 0 || self.run[period] + 1 + period + margin < Self::nested_limit(period) {
+                return false;
+            }
+            opens(&self.last.range(n - period..).copied().collect::<Vec<_>>())
+        })
+    }
+}
+
+/// Whether text opens more brackets (`(`, `[`, `{`) than it closes.
+pub(crate) fn opens_more(text: &str) -> bool {
+    let depth: i64 = text.chars().map(|c| match c {
+        '(' | '[' | '{' => 1,
+        ')' | ']' | '}' => -1,
+        _ => 0,
+    }).sum();
+    depth > 0
+}
+
+/// What a reply the guard stopped says: [`CODE`], how many tokens the run's turn is, the turn written out (quoted and
+/// escaped as JSON writes a string, its middle left out past 80 characters), how many times it came, and whether that
+/// was in a tool call (where nothing the call wrote is used). OAIY's Agent quotes it to the model when it asks again.
+pub(crate) fn stopped(cycle: Cycle, turn: &str, in_call: bool) -> String {
+    let chars: Vec<char> = turn.chars().collect();
+    let shown: String = if chars.len() > 80 { chars[..60].iter().chain(&['…']).chain(&chars[chars.len() - 19..]).collect() } else { turn.to_owned() };
+    let mut quoted = String::from('"');
+    for c in shown.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            c if (c as u32) < 0x20 => quoted.push_str(&format!("\\u{:04x}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    let what = if cycle.period == 1 { "token".to_owned() } else { format!("{} tokens", cycle.period) };
+    format!("{CODE}: the reply went on repeating the same {what} ({quoted}, {} times: {} tokens){} and was stopped", cycle.span / cycle.period.max(1), cycle.span, if in_call { " in a tool call" } else { "" })
 }
 
 /// Tiny exact cycles such as repeated intentions to call a tool. Only used
@@ -370,10 +508,149 @@ mod tests {
             assert_eq!(guard.over(next, 0), None);
             guard.push(next);
         }
-        // nor one whose repeats are longer than it watches (a chapter written again: the other guards' to judge)
-        let chapter: Vec<u32> = (0..1100).collect();
+        // nor one whose repeats are longer than it watches (a book written again)
+        let book: Vec<u32> = (0..CycleGuard::MOST as u32 + 8).collect();
         let mut guard = CycleGuard::default();
-        assert!(until_over(&mut guard, &chapter, 12_000).is_none());
+        assert!(until_over(&mut guard, &book, 2 * book.len() + 1000).is_none());
+    }
+
+    /// `n` tokens of many kinds with no shorter period among them: a stretch of code or prose, as the guard sees one.
+    fn stretch(n: usize, seed: u32) -> Vec<u32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                1000 + x % 5000
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_block_written_again_whole_is_a_cycle_into_its_third_copy() {
+        // a file of 1,100 tokens written again into the call that writes it: let be its second copy and 128 tokens of a
+        // third, where eight turns (8,800 tokens) would have let it go on to the reply's limit
+        let file = stretch(1100, 7);
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &file, 20_000).expect("a file written again");
+        assert_eq!((cycle.period, pushed, cycle.past), (1100, 2 * 1100 + CycleGuard::INTO - 1, 0));
+        assert!(cycle.whole(), "stopped, not turned: another token would leave the copy in the file");
+        // after what came before it, the same: the run is the copy's alone
+        let mut guard = CycleGuard::default();
+        stretch(3000, 11).into_iter().for_each(|t| guard.push(t));
+        let (pushed, cycle) = until_over(&mut guard, &stretch(5000, 13), 20_000).unwrap();
+        assert_eq!((cycle.period, pushed), (5000, 2 * 5000 + CycleGuard::INTO - 1));
+        // a reply turned from runs before is given no less (a long block's limit is not halved)
+        let mut guard = CycleGuard::default();
+        let mut written = 0;
+        while guard.over(file[written % file.len()], 3).is_none() {
+            guard.push(file[written % file.len()]);
+            written += 1;
+        }
+        assert_eq!(written, 2 * 1100 + CycleGuard::INTO - 1);
+        // a block of LONG tokens keeps its eight turns, and is turned from, not stopped
+        let block = stretch(CycleGuard::LONG, 17);
+        let mut guard = CycleGuard::default();
+        let (pushed, cycle) = until_over(&mut guard, &block, 20_000).unwrap();
+        assert_eq!((cycle.period, pushed), (CycleGuard::LONG, 8 * CycleGuard::LONG - 1));
+        assert!(!cycle.whole());
+        // a long row of data (a map's 750 cells, `0` and `,`, and its line end) is let be, row after row
+        let row: Vec<u32> = (0..750).flat_map(|_| [10, 11]).chain([12]).collect();
+        let mut guard = CycleGuard::default();
+        assert!(until_over(&mut guard, &row, 10 * row.len()).is_none());
+        // and a long block that is not the same again (the file's copy with a line changed) is none: the run starts over
+        let mut changed = file.clone();
+        changed[600] = 99;
+        let mut guard = CycleGuard::default();
+        file.iter().chain(&changed).for_each(|&t| guard.push(t));
+        for &t in &file[..700] {
+            assert_eq!(guard.over(t, 0), None);
+            guard.push(t);
+        }
+    }
+
+    #[test]
+    fn a_call_nested_in_itself_is_a_cycle_after_32_turns() {
+        // `dirs.indexOf(` as four tokens, the last an opening bracket: what a 33B with its thinking off wrote 513 times
+        // into a file, at the run's own limit of 2,048 tokens
+        let opens = |turn: &[u32]| turn.contains(&4);
+        let unit = [1, 2, 3, 4];
+        let mut guard = CycleGuard::default();
+        guard.push(900); // what came before it
+        let mut written = 0;
+        let cycle = loop {
+            let next = unit[written % 4];
+            assert_eq!(guard.over(next, 0), None, "under its run's own limit throughout");
+            if let Some(cycle) = guard.nested(next, opens) {
+                break cycle;
+            }
+            guard.push(next);
+            written += 1;
+        };
+        assert_eq!((cycle.period, cycle.span, cycle.past, written), (4, 128, 0, 127));
+        assert_eq!(CycleGuard::limit(4), 2048);
+        // near it a margin before, as `near` is of the runs `over` judges
+        let mut guard = CycleGuard::default();
+        (0..127 - 16).for_each(|i| guard.push(unit[i % 4]));
+        assert!(guard.nested_near(16, opens) && !guard.nested_near(15, opens));
+        // one opening token over and over: 128 of it (a parser's test nesting arrays 32 deep is let be)
+        let mut guard = CycleGuard::default();
+        for _ in 0..127 {
+            assert_eq!(guard.nested(9, |t: &[u32]| t == [9]), None);
+            guard.push(9);
+        }
+        assert_eq!(guard.nested(9, |t: &[u32]| t == [9]).map(|c| (c.period, c.span)), Some((1, 128)));
+        // a turn that closes what it opens (a list's item, `{"key":"ArrowRight"},`) is none: its limit is `over`'s
+        let item = [1, 2, 3, 4, 5, 6, 7];
+        let mut guard = CycleGuard::default();
+        for i in 0..3000 {
+            assert_eq!(guard.nested(item[i % 7], |_: &[u32]| false), None);
+            assert!(!guard.nested_near(16, |_: &[u32]| false));
+            guard.push(item[i % 7]);
+        }
+        // a run's turn is asked whole, and once a shorter period's run holds it, as that period's
+        let mut guard = CycleGuard::default();
+        let asked = std::cell::RefCell::new(Vec::new());
+        for i in 0..300 {
+            let _ = guard.nested(unit[i % 4], |t: &[u32]| {
+                asked.borrow_mut().push(t.len());
+                false
+            });
+            guard.push(unit[i % 4]);
+        }
+        let asked = asked.into_inner();
+        assert!(!asked.is_empty() && asked.iter().all(|&len| len == 4), "{asked:?}");
+        // a turn longer than SHORT tokens is not judged so
+        let long = stretch(CycleGuard::SHORT + 1, 5);
+        let mut guard = CycleGuard::default();
+        for i in 0..40 * long.len() {
+            assert_eq!(guard.nested(long[i % long.len()], |_: &[u32]| true), None);
+            guard.push(long[i % long.len()]);
+        }
+    }
+
+    #[test]
+    fn a_turn_opens_more_than_it_closes() {
+        for text in ["dirs.indexOf(", "dirs.indexOf(dirsInv[", "f(", "[[", "{ a: {"] {
+            assert!(opens_more(text), "{text}");
+        }
+        for text in ["{\"key\":\"ArrowRight\"},", "0,", "f(x)", ")", "]);", "", "abc"] {
+            assert!(!opens_more(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_reply_says_what_it_repeated_and_where() {
+        let said = stopped(Cycle { period: 4, span: 128, past: 0 }, "dirs.indexOf(", true);
+        assert_eq!(said, "generation_repetition: the reply went on repeating the same 4 tokens (\"dirs.indexOf(\", 32 times: 128 tokens) in a tool call and was stopped");
+        // quotes and line ends as JSON writes them
+        let said = stopped(Cycle { period: 3, span: 4096, past: 0 }, "say \"hi\"\n", false);
+        assert!(said.ends_with("(\"say \\\"hi\\\"\\n\", 1365 times: 4096 tokens) and was stopped"), "{said}");
+        // a long turn by its start and end
+        let turn = format!("{}{}", "a".repeat(100), "b".repeat(100));
+        let said = stopped(Cycle { period: 1100, span: 2328, past: 0 }, &turn, true);
+        assert!(said.contains(&format!("(\"{}…{}\", 2 times: 2328 tokens) in a tool call", "a".repeat(60), "b".repeat(19))), "{said}");
     }
 
     #[test]
