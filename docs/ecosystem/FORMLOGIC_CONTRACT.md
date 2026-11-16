@@ -89,6 +89,36 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
   `requested`, never confirmed.
 - An Aokie Companion path exists (`AokieCompanionController`, `client_id aokie-companion`).
 
+## FormLogic's App AI and OAIY's own servers
+
+An app hosted on FormLogic may ask its host for chat, pictures and speech (App AI:
+`formlogicAi` in the app's manifest, `docs/HOSTED_APPS.md` there). FormLogic answers from a
+linked computer over the sealed AI relay (`ai:relay`, above), or, where its server and an OAIY
+share a machine or a network, from OAIY's local servers named in its `.env`. The second way
+leans on what follows. Read in November 2026 (`AppAiUpstream.php`, `AppAiWorker.php`,
+FormLogic `main` at `6218adea`).
+
+- **Chat** (`AI_BASE_URL`, the gateway): `POST /v1/chat/completions {model, messages,
+  max_tokens, stream}`. With `stream: true`, where the app takes its answers in parts, the
+  reply is read as it is written from `data:` events (`choices[0].delta.content`) up to
+  `data: [DONE]`; otherwise from `choices[0].message.content`. No tools and no
+  `response_format` are sent. A request holds what FormLogic's administrator allows: 16,000
+  characters to start with, up to 64,000. One a card has no room for must go on being
+  answered as past the context, not cut short or hung.
+- **Speech** (`AI_SPEECH_BASE_URL`, OAIY Voice): `POST /v1/audio/speech {input, voice?,
+  model?, response_format}`, a line of up to 300 characters. `response_format: "pcm"` must
+  stay what it is: 16-bit mono sound sent as it is made, with `X-Sample-Rate` saying its rate
+  (`crates/oaiy-voice/src/server.rs`, which has a test of that answer's head). FormLogic cuts
+  what has come at the line's pauses and hands each piece to the app, so the voice is heard
+  before the line is whole; a server that kept the sound until it was whole would still be
+  understood, and the voice would only begin later. `"wav"` is asked for where an app takes
+  its answers whole.
+- **Stopping:** FormLogic ends a request it no longer wants by closing the connection (the
+  app's own request was stopped, or the answer ran past its length). OAIY Voice stops making
+  a line when its client goes (`crates/oaiy-voice/src/server.rs`), and the chat server stops
+  for a client that has gone (`crates/oaiy-llm-server/src/api.rs`). FormLogic counts on both:
+  it is what keeps one abandoned request from holding the model up for the next.
+
 ## Publishing an app (for later)
 
 - In the browser: `/apps/new`, or drop a `.softn` on Apps → Import (`lib/softnApps.ts`):
