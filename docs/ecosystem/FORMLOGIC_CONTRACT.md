@@ -113,6 +113,16 @@ FormLogic `main` at `6218adea`).
   before the line is whole; a server that kept the sound until it was whole would still be
   understood, and the voice would only begin later. `"wav"` is asked for where an app takes
   its answers whole.
+- **Listening** (`AI_SPEECH_BASE_URL`, OAIY Voice again): `POST /v1/audio/transcriptions`
+  with JSON `{audio, response_format: "json"}`, where `audio` is a WAV as base64 (16 kHz,
+  mono, 16-bit, of up to 60 seconds), and the answer's `text` is what was said. This is not
+  App AI's worker: FormLogic's own page records a person for an app whose owner allows it
+  (an app's frame may not have a microphone), its server asks OAIY Voice while the person
+  waits, and the app is handed only the words; neither the sound nor the words are kept
+  (`POST /api/app/{slug}/native/listen` there). It leans on OAIY Voice taking a WAV as base64
+  in JSON as well as in a form, taking nothing but WAV, and answering `{"text": …}`
+  (`crates/oaiy-voice/src/server.rs`, `transcriptions`). A linked computer is not asked to
+  listen: the sealed lane has no kind for it, as it has none for speech.
 - **Stopping:** FormLogic ends a request it no longer wants by closing the connection (the
   app's own request was stopped, or the answer ran past its length). OAIY Voice stops making
   a line when its client goes (`crates/oaiy-voice/src/server.rs`), and the chat server stops
