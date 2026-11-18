@@ -773,6 +773,14 @@ describe('ConnectionsPanel · Linked account', () => {
 });
 
 describe('ConnectionsPanel · Companion relay', () => {
+  it('waits for a known relay state before offering the connection form and retries a failed read', async () => {
+    relayStatusMock.mockRejectedValueOnce(new Error('offline')).mockResolvedValue({ configured: false, hasToken: false });
+    await mount();
+    expect(container.textContent).toContain('Couldn’t check the Companion relay.');
+    expect(container.querySelector('input[placeholder^="the key your relay issued"]')).toBeNull();
+    await click('Try again');
+    expect(container.querySelector('input[placeholder^="the key your relay issued"]')).not.toBeNull();
+  });
   it('says a phone cannot join a call when no relay is connected', async () => {
     await mount();
     // The honest consequence, not just "not configured" — a user who paired a
@@ -876,10 +884,14 @@ describe('ConnectionsPanel · Companion relay', () => {
     expect(relaySection.querySelector('input[type=password]')).toBeNull();
     await click('Change relay');
     expect(relaySection.querySelector('form')).not.toBeNull();
+    expect(relaySection.querySelector<HTMLInputElement>('input[placeholder^="https://formlogic.com"]')?.value).toBe('https://r.example');
     expect(relaySection.querySelector<HTMLInputElement>('input[type=password]')!.type).toBe('password');
+    await type('the key your relay issued', 'cancelled-edit-key');
     expect(Array.from(relaySection.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Replace relay')).toBe(true);
     await click('Cancel');
     expect(relaySection.querySelector('form')).toBeNull();
+    await click('Change relay');
+    expect(relaySection.querySelector<HTMLInputElement>('input[type=password]')!.value).toBe('');
   });
 });
 

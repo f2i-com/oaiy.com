@@ -84,11 +84,17 @@ function allowModelAssets(dir) {
 }
 
 /** Returns false when there is no runtime installed in `dir`. */
-export function installBridge(dir) {
+export function installBridge(dir, release) {
   const index = join(dir, 'index.html');
   if (!existsSync(index)) return false;
   copyBridge(dir);
-  allowModelAssets(dir);
+  // From v0.0.28 SoftN resolves its own 3D media. In v0.0.47 this lives in
+  // a shared chunk, separate from the frame handshake.
+  if (release === undefined && existsSync(join(dir, 'SOURCE.json'))) {
+    try { release = JSON.parse(readFileSync(join(dir, 'SOURCE.json'), 'utf8')).release; } catch { /* older install */ }
+  }
+  const version = /^v(\d+)\.(\d+)\.(\d+)$/.exec(release ?? '');
+  if (!version || (+version[1] === 0 && +version[2] === 0 && +version[3] < 28)) allowModelAssets(dir);
   const original = readFileSync(index, 'utf8');
   let html = original;
   for (const [mark, tag] of TAGS) {

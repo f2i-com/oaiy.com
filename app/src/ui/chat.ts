@@ -105,30 +105,40 @@ function lastWay(turns: Turn[]): 'call' | 'sms' | null {
 /** Who said something: the person, the agent, the caller, the one texting, or a flow. */
 type Speaker = 'you' | 'agent' | 'caller' | 'texter' | 'flow';
 
-/** Suggestions for an empty conversation: they fill the message box, and are sent only when the person sends them. */
 /** The person's own conversation: a project's, the Front desk's runner, or "Set up OAIY". */
 type OwnKind = 'project' | 'runner' | 'setup';
 
-const SUGGESTIONS: Record<OwnKind, { title: string; text: string; ideas: string[] }> = {
+type Suggestion = { icon: string; label: string; prompt?: string };
+const SUGGESTIONS: Record<OwnKind, { title: string; text: string; ideas: Suggestion[] }> = {
   runner: {
-    title: "Your phone's front desk",
-    text: "Tell me what callers and texters should hear: I keep the brief, the knowledge files and each caller's notes up to date, and I can look over what the phone's agents said.",
+    title: 'Your front desk',
+    text: 'Review recent calls and texts, or update what the receptionist tells people.',
     ideas: [
-      'What did callers and texters ask about today?',
-      "This week, tell callers we're booked until Friday.",
-      "Don't quote prices for jobs that take more than a day.",
-      'Add our services and prices to the knowledge files.',
+      { icon: 'message', label: 'Review today’s enquiries', prompt: 'What did callers and texters ask about today?' },
+      { icon: 'calendar', label: 'Update availability', prompt: "This week, tell callers we're booked until Friday." },
+      { icon: 'phone', label: 'Set a call guideline', prompt: "Don't quote prices for jobs that take more than a day." },
+      { icon: 'file-text', label: 'Update services and prices', prompt: 'Add our services and prices to the knowledge files.' },
     ],
   },
   project: {
-    title: 'What shall we make?',
-    text: 'Ask for code, a web page or a SoftN app: I write the files here, run them on the Zipp VM, and show you the result.',
-    ideas: ['Explain what this project does.', 'Build a one-page site with a contact form.', 'Start a SoftN app that keeps a task list.', 'Find the TODOs and fix the first one.'],
+    title: 'Work on this project',
+    text: 'Ask OAIY to explore the files, build something, or work through a change with you.',
+    ideas: [
+      { icon: 'folder-open', label: 'Explore the project', prompt: 'Explain what this project does and where to start reading.' },
+      { icon: 'globe', label: 'Build a website', prompt: 'Build a one-page site with a contact form.' },
+      { icon: 'app', label: 'Create a small app', prompt: 'Build a task list app where I can add tasks and mark them complete.' },
+      { icon: 'list', label: 'Tackle a TODO', prompt: 'Find the TODOs in this project and help me fix the first one.' },
+    ],
   },
   setup: {
     title: 'Set up OAIY',
-    text: "Tell me what you want OAIY to do. I'll check this computer, suggest the next step and do it with you, one step at a time, and show you anything only you can do.",
-    ideas: ['Set up my business phone', 'What can OAIY do on this computer?', 'Use ChatGPT instead of a local model', 'Check that everything in OAIY is working'],
+    text: 'Choose what to set up. OAIY can check this computer and guide you through the next step.',
+    ideas: [
+      { icon: 'phone', label: 'Set up my business phone' },
+      { icon: 'cpu', label: 'What can OAIY do on this computer?' },
+      { icon: 'message', label: 'Use ChatGPT instead of a local model' },
+      { icon: 'activity', label: 'Check that everything in OAIY is working' },
+    ],
   },
 };
 
@@ -143,16 +153,17 @@ export class ChatPane {
   private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'off', 'aria-label': 'Conversation' });
   /** What a screen reader is told as the conversation goes: a reply once it is written, the app's notes, the other end's words. */
   private readonly announcer = h('div.sr-only', { 'aria-live': 'polite', 'aria-atomic': 'true' });
-  private readonly input = h('textarea.chat-input', { rows: 1, placeholder: 'Ask OAIY…', 'aria-label': 'Message the agent', title: 'Enter sends; Shift+Enter starts a new line' }) as HTMLTextAreaElement;
+  private readonly input = h('textarea.chat-input', { rows: 1, placeholder: 'Ask OAIY…', 'aria-label': 'Message the agent', 'aria-describedby': 'composer-hint', title: 'Enter sends; Shift+Enter starts a new line' }) as HTMLTextAreaElement;
   private readonly send = h('button.send-button', { type: 'button' }) as HTMLButtonElement;
-  private readonly attachButton = h('button.attach', { type: 'button', title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, icon('paperclip'));
+  private readonly attachButton = h('button.attach', { type: 'button', title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, icon('paperclip'), h('span', 'Attach'));
   private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
   private readonly pending = h('div.attachments');
   private files: File[] = [];
   /** What the agent is doing now, at the end of the log; said to a screen reader by `statusSaid`, outside the log. */
   private readonly status = h('div.chat-status', { 'aria-hidden': 'true' });
   private readonly statusSaid = h('div.sr-only', { role: 'status' });
-  private readonly hint = h('span.composer-hint');
+  private readonly hint = h('span.composer-hint', { id: 'composer-hint' });
+  private suggestionDraft: { original: string; preview: string } | null = null;
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
@@ -395,6 +406,7 @@ export class ChatPane {
       }
     });
     this.input.addEventListener('input', () => {
+      this.suggestionDraft = null;
       this.updateSend();
       this.grow();
     });
@@ -473,6 +485,7 @@ export class ChatPane {
 
   /** A conversation's draft back in the box as it was left (an empty box, for one with none). */
   putDraft(draft: { text: string; files: File[] } | null): void {
+    this.suggestionDraft = null;
     this.input.value = draft?.text ?? '';
     this.files = [...(draft?.files ?? [])];
     this.renderPending();
@@ -557,7 +570,7 @@ export class ChatPane {
     this.send.title = stop ? 'Stop the agent' : this.busy ? 'Send: the agent reads it at its next step' : 'Send (Enter)';
     this.send.setAttribute('aria-label', stop ? 'Stop' : 'Send');
     this.send.disabled = !stop && !this.hasMessage();
-    this.hint.textContent = stop ? 'The agent is working: the square button stops it' : this.busy ? 'Enter sends it: the agent reads it at its next step' : 'Enter to send · Shift+Enter for a new line · /help';
+    this.hint.textContent = stop ? 'Stop to end this run' : this.busy ? 'Send a note for the next step' : 'Enter to send · Shift+Enter for a new line · /help';
   }
 
   setStatus(text: string): void {
@@ -1030,6 +1043,7 @@ export class ChatPane {
   }
 
   private drawHero(): void {
+    const examplesOpen = !!this.hero.querySelector('details[open]');
     clear(this.hero);
     if (this.kind !== 'own') {
       const [glyph, words] = this.kind === 'call' ? ['phone', 'No words on this call yet.'] : this.kind === 'sms' ? ['message', 'No calls or texts with them yet.'] : ['flow', 'No tasks from this flow yet.'];
@@ -1040,33 +1054,32 @@ export class ChatPane {
     const s = SUGGESTIONS[this.own];
     this.hero.className = `chat-empty own-${this.own}${this.setup ? ' needs-setup' : ''}`;
     const setup = this.setup;
-    this.hero.append(
-      h('span.chat-empty-icon', icon(OWN_ICON[this.own])),
-      h('h2', s.title),
-      h('p', s.text),
-      // No AI provider yet: the one thing to do first is the one button here (it was a note at the foot of the
-      // conversation, under suggestions that could not be sent to anything).
-      // In OAIY's window the Agent's AI is chosen in one place, OAIY's own Settings → Agent: the button goes there
-      // and the words name it (the Agent's own dialog is for its other settings).
-      ...(setup
-        ? [h('div.chat-setup',
-            h('button.primary', { type: 'button', onclick: () => setup() }, icon('sparkle'), h('span', IN_WINDOW ? "Choose the Agent's AI" : 'Set up an AI provider')),
-            h('p', IN_WINDOW
-              ? "Welcome! The Agent has no AI to run on yet. Choose one in OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar): a model on this computer keeps everything here; an online one is sent what you write. The editor and terminal work without one."
-              : 'Welcome! Set up an AI provider first: the agent needs a model to talk to. One on this computer keeps everything here; an online one is sent what you write. The editor and terminal work without one.'),
-          )]
-        : []),
-      h('div.chat-suggestions', { role: 'group', 'aria-label': 'Suggestions' }, ...s.ideas.map((idea) => h('button.suggestion', { type: 'button', title: 'Put this in the message box (it is not sent until you send it)', onclick: () => this.suggest(idea) }, idea))),
-    );
+    const suggestions = h('div.chat-suggestions', { role: 'group', 'aria-label': 'Suggestions' }, ...s.ideas.map(({ icon: glyph, label, prompt = label }) =>
+      h('button.suggestion', { type: 'button', title: prompt, onclick: () => this.suggest(prompt) },
+        icon(glyph), h('span', label), icon('chevron-right', 'suggestion-arrow'))));
+    this.hero.append(h('div.chat-welcome-heading', h('span.chat-empty-icon', icon(OWN_ICON[this.own])), h('h2', s.title)));
+    if (setup) {
+      // Let people draft before connecting a model. The example prompts take space only when opened.
+      this.hero.append(h('p', 'Choose a model to start a conversation. A local model keeps your messages on this computer. An online provider receives what you send.'),
+        h('div.chat-setup', h('button.primary', { type: 'button', onclick: setup },
+          icon('plug'), IN_WINDOW ? "Choose the Agent's AI" : 'Set up an AI provider')),
+        h('details.chat-examples', { open: examplesOpen }, h('summary', 'Browse example prompts', icon('chevron-down')), suggestions));
+    } else {
+      this.hero.append(h('p', s.text), suggestions);
+    }
   }
 
   /** A suggestion goes into the message box, to change or send. */
   private suggest(text: string): void {
-    this.input.value = text;
+    const previous = this.suggestionDraft;
+    const original = previous?.preview === this.input.value ? previous.original : this.input.value;
+    const preview = original.trim() ? original + '\n\n' + text : text;
+    this.input.value = preview;
+    this.suggestionDraft = { original, preview };
     this.grow();
     this.updateSend();
     this.input.focus();
-    this.input.setSelectionRange(text.length, text.length);
+    this.input.setSelectionRange(this.input.value.length, this.input.value.length);
   }
 
   private async copyCode(button: HTMLElement): Promise<void> {

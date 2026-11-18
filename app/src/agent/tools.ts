@@ -12,7 +12,7 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { FrameReview, ToolCall, ToolResult, ToolSpec, Turn } from './protocol';
-import { appFiles, appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp, softnAppOf } from '../softn/softn';
+import { appFiles, appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, isWebApp, logicSyntax, resolveApp, softnAppOf } from '../softn/softn';
 import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
 import { findModels, isModelPath, resolveModel } from '../preview/model';
@@ -764,7 +764,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'softn_docs',
     description:
       'The SoftN reference: how to write SoftN apps. With no arguments: the map of everything there is (the writing guide\'s sections, the published guides, every component, the example apps). ' +
-      '`topic` reads one: "guide" for the whole writing guide (read it before your first app), "guide#<words from a heading>" for one section (e.g. "guide#mistakes"), or a published guide\'s slug, optionally "#section" (e.g. "xdb-data", "state-events#events"). ' +
+      '`topic` reads one: "web-starters" for Vanilla JS, React and Vue projects, "guide" for the current app\'s writing guide (read it before your first app), "guide#<words from a heading>" for one section (e.g. "guide#mistakes"), or a published guide\'s slug, optionally "#section" (e.g. "xdb-data", "state-events#events"). ' +
       '`search` finds words across the guide, the guides, the component reference and the example apps\' source, best first, each with a snippet and how to open it: use it when you need to know how something is done (e.g. "timer interval", "@change Select", "save to storage").',
     parameters: { type: 'object', properties: { topic: str, search: str, app: { ...str, description: 'The app folder, so the guide matches its language (JavaScript or Python logic)' } } },
   },
@@ -776,7 +776,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'softn_examples',
     description:
-      'Complete, working SoftN apps to learn from (a notes app with storage, a game, a component and chart showcase, 3D, WebGPU, device permissions). ' +
+      'Editable Vanilla JavaScript, React and Vue starters (vanilla-js, react, vue) and complete classic SoftN apps. ' +
       'No arguments: the list. `name`: an app\'s files and manifest. `name` + `file`: read one of its files. `name` + `install_to`: copy the whole app into the project, in a new folder (named after the app) inside install_to (it then shows in the preview; start from it or take parts of it).',
     parameters: { type: 'object', properties: { name: str, file: str, install_to: str } },
   },
@@ -787,13 +787,13 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'softn_inspect',
-    description: 'Describe what a SoftN app shows in the live preview right now, as text: headings, text, buttons, inputs with their values, checkboxes, selects, links, images and canvases, plus any errors the app reported. Use it to confirm the page looks as intended.',
+    description: 'Describe what a classic SoftN app shows in the live preview right now, as text: headings, text, buttons, inputs with their values, checkboxes, selects, links, images and canvases, plus any errors the app reported. Use it to confirm the page looks as intended.',
     parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder; optional when the project has one app' } } },
   },
   {
     name: 'softn_interact',
     description:
-      'Use a SoftN app in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors the app raised. ' +
+      'Exercise a classic SoftN app in the live preview: a list of actions, run in order, then the page as text and any errors the app raised. ' +
       'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"} (a select that takes several: "value": ["<option>", "<option>"], exactly those chosen), {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
       'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 400} (a few hundred ms moves a step or two; a call holds keys 8 s at most in all). At most 20 actions a call. ' +
       'State carries over between calls until the app is changed or re-rendered.',
@@ -2055,7 +2055,7 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
     lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
     // (the frame kept the last version that started: what the page tools see is that one, not the files as they are now)
     if (result.kept) lines.push('The preview still shows the last version that worked, because this one does not start: softn_inspect, softn_interact and preview_screenshot see that older version until the errors above are fixed.');
-    if (!result.ok && result.errors.some((e) => /of null|is null|of undefined/.test(e)) && looksUpElements(ctx.vfs, root)) lines.push(ELEMENTS_HINT);
+    if (!result.ok && !isWebApp(ctx.vfs, root) && result.errors.some((e) => /of null|is null|of undefined/.test(e)) && looksUpElements(ctx.vfs, root)) lines.push(ELEMENTS_HINT);
     if (result.warnings?.length) lines.push(`Warnings while it loaded (often a handler or name the logic does not define):\n${[...new Set(result.warnings)].slice(0, 8).map((w) => `- ${w}`).join('\n')}`);
   }
   // The same errors again mean the fixes are not working.

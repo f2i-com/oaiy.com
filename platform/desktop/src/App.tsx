@@ -14,6 +14,7 @@ import {
   Inbox,
   LayoutDashboard,
   ListChecks,
+  Menu,
   Moon,
   Package,
   PhoneForwarded,
@@ -26,6 +27,7 @@ import {
   Sparkles,
   Sun,
   Workflow,
+  X,
   type LucideIcon,
   Network,
 } from 'lucide-react';
@@ -419,11 +421,14 @@ export default function App() {
   const [healthError, setHealthError] = useState<string | null>(null);
   const toast = useToastIfAny();
   const [view, setViewNow] = useState<View>(isolated ? 'plugins' : 'overview');
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menu = useRef<HTMLDialogElement>(null);
   // Another page: asked first where the page open has changes not saved yet (a form's), which would go with it.
   const shownView = useRef(view);
   shownView.current = view;
   const setView = useCallback((next: View | ((current: View) => View)) => {
     const to = typeof next === 'function' ? next(shownView.current) : next;
+    setMenuOpen(false);
     if (to === shownView.current) setViewNow(to);
     else whenLeaving(() => setViewNow(to));
   }, []);
@@ -462,6 +467,16 @@ export default function App() {
     return n > 0 ? { n, words: countWords(n, v) } : null;
   };
   const narrowSidebar = useMedia(NARROW_SIDEBAR);
+  useEffect(() => {
+    const dialog = menu.current;
+    if (!dialog) return;
+    if (menuOpen && narrowSidebar) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+      if (menuOpen) setMenuOpen(false);
+    }
+  }, [menuOpen, narrowSidebar]);
   const toastSlot = useToastSlot();
   // A page change can take away what held the keyboard (the wizard's "Continue later" goes with the wizard), which
   // leaves it on nothing. It is put on the page that opened, so the next Tab is that page's first control.
@@ -639,6 +654,10 @@ export default function App() {
 
   // A call ringing for the owner (RingDialog showing): a page in a webview is taken away meanwhile, as it would cover it.
   const [ringShowing, setRingShowing] = useState(false);
+  const onRingShowing = useCallback((showing: boolean) => {
+    setRingShowing(showing);
+    if (showing) setMenuOpen(false);
+  }, []);
 
   // The top bar's Refresh on a plugin's screen: each press loads the screen again, as opening it afresh does (a
   // message the screen still shows goes with it).
@@ -940,15 +959,8 @@ export default function App() {
     );
   };
 
-  return (
-    <div className="app-shell">
-      <a className="skip" href="#main">
-        Skip to dashboard
-      </a>
-      {/* A caller wants to speak to you: over everything, while the receptionist is trying to reach you. */}
-      <RingDialog on={phoneOn === true} onShowing={setRingShowing} />
-
-      <aside className="sidebar">
+  const sidebarContent = (
+      <>
         <div className="brand">
           <strong>OAIY</strong>
           <span>Orchestrate AI Yourself</span>
@@ -998,7 +1010,22 @@ export default function App() {
           <Settings2 size={18} />
           <span>Settings</span>
         </button>
-      </aside>
+      </>
+  );
+
+  return (
+    <div className="app-shell">
+      <a className="skip" href="#main">Skip to dashboard</a>
+      <RingDialog on={phoneOn === true} onShowing={onRingShowing} />
+      <div className="sidebar-rail"><aside className="sidebar">{!menuOpen && sidebarContent}</aside></div>
+      <dialog ref={menu} id="workspace-navigation" className="workspace-nav-dialog" aria-label="Workspace navigation"
+        onCancel={() => setMenuOpen(false)} onClose={() => setMenuOpen(false)}
+        onClick={event => { if (event.target === event.currentTarget) setMenuOpen(false); }}>
+        {menuOpen && <div className="sidebar">
+          <button className="icon-button nav-dismiss" type="button" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
+          {sidebarContent}
+        </div>}
+      </dialog>
 
       <main id="main" className={compact ? 'workspace is-compact' : 'workspace'} tabIndex={-1}>
         <header className={compact ? 'topbar is-compact' : 'topbar'}>
@@ -1010,6 +1037,8 @@ export default function App() {
               have. No group word over the name: the sidebar's own labels say it. */}
           <div className="top-row">
             <div className="top-heading">
+              <button className="icon-button nav-launch" type="button" aria-label="Open workspace navigation" aria-haspopup="dialog"
+                aria-controls="workspace-navigation" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={19} /></button>
               <h1 title={header.copy || undefined} aria-description={compact ? header.copy || undefined : undefined}>
                 {header.title}
               </h1>
@@ -1075,7 +1104,7 @@ export default function App() {
           )}
           {/* A page in a webview of its own: the desktop lays it over this box (and takes it away while a call rings,
               whose dialog it would cover). */}
-          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing} />}
+          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing || menuOpen} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset. `revisit`
               suppresses the entrance animation the second time you open a panel,

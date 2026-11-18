@@ -21,8 +21,11 @@ const stdlib = /export const SOFTN_PY_STDLIB_IMPORTS[^=]*=\s*(\[[^\]]*\])/.exec(
 if (!stdlib) throw new Error('SOFTN_PY_STDLIB_IMPORTS not found in @softn/core');
 
 let source = readFileSync(guidePath, 'utf8');
-source = source.replace(/import\s*\{\s*SOFTN_PY_STDLIB_IMPORTS\s*\}\s*from\s*'@softn\/core';/, `const SOFTN_PY_STDLIB_IMPORTS = ${stdlib};`);
-if (/from\s+'/.test(source)) throw new Error('guide.ts has imports this generator does not know how to satisfy');
+source = source.replace(/import\s*\{\s*SOFTN_PY_STDLIB_IMPORTS\s*\}\s*from\s*'@softn\/core(?:\/authoring)?';/, `const SOFTN_PY_STDLIB_IMPORTS = ${stdlib};`);
+const parsed = ts.createSourceFile(guidePath, source, ts.ScriptTarget.ES2022);
+if (parsed.statements.some((s) => ts.isImportDeclaration(s) || (ts.isExportDeclaration(s) && s.moduleSpecifier))) {
+  throw new Error('guide.ts has imports this generator does not know how to satisfy');
+}
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 const guide = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
 

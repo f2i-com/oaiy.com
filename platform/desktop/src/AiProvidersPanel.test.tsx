@@ -225,6 +225,7 @@ describe('adding a provider', () => {
     await setValue(field(/^Name/), 'Something else');
     expect(field(/^ID/).value).toBe('mine');
     await setValue(field(/^ID/), '');
+    expect(field(/^ID/).value).toBe('something-else');
     await setValue(field(/^Name/), 'Back again');
     expect(field(/^ID/).value).toBe('back-again');
 
@@ -239,6 +240,22 @@ describe('adding a provider', () => {
     await setValue(field(/^Name/), 'Renamed');
     expect(field(/^ID/).value).toBe('openai');
     expect(field(/^ID/).readOnly).toBe(true);
+  });
+
+  it('returns focus to the edit action when the editor closes', async () => {
+    await mount();
+    const trigger = byLabel('Edit OpenAI');
+    await click(trigger);
+    expect(document.activeElement).toBe(field(/^Name/));
+    await click(Array.from(container.querySelectorAll('button')).find(b => b.textContent === 'Cancel')!);
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('explains when a saved provider still needs a model for the connection test', async () => {
+    listMock.mockResolvedValue({ providers: [{ ...PROVIDER, protocol: 'anthropic', model: null }] });
+    await mount();
+    expect((byLabel('Test OpenAI') as HTMLButtonElement).disabled).toBe(true);
+    expect(container.textContent).toContain('Set a default model to test this provider.');
   });
 });
 

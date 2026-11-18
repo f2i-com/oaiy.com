@@ -551,7 +551,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
       )}
         </Fragment>,
 
-      <section className="service-section" key="this-computer">
+      <section className="service-section computer-section" key="this-computer">
         <div className="section-title-row">
           <h3 className="section-title">This computer</h3>
         </div>

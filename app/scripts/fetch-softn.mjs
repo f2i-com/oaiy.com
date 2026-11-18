@@ -24,9 +24,9 @@ import { installBridge } from './softn-bridge/install.mjs';
 import { downloadReleaseFile } from './release-download.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.42';
+const RELEASE = 'v0.0.47';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || '741827ae7cb20df09954cfa8a3e14e803aceeb0e47cc75ca755e5f6be943acf3';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'e6d55086cb46a5300b35097c4f049820f66fe8f752c692f66c5da2ade801a5ca';
 const PREFIX = 'hosted-runtime/';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -37,7 +37,7 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 function installed() {
   try {
     const source = JSON.parse(readFileSync(stamp, 'utf8'));
-    return source.release === RELEASE && existsSync(join(out, 'index.html'));
+    return source.release === RELEASE && source.zip_sha256 === ZIP_SHA256 && existsSync(join(out, 'index.html'));
   } catch {
     return false;
   }
@@ -45,7 +45,7 @@ function installed() {
 
 async function main() {
   if (process.argv.includes('--ensure') && installed()) {
-    installBridge(out);
+    installBridge(out, RELEASE);
     console.log(`SoftN runtime ${RELEASE} is installed in public/softn/`);
     return;
   }
@@ -72,7 +72,7 @@ async function main() {
     count++;
     bytes += data.byteLength;
   }
-  installBridge(out);
+  installBridge(out, RELEASE);
   writeFileSync(stamp, JSON.stringify({ release: RELEASE, zip: ZIP, zip_sha256: ZIP_SHA256, files: count, bytes }, null, 2));
   console.log(`installed the SoftN runtime ${RELEASE} into public/softn/ (${count} files, ${(bytes / 1e6).toFixed(1)} MB)`);
 }

@@ -10,7 +10,7 @@ import {
   type MigratePlan,
   type MigrationProgress,
 } from './api';
-import { Check, Copy, FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
+import { Cable, Check, Copy, FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
 import { ask } from './ask';
 import UpdatesSection from './UpdatesSection';
@@ -18,6 +18,7 @@ import UpdatesSection from './UpdatesSection';
 import { BackupSection } from './BackupPanel';
 import { pathExamples } from './platform';
 import { forgetGuideDismissal, openSetup, setSetupState, useSetupState } from './useSetupState';
+import './connectionSettings.css';
 
 /** The path boxes' examples, as this system writes a path: a drive letter on Windows, a volume on a Mac. */
 const EXAMPLE = pathExamples();
@@ -123,27 +124,38 @@ function OnlyInTheApp() {
  */
 function ApiAddressSection() {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const address = useRef<HTMLElement>(null);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(API_BASE);
+      setCopyFailed(false);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     } catch {
-      // Clipboard can be unavailable in a webview without a focused document.
+      const selection = window.getSelection();
+      if (selection && address.current) {
+        const range = document.createRange();
+        range.selectNodeContents(address.current);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      setCopyFailed(true);
     }
   };
   return (
-    <section className="model-section" aria-label="Local API address">
-      <h3 className="section-title">Local API address</h3>
+    <section className="model-section settings-endpoint" aria-label="Local API address">
+      <h3 className="section-title"><Cable size={16} aria-hidden />Local API address</h3>
       <p className="form-hint">Where other programs on this computer reach OAIY. It answers this computer only: nothing outside it can use this address.</p>
       <div className="settings-value api-address">
-        <code className="path-code">{API_BASE}</code>
+        <code ref={address} className="path-code">{API_BASE}</code>
         {/* The confirmation is otherwise only an icon swap — name the button
             for its current state so a screen reader hears the copy landed. */}
         <button type="button" className="btn-tiny" aria-label={copied ? 'Local API address copied' : 'Copy the local API address'} onClick={() => void copy()}>
           {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? 'Copied' : 'Copy'}
         </button>
       </div>
+      {copyFailed && <p className="form-hint" role="status">Use your device’s Copy command to copy the address.</p>}
     </section>
   );
 }

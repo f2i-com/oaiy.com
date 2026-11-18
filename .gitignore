@@ -14,6 +14,7 @@
 # Logs and scratch
 *.log
 /.coder-cli/
+/.claude/worktrees/
 
 # Python tooling (tools/dsv41)
 __pycache__/

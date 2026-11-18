@@ -75,7 +75,7 @@ const oaiy = createHttpServer((req, res) => {
 await new Promise((r) => oaiy.listen(0, '127.0.0.1', r));
 const oaiyUrl = `http://127.0.0.1:${oaiy.address().port}`;
 
-const server = await createServer({ server: { port: 0, host: '127.0.0.1' }, logLevel: 'error' });
+const server = await createServer({ server: { port: 0, host: '127.0.0.1', hmr: false, watch: null }, logLevel: 'error' });
 await server.listen();
 const base = `http://127.0.0.1:${server.httpServer.address().port}`;
 let failures = 0;
@@ -103,10 +103,31 @@ try {
   const log = () => page.$eval('.chat-log', (e) => e.textContent);
 
   await check('an OAIY with no language model yet gives the page nothing to chat on', async () => {
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Welcome! Set up an AI provider'), { timeout: 15_000 });
+    await page.waitForSelector('.chat-setup button', { visible: true, timeout: 15_000 });
     const text = await log();
     expect(text.includes("Found OAIY's engines at") && !text.includes('chats with them'), text.slice(0, 400));
     expect((await chip()) === 'Set up AI', await chip());
+  });
+
+  await check('example prompts keep a written draft and wait for Send', async () => {
+    const first = '.chat-examples .suggestion:nth-child(1)';
+    const second = '.chat-examples .suggestion:nth-child(2)';
+    expect(!(await page.$eval('.chat-examples', (el) => el.open)), 'examples were already expanded');
+    await page.click('.chat-examples summary');
+    await page.type('.chat-input', 'Please use a dark theme.');
+    for (const choice of [first, second]) {
+      await page.click(choice);
+      const prompt = await page.$eval(choice, (el) => el.title);
+      const draft = await page.$eval('.chat-input', (el) => ({ text: el.value, focused: document.activeElement === el }));
+      expect(draft.text === 'Please use a dark theme.\n\n' + prompt && draft.focused, JSON.stringify(draft));
+    }
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('Enter');
+    await page.keyboard.up('Shift');
+    expect(await page.$eval('.chat-input', (el) => el.value.endsWith('\n')), 'Shift+Enter sent the message');
+    await page.$eval('.chat-input', (el) => el.select());
+    await page.keyboard.press('Backspace');
+    await page.click('.chat-examples summary');
   });
 
   await check('the model that arrives afterwards answers the first message', async () => {
@@ -171,8 +192,7 @@ try {
     await again.goto(`${base}/?oaiy=${encodeURIComponent(oaiyUrl)}`);
     await again.waitForSelector('.tree-row', { timeout: 60_000 });
     await again.waitForFunction((want) => document.querySelector('button.chip.model')?.textContent === want, { timeout: 15_000 }, `OAIY · ${MODEL}`);
-    const text = await again.$eval('.chat-log', (e) => e.textContent);
-    expect(!text.includes('Welcome! Set up an AI provider'), 'the welcome asks for a provider that is there');
+    expect(!(await again.$('.chat-setup button')), 'the welcome asks for a provider that is there');
     await again.close();
   });
   await page.close();

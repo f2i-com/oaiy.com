@@ -30,7 +30,7 @@ import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { onTheme, theme } from '../ui/theme';
-import { appFiles, appLabel, findApps, isSoftnApp, logicSyntax } from '../softn/softn';
+import { appFiles, appLabel, findApps, isSoftnApp, isWebApp, logicSyntax } from '../softn/softn';
 import { findPages, pageFiles, pageLabel } from './page';
 import { findModels, modelFiles, modelLabel } from './model';
 import { KEPT_STATUS, KEPT_TITLE, LiveFrame, engineMismatch, fitNote, frameSays, isLoadSyntaxError, plainProblem, updateSaid } from './liveFrame';
@@ -680,6 +680,7 @@ export class Preview {
 
   private async inspectNow(target?: PreviewTarget): Promise<PageReport> {
     const rendered = await this.ready(target);
+    if (this.webFrame()) return { ok: false, page: '', error: 'The web app renders in an isolated container. Use softn_check for its render status and the visible preview to inspect its controls.', problems: [...this.problems] };
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
     const result = await this.requestAgain({ type: 'bot:inspect' });
@@ -693,6 +694,7 @@ export class Preview {
 
   private async actNow(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport> {
     const rendered = await this.ready(target);
+    if (this.webFrame()) return { ok: false, page: '', error: 'Use the visible preview to interact with this web app. Its isolated container exposes no agent control interface.', problems: [...this.problems] };
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
     const result = await this.request({ type: 'bot:act', actions }, 60_000);
@@ -706,6 +708,7 @@ export class Preview {
   screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[]; since: number }> {
     return this.exclusive(async () => {
       const rendered = await this.ready(target);
+      if (this.webFrame()) throw new Error('The web app renders in an isolated container. Use the visible preview to see it.');
       if (!this.frame) throw new Error(rendered.errors.join('; ') || 'nothing is rendered');
       // A model that could not be read has nothing to draw: why is the answer.
       if (this.target?.kind === 'model' && !rendered.ok) throw new Error(rendered.errors.join('; ') || 'the model could not be shown');
@@ -793,7 +796,7 @@ export class Preview {
     // (a manifest that is there and cannot be read, half-written say, goes to the frame too: it answers `kept`, and
     // the last working app stays on screen with the problem said, where a new frame would show only "not an app".
     // An app whose manifest is gone is not an app any more, and is said so as before.)
-    if (!fresh && link && this.frame && target?.kind === 'app' && link.takes(target.root) && (isSoftnApp(this.vfs, target.root) || this.vfs.exists(manifestPath(target.root)))) return this.updateApp(target.root, generation, link);
+    if (!fresh && link && this.frame && target?.kind === 'app' && !isWebApp(this.vfs, target.root) && link.takes(target.root) && (isSoftnApp(this.vfs, target.root) || this.vfs.exists(manifestPath(target.root)))) return this.updateApp(target.root, generation, link);
     this.leaveFrame();
     if (target?.kind === 'page') return this.renderPage(target.path, generation);
     if (target?.kind === 'model') return this.renderModel(target.path, generation);
@@ -830,6 +833,10 @@ export class Preview {
       if (!said) this.problems.push({ level: 'error', message: message.slice(0, 2000), at: Date.now() });
     }
     this.showProblems();
+  }
+
+  private webFrame(): boolean {
+    return this.target?.kind === 'app' && isWebApp(this.vfs, this.target.root);
   }
 
   /** The app's files as the frame takes them: its text files by path, and the rest (pictures, sounds, fonts) as base64. */
@@ -1051,9 +1058,12 @@ export class Preview {
     // reporting it, so the logic is also compiled here, on Zipp.
     const syntax = logicSyntax(this.vfs, root).catch(() => []);
     const { client, assets } = this.appSource(root);
-    let bytes: ArrayBuffer;
+    const web = isWebApp(this.vfs, root);
+    const appId = `bot.computer-${this.projectId()}-${root || 'root'}`;
+    const webStorageKey = `web:${appId}`;
+    let bytes: ArrayBuffer | undefined;
     try {
-      bytes = await softnZippBytes();
+      if (!web) bytes = await softnZippBytes();
     } catch (error) {
       // Nothing can be drawn: why, and what to do about it, is said where the app would be.
       const message = (error as Error).message;
@@ -1064,7 +1074,7 @@ export class Preview {
     }
     if (generation !== this.generation) return;
 
-    const frame = this.newFrame('SoftN app preview', `${import.meta.env.BASE_URL}softn/index.html?v=${generation}`, 'allow-scripts allow-forms allow-modals');
+    const frame = this.newFrame('SoftN app preview', `${import.meta.env.BASE_URL}softn/index.html?${web ? 'format=web&' : ''}v=${generation}`, 'allow-scripts allow-forms allow-modals');
     const errors: string[] = [];
     const warnings: string[] = [];
     this.frame = frame;
@@ -1088,7 +1098,7 @@ export class Preview {
       window.removeEventListener('message', onMessage);
       // The app's localStorage as it was left, for the bridge's stand-in (the frame has no origin, and the browser's own
       // store refused every write: a snake game saving its best score failed at every step), before the app is sent.
-      frame.contentWindow?.postMessage({ __botComputer: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
+      if (!web) frame.contentWindow?.postMessage({ __botComputer: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
       const channel = new MessageChannel();
       // What this frame does past drawing the app once: saying when it is drawn, taking a newer version in place.
       // (with the media `init` carries: an update leaves its media out while it is the same)
@@ -1111,7 +1121,7 @@ export class Preview {
         // (the port outlives the render that opened it where the frame takes updates: its messages are this frame's
         // for as long as it is the one shown)
         if (this.link !== link) return;
-        const data = e.data as { type?: string; reason?: string; phase?: string; id?: unknown };
+        const data = e.data as { type?: string; reason?: string; phase?: string; id?: unknown; action?: string; input?: Record<string, unknown> };
         if (link.take(data)) return;
         if (data?.type === 'shown') {
           if (link.drawn) return;
@@ -1132,7 +1142,22 @@ export class Preview {
           this.report([reason]);
           this.settle({ ok: false, errors: [...errors], warnings: [...warnings] });
         } else if (data?.type === 'call') {
-          channel.port1.postMessage({ id: data.id, result: { error: 'This preview has no backend: server/ actions run only when the app is deployed.' } });
+          const respond = (result: unknown) => channel.port1.postMessage({ id: data.id, result });
+          if (web && data.action === 'containerEngine') {
+            // The lite tier is bundled in the hosted frame; fetch the shared full engine only on request.
+            void softnZippBytes().then(engine => respond({ result: engine }), error => respond({ error: String(error) }));
+          } else if (web && data.action === 'nativeStorage') {
+            const input = data.input;
+            const state = new Map(Object.entries(this.storage.get(webStorageKey) ?? {}));
+            if (input?.operation === 'clear') state.clear();
+            else if (input?.operation === 'set' && typeof input.key === 'string' && typeof input.value === 'string') state.set(input.key, input.value);
+            else if (input?.operation === 'remove' && typeof input.key === 'string') state.delete(input.key);
+            else { respond({ error: 'Unsupported preview storage operation.' }); return; }
+            this.storage.set(webStorageKey, Object.fromEntries(state));
+            respond({ result: { saved: true } });
+          } else {
+            respond({ error: 'This preview has no backend: server/ actions run only when the app is deployed.' });
+          }
         } else if (data?.type === 'link') {
           // A link the person clicked in the app to another site, a mail address or a number (SoftN's `links/1`): shown
           // over the app, and opened only when they say so. Anything that is no such address is let go.
@@ -1142,7 +1167,9 @@ export class Preview {
       };
       frame.contentWindow!.postMessage(
         // dark: OAIY's own theme (the dashboard's choice in its window), which the system's setting need not be.
-        { type: 'formlogic:init', client, assets, appId: `bot.computer-${this.projectId()}-${root || 'root'}`, dark: theme() === 'dark', engine: 'zipp-web-python', zippWasm: bytes.slice(0) },
+        { type: 'formlogic:init', client, assets, appId, dark: theme() === 'dark', ...(web
+          ? { engine: 'web-container', native: true, storage: this.storage.get(webStorageKey) ?? {} }
+          : { engine: 'zipp-web-python', zippWasm: bytes!.slice(0) }) },
         '*',
         [channel.port2],
       );

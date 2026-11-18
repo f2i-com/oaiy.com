@@ -10,6 +10,7 @@
  * window, a plugin's among them, fit with no scrollbar at all.
  * ========================================================================== */
 
+.sidebar-rail { display: grid; min-width: 0; min-height: 0; }
 .sidebar {
   z-index: 10;
   display: flex;
@@ -25,14 +26,27 @@
 /* ---- the brand: fixed at the top ----------------------------------------------- */
 
 .brand {
+  position: relative;
   flex: none;
-  padding: 0 10px 16px;
+  min-height: 48px;
+  margin: 0 6px 10px;
+  padding: 0 0 14px 46px;
+  border-bottom: 1px solid var(--border);
+}
+.brand::before {
+  position: absolute;
+  top: 1px;
+  left: 0;
+  width: 36px;
+  height: 36px;
+  background: url('/favicon.svg') center / contain no-repeat;
+  content: '';
 }
 .brand > strong {
   display: block;
-  font-size: 28px;
+  font-size: 22px;
   font-weight: 680;
-  letter-spacing: 0.13em;
+  letter-spacing: 0.055em;
   line-height: 1;
 }
 .brand > span {
@@ -145,7 +159,7 @@
   padding: 0 10px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   font-weight: 650;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -287,54 +301,83 @@
 /* ---- the narrow sidebar (icons only) ------------------------------------------------ */
 
 @media (max-width: 1240px) {
-  .sidebar { align-items: center; padding: 18px 8px 10px; }
-  .brand { padding: 0 0 12px; text-align: center; }
-  .brand > strong { font-size: 17px; letter-spacing: 0.06em; }
-  .brand > span,
-  .sidebar nav button > span,
-  .sidebar .api-status > span,
-  .sidebar .settings > span { display: none; }
-  .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 8px; }
-  .sidebar .settings { width: 42px; }
-  /* (the dot alone: "OAIY is running" is its name and its tooltip) */
-  .sidebar .api-status { width: 42px; min-height: 30px; justify-content: center; padding: 0; }
-  .sidebar .api-status > i { margin: 0; }
-  .sidebar nav button,
-  .sidebar .settings { width: 42px; min-height: 38px; justify-content: center; padding: 0; }
-  .sidebar nav button > svg,
-  .sidebar .settings > svg { width: 18px; height: 18px; }
-  /* (a group's label is a short line between its icons and the ones above) */
-  .sidebar nav .nav-group { width: 22px; height: 1px; margin: 8px 0 7px; overflow: hidden; background: var(--border); padding: 0; color: transparent; font-size: 0; }
-  .sidebar nav .nav-group:first-child { margin-top: 2px; }
-  .sidebar .nav-badge { display: none; }
-  /* A sub-menu folds away: its entry is one icon like the others, and its pages are the tabs beside the page's
-     name (App.tsx, `folded`). Shown under their entry, six more icons pushed the sections below them out of a
-     short window (at 760 by 560 Engines, Services, Networking and Connections could not be reached). No chevron. */
-  .sidebar nav .nav-toggle { display: none; }
-  .sidebar nav .nav-sub-head > .nav-parent { padding-right: 0; }
-  .sidebar nav .nav-sub { align-items: center; }
-  .sidebar nav .nav-sub.is-expanded .nav-children,
-  .sidebar nav .nav-sub.has-active .nav-children,
-  .sidebar nav .nav-children { display: none; }
-  .sidebar nav .nav-sub.is-expanded .nav-parent.active { background: var(--primary-soft); }
-  .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
-  /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
-  .sidebar .nav-count {
-    position: absolute;
-    top: 2px;
-    right: 0;
-    min-width: 15px;
-    height: 15px;
-    padding: 0 3px;
-    font-size: 9px;
-    line-height: 15px;
+  .sidebar-rail {
+    .sidebar { align-items: center; padding: 18px 8px 10px; }
+    .brand { width: 36px; min-height: 46px; margin: 0 0 6px; padding: 0; border: 0; }
+    .brand > strong { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    .brand > span,
+    .sidebar nav button > span,
+    .sidebar .api-status > span,
+    .sidebar .settings > span { display: none; }
+    .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 8px; }
+    .sidebar .settings { width: 42px; }
+    /* (the dot alone: "OAIY is running" is its name and its tooltip) */
+    .sidebar .api-status { width: 42px; min-height: 30px; justify-content: center; padding: 0; }
+    .sidebar .api-status > i { margin: 0; }
+    .sidebar nav button,
+    .sidebar .settings { width: 42px; min-height: 38px; justify-content: center; padding: 0; }
+    .sidebar nav button > svg,
+    .sidebar .settings > svg { width: 18px; height: 18px; }
+    /* (a group's label is a short line between its icons and the ones above) */
+    .sidebar nav .nav-group { width: 22px; height: 1px; margin: 8px 0 7px; overflow: hidden; background: var(--border); padding: 0; color: transparent; font-size: 0; }
+    .sidebar nav .nav-group:first-child { margin-top: 2px; }
+    .sidebar .nav-badge { display: none; }
+    /* A sub-menu folds away: its entry is one icon like the others, and its pages are the tabs beside the page's
+       name (App.tsx, `folded`). Shown under their entry, six more icons pushed the sections below them out of a
+       short window (at 760 by 560 Engines, Services, Networking and Connections could not be reached). No chevron. */
+    .sidebar nav .nav-toggle { display: none; }
+    .sidebar nav .nav-sub-head > .nav-parent { padding-right: 0; }
+    .sidebar nav .nav-sub { align-items: center; }
+    .sidebar nav .nav-sub.is-expanded .nav-children,
+    .sidebar nav .nav-sub.has-active .nav-children,
+    .sidebar nav .nav-children { display: none; }
+    .sidebar nav .nav-sub.is-expanded .nav-parent.active { background: var(--primary-soft); }
+    .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: block; }
+    /* (the sidebar's: a count elsewhere, a Messages tab's, stays beside its word) */
+    .sidebar .nav-count {
+      position: absolute;
+      top: 2px;
+      right: 0;
+      min-width: 15px;
+      height: 15px;
+      padding: 0 3px;
+      font-size: 9px;
+      line-height: 15px;
+    }
+    /* (what waits in its pages is on its icon whether or not one of them is open: the pages themselves are tabs) */
+    .nav-sub.is-expanded .nav-count-parent,
+    .nav-sub.has-active .nav-count-parent { display: inline-block; }
   }
-  /* (what waits in its pages is on its icon whether or not one of them is open: the pages themselves are tabs) */
-  .nav-sub.is-expanded .nav-count-parent,
-  .nav-sub.has-active .nav-count-parent { display: inline-block; }
 }
 
-@media (max-width: 480px) {
-  .brand > strong { font-size: 15px; letter-spacing: 0.03em; }
-  .sidebar { padding: 18px 6px 12px; }
+.nav-launch { display: none; }
+.workspace-nav-dialog {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: min(19rem, 90vw);
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: var(--sidebar);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+.workspace-nav-dialog::backdrop { background: rgb(8 12 22 / 46%); }
+.workspace-nav-dialog > .sidebar { height: 100%; padding: 22px 12px 12px; }
+.workspace-nav-dialog .nav-dismiss { position: absolute; top: 13px; right: 12px; z-index: 1; }
+.workspace-nav-dialog .sidebar nav button, .workspace-nav-dialog .sidebar .settings { min-height: 44px; }
+.workspace-nav-dialog .sidebar nav .nav-toggle { width: 40px; min-height: 40px; }
+.workspace-nav-dialog .sidebar nav .nav-child { min-height: 40px; }
+.workspace-nav-dialog .sidebar nav { padding-bottom: 16px; }
+@media (max-width: 1240px) {
+  .nav-launch { display: inline-flex; flex: none; }
+}
+@media (max-width: 700px) {
+  .app-shell { grid-template-columns: minmax(0, 1fr); height: 100dvh; }
+  .sidebar-rail { display: none; }
+  .top-row { gap: 6px; padding-left: 6px; }
+  .top-heading { gap: 6px; }
 }

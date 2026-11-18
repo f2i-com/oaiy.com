@@ -10,6 +10,24 @@ const ctx = () => ({ vfs: new Vfs(), gate: new NetGate(), reads: new Map(), shel
 const call = async (c: ReturnType<typeof ctx>, name: string, input: Record<string, unknown> = {}) => runTool({ id: 'c', name, input }, c);
 
 describe('the SoftN reference harness', () => {
+  it('finds framework recipes and installs each documented editable starter', async () => {
+    for (const [slug, heading, code] of [
+      ['vanilla-js', 'Vanilla JavaScript', 'document.createElement'],
+      ['react', 'React', 'React.createElement'],
+      ['vue', 'Vue', 'createApp'],
+    ]) {
+      const c = ctx();
+      const recipe = await call(c, 'softn_docs', { topic: `web-starters#${heading}` });
+      expect(recipe.isError).toBe(false);
+      expect(recipe.content).toContain(code);
+      const result = await call(c, 'softn_examples', { name: slug, install_to: 'apps' });
+      expect(result.isError).toBe(false);
+      const [root] = findApps(c.vfs);
+      expect(JSON.parse(c.vfs.readText(`${root}/manifest.json`)).engine).toBe(2);
+      expect(c.vfs.readText(`${root}/index.html`)).toContain('app.js');
+      expect(c.vfs.readText(`${root}/app.js`).length).toBeGreaterThan(0);
+    }
+  });
   it('names the Agent’s own tools where SoftN’s guide names Studio’s, and the guide it points to for games opens', async () => {
     // SoftN's guide is written for SoftN Studio's agent; the copy here is made by scripts/generate-softn-guide.mjs.
     for (const guide of [SOFTN_GUIDE_JAVASCRIPT, SOFTN_GUIDE_PYTHON]) {

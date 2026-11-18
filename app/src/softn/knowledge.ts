@@ -11,13 +11,17 @@
 import { unzipSync } from 'fflate';
 import type { Vfs } from '../vfs/vfs';
 import { COMPONENT_INDEX, DOC_INDEX } from './knowledge/index.generated';
-import { appFiles, handlersIn, importSoftn, isAppPagePath, type Finding } from './softn';
+import webStartersGuide from './web-starters.md?raw';
+import { appFiles, handlersIn, importSoftn, isAppPagePath, isWebApp, type Finding } from './softn';
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const components = () => import('./knowledge/components.generated').then((m) => m.COMPONENT_REFERENCE);
 const docs = () => import('./knowledge/docs.generated').then((m) => m.DOC_PAGES);
-const examples = () => import('./knowledge/examples.generated').then((m) => m.SOFTN_EXAMPLES);
+const examples = async () => {
+  const [web, classic] = await Promise.all([import('./knowledge/web-starters.generated'), import('./knowledge/examples.generated')]);
+  return [...web.WEB_STARTER_EXAMPLES, ...classic.SOFTN_EXAMPLES];
+};
 
 /** Each component's events as its reference lists them ("Events …", then "- @name" lines), in lower case. */
 let eventsOf: Promise<Map<string, Set<string>>> | null = null;
@@ -43,6 +47,7 @@ export function componentEvents(): Promise<Map<string, Set<string>>> {
  * events at all is an error; one that has events but not this one a warning.
  */
 export async function checkEvents(vfs: Vfs, root = ''): Promise<Finding[]> {
+  if (isWebApp(vfs, root)) return [];
   const events = await componentEvents();
   const out: Finding[] = [];
   for (const [path, data] of appFiles(vfs, root)) {
@@ -80,7 +85,7 @@ export async function docsMap(guide: string): Promise<string> {
   }
   const list = await examples();
   return [
-    'SoftN reference. Start with the writing guide; look up components before using props you are unsure of; read an example app that does something similar; search when you do not know where something is.',
+    'For Vanilla JavaScript, React and Vue, read softn_docs topic "web-starters" and install the matching softn_examples starter. For classic apps, use the project writing guide and component reference.',
     '',
     '## The writing guide (softn_docs topic "guide", or "guide#<words from a heading>")',
     ...guideSections(guide).filter((s) => s.title && !s.title.startsWith('#')).map((s) => `- ${s.title}`),
@@ -101,12 +106,13 @@ export async function docsMap(guide: string): Promise<string> {
 /** A guide section or a published guide by slug, optionally one section of it. */
 export async function readTopic(topic: string, guide: string): Promise<{ ok: boolean; text: string }> {
   const [pagePart, sectionPart = ''] = topic.trim().replace(/^\/+/, '').split('#');
-  if (norm(pagePart) === 'guide' || norm(pagePart) === 'writingguide') {
-    if (!sectionPart) return { ok: true, text: guide };
+  if (norm(pagePart) === 'webstarters' || norm(pagePart) === 'guide' || norm(pagePart) === 'writingguide') {
+    const content = norm(pagePart) === 'webstarters' ? webStartersGuide : guide;
+    if (!sectionPart) return { ok: true, text: content };
     const want = sectionPart.toLowerCase();
-    const hits = guideSections(guide).filter((s) => s.title.toLowerCase().includes(want));
+    const hits = guideSections(content).filter((s) => s.title.toLowerCase().includes(want));
     if (hits.length) return { ok: true, text: hits.map((s) => s.text).join('\n\n') };
-    return { ok: false, text: `No heading in the writing guide contains "${sectionPart}". Its sections: ${guideSections(guide).map((s) => s.title).join('; ')}` };
+    return { ok: false, text: `No heading in ${pagePart} contains "${sectionPart}". Its sections: ${guideSections(content).map((s) => s.title).join('; ')}` };
   }
   const pages = await docs();
   const page = pages.find((p) => p.slug === pagePart) ?? pages.find((p) => norm(p.slug) === norm(pagePart) || norm(p.title) === norm(pagePart));
@@ -155,17 +161,18 @@ async function exampleFiles(slug: string): Promise<Record<string, Uint8Array> | 
   return files;
 }
 
-const TEXT_FILE = /\.(ui|logic|py|json|md|txt|xdb|wgsl|css|svg|js)$/i;
+const TEXT_FILE = /\.(ui|logic|py|json|md|txt|xdb|wgsl|css|svg|html?|[cm]?js|jsx|ts|tsx|vue)$/i;
 
 async function corpus(guide: string): Promise<Doc[]> {
   const out: Doc[] = [];
+  for (const s of guideSections(webStartersGuide)) out.push({ ref: `softn_docs topic "web-starters#${s.title}"`, title: `Web starters: ${s.title}`, text: s.text });
   for (const s of guideSections(guide)) out.push({ ref: `softn_docs topic "guide#${s.title}"`, title: `Writing guide: ${s.title}`, text: s.text });
   for (const p of await docs()) for (const s of p.sections) out.push({ ref: `softn_docs topic "${p.slug}#${s.id}"`, title: `${p.title}: ${s.title}`, text: s.text });
   for (const [name, text] of Object.entries(await components())) out.push({ ref: `softn_components names ["${name}"]`, title: `Component ${name}`, text });
   for (const e of await examples()) {
     const files = await exampleFiles(e.slug);
     for (const [path, data] of Object.entries(files ?? {})) {
-      if (!TEXT_FILE.test(path)) continue;
+      if (!TEXT_FILE.test(path) || path.startsWith('vendor/') || path.startsWith('__softn_generated__/')) continue;
       out.push({ ref: `softn_examples name "${e.slug}" file "${path}"`, title: `Example ${e.slug}: ${path}`, text: textDecoder.decode(data) });
     }
   }

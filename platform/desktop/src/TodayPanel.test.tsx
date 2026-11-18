@@ -75,6 +75,25 @@ afterEach(() => {
 });
 
 describe("Today's tiles and the desktop's modules", () => {
+  it('replaces stale appointment counts with an unavailable state until the calendar answers again', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      modulesMock.mockResolvedValue(snapshot(true, true));
+      await mount();
+      const requests = () => [...host.querySelectorAll('button')].find(button => button.textContent?.includes('Requests to confirm'))?.querySelector('strong')?.textContent;
+      expect(requests()).toBe('0');
+      calendarGet.mockRejectedValueOnce(new Error('Offline'));
+      await act(async () => { vi.advanceTimersByTime(10_000); });
+      expect(requests()).toBe('Unavailable');
+      calendarGet.mockResolvedValueOnce({ available: false, appointments: [] });
+      await act(async () => { vi.advanceTimersByTime(10_000); });
+      expect(requests()).toBe('Unavailable');
+      await act(async () => { vi.advanceTimersByTime(10_000); });
+      expect(requests()).toBe('0');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('with the phone off there is no phone tile, and the phone is never asked', async () => {
     modulesMock.mockResolvedValue(snapshot(false, true));
     await mount();

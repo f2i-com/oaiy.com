@@ -126,11 +126,14 @@ Any `.glb` or `.gltf` file of the project is a 3D model the **Preview** tab can 
 
 OAIY can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
 
-- **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. The dialog starts from a small working task list, a blank page, or one of the example apps, in a new project or in a folder of this one. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
+Ask the agent to build an app in **Vanilla JavaScript, React or Vue**. It can install an offline starter, edit its source and run it in Preview. For example, ask it to build a React practice timer, then try the Start button in Preview. Each starter uses an ordinary HTML entry and an editable `app.js`. [Framework guide and code examples](src/softn/web-starters.md)
+
+To choose one yourself, open **New SoftN app → Start from an example app** and select **Trail log** for Vanilla JS, **Practice set** for React or **Reading log** for Vue. The dialog also offers a classic task list and a blank project. Existing classic projects keep their component pages and JavaScript or Python logic.
+
 - **Reference for the agent:** SoftN is in its tools, so it doesn't have to guess.
   - `softn_docs` with no arguments gives a map of the writing guide, the published guides, every component and the example apps. It reads any of them by topic (`"guide#mistakes"`, `"xdb-data#operations"`). With `search` it finds a term across all of them, including the example apps' source, and says how to open each hit.
   - `softn_components` gives a component's exact props, events and an example.
-  - `softn_examples` lists, reads or installs complete apps from softn.com's catalogue: notes, a 2048 game, a component showcase, 3D, WebGPU and device permissions.
+  - `softn_examples` lists, reads or installs the three editable web starters and classic examples for notes, games, components, 3D and device permissions.
   - All of this is bundled for offline use. Regenerate it with `npm run softn:knowledge`.
 - **Live preview:** the **Preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
 - **Errors the agent sees and fixes:**

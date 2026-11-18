@@ -23,6 +23,7 @@ import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import { ask } from './ask';
 import ChatGptConnector from './ChatGptConnector';
+import './connectionSettings.css';
 
 /**
  * AI Providers panel — configure the cloud (or local) AI providers the local AI
@@ -145,6 +146,8 @@ export default function AiProvidersPanel() {
    *  was actually clicked rather than always on Test. */
   const [busy, setBusy] = useState<Record<string, string>>({});
   const nameRef = useRef<HTMLInputElement>(null);
+  const addRef = useRef<HTMLButtonElement>(null);
+  const editTrigger = useRef<HTMLButtonElement | null>(null);
   /** The person typed an ID of their own into the add form: it stops following the name. */
   const idTyped = useRef(false);
 
@@ -180,17 +183,20 @@ export default function AiProvidersPanel() {
     setForm(EMPTY);
     setEditingId(null);
     setShowForm(false);
+    window.setTimeout(() => (editTrigger.current?.isConnected ? editTrigger.current : addRef.current)?.focus(), 0);
   };
 
   const startAdd = () => {
     setForm(EMPTY);
+    editTrigger.current = null;
     idTyped.current = false;
     setEditingId(null);
     setShowForm(true);
     window.setTimeout(() => nameRef.current?.focus(), 0);
   };
 
-  const startEdit = (p: AiProviderPublic) => {
+  const startEdit = (p: AiProviderPublic, button: HTMLButtonElement) => {
+    editTrigger.current = button;
     setEditingId(p.id);
     setShowForm(true);
     setForm({
@@ -331,7 +337,7 @@ export default function AiProvidersPanel() {
   };
 
   return (
-    <div className="panel is-form">
+    <div className="panel is-form provider-settings">
       {loadError && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>Couldn't reach the AI gateway: {loadError}</span>
@@ -368,19 +374,15 @@ export default function AiProvidersPanel() {
         </div>
       )}
 
-      {/* Sign in with a ChatGPT account — no API key involved, so it lives above
-          the key-based providers rather than among them. */}
-      <ChatGptConnector />
-
       {/* Add / edit form — gated behind a button like ServicesPanel's add form, so
           the panel opens on the providers themselves rather than an empty form. (The button is in the list's own
           heading: a card that held nothing but the button floated between the two.) */}
       {showForm && (
-        <section className="service-section">
-          <form className="dl-form" onSubmit={submit}>
+        <section className="service-section provider-editor" aria-labelledby="provider-editor-title">
+          <form className="dl-form" onSubmit={submit} aria-busy={saving} inert={saving}>
             <div className="section-title-row">
-              <h3 className="section-title">{editingId ? `Edit ${form.name || editingId}` : 'Add a provider'}</h3>
-              <button type="button" className="btn-tiny" onClick={resetForm}>
+              <h3 id="provider-editor-title" className="section-title"><Waypoints size={17} aria-hidden />{editingId ? `Edit ${form.name || editingId}` : 'Add a provider'}</h3>
+              <button type="button" className="btn-tiny" onClick={resetForm} disabled={saving}>
                 Cancel
               </button>
             </div>
@@ -416,8 +418,9 @@ export default function AiProvidersPanel() {
                   readOnly={editingId !== null}
                   onChange={(e) => {
                     // (emptied again, it goes back to following the name)
-                    idTyped.current = e.target.value !== '';
-                    setForm((f) => ({ ...f, id: e.target.value }));
+                    const typed = e.target.value;
+                    idTyped.current = typed !== '';
+                    setForm((f) => ({ ...f, id: typed || idFromName(f.name, providers?.map((p) => p.id) ?? []) }));
                   }}
                   required
                 />
@@ -437,7 +440,7 @@ export default function AiProvidersPanel() {
               </label>
               <label className="form-row">
                 <span>
-                  Default model {form.protocol === 'anthropic' ? '(required)' : '(optional)'}
+                  Default model {form.protocol === 'anthropic' ? '(needed to test)' : '(optional)'}
                 </span>
                 {/* No placeholder model name — model IDs churn too fast to suggest one
                     that stays valid; the user pastes the exact id their provider serves. */}
@@ -452,7 +455,7 @@ export default function AiProvidersPanel() {
             <label className="form-row">
               <span>Base URL</span>
               <input className="is-mono"
-                type="text"
+                type="url"
                 placeholder={DEFAULT_BASE[form.protocol]}
                 value={form.baseUrl}
                 onChange={(e) => setForm((f) => ({ ...f, baseUrl: e.target.value }))}
@@ -465,12 +468,12 @@ export default function AiProvidersPanel() {
               <input className="is-mono"
                 type="password"
                 autoComplete="off"
-                placeholder={editingId ? '••••••••' : 'sk-…'}
+                placeholder={editingId && providers?.some((p) => p.id === editingId && p.hasKey) ? 'Key already saved' : 'Enter an API key'}
                 value={form.apiKey}
                 onChange={(e) => setForm((f) => ({ ...f, apiKey: e.target.value }))}
               />
             </label>
-            {editingId && (
+            {editingId && providers?.some((p) => p.id === editingId && p.hasKey) && (
               <p className="form-hint">Leave the API key blank to keep the current one.</p>
             )}
 
@@ -480,7 +483,7 @@ export default function AiProvidersPanel() {
                 checked={form.allowLocal}
                 onChange={(e) => setForm((f) => ({ ...f, allowLocal: e.target.checked }))}
               />
-              <span>It runs on this computer or my own network (Ollama or LM Studio, for example), so it needs no key and may use plain http</span>
+              <span>Local endpoint <small>Allow an address on this computer or my network to use HTTP and run without a key.</small></span>
             </label>
 
             <div className="form-actions">
@@ -503,49 +506,30 @@ export default function AiProvidersPanel() {
         </div>
       ) : providers === null ? (
         <div className="empty-state is-loading">Loading providers…</div>
-      ) : providers.length === 0 ? (
-        <div className="empty-state">
-          <Sparkles size={22} aria-hidden />
-          <p>No AI providers yet.</p>
-          <p>
-            Add one to give your flows a chat model, in the cloud or on this computer. Its key stays on this computer: flows reach the provider
-            through OAIY, never with the key in the browser.
-          </p>
-          {!showForm && (
-            <button className="btn btn-secondary" onClick={startAdd}>
-              <Plus size={14} /> Add provider
-            </button>
-          )}
-        </div>
       ) : (
-        <section className="service-section">
+        <section className="service-section provider-directory" aria-labelledby="provider-directory-title">
           <div className="section-title-row">
-            <h3 className="section-title">Providers with a key or an address</h3>
+            <h3 id="provider-directory-title" className="section-title"><Waypoints size={17} aria-hidden />API providers</h3>
             {!showForm && (
-              <span className="section-actions">
-                {/* The promise, where keys are typed (it was at the foot of every page). */}
-                <span className="trust-line">
-                  <LockKeyhole size={12} aria-hidden /> Keys stay on this computer
-                </span>
-                <button className="btn-tiny" onClick={startAdd}>
-                  <Plus size={13} /> Add provider
-                </button>
-              </span>
+              <button ref={addRef} className="btn btn-primary" onClick={startAdd}><Plus size={15} /> Add provider</button>
             )}
           </div>
+          {providers.length === 0 && <div className="provider-empty">
+            <Sparkles size={20} aria-hidden />
+            <div><strong>No AI providers yet.</strong><p>Add a local server or a cloud API for your flows and Agent to use.</p></div>
+          </div>}
           {providers.map((p) => {
             const action = busy[p.id];
-            const working = action !== undefined;
-            const testable = p.hasKey || p.allowLocal;
+            const working = action !== undefined || saving;
+            const testHint = !p.hasKey && !p.allowLocal ? 'Add an API key first'
+              : p.protocol === 'anthropic' && !p.model?.trim() ? 'Set a default model to test this provider' : '';
             return (
-              <div key={p.id} className={`service-card service-card-${cardStatus(p)}`}>
+              <div key={p.id} className={`service-card provider-card service-card-${cardStatus(p)}`}>
                 <div className="card-head">
-                  <Waypoints size={14} aria-hidden />
                   {/* (its id is what flows name it by: in its tooltip, and in the Edit form, not a chip of code on the card) */}
                   <strong className="card-title" title={`Flows name this provider “${p.id}”`}>
                     {p.name}
                   </strong>
-                  <span className="badge badge-neutral">{PROTOCOL_WORDS[p.protocol] ?? p.protocol}</span>
                   {/* Key state, agreeing with the card accent: a local endpoint needs
                       no key, so it isn't an error — it's simply not required. */}
                   {p.hasKey ? (
@@ -558,24 +542,26 @@ export default function AiProvidersPanel() {
                   {!p.enabled && <span className="badge badge-neutral">Off</span>}
                 </div>
 
-                <p className="card-desc card-address">
-                  {p.baseUrl}
-                  {p.model ? ` · uses ${p.model}` : ''}
-                </p>
+                <dl className="provider-facts">
+                  <div><dt>Endpoint</dt><dd>{p.baseUrl}</dd></div>
+                  <div><dt>Protocol</dt><dd>{PROTOCOL_WORDS[p.protocol] ?? p.protocol}</dd></div>
+                  {p.model && <div><dt>Default model</dt><dd>{p.model}</dd></div>}
+                </dl>
+                {!!testHint && <p className="form-hint">{testHint}.</p>}
 
                 <div className="card-actions">
                   <button
                     className="btn btn-secondary"
                     onClick={() => void runAction(p.id, 'test', () => aiProviders.test(p.id), `${p.name} is reachable and authorized`)}
-                    disabled={working || !testable}
+                    disabled={working || !!testHint}
                     aria-label={`Test ${p.name}`}
-                    title={testable ? `Test ${p.name}` : 'Add an API key first'}
+                    title={testHint || `Test ${p.name}`}
                   >
                     {action === 'test' ? <Loader2 size={14} className="spin" /> : <KeyRound size={14} />} Test
                   </button>
                   <button
                     className="btn btn-ghost"
-                    onClick={() => startEdit(p)}
+                    onClick={(e) => startEdit(p, e.currentTarget)}
                     disabled={working}
                     aria-label={`Edit ${p.name}`}
                   >
@@ -621,8 +607,10 @@ export default function AiProvidersPanel() {
               </div>
             );
           })}
+          <span className="trust-line"><LockKeyhole size={13} aria-hidden /> Keys stay on this computer</span>
         </section>
       )}
+      <ChatGptConnector />
     </div>
   );
 }

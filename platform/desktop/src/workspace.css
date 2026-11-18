@@ -94,3 +94,111 @@ input, select, textarea { max-width: 100%; }
 /* Settings → Backup: when the last backup was made, at the top of the section. */
 .backup-last { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; color: var(--text); font-size: 13px; font-weight: 560; }
 .backup-last svg { flex: none; color: var(--muted); }
+
+/* Today gives the selected model room for its name. The remaining tiles read
+   as a short agenda, with the same order at desktop and phone widths. */
+.today-section, .computer-section { container-type: inline-size; }
+.today-section .section-title, .computer-section .section-title {
+  font-size: 18px;
+  line-height: 1.3;
+  letter-spacing: -.035em;
+}
+.today-section .section-title::before, .computer-section .section-title::before { display: none; }
+.today-section .section-title-row { justify-content: space-between; }
+.today-section time { color: var(--muted); font-size: var(--text-hint); }
+.today-section .today-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr);
+  align-items: stretch;
+  gap: 12px;
+}
+.today-section .today-grid > .overview-tile {
+  display: grid;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  grid-template: 'icon state' auto 'name name' 1fr / minmax(0, 1fr) auto;
+  min-height: 155px;
+  gap: 18px 10px;
+  padding: clamp(16px, 3cqi, 26px);
+  border: 1px solid #59539d;
+  border-radius: 12px;
+  background: linear-gradient(118deg, #232545, #343161 66%, #464577);
+  color: #fff;
+  box-shadow: none;
+}
+.today-grid > .overview-tile::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(circle at 1px 1px, #d7ceff55 1px, transparent 1.5px);
+  background-size: 12px 12px;
+  mask-image: linear-gradient(108deg, transparent 35%, #000 155%);
+}
+.today-section .today-grid > .overview-tile > svg {
+  grid-area: icon;
+  width: 37px;
+  height: 37px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid #ffffff30;
+  border-radius: 10px;
+  background: #ffffff0f;
+  color: #ebe8ff;
+}
+.today-section .today-grid > .overview-tile > strong {
+  grid-area: state;
+  justify-self: end;
+  align-self: start;
+  max-width: 100%;
+  border: 1px solid #ffffff36;
+  border-radius: 20px;
+  padding: 4px 9px;
+  color: #f1efff;
+  font-size: 12px;
+  font-weight: 570;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.today-section .today-grid > .overview-tile > strong.ok { color: #bdffdd; background: #24634e77; }
+.today-section .today-grid > .overview-tile > strong.warn { color: #ffe9a6; background: #614b3077; }
+.today-section .today-grid > .overview-tile > small {
+  grid-area: name;
+  align-self: end;
+  color: #fff;
+  font-size: clamp(21px, 2.8cqi, 33px);
+  font-weight: 610;
+  line-height: 1.16;
+  letter-spacing: -.04em;
+}
+.today-activity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.today-activity > .overview-tile {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: center;
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 3px;
+  padding: 12px 14px;
+  background: var(--surface-solid);
+  box-shadow: none;
+}
+.today-activity > .overview-tile:last-child:nth-child(odd), .today-grid > .overview-tile:only-child { grid-column: 1 / -1; }
+.today-activity > .overview-tile > svg { grid-row: span 2; margin: 0; color: var(--primary-text); }
+.today-activity > .overview-tile strong { white-space: normal; font-size: 15px; }
+.today-activity > .overview-tile small { grid-column: 2; font-size: 12px; }
+.computer-section .overview-tile { box-shadow: none; background: var(--surface-soft); }
+.computer-section .overview-tile strong { font-variant-numeric: tabular-nums; }
+.computer-section .overview-tile:hover, .today-activity .overview-tile:hover {
+  background: var(--primary-soft);
+  border-color: var(--primary-text);
+}
+@container (max-width: 620px) {
+  .today-section .today-grid { grid-template-columns: minmax(0, 1fr); }
+  .today-section .today-grid > .overview-tile { min-height: 110px; }
+  .today-activity > .overview-tile { grid-template-columns: minmax(0, 1fr); row-gap: 4px; }
+  .today-activity > .overview-tile > svg { grid-row: auto; }
+  .today-activity > .overview-tile small { grid-column: 1; }
+  .computer-section .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

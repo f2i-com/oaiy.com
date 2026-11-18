@@ -131,7 +131,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
       <section className={bare ? 'chatgpt-connector is-bare' : 'service-section'}>
         {!bare && (
           <div className="section-title-row">
-            <h3 className="section-title">ChatGPT</h3>
+            <h3 className="section-title"><MessageSquare size={17} aria-hidden />ChatGPT</h3>
           </div>
         )}
         <p className="form-hint">
@@ -162,7 +162,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
     <section className={bare ? 'chatgpt-connector is-bare' : 'service-section'}>
       {!bare && (
         <div className="section-title-row">
-          <h3 className="section-title">ChatGPT</h3>
+          <h3 className="section-title"><MessageSquare size={17} aria-hidden />ChatGPT</h3>
           {status && (
             <span className={connected ? 'badge badge-ok' : 'badge badge-neutral'}>
               {connected ? 'Signed in' : 'Signed out'}

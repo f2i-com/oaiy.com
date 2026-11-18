@@ -212,7 +212,8 @@ const closed = createHttpServer((req, res) => {
 await new Promise((r) => closed.listen(0, '127.0.0.1', r));
 const closedUrl = `http://127.0.0.1:${closed.address().port}`;
 
-const server = await createServer({ server: { port: 0, host: '127.0.0.1' }, logLevel: 'error' });
+// A source edit during the run must not reload the conversation mid-script.
+const server = await createServer({ server: { port: 0, host: '127.0.0.1', hmr: false, watch: null }, logLevel: 'error' });
 await server.listen();
 const base = `http://127.0.0.1:${server.httpServer.address().port}`;
 let failures = 0;
@@ -243,7 +244,7 @@ try {
     // (in plain words: the engines, not their service's name, and where each thing is changed)
     expect(log.includes(`Found OAIY's engines at ${new URL(oaiyUrl).origin} (version 0.1.0).`) && !log.includes('oaiy-studio'), log.slice(0, 500));
     expect(log.includes('The agent chats with them (Settings → AI providers) and can make images, video, speech, music, sound effects and 3D models with them (Settings → Images, video and audio).'), log.slice(0, 500));
-    expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
+    expect(!(await page.$('.chat-setup button')), 'the welcome still asks for a provider');
     const chip = await page.$eval('button.chip.model', (b) => b.textContent);
     expect(chip === 'OAIY · qwen3.8-27b', chip);
     await page.click('button.settings-button');

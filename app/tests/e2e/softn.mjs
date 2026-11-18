@@ -415,6 +415,39 @@ try {
     await page.click('dialog.modal button.danger');
     await page.waitForFunction(() => ![...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'todo.md'));
   });
+  await check('Vanilla JS, React and Vue starters render and retain a saved change across preview reloads', async () => {
+    const host = await browser.newPage();
+    try {
+      await host.goto(base);
+      await host.evaluate(async () => {
+        const { Vfs } = await import('/src/vfs/vfs.ts');
+        const { Preview } = await import('/src/preview/preview.ts');
+        const { installExample } = await import('/src/softn/knowledge.ts');
+        const vfs = new Vfs();
+        const preview = new Preview(vfs, () => 'web-starter-test');
+        document.body.replaceChildren(preview.element);
+        preview.setVisible(true);
+        window.openStarter = async slug => {
+          const { root } = await installExample(vfs, slug, '');
+          window.reopenStarter = () => preview.check({ kind: 'app', root });
+          return window.reopenStarter();
+        };
+      });
+      for (const [slug, action] of [['vanilla-js', 'Log a section'], ['react', 'Finish a round'], ['vue', 'Log a page']]) {
+        const opened = await host.evaluate(slug => window.openStarter(slug), slug);
+        expect(opened.ok, slug + ': ' + opened.errors.join('; '));
+        const frame = appFrame(host);
+        expect(new URL(frame.url()).searchParams.get('format') === 'web', 'web container was not selected');
+        await frame.locator(`::-p-aria(${action})`).click();
+        await frame.locator('::-p-aria(Reset)').filter(button => !button.disabled).wait();
+        const reopened = await host.evaluate(() => window.reopenStarter());
+        expect(reopened.ok, reopened.errors.join('; '));
+        await appFrame(host).locator('::-p-aria(Reset)').filter(button => !button.disabled).wait();
+      }
+    } finally {
+      await host.close();
+    }
+  });
 } finally {
   await browser.close();
   await server.close();

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Cloud, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
+import { Check, Cloud, Link2, Radio, RefreshCw, ShieldCheck, TriangleAlert, X } from 'lucide-react';
 import {
   companion,
   link as linkApi,
@@ -16,6 +16,7 @@ import { ask } from './ask';
 import { accessName, pairingFrom, pairingGrants } from './pairingWords';
 import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
+import './connectionSettings.css';
 
 /**
  * Connections — every app that has been granted access to this machine, and any
@@ -218,6 +219,7 @@ export default function ConnectionsPanel() {
   const [relay, setRelay] = useState<CompanionRelayStatus | null>(() => peek('companionRelay') ?? null);
   const [relayForm, setRelayForm] = useState({ baseUrl: '', token: '', appId: '' });
   const [relayError, setRelayError] = useState<string | null>(null);
+  const [relayReadError, setRelayReadError] = useState(false);
   /** The relay's three fields, open under a relay that is connected only once "Change relay" is pressed. */
   const [relayEditing, setRelayEditing] = useState(false);
   const [account, setAccount] = useState<LinkStatus | null>(() => peek('linkStatus') ?? null);
@@ -235,15 +237,18 @@ export default function ConnectionsPanel() {
   // show a disconnected account, or a cancelled link, back for a moment)
   const accountAsk = useRef(0);
   const pairAsk = useRef(0);
+  const relayAsk = useRef(0);
 
   const refreshRelay = useCallback(async () => {
+    const mine = ++relayAsk.current;
+    setRelayReadError(false);
     try {
       const next = await companion.relayStatus();
+      if (mine !== relayAsk.current) return;
       setRelay(next);
       put('companionRelay', next);
     } catch {
-      // A relay this desktop has never configured is the normal case, not an
-      // error worth a banner over the pairing list.
+      if (mine === relayAsk.current) setRelayReadError(true);
     }
   }, []);
 
@@ -399,6 +404,8 @@ export default function ConnectionsPanel() {
         token: relayForm.token,
         appId: relayForm.appId.trim() || undefined,
       });
+      ++relayAsk.current;
+      setRelayReadError(false);
       setRelay(next);
       put('companionRelay', next);
       // Clear the token from component state the moment it is stored: it is
@@ -424,9 +431,13 @@ export default function ConnectionsPanel() {
     setRelayBusy(true);
     try {
       const next = await companion.clearRelay();
+      ++relayAsk.current;
+      setRelayReadError(false);
       setRelay(next);
       put('companionRelay', next);
       toast.push({ kind: 'success', title: 'Companion relay disconnected' });
+      setRelayEditing(false);
+      setRelayForm({ baseUrl: '', token: '', appId: '' });
     } catch (err) {
       setRelayError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -467,7 +478,7 @@ export default function ConnectionsPanel() {
   };
 
   return (
-    <div className="panel is-form">
+    <div className="panel is-form connection-settings">
       {error && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>{error}</span>
@@ -486,9 +497,10 @@ export default function ConnectionsPanel() {
       )}
 
       {pending.length > 0 && (
-        <section className="service-section">
+        <section className="service-section connection-requests">
           <div className="section-title-row">
-            <h3 className="section-title">Waiting for you</h3>
+            <h3 className="section-title"><Link2 size={17} aria-hidden />Waiting for you</h3>
+            <span className="section-count">{pending.length} pending</span>
           </div>
           {pending.map((req) => (
             <div key={req.pairingId} className="service-card service-card-starting">
@@ -530,7 +542,8 @@ export default function ConnectionsPanel() {
 
       <section className="service-section">
         <div className="section-title-row">
-          <h3 className="section-title">Connected apps</h3>
+          <h3 className="section-title"><ShieldCheck size={17} aria-hidden />Connected apps</h3>
+          {loaded && paired.length > 0 && <span className="section-count">{paired.length} connected</span>}
         </div>
         {!loaded ? (
           <p className="form-hint">{error ? 'The connected apps could not be read.' : 'Reading the connected apps…'}</p>
@@ -581,9 +594,9 @@ export default function ConnectionsPanel() {
         </details>
       </section>
 
-      <section className="service-section">
+      <section className="service-section connection-account">
         <div className="section-title-row">
-          <h3 className="section-title">Linked account</h3>
+          <h3 className="section-title"><Cloud size={17} aria-hidden />Linked account</h3>
         </div>
         {/* Linked: how the link stands comes first, and what a link is goes under "How the link works". Not linked:
             one sentence on what it is for, then the form. */}
@@ -770,9 +783,9 @@ export default function ConnectionsPanel() {
         </details>
       </section>
 
-      <section className="service-section">
+      <section className="service-section companion-relay">
         <div className="section-title-row">
-          <h3 className="section-title">Companion relay</h3>
+          <h3 className="section-title"><Radio size={17} aria-hidden />Companion relay</h3>
         </div>
         {/* Connected: the relay's line comes first, and what a relay is goes under "What the relay does". */}
         {!relay?.configured && (
@@ -787,6 +800,10 @@ export default function ConnectionsPanel() {
           </div>
         )}
 
+        {relayReadError && <div className="banner banner-err" role="alert">
+          <span>Couldn’t check the Companion relay.</span>
+          <button type="button" className="btn-tiny" onClick={() => void refreshRelay()}><RefreshCw size={13} />Try again</button>
+        </div>}
         {relay?.configured ? (
           <ul className="pairing-list">
             <li>
@@ -797,7 +814,11 @@ export default function ConnectionsPanel() {
               </span>
               <span className="banner-actions">
                 {/* The three fields are for connecting or changing a relay: closed while one is connected. */}
-                <button type="button" className="btn-tiny" aria-expanded={relayEditing} onClick={() => setRelayEditing((v) => !v)}>
+                <button type="button" className="btn-tiny" disabled={relayBusy} aria-expanded={relayEditing} onClick={() => {
+                  setRelayForm(relayEditing ? { baseUrl: '', token: '', appId: '' } : { baseUrl: relay.baseUrl ?? '', token: '', appId: relay.appId ?? '' });
+                  setRelayError(null);
+                  setRelayEditing(!relayEditing);
+                }}>
                   {relayEditing ? 'Cancel' : 'Change relay'}
                 </button>
                 <button className="btn-tiny btn-danger" disabled={relayBusy} onClick={() => void disconnectRelay()}>
@@ -806,14 +827,14 @@ export default function ConnectionsPanel() {
               </span>
             </li>
           </ul>
-        ) : (
+        ) : relay ? (
           <p className="form-hint">
             No relay is connected, so a Companion phone cannot join a call yet.
           </p>
-        )}
+        ) : !relayReadError && <p className="form-hint" role="status">Checking the relay…</p>}
 
-        {(!relay?.configured || relayEditing) && (
-        <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void saveRelay(e)}>
+        {relay && (!relay.configured || relayEditing) && (
+        <form className="dl-form" onSubmit={(e) => void saveRelay(e)}>
           <label className="form-row">
             <span>Relay address</span>
             <input className="is-mono"
@@ -830,6 +851,7 @@ export default function ConnectionsPanel() {
             <input className="is-mono"
               type="password"
               placeholder="the key your relay issued this computer"
+              autoComplete="off"
               value={relayForm.token}
               onChange={(e) => setRelayForm((f) => ({ ...f, token: e.target.value }))}
             />
@@ -862,7 +884,6 @@ export default function ConnectionsPanel() {
           </p>
         </details>
       </section>
-
     </div>
   );
 }

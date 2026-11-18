@@ -8,6 +8,9 @@
  *       knowledge/), itself generated from the component manifest and the
  *       published docs: every component's props, events and an example, and
  *       every guide as text;
+ *   web-starters.generated.ts
+ *     — Studio's no-build Vanilla JS, React and Vue projects, with the local
+ *       framework libraries and licenses shipped in the website examples;
  *   examples.generated.ts
  *     — a few complete apps from softn.com's catalogue (apps/softn-api/data/
  *       apps/<slug>/v1.softn), kept as the .softn bytes, for the agent to
@@ -17,9 +20,11 @@
  * SoftN update:   SOFTN_REPO=../softn.com node scripts/generate-softn-knowledge.mjs
  */
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { registerHooks } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { unzipSync } from 'fflate';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(process.env.SOFTN_REPO || join(here, '..', '..', 'softn.com'));
@@ -28,8 +33,7 @@ mkdirSync(out, { recursive: true });
 
 let commit = 'unknown';
 try {
-  const head = readFileSync(join(repo, '.git', 'HEAD'), 'utf8').trim();
-  commit = head.startsWith('ref: ') ? readFileSync(join(repo, '.git', head.slice(5)), 'utf8').trim() : head;
+  commit = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 } catch {
   /* not a git checkout */
 }
@@ -42,6 +46,57 @@ for (const name of ['index.generated.ts', 'components.generated.ts', 'docs.gener
   writeFileSync(join(out, name), `${header(`apps/softn-studio/src/lib/agent/knowledge/${name}`)}${source}`);
   console.log(`copied ${name} (${(source.length / 1024).toFixed(1)} KiB)`);
 }
+
+const editor = join(repo, 'packages/@softn/editor-shared/src');
+const builderUrl = pathToFileURL(join(editor, 'starters/buildStarter.ts')).href;
+const { WEB_STARTERS } = await import(pathToFileURL(join(editor, 'webStarters.ts')).href);
+const archiveNames = { vanilla: 'TrailPack', react: 'RatioBar', vue: 'Swatchbook' };
+const archives = new Map(WEB_STARTERS.map(({ id }) => {
+  const file = join(repo, 'apps/softn-site/public/examples', archiveNames[id] + '.softn');
+  return [id, unzipSync(readFileSync(file))];
+}));
+
+// Studio's builder imports raw templates and virtual framework modules through
+// Vite. Supply the same inputs when running that builder directly under Node.
+const starterModules = registerHooks({
+  resolve(id, context, nextResolve) {
+    if (context.parentURL !== builderUrl) return nextResolve(id, context);
+    let text;
+    if (id.startsWith('./') && id.endsWith('?raw')) {
+      text = readFileSync(new URL(id.slice(0, -4), builderUrl), 'utf8');
+    } else if (id.startsWith('virtual:softn-starter/')) {
+      const framework = id.slice('virtual:softn-starter/'.length);
+      const library = archives.get(framework)?.[`__softn_generated__/vendor/${framework}.js`];
+      if (!library) throw new Error(`The ${framework} example is missing its framework library`);
+      text = strFromU8(library);
+    } else return nextResolve(id, context);
+    const module = Buffer.from('export default ' + JSON.stringify(text)).toString('base64');
+    return { url: 'data:text/javascript;base64,' + module, shortCircuit: true };
+  },
+});
+const starters = [];
+try {
+  const { buildStarter } = await import(builderUrl);
+  for (const { id, label, name, description } of WEB_STARTERS) {
+    const slug = id === 'vanilla' ? 'vanilla-js' : id;
+    const files = await buildStarter(id, name, description, 'system');
+    const entries = Object.fromEntries(files.map(({ path, content }) => [path, strToU8(content)]));
+    for (const notice of ['LICENSE.txt', 'NOTICE.txt']) {
+      const bytes = archives.get(id)[notice];
+      if (!bytes) throw new Error(`The ${id} example is missing ${notice}`);
+      entries[notice] = bytes;
+    }
+    const archive = zipSync(entries, { level: 9, mtime: new Date(2000, 0, 1) });
+    starters.push({ slug, name, description, tags: [label, 'web app', 'starter'], files: Object.keys(entries).sort(), softn: Buffer.from(archive).toString('base64') });
+    console.log(`packed web starter ${slug} (${archive.byteLength} bytes)`);
+  }
+} finally {
+  starterModules.deregister();
+}
+writeFileSync(join(out, 'web-starters.generated.ts'), `${header('packages/@softn/editor-shared/src/starters and apps/softn-site/public/examples')}
+import type { SoftnExample } from './examples.generated';
+export const WEB_STARTER_EXAMPLES: SoftnExample[] = ${JSON.stringify(starters, null, 1)};
+`);
 
 // Small, varied, complete apps: CRUD with storage, a game with state and
 // sound, components and charts across pages, 3D, WebGPU, device permissions.

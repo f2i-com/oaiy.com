@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Network, Phone } from 'lucide-react';
 import { calendar, engines, link, network, phone, type Appointment, type CalendarSync, type EngineCatalog, type EnginesStatus, type LinkStatus, type NetworkDefault } from './api';
@@ -28,7 +28,9 @@ function sayWhen(start: string): { day: string; clock: string } {
   const [h, m] = time.split(':').map(Number);
   const clock = `${h % 12 || 12}${m ? `:${pad(m)}` : ''} ${h < 12 ? 'am' : 'pm'}`;
   const today = ymd(new Date());
-  const tomorrow = ymd(new Date(Date.now() + 86_400_000));
+  const tomorrowDate = new Date();
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const tomorrow = ymd(tomorrowDate);
   if (date === today) return { day: 'Today', clock };
   if (date === tomorrow) return { day: 'Tomorrow', clock };
   const d = new Date(`${date}T00:00`);
@@ -44,6 +46,7 @@ export default function TodayPanel({
   soloSlot?: HTMLElement | null;
 }) {
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
+  const [readErrors, setReadErrors] = useState({ phone: false, calendar: false, model: false });
   const [model, setModel] = useState<EnginesStatus | null>(null);
   /** The engine's default language model where it is a paired computer's, and in effect (OAIY Network). */
   const [onPaired, setOnPaired] = useState<NetworkDefault | null>(null);
@@ -59,41 +62,53 @@ export default function TodayPanel({
   const phoneOn = moduleOn(modules, 'phone') === true;
   const calendarOn = moduleOn(modules, 'calendar') === true;
 
-  const refresh = useCallback(async () => {
-    const off = Promise.reject(new Error('off'));
-    off.catch(() => {});
-    const [p, calls, e, cal, s, l, n] = await Promise.allSettled([
-      phoneOn ? phone.status() : off,
-      phoneOn ? phone.calls() : off,
-      engines.status(),
-      calendarOn ? calendar.get(ymd(new Date())) : off,
-      calendarOn ? calendar.syncStatus() : off,
-      link.status(),
-      // (OAIY Network's status: an older desktop, or a test's, may have none)
-      (async () => network.status())(),
-    ]);
-    setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
-    setModel(e.status === 'fulfilled' ? e.value : null);
-    // (`model` is the model the paired computer runs now, as the desktop says it: nothing older, nothing worked out here)
-    const llm = n.status === 'fulfilled' && n.value?.uses ? n.value.defaults?.llm : undefined;
-    setOnPaired(llm && llm.inEffect !== false ? llm : null);
-    if (cal.status === 'fulfilled') {
-      const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
-      setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
-      setWaiting(cal.value.appointments.filter((a) => a.status === 'requested'));
-    }
-    setSync(s.status === 'fulfilled' ? s.value : null);
-    setLinked(l.status === 'fulfilled' ? l.value : null);
-  }, [phoneOn, calendarOn]);
   const formlogic = describeSync(sync, linked);
-
   useEffect(() => {
+    let active = true;
+    let reading = false;
+    async function refresh() {
+      if (reading) return;
+      reading = true;
+      const [p, calls, e, cal, s, l, n] = await Promise.allSettled([
+        phoneOn ? phone.status() : null,
+        phoneOn ? phone.calls() : null,
+        engines.status(),
+        calendarOn ? calendar.get(ymd(new Date())) : null,
+        calendarOn ? calendar.syncStatus() : null,
+        link.status(),
+        // Older desktops may have no network API.
+        (async () => network.status())(),
+      ]);
+      reading = false;
+      if (!active) return;
+      const phoneStatus = p.status === 'fulfilled' ? p.value : null;
+      const calendarDay = cal.status === 'fulfilled' && cal.value?.available !== false ? cal.value : null;
+      setReadErrors({
+        phone: phoneOn && !phoneStatus,
+        calendar: calendarOn && !calendarDay,
+        model: e.status === 'rejected',
+      });
+      setPhoneState(phoneStatus ? {
+        connected: phoneStatus.connected,
+        onCall: calls.status === 'fulfilled' && (calls.value?.length ?? 0) > 0,
+      } : null);
+      setModel(e.status === 'fulfilled' ? e.value : null);
+      const llm = n.status === 'fulfilled' && n.value?.uses ? n.value.defaults?.llm : undefined;
+      setOnPaired(llm && llm.inEffect !== false ? llm : null);
+      const now = new Date();
+      const localTime = `${ymd(now)}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      setUpcoming(calendarDay?.appointments.filter(a => (a.status === 'confirmed' || a.status === 'requested') && a.start >= localTime) ?? null);
+      setWaiting(calendarDay?.appointments.filter(a => a.status === 'requested') ?? null);
+      setSync(s.status === 'fulfilled' ? s.value : null);
+      setLinked(l.status === 'fulfilled' ? l.value : null);
+    }
     void refresh();
-    const id = window.setInterval(() => {
-      if (!document.hidden) void refresh();
-    }, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+    const id = window.setInterval(() => { if (!document.hidden) void refresh(); }, POLL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [phoneOn, calendarOn]);
 
   // The catalogue is read once there is a model to name, and again when the model named changes: not at every poll.
   const resident = model?.llm?.resident ?? null;
@@ -115,7 +130,7 @@ export default function TodayPanel({
   const requests = waiting ?? [];
   const next = (upcoming ?? []).find((a) => a.status === 'confirmed') ?? upcoming?.[0];
   const when = next ? sayWhen(next.start) : null;
-  const modelTile = <ModelTile onPaired={onPaired} model={model} catalog={catalog} onNavigate={onNavigate} />;
+  const modelTile = <ModelTile onPaired={onPaired} model={model} unavailable={readErrors.model} catalog={catalog} onNavigate={onNavigate} />;
   // With no phone, no calendar and no linked account, the language model's tile is all Today would hold: a whole
   // card for one tile and four empty columns. The page then gives a place for that tile among its own (`soloSlot`,
   // the first of "This computer", whose row it fills), and no Today card is drawn. With the receptionist, Today
@@ -123,50 +138,55 @@ export default function TodayPanel({
   if (soloSlot !== undefined && !phoneOn && !calendarOn && !formlogic) return soloSlot ? createPortal(modelTile, soloSlot) : null;
 
   return (
-    <section className="service-section">
+    <section className="service-section today-section">
       <div className="section-title-row">
         <h3 className="section-title">Today</h3>
+        <time dateTime={ymd(new Date())}>{new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</time>
       </div>
       <div className="overview-grid today-grid">
-        {phoneOn && (
-          <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
-            <Phone size={16} aria-hidden />
-            {/* (not amber while it is still asked: only "Not connected" is a warning) */}
-            <strong className={phoneState === null ? undefined : phoneState.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
-            <small>The phone</small>
-          </button>
-        )}
         {modelTile}
-        {calendarOn && (
-          <>
-            <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">
-              <CalendarClock size={16} aria-hidden />
-              {/* Today's is its time; a later one its day, with the time beside what it is. */}
-              <strong>{upcoming === null ? '—' : when ? (when.day === 'Today' ? when.clock : when.day) : 'Nothing booked'}</strong>
-              <small>
-                {next && when
-                  ? `${when.day === 'Today' ? 'Today' : when.clock} · ${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}`
-                  : 'Next appointment'}
-              </small>
-            </button>
-            <button className="overview-tile" onClick={() => onNavigate('calendar')}>
-              <Inbox size={16} aria-hidden />
-              <strong className={requests.length ? 'warn' : undefined}>{upcoming === null ? '—' : requests.length}</strong>
-              <small>{requests.length === 1 ? 'Request to confirm' : 'Requests to confirm'}</small>
-            </button>
-          </>
-        )}
-        {formlogic && (
-          <button
-            className="overview-tile"
-            onClick={() => onNavigate('connections')}
-            aria-label={`FormLogic: ${formlogic.headline}. ${formlogic.detail}`}
-            title={[sync?.error, linked?.heartbeatError, linked?.outbox?.lastError, 'Calls, the calendar and the agent work without FormLogic; what changed here is sent when it can be reached.'].filter(Boolean).join('\n')}
-          >
-            {formlogic.headline === 'Offline' ? <CloudOff size={16} aria-hidden /> : <Cloud size={16} aria-hidden />}
-            <strong className={formlogic.tone === 'ok' ? 'ok' : formlogic.tone === 'neutral' ? undefined : 'warn'}>{formlogic.headline}</strong>
-            <small>FormLogic · {formlogic.detail}</small>
-          </button>
+        {(phoneOn || calendarOn || formlogic) && (
+          <div className="today-activity">
+            {phoneOn && (
+              <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
+                <Phone size={16} aria-hidden />
+                {/* (not amber while it is still asked: only "Not connected" is a warning) */}
+                <strong className={phoneState === null ? undefined : phoneState.connected ? 'ok' : 'warn'}>{readErrors.phone ? 'Unavailable' : phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
+                <small>The phone</small>
+              </button>
+            )}
+            {calendarOn && (
+              <>
+                <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">
+                  <CalendarClock size={16} aria-hidden />
+                  {/* Today's is its time; a later one its day, with the time beside what it is. */}
+                  <strong>{readErrors.calendar ? 'Unavailable' : upcoming === null ? '—' : when ? (when.day === 'Today' ? when.clock : when.day) : 'Nothing booked'}</strong>
+                  <small>
+                    {next && when
+                      ? `${when.day === 'Today' ? 'Today' : when.clock} · ${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}`
+                      : 'Next appointment'}
+                  </small>
+                </button>
+                <button className="overview-tile" onClick={() => onNavigate('calendar')}>
+                  <Inbox size={16} aria-hidden />
+                  <strong className={requests.length ? 'warn' : undefined}>{readErrors.calendar ? 'Unavailable' : upcoming === null ? '—' : requests.length}</strong>
+                  <small>{requests.length === 1 ? 'Request to confirm' : 'Requests to confirm'}</small>
+                </button>
+              </>
+            )}
+            {formlogic && (
+              <button
+                className="overview-tile"
+                onClick={() => onNavigate('connections')}
+                aria-label={`FormLogic: ${formlogic.headline}. ${formlogic.detail}`}
+                title={[sync?.error, linked?.heartbeatError, linked?.outbox?.lastError, 'Calls, the calendar and the agent work without FormLogic; what changed here is sent when it can be reached.'].filter(Boolean).join('\n')}
+              >
+                {formlogic.headline === 'Offline' ? <CloudOff size={16} aria-hidden /> : <Cloud size={16} aria-hidden />}
+                <strong className={formlogic.tone === 'ok' ? 'ok' : formlogic.tone === 'neutral' ? undefined : 'warn'}>{formlogic.headline}</strong>
+                <small>FormLogic · {formlogic.detail}</small>
+              </button>
+            )}
+          </div>
         )}
       </div>
     </section>
@@ -177,11 +197,13 @@ export default function TodayPanel({
 function ModelTile({
   onPaired,
   model,
+  unavailable,
   catalog,
   onNavigate,
 }: {
   onPaired: NetworkDefault | null;
   model: EnginesStatus | null;
+  unavailable: boolean;
   catalog: Pick<EngineCatalog, 'models'> | null;
   onNavigate: (view: 'engines' | 'engine-workers') => void;
 }) {
@@ -216,7 +238,7 @@ function ModelTile({
         ) : (
           <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${modelName(catalog, llm.resident)}: ${llm.state}` : 'The engines'}>
             <Cpu size={16} aria-hidden />
-            <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
+            <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{unavailable ? 'Unavailable' : model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
             <small>{modelName(catalog, llm?.resident) ?? 'Language model'}</small>
           </button>
         )}
