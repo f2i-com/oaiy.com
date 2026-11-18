@@ -29,13 +29,29 @@ function update(to, content) {
   writeFileSync(to, content);
 }
 
-/** Copies the bridge and the capture library into `dir` (no index.html is touched). */
-export function copyBridge(dir) {
-  update(join(dir, 'bot-bridge.js'), readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'bot-bridge.js')));
+function bridgeFiles() {
+  const files = [['bot-bridge.js', readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'bot-bridge.js'))]];
   try {
-    update(join(dir, 'bot-capture.js'), readFileSync(captureLibrary()));
+    files.push(['bot-capture.js', readFileSync(captureLibrary())]);
   } catch {
     /* not installed yet (npm install): screenshots say so */
+  }
+  return files;
+}
+
+/** Copies the bridge and the capture library into `dir` (no index.html is touched). */
+export function copyBridge(dir) {
+  for (const [name, bytes] of bridgeFiles()) update(join(dir, name), bytes);
+}
+
+/** The installed page loads the current bridge and capture library. */
+export function bridgeCurrent(dir) {
+  try {
+    const html = readFileSync(join(dir, 'index.html'), 'utf8');
+    return TAGS.every(([, tag]) => html.includes(tag))
+      && bridgeFiles().every(([name, bytes]) => readFileSync(join(dir, name)).equals(bytes));
+  } catch {
+    return false;
   }
 }
 

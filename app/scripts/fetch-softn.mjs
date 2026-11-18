@@ -17,16 +17,16 @@
  * goes to the API alone.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { installBridge } from './softn-bridge/install.mjs';
+import { bridgeCurrent, installBridge } from './softn-bridge/install.mjs';
 import { downloadReleaseFile } from './release-download.mjs';
 import { unzipSync } from 'fflate';
 
-const RELEASE = 'v0.0.47';
+const RELEASE = 'v0.0.48';
 const ZIP = `softn-formlogic-runtime-${RELEASE}.zip`;
-const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'e6d55086cb46a5300b35097c4f049820f66fe8f752c692f66c5da2ade801a5ca';
+const ZIP_SHA256 = process.env.SOFTN_ZIP_SHA256 || 'a09f7a14b3ed16dfe9cabe145c8fa1a123b9dd3e567d9e0384811f6cd540ff22';
 const PREFIX = 'hosted-runtime/';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,9 +43,56 @@ function installed() {
   }
 }
 
+function extractRuntime(zip, stage) {
+  const entries = unzipSync(zip, { filter: ({ name }) => name.replaceAll('\\', '/').startsWith(PREFIX) });
+  const digests = new Map();
+  let bytes = 0;
+  for (const [name, data] of Object.entries(entries)) {
+    const rel = name.replaceAll('\\', '/').slice(PREFIX.length);
+    if (!rel || rel.endsWith('/')) continue;
+    if (rel.split('/').some(part => !part || /[. ]$|[<>:"|?*\x00-\x1f]/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+      throw new Error(`invalid hosted runtime path ${name}`);
+    }
+    const target = join(stage, rel);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, data, { flag: 'wx' });
+    digests.set(rel, sha256(data));
+    bytes += data.byteLength;
+  }
+  const manifest = JSON.parse(readFileSync(join(stage, 'runtime-manifest.json'), 'utf8'));
+  if (!manifest.files?.['index.html']) throw new Error('the hosted runtime manifest names no index.html');
+  for (const [name, digest] of Object.entries(manifest.files)) {
+    if (digests.get(name) !== digest) throw new Error(`the hosted runtime is missing or does not match its manifest: ${name}`);
+  }
+  return { files: digests.size, bytes };
+}
+
+// Keep the last working preview until all files, the bridge and the stamp are ready.
+function replaceRuntime(prepare) {
+  const stage = mkdtempSync(join(root, '.softn-install-'));
+  const previous = `${stage}.previous`;
+  try {
+    const result = prepare(stage);
+    if (!installBridge(stage, RELEASE) || !bridgeCurrent(stage)) throw new Error('the hosted runtime index could not load the preview bridge');
+    mkdirSync(dirname(out), { recursive: true });
+    const hadPrevious = existsSync(out);
+    if (hadPrevious) renameSync(out, previous);
+    try {
+      renameSync(stage, out);
+    } catch (error) {
+      if (hadPrevious) renameSync(previous, out);
+      throw error;
+    }
+    if (hadPrevious) rmSync(previous, { recursive: true, force: true });
+    return result;
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   if (process.argv.includes('--ensure') && installed()) {
-    installBridge(out, RELEASE);
+    if (!bridgeCurrent(out)) replaceRuntime(stage => cpSync(out, stage, { recursive: true }));
     console.log(`SoftN runtime ${RELEASE} is installed in public/softn/`);
     return;
   }
@@ -53,28 +100,17 @@ async function main() {
   if (process.env.SOFTN_RELEASE_DIR) {
     zip = readFileSync(join(process.env.SOFTN_RELEASE_DIR, ZIP));
   } else {
-    console.log(`fetching ${ZIP} from the softn.com ${RELEASE} release (about 32 MB) ...`);
+    console.log(`fetching ${ZIP} from the softn.com ${RELEASE} release ...`);
     // GitHub's API asset address first, the plain download address second; the digest below holds either way.
     zip = await downloadReleaseFile({ repository: 'f2i-com/softn.com', tag: RELEASE, name: ZIP });
   }
   if (sha256(zip) !== ZIP_SHA256) throw new Error(`${ZIP} does not match its pinned SHA-256`);
-  const entries = unzipSync(zip, { filter: (f) => f.name.startsWith(PREFIX) });
-  rmSync(out, { recursive: true, force: true });
-  let count = 0;
-  let bytes = 0;
-  for (const [name, data] of Object.entries(entries)) {
-    if (name.endsWith('/')) continue;
-    const rel = name.slice(PREFIX.length);
-    if (!rel || rel.split('/').some((seg) => seg === '..')) continue;
-    const target = join(out, rel);
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, data);
-    count++;
-    bytes += data.byteLength;
-  }
-  installBridge(out, RELEASE);
-  writeFileSync(stamp, JSON.stringify({ release: RELEASE, zip: ZIP, zip_sha256: ZIP_SHA256, files: count, bytes }, null, 2));
-  console.log(`installed the SoftN runtime ${RELEASE} into public/softn/ (${count} files, ${(bytes / 1e6).toFixed(1)} MB)`);
+  const inventory = replaceRuntime(stage => {
+    const inventory = extractRuntime(zip, stage);
+    writeFileSync(join(stage, 'SOURCE.json'), JSON.stringify({ release: RELEASE, zip: ZIP, zip_sha256: ZIP_SHA256, ...inventory }, null, 2));
+    return inventory;
+  });
+  console.log(`installed the SoftN runtime ${RELEASE} into public/softn/ (${inventory.files} files, ${(inventory.bytes / 1e6).toFixed(1)} MB)`);
 }
 
 main().catch((error) => {
