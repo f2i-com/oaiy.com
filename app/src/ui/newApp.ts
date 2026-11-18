@@ -18,6 +18,7 @@ export interface NewAppChoice {
 export interface Template {
   id: string;
   name: string;
+  label?: string;
   description: string;
   icon: string;
 }
@@ -26,12 +27,12 @@ const slug = (name: string) => name.trim().replace(/[^\w.-]+/g, '-').replace(/^-
 
 export function newAppDialog(options: {
   projectName: string;
-  /** Always shown: the starter and a blank page. */
+  /** Starters shown without opening the example gallery. */
   templates: Template[];
   /** Complete example apps, in a section that opens on demand. */
   examples: Template[];
   /** Why a folder will not do (it holds an app already, say), or null. */
-  folderProblem: (folder: string) => string | null;
+  folderProblem: (folder: string, start: string) => string | null;
 }): Promise<NewAppChoice | null> {
   const name = h('input', { type: 'text', value: 'My app', spellcheck: false, autocomplete: 'off' }) as HTMLInputElement;
   const folder = h('input', { type: 'text', value: 'my-app', spellcheck: false, autocomplete: 'off' }) as HTMLInputElement;
@@ -53,7 +54,7 @@ export function newAppDialog(options: {
         }
       } }),
       h('span.template-icon', t.icon),
-      h('span.template-text', h('strong', t.name), h('span.template-description', { title: t.description }, t.description)),
+      h('span.template-text', h('strong', t.label ?? t.name), h('span.template-description', { title: t.description }, t.description)),
     );
   const examples = h(
     'details.template-examples',
@@ -109,7 +110,7 @@ export function newAppDialog(options: {
         }
         const dir = folder.value.trim().replace(/^\/+|\/+$/g, '');
         if (where === 'folder') {
-          const problem = !dir ? 'Name the folder for the app.' : dir.split('/').includes('..') ? 'The folder must be inside the project.' : options.folderProblem(dir);
+          const problem = !dir ? 'Name the folder for the app.' : options.folderProblem(dir, start);
           if (problem) {
             error.textContent = problem;
             folder.focus();

@@ -128,7 +128,7 @@ OAIY can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them 
 
 Ask the agent to build an app in **Vanilla JavaScript, React or Vue**. It can install an offline starter, edit its source and run it in Preview. For example, ask it to build a React practice timer, then try the Start button in Preview. Each starter uses an ordinary HTML entry and an editable `app.js`. [Framework guide and code examples](src/softn/web-starters.md)
 
-To choose one yourself, open **New SoftN app → Start from an example app** and select **Trail log** for Vanilla JS, **Practice set** for React or **Reading log** for Vue. The dialog also offers a classic task list and a blank project. Existing classic projects keep their component pages and JavaScript or Python logic.
+Open **New SoftN app** and choose **Vanilla JS**, **React** or **Vue** to start an editable Trail log, Practice set or Reading log. The same dialog offers a classic task list, a blank project and a gallery of examples. When creating an app in an existing folder, OAIY checks its filenames before writing anything.
 
 - **Reference for the agent:** SoftN is in its tools, so it doesn't have to guess.
   - `softn_docs` with no arguments gives a map of the writing guide, the published guides, every component and the example apps. It reads any of them by topic (`"guide#mistakes"`, `"xdb-data#operations"`). With `search` it finds a term across all of them, including the example apps' source, and says how to open each hit.

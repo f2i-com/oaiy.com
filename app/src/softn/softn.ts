@@ -17,7 +17,7 @@
  */
 import { zipSync } from 'fflate';
 import { unzipChecked } from '../vfs/transfer';
-import { IGNORED_DIRS, normalizePath, type Vfs } from '../vfs/vfs';
+import { IGNORED_DIRS, normalizePath, parentOf, type Vfs } from '../vfs/vfs';
 import { SOFTN_GUIDE_JAVASCRIPT, SOFTN_GUIDE_PYTHON } from './guide.generated';
 import webGuide from './web-starters.md?raw';
 import { NetGate } from '../gate/netgate';
@@ -193,6 +193,21 @@ function fileGroups(files: Array<[string, Uint8Array]>, manifest: SoftnManifest 
 /** An app folder as a key: '' is the project root, else `a/b` (no slashes at the ends). */
 export function appKey(folder: string | undefined | null): string {
   return normalizePath(folder ?? '/');
+}
+
+/** Check every destination before installing the first starter file. An existing folder may contain unrelated work. */
+export function starterFolderProblem(vfs: Vfs, folder: string, files: readonly string[]): string | null {
+  const root = appKey(folder);
+  if (!root || folder.split(/[\\/]/).includes('..')) return 'Choose a folder inside the project.';
+  if (vfs.exists(`${root}/manifest.json`)) return `${root}/ already holds an app (it has a manifest.json).`;
+  for (const file of files) {
+    const path = `${root}/${file}`;
+    if (vfs.exists(path)) return `${path} already exists. Choose another folder to keep your work.`;
+    for (let dir = parentOf(path); dir; dir = parentOf(dir)) {
+      if (vfs.stat(dir)?.type === 'file') return `${dir} is a file. Choose another folder.`;
+    }
+  }
+  return null;
 }
 
 function inApp(root: string, rel: string): string {

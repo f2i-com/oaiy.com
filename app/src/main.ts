@@ -58,7 +58,7 @@ import { isModelPath } from './preview/model';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
 import { askText, confirmAction } from './ui/modal';
 import { newAppDialog, type NewAppChoice } from './ui/newApp';
-import { MAIN_PAGE, SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp, softnAppOf } from './softn/softn';
+import { MAIN_PAGE, SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp, softnAppOf, starterFolderProblem } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
@@ -2140,30 +2140,30 @@ async function main(): Promise<void> {
    */
   async function newSoftnApp(folder?: string): Promise<void> {
     let choice: NewAppChoice | null;
-    const folderProblem = (dir: string) => {
-      const key = appKey(dir);
-      if (project.vfs.exists(`/${key}/manifest.json`)) return `${dir}/ already holds an app (it has a manifest.json).`;
-      if (project.vfs.stat(`/${key}`)?.type === 'file') return `${dir} is a file.`;
-      return null;
-    };
     if (folder) {
       choice = { name: folder.split('/').filter(Boolean).pop() ?? 'app', start: 'starter', where: 'folder', folder };
     } else {
       const catalogue = await exampleCatalogue().catch(() => []);
+      const web = catalogue.filter(e => e.tags.includes('web app') && e.tags.includes('starter'));
       choice = await newAppDialog({
         projectName: project.meta.name,
-        folderProblem,
+        folderProblem: (dir, start) => {
+          const paths = catalogue.find(e => e.slug === start)?.files ?? (start === 'blank' ? SOFTN_BLANK : SOFTN_STARTER).map(([path]) => path);
+          return starterFolderProblem(project.vfs, dir, paths);
+        },
         templates: [
           { id: 'starter', name: 'Task list', description: 'A small working app: add, tick off and delete tasks.', icon: '☑' },
           { id: 'blank', name: 'Blank', description: 'One page and an empty logic file.', icon: '◻' },
+          ...web.map(e => ({ id: e.slug, name: e.name, label: e.tags[0], description: `${e.name} · ${e.description}`, icon: '</>' })),
         ],
-        examples: catalogue.map((e) => ({ id: e.slug, name: e.name, description: e.description, icon: EXAMPLE_ICONS[e.slug] ?? '◆' })),
+        examples: catalogue.filter(e => !web.includes(e)).map(e => ({ id: e.slug, name: e.name, description: e.description, icon: EXAMPLE_ICONS[e.slug] ?? '◆' })),
       });
     }
     if (!choice) return;
+    const files: Array<[string, string | Uint8Array]> = choice.start === 'starter' ? SOFTN_STARTER : choice.start === 'blank' ? SOFTN_BLANK : await exampleBundle(choice.start);
     let root = '';
     if (choice.where === 'folder') {
-      const problem = folderProblem(choice.folder);
+      const problem = starterFolderProblem(project.vfs, choice.folder, files.map(([path]) => path));
       if (problem) {
         chat.system(problem, 'error');
         return;
@@ -2173,7 +2173,6 @@ async function main(): Promise<void> {
       if (!(await mayLeaveRun())) return;
       await openProject(await createProject(choice.name));
     }
-    const files: Array<[string, string | Uint8Array]> = choice.start === 'starter' ? SOFTN_STARTER : choice.start === 'blank' ? SOFTN_BLANK : await exampleBundle(choice.start);
     const prefix = root ? `${root}/` : '';
     for (const [path, data] of files) {
       let content = data;

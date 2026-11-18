@@ -277,8 +277,8 @@ export async function installExample(vfs: Vfs, slug: string, parent: string): Pr
 }
 
 /** The example apps, for choosing one to start from. */
-export async function exampleCatalogue(): Promise<Array<{ slug: string; name: string; description: string; tags: string[] }>> {
-  return (await examples()).map(({ slug, name, description, tags }) => ({ slug, name, description, tags }));
+export async function exampleCatalogue() {
+  return (await examples()).map(({ slug, name, description, tags, files }) => ({ slug, name, description, tags, files }));
 }
 
 /** An example app's files, by path inside the app. */

@@ -16,6 +16,7 @@ import {
   pageLogicSources,
   resolveApp,
   softnAppOf,
+  starterFolderProblem,
 } from '../../src/softn/softn';
 import { Vfs } from '../../src/vfs/vfs';
 
@@ -24,6 +25,16 @@ const write = (files: Record<string, string>) => {
   for (const [path, text] of Object.entries(files)) vfs.writeFile(`/${path}`, text, { parents: true });
   return vfs;
 };
+
+describe('starter destinations', () => {
+  it('checks files and their parent folders while allowing unrelated project files', () => {
+    const vfs = write({ 'desk/notes.md': 'keep', 'desk/vendor': 'existing file', 'desk/app.js': 'my code' });
+    expect(starterFolderProblem(vfs, 'desk', ['index.html', 'app.js'])).toContain('desk/app.js already exists');
+    expect(starterFolderProblem(vfs, 'desk', ['vendor/react.js'])).toContain('desk/vendor is a file');
+    expect(starterFolderProblem(vfs, 'desk', ['index.html', 'styles.css'])).toBeNull();
+    expect(starterFolderProblem(vfs, 'desk/..', ['index.html'])).toContain('inside the project');
+  });
+});
 
 describe('web app bundles', () => {
   const files = { ui: ['index.html'], logic: ['App.jsx'], assets: ['style.css'] };

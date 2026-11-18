@@ -374,6 +374,16 @@ try {
     await page.evaluate(() => [...document.querySelectorAll('.actions button')].find((b) => b.textContent === 'New SoftN app').click());
     await page.waitForSelector('dialog.modal[open] .template-card');
     expect(!(await page.$eval('dialog.modal details.template-examples', (d) => d.open)), 'the examples start open');
+    for (const [id, label, name] of [['vanilla-js', 'Vanilla JS', 'Trail log'], ['react', 'React', 'Practice set'], ['vue', 'Vue', 'Reading log']]) {
+      const input = `dialog.modal input[value="${id}"]`;
+      const displayed = await page.$eval(input, el => {
+        const card = el.closest('label');
+        return card.getClientRects().length && card.querySelector('strong')?.textContent;
+      });
+      expect(displayed === label, `${label} must be available with the gallery closed`);
+      await page.$eval(input, el => el.click());
+      expect(await page.$eval('dialog.modal input[type=text]', el => el.value) === name, `${label} starter name`);
+    }
     await page.click('dialog.modal details.template-examples summary');
     await page.evaluate(() => [...document.querySelectorAll('dialog.modal .template-card')].find((c) => c.textContent.includes('Twenty48')).click());
     expect((await page.$eval('dialog.modal input[type=text]', (i) => i.value)) === 'Twenty48', 'the name did not follow the example');
