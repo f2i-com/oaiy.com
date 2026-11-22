@@ -192,6 +192,7 @@ export class FileTree {
       }
       entries.sort((a, b) => (a.type === b.type ? (a.name < b.name ? -1 : 1) : a.type === 'dir' ? -1 : 1));
       for (const entry of entries) {
+        if (dir === '' && entry.name === '.oaiy') continue;
         const key = dir ? `${dir}/${entry.name}` : entry.name;
         const path = `/${key}`;
         const isDir = entry.type === 'dir';

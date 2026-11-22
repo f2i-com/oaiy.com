@@ -334,9 +334,9 @@ await check('install: a shell file over the limit fails the install rather than 
 
 await check('activate: the caches of other builds go, only ours by prefix, and the pages are taken over', async () => {
   const w = await installedWorker();
-  for (const name of ['oaiy-web-old1-shell', 'oaiy-web-old1-runtime', 'oaiy-web-old2-shell', 'bot.computer-v3', 'workbox-precache', W.cacheNames('b1').runtime]) await w.caches.open(name);
+  for (const name of ['oaiy-web-old1-shell', 'oaiy-web-old1-runtime', 'oaiy-web-old2-shell', 'oaiy-agent-v3', 'workbox-precache', W.cacheNames('b1').runtime]) await w.caches.open(name);
   await w.activate();
-  assert.deepEqual((await w.caches.keys()).sort(), ['bot.computer-v3', 'oaiy-web-b1-runtime', 'oaiy-web-b1-shell', 'workbox-precache']);
+  assert.deepEqual((await w.caches.keys()).sort(), ['oaiy-agent-v3', 'oaiy-web-b1-runtime', 'oaiy-web-b1-shell', 'workbox-precache']);
   assert.equal(w.state.claimed, 1);
 });
 

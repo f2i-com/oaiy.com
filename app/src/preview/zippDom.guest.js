@@ -15,10 +15,10 @@
  * a function of the page {$f: id}, undefined {$u: 1}, a promise {$p: id},
  * a typed array {$ta: name, d: [...]}, a date {$date: ms}.
  */
-(function () {
+var __zdom_entry = (function () {
 var window = globalThis;
 var self = window;
-var __MAGIC = '\u0000bot.computer.page:';
+var __MAGIC = '\u0000oaiy.agent.page:';
 var __channel = typeof __zippHostCall === 'function' ? __zippHostCall : null;
 try {
   delete globalThis.__zippHostCall;
@@ -788,14 +788,20 @@ var __exports = {
   queueMicrotask: queueMicrotask,
   fetch: fetch,
   XMLHttpRequest: XMLHttpRequest,
-  __zdom_cb: __zdom_cb,
-  __zdom_settle: __zdom_settle,
-  __zdom_inline: __zdom_inline,
-  __zdom_run: __zdom_run,
 };
 for (var __k in __exports) {
   try {
     globalThis[__k] = __exports[__k];
   } catch (_e) {}
 }
+return {
+  cb: __zdom_cb,
+  settle: __zdom_settle,
+  inline: __zdom_inline,
+  run: __zdom_run,
+};
 })();
+function __zdom_cb(fnId, thisValue, args) { return __zdom_entry.cb(fnId, thisValue, args); }
+function __zdom_settle(pid, ok, value) { return __zdom_entry.settle(pid, ok, value); }
+function __zdom_inline(list) { return __zdom_entry.inline(list); }
+function __zdom_run(source, name) { return __zdom_entry.run(source, name); }

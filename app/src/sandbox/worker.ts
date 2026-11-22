@@ -15,7 +15,7 @@ import type { ConsoleLine, FromWorker, GuestSources, RunRequest, RunResult, ToWo
 
 declare const self: DedicatedWorkerGlobalScope;
 
-const MAGIC = '\u0000bot.computer:';
+const MAGIC = '\u0000oaiy.agent:';
 
 /** The operations a guest may ask the page for (answered by host.ts). */
 const HOST_KINDS = ['fs.read', 'fs.readb64', 'fs.write', 'fs.append', 'fs.writeb64', 'fs.stat', 'fs.list', 'fs.walk', 'fs.grep', 'fs.mkdir', 'fs.remove', 'fs.rename', 'fs.copy', 'net.fetch', 'proc.run', 'sys.sleep', 'fs.archive'];
@@ -133,7 +133,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   if (request.lang === 'python' && glue.addPythonPackage && glue.pythonPackages) {
     try {
       const info = JSON.parse(glue.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
-      if (!info.installed.some((p) => p.name === 'botcomputer-stdlib')) glue.addPythonPackage(await buildPackage(info.engineAbi), null);
+      if (!info.installed.some((p) => p.name === 'oaiy-stdlib')) glue.addPythonPackage(await buildPackage(info.engineAbi), null);
     } catch (error) {
       packageError = errorText(error);
     }

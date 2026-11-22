@@ -435,7 +435,21 @@ export class Preview {
       const key = path.replace(/^\/+/, '');
       if (target.kind === 'app') {
         if (target.root && !key.startsWith(`${target.root}/`)) return;
-        if (!/(^|\/)(manifest\.json|permission\.json)$|\.(ui|html?|logic|js|py|xdb|css)$|(^|\/)assets\//i.test(key)) return;
+        const rel = target.root ? key.slice(target.root.length + 1) : key;
+        if (!/(^|\/)(manifest\.json|permission\.json|\.htaccess|Cargo\.toml)$|\.(ui|html?|logic|js|mjs|cjs|jsx|ts|tsx|mts|vue|py|php|phtml|rs|sql|db|sqlite|sqlite3|xdb|css|json|svg)$|(^|\/)(assets|backend|server|db|database|migrations)\//i.test(rel)) return;
+        // When the author/agent edits a database schema, seed, or .db file, clear cached persisted
+        // SQLite blobs for this app so the updated schema/seed/image takes effect on next render.
+        if (/\.(?:sql|db|sqlite|sqlite3)$/i.test(rel) || /(?:^|\/)(?:db|database|migrations)\/[^/]+\.json$/i.test(rel)) {
+          const webStorageKey = `web:oaiy-agent-${this.projectId()}-${target.root || 'root'}`;
+          const saved = this.storage.get(webStorageKey);
+          if (saved) {
+            const next: Record<string, string> = {};
+            for (const [k, v] of Object.entries(saved)) {
+              if (!k.includes('sqlite:')) next[k] = v;
+            }
+            this.storage.set(webStorageKey, next);
+          }
+        }
       } else if (target.kind === 'model') {
         // A .glb is all there is to it; a .gltf also reads its folder.
         const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
@@ -545,8 +559,8 @@ export class Preview {
   }
 
   private fromBridge(event: MessageEvent): void {
-    const data = event.data as { __botComputer?: boolean; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string };
-    if (!this.frame || event.source !== this.frame.contentWindow || data?.__botComputer !== true) return;
+    const data = event.data as { __oaiyAgent?: boolean; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string };
+    if (!this.frame || event.source !== this.frame.contentWindow || data?.__oaiyAgent !== true) return;
     if (data.type === 'bot:bridge') {
       this.bridgeReady = true;
     } else if (data.type === 'bot:problem' && typeof data.message === 'string') {
@@ -654,7 +668,7 @@ export class Preview {
         });
       }, timeoutMs);
       this.requests.set(id, finish);
-      frame.postMessage({ __botComputer: true, id, ...message }, '*');
+      frame.postMessage({ __oaiyAgent: true, id, ...message }, '*');
     });
   }
 
@@ -681,7 +695,6 @@ export class Preview {
 
   private async inspectNow(target?: PreviewTarget): Promise<PageReport> {
     const rendered = await this.ready(target);
-    if (this.webFrame()) return { ok: false, page: '', error: 'The web app renders in an isolated container. Use softn_check for its render status and the visible preview to inspect its controls.', problems: [...this.problems] };
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
     const result = await this.requestAgain({ type: 'bot:inspect' });
@@ -695,7 +708,6 @@ export class Preview {
 
   private async actNow(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport> {
     const rendered = await this.ready(target);
-    if (this.webFrame()) return { ok: false, page: '', error: 'Use the visible preview to interact with this web app. Its isolated container exposes no agent control interface.', problems: [...this.problems] };
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
     const result = await this.request({ type: 'bot:act', actions }, 60_000);
@@ -709,7 +721,6 @@ export class Preview {
   screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[]; since: number }> {
     return this.exclusive(async () => {
       const rendered = await this.ready(target);
-      if (this.webFrame()) throw new Error('The web app renders in an isolated container. Use the visible preview to see it.');
       if (!this.frame) throw new Error(rendered.errors.join('; ') || 'nothing is rendered');
       // A model that could not be read has nothing to draw: why is the answer.
       if (this.target?.kind === 'model' && !rendered.ok) throw new Error(rendered.errors.join('; ') || 'the model could not be shown');
@@ -836,16 +847,13 @@ export class Preview {
     this.showProblems();
   }
 
-  private webFrame(): boolean {
-    return this.target?.kind === 'app' && isWebApp(this.vfs, this.target.root);
-  }
-
-  /** The app's files as the frame takes them: its text files by path, and the rest (pictures, sounds, fonts) as base64. */
+  /** The app's files as the frame takes them: its text files by path, and the rest (pictures, sounds, fonts, SQLite .db, WASM) as base64. */
   private appSource(root: string): { client: Record<string, string>; assets: Record<string, string> } {
+    const BINARY_ASSET_EXT = /\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3|wasm|png|jpe?g|gif|webp|avif|ico|bmp|mp3|wav|ogg|m4a|mp4|webm|woff2?|ttf|otf|glb|fbx|stl|zip|gz|br|pdf|bin)$/i;
     const client: Record<string, string> = {};
     const assets: Record<string, string> = {};
     for (const [path, data] of appFiles(this.vfs, root)) {
-      if (path.startsWith('assets/')) {
+      if (path.startsWith('assets/') || BINARY_ASSET_EXT.test(path) || data.includes(0)) {
         assets[path] = toBase64(data);
         continue;
       }
@@ -1060,7 +1068,7 @@ export class Preview {
     const syntax = logicSyntax(this.vfs, root).catch(() => []);
     const { client, assets } = this.appSource(root);
     const web = isWebApp(this.vfs, root);
-    const appId = `bot.computer-${this.projectId()}-${root || 'root'}`;
+    const appId = `oaiy-agent-${this.projectId()}-${root || 'root'}`;
     const webStorageKey = `web:${appId}`;
     let bytes: ArrayBuffer | undefined;
     try {
@@ -1099,7 +1107,7 @@ export class Preview {
       window.removeEventListener('message', onMessage);
       // The app's localStorage as it was left, for the bridge's stand-in (the frame has no origin, and the browser's own
       // store refused every write: a snake game saving its best score failed at every step), before the app is sent.
-      if (!web) frame.contentWindow?.postMessage({ __botComputer: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
+      if (!web) frame.contentWindow?.postMessage({ __oaiyAgent: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
       const channel = new MessageChannel();
       // What this frame does past drawing the app once: saying when it is drawn, taking a newer version in place.
       // (with the media `init` carries: an update leaves its media out while it is the same)
@@ -1153,6 +1161,11 @@ export class Preview {
             if (input?.operation === 'clear') state.clear();
             else if (input?.operation === 'set' && typeof input.key === 'string' && typeof input.value === 'string') state.set(input.key, input.value);
             else if (input?.operation === 'remove' && typeof input.key === 'string') state.delete(input.key);
+            else if (input?.operation === 'batch' && Array.isArray(input.replacements)) {
+              for (const item of input.replacements as Array<{ key?: unknown; value?: unknown }>) {
+                if (item && typeof item.key === 'string' && typeof item.value === 'string') state.set(item.key, item.value);
+              }
+            }
             else { respond({ error: 'Unsupported preview storage operation.' }); return; }
             this.storage.set(webStorageKey, Object.fromEntries(state));
             respond({ result: { saved: true } });
@@ -1169,7 +1182,13 @@ export class Preview {
       frame.contentWindow!.postMessage(
         // dark: OAIY's own theme (the dashboard's choice in its window), which the system's setting need not be.
         { type: 'formlogic:init', client, assets, appId, dark: theme() === 'dark', ...(web
-          ? { engine: 'web-container', native: true, storage: this.storage.get(webStorageKey) ?? {} }
+          ? {
+              engine: 'web-container',
+              native: true,
+              python: true,
+              storage: this.storage.get(webStorageKey) ?? {},
+              storageLimits: { value: 4 * 1024 * 1024, entries: 1000, map: 32 * 1024 * 1024, input: 4 * 1024 * 1024 + 4096, queued: 32 * 1024 * 1024 },
+            }
           : { engine: 'zipp-web-python', zippWasm: bytes!.slice(0) }) },
         '*',
         [channel.port2],

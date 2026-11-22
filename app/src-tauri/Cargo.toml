@@ -1,13 +1,13 @@
 [package]
-name = "bot-computer"
+name = "oaiy-agent"
 version = "0.1.0"
-description = "bot.computer: a coding agent in a desktop window"
+description = "OAIY Agent: a coding agent in a desktop window"
 license = "Apache-2.0"
 edition = "2021"
 publish = false
 
 [lib]
-name = "bot_computer_lib"
+name = "oaiy_agent_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -17,22 +17,29 @@ import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type Previ
 import { findPages, resolvePage } from '../preview/page';
 import { findModels, isModelPath, resolveModel } from '../preview/model';
 import { checkEvents, describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
+import { executeSqlite, inspectSqliteSchema, listSqliteDatabases, querySqlite, validateAppDatabases } from '../softn/sqlite';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
 import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, removeBackground, upscaleImage, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
+import { maybeSpillOutput } from './spill';
+import { applyPatchToVfs } from './patch';
+import { ASK_USER_SPEC, ASK_USER_TOOL } from './askUser';
+import { EXIT_PLAN_MODE_TOOL } from './planMode';
+import { withToolTimeout } from './repair';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
 /** A line longer than this is cut in a line read; char_start reads the rest. */
 const LINE_CHARS = 2_000;
 const SEARCH_RESULTS = 100;
-const OUTPUT_CHARS = 30_000;
+/** Hard memory ceiling before spill-to-VFS bounds the inline copy. */
+const OUTPUT_CHARS = 250_000;
 const DEFAULT_TIMEOUT_S = 30;
 const MAX_TIMEOUT_S = 300;
 
-/** Tools a sub-agent does not get: it does not delegate further or change the plan. */
-export const MAIN_AGENT_ONLY = new Set(['delegate', 'update_plan']);
+/** Tools a sub-agent does not get: it does not delegate further, change the plan, or prompt the user interactively. */
+export const MAIN_AGENT_ONLY = new Set(['delegate', 'update_plan', ASK_USER_TOOL, EXIT_PLAN_MODE_TOOL]);
 
 /** The video and sound editing tools: left out for a model with a small context window, to leave it room to work. */
 export const EDIT_TOOLS = new Set(['media_info', 'video_frames', 'video_split', 'media_compose']);
@@ -169,6 +176,8 @@ export interface PreviewHost {
 
 export interface ToolContext {
   vfs: Vfs;
+  /** Unwrapped project VFS for internal harness bookkeeping (spill storage under `/.oaiy/spill/`). */
+  rawVfs?: Vfs;
   gate: NetGate;
   /** Versions of the files read in this conversation: path -> version when read. */
   reads: Map<string, number>;
@@ -713,6 +722,21 @@ export const TOOLS: ToolSpec[] = [
     parameters: { type: 'object', required: ['path', 'old_string', 'new_string'], properties: { path: str, old_string: str, new_string: str, replace_all: { type: 'boolean' } } },
   },
   {
+    name: 'apply_patch',
+    description:
+      'Apply an atomic multi-file patch (add, update, move, or delete files in one call). ' +
+      'Format:\n*** Begin Patch\n*** Update File: path/to/file.ts\n@@ optional anchor line\n context line\n-old line\n+new line\n*** Add File: path/to/new.ts\n+line 1\n*** Delete File: path/to/old.ts\n*** End Patch\n' +
+      'Every update target must have been read with read_file first; if any hunk fails to match, no file is modified.',
+    parameters: {
+      type: 'object',
+      required: ['patch'],
+      properties: {
+        patch: { ...str, description: 'Complete patch text wrapped in *** Begin Patch ... *** End Patch' },
+      },
+    },
+  },
+  ASK_USER_SPEC,
+  {
     name: 'delete_file',
     description: 'Delete a file or folder (folders recursively).',
     parameters: { type: 'object', required: ['path'], properties: { path: str } },
@@ -776,24 +800,24 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'softn_examples',
     description:
-      'Editable Vanilla JavaScript, React and Vue starters (vanilla-js, react, vue) and complete classic SoftN apps. ' +
+      'Editable Container v2 starters (vanilla-js, react, vue, fullstack-sqlite with embedded backend + XDB SQLite) and complete classic SoftN apps. ' +
       'No arguments: the list. `name`: an app\'s files and manifest. `name` + `file`: read one of its files. `name` + `install_to`: copy the whole app into the project, in a new folder (named after the app) inside install_to (it then shows in the preview; start from it or take parts of it).',
     parameters: { type: 'object', properties: { name: str, file: str, install_to: str } },
   },
   {
     name: 'softn_check',
-    description: 'Check a SoftN app: its files (manifest.json, listed files, JSON, permissions, logic syntax) and a real render in the live preview, which switches to show it, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports. With several apps in the project, name the one with `app` (its folder; "/" for the project root).',
+    description: 'Check a SoftN app (classic or Container v2 full-stack): its files (manifest.json, backend config, SQLite schemas/seeds via XDB WASM, listed files, JSON, permissions, logic syntax) and a real render in the live preview, which switches to show it, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports. With several apps in the project, name the one with `app` (its folder; "/" for the project root).',
     parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder, e.g. "apps/tasks"; optional when the project has one app' } } },
   },
   {
     name: 'softn_inspect',
-    description: 'Describe what a classic SoftN app shows in the live preview right now, as text: headings, text, buttons, inputs with their values, checkboxes, selects, links, images and canvases, plus any errors the app reported. Use it to confirm the page looks as intended.',
+    description: 'Describe what a SoftN app (classic or Container v2) shows in the live preview right now, as text: headings, text, buttons, inputs with their values, checkboxes, selects, links, images and canvases, plus any errors the app reported. Use it to confirm the page looks as intended.',
     parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder; optional when the project has one app' } } },
   },
   {
     name: 'softn_interact',
     description:
-      'Exercise a classic SoftN app in the live preview: a list of actions, run in order, then the page as text and any errors the app raised. ' +
+      'Exercise a SoftN app (classic or Container v2, including full-stack backend & XDB SQLite flows) in the live preview: a list of actions, run in order, then the page as text and any errors the app raised. ' +
       'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"} (a select that takes several: "value": ["<option>", "<option>"], exactly those chosen), {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
       'To repeat a key or a click add "times": {"key": "ArrowRight", "times": 10}; to keep a key down, as a game needs to move, add "hold" in ms: {"key": "ArrowRight", "hold": 400} (a few hundred ms moves a step or two; a call holds keys 8 s at most in all). At most 20 actions a call. ' +
       'State carries over between calls until the app is changed or re-rendered.',
@@ -801,6 +825,56 @@ export const TOOLS: ToolSpec[] = [
       type: 'object',
       required: ['actions'],
       properties: { app: { ...str, description: 'The app\'s folder; optional when the project has one app' }, actions: { type: 'array', items: { type: 'object' } } },
+    },
+  },
+  {
+    name: 'sqlite_list_databases',
+    description: 'List SQLite databases (.db/.sqlite files, manifest.json `databases` entries, and .sql / .json seed files) in a SoftN app or project.',
+    parameters: {
+      type: 'object',
+      properties: { app: { ...str, description: 'The app\'s folder, e.g. "apps/tracker"; optional when the project has one app (use "/" for project root)' } },
+    },
+  },
+  {
+    name: 'sqlite_schema',
+    description: 'Inspect the schema of a SoftN app\'s XDB SQLite database (tables, columns, types, primary keys, constraints, indexes, views, triggers, and row counts) using the bundled XDB SQLite WASM engine.',
+    parameters: {
+      type: 'object',
+      properties: {
+        app: { ...str, description: 'The app\'s folder; optional when the project has one app' },
+        database: { ...str, description: 'Database name or file path (e.g. "app", "db/app.db"); defaults to the app\'s primary database' },
+        table: { ...str, description: 'Optional single table name to inspect' },
+      },
+    },
+  },
+  {
+    name: 'sqlite_query',
+    description: 'Run a read-only SQL query (SELECT, WITH, EXPLAIN, PRAGMA, VALUES) against a SoftN app\'s XDB SQLite database and return columns and rows.',
+    parameters: {
+      type: 'object',
+      required: ['sql'],
+      properties: {
+        app: { ...str, description: 'The app\'s folder; optional when the project has one app' },
+        database: { ...str, description: 'Database name or file path; defaults to the app\'s primary database' },
+        sql: { ...str, description: 'Read-only SQL query (use ? placeholders with `params`)' },
+        params: { type: 'array', description: 'Optional positional bind parameters' },
+        limit: { ...int, minimum: 1, maximum: 500, description: 'Maximum rows to return (default 100, max 500)' },
+      },
+    },
+  },
+  {
+    name: 'sqlite_execute',
+    description: 'Execute DDL or DML SQL (CREATE TABLE, ALTER TABLE, INSERT, UPDATE, DELETE, multi-statement scripts) against a SoftN app\'s XDB SQLite database via XDB WASM and save the updated SQLite .db binary into the app.',
+    parameters: {
+      type: 'object',
+      required: ['sql'],
+      properties: {
+        app: { ...str, description: 'The app\'s folder; optional when the project has one app' },
+        database: { ...str, description: 'Database name or file path (default "db/app.db" or manifest primary)' },
+        sql: { ...str, description: 'SQL statement(s) to execute' },
+        params: { type: 'array', description: 'Optional positional bind parameters' },
+        register_in_manifest: { type: 'boolean', description: 'Register a newly created database in manifest.json `databases` (default true for Container v2 apps)' },
+      },
     },
   },
   {
@@ -878,7 +952,7 @@ export function browserHint(output: string): string | null {
 }
 
 /** The names Zipp's Python gives code it was given as text (code_run's `code`, python -c, a pipe), where it says an error was raised. */
-export const SENT_CODE_FILE = /^(?:__main__\.py|__botcomputer_main__\.py|<stdin>|<string>)$/;
+export const SENT_CODE_FILE = /^(?:__main__\.py|__oaiy_main__\.py|<stdin>|<string>)$/;
 
 /**
  * What code_run or sandbox_shell says of Python that reached for exec, eval or compile (`stderr`: its errors), or null.
@@ -1301,6 +1375,10 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       ctx.reads.set(key, vfs.version(`/${key}`));
       return `edited /${key} (${count} replacement${count === 1 ? '' : 's'})`;
     }
+    case 'apply_patch': {
+      const outcome = applyPatchToVfs(need(input, 'patch'), vfs, ctx.reads);
+      return outcome.summary;
+    }
     case 'delete_file': {
       const key = normalizePath(need(input, 'path'));
       vfs.remove(`/${key}`, true);
@@ -1452,9 +1530,46 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (!ctx.preview) throw new Error('there is no live preview in this session');
       const app: PreviewTarget = { kind: 'app', root: target.root };
       const report = call.name === 'softn_inspect' ? await ctx.preview.inspect(app) : await ctx.preview.act(app, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
-      // (text that was meant as a button: in SoftN that is most often a handler on a component that takes none)
-      if (report.error && /nothing takes a click there/.test(report.error)) report.error += ' In a SoftN app only some components take @click (Button, Box, Card, …); softn_check names a handler that is ignored.';
+      // (text that was meant as a button: in classic SoftN that is most often a handler on a component that takes none)
+      if (report.error && !isWebApp(vfs, target.root) && /nothing takes a click there/.test(report.error)) report.error += ' In a SoftN app only some components take @click (Button, Box, Card, …); softn_check names a handler that is ignored.';
       return pageReport(`App: ${appLabel(target.root)}`, report);
+    }
+    case 'sqlite_list_databases': {
+      const target = resolveApp(vfs, input.app);
+      const root = target.ok ? target.root : typeof input.app === 'string' && input.app.trim() ? normalizePath(input.app) : '';
+      const info = listSqliteDatabases(vfs, root);
+      return JSON.stringify({ app: appLabel(root), ...info }, null, 2);
+    }
+    case 'sqlite_schema': {
+      const target = resolveApp(vfs, input.app);
+      const root = target.ok ? target.root : typeof input.app === 'string' && input.app.trim() ? normalizePath(input.app) : '';
+      const schema = await inspectSqliteSchema(vfs, root, {
+        database: typeof input.database === 'string' ? input.database : undefined,
+        table: typeof input.table === 'string' ? input.table : undefined,
+      });
+      return JSON.stringify(schema, null, 2);
+    }
+    case 'sqlite_query': {
+      const target = resolveApp(vfs, input.app);
+      const root = target.ok ? target.root : typeof input.app === 'string' && input.app.trim() ? normalizePath(input.app) : '';
+      const sql = typeof input.sql === 'string' ? input.sql : '';
+      const res = await querySqlite(vfs, root, sql, {
+        database: typeof input.database === 'string' ? input.database : undefined,
+        params: Array.isArray(input.params) ? input.params : undefined,
+        limit: typeof input.limit === 'number' ? input.limit : undefined,
+      });
+      return JSON.stringify(res, null, 2);
+    }
+    case 'sqlite_execute': {
+      const target = resolveApp(vfs, input.app);
+      const root = target.ok ? target.root : typeof input.app === 'string' && input.app.trim() ? normalizePath(input.app) : '';
+      const sql = typeof input.sql === 'string' ? input.sql : '';
+      const res = await executeSqlite(vfs, root, sql, {
+        database: typeof input.database === 'string' ? input.database : undefined,
+        params: Array.isArray(input.params) ? input.params : undefined,
+        registerInManifest: input.register_in_manifest !== false,
+      });
+      return JSON.stringify(res, null, 2);
     }
     case 'page_check': {
       if (!ctx.preview) throw new Error('there is no live preview in this session');
@@ -2042,7 +2157,8 @@ function looksUpElements(vfs: Vfs, root: string): boolean {
 }
 
 export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
-  const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => [])), ...(await checkEvents(ctx.vfs, root).catch(() => []))];
+  const dbFindings = isWebApp(ctx.vfs, root) ? await validateAppDatabases(ctx.vfs, root).catch(() => []) : [];
+  const findings = [...checkProject(ctx.vfs, root), ...dbFindings, ...(await logicSyntax(ctx.vfs, root).catch(() => [])), ...(await checkEvents(ctx.vfs, root).catch(() => []))];
   const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
   const problems: string[] = findings.filter((f) => f.level === 'error').map((f) => `${f.file}: ${f.message}`);
   if (problems.length) {
@@ -2079,11 +2195,21 @@ function reportChanges(report: Record<string, unknown>, changes: { written: Set<
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
   const out: ToolOut = { images: [], files: [], check: null, review: [] };
+  const explicitTimeoutMs =
+    typeof call.input.timeout_ms === 'number' && Number.isFinite(call.input.timeout_ms) && call.input.timeout_ms > 0
+      ? Math.min(call.input.timeout_ms, MAX_TIMEOUT_S * 1000)
+      : undefined;
   try {
-    const content = await execute(call, ctx, out);
+    const rawContent = explicitTimeoutMs
+      ? await withToolTimeout(call.name, explicitTimeoutMs, ctx.signal, (scopedSignal) =>
+          execute(call, { ...ctx, signal: scopedSignal }, out),
+        )
+      : await execute(call, ctx, out);
     let isError = false;
-    if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(content)) isError = true;
-    const result: ToolResult = { id: call.id, name: call.name, content, isError };
+    if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(rawContent)) isError = true;
+    const spilled = maybeSpillOutput(ctx.rawVfs ?? ctx.vfs, call.name, call.id, rawContent);
+    const result: ToolResult = { id: call.id, name: call.name, content: spilled.text, isError };
+    if (spilled.spillPath) result.spillPath = spilled.spillPath;
     if (out.images.length) result.images = out.images;
     if (out.files.length) result.files = out.files;
     if (out.check) result.check = out.check;
@@ -2091,6 +2217,6 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
     return result;
   } catch (error) {
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);
-    return { id: call.id, name: call.name, content: `Error: ${message}`, isError: true };
+    return { id: call.id, name: call.name, content: message.startsWith('Error') ? message : `Error: ${message}`, isError: true };
   }
 }

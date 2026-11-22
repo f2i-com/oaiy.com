@@ -398,7 +398,7 @@ fn hand_off_sentence(target: Option<Target>, replaced: &std::path::Path, kind: O
 fn flush_script(nonce: &str) -> String {
     let nonce = serde_json::to_string(nonce).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "(async () => {{ try {{ if (typeof window.__botComputerBeforeQuit === 'function') await window.__botComputerBeforeQuit(); }} catch (e) {{}} \
+        "(async () => {{ try {{ if (typeof window.__oaiyAgentBeforeQuit === 'function') await window.__oaiyAgentBeforeQuit(); }} catch (e) {{}} \
          try {{ const d = window.__OAIY_DESKTOP__; if (d && d.origin && d.token) await fetch(d.origin + '/api/update/agent-flushed', {{ method: 'POST', \
          headers: {{ 'content-type': 'application/json', authorization: 'Bearer ' + d.token }}, body: JSON.stringify({{ nonce: {nonce} }}) }}); }} catch (e) {{}} }})();"
     )
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn the_agent_is_asked_to_save_by_its_own_hook_and_answers_with_the_nonce_it_was_given() {
         let script = flush_script("a1b2c3d4");
-        assert!(script.contains("window.__botComputerBeforeQuit"));
+        assert!(script.contains("window.__oaiyAgentBeforeQuit"));
         assert!(script.contains("/api/update/agent-flushed"));
         assert!(script.contains("nonce: \"a1b2c3d4\""));
         // Whatever the hook does, the answer is still sent; and an error in either never escapes the page.

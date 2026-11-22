@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "bot.computer",
-  "mainBinaryName": "bot-computer",
+  "productName": "OAIY Agent",
+  "mainBinaryName": "oaiy-agent",
   "version": "../package.json",
-  "identifier": "computer.bot.desktop",
+  "identifier": "com.oaiy.agent",
   "build": {
     "devUrl": "http://localhost:5317",
     "frontendDist": "../dist",

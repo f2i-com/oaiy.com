@@ -134,7 +134,7 @@ describe('E5: the Agent', () => {
     const again = await open('agent');
     await again.page.waitForSelector('.tree-row', { timeout: 60_000 });
     await again.page.evaluate(async () => {
-      const open = indexedDB.open('bot.computer');
+      const open = indexedDB.open('oaiy-agent');
       const db = await new Promise((resolve, reject) => {
         open.onsuccess = () => resolve(open.result);
         open.onerror = () => reject(open.error);

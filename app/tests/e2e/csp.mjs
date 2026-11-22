@@ -1,4 +1,4 @@
-// The page's Content-Security-Policy: nothing bot.computer does is refused by
+// The page's Content-Security-Policy: nothing OAIY Agent does is refused by
 // it, and script in an SVG opened from a blob URL does not run.
 //   node tests/e2e/csp.mjs
 import { existsSync } from 'node:fs';

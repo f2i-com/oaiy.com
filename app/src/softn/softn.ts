@@ -228,17 +228,44 @@ export function readManifest(vfs: Vfs, root = ''): SoftnManifest | null {
   }
 }
 
-/** Is this folder a SoftN app? (A manifest.json whose `main` is a page: `index.html`, or a .ui page made before.) */
-export function isSoftnApp(vfs: Vfs, root = ''): boolean {
-  const manifest = readManifest(vfs, root);
-  return !!manifest && typeof manifest.main === 'string' && isAppPagePath(manifest.main);
+/** Whether `value` is a plain JSON object (not null, not an array). */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** SoftN's manifest-based renderer selection. Classic HTML also permits module script tags. */
+/** Valid embedded backend runtimes supported by SoftN Container v2. */
+const BACKEND_RUNTIMES = new Set(['javascript', 'typescript', 'php', 'rust', 'python']);
+const SQLITE_MAGIC = 'SQLite format 3\0';
+
+function isSqliteHeader(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 16) return false;
+  for (let i = 0; i < SQLITE_MAGIC.length; i++) {
+    if (bytes[i] !== SQLITE_MAGIC.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+/** Is this folder a SoftN app? (A manifest.json whose `main` is a page: `index.html`, a .ui page, or a v2 SSR entry such as `index.php` with `backend`.) */
+export function isSoftnApp(vfs: Vfs, root = ''): boolean {
+  const manifest = readManifest(vfs, root);
+  if (!manifest || typeof manifest.main !== 'string' || !manifest.main.trim()) return false;
+  if (isAppPagePath(manifest.main)) return true;
+  if ((manifest.engine === 2 || manifest.container === true || isRecord(manifest.backend)) && isRecord(manifest.backend)) {
+    return !/\.ui$/i.test(manifest.main);
+  }
+  return false;
+}
+
+/** SoftN's manifest-based Container v2 selection. Classic HTML also permits module script tags. */
 export function isWebApp(vfs: Vfs, root = ''): boolean {
   const manifest = readManifest(vfs, root);
-  return !!manifest && (manifest.engine === 2 || manifest.container === true)
-    && typeof manifest.main === 'string' && /\.html?$/i.test(manifest.main);
+  if (!manifest || typeof manifest.main !== 'string') return false;
+  if (/\.ui$/i.test(manifest.main)) return false;
+  if (manifest.engine === 2 || manifest.container === true) {
+    return /\.html?$/i.test(manifest.main) || isRecord(manifest.backend);
+  }
+  if (isRecord(manifest.backend)) return true;
+  return false;
 }
 
 /** Every SoftN app folder in the project, the root first. */
@@ -455,7 +482,67 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
   if (manifest && isWebApp(vfs, root)) {
     if (!present.has(manifest.main as string)) err('manifest.json', `Entry page ${manifest.main} is missing.`);
     if (typeof manifest.name !== 'string' || !manifest.name.trim()) warn('manifest.json', 'Give this app a name for the library.');
-    for (const [path] of files) {
+    // Validate optional embedded Container v2 backend configuration
+    if (manifest.backend !== undefined) {
+      if (!isRecord(manifest.backend)) {
+        err('manifest.json', '`backend` must be an object with `runtime` and `entry`.');
+      } else {
+        const runtime = typeof manifest.backend.runtime === 'string' ? manifest.backend.runtime.toLowerCase() : '';
+        if (!BACKEND_RUNTIMES.has(runtime)) {
+          err('manifest.json', `\`backend.runtime\` must be one of: ${[...BACKEND_RUNTIMES].join(', ')}.`);
+        }
+        const entry = typeof manifest.backend.entry === 'string' ? normalizePath(manifest.backend.entry) : '';
+        if (!entry) {
+          err('manifest.json', '`backend.entry` must name the backend entry file (e.g. "backend/server.js").');
+        } else if (!present.has(entry)) {
+          err('manifest.json', `\`backend.entry\` names ${entry}, which does not exist in the app.`);
+        }
+        if (manifest.backend.routes !== undefined && (!Array.isArray(manifest.backend.routes) || !manifest.backend.routes.every((r) => typeof r === 'string'))) {
+          err('manifest.json', '`backend.routes` must be an array of route prefixes (e.g. ["/api/"]).');
+        }
+      }
+    }
+    // Validate optional XDB SQLite databases configuration
+    if (manifest.databases !== undefined) {
+      if (!Array.isArray(manifest.databases)) {
+        err('manifest.json', '`databases` must be an array of SQLite database definitions.');
+      } else {
+        for (const entry of manifest.databases) {
+          if (!isRecord(entry)) {
+            err('manifest.json', 'Each item in `databases` must be an object (e.g. { "name": "app", "engine": "sqlite", "file": "app.db" }).');
+            continue;
+          }
+          const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+          const file = typeof entry.file === 'string' ? normalizePath(entry.file) : '';
+          if (!name && !file) {
+            err('manifest.json', 'Each database entry needs a `name` (e.g. "app") or `file` (e.g. "app.db").');
+          }
+          if (typeof entry.seedSql === 'string' && entry.seedSql.trim()) {
+            const sqlSpec = entry.seedSql.trim();
+            const looksInline = /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*(?:CREATE|INSERT|UPDATE|DELETE|ALTER|DROP|PRAGMA|BEGIN|WITH|REPLACE)\b/i.test(sqlSpec);
+            if (!looksInline && !present.has(normalizePath(sqlSpec))) {
+              err('manifest.json', `\`databases[].seedSql\` names ${sqlSpec}, which does not exist in the app.`);
+            }
+          }
+          if (typeof entry.seedJson === 'string' && entry.seedJson.trim()) {
+            const seedPath = normalizePath(entry.seedJson.trim());
+            if (!present.has(seedPath)) {
+              err('manifest.json', `\`databases[].seedJson\` names ${seedPath}, which does not exist in the app.`);
+            } else {
+              try {
+                JSON.parse(vfs.readText(inApp(root, seedPath)));
+              } catch (error) {
+                err(seedPath, `not valid JSON: ${(error as Error).message}`);
+              }
+            }
+          }
+        }
+      }
+    }
+    for (const [path, bytes] of files) {
+      if (/\.(?:db|sqlite|sqlite3)$/i.test(path) && bytes.byteLength > 0 && !isSqliteHeader(bytes)) {
+        err(path, 'Not a valid SQLite 3 database file (missing SQLite format 3 header).');
+      }
       if (/^(?:server|backend|private|__softn_generated__)\//i.test(path)) continue;
       if (/\.(jsx|vue)$/i.test(path) && !present.has(`__softn_generated__/${path}.js`)) {
         err(path, 'This component needs its prepared JavaScript module. Export it from SoftN Studio or Builder, or use a local JavaScript module.');
@@ -605,6 +692,23 @@ export async function checkLogicSyntax(vfs: Vfs, root: string, run: (source: str
       const hash = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
       if (hash !== header[1]) findings.push({ level: 'error', file: path, message: 'The component changed after its JavaScript was generated. Export it again from SoftN Studio or Builder.' });
     }
+    // Syntax-check embedded JS backend entry (classic script with handleRequest(req)) if present.
+    const manifest = readManifest(vfs, root);
+    if (manifest && isRecord(manifest.backend) && String(manifest.backend.runtime ?? '').toLowerCase() === 'javascript' && typeof manifest.backend.entry === 'string') {
+      const entry = normalizePath(manifest.backend.entry);
+      if (vfs.exists(inApp(root, entry))) {
+        try {
+          const code = vfs.readText(inApp(root, entry));
+          const program = `var src = ${JSON.stringify(code)}; try { Function(src); ""; } catch (e) { String(e && e.message ? e.message : e); }`;
+          const errMsg = await run(program);
+          if (errMsg && errMsg.trim()) {
+            findings.push({ level: 'error', file: entry, message: `syntax error: ${errMsg.trim()}` });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     return findings;
   }
   const sources: Record<string, string> = {};
@@ -729,6 +833,246 @@ function deleteTask(id) {
 function remaining() {
   return tasks.filter((t) => !t.done).length
 }
+`,
+  ],
+];
+
+/**
+ * Full-Stack Container v2 + XDB SQLite starter:
+ * - Vanilla JS frontend (`index.html`, `app.js`, `styles.css`) talking to `/api/items`
+ * - Embedded sandboxed JS backend (`backend/server.js`) using XDB SQLite (`sqlite.open('app.db')`)
+ * - Declarative SQLite schema & initial seed (`db/schema.sql`)
+ */
+export const SOFTN_FULLSTACK_SQLITE: Array<[string, string]> = [
+  [
+    'manifest.json',
+    `${JSON.stringify(
+      {
+        name: 'SQLite Tracker',
+        version: '1.0.0',
+        engine: 2,
+        main: 'index.html',
+        backend: {
+          runtime: 'javascript',
+          entry: 'backend/server.js',
+          routes: ['/api/'],
+        },
+        databases: [
+          {
+            name: 'app',
+            engine: 'sqlite',
+            file: 'app.db',
+            seedSql: 'db/schema.sql',
+            persist: true,
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+  ],
+  [
+    'db/schema.sql',
+    `CREATE TABLE IF NOT EXISTS items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT INTO items (title, done) VALUES
+  ('Explore embedded XDB SQLite backend', 0),
+  ('Add or toggle an item and reload to verify persistence', 0);
+`,
+  ],
+  [
+    'backend/server.js',
+    `function json(status, data) {
+  return { status: status, json: data };
+}
+
+function handleRequest(req) {
+  const db = sqlite.open('app.db');
+  const method = (req.method || 'GET').toUpperCase();
+  const path = req.path || '/';
+
+  if (method === 'GET' && path === '/api/items') {
+    const items = db.all('SELECT id, title, done, created_at FROM items ORDER BY id DESC');
+    return json(200, { items: items });
+  }
+
+  if (method === 'POST' && path === '/api/items') {
+    const body = JSON.parse(req.body || '{}');
+    const title = String(body.title || '').trim();
+    if (!title) return json(400, { error: 'Title is required.' });
+    const res = db.run('INSERT INTO items (title, done) VALUES (?, 0)', [title]);
+    const item = db.first('SELECT id, title, done, created_at FROM items WHERE id = ?', [res.last_insert_rowid]);
+    return json(201, { item: item });
+  }
+
+  const match = /^\\/api\\/items\\/(\\d+)$/.exec(path);
+  if (match) {
+    const id = Number(match[1]);
+    if (method === 'PATCH') {
+      const existing = db.first('SELECT id, done FROM items WHERE id = ?', [id]);
+      if (!existing) return json(404, { error: 'Item not found.' });
+      const nextDone = existing.done ? 0 : 1;
+      db.run('UPDATE items SET done = ? WHERE id = ?', [nextDone, id]);
+      const item = db.first('SELECT id, title, done, created_at FROM items WHERE id = ?', [id]);
+      return json(200, { item: item });
+    }
+    if (method === 'DELETE') {
+      db.run('DELETE FROM items WHERE id = ?', [id]);
+      return json(200, { deleted: id });
+    }
+  }
+
+  return json(404, { error: 'Not found: ' + method + ' ' + path });
+}
+`,
+  ],
+  [
+    'index.html',
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SQLite Tracker</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="head">
+      <h1>SQLite Tracker</h1>
+      <p id="summary" class="muted">Loading from XDB SQLite…</p>
+    </header>
+    <form id="add-form" class="row">
+      <input id="title-input" type="text" placeholder="Add a new item…" aria-label="New item" autocomplete="off" />
+      <button type="submit">Add</button>
+    </form>
+    <p id="error" class="error" hidden></p>
+    <ul id="list" class="list"></ul>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
+`,
+  ],
+  [
+    'styles.css',
+    `:root { color-scheme: light dark; font-family: system-ui, -apple-system, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px 16px; background: Canvas; color: CanvasText; }
+.shell { max-width: 560px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.head h1 { margin: 0 0 4px; font-size: 1.5rem; }
+.muted { margin: 0; opacity: 0.7; font-size: 0.9rem; }
+.row { display: flex; gap: 8px; }
+.row input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); background: transparent; color: inherit; font: inherit; }
+.row button, .item button { padding: 8px 14px; border-radius: 8px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); background: color-mix(in srgb, CanvasText 8%, transparent); color: inherit; font: inherit; cursor: pointer; }
+.row button { font-weight: 600; }
+.error { margin: 0; padding: 10px 12px; border-radius: 8px; background: color-mix(in srgb, crimson 16%, transparent); }
+.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, CanvasText 14%, transparent); }
+.item label { flex: 1; display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.item.done .title { text-decoration: line-through; opacity: 0.6; }
+`,
+  ],
+  [
+    'app.js',
+    `const listEl = document.getElementById('list');
+const summaryEl = document.getElementById('summary');
+const errorEl = document.getElementById('error');
+const formEl = document.getElementById('add-form');
+const inputEl = document.getElementById('title-input');
+
+function showError(msg) {
+  errorEl.textContent = msg || '';
+  errorEl.hidden = !msg;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+function render(items) {
+  const remaining = items.filter((i) => !i.done).length;
+  summaryEl.textContent = items.length ? \`\${remaining} open of \${items.length} in SQLite\` : 'No items yet';
+  listEl.innerHTML = '';
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.className = 'item' + (item.done ? ' done' : '');
+
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = Boolean(item.done);
+    cb.setAttribute('aria-label', item.title);
+    cb.addEventListener('change', async () => {
+      try {
+        showError('');
+        await api(\`/api/items/\${item.id}\`, { method: 'PATCH' });
+        await load();
+      } catch (err) {
+        showError(err.message);
+      }
+    });
+
+    const span = document.createElement('span');
+    span.className = 'title';
+    span.textContent = item.title;
+    label.append(cb, span);
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = 'Delete';
+    del.setAttribute('aria-label', \`Delete \${item.title}\`);
+    del.addEventListener('click', async () => {
+      try {
+        showError('');
+        await api(\`/api/items/\${item.id}\`, { method: 'DELETE' });
+        await load();
+      } catch (err) {
+        showError(err.message);
+      }
+    });
+
+    li.append(label, del);
+    listEl.appendChild(li);
+  }
+}
+
+async function load() {
+  try {
+    showError('');
+    const { items } = await api('/api/items');
+    render(items);
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+formEl.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const title = inputEl.value.trim();
+  if (!title) return;
+  try {
+    showError('');
+    await api('/api/items', { method: 'POST', body: JSON.stringify({ title }) });
+    inputEl.value = '';
+    await load();
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+void load();
 `,
   ],
 ];

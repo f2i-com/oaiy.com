@@ -3738,7 +3738,8 @@ function planHtml(p) {
   // what happens to them: a list of 28 was mostly files of a few KB)
   const big = p.files.filter(f => (f.size || 0) >= 8e6), small = p.files.filter(f => (f.size || 0) < 8e6);
   const why = f => f.status === "download" ? "to download" : f.status === "here" ? "in place" : f.status === "network" ? "from " + esc(f.from || "") + " (OAIY Network)" : (f.copy ? "copied from " : "on this computer: ") + esc(f.from || "");
-  const files = big.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${why(f)}</span></li>`).join("")
+  const roleTag = path => /(^|\/)mmproj[^/]*\.gguf$/i.test(path) ? ' <span class="tag">vision projector</span>' : "";
+  const files = big.map(f => `<li class="${esc(f.status)}"><span>${esc(f.path.split("/").slice(-2).join("/"))}${roleTag(f.path)}</span><span>${f.size ? dlSize(f.size) : ""}</span><span class="why" title="${esc(f.from || "")}">${why(f)}</span></li>`).join("")
     + [...new Set(small.map(f => f.status))].map(st => {
         const these = small.filter(f => f.status === st), bytes = these.reduce((n, f) => n + (f.size || 0), 0);
         return `<li class="${esc(st)}"><span title="${esc(these.map(f => f.path).join("\n"))}">${these.length} small file${these.length === 1 ? "" : "s"} (settings, tokenizer…)</span><span>${bytes ? dlSize(bytes) : ""}</span><span class="why">${st === "download" ? "to download" : st === "here" ? "in place" : st === "network" ? "over OAIY Network" : "on this computer"}</span></li>`;

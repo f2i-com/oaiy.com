@@ -3,7 +3,7 @@
  * project at once, so a "Gary" made for one project would block (or be reused
  * by) another. Each project gets its own key: the agent names a voice "Gary",
  * and it is saved on the service as "Gary-<key>". The names the agent uses and
- * the names they are saved under are kept in `.botcomputer/voices.json`, so a
+ * the names they are saved under are kept in `.oaiy/voices.json`, so a
  * later chat in the same project speaks in the same voices.
  *
  * A service that can (OAIY) hands a new voice back instead of keeping it: the
@@ -14,7 +14,7 @@
 import type { Vfs } from '../vfs/vfs';
 import { bytesToBase64, type HandedVoice, type VoiceChoice, type VoiceInfo } from './media';
 
-export const VOICES_FILE = '/.botcomputer/voices.json';
+export const VOICES_FILE = '/.oaiy/voices.json';
 
 export interface ProjectVoices {
   /** This project's suffix for the voices it saves. */

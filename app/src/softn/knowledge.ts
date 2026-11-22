@@ -8,19 +8,40 @@
  * guides, and apps from softn.com's catalogue. The large parts load on first
  * use; main.ts warms them after start so they are cached for offline use.
  */
-import { unzipSync } from 'fflate';
+import { unzipSync, zipSync, strToU8 } from 'fflate';
 import type { Vfs } from '../vfs/vfs';
 import { COMPONENT_INDEX, DOC_INDEX } from './knowledge/index.generated';
 import webStartersGuide from './web-starters.md?raw';
-import { appFiles, handlersIn, importSoftn, isAppPagePath, isWebApp, type Finding } from './softn';
+import { SOFTN_FULLSTACK_SQLITE, appFiles, handlersIn, importSoftn, isAppPagePath, isWebApp, type Finding } from './softn';
+import type { SoftnExample } from './knowledge/examples.generated';
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+let fullstackStarterCache: SoftnExample | null = null;
+function fullstackSqliteStarter(): SoftnExample {
+  if (!fullstackStarterCache) {
+    const entries: Record<string, Uint8Array> = {};
+    for (const [path, text] of SOFTN_FULLSTACK_SQLITE) entries[path] = strToU8(text);
+    const bytes = zipSync(entries, { level: 6 });
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    fullstackStarterCache = {
+      slug: 'fullstack-sqlite',
+      name: 'SQLite Tracker',
+      description: 'Full-stack Container v2 app with an embedded JS backend and persistent XDB SQLite database.',
+      tags: ['Full-Stack SQLite', 'web app', 'starter'],
+      files: SOFTN_FULLSTACK_SQLITE.map(([path]) => path).sort(),
+      softn: btoa(binary),
+    };
+  }
+  return fullstackStarterCache;
+}
 
 const components = () => import('./knowledge/components.generated').then((m) => m.COMPONENT_REFERENCE);
 const docs = () => import('./knowledge/docs.generated').then((m) => m.DOC_PAGES);
 const examples = async () => {
   const [web, classic] = await Promise.all([import('./knowledge/web-starters.generated'), import('./knowledge/examples.generated')]);
-  return [...web.WEB_STARTER_EXAMPLES, ...classic.SOFTN_EXAMPLES];
+  return [...web.WEB_STARTER_EXAMPLES, fullstackSqliteStarter(), ...classic.SOFTN_EXAMPLES];
 };
 
 /** Each component's events as its reference lists them ("Events …", then "- @name" lines), in lower case. */

@@ -1,5 +1,5 @@
 /**
- * What kind of page this is, read once and without a request (design 3.5): one of OAIY's own windows, the older bot.computer
+ * What kind of page this is, read once and without a request (design 3.5): one of OAIY's own windows, the OAIY Agent
  * desktop shell, or a tab in a browser.
  *
  * OAIY's own windows and the desktop shell belong to a person who has installed OAIY, so a page there may look for OAIY on this
@@ -16,7 +16,7 @@
 export type HostKind =
   /** OAIY's own window: the desktop gives the page its address and a token before the page runs. */
   | 'oaiy-window'
-  /** The bot.computer desktop shell (Tauri): no desktop is given, but the person installed this app on this computer. */
+  /** The OAIY Agent desktop shell (Tauri): no desktop is given, but the person installed this app on this computer. */
   | 'desktop-shell'
   /** Anything else: a tab in a browser, on a public host, a dev server or a local copy. */
   | 'browser';
@@ -56,8 +56,8 @@ const OWN_ORIGINS: ReadonlyArray<readonly [protocol: string, hostname: string, k
   ['oaiy:', 'localhost', 'oaiy-window'],
   ['http:', 'oaiyflows.localhost', 'oaiy-window'],
   ['oaiyflows:', 'localhost', 'oaiy-window'],
-  ['http:', 'botcomputer.localhost', 'desktop-shell'],
-  ['botcomputer:', 'localhost', 'desktop-shell'],
+  ['http:', 'oaiyagent.localhost', 'desktop-shell'],
+  ['oaiyagent:', 'localhost', 'desktop-shell'],
 ];
 
 /** Which of OAIY's own origins the page is at, or null. No port, and no user name or password in the address. */

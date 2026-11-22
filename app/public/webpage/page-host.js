@@ -26,10 +26,10 @@
   'use strict';
   const parentWindow = window.parent;
   if (!parentWindow || parentWindow === window) return;
-  const MAGIC = '\u0000bot.computer.page:';
+  const MAGIC = '\u0000oaiy.agent.page:';
   /** Instructions for one entry into the page's code: a loop that never ends is stopped. */
   const BUDGET = 400_000_000;
-  const post = (message, transfer) => parentWindow.postMessage({ __botComputer: true, ...message }, '*', transfer || []);
+  const post = (message, transfer) => parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*', transfer || []);
   const nativeConsole = { log: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console) };
 
   let port = null;
@@ -135,7 +135,7 @@
    */
   /** The events the page listens for on each element, so OAIY's bridge can find and click them. */
   const listening = new WeakMap();
-  window.__botComputerListening = listening;
+  window.__oaiyAgentListening = listening;
   const markListener = (el, type) => {
     if (!(el instanceof Element)) return;
     let types = listening.get(el);
@@ -413,11 +413,11 @@
     'parent', 'top', 'opener', 'frames', 'frameElement', 'location',
     'eval', 'Function', 'postMessage', 'open', 'close',
     'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker',
-    '__botComputerListening', '__botComputerBridge',
+    '__oaiyAgentListening', '__oaiyAgentBridge',
   ]);
   const isBlockedProp = (obj, prop) => {
     const p = String(prop);
-    if (p.startsWith('__botComputer') || p.startsWith('__zdom')) return true;
+    if (p.startsWith('__oaiyAgent') || p.startsWith('__zdom')) return true;
     return obj === window && BLOCKED_WIN_PROPS.has(p);
   };
   const isForbiddenHostVal = (val) => val === parentWindow || (window.top && window.top !== window && val === window.top);
@@ -528,7 +528,7 @@
       document.body.insertAdjacentHTML('beforeend', String(html));
       harvest(document.body);
     },
-    location: () => ({ origin: 'https://preview.bot.computer', host: 'preview.bot.computer', path: `/${pagePath}`, search: '' }),
+    location: () => ({ origin: 'https://preview.oaiy.com', host: 'preview.oaiy.com', path: `/${pagePath}`, search: '' }),
     hash(value) {
       if (value === undefined) return window.location.hash;
       window.location.hash = String(value);
@@ -675,7 +675,7 @@
     csp.content = "default-src 'none'; script-src 'wasm-unsafe-eval'; style-src 'unsafe-inline' blob: data:; img-src data: blob:; media-src data: blob:; font-src data: blob:; connect-src data: blob:; form-action 'none'; base-uri 'none'; frame-src 'none'; worker-src 'none'";
     document.head.prepend(csp);
     for (const attr of [...parsed.documentElement.attributes]) document.documentElement.setAttribute(attr.name, attr.value);
-    const keep = [...document.head.children].filter((el) => el === csp || el.hasAttribute('data-bot-computer-bridge') || el.hasAttribute('data-bot-computer-capture'));
+    const keep = [...document.head.children].filter((el) => el === csp || el.hasAttribute('data-oaiy-agent-bridge') || el.hasAttribute('data-oaiy-agent-capture'));
     document.head.replaceChildren(...keep, ...[...parsed.head.childNodes].map((n) => document.adoptNode(n)));
     document.body.replaceWith(document.adoptNode(parsed.body));
     document.title = parsed.title || pagePath;

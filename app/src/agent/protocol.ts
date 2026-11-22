@@ -40,6 +40,8 @@ export interface ToolResult {
   review?: FrameReview[];
   /** The tool started calls (SessionTool.startsCalls, asked of what it answered itself, before any flow's note); not sent to the model. */
   startedCalls?: boolean;
+  /** VFS path where full verbatim tool output was spilled when it exceeded the inline budget; not sent to the model. */
+  spillPath?: string;
 }
 
 /** A picture made for a scripted video, and what it is checked against. */

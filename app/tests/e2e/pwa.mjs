@@ -196,15 +196,14 @@ try {
   // ---- the files of the build ----
   await check('the build stamped its service worker with a cache name of this app', () => {
     expect(builtCache, `dist/sw.js has no "const CACHE = 'oaiy-agent-<12 hex>';" line`);
-    expect(!/bot\.computer-[0-9a-f]{6,}/.test(stamped), 'the worker still names a bot.computer cache');
-    expect(stamped.includes("'bot.computer-'"), 'the worker no longer knows to remove the bot.computer caches');
+    expect(stamped.includes("'oaiy-agent-'"), 'the worker no longer knows to remove older OAIY Agent caches');
   });
 
   await check('the manifest names OAIY and its colours are the app own', async () => {
     const served = await get('manifest.webmanifest');
     same([served.status, served.type], [200, 'application/manifest+json'], 'the manifest');
     same([manifest.name, manifest.short_name], ['OAIY', 'OAIY'], 'name and short name');
-    expect(/OAIY/.test(manifest.description) && !/bot\.computer/i.test(JSON.stringify(manifest)), `the description: ${manifest.description}`);
+    expect(/OAIY/.test(manifest.description), `the description: ${manifest.description}`);
     expect(typeof manifest.id === 'string' && manifest.id.length > 0, 'the manifest has no id');
     same([manifest.display, manifest.start_url, manifest.scope], ['standalone', './', './'], 'display, start_url and scope');
     // The app's dark background (styles.css --bg), which is also the page's theme-color.
@@ -253,7 +252,7 @@ try {
   await seed.goto(`${base}__seed`);
   await seed.evaluate(async () => {
     // In this order: the newest of the app's caches is the one the first worker keeps (it has no record of a build that ran).
-    for (const name of ['oaiy-agent-000000000001', 'bot.computer-deadbeef', 'unrelated-cache']) await (await caches.open(name)).put('/old', new Response('old'));
+    for (const name of ['oaiy-agent-000000000001', 'oaiy-agent-deadbeef', 'unrelated-cache']) await (await caches.open(name)).put('/old', new Response('old'));
   });
   await seed.close();
 
@@ -289,8 +288,8 @@ try {
       if (!keys.includes('oaiy-agent-000000000001')) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    // The bot.computer cache was the newest of the app's, so it is the "previous build" a tab of the old days still runs.
-    same(keys, [builtCache, 'bot.computer-deadbeef', 'unrelated-cache'].sort(), 'the caches');
+    // The newest earlier OAIY Agent cache is the "previous build" a tab from before still runs.
+    same(keys, [builtCache, 'oaiy-agent-deadbeef', 'unrelated-cache'].sort(), 'the caches');
   });
 
   await check('the cache holds every file the worker precaches', async () => {
@@ -533,7 +532,7 @@ try {
     same(dialogs, [], "the browser's own leave prompts");
     same(navigations - navigationsBefore, 1, 'navigations after Reload');
     same(await page.evaluate(() => !!document.querySelector('.update-notice')), false, 'the notice after reloading');
-    // The version before is kept for one more update; the bot.computer cache, older than that, is gone.
+    // The version before is kept for one more update; the older cache before that is gone.
     await cachesAre([builtCache, NEXT_CACHE, 'unrelated-cache'], 'the caches after the update');
   });
 

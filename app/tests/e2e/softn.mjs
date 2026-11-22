@@ -1,4 +1,4 @@
-// SoftN in bot.computer: a new app renders live, reacts to input, follows
+// SoftN in OAIY Agent: a new app renders live, reacts to input, follows
 // edits, reports errors, is checked by the agent, and exports as .softn.
 // Needs the SoftN runtime (npm run fetch:softn).   node tests/e2e/softn.mjs
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';

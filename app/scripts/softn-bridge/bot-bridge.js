@@ -24,7 +24,7 @@
   if (!parentWindow || parentWindow === window) return;
   const post = (message) => {
     try {
-      parentWindow.postMessage({ __botComputer: true, ...message }, '*');
+      parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*');
     } catch {
       /* the parent went away */
     }
@@ -72,7 +72,7 @@
     }
     window.addEventListener('message', (event) => {
       const message = event.data;
-      if (event.source !== parentWindow || !message || message.__botComputer !== true || message.type !== 'bot:storage-init') return;
+      if (event.source !== parentWindow || !message || message.__oaiyAgent !== true || message.type !== 'bot:storage-init') return;
       if (!message.store || typeof message.store !== 'object') return;
       // (what the app wrote since the frame opened stays: the store kept is the older)
       for (const [key, value] of Object.entries(message.store)) {
@@ -86,7 +86,7 @@
   // what lay past the window's bottom was cut off and could not be reached. Its own layout is kept (its height the
   // window's), only what overflows it scrolls, with SoftN's own scroll bars; an app as it is exported keeps SoftN's.
   const scrolling = document.createElement('style');
-  scrolling.setAttribute('data-bot-computer-scrolling', '');
+  scrolling.setAttribute('data-oaiy-agent-scrolling', '');
   scrolling.textContent = '.softn-app { overflow: auto !important; }';
   (document.head || document.documentElement).appendChild(scrolling);
 
@@ -122,6 +122,40 @@
     };
   }
 
+  // --- SoftN v2 container ShadowRoot tracking (private to this closure) --------
+  // SoftN v2 Web Containers draw the app inside a closed ShadowRoot on `[data-softn-box]`
+  // (`[data-softn-docroot]` -> `[data-softn-viewport]`). Tracking that ShadowRoot inside
+  // this private WeakMap lets OAIY's inspect/act/screenshot bridge see and test Container v2
+  // apps without ever exposing the shadow root on window or weakening container isolation.
+  const containerRoots = new WeakMap();
+  let lastBox = null;
+  const nativeAttachShadow = Element.prototype.attachShadow;
+  if (typeof nativeAttachShadow === 'function') {
+    Element.prototype.attachShadow = function (init) {
+      const sr = nativeAttachShadow.call(this, init);
+      try {
+        if (this && this.hasAttribute && this.hasAttribute('data-softn-box')) {
+          containerRoots.set(this, sr);
+          lastBox = this;
+        }
+      } catch {
+        /* ignore */
+      }
+      return sr;
+    };
+  }
+  const activeShadow = () => {
+    if (lastBox && lastBox.isConnected) return containerRoots.get(lastBox) || null;
+    const box = document.querySelector('[data-softn-box]');
+    return box ? containerRoots.get(box) || null : null;
+  };
+  const pageRoot = () => {
+    const sr = activeShadow();
+    if (!sr) return document.body;
+    return sr.querySelector('[data-softn-viewport]') || sr.querySelector('[data-softn-docroot]') || sr;
+  };
+  const queryRoot = () => activeShadow() || document;
+
   // --- describing the page ----------------------------------------------------
   const hidden = (el) => {
     for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
@@ -136,7 +170,7 @@
     const aria = el.getAttribute('aria-label');
     if (aria) return clean(aria);
     if (el.id) {
-      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const label = queryRoot().querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (label) return clean(label.textContent);
     }
     const wrapping = el.closest('label');
@@ -156,10 +190,18 @@
     return reactProps ? el[reactProps] : null;
   };
   const clickable = (el) => {
-    const types = window.__botComputerListening && window.__botComputerListening.get(el);
+    const types = window.__oaiyAgentListening && window.__oaiyAgentListening.get(el);
     if (types && CLICK_TYPES.some((t) => types.has(t))) return true;
     const props = propsOf(el);
-    return !!props && CLICK_PROPS.some((p) => typeof props[p] === 'function');
+    if (!!props && CLICK_PROPS.some((p) => typeof props[p] === 'function')) return true;
+    // In SoftN v2 containers, HostDomPatcher delegates events at [data-softn-docroot];
+    // detect custom clickable elements via onclick/tabindex or top-level cursor:pointer.
+    if (activeShadow()) {
+      if (el.hasAttribute('onclick') || el.getAttribute('tabindex') !== null) return true;
+      const style = getComputedStyle(el);
+      if (style.cursor === 'pointer' && (!el.parentElement || getComputedStyle(el.parentElement).cursor !== 'pointer')) return true;
+    }
+    return false;
   };
   const describeControl = (el) => {
     const tag = el.tagName.toLowerCase();
@@ -226,7 +268,14 @@
       }
       for (const child of el.childNodes) walk(child);
     };
-    walk(document.body);
+    const rootNode = pageRoot();
+    if (rootNode) {
+      if (rootNode.nodeType === 11) {
+        for (const child of rootNode.childNodes) walk(child);
+      } else {
+        walk(rootNode);
+      }
+    }
     return lines.length ? lines.join('\n') : '(the page shows nothing)';
   };
 
@@ -235,8 +284,10 @@
   const HOLD_MOST = 8_000;
   let holdLeft = HOLD_MOST;
   const candidates = (selector, withClickable) => {
-    const all = [...document.querySelectorAll(selector)];
-    if (withClickable) for (const el of document.body.querySelectorAll('*')) if (!all.includes(el) && clickable(el)) all.push(el);
+    const rootNode = pageRoot();
+    if (!rootNode) return [];
+    const all = [...rootNode.querySelectorAll(selector)];
+    if (withClickable) for (const el of rootNode.querySelectorAll('*')) if (!all.includes(el) && clickable(el)) all.push(el);
     return all.filter((el) => !hidden(el));
   };
   const find = (target, selector, nth = 1, withClickable = false) => {
@@ -265,7 +316,8 @@
       const names = [...new Set(all.map((el) => shownAs.get(el)).filter((n) => n && n.length <= 80))].slice(0, 30);
       const there = names.map((n) => `"${n.slice(0, 40)}"`).join(', ') || 'nothing';
       // (shown, and not a control: text that looks like a button and has nothing behind it is said to be that)
-      const shown = withClickable && [...document.body.querySelectorAll('*')].some((el) => el.children.length === 0 && !hidden(el) && clean(el.textContent).toLowerCase().includes(want));
+      const rootNode = pageRoot();
+      const shown = withClickable && rootNode && [...rootNode.querySelectorAll('*')].some((el) => el.children.length === 0 && !hidden(el) && clean(el.textContent).toLowerCase().includes(want));
       if (shown) throw new Error(`"${target}" is on the page as text, but nothing takes a click there. What can be clicked: ${there}.`);
       throw new Error(`nothing matches "${target}". On the page: ${there}`);
     }
@@ -277,8 +329,8 @@
     el.focus();
     if (setter) setter.call(el, value);
     else el.value = value;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
   };
   const act = async (action) => {
     // `times`: the click or the key press again and again (50 at most), a moment between them for the page to
@@ -291,7 +343,7 @@
       el.scrollIntoView?.({ block: 'center' });
       for (let i = 0; i < times; i++) {
         if (i) await moment();
-        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true }));
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true, composed: true }));
         el.click();
       }
       return `clicked ${describeControl(el) || `"${action.click}"`}${again}`;
@@ -301,7 +353,7 @@
       if (el.isContentEditable) {
         el.focus();
         el.textContent = String(action.value ?? '');
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
       } else setValue(el, String(action.value ?? ''));
       return `filled "${labelOf(el) || action.fill}" with "${action.value ?? ''}"`;
     }
@@ -318,8 +370,8 @@
         const chosen = wanted.map(optionFor);
         el.focus();
         for (const option of el.options) option.selected = chosen.includes(option);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
         return chosen.length ? `chose ${chosen.map((o) => `"${clean(o.textContent)}"`).join(', ')} in "${labelOf(el)}"` : `chose nothing in "${labelOf(el)}"`;
       }
       if (wanted.length !== 1) throw new Error(`"${labelOf(el)}" takes one choice: give "value" one option, not a list of ${wanted.length} (a list is for a select that takes several)`);
@@ -328,8 +380,10 @@
       return `chose "${clean(option.textContent)}" in "${labelOf(el)}"`;
     }
     if (typeof action.key === 'string') {
-      const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
-      const init = { key: action.key, code: action.key.length === 1 ? `Key${action.key.toUpperCase()}` : action.key, bubbles: true, cancelable: true };
+      const sr = activeShadow();
+      const active = (sr && sr.activeElement) || (document.activeElement && document.activeElement !== document.body ? document.activeElement : null);
+      const target = active || (sr && (sr.querySelector('[data-softn-docroot]') || sr.querySelector('[data-softn-viewport]'))) || document.body;
+      const init = { key: action.key, code: action.key.length === 1 ? `Key${action.key.toUpperCase()}` : action.key, bubbles: true, cancelable: true, composed: true };
       // `hold`: the key kept down that long (ms) before it is let go, as a game that moves while a key is down reads
       // it: down and up in one instant is no time held, and nothing moves. A call's holds are HOLD_MOST in all: a
       // model that saw a game not do what it wanted asked for 20 s, 60 s, 120 s, a call after another (each 44 s
@@ -430,14 +484,106 @@
   const MAX_PAGE_HEIGHT = 12_000;
   const MOST_DRAWS = 5;
   const opaque = (color) => color && color !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(color);
+  const syncLiveControlsAndCanvases = (origRoot, cloneRoot) => {
+    const origInputs = origRoot.querySelectorAll('input, textarea, select');
+    const cloneInputs = cloneRoot.querySelectorAll('input, textarea, select');
+    for (let i = 0; i < Math.min(origInputs.length, cloneInputs.length); i++) {
+      const o = origInputs[i];
+      const c = cloneInputs[i];
+      if (o.tagName === 'TEXTAREA') {
+        c.value = o.value;
+        c.textContent = o.value;
+      } else if (o.tagName === 'SELECT') {
+        for (let j = 0; j < Math.min(o.options.length, c.options.length); j++) {
+          if (o.options[j].selected) c.options[j].setAttribute('selected', '');
+          else c.options[j].removeAttribute('selected');
+        }
+      } else if (o.type === 'checkbox' || o.type === 'radio') {
+        c.checked = o.checked;
+        if (o.checked) c.setAttribute('checked', '');
+        else c.removeAttribute('checked');
+      } else {
+        c.value = o.value;
+        c.setAttribute('value', o.value);
+      }
+    }
+    const origCanvases = origRoot.querySelectorAll('canvas');
+    const cloneCanvases = cloneRoot.querySelectorAll('canvas');
+    for (let i = 0; i < Math.min(origCanvases.length, cloneCanvases.length); i++) {
+      const o = origCanvases[i];
+      const c = cloneCanvases[i];
+      if (!o.width || !o.height) continue;
+      c.width = o.width;
+      c.height = o.height;
+      try {
+        c.getContext('2d')?.drawImage(o, 0, 0);
+      } catch {
+        /* tainted or empty canvas */
+      }
+    }
+  };
   const shoot = async (fullPage) => {
     const lib = window.modernScreenshot;
     if (!lib) throw new Error('the screenshot library is not installed here (run npm install, then reload OAIY)');
+    const sr = activeShadow();
     const root = document.documentElement;
     const width = window.innerWidth;
-    const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight);
-    const height = fullPage ? Math.min(pageHeight, MAX_PAGE_HEIGHT) : Math.min(pageHeight, window.scrollY + window.innerHeight);
-    const background = [document.body && getComputedStyle(document.body).backgroundColor, getComputedStyle(root).backgroundColor].find(opaque) || '#ffffff';
+    let captureTarget = root;
+    let mirror = null;
+    let pageHeight;
+    let scrollY;
+    let background;
+    if (sr) {
+      const docRoot = sr.querySelector('[data-softn-docroot]') || sr;
+      const viewport = sr.querySelector('[data-softn-viewport]') || docRoot;
+      scrollY = Math.round(viewport.scrollTop || docRoot.scrollTop || window.scrollY || 0);
+      pageHeight = Math.max(viewport.scrollHeight || 0, docRoot.scrollHeight || 0, window.innerHeight);
+      const height = fullPage ? Math.min(pageHeight, MAX_PAGE_HEIGHT) : Math.min(pageHeight, scrollY + window.innerHeight);
+      background = [
+        viewport.nodeType === 1 && getComputedStyle(viewport).backgroundColor,
+        docRoot.nodeType === 1 && getComputedStyle(docRoot).backgroundColor,
+        document.body && getComputedStyle(document.body).backgroundColor,
+        getComputedStyle(root).backgroundColor,
+      ].find(opaque) || '#ffffff';
+      // Mirror the closed container ShadowRoot into a temporary light-DOM container so
+      // modern-screenshot renders all shadow styles, controls, and canvases accurately.
+      mirror = document.createElement('div');
+      mirror.setAttribute('data-bot-capture-mirror', '');
+      mirror.setAttribute('style', `position: fixed; left: 0; top: 0; width: ${width}px; height: ${height}px; overflow: hidden; pointer-events: none; z-index: -1; background: ${background};`);
+      for (const child of sr.childNodes) {
+        if (child.nodeType === 1 && child.tagName === 'STYLE') {
+          const st = document.createElement('style');
+          st.textContent = (child.textContent || '').replace(/:host\b/g, '[data-bot-capture-mirror]');
+          mirror.appendChild(st);
+        }
+      }
+      if (docRoot.nodeType === 1) {
+        const cloned = docRoot.cloneNode(true);
+        for (const st of cloned.querySelectorAll('style')) {
+          st.textContent = (st.textContent || '').replace(/:host\b/g, '[data-bot-capture-mirror]');
+        }
+        if (fullPage) {
+          cloned.style.height = 'auto';
+          cloned.style.maxHeight = 'none';
+          cloned.style.overflow = 'visible';
+          const vp = cloned.querySelector('[data-softn-viewport]');
+          if (vp) {
+            vp.style.height = 'auto';
+            vp.style.maxHeight = 'none';
+            vp.style.overflow = 'visible';
+          }
+        }
+        syncLiveControlsAndCanvases(docRoot, cloned);
+        mirror.appendChild(cloned);
+      }
+      document.body.appendChild(mirror);
+      captureTarget = mirror;
+    } else {
+      scrollY = Math.round(window.scrollY);
+      pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight);
+      background = [document.body && getComputedStyle(document.body).backgroundColor, getComputedStyle(root).backgroundColor].find(opaque) || '#ffffff';
+    }
+    const height = fullPage ? Math.min(pageHeight, MAX_PAGE_HEIGHT) : Math.min(pageHeight, scrollY + window.innerHeight);
     // The library learns each element's default style from a blank iframe it
     // makes; in this sandboxed frame that iframe would be another origin, so it
     // gets a shadow root instead, where browser defaults apply and the page's
@@ -456,7 +602,7 @@
     };
     let whole;
     try {
-      const context = await lib.createContext(root, { width, height, scale: 1, backgroundColor: background, timeout: 15_000, filter: (node) => node !== host });
+      const context = await lib.createContext(captureTarget, { width, height, scale: 1, backgroundColor: background, timeout: 15_000, filter: (node) => node !== host && (mirror ? true : node !== mirror) });
       context.sandbox = sandbox;
       // In WebKit and Firefox the library draws the picture again for each image the page holds, 100 ms and more
       // apart (a picture's own images show only on a later draw there), and it counts every element with a
@@ -468,6 +614,7 @@
       lib.destroyContext(context);
     } finally {
       host.remove();
+      if (mirror) mirror.remove();
     }
     let canvas = whole;
     if (!fullPage) {
@@ -477,15 +624,15 @@
       const ctx = canvas.getContext('2d');
       ctx.fillStyle = background;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(whole, 0, -window.scrollY);
+      ctx.drawImage(whole, 0, -scrollY);
     }
     const blob = await new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('the page could not be drawn'))), 'image/png'));
-    return { png: await blob.arrayBuffer(), width: canvas.width, height: canvas.height, pageHeight, scrollY: Math.round(window.scrollY), cut: fullPage && pageHeight > MAX_PAGE_HEIGHT };
+    return { png: await blob.arrayBuffer(), width: canvas.width, height: canvas.height, pageHeight, scrollY, cut: fullPage && pageHeight > MAX_PAGE_HEIGHT };
   };
 
   window.addEventListener('message', async (event) => {
     const data = event.data;
-    if (event.source !== parentWindow || !data || data.__botComputer !== true || typeof data.id !== 'number') return;
+    if (event.source !== parentWindow || !data || data.__oaiyAgent !== true || typeof data.id !== 'number') return;
     let result;
     const done = [];
     try {

@@ -2126,7 +2126,7 @@
       author: () => {
         const c = repo.config();
         const name = state.env.GIT_AUTHOR_NAME || c["user.name"] || "sandbox";
-        const email = state.env.GIT_AUTHOR_EMAIL || c["user.email"] || "sandbox@bot.computer";
+        const email = state.env.GIT_AUTHOR_EMAIL || c["user.email"] || "sandbox@oaiy.com";
         return name + " <" + email + ">";
       },
       index: () => repo.json("index.json", {}),

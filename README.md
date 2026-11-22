@@ -92,7 +92,7 @@ and services, and keeps the link to a FormLogic account.
 
 ### The Agent
 
-The Agent app (`app/`, which began as [bot.computer](app/README.md)) is a coding and
+The [Agent app](app/README.md) (`app/`) is a coding and
 working agent:
 
 - **Projects** with a file tree, an editor, a live preview (web pages, SoftN apps, 3D
@@ -348,7 +348,7 @@ release is made by tagging a version: see [docs/RELEASING.md](docs/RELEASING.md)
 | [`docs/`](docs/) | The documentation |
 
 The repository joins three projects with their histories: the engines (formerly nrob)
-at the root, the agent (bot.computer) in `app/`, and the previous OAIY in `platform/`.
+at the root, the agent in `app/`, and the previous OAIY in `platform/`.
 `git log -- <path>` follows a file back into its project.
 
 ## Documentation

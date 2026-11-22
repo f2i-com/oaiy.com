@@ -264,9 +264,9 @@ fn pictures_are_cut_out_and_enlarged() -> Result<()> {
     let dev = Device::cuda_if_available(gpu)?;
     let bust = image::open("E:/p3dref/case4/input.png").unwrap().to_rgb8();
     image::imageops::resize(&bust, 300, 300, image::imageops::FilterType::Lanczos3).save(out.join("small.png")).unwrap();
-    let turtle = image::open(std::env::var("TURTLE").unwrap_or_else(|_| "C:/Users/User/AppData/Local/Temp/claude/E--repos-bot-computer/fc80cba4-4bf0-4581-8aca-668cb05bf606/scratchpad/pixal3d/repo/assets/images/0_img.png".into())).unwrap().to_rgba8();
+    let turtle = image::open(std::env::var("TURTLE").unwrap_or_else(|_| "E:/p3dref/turtle.png".into())).unwrap().to_rgba8();
     let turtle = image::imageops::resize(&turtle, 900, 900, image::imageops::FilterType::Lanczos3);
-    let mut scene = image::imageops::resize(&image::open(std::env::var("SCENE").unwrap_or_else(|_| "C:/Users/User/AppData/Local/Temp/claude/E--repos-bot-computer/fc80cba4-4bf0-4581-8aca-668cb05bf606/scratchpad/pixal3d/repo/assets/app/hdri_city.png".into())).unwrap().to_rgba8(), 1200, 1000, image::imageops::FilterType::Lanczos3);
+    let mut scene = image::imageops::resize(&image::open(std::env::var("SCENE").unwrap_or_else(|_| "E:/p3dref/scene.png".into())).unwrap().to_rgba8(), 1200, 1000, image::imageops::FilterType::Lanczos3);
     image::imageops::overlay(&mut scene, &turtle, 150, 60);
     image::DynamicImage::ImageRgba8(scene).to_rgb8().save(out.join("busy.png")).unwrap();
     let helpers = super::prepare::Helpers { matte: Some(std::path::Path::new("E:/models/BiRefNet")), upscaler: Some(std::path::Path::new("E:/models/Real-ESRGAN/RealESRGAN_x4plus.pth")), dev: &dev, webgpu: None };

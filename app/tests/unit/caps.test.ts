@@ -9,7 +9,7 @@ const PAIRED = { origin: 'http://127.0.0.1:17972' };
 
 const at = (env: HostEnv) => readHost(env);
 const OAIY_WINDOW = at({ location: { hostname: 'oaiy.localhost', protocol: 'http:' }, __OAIY_DESKTOP__: { origin: PAIRED.origin, token: 't' } });
-const SHELL = at({ location: { hostname: 'botcomputer.localhost', protocol: 'http:' } });
+const SHELL = at({ location: { hostname: 'oaiyagent.localhost', protocol: 'http:' } });
 const TAB = at({ location: { hostname: 'agent.example.org', protocol: 'https:' } });
 const DEV = at({ location: { hostname: 'localhost', protocol: 'http:' } });
 

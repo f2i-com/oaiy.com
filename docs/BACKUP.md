@@ -243,7 +243,7 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 
 #### Keys of `idb/settings.json` (agent.settings)
 
-The Agent's settings as its page keeps them in IndexedDB (database bot.computer, store kv, keys providers, active-provider, gate, last-project, last-kept-project, agent-settings, media, messages; secret-key and desktop are never exported).
+The Agent's settings as its page keeps them in IndexedDB (database oaiy-agent, store kv, keys providers, active-provider, gate, last-project, last-kept-project, agent-settings, media, messages; secret-key and desktop are never exported).
 
 | Key | Class | Comes back | What it is, why, and what to do again |
 |---|---|---|---|

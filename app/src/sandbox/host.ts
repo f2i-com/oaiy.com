@@ -365,7 +365,7 @@ export class SandboxHost implements HostHandler {
    * Run a JS or Python program; Python's writes come back into the project.
    *
    * A Python program's files are the whole project ("/" its root), with the
-   * run's settings under `.botcomputer/` (the working folder, environment,
+   * run's settings under `.oaiy/` (the working folder, environment,
    * stdin, argv[0]) for OAIY's runtime additions (pystd/runtime.js),
    * which resolve relative paths against the working folder. Modules beside
    * the script are also placed at the root, where Zipp looks for imports, so
@@ -385,19 +385,19 @@ export class SandboxHost implements HostHandler {
       const files = this.preload(cwdRel, scriptDir, preload);
       const aliases = scriptDir ? this.aliasModules(scriptDir, files) : [];
       // Code given as text (python -c, a pipe, code_run) runs as a module at the root, kept out of listings.
-      const entry = entryPath ? normalizePath(entryPath) : files['__main__.py'] === undefined ? '__main__.py' : '__botcomputer_main__.py';
+      const entry = entryPath ? normalizePath(entryPath) : files['__main__.py'] === undefined ? '__main__.py' : '__oaiy_main__.py';
       if (!entryPath) aliases.push(entry);
-      files['.botcomputer/run.json'] = JSON.stringify({
+      files['.oaiy/run.json'] = JSON.stringify({
         cwd: cwdRel,
         scriptDir,
         env: request.env ?? {},
         argv0: request.fileName ?? (entryPath ? relativeTo(cwd, `/${entry}`) : '-c'),
         hide: aliases,
       });
-      files['.botcomputer/stdin'] = request.stdin ?? '';
+      files['.oaiy/stdin'] = request.stdin ?? '';
       full.files = files;
       full.fileName = entry;
-      skip = (path) => path === '.botcomputer' || path.startsWith('.botcomputer/') || aliases.some((a) => path === a || path.startsWith(`${a}/`));
+      skip = (path) => path === '.oaiy' || path.startsWith('.oaiy/') || aliases.some((a) => path === a || path.startsWith(`${a}/`));
     } else if (request.lang === 'js') {
       // The script's absolute path, as Node has it: require() resolves from its folder; code with no file runs in the working folder.
       full.fileName = entryPath ? `/${normalizePath(entryPath)}` : `${cwd === '/' ? '' : cwd}/${request.fileName ?? '[eval]'}`;
@@ -440,7 +440,7 @@ export class SandboxHost implements HostHandler {
     const rank = (path: string) => (under(path, scriptDir) ? 0 : under(path, cwdRel) ? 1 : 2);
     const entries = walked.entries.filter((e) => e.type === 'file').sort((a, b) => rank(a.path) - rank(b.path));
     for (const entry of entries) {
-      if (entry.path === '.botcomputer' || entry.path.startsWith('.botcomputer/')) continue;
+      if (entry.path === '.oaiy' || entry.path.startsWith('.oaiy/')) continue;
       const inside = cwdRel ? (under(entry.path, cwdRel) ? entry.path.slice(cwdRel.length + 1) : null) : entry.path;
       if (matchers && (inside === null || !matchers.some((m) => m.test(inside)))) continue;
       const key = entry.path;

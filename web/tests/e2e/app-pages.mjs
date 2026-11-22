@@ -98,13 +98,13 @@ export async function openApp(env, app, { desktop = null, storage = {}, path = a
 }
 
 /**
- * What the Agent keeps in its own IndexedDB (`bot.computer`/`kv`, src/settings.ts): a key or a token is sealed under the page's own
+ * What the Agent keeps in its own IndexedDB (`oaiy-agent`/`kv`, src/settings.ts): a key or a token is sealed under the page's own
  * AES-GCM key, so a test that wants one stored seals it the way the page does. Run in the page, after it has loaded once.
  */
 async function seedStore(page, records) {
   await page.evaluate(async (records) => {
     const db = await new Promise((resolve, reject) => {
-      const open = indexedDB.open('bot.computer', 1);
+      const open = indexedDB.open('oaiy-agent', 1);
       open.onsuccess = () => resolve(open.result);
       open.onerror = () => reject(open.error);
     });
@@ -146,7 +146,7 @@ export const seedPairing = (page, { origin, token }) => seedStore(page, { deskto
 export function readStored(page) {
   return page.evaluate(async () => {
     const db = await new Promise((resolve) => {
-      const open = indexedDB.open('bot.computer', 1);
+      const open = indexedDB.open('oaiy-agent', 1);
       open.onsuccess = () => resolve(open.result);
     });
     const get = (name) => new Promise((resolve) => {

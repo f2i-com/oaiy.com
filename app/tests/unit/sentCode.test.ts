@@ -313,7 +313,7 @@ describe('a step repeated with the same error in the code it sent', () => {
     const said = (stderr: string) => ({ id: 'c1', name: 'code_run', content: JSON.stringify({ ok: false, exit_code: 1, stdout: '', stderr, elapsed_ms: 9 }, null, 1), isError: true });
     expect(sentCodeError(call, said('warn (x.py:3)\nRuntimeError: boom: (1) (__main__.py:3)\nTraceback (most recent call last):\n'))).toBe('line 3: RuntimeError: boom: (1)');
     expect(sentCodeError(call, said('ValueError:  (__main__.py:2)\n'))).toBe('line 2: ValueError');
-    expect(sentCodeError(call, said("NameError: name 'exec' is not defined (__botcomputer_main__.py:1)\n"))).toBe("line 1: NameError: name 'exec' is not defined");
+    expect(sentCodeError(call, said("NameError: name 'exec' is not defined (__oaiy_main__.py:1)\n"))).toBe("line 1: NameError: name 'exec' is not defined");
     // a run that did not fail, or another tool, is not read
     expect(sentCodeError(call, { id: 'c1', name: 'code_run', content, isError: false })).toBeNull();
     expect(sentCodeError({ ...call, name: 'read_file' }, { id: 'c1', name: 'read_file', content, isError: true })).toBeNull();

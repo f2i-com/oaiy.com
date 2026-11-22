@@ -15,15 +15,15 @@ if (process.platform !== 'win32') {
   console.log('skipped: the desktop check drives WebView2, on Windows');
   process.exit(0);
 }
-const exe = 'src-tauri/target/release/bot-computer.exe';
+const exe = 'src-tauri/target/release/oaiy-agent.exe';
 if (!existsSync(exe)) {
   console.error(`no ${exe}; run npm run desktop:build first`);
   process.exit(2);
 }
 const PORT = 9333;
 // A data folder of its own, so the check neither sees nor touches the person's projects.
-const data = mkdtempSync(join(tmpdir(), 'bot-computer-desktop-'));
-const downloads = mkdtempSync(join(tmpdir(), 'bot-computer-downloads-'));
+const data = mkdtempSync(join(tmpdir(), 'oaiy-agent-desktop-'));
+const downloads = mkdtempSync(join(tmpdir(), 'oaiy-agent-downloads-'));
 const env = {
   ...process.env,
   // The environment's arguments replace the app's own, so repeat those (no throttling in the tray).
@@ -38,7 +38,7 @@ async function launch(path = exe, withEnv = env, port = PORT) {
     try {
       const browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${port}`, defaultViewport: null });
       const pages = await browser.pages();
-      const page = pages.find((p) => p.url().includes('botcomputer'));
+      const page = pages.find((p) => p.url().includes('oaiyagent'));
       if (page) {
         await page.waitForSelector('.tree-row', { timeout: 60_000 });
         return { browser, page };
@@ -55,7 +55,7 @@ async function launch(path = exe, withEnv = env, port = PORT) {
 /** Quit as the tray menu does: the page saves everything, then the app exits. */
 async function quit(browser, page, proc = app) {
   const exited = new Promise((r) => proc.once('exit', r));
-  await page.evaluate(() => { void window.__botComputerBeforeQuit(); }).catch(() => {});
+  await page.evaluate(() => { void window.__oaiyAgentBeforeQuit(); }).catch(() => {});
   const timer = setTimeout(() => proc.kill(), 15_000);
   await exited;
   clearTimeout(timer);
@@ -78,10 +78,40 @@ const expect = (c, m) => {
   if (!c) throw new Error(m);
 };
 const ps = (command) => execFileSync('powershell', ['-NoProfile', '-Command', command]).toString().trim();
+/** The app's own Tauri window handle (Windows' MainWindowHandle can pick WebView2's UAC Input Indicator instead). */
+const mainWindow = (pid) => ps(`
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices;
+public class TW {
+  public delegate bool P(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(P f, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  public static IntPtr Find(uint pid) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      if (p == pid) {
+        var c = new StringBuilder(64);
+        GetClassName(h, c, 64);
+        if (c.ToString() == "Tauri Window") { found = h; return false; }
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+}
+"@
+[TW]::Find(${pid}).ToInt64()
+`);
+const closeWindow = (handle) => ps(`Add-Type -Name C -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'; [U.C]::PostMessage([IntPtr]${handle}, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null`);
 /** Whether a process's main window shows (a window in the tray does not). */
 const windowOf = (pid) => {
-  const handle = ps(`(Get-Process -Id ${pid}).MainWindowHandle`);
-  return () => ps(`Add-Type -Name W -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);'; [U.W]::IsWindowVisible([IntPtr]${handle})`) === 'True';
+  const handle = mainWindow(pid);
+  return {
+    handle,
+    shown: () => ps(`Add-Type -Name W -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);'; [U.W]::IsWindowVisible([IntPtr]${handle})`) === 'True',
+  };
 };
 /** Wait until `test()` holds (a window shown or hidden), for up to 10 s. */
 async function until(test) {
@@ -116,7 +146,7 @@ try {
 
   await check('the app is served from its own origin, cross-origin isolated', async () => {
     const info = await page.evaluate(() => ({ href: location.href, isolated: crossOriginIsolated, sab: typeof SharedArrayBuffer, sw: navigator.serviceWorker?.controller ?? null }));
-    expect(info.href.startsWith('http://botcomputer.localhost/'), JSON.stringify(info));
+    expect(info.href.startsWith('http://oaiyagent.localhost/'), JSON.stringify(info));
     expect(info.isolated && info.sab === 'function', JSON.stringify(info));
     expect(info.sw === null, 'a service worker controls the desktop page');
   });
@@ -186,12 +216,11 @@ try {
   });
 
   await check('closing or minimizing the window leaves it running in the tray, still working; starting it again brings it back', async () => {
-    const handle = ps(`(Get-Process -Id ${app.pid}).MainWindowHandle`);
-    const visible = () => ps(`Add-Type -Name W -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);'; [U.W]::IsWindowVisible([IntPtr]${handle})`);
-    expect(visible() === 'True', 'the window is not visible to begin with');
+    const { handle, shown } = windowOf(app.pid);
+    expect(shown(), 'the window is not visible to begin with');
     // WM_CLOSE, as the window's close button sends it.
-    ps(`(Get-Process -Id ${app.pid}).CloseMainWindow() | Out-Null`);
-    expect(await until(() => visible() === 'False'), 'the window is still showing after close');
+    closeWindow(handle);
+    expect(await until(() => !shown()), 'the window is still showing after close');
     expect(app.exitCode === null, 'the app exited on close');
     // Hidden, timers still run at speed: the agent keeps working in the background.
     const ticks = await page.evaluate(() => new Promise((resolve) => {
@@ -207,14 +236,14 @@ try {
     // A second start hands over to the running app, which shows its window.
     const second = spawn(exe, [], { env, stdio: 'ignore' });
     const code = await new Promise((r) => second.once('exit', r));
-    expect(await until(() => visible() === 'True'), 'the window did not come back');
+    expect(await until(shown), 'the window did not come back');
     expect(code === 0 && app.exitCode === null, `second start exited ${code}; first ${app.exitCode}`);
     // Minimizing puts it in the tray too.
     ps(`Add-Type -Name S -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'; [U.S]::ShowWindow([IntPtr]${handle}, 6) | Out-Null`);
-    expect(await until(() => visible() === 'False'), 'the window is still showing after minimize');
+    expect(await until(() => !shown()), 'the window is still showing after minimize');
     const third = spawn(exe, [], { env, stdio: 'ignore' });
     await new Promise((r) => third.once('exit', r));
-    expect(await until(() => visible() === 'True'), 'the minimized window did not come back');
+    expect(await until(shown), 'the minimized window did not come back');
   });
 
   await check('Quit saves everything: projects and history are there after a restart', async () => {
@@ -227,8 +256,8 @@ try {
   if (!portableExe) console.log('skip portable: run npm run desktop:portable first');
   else {
     await check('portable: one exe, its data beside it, in the tray when closed, carried to another folder with it, and running next to the installed app', async () => {
-      const usb = mkdtempSync(join(tmpdir(), 'bot-computer-usb-'));
-      const moved = mkdtempSync(join(tmpdir(), 'bot-computer-moved-'));
+      const usb = mkdtempSync(join(tmpdir(), 'oaiy-agent-usb-'));
+      const moved = mkdtempSync(join(tmpdir(), 'oaiy-agent-moved-'));
       try {
         const copy = join(usb, portableExe);
         copyFileSync(join('src-tauri/target/release/bundle/portable', portableExe), copy);
@@ -240,15 +269,15 @@ try {
         expect(installed.exitCode === null && portable.exitCode === null, 'the portable app handed over to the installed one');
         await terminal(p.page, 'echo "on the stick" > carried.txt && cat carried.txt', 'on the stick');
         // The tray works the same without an install: closing hides it, it keeps running, a second start shows it.
-        const shown = windowOf(portable.pid);
-        ps(`(Get-Process -Id ${portable.pid}).CloseMainWindow() | Out-Null`);
+        const { handle: portableHandle, shown } = windowOf(portable.pid);
+        closeWindow(portableHandle);
         expect((await until(() => !shown())) && portable.exitCode === null, 'the portable app did not go to the tray on close');
         await terminal(p.page, 'echo "tray $((6*7))"', 'tray 42');
         const again = spawn(copy, [], { env: own, stdio: 'ignore' });
         await new Promise((r) => again.once('exit', r));
         expect(await until(shown), 'the portable app did not come back from the tray');
         await quit(p.browser, p.page, portable);
-        expect(existsSync(join(usb, 'bot.computer-data', 'webview')), `nothing beside the exe: ${readdirSync(usb)}`);
+        expect(existsSync(join(usb, 'oaiy-agent-data', 'webview')), `nothing beside the exe: ${readdirSync(usb)}`);
         // Carry the exe and its folder somewhere else: the projects come along.
         cpSync(usb, moved, { recursive: true });
         p = await launch(join(moved, portableExe), own, PORT + 1);

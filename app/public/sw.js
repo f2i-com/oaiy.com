@@ -13,9 +13,9 @@
 // The build stamps its own name here (vite.config.ts), so a new version gets a
 // fresh cache: the app, the Zipp engine and the rest always come from the same build.
 const CACHE = 'oaiy-agent-v1';
-// The caches this worker owns: its own, the ones of earlier builds, and the
-// ones the app had before it was called OAIY. Nothing else on the origin is touched.
-const OWNED = ['oaiy-agent-', 'bot.computer-'];
+// The caches this worker owns: its own and the ones of earlier builds.
+// Nothing else on the origin is touched.
+const OWNED = ['oaiy-agent-'];
 const SCOPE = new URL(self.registration.scope);
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
 // The entry a worker writes into its own cache when it takes over: when it did, so the next one knows which build ran before it.
@@ -66,8 +66,8 @@ async function tookOverAt(name) {
 
 /**
  * The build that ran before this one: the one that took over last. Builds that never took over (they
- * were replaced while they waited) are not it. With no record at all (the caches of the bot.computer
- * days, or of a build from before the records) it is the newest cache that holds anything.
+ * were replaced while they waited) are not it. With no record at all (a build
+ * from before the records) it is the newest cache that holds anything.
  */
 async function previousBuild(names) {
   let previous = null;

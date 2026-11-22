@@ -690,7 +690,7 @@
 
     "agent.settings": {
       "file": "idb/settings.json",
-      "about": "The Agent's settings as its page keeps them in IndexedDB (database bot.computer, store kv, keys providers, active-provider, gate, last-project, last-kept-project, agent-settings, media, messages; secret-key and desktop are never exported).",
+      "about": "The Agent's settings as its page keeps them in IndexedDB (database oaiy-agent, store kv, keys providers, active-provider, gate, last-project, last-kept-project, agent-settings, media, messages; secret-key and desktop are never exported).",
       "keys": [
         { "path": "providers", "class": "runs", "tick": "agentSettings", "type": "objects", "maxItems": 100, "what": "AI providers", "reason": "They say where the Agent's requests, and your conversations in them, are sent." },
         { "path": "providers[].id", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 128, "what": "A provider's id" },
@@ -1001,7 +1001,7 @@
     "agentModules": {
       "desktop/backup.ts": "The Agent's half of the backup: it reads its storage to export it, and writes only what the desktop lists when a restore is applied.",
       "main.ts": "Only asks the browser to keep its storage (navigator.storage.persist): it writes nothing.",
-      "settings.ts": "IndexedDB (database bot.computer, store kv): the Agent's settings.",
+      "settings.ts": "IndexedDB (database oaiy-agent, store kv): the Agent's settings.",
       "vfs/projects.ts": "The private file system: the projects and the front desk.",
       "vfs/transfer.ts": "Exports a project to a folder the person picks on their own disk (the File System Access API): it does not touch the Agent's storage."
     }

@@ -20,10 +20,33 @@ import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, 
 import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
-import { appLabel, findApps, resolveApp } from '../softn/softn';
+import { appLabel, findApps, resolveApp, softnAppOf } from '../softn/softn';
 import { findPages } from '../preview/page';
 import { findModels } from '../preview/model';
 import { imageMimeFor, viewImage, type ImagePart } from './images';
+import { diffSnapshots, snapshotVfs, type DeliverableFile } from './deliverables';
+import { pruneOldToolResults } from './pruner';
+import { RepeatToolGuard, type RepeatReminder } from './repeatGuard';
+import { WorkspaceInstructions } from './instructions';
+import { abortedToolResult, executeToolBatch, isParallelSafeTool, type BatchCallSpec } from './toolBatch';
+import { repairDanglingToolCalls } from './repair';
+import { ASK_USER_TOOL, parseAskUserInput, type AskUserHandler } from './askUser';
+import {
+  EXIT_PLAN_MODE_SPEC,
+  EXIT_PLAN_MODE_TOOL,
+  PLAN_MODE_ENTER_NOTE,
+  PLAN_MODE_EXIT_NOTE,
+  PLAN_MODE_RESTRICTED_TOOLS,
+  extractPlanTitle,
+  planModeBlockedMessage,
+  type PlanReviewDecision,
+  type PlanReviewRequest,
+} from './planMode';
+import { extractFileMentions } from '../ui/chat/mentions';
+
+export type { DeliverableFile } from './deliverables';
+export type { AskUserHandler, UserQuestionAnswer, UserQuestionItem, UserQuestionResult } from './askUser';
+export type { PlanReviewDecision, PlanReviewRequest } from './planMode';
 
 export type AgentEvent =
   | { type: 'text'; delta: string }
@@ -45,10 +68,16 @@ export type AgentEvent =
   | { type: 'context'; used: number; window: number }
   /** A sub-agent's task: waiting in the queue, running (with what it is doing), done or failed. */
   | { type: 'agent_task'; callId: string; id: string; title: string; state: 'queued' | 'running' | 'done' | 'failed'; activity?: string; result?: string }
-  /** Older turns were summarized to make room. */
-  | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' }
+  /** Older turns were summarized or pruned to make room. */
+  | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' | 'pruned' }
+  /** Live prompt read & decode write speed telemetry measured for the latest model step. */
+  | { type: 'speed'; readTokPerSec: number | null; writeTokPerSec: number | null; ttftMs: number; promptTokens: number; cachedTokens: number; outputTokens: number }
+  /** Net workspace file changes produced during this run, with unified diff hunks. */
+  | { type: 'deliverables'; files: DeliverableFile[]; durationMs: number; toolCount: number }
   /** The checklist changed (update_plan). */
   | { type: 'plan'; plan: Plan }
+  /** Collaborative Plan Mode toggled on or off (via `/plan` or `exit_plan_mode`). */
+  | { type: 'plan_mode'; active: boolean }
   /** OAIY asked the model to carry on (open plan items, a failing app). */
   | { type: 'nudge'; message: string }
   /** The automatic check of a SoftN app after the agent changed it: running, then its outcome. */
@@ -315,7 +344,7 @@ type GuideTopic = 'app' | 'web' | 'video' | 'media' | 'document';
 const GUIDE_ABOUT: Record<GuideTopic, string> = {
   video: 'making a video, film, animation or any story told in clips: the script, pictures, voices and clips',
   media: 'making pictures, speech, voices, music, sound effects or 3D models',
-  app: 'building or changing a SoftN app in Vanilla JavaScript, React, Vue or classic SoftN with a live preview and app tools',
+  app: 'building or changing a SoftN app in Vanilla JavaScript, React, Vue, Full-Stack SQLite (Container v2) or classic SoftN with a live preview, XDB SQLite tools and app tools',
   web: 'building or changing a web page or website (HTML, CSS and JavaScript, with a live preview, screenshots and screen sizes); it also gives you the page tools',
   document: 'writing a long document: a story, a script, a report',
 };
@@ -324,7 +353,7 @@ const GUIDE_ABOUT: Record<GuideTopic, string> = {
 const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
   ['video', /\b(videos?|clips?|films?|movies?|animat\w*|sitcoms?|episodes?|trailers?|cartoons?|vlogs?|commercials?)\b/i],
   ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?|3-?d[ -]?(?:models?|assets?|objects?|props?|meshe?s?|prints?|characters?)|in 3-?d|three-dimensional|meshe?s?|glb|gltf)\b/i],
-  ['app', /\b(apps?|softn|vue(?:\.js)?|react(?:js|\.js| components?| websites?)|dashboard|calculator|games?|to-?do list)\b/i],
+  ['app', /\b(apps?|softn|vue(?:\.js)?|react(?:js|\.js| components?| websites?)|full[- ]?stack|sqlite|dashboard|calculator|games?|to-?do list)\b/i],
   ['web', /\b(websites?|web ?sites?|web ?pages?|landing pages?|home ?pages?|html|css|responsive)\b/i],
   ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
 ];
@@ -384,7 +413,7 @@ export function repetitionNote(said: string): string {
 /**
  * The error of a failed code_run or sandbox_shell run when it is in the code the model sent as text, not in a file of the
  * project, as "line 8: NameError: name 'exec' is not defined"; or null. Zipp's Python says where an error was raised at
- * the end of its first line, naming code given as text __main__.py (__botcomputer_main__.py where the project has a
+ * the end of its first line, naming code given as text __main__.py (__oaiy_main__.py where the project has a
  * __main__.py of its own) and a project file by its path. Its JavaScript says <anonymous> of every place, a file required
  * as much as the code sent, so code_run's JavaScript counts only where it loads nothing. A module the shell runs with -m
  * (json.tool) is the shell's own text, not the model's.
@@ -516,7 +545,7 @@ function firstSentence(text: string): string {
 }
 
 /** The app tools: offered once the app guide is read, or when the project has an app. */
-const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import']);
+const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import', 'sqlite_list_databases', 'sqlite_schema', 'sqlite_query', 'sqlite_execute']);
 
 /** The web page tools: offered once the web guide is read, or when the project has a page. */
 const WEB_TOOLS = new Set(['page_check', 'page_inspect', 'page_interact']);
@@ -524,7 +553,7 @@ const WEB_TOOLS = new Set(['page_check', 'page_inspect', 'page_interact']);
 const PREVIEW_TOOLS = new Set(['preview_screenshot', 'preview_viewport']);
 
 /** Files that make an app: writing one reads the app guide. */
-const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic))$/;
+const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic|sql|db|sqlite|sqlite3))$/i;
 /** A web page: writing one reads the web guide. */
 const WEB_FILE = /\.html?$/i;
 
@@ -532,11 +561,11 @@ const WEB_FILE = /\.html?$/i;
 const APP_3D = `- A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the page's markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
 `;
 
-const WEB_APP_START = `Choose the requested framework. For a new Vanilla JavaScript, React or Vue app, read softn_docs topic "web-starters" and use softn_examples with name "vanilla-js", "react" or "vue" and install_to. Keep "engine": 2 and edit the starter's app.js with standard DOM, React components or Vue components. React and Vue ship in vendor/ and run offline. Use softn_check to check the app and start Preview. For engine 2, only the visible Preview can show the page and exercise its controls; agent screenshots, inspection and clicks are unavailable. Report which checks actually ran. `;
+const WEB_APP_START = `Choose the requested stack. For a new Vanilla JavaScript, React, Vue or Full-Stack SQLite (Container v2) app, read softn_docs topic "web-starters" and use softn_examples with name "vanilla-js", "react", "vue" or "fullstack-sqlite" and install_to. Keep "engine": 2. Full-stack apps run embedded backends ("javascript", "typescript", "python", "php", "rust" via manifest.backend) and persistent XDB SQLite databases (manifest.databases, backend sqlite.open("app.db"), frontend "softn:sqlite") offline in the sandbox; use sqlite_list_databases, sqlite_schema, sqlite_query and sqlite_execute to inspect or evolve SQLite databases directly. React and Vue ship in vendor/ and run offline. Use softn_check to check files, schemas and live rendering, and use softn_inspect, softn_interact, preview_viewport and preview_screenshot to verify both UI and full-stack CRUD flows. `;
 
-const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names its main page as "main". ${WEB_APP_START}A classic app has its logic in JavaScript in main.js named with <script src> (in Python, main.py, only when the user asks for Python). Follow its own writing guide and preserve its existing page and logic filenames. A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand. For classic apps, softn_inspect shows what the page displays and softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
-- For classic apps, preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link.
-${APP_3D}- Run softn_check before finishing. Exercise classic controls with softn_interact and report the interactions actually tested.
+const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names its main page as "main". ${WEB_APP_START}A classic app has its logic in JavaScript in main.js named with <script src> (in Python, main.py, only when the user asks for Python). Follow its own writing guide and preserve its existing page and logic filenames. A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, schemas, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand. softn_inspect shows what the page displays and softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
+- preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link.
+${APP_3D}- Run softn_check before finishing. Exercise controls with softn_interact (and verify database state with sqlite_query for SQLite apps) and report the interactions actually tested.
 `;
 
 const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it (say index.html, css/, js/, images/), linked by relative paths. The user watches it in a live preview as you build it; links between pages of the project open there too.
@@ -551,8 +580,8 @@ const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, im
  * The app and web guides in brief, where the tools are found (`AgentOptions.discoverTools`): a local model's, which reads
  * each guide's every token where a cloud model's provider caches them; the rules the same, their words fewer.
  */
-const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main page as "main" (keep it true). ${WEB_APP_START}For an existing classic app, follow its own writing guide and keep its page and logic filenames. Each app has its own folder: to rebuild one or base a new one on it (or on a .softn the user attached, unpacked into its own folder; softn_import unpacks any in the project), write the new app in a new folder and leave the original as it is; to change one, edit its folder. Do not guess the language: softn_docs (no arguments: the map; topic "guide": read it before your first app; search: how something is done), softn_components (exact props and events), softn_examples (working apps to read or copy). OAIY checks the app after each change and adds the outcome to the step's result: fix its errors first. For classic apps, softn_inspect shows what the page displays and softn_interact uses the app like a person and reports its errors. For these classic apps, preview_screenshot shows how the app looks (fix what looks wrong), preview_viewport sets the screen size. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link. The user watches it in a live preview.
-- Run softn_check before finishing. Exercise classic controls with softn_interact and report the interactions actually tested.
+const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main page as "main" (keep it true). For Vanilla JS, React, Vue or Full-Stack SQLite (Container v2, "engine": 2), read softn_docs topic "web-starters" and install a starter with softn_examples ("vanilla-js", "react", "vue", "fullstack-sqlite"); full-stack apps support embedded backends and XDB SQLite (sqlite_schema, sqlite_query, sqlite_execute). For an existing classic app, follow its writing guide and keep its filenames. Each app has its own folder: edit in place to change one, or write a new folder to rebuild (softn_import unpacks .softn files). Do not guess: use softn_docs, softn_components, softn_examples. OAIY checks after each change: fix errors first. Use softn_inspect, softn_interact, preview_screenshot and preview_viewport to verify both UI and backend/SQLite flows. The preview pane is usually under 768 px wide, where a Sidebar is a Menu button and a wide Table is cards: use preview_viewport (laptop) to check the wide layout, and open Menu before looking for a page's link.
+- Run softn_check before finishing. Exercise controls with softn_interact and report the interactions actually tested.
 `;
 
 /** The app guide's part on 3D models in brief, where none is made (no generate_3d_model). */
@@ -657,6 +686,10 @@ export interface AgentOptions {
    * would wait behind). Only a run that started calls (a tool with `startsCalls`) waits so: another run's plan is its own.
    */
   waitingOnCall?: () => boolean;
+  /** Interactive clarifying-question handler (`ask_user_question`). Omit for non-interactive/sub-agent runs. */
+  askUser?: AskUserHandler;
+  /** Interactive plan-approval handler (`exit_plan_mode`). */
+  reviewPlan?: (request: PlanReviewRequest, signal?: AbortSignal) => Promise<PlanReviewDecision>;
 }
 
 /**
@@ -721,7 +754,7 @@ function transcript(turn: Turn): string {
 
 /** A file that belongs to an app at the project root (its manifest, pages, logic, data, assets). */
 function isAppFile(path: string): boolean {
-  return /^(manifest\.json|permission\.json|ui\/|logic\/|xdb\/|assets\/|server\/)/.test(path);
+  return /^(manifest\.json|permission\.json|ui\/|logic\/|xdb\/|assets\/|server\/|backend\/|db\/|database\/|migrations\/|vendor\/)/.test(path) || /\.(?:ui|logic|sql|db|sqlite|sqlite3)$/i.test(path);
 }
 
 /**
@@ -959,11 +992,42 @@ export class Agent {
   readonly toolContext: ToolContext;
   /** Set during a run: records a path this agent's tools wrote. */
   private onWrite: ((path: string) => void) | null = null;
+  /** Workspace AGENTS.md / OAIY.md discovery and incremental reconciliation. */
+  private readonly workspaceInstructions = new WorkspaceInstructions();
+  /** Collaborative Plan Mode state (cache-friendly: narrated on transitions rather than mutating systemPrompt). */
+  private planModeActive = false;
+  private planModeEntered = false;
+  private pendingPlanNotice: string | null = null;
   running = false;
+
+  get planMode(): boolean {
+    return this.planModeActive;
+  }
+
+  /** Toggle collaborative Plan Mode on or off; queues a cache-stable boundary notice for the next model step. */
+  setPlanMode(active: boolean): boolean {
+    if (this.planModeActive === active) return false;
+    this.planModeActive = active;
+    if (active) this.planModeEntered = true;
+    this.pendingPlanNotice = active ? PLAN_MODE_ENTER_NOTE : PLAN_MODE_EXIT_NOTE;
+    return true;
+  }
 
   constructor(private readonly options: AgentOptions) {
     // Writes made through this agent's tools are its changes; another agent's (or the person's) are not.
-    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, preview: options.preview, media: options.media, spoken: new Map(), viewSize: options.viewSize };
+    this.toolContext = {
+      vfs: trackedVfs(options.vfs, (path) => {
+        if (!path.startsWith('.oaiy/') && path !== '.oaiy') this.onWrite?.(path);
+      }),
+      rawVfs: options.vfs,
+      gate: options.gate,
+      reads: new Map(),
+      shell: { cwd: '/', env: {} },
+      preview: options.preview,
+      media: options.media,
+      spoken: new Map(),
+      viewSize: options.viewSize,
+    };
   }
 
   reset(): void {
@@ -982,6 +1046,10 @@ export class Agent {
     if (this.activeFlag && !this.flagFixed(this.activeFlag.path)) this.flags.unshift(this.activeFlag);
     this.activeFlag = null;
     this.scriptsChecked.clear();
+    this.workspaceInstructions.reset();
+    this.planModeActive = false;
+    this.planModeEntered = false;
+    this.pendingPlanNotice = null;
   }
 
   /** The checklist from the latest update_plan. */
@@ -1233,7 +1301,8 @@ export class Agent {
   private get listed(): ToolSpec[] {
     const usable = this.usable;
     if (!this.discovering) return usable;
-    return [...usable.filter((t) => LISTED.has(t.name)).map(shortSpec), FIND_TOOLS, USE_TOOL];
+    const base = usable.filter((t) => LISTED.has(t.name) || (this.planModeEntered && t.name === EXIT_PLAN_MODE_TOOL)).map(shortSpec);
+    return [...base, FIND_TOOLS, USE_TOOL];
   }
 
   /** Every tool this agent may use, listed or found. */
@@ -1248,7 +1317,14 @@ export class Agent {
     const provider = this.options.provider();
     // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
-    const all = [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs))];
+    const coreTools = (lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS).filter(
+      (t) => t.name !== ASK_USER_TOOL || !!this.options.askUser,
+    );
+    const all = [
+      ...coreTools,
+      ...(this.planModeEntered ? [EXIT_PLAN_MODE_SPEC] : []),
+      ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs)),
+    ];
     // The app tools only once there is an app to work on: otherwise they only distract.
     const apps = this.loadedGuides().has('app') || findApps(this.options.vfs).length > 0;
     const web = this.loadedGuides().has('web') || findPages(this.options.vfs).length > 0;
@@ -1350,13 +1426,13 @@ export class Agent {
     // (where the tools are found, the guide is its result, again when asked again: an early one may be summarized away)
     if (this.discovering) return { id: call.id, name: call.name, content: this.guideGivenText(topic, names), isError: false };
     if (this.loadedGuides().has(topic)) return { id: call.id, name: call.name, content: `The ${topic} guide is already in your instructions: follow it.`, isError: false };
-    const tools = topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours from now on too.' : topic === 'web' ? ' The page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours from now on too.' : '';
+    const tools = topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, sqlite_list_databases, sqlite_schema, sqlite_query, sqlite_execute, preview_screenshot, preview_viewport) are yours from now on too.' : topic === 'web' ? ' The page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours from now on too.' : '';
     return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${tools}`, isError: false };
   }
 
   /** A guide given where the tools are found: its mark, its text, and where its tools are. */
   private guideGivenText(topic: GuideTopic, names: Set<string>): string {
-    const tools = topic === 'app' ? '\n\nThe app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : topic === 'web' ? '\n\nThe page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : '';
+    const tools = topic === 'app' ? '\n\nThe app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, sqlite_list_databases, sqlite_schema, sqlite_query, sqlite_execute, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : topic === 'web' ? '\n\nThe page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours: run each with use_tool (find_tools gives their parameters), not by its own name.' : '';
     return `${guideGiven(topic)} (follow it from now on; read it again with guide if it is out of view):\n${this.guideText(topic, names)}${tools}`;
   }
 
@@ -1867,9 +1943,9 @@ ${personInstructionsText(own)}` : ''}`;
   }
 
   /**
-   * Before a request: if the prompt would pass the compaction threshold,
-   * summarize the older turns. `force` compacts regardless (the server said
-   * the prompt was too long).
+   * Before a request: if the prompt would pass the compaction threshold, first run Stage-1
+   * deterministic, model-free tool-result pruning; if still over threshold (or forced),
+   * run Stage-2 LLM summarization.
    */
   private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
     const b = this.budget(provider);
@@ -1879,7 +1955,52 @@ ${personInstructionsText(own)}` : ''}`;
     emit({ type: 'context', used: used + b.fixed, window: b.window });
     const threshold = b.prompt * (this.options.compactAt?.() ?? DEFAULT_COMPACT_AT);
     if (!force && used <= threshold) return;
+
+    // Stage 1: deterministic, model-free, code-point-safe pruning of oversized older tool results.
+    const pruned = pruneOldToolResults(this.turns, viewStart(this.turns));
+    if (pruned.prunedResults > 0) {
+      const before = used + b.fixed;
+      this.turns = pruned.turns;
+      const usedAfter = this.estimate(this.view());
+      const after = usedAfter + b.fixed;
+      emit({ type: 'compact', turns: pruned.prunedResults, before, after, how: 'pruned' });
+      emit({ type: 'context', used: after, window: b.window });
+      if (!force && usedAfter <= threshold) return;
+    }
+
+    // Stage 2: LLM summarization with mechanical fallback.
     await this.compact(provider, b, emit, signal);
+  }
+
+  /**
+   * Manually compact the current conversation (used by `/compact` and the context meter button):
+   * runs Stage-1 deterministic tool-result pruning first, then Stage-2 summarization if history remains.
+   */
+  async compactNow(emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<{ compacted: boolean; before: number; after: number; how?: 'pruned' | 'summary' | 'trimmed'; turns?: number }> {
+    const provider = this.options.provider();
+    if (!provider) throw new Error('No AI provider is set up yet.');
+    const b = this.budget(provider);
+    const initial = this.estimate(this.view()) + b.fixed;
+    let lastHow: 'pruned' | 'summary' | 'trimmed' | undefined;
+    let lastTurns = 0;
+    const capture = (e: AgentEvent) => {
+      if (e.type === 'compact') {
+        lastHow = e.how;
+        lastTurns += e.turns;
+      }
+      emit(e);
+    };
+    const pruned = pruneOldToolResults(this.turns, viewStart(this.turns));
+    if (pruned.prunedResults > 0) {
+      this.turns = pruned.turns;
+      const mid = this.estimate(this.view()) + b.fixed;
+      capture({ type: 'compact', turns: pruned.prunedResults, before: initial, after: mid, how: 'pruned' });
+      capture({ type: 'context', used: mid, window: b.window });
+    }
+    await this.compact(provider, this.budget(provider), capture, signal);
+    const after = this.estimate(this.view()) + this.budget(provider).fixed;
+    emit({ type: 'context', used: after, window: b.window });
+    return { compacted: lastHow !== undefined && after < initial, before: initial, after, how: lastHow, turns: lastTurns };
   }
 
   /**
@@ -2004,6 +2125,15 @@ ${personInstructionsText(own)}` : ''}`;
         if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
         let thought = false;
         const varied = this.varyNext;
+        const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        const reqStartMs = nowMs();
+        let prefillDoneMs: number | null = null;
+        let firstTokenMs: number | null = null;
+        let readingTotal = 0;
+        let readingReused = 0;
+        const markFirstToken = () => {
+          if (firstTokenMs === null) firstTokenMs = nowMs();
+        };
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
@@ -2011,21 +2141,64 @@ ${personInstructionsText(own)}` : ''}`;
           ...this.thinking(b.reply),
           sink: {
             text: (delta) => {
+              markFirstToken();
               this.streamed += delta;
               emit({ type: 'text', delta });
             },
             thinking: (delta) => {
+              markFirstToken();
               thought = true;
               emit({ type: 'thinking', delta });
             },
             thinkingCount: (used, budget, done) => emit({ type: 'thinking_count', used, budget, done }),
-            toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
-            toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
-            draft: (text, start) => emit({ type: 'tool_draft', text, start }),
+            toolStart: (index, _id, name) => {
+              markFirstToken();
+              emit({ type: 'tool_start', index, name });
+            },
+            toolArgs: (index, delta) => {
+              markFirstToken();
+              emit({ type: 'tool_draft', text: delta, start: false, index });
+            },
+            draft: (text, start) => {
+              markFirstToken();
+              emit({ type: 'tool_draft', text, start });
+            },
             // (a local model reading its prompt: said as that, not as thinking)
-            reading: (done, total, reused) => emit({ type: 'status', message: readingStatus(done, total, reused) }),
+            reading: (done, total, reused) => {
+              readingTotal = Math.max(readingTotal, total);
+              readingReused = Math.max(readingReused, reused ?? 0);
+              if (total > 0 && done >= total && prefillDoneMs === null) prefillDoneMs = nowMs();
+              emit({ type: 'status', message: readingStatus(done, total, reused) });
+            },
           },
         });
+        const reqEndMs = nowMs();
+        const ttftMs = Math.max(1, (firstTokenMs ?? reqEndMs) - reqStartMs);
+        const cachedTokens = Math.max(reply.usage.cacheReadTokens, readingReused);
+        const uncachedPrompt =
+          reply.usage.inputTokens > 0
+            ? Math.max(0, reply.usage.inputTokens - cachedTokens)
+            : readingTotal;
+        const prefillMs = Math.max(1, (prefillDoneMs ?? firstTokenMs ?? reqEndMs) - reqStartMs);
+        const readTokPerSec = uncachedPrompt > 0 ? uncachedPrompt / (prefillMs / 1000) : null;
+        const decodeMs = firstTokenMs !== null ? Math.max(1, reqEndMs - firstTokenMs) : 0;
+        const writeTokPerSec =
+          reply.usage.outputTokens > 1 && decodeMs > 0
+            ? (reply.usage.outputTokens - 1) / (decodeMs / 1000)
+            : reply.usage.outputTokens === 1 && decodeMs > 0
+              ? 1000 / decodeMs
+              : null;
+        if (readTokPerSec !== null || writeTokPerSec !== null) {
+          emit({
+            type: 'speed',
+            readTokPerSec,
+            writeTokPerSec,
+            ttftMs,
+            promptTokens: reply.usage.inputTokens,
+            cachedTokens,
+            outputTokens: reply.usage.outputTokens,
+          });
+        }
         // A reply that came whole, through no stream (a server that ignores `stream`, or one asked again without it when its
         // stream could not be read): shown as a streamed one is, its thought first (the chat draws a reply as it streams).
         if (!thought && reply.thinking) emit({ type: 'thinking', delta: reply.thinking });
@@ -2410,6 +2583,81 @@ ${personInstructionsText(own)}` : ''}`;
     return true;
   }
 
+  /** Interactive clarifying questions (`ask_user_question`). */
+  private async askUserQuestion(call: ToolCall, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
+    let questions;
+    try {
+      questions = parseAskUserInput(call.input);
+    } catch (error) {
+      return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
+    }
+    if (!this.options.askUser) {
+      return {
+        id: call.id,
+        name: call.name,
+        content: 'No interactive user UI is attached in this context. Decide sensibly from the workspace and state your assumption clearly.',
+        isError: false,
+      };
+    }
+    emit({ type: 'status', message: 'Waiting for your answer…' });
+    const answer = await this.options.askUser(questions, signal);
+    return {
+      id: call.id,
+      name: call.name,
+      content: JSON.stringify(answer),
+      isError: false,
+    };
+  }
+
+  /** Collaborative Plan Mode exit & user approval (`exit_plan_mode`). */
+  private async exitPlanMode(call: ToolCall, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
+    if (!this.planModeActive) {
+      return {
+        id: call.id,
+        name: call.name,
+        content: 'Plan mode is not active. Continue carrying out the task directly.',
+        isError: false,
+      };
+    }
+    const plan = typeof call.input.plan === 'string' ? call.input.plan.trim() : '';
+    if (!plan) {
+      return {
+        id: call.id,
+        name: call.name,
+        content: 'Error: `plan` must be a non-empty Markdown plan for the user to review.',
+        isError: true,
+      };
+    }
+    const title = extractPlanTitle(plan, typeof call.input.title === 'string' ? call.input.title : undefined);
+    let decision: PlanReviewDecision;
+    if (this.options.reviewPlan) {
+      emit({ type: 'status', message: 'Waiting for plan approval…' });
+      decision = await this.options.reviewPlan({ title, plan }, signal);
+    } else {
+      // Headless / test environment without UI handler: auto-approve so runs don't hang.
+      decision = { approved: true };
+    }
+    if (decision.approved) {
+      this.planModeActive = false;
+      this.pendingPlanNotice = null;
+      emit({ type: 'plan_mode', active: false });
+      const note = decision.feedback ? `\nUser note: ${decision.feedback}` : '';
+      return {
+        id: call.id,
+        name: call.name,
+        content: `Plan "${title}" approved by user. Plan Mode is now OFF — carry out the plan starting now.${note}`,
+        isError: false,
+      };
+    }
+    const fb = decision.feedback ? ` User feedback: ${decision.feedback}` : '';
+    return {
+      id: call.id,
+      name: call.name,
+      content: `User chose to keep planning.${fb} Revise the plan and call exit_plan_mode again when ready.`,
+      isError: false,
+    };
+  }
+
   /**
    * Run the agent on `prompt`. With `again`, carry on from the conversation as it is instead (a run that failed: its
    * request is in the turns already, and is not sent twice).
@@ -2428,12 +2676,20 @@ ${personInstructionsText(own)}` : ''}`;
       emit({ type: 'error', message: this.options.noProvider?.() || 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });
       return;
     }
+    // Repair any dangling assistant tool calls from an earlier crash/interrupted session before sending.
+    const repaired = repairDanglingToolCalls(this.turns, 'interrupted');
+    if (repaired.repairedCalls > 0) this.turns = repaired.turns;
+
     this.running = true;
     this.toolContext.signal = signal;
     this.toolContext.progress = (message) => emit({ type: 'status', message });
     if (!again || this.turns.length === 0) {
       const first = this.turns.length === 0;
-      const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
+      const baselineInstr = first && !this.options.conversation ? this.workspaceInstructions.loadBaseline(this.options.vfs) : null;
+      const mentions = extractFileMentions(prompt).filter((p) => this.options.vfs.exists(`/${p}`));
+      const mentionHint = mentions.length ? `\n\n[Referenced project files: ${mentions.map((p) => `/${p}`).join(', ')}]` : '';
+      const head = first ? `<project>\n${this.options.projectSummary()}\n</project>${baselineInstr ? `\n\n${baselineInstr}` : ''}\n\n` : '';
+      const text = `${head}${prompt}${mentionHint}`;
       const guides = this.guidesFor(prompt);
       // (where the tools are found, the request's guides come with it: the instructions stay the same)
       const names = new Set(this.usable.map((t) => t.name));
@@ -2489,10 +2745,25 @@ ${personInstructionsText(own)}` : ''}`;
     // How many times it was asked to say what it started (its own limit: a tool call in between is not progress).
     let speakNudges = 0;
     const maxSteps = this.options.maxSteps ?? MAX_STEPS;
+    const runStartMs = Date.now();
+    const trackDeliverables = !this.options.role && !this.options.conversation;
+    const beforeSnapshot = trackDeliverables ? snapshotVfs(this.options.vfs) : null;
+    const repeatGuard = new RepeatToolGuard();
+    const emitDeliverables = () => {
+      if (!beforeSnapshot) return;
+      const files = diffSnapshots(beforeSnapshot, snapshotVfs(this.options.vfs));
+      if (files.length) {
+        emit({ type: 'deliverables', files, durationMs: Math.max(0, Date.now() - runStartMs), toolCount: acted });
+      }
+    };
     try {
       for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
         this.readInbox(emit);
+        if (this.pendingPlanNotice) {
+          this.turns.push({ role: 'user', text: this.pendingPlanNotice, automatic: true });
+          this.pendingPlanNotice = null;
+        }
         this.flagStep(emit);
         const finish = this.options.finish;
         if (finish && !this.finishing && step > finish.after) {
@@ -2526,6 +2797,7 @@ ${personInstructionsText(own)}` : ''}`;
               continue;
             }
             emit({ type: 'notice', message: 'The model kept giving the same reply without doing anything, so the run stopped. Say what to do next.' });
+            emitDeliverables();
             emit({ type: 'done', text: reply.text, steps: step });
             return;
           }
@@ -2557,6 +2829,7 @@ ${personInstructionsText(own)}` : ''}`;
             this.turns.push({ role: 'user', text: `[OAIY] ${unfinished}`, automatic: true });
             continue;
           }
+          emitDeliverables();
           emit({ type: 'done', text: reply.text, steps: step });
           return;
         }
@@ -2585,115 +2858,181 @@ ${personInstructionsText(own)}` : ''}`;
         cutOff = 0;
         // A file written again with what it already held, a third time: the path, to stop the run once the step is told.
         // (Counted once a step: three of the same write in one reply were "told each time" when they were told nothing.)
-        let unchangedStop: { path: string; times: number } | null = null;
+        const unchangedStopRef: { value: { path: string; times: number } | null } = { value: null };
         const unchangedHere = new Set<string>();
         // The errors this step's calls got: one counts once a step toward the same failure in a row (three edits of an
         // unread file, refused in the same words in one reply, stopped the run before the model had seen any of them).
         const failedHere = new Set<string>();
-        for (const [index, asked] of reply.calls.entries()) {
-          signal?.throwIfAborted();
-          callIndex = index;
-          // (use_tool is the call of the tool it names, from here on as any other: a found tool may be called by name too)
-          let call = asked.name === 'use_tool' && this.discovering ? this.unwrapped(asked) : asked;
-          emit({ type: 'tool_call', call });
+        const touchedPaths: string[] = [];
+
+        type PreparedOutcome = {
+          call: ToolCall;
+          result: ToolResult;
+          allowed: boolean;
+          stopped: boolean;
+          scriptCheck: boolean;
+          usedInsteadHook: boolean;
+        };
+
+        const batchSpecs: BatchCallSpec[] = reply.calls.map((asked, index) => {
+          const call = asked.name === 'use_tool' && this.discovering ? this.unwrapped(asked) : asked;
           const finding = call.name === 'find_tools' && this.discovering;
           const allowed = finding || this.usable.some((t) => t.name === call.name);
-          // A flow of the person's before the tool: it may change the call, stop it, or add a note.
           const hooks = allowed ? this.hooksFor(call.name) : {};
-          let flowNote = '';
-          let stopped: ToolResult | null = null;
-          if (hooks.before) {
-            try {
-              const verdict = beforeVerdict(await hooks.before.run({ name: call.name, input: call.input }, signal));
-              if (verdict.stop) stopped = { id: call.id, name: call.name, content: `Error: your flow "${hooks.before.flowName}", which runs before ${call.name}, stopped this call: ${verdict.stop}`, isError: true };
-              if (verdict.input) call = { ...call, input: { ...call.input, ...verdict.input } };
-              flowNote = `[Your flow "${hooks.before.flowName}" ran before ${call.name}${verdict.input ? ` and changed ${Object.keys(verdict.input).join(', ')}` : ''}${verdict.note ? `: ${verdict.note.replace(/[.!?]+$/, '')}` : ''}.]`;
-            } catch (error) {
-              flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
+          const isSession = this.sessionToolList.some((t) => t.spec.name === call.name);
+          const parallel =
+            isParallelSafeTool(call.name) &&
+            !hooks.before &&
+            !hooks.instead &&
+            !isSession &&
+            !this.planModeActive;
+          return { index, call, parallel };
+        });
+
+        await executeToolBatch<PreparedOutcome>(batchSpecs, {
+          signal,
+          dispatch: async (spec): Promise<PreparedOutcome> => {
+            signal?.throwIfAborted();
+            if (!spec.parallel) callIndex = spec.index;
+            let call = spec.call;
+            emit({ type: 'tool_call', call });
+            const finding = call.name === 'find_tools' && this.discovering;
+            const allowed = finding || this.usable.some((t) => t.name === call.name);
+            const hooks = allowed ? this.hooksFor(call.name) : {};
+            let flowNote = '';
+            let stopped: ToolResult | null = null;
+            if (hooks.before) {
+              try {
+                const verdict = beforeVerdict(await hooks.before.run({ name: call.name, input: call.input }, signal));
+                if (verdict.stop) stopped = { id: call.id, name: call.name, content: `Error: your flow "${hooks.before.flowName}", which runs before ${call.name}, stopped this call: ${verdict.stop}`, isError: true };
+                if (verdict.input) call = { ...call, input: { ...call.input, ...verdict.input } };
+                flowNote = `[Your flow "${hooks.before.flowName}" ran before ${call.name}${verdict.input ? ` and changed ${Object.keys(verdict.input).join(', ')}` : ''}${verdict.note ? `: ${verdict.note.replace(/[.!?]+$/, '')}` : ''}.]`;
+              } catch (error) {
+                flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
+              }
             }
-          }
-          const guideNote = allowed && !stopped ? this.guideFirst(call) : null;
-          const unchanged = allowed && !stopped && !guideNote ? this.writtenAlready(call, appended) : null;
-          const scriptCheck = guideNote ?? unchanged ?? (allowed && !stopped ? this.scriptCheck(call, changedThisRun) : null);
-          if (unchanged && typeof call.input.path === 'string' && !unchangedHere.has(normalizePath(call.input.path))) {
-            const path = normalizePath(call.input.path);
-            unchangedHere.add(path);
-            const times = (unchangedWrites.get(path) ?? 0) + 1;
-            unchangedWrites.set(path, times);
-            if (times >= UNCHANGED_WRITE_STOP) unchangedStop = { path, times };
-          }
-          const result: ToolResult = stopped
-            ? stopped
-            : finding
-            ? this.findTools(call)
-            : allowed && !scriptCheck && hooks.instead
-            ? await this.runInstead(hooks.instead, call, signal)
-            : !allowed
-            ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
-            : scriptCheck
-              ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
-              : call.name === 'update_plan'
-              ? this.takePlan(call, emit)
-              : this.sessionToolList.some((t) => t.spec.name === call.name)
-              ? await this.runSessionTool(call, signal)
-              : call.name === 'delegate'
-              ? await this.delegate(call, emit, signal)
-              : call.name === 'review_frame'
-                ? await this.reviewFrame(call, emit, signal)
-                : call.name === 'give_verdict'
-                  ? this.takeVerdict(call)
-                  : call.name === 'guide'
-                    ? this.readGuide(call)
-                    : await runTool(call, this.toolContext);
-          if (flowNote) result.content = `${flowNote}\n${result.content}`;
-          // The parts this run appended to each file, as they went in (a file written anew or deleted starts again).
-          if (!result.isError && !stopped && !scriptCheck && !(allowed && hooks.instead) && typeof call.input.path === 'string') {
-            const path = normalizePath(call.input.path);
-            if (call.name === 'append_file' && typeof call.input.content === 'string') {
-              const part = call.input.content.trim();
-              appended.set(path, [...(appended.get(path) ?? []), { head: part.slice(0, 400), length: part.length }]);
-            } else if (call.name === 'write_file' || call.name === 'delete_file') appended.delete(path);
-          }
-          if (call.name === 'write_file' && !result.isError && typeof call.input.path === 'string') {
-            const path = normalizePath(call.input.path);
-            const times = (rewrites.get(path) ?? 0) + 1;
-            rewrites.set(path, times);
-            if (times >= 3) result.content += `\n\n[OAIY] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
-          }
-          // Writing an app's files reads the app guide (and gives the app tools).
-          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.usable.some((t) => t.name === 'guide')) {
-            result.content += this.discovering ? `\n\n${this.guideGivenText('app', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
-          }
-          // Writing a web page reads the web guide (and gives the page tools).
-          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && !this.loadedGuides().has('web') && this.usable.some((t) => t.name === 'guide')) {
-            result.content += this.discovering ? `\n\n${this.guideGivenText('web', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
-          }
-          if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
-          if (result.startedCalls) startedCalls = true;
-          // A picture for a scripted video is reviewed before anything else is made.
-          if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
-          results.push(result);
-          ran.push(call);
-          // softn_check keeps the record of failing apps current, as the automatic check does.
-          if (result.check) {
-            this.checkedRoots.add(result.check.root);
-            if (result.check.ok) this.failingApps.delete(result.check.root);
-            else this.failingApps.set(result.check.root, result.check.text);
-          }
-          if (call.name === 'update_plan' && !result.isError) {
-            planThisRun = true;
-            sincePlan = 0;
-          }
-          emit({ type: 'tool_result', result });
-          if (result.isError && failedHere.has(result.content)) {
-            /* counted for this step already */
-          } else if (result.isError && result.content === lastFailure) failures++;
-          else failures = result.isError ? 1 : 0;
-          if (result.isError) failedHere.add(result.content);
-          lastFailure = result.isError ? result.content : '';
-        }
+            // Plan Mode guard: block mutating / code-execution tools until user approves via exit_plan_mode.
+            if (!stopped && this.planModeActive && PLAN_MODE_RESTRICTED_TOOLS.has(call.name)) {
+              stopped = { id: call.id, name: call.name, content: planModeBlockedMessage(call.name), isError: true };
+            }
+            const guideNote = allowed && !stopped ? this.guideFirst(call) : null;
+            const unchanged = allowed && !stopped && !guideNote ? this.writtenAlready(call, appended) : null;
+            const scriptCheck = guideNote ?? unchanged ?? (allowed && !stopped ? this.scriptCheck(call, changedThisRun) : null);
+            if (unchanged && typeof call.input.path === 'string' && !unchangedHere.has(normalizePath(call.input.path))) {
+              const path = normalizePath(call.input.path);
+              unchangedHere.add(path);
+              const times = (unchangedWrites.get(path) ?? 0) + 1;
+              unchangedWrites.set(path, times);
+              if (times >= UNCHANGED_WRITE_STOP) unchangedStopRef.value = { path, times };
+            }
+            const usedInsteadHook = allowed && !scriptCheck && !!hooks.instead;
+            const result: ToolResult = stopped
+              ? stopped
+              : finding
+              ? this.findTools(call)
+              : usedInsteadHook
+              ? await this.runInstead(hooks.instead!, call, signal)
+              : !allowed
+              ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
+              : scriptCheck
+                ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
+                : call.name === 'update_plan'
+                ? this.takePlan(call, emit)
+                : call.name === ASK_USER_TOOL
+                ? await this.askUserQuestion(call, emit, signal)
+                : call.name === EXIT_PLAN_MODE_TOOL
+                ? await this.exitPlanMode(call, emit, signal)
+                : this.sessionToolList.some((t) => t.spec.name === call.name)
+                ? await this.runSessionTool(call, signal)
+                : call.name === 'delegate'
+                ? await this.delegate(call, emit, signal)
+                : call.name === 'review_frame'
+                  ? await this.reviewFrame(call, emit, signal)
+                  : call.name === 'give_verdict'
+                    ? this.takeVerdict(call)
+                    : call.name === 'guide'
+                      ? this.readGuide(call)
+                      : await runTool(call, this.toolContext);
+            if (flowNote) result.content = `${flowNote}\n${result.content}`;
+            return {
+              call,
+              result,
+              allowed,
+              stopped: !!stopped,
+              scriptCheck: !!scriptCheck,
+              usedInsteadHook,
+            };
+          },
+          onSkipped: (spec): PreparedOutcome => ({
+            call: spec.call,
+            result: abortedToolResult(spec.call),
+            allowed: false,
+            stopped: true,
+            scriptCheck: false,
+            usedInsteadHook: false,
+          }),
+          onCommit: async (_spec, outcome) => {
+            const { call, result, stopped, scriptCheck, usedInsteadHook } = outcome;
+            if (!result.isError && typeof call.input.path === 'string') {
+              touchedPaths.push(normalizePath(call.input.path));
+            }
+            // The parts this run appended to each file, as they went in (a file written anew or deleted starts again).
+            if (!result.isError && !stopped && !scriptCheck && !usedInsteadHook && typeof call.input.path === 'string') {
+              const path = normalizePath(call.input.path);
+              if (call.name === 'append_file' && typeof call.input.content === 'string') {
+                const part = call.input.content.trim();
+                appended.set(path, [...(appended.get(path) ?? []), { head: part.slice(0, 400), length: part.length }]);
+              } else if (call.name === 'write_file' || call.name === 'delete_file') appended.delete(path);
+            }
+            if (call.name === 'write_file' && !result.isError && typeof call.input.path === 'string') {
+              const path = normalizePath(call.input.path);
+              const times = (rewrites.get(path) ?? 0) + 1;
+              rewrites.set(path, times);
+              if (times >= 3) result.content += `\n\n[OAIY] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
+            }
+            // Writing an app's files reads the app guide (and gives the app tools).
+            if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.usable.some((t) => t.name === 'guide')) {
+              result.content += this.discovering ? `\n\n${this.guideGivenText('app', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
+            }
+            // Writing a web page reads the web guide (and gives the page tools).
+            if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && softnAppOf(this.options.vfs, call.input.path) === null && !this.loadedGuides().has('web') && this.usable.some((t) => t.name === 'guide')) {
+              result.content += this.discovering ? `\n\n${this.guideGivenText('web', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
+            }
+            if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
+            if (result.startedCalls) startedCalls = true;
+            // A picture for a scripted video is reviewed before anything else is made.
+            if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
+            results.push(result);
+            ran.push(call);
+            // softn_check keeps the record of failing apps current, as the automatic check does.
+            if (result.check) {
+              this.checkedRoots.add(result.check.root);
+              if (result.check.ok) this.failingApps.delete(result.check.root);
+              else this.failingApps.set(result.check.root, result.check.text);
+            }
+            if (call.name === 'update_plan' && !result.isError) {
+              planThisRun = true;
+              sincePlan = 0;
+            }
+            emit({ type: 'tool_result', result });
+            if (result.isError && failedHere.has(result.content)) {
+              /* counted for this step already */
+            } else if (result.isError && result.content === lastFailure) failures++;
+            else failures = result.isError ? 1 : 0;
+            if (result.isError) failedHere.add(result.content);
+            lastFailure = result.isError ? result.content : '';
+          },
+        });
         callIndex = reply.calls.length;
-        for (const c of changes) changedThisRun.add(c.path);
+        for (const c of changes) {
+          changedThisRun.add(c.path);
+          touchedPaths.push(c.path);
+        }
+        // Reconcile nested or modified AGENTS.md / OAIY.md workspace instructions without mutating systemPrompt.
+        if (!this.options.conversation && touchedPaths.length && results.length) {
+          const instrDelta = this.workspaceInstructions.reconcile(this.options.vfs, touchedPaths);
+          if (instrDelta) results[results.length - 1].content += `\n\n${instrDelta}`;
+        }
         const stop = await this.autoCheck(reply.calls, results, changes, emit);
         // (read from what the tools and the automatic check said, before the notes below are added to it: a step
         // given the plan's reminder read as another step, and a call repeated with the same result 11 times was
@@ -2703,6 +3042,17 @@ ${personInstructionsText(own)}` : ''}`;
           results[results.length - 1].content += `\n\n${sameStepNote(same, ran, results)}`;
           // (and its next step sampled anew: told what to change, a model at its server's temperature wrote the same call)
           this.varyNext = true;
+        } else if (results.length) {
+          // Escalating per-tool consecutive repeat guard (`[3, 5, 8]`, canonical deep-key-sorted args).
+          let lastReminder: RepeatReminder | null = null;
+          for (const c of ran) {
+            const rem = repeatGuard.observe(c);
+            if (rem) lastReminder = rem;
+          }
+          if (lastReminder) {
+            results[results.length - 1].content += `\n\n${lastReminder.message}`;
+            if (lastReminder.tier === 'detailed') this.varyNext = true;
+          }
         }
         // Many steps on one plan step without the plan moving: where the work is, and what to do about it.
         const openStep = planThisRun ? this.plan?.items.findIndex((i) => i.status === 'active') ?? -1 : -1;
@@ -2729,8 +3079,8 @@ ${personInstructionsText(own)}` : ''}`;
           emit({ type: 'error', message: `The agent ran the same calls with the same results ${same} times in a row without changing anything, so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
-        if (unchangedStop) {
-          emit({ type: 'error', message: `The model kept writing /${unchangedStop.path} with what it already holds (${unchangedStop.times} times this run, told each time), so the run stopped. Say how to proceed, or "continue" to let it try again.` });
+        if (unchangedStopRef.value) {
+          emit({ type: 'error', message: `The model kept writing /${unchangedStopRef.value.path} with what it already holds (${unchangedStopRef.value.times} times this run, told each time), so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
         // Its finishing tool has done its job: nothing more to ask the model.

@@ -31,7 +31,7 @@ it('keeps the working preview after a missing asset, a bridge failure or an extr
 
     const initial = install();
     expect(initial.status, initial.stderr).toBe(0);
-    expect(readFileSync(join(runtime, 'index.html'), 'utf8')).toContain('data-bot-computer-bridge');
+    expect(readFileSync(join(runtime, 'index.html'), 'utf8')).toContain('data-oaiy-agent-bridge');
     const working = snapshot();
     for (const failure of [{ missing: true }, { html: '<body>Incomplete page</body>' }, { collision: true }]) {
       expect(install(failure).status).toBe(1);

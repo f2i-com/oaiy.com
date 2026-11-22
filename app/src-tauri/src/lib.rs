@@ -1,5 +1,5 @@
-//! bot.computer as a desktop app: the same web app (the built `dist/`) in the
-//! system's webview, served from the app's own `botcomputer` scheme.
+//! OAIY Agent as a desktop app: the same web app (the built `dist/`) in the
+//! system's webview, served from the app's own `oaiyagent` scheme.
 //!
 //! Serving it here, rather than from Tauri's default scheme, is for the
 //! headers the app needs:
@@ -8,8 +8,8 @@
 //! - CORP and a wildcard CORS header on `/softn/` let the SoftN preview (an
 //!   opaque-origin, sandboxed frame) load its runtime.
 //!
-//! It also gives the app an origin of its own (`http://botcomputer.localhost`
-//! on Windows, `botcomputer://localhost` elsewhere) that local servers such as
+//! It also gives the app an origin of its own (`http://oaiyagent.localhost`
+//! on Windows, `oaiyagent://localhost` elsewhere) that local servers such as
 //! OAIY can allow by name. Links that leave the app open in the system browser.
 //!
 //! The app lives in the system tray: minimizing hides the window there, and
@@ -17,8 +17,8 @@
 //! keep working in the background. Quit saves the page's work before exiting.
 //!
 //! Portable: an executable whose name contains "portable" keeps everything
-//! (the webview's storage, where projects live, and its own settings) in a
-//! `bot.computer-data` folder beside itself, so the two can be carried together.
+//! (the webview's storage, where projects live, and its own settings) in an
+//! `oaiy-agent-data` folder beside itself, so the two can be carried together.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,12 +32,12 @@ use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Runtime, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
-const SCHEME: &str = "botcomputer";
+const SCHEME: &str = "oaiyagent";
 const MAIN: &str = "main";
 
 /// Where the app's pages live: Windows (WebView2) maps a custom scheme to `http://<scheme>.localhost`.
 fn app_url() -> Url {
-    let url = if cfg!(any(windows, target_os = "android")) { "http://botcomputer.localhost/" } else { "botcomputer://localhost/" };
+    let url = if cfg!(any(windows, target_os = "android")) { "http://oaiyagent.localhost/" } else { "oaiyagent://localhost/" };
     url.parse().expect("the app URL is valid")
 }
 
@@ -66,7 +66,7 @@ fn serve<R: Runtime>(app: &AppHandle<R>, request: &Request<Vec<u8>>) -> Response
         path.push_str("index.html");
     }
     let Some(asset) = app.asset_resolver().get(path.clone()) else {
-        return Response::builder().status(StatusCode::NOT_FOUND).header(header::CONTENT_TYPE, "text/plain").body(format!("{path} is not part of bot.computer").into_bytes()).unwrap();
+        return Response::builder().status(StatusCode::NOT_FOUND).header(header::CONTENT_TYPE, "text/plain").body(format!("{path} is not part of OAIY Agent").into_bytes()).unwrap();
     };
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -91,7 +91,7 @@ fn portable_dir() -> Option<PathBuf> {
     if !name.contains("portable") {
         return None;
     }
-    Some(exe.parent()?.join("bot.computer-data"))
+    Some(exe.parent()?.join("oaiy-agent-data"))
 }
 
 /// An identifier per data folder (FNV-1a of its path), so a portable copy is
@@ -143,7 +143,7 @@ fn show_main<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.set_focus();
     }
     if let Some(tray) = app.tray_by_id(MAIN) {
-        let _ = tray.set_tooltip(Some("bot.computer"));
+        let _ = tray.set_tooltip(Some("OAIY Agent"));
     }
 }
 
@@ -152,7 +152,7 @@ fn hide_main<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.hide();
     }
     if let Some(tray) = app.tray_by_id(MAIN) {
-        let _ = tray.set_tooltip(Some("bot.computer: running in the background"));
+        let _ = tray.set_tooltip(Some("OAIY Agent: running in the background"));
     }
 }
 
@@ -166,7 +166,7 @@ fn quit<R: Runtime>(app: &AppHandle<R>) {
     }
     match app.get_webview_window(MAIN) {
         Some(window) => {
-            let _ = window.eval("window.__botComputerBeforeQuit ? window.__botComputerBeforeQuit() : window.__TAURI_INTERNALS__.invoke('ready_to_quit')");
+            let _ = window.eval("window.__oaiyAgentBeforeQuit ? window.__oaiyAgentBeforeQuit() : window.__TAURI_INTERNALS__.invoke('ready_to_quit')");
             let handle = app.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(8));
@@ -185,12 +185,12 @@ fn ready_to_quit<R: Runtime>(app: AppHandle<R>) {
 
 fn tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     let keep = app.state::<KeepRunning>().0.load(Ordering::SeqCst);
-    let open = MenuItem::with_id(app, "open", "Open bot.computer", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open OAIY Agent", true, None::<&str>)?;
     let keep_item = CheckMenuItem::with_id(app, "keep", "Keep running when the window is closed", true, keep, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit bot.computer", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit OAIY Agent", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &PredefinedMenuItem::separator(app)?, &keep_item, &PredefinedMenuItem::separator(app)?, &quit_item])?;
     let mut builder = TrayIconBuilder::with_id(MAIN)
-        .tooltip("bot.computer")
+        .tooltip("OAIY Agent")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id().as_ref() {
@@ -239,7 +239,7 @@ pub fn run() {
             let dev_nav = dev.clone();
             let dev_win = dev.clone();
             let mut builder = WebviewWindowBuilder::new(app, MAIN, url)
-                .title(if portable_dir().is_some() { "bot.computer (portable)" } else { "bot.computer" })
+                .title(if portable_dir().is_some() { "OAIY Agent (portable)" } else { "OAIY Agent" })
                 .inner_size(1400.0, 900.0)
                 .min_inner_size(720.0, 520.0)
                 .center()
@@ -291,7 +291,7 @@ pub fn run() {
             }
         })
         .run(context)
-        .expect("bot.computer could not start");
+        .expect("OAIY Agent could not start");
 }
 
 #[cfg(test)]
@@ -300,10 +300,10 @@ mod tests {
 
     #[test]
     fn each_portable_folder_is_its_own_instance() {
-        let a = portable_identifier("computer.bot.desktop", std::path::Path::new("E:\\USB\\bot.computer-data"));
-        let b = portable_identifier("computer.bot.desktop", std::path::Path::new("e:\\usb\\BOT.computer-data"));
-        let c = portable_identifier("computer.bot.desktop", std::path::Path::new("D:\\tools\\bot.computer-data"));
-        assert!(a.starts_with("computer.bot.desktop.portable."));
+        let a = portable_identifier("com.oaiy.agent", std::path::Path::new("E:\\USB\\oaiy-agent-data"));
+        let b = portable_identifier("com.oaiy.agent", std::path::Path::new("e:\\usb\\OAIY-AGENT-data"));
+        let c = portable_identifier("com.oaiy.agent", std::path::Path::new("D:\\tools\\oaiy-agent-data"));
+        assert!(a.starts_with("com.oaiy.agent.portable."));
         assert_eq!(a, b, "the same folder, however it is spelled");
         assert_ne!(a, c);
     }
@@ -313,7 +313,7 @@ mod tests {
         let app = app_url();
         assert!(belongs_to_app(&app.join("index.html").unwrap(), None));
         assert!(belongs_to_app(&app.join("softn/index.html?v=3").unwrap(), None));
-        assert!(belongs_to_app(&"blob:http://botcomputer.localhost/1234".parse().unwrap(), None));
+        assert!(belongs_to_app(&"blob:http://oaiyagent.localhost/1234".parse().unwrap(), None));
         assert!(!belongs_to_app(&"https://github.com/f2i-com".parse().unwrap(), None));
         assert!(!belongs_to_app(&"http://tauri.localhost/".parse().unwrap(), None));
         let dev: Url = "http://localhost:5317".parse().unwrap();

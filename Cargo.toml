@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-# The two desktop apps (bot.computer's in app/, the previous OAIY Desktop in
+# The two desktop apps (OAIY Agent in app/, OAIY Desktop in
 # platform/) keep their own lockfiles and build on their own for now.
 exclude = ["app/src-tauri", "platform/desktop/src-tauri"]
 members = [

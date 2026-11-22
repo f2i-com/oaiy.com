@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { OLD_RELOAD_KEY, RELOAD_KEY, mayReloadForIsolation } from '../../src/pwa/reloadGuard';
+import { RELOAD_KEY, mayReloadForIsolation } from '../../src/pwa/reloadGuard';
 
 /** A Storage stand-in that can also refuse. */
 function store(initial: Record<string, string> = {}, fail = false) {
@@ -28,7 +28,6 @@ describe('the isolation reload guard', () => {
     const s = store();
     expect(mayReloadForIsolation(s, NOW)).toBe(true);
     expect(s.data.get(RELOAD_KEY)).toBe(String(NOW));
-    expect(s.data.has(OLD_RELOAD_KEY)).toBe(false);
   });
 
   it('refuses a second reload within a minute and allows one after it', () => {
@@ -38,31 +37,8 @@ describe('the isolation reload guard', () => {
     expect(mayReloadForIsolation(s, NOW + 60_000)).toBe(true);
   });
 
-  it('honours a reload the old key recorded a moment ago, once, and moves it to the new key', () => {
-    const s = store({ [OLD_RELOAD_KEY]: String(NOW - 5_000) });
-    expect(mayReloadForIsolation(s, NOW)).toBe(false);
-    expect(s.data.has(OLD_RELOAD_KEY)).toBe(false);
-    expect(s.data.get(RELOAD_KEY)).toBe(String(NOW - 5_000));
-    // The record survived the move: still no reload a little later, then one after the minute.
-    expect(mayReloadForIsolation(s, NOW + 10_000)).toBe(false);
-    expect(mayReloadForIsolation(s, NOW + 60_000)).toBe(true);
-  });
-
-  it('ignores an old key that is a minute or more old, and still drops it', () => {
-    const s = store({ [OLD_RELOAD_KEY]: String(NOW - 120_000) });
-    expect(mayReloadForIsolation(s, NOW)).toBe(true);
-    expect(s.data.has(OLD_RELOAD_KEY)).toBe(false);
-    expect(s.data.get(RELOAD_KEY)).toBe(String(NOW));
-  });
-
-  it('takes the later of the two keys', () => {
-    const s = store({ [OLD_RELOAD_KEY]: String(NOW - 30_000), [RELOAD_KEY]: String(NOW - 90_000) });
-    expect(mayReloadForIsolation(s, NOW)).toBe(false);
-    expect(s.data.get(RELOAD_KEY)).toBe(String(NOW - 30_000));
-  });
-
   it('treats a value that is not a number as never having reloaded', () => {
-    const s = store({ [RELOAD_KEY]: 'nonsense', [OLD_RELOAD_KEY]: '' });
+    const s = store({ [RELOAD_KEY]: 'nonsense' });
     expect(mayReloadForIsolation(s, NOW)).toBe(true);
   });
 

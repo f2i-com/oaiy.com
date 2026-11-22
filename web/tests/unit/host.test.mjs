@@ -4,7 +4,7 @@
  *     npm run test:unit
  *
  * The three places the Agent and the flow editor run: one of OAIY's own windows (the desktop gives the page its address and a
- * token before it runs), the bot.computer desktop shell, and a tab in a browser. A tab must never be taken for either of the
+ * token before it runs), the OAIY Agent desktop shell, and a tab in a browser. A tab must never be taken for either of the
  * others, so what counts is exact: the flow editor's browser shim defines Tauri's global too, a name that only looks like OAIY's
  * is not OAIY's, and an object with no token proves nothing.
  */
@@ -86,20 +86,20 @@ describe("OAIY's own windows", () => {
       assert.equal(kind({ location: { protocol: 'http:', hostname: 'oaiy.localhost', port: '', href: 'not a url' } }), 'browser');
     });
 
-    it('the bot.computer shell is matched the same way: no port, no user name', () => {
-      assert.equal(kind(page('http:', 'botcomputer.localhost')), 'desktop-shell');
-      assert.equal(kind(page('botcomputer:', 'localhost')), 'desktop-shell');
-      assert.equal(kind(page('http:', 'botcomputer.localhost', '5317')), 'browser');
-      assert.equal(kind(page('http:', 'botcomputer.localhost', '', 'http://u@botcomputer.localhost/')), 'browser');
-      assert.equal(kind(page('botcomputer:', 'evil.example')), 'browser');
+    it('the OAIY Agent shell is matched the same way: no port, no user name', () => {
+      assert.equal(kind(page('http:', 'oaiyagent.localhost')), 'desktop-shell');
+      assert.equal(kind(page('oaiyagent:', 'localhost')), 'desktop-shell');
+      assert.equal(kind(page('http:', 'oaiyagent.localhost', '5317')), 'browser');
+      assert.equal(kind(page('http:', 'oaiyagent.localhost', '', 'http://u@oaiyagent.localhost/')), 'browser');
+      assert.equal(kind(page('oaiyagent:', 'evil.example')), 'browser');
     });
   });
 });
 
-describe('the bot.computer desktop shell', () => {
+describe('the OAIY Agent desktop shell', () => {
   it('its own address, or Tauri behind whatever address a dev server has, is the desktop shell', () => {
-    assert.equal(H.readHost(at('botcomputer.localhost')).kind, 'desktop-shell');
-    assert.equal(H.readHost({ location: { hostname: 'localhost', protocol: 'botcomputer:' } }).kind, 'desktop-shell');
+    assert.equal(H.readHost(at('oaiyagent.localhost')).kind, 'desktop-shell');
+    assert.equal(H.readHost({ location: { hostname: 'localhost', protocol: 'oaiyagent:' } }).kind, 'desktop-shell');
     assert.equal(H.readHost(at('localhost', { __TAURI_INTERNALS__: {} })).kind, 'desktop-shell', 'tauri dev shows the dev server at localhost:5317');
   });
 
@@ -109,7 +109,7 @@ describe('the bot.computer desktop shell', () => {
   });
 
   it("OAIY's window is not the shell, whichever signs it shows", () => {
-    assert.equal(H.readHost(at('botcomputer.localhost', { __OAIY_DESKTOP__: GIVEN })).kind, 'oaiy-window');
+    assert.equal(H.readHost(at('oaiyagent.localhost', { __OAIY_DESKTOP__: GIVEN })).kind, 'oaiy-window');
     assert.equal(H.readHost(at('oaiy.localhost', { __TAURI_INTERNALS__: {} })).kind, 'oaiy-window');
   });
 });

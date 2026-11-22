@@ -3,13 +3,13 @@
  * story's folder (one with a script.md in it or above it) is shown to the model
  * with its reference images and its part of the script, and waits for a
  * verdict (review_frame) before another picture is made; a frame that has not
- * passed is not animated. Verdicts are kept in `.botcomputer/reviews.json` by
+ * passed is not animated. Verdicts are kept in `.oaiy/reviews.json` by
  * the picture's content, so they hold across chats and sub-agents, and a
  * picture made again waits for a new one.
  */
 import type { Vfs } from '../vfs/vfs';
 
-export const REVIEWS_FILE = '/.botcomputer/reviews.json';
+export const REVIEWS_FILE = '/.oaiy/reviews.json';
 /** Tries at one picture before the best one is taken. */
 export const MAX_REDOS = 3;
 /** Reviews without a verdict before a picture may be taken without one. */

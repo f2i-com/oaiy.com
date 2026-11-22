@@ -39,7 +39,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const parentWindow = window.parent;
-const post = (message, transfer) => parentWindow.postMessage({ __botComputer: true, ...message }, '*', transfer || []);
+const post = (message, transfer) => parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*', transfer || []);
 
 // --- errors ---------------------------------------------------------------------
 
@@ -386,7 +386,7 @@ window.addEventListener('message', async (event) => {
     start(data);
     return;
   }
-  if (data.__botComputer !== true || typeof data.id !== 'number') return;
+  if (data.__oaiyAgent !== true || typeof data.id !== 'number') return;
   let result;
   try {
     if (data.type === 'bot:inspect') result = { ok: true, page: shown ? shown.text : '(no model is shown)' };

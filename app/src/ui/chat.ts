@@ -10,8 +10,9 @@
  * are shown without the labels the agent reads them with (transcript.ts), and
  * tool calls made one after another fold into one "Used N tools" row.
  */
-import type { AgentEvent } from '../agent/agent';
+import type { AgentEvent, PlanReviewDecision, PlanReviewRequest, UserQuestionItem, UserQuestionResult } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
+import type { Vfs } from '../vfs/vfs';
 import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } from '../agent/tools';
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
@@ -44,6 +45,9 @@ import {
 import { outreachCard, outreachNoteElement, type OutreachHost } from './chat/outreachCard';
 import { Follow, anchorIndex, anchoredScrollTop } from './chat/scroll';
 import { thinkingLabel, thinkingStatus, type ThinkingCount } from './chat/thinking';
+import { renderDeliverablesCard } from './chat/deliverablesCard';
+import { attachComposerAutocomplete, type ComposerAutocomplete } from './chat/mentions';
+import { mountPlanReviewCard, mountQuestionCard } from './chat/questionCard';
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
@@ -163,6 +167,15 @@ export class ChatPane {
   private readonly status = h('div.chat-status', { 'aria-hidden': 'true' });
   private readonly statusSaid = h('div.sr-only', { role: 'status' });
   private readonly hint = h('span.composer-hint', { id: 'composer-hint' });
+  /** Visible while the agent is busy and the user starts typing a mid-turn steer note. */
+  private readonly steerPill = h('span.steer-pill', { hidden: true, title: 'Your message will steer the agent at its next step without stopping the run' }, 'Steer');
+  /** Collaborative Plan Mode toggle pill inside the composer toolbar (`/plan`). */
+  private readonly planToggleBtn = h('button.plan-pill', { type: 'button', 'aria-pressed': 'false', title: 'Toggle Plan Mode (/plan): agent inspects & presents a plan for approval before editing files' }, icon('list'), h('span', 'Plan')) as HTMLButtonElement;
+  private autocomplete: ComposerAutocomplete | null = null;
+  /** Compact StatsPills strip beneath the composer (context fill + compact button + live read/write tok/s). */
+  private readonly statsStrip = h('div.composer-stats', { hidden: true, 'aria-label': 'Session telemetry' });
+  private composerEl!: HTMLElement;
+  private lastSpeed: { readTokPerSec: number | null; writeTokPerSec: number | null; ttftMs: number; cachedTokens: number } | null = null;
   private suggestionDraft: { original: string; preview: string } | null = null;
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
@@ -285,6 +298,12 @@ export class ChatPane {
       block?: (tab: ConversationTab) => void;
       /** End the call going on in the conversation shown (the live strip's End call): asked first, by the handler. */
       hangUp?: () => void;
+      /** Manually compact conversation context (`/compact` or the context popover's Compact now button). */
+      compact?: () => void;
+      /** Toggle collaborative Plan Mode (`/plan`). */
+      togglePlanMode?: () => void;
+      /** Active project VFS for `@file` composer mention autocomplete. */
+      getVfs?: () => Vfs | null;
     },
   ) {
     this.planBox.hidden = true;
@@ -350,8 +369,12 @@ export class ChatPane {
       'div.composer',
       this.pending,
       this.input,
-      h('div.composer-bar', this.attachButton, this.hint, this.send),
+      h('div.composer-bar', this.attachButton, this.planToggleBtn, this.steerPill, this.hint, this.send),
     );
+    this.composerEl = composer;
+    this.planToggleBtn.hidden = !this.handlers.togglePlanMode;
+    this.planToggleBtn.addEventListener('click', () => this.handlers.togglePlanMode?.());
+    this.autocomplete = attachComposerAutocomplete(this.input, composer, () => this.handlers.getVfs?.() ?? null);
     composer.addEventListener('click', (e) => {
       if (e.target === composer) this.input.focus();
     });
@@ -361,7 +384,7 @@ export class ChatPane {
       this.liveBar,
       this.planBox,
       h('div.chat-log-wrap', this.log, this.toLatest),
-      h('div.chat-compose', composer),
+      h('div.chat-compose', composer, this.statsStrip),
       this.picker,
       this.statusSaid,
       this.announcer,
@@ -400,6 +423,7 @@ export class ChatPane {
     // While the agent works, a written message is sent to it; with nothing written, the button stops it.
     this.send.addEventListener('click', () => (this.busy && !this.hasMessage() ? this.handlers.stop() : this.submit()));
     this.input.addEventListener('keydown', (e) => {
+      if (this.autocomplete?.handleKeyDown(e)) return;
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         this.submit();
@@ -409,6 +433,10 @@ export class ChatPane {
       this.suggestionDraft = null;
       this.updateSend();
       this.grow();
+      this.autocomplete?.refresh();
+    });
+    this.input.addEventListener('keyup', (e) => {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') this.autocomplete?.refresh();
     });
     this.updateSend();
     this.updateEmpty();
@@ -543,6 +571,7 @@ export class ChatPane {
     this.clearButton.disabled = busy;
     this.clearButton.title = busy ? 'The agent is working: stop it first, then clear the conversation.' : CLEAR_TITLE;
     this.updateSend();
+    this.drawStats();
     if (!busy) this.setStatus('');
   }
 
@@ -560,17 +589,47 @@ export class ChatPane {
     return !!this.input.value.trim() || this.files.length > 0;
   }
 
-  /** Stop while the agent works with nothing written; Send otherwise. */
+  /** Stop while the agent works with nothing written; Steer when typing while busy; Send otherwise. */
   private updateSend(): void {
     const stop = this.busy && !this.hasMessage();
+    const steer = this.busy && this.hasMessage();
     clear(this.send);
     this.send.append(icon(stop ? 'stop' : 'arrow-up'));
-    this.send.dataset.mode = stop ? 'stop' : 'send';
+    this.send.dataset.mode = stop ? 'stop' : steer ? 'steer' : 'send';
     this.send.classList.toggle('danger', stop);
-    this.send.title = stop ? 'Stop the agent' : this.busy ? 'Send: the agent reads it at its next step' : 'Send (Enter)';
-    this.send.setAttribute('aria-label', stop ? 'Stop' : 'Send');
+    this.send.title = stop ? 'Stop the agent' : steer ? 'Steer: the agent reads this at its next step without stopping' : 'Send (Enter)';
+    this.send.setAttribute('aria-label', stop ? 'Stop' : steer ? 'Steer' : 'Send');
     this.send.disabled = !stop && !this.hasMessage();
-    this.hint.textContent = stop ? 'Stop to end this run' : this.busy ? 'Send a note for the next step' : 'Enter to send · Shift+Enter for a new line · /help';
+    this.steerPill.hidden = !steer;
+    if (this.composerEl) this.composerEl.dataset.mode = steer ? 'steer' : stop ? 'busy' : 'idle';
+    this.hint.textContent = stop ? 'Type to steer mid-turn, or Stop' : steer ? 'Queued for next step' : 'Enter to send · @file · /plan · /help';
+  }
+
+  /** Update the visual state of the Plan Mode toggle pill in the composer. */
+  setPlanMode(active: boolean): void {
+    this.planToggleBtn.classList.toggle('active', active);
+    this.planToggleBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    if (this.composerEl) this.composerEl.dataset.planMode = active ? 'on' : 'off';
+  }
+
+  /** Mount an interactive clarifying-question card in the chat stream and wait for the user's answer. */
+  askUser(questions: UserQuestionItem[], signal?: AbortSignal): Promise<UserQuestionResult> {
+    this.finishReply();
+    const wrap = h('div.msg.ask-wrap');
+    this.add(wrap, 'agent');
+    const p = mountQuestionCard(wrap, questions, signal);
+    this.scroll();
+    return p;
+  }
+
+  /** Mount an interactive Plan Review card (`exit_plan_mode`) in chat and wait for Approve / Keep planning. */
+  reviewPlan(request: PlanReviewRequest, signal?: AbortSignal): Promise<PlanReviewDecision> {
+    this.finishReply();
+    const wrap = h('div.msg.plan-review-wrap');
+    this.add(wrap, 'agent');
+    const p = mountPlanReviewCard(wrap, request, signal);
+    this.scroll();
+    return p;
   }
 
   setStatus(text: string): void {
@@ -803,6 +862,98 @@ export class ChatPane {
     this.meterText.textContent = `${formatTokens(used)} / ${formatTokens(window)}`;
     this.contextUsed = { used, window };
     this.drawContext();
+    this.drawStats();
+  }
+
+  /** Render the compact DeepSeek-Harness-style StatsPills strip beneath the composer. */
+  private drawStats(): void {
+    const ctx = this.contextUsed;
+    const sp = this.lastSpeed;
+    if ((!ctx || ctx.used === 0) && !sp) {
+      this.statsStrip.hidden = true;
+      clear(this.statsStrip);
+      return;
+    }
+    const items: HTMLElement[] = [];
+    const sep = () => h('span.stat-sep', { 'aria-hidden': 'true' }, '·');
+    const fmtRate = (tps: number) => (tps >= 1000 ? `${(tps / 1000).toFixed(1)}k` : `${Math.round(tps)}`);
+
+    if (ctx && ctx.used > 0) {
+      const pct = Math.min(100, Math.round((ctx.used / Math.max(1, ctx.window)) * 100));
+      const level = pct >= 85 ? 'high' : pct >= 65 ? 'mid' : 'low';
+      items.push(
+        h(
+          'button.stat-pill.stat-ctx',
+          {
+            type: 'button',
+            'data-level': level,
+            title: `${formatTokens(ctx.used)} of ${formatTokens(ctx.window)} context tokens (${pct}%). Click to inspect or compact.`,
+            onclick: () => this.openContext(this.contextPop.hidden),
+          },
+          h('span.stat-dot', { 'aria-hidden': 'true' }),
+          h('span.stat-label', `Context ${pct}%`),
+          h('span.stat-sub', `${formatTokens(ctx.used)}/${formatTokens(ctx.window)}`),
+        ),
+      );
+      if (pct >= 50 && this.handlers.compact && !this.busy) {
+        items.push(
+          h(
+            'button.stat-pill.stat-action',
+            {
+              type: 'button',
+              title: 'Prune older tool outputs and summarize earlier turns to free context room (/compact)',
+              onclick: () => this.handlers.compact?.(),
+            },
+            icon('layers'),
+            h('span', 'Compact'),
+          ),
+        );
+      }
+    }
+
+    if (sp) {
+      if (sp.readTokPerSec !== null && Number.isFinite(sp.readTokPerSec) && sp.readTokPerSec > 0) {
+        if (items.length) items.push(sep());
+        const cachedNote = sp.cachedTokens > 0 ? ` (${formatTokens(sp.cachedTokens)} cached)` : '';
+        items.push(
+          h(
+            'span.stat-pill.stat-speed',
+            {
+              'data-fast': sp.readTokPerSec >= 500 ? 'true' : 'false',
+              title: `Prompt read speed: ${Math.round(sp.readTokPerSec).toLocaleString()} tok/s${cachedNote} · TTFT ${(sp.ttftMs / 1000).toFixed(2)}s`,
+            },
+            h('span.stat-key', 'Read'),
+            h('span.stat-val', `${fmtRate(sp.readTokPerSec)} t/s`),
+            ...(sp.cachedTokens > 0 ? [h('span.stat-cached', `${formatTokens(sp.cachedTokens)} hit`)] : []),
+          ),
+        );
+      } else if (sp.cachedTokens > 0) {
+        if (items.length) items.push(sep());
+        items.push(
+          h(
+            'span.stat-pill.stat-speed',
+            { 'data-fast': 'true', title: `${sp.cachedTokens.toLocaleString()} prompt tokens reused from KV cache · TTFT ${(sp.ttftMs / 1000).toFixed(2)}s` },
+            h('span.stat-key', 'Cached'),
+            h('span.stat-val', `${formatTokens(sp.cachedTokens)} tok`),
+          ),
+        );
+      }
+
+      if (sp.writeTokPerSec !== null && Number.isFinite(sp.writeTokPerSec) && sp.writeTokPerSec > 0) {
+        if (items.length) items.push(sep());
+        items.push(
+          h(
+            'span.stat-pill.stat-speed',
+            { 'data-fast': sp.writeTokPerSec >= 60 ? 'true' : 'false', title: `Generation speed: ${sp.writeTokPerSec.toFixed(1)} tok/s` },
+            h('span.stat-key', 'Write'),
+            h('span.stat-val', `${fmtRate(sp.writeTokPerSec)} t/s`),
+          ),
+        );
+      }
+    }
+
+    this.statsStrip.hidden = items.length === 0;
+    this.statsStrip.replaceChildren(...items);
   }
 
   /**
@@ -830,7 +981,28 @@ export class ChatPane {
     const used = this.contextUsed;
     const prompts = this.prompts.slice(-PROMPTS_KEPT).reverse();
     this.contextPop.replaceChildren(
-      h('strong.context-pop-title', "The model's context"),
+      h(
+        'div.context-pop-head',
+        h('strong.context-pop-title', "The model's context"),
+        ...(this.handlers.compact && used && used.used > 0
+          ? [
+              h(
+                'button.context-compact-btn',
+                {
+                  type: 'button',
+                  disabled: this.busy,
+                  title: this.busy ? 'Wait for the current run to finish before compacting' : 'Prune older tool outputs and summarize earlier turns (/compact)',
+                  onclick: () => {
+                    this.openContext(false);
+                    this.handlers.compact?.();
+                  },
+                },
+                icon('layers'),
+                h('span', 'Compact now'),
+              ),
+            ]
+          : []),
+      ),
       ...(used ? [h('p.context-pop-used', used.used ? `${formatTokens(used.used)} of ${formatTokens(used.window)} tokens used by the last step: what the model was sent, and its reply.` : `Room for ${formatTokens(used.window)} tokens. Nothing has been counted yet.`)] : []),
       ...this.contextNotes.map((note) => h('p.context-pop-note', note)),
       ...(prompts.length
@@ -954,6 +1126,8 @@ export class ChatPane {
     this.contextNotes = [];
     this.prompts = [];
     this.contextUsed = null;
+    this.lastSpeed = null;
+    this.drawStats();
     this.contextPop.replaceChildren();
     // (another conversation shown, or this one started again: an error here does not send what was written there)
     this.lastSent = null;
@@ -1595,14 +1769,16 @@ export class ChatPane {
   }
 
   private toolGroup(): HTMLElement {
-    return h(
+    const group = h(
       'details.tool-group',
-      h('summary.tool-group-head', h('span.tool-status', { role: 'img', 'aria-label': 'running' }), icon('layers', 'tool-icon'), h('span.tool-group-title'), h('span.tool-group-names')),
+      h('summary.tool-group-head', h('span.tool-status', { role: 'img', 'aria-label': 'running' }), icon('layers', 'tool-icon'), h('span.tool-group-title'), h('span.tool-group-names'), icon('chevron-down', 'tool-group-caret')),
       h('div.tool-group-list'),
     );
+    if (!this.replaying) group.dataset.started = String(performance.now());
+    return group;
   }
 
-  /** A group's line: how many tools, which, and whether one is running or failed. */
+  /** A group's line: how many tools, elapsed duration, which, and whether one is running or failed. */
   private updateGroup(group: HTMLElement): void {
     const cards = [...group.lastElementChild!.children].filter((c): c is HTMLElement => c.matches('details.tool'));
     const running = cards.find((c) => c.classList.contains('pending'));
@@ -1617,7 +1793,10 @@ export class ChatPane {
       title.textContent = `${cards.length} tools`;
       names.textContent = `now: ${`${running.querySelector('.tool-name')?.textContent ?? ''} ${running.querySelector('.tool-arg')?.textContent ?? ''}`.trim()}`;
     } else {
-      title.textContent = `Used ${cards.length} tools`;
+      const started = Number(group.dataset.started);
+      const elapsed = started && !this.replaying ? performance.now() - started : 0;
+      const elapsedTag = elapsed >= 300 ? `Worked ${duration(elapsed)} · ` : 'Used ';
+      title.textContent = `${elapsedTag}${cards.length} tool${cards.length === 1 ? '' : 's'}`;
       const labels = [...new Set(cards.map((c) => c.querySelector('.tool-name')?.textContent ?? ''))].filter(Boolean);
       names.textContent = `${labels.slice(0, 3).join(' · ')}${labels.length > 3 ? ` · +${labels.length - 3}` : ''}${failed ? ` · ${failed} failed` : ''}`;
     }
@@ -1777,6 +1956,23 @@ export class ChatPane {
       if (arg) arg.textContent = result.content.split('\n')[0];
     }
     const output = card.querySelector('.tool-output') ?? card;
+    if (result.spillPath) {
+      const head = output.querySelector('.tool-section-head');
+      head?.querySelector('.tool-spill-open')?.remove();
+      const spillPath = result.spillPath;
+      head?.append(
+        h(
+          'button.tool-spill-open',
+          {
+            type: 'button',
+            title: `Open verbatim saved output (${spillPath}) in the editor`,
+            onclick: () => this.handlers.open(spillPath),
+          },
+          icon('file-text'),
+          h('span', 'View full output'),
+        ),
+      );
+    }
     for (const image of result.images ?? []) {
       output.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
     }
@@ -1891,18 +2087,50 @@ export class ChatPane {
         this.currentPlan = e.plan;
         this.showPlan(e.plan, true);
         break;
+      case 'plan_mode':
+        this.setPlanMode(e.active);
+        break;
       case 'context':
         this.showContext(e.used, e.window);
         break;
       case 'agent_task':
         this.agentTask(e);
         break;
+      case 'speed':
+        this.lastSpeed = {
+          readTokPerSec: e.readTokPerSec,
+          writeTokPerSec: e.writeTokPerSec,
+          ttftMs: e.ttftMs,
+          cachedTokens: e.cachedTokens,
+        };
+        this.drawStats();
+        break;
+      case 'deliverables':
+        if (e.files.length) {
+          this.finishReply();
+          this.add(
+            renderDeliverablesCard(e.files, { durationMs: e.durationMs, toolCount: e.toolCount }, (path) => this.handlers.open(path)),
+            'agent',
+          );
+          this.scroll();
+        }
+        break;
       case 'compact':
         this.current = null;
         this.add(
-          h('div.msg.nudge.compacted', icon('layers'), h('span', e.how === 'summary'
-            ? `Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
-            : `Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`)),
+          h(
+            'div.msg.nudge.compacted',
+            { 'data-how': e.how },
+            icon('layers'),
+            h(
+              'span',
+              e.how === 'pruned'
+                ? `Context pruned: ${e.turns} older tool output${e.turns === 1 ? '' : 's'} trimmed (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). Full copies stay in spill storage.`
+                : e.how === 'summary'
+                  ? `Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
+                  : `Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`,
+            ),
+          ),
         );
         this.scroll();
         break;

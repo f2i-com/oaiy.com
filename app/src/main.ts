@@ -118,7 +118,7 @@ function embeddedDesktop(): { origin: string; token: string; backupToken?: strin
 }
 
 // Which window this is, read once as the page loads (shared/capabilities/host.ts): OAIY's own window (given the desktop, or served from OAIY's own
-// origin, exactly), the bot.computer desktop shell, or a tab in a browser. Only the first two look for OAIY on their own (agent/lookup.ts).
+// origin, exactly), the OAIY Agent desktop shell, or a tab in a browser. Only the first two look for OAIY on their own (agent/lookup.ts).
 const HOST = pageHost();
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
 const IN_OAIY = HOST.kind === 'oaiy-window';
@@ -527,6 +527,14 @@ async function main(): Promise<void> {
     block: (tab) => void toggleBlocked(tab.key ?? '', tab.name ?? ''),
     // The call in the conversation shown, ended from its live strip.
     hangUp: () => void endShownCall(),
+    // Compact context on demand (from the context popover or StatsPills strip).
+    compact: () => {
+      if (!viewing) void submit('/compact', []);
+    },
+    togglePlanMode: () => {
+      if (!viewing) void submit(agent.planMode ? '/plan off' : '/plan on', []);
+    },
+    getVfs: () => (viewing ? frontDesk?.vfs ?? null : project?.vfs ?? null),
   });
 
   /** Who a conversation's lane is with, as the chat says it: their name, or (none yet) their number as it is read. */
@@ -1338,6 +1346,8 @@ async function main(): Promise<void> {
           ? {
               reasoning: chosenReasoning,
               personInstructions: () => ownInstructions(kind(), place().meta, agentSettings.instructions),
+              askUser: (questions, sig) => chat.askUser(questions, sig),
+              reviewPlan: (request, sig) => chat.reviewPlan(request, sig),
             }
           : {}),
         projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
@@ -1707,6 +1717,7 @@ async function main(): Promise<void> {
     agent.turns = await project.loadChat();
     // The plan goes on where the saved conversation left it.
     agent.plan = planAfter(agent.turns);
+    chat.setPlanMode(agent.planMode);
     // The phone's conversations stay in the front desk: the project's own conversation shows.
     viewing = null;
     swapDraft(was);
@@ -1959,8 +1970,47 @@ async function main(): Promise<void> {
           // (the meter of the conversation before is not this one's)
           lastContext.delete(agent);
           chat.clearLog();
+          chat.setPlanMode(false);
           await project.saveChat([]);
           chat.system('New conversation. The project\'s files are unchanged.');
+          return;
+        case 'plan': {
+          const arg = (args[0] ?? '').toLowerCase();
+          if (arg === 'status' || arg === '?') {
+            chat.system(`Plan Mode is currently ${agent.planMode ? 'ON (inspect & plan before editing)' : 'OFF'}. Use /plan on or /plan off to toggle.`);
+            return;
+          }
+          const want = arg === 'off' || arg === 'false' || arg === '0' ? false : arg === 'on' || arg === 'true' || arg === '1' ? true : !agent.planMode;
+          agent.setPlanMode(want);
+          chat.setPlanMode(want);
+          chat.system(
+            want
+              ? 'Plan Mode is ON: the agent will inspect the workspace and present a plan for your approval before making edits.'
+              : 'Plan Mode is OFF: the agent can edit files and execute tools directly.',
+          );
+          return;
+        }
+        case 'compact':
+          if (currentRun) {
+            chat.system('The agent is working: stop it first, then compact the conversation.', 'error');
+            return;
+          }
+          chat.setBusy(true);
+          try {
+            const outcome = await agent.compactNow((e) => {
+              if (e.type === 'context') lastContext.set(agent, { used: e.used, window: e.window });
+              chat.event(e);
+            });
+            if (outcome.compacted) {
+              await project.saveChat(agent.savedTurns());
+            } else {
+              chat.system('Conversation is already compact — nothing older to prune or summarize yet.');
+            }
+          } catch (error) {
+            chat.system(error instanceof Error ? error.message : String(error), 'error');
+          } finally {
+            chat.setBusy(false);
+          }
           return;
         case 'help': case '?':
           chat.system(HELP);
@@ -2535,7 +2585,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
 
   // Another tab with the same project open would overwrite this one's work (and the other way round).
   const tabId = Math.random().toString(36).slice(2);
-  const tabChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('bot.computer-tabs') : null;
+  const tabChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('oaiy-agent-tabs') : null;
   const warned = new Set<string>();
   const warnTwice = (projectId: string) => {
     if (warned.has(projectId) || project?.meta.id !== projectId) return;
@@ -2591,7 +2641,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     if (!found || found.state === 'absent') return;
     if (found.state !== 'found') {
       // OAIY is there but closed to this page: say how to open it, once per browser.
-      const told = `bot.computer:oaiy-told:${found.origin}:${found.state}`;
+      const told = `oaiy-agent:oaiy-told:${found.origin}:${found.state}`;
       try {
         if (localStorage.getItem(told)) return;
         localStorage.setItem(told, '1');
@@ -3693,7 +3743,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   // The desktop app's Quit (tray menu, or closing with "keep running" off): stop the
   // agent, write everything, then tell the app it may exit.
   if (DESKTOP) {
-    (window as unknown as { __botComputerBeforeQuit: () => Promise<void> }).__botComputerBeforeQuit = async () => {
+    (window as unknown as { __oaiyAgentBeforeQuit: () => Promise<void> }).__oaiyAgentBeforeQuit = async () => {
       try {
         controller?.abort();
         editor.flush();

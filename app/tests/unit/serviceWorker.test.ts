@@ -192,16 +192,16 @@ describe('taking over', () => {
     expect((await storage.keys()).sort()).toEqual(['oaiy-agent-first', 'oaiy-agent-new']);
   });
 
-  it('with no records at all (the bot.computer days) keeps the newest cache that holds anything', async () => {
+  it('with no records at all (a build from before the records) keeps the newest cache that holds anything', async () => {
     const storage = new FakeCaches();
     await storage.fill('oaiy-agent-a', '/a.js');
-    await storage.fill('bot.computer-b', '/b.js');
+    await storage.fill('oaiy-agent-b', '/b.js');
     // Newer, but empty (a failed install leaves such a thing): it is not a build that ran.
-    await storage.open('bot.computer-empty');
+    await storage.open('oaiy-agent-empty');
     const worker = load('oaiy-agent-new', storage, true);
     await worker.install();
     await worker.activate();
-    expect((await storage.keys()).sort()).toEqual(['bot.computer-b', 'oaiy-agent-new']);
+    expect((await storage.keys()).sort()).toEqual(['oaiy-agent-b', 'oaiy-agent-new']);
   });
 
   it('has nothing to keep when it is the only cache of the app', async () => {

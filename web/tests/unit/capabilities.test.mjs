@@ -30,7 +30,7 @@ const TABLE = [
   // OAIY's own window: the desktop is given, so it is paired with or without a saved link, and nothing that was there is gone.
   ["OAIY's own window", host('oaiy-window'), [], 'paired', ALL, true],
   ["OAIY's own window, with a saved link too", host('oaiy-window'), [desktop], 'paired', ALL, true],
-  // The bot.computer desktop shell: the desktop is paired like a tab's, but it looks for OAIY as it loads.
+  // The OAIY Agent desktop shell: the desktop is paired like a tab's, but it looks for OAIY as it loads.
   ['the desktop shell, not paired', host('desktop-shell'), [], 'standalone', [], true],
   ['the desktop shell, paired', host('desktop-shell'), [desktop], 'paired', BEHIND_A_DESKTOP, true],
   // A tab on a public host, a dev server or a local copy: nothing is on until it is linked.

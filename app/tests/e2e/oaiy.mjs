@@ -22,7 +22,7 @@ function triangleGlb() {
   [-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0].forEach((v, i) => bin.writeFloatLE(v, i * 4));
   [0, 1, 2].forEach((v, i) => bin.writeUInt16LE(v, 36 + i * 2));
   const gltf = {
-    asset: { version: '2.0', generator: 'bot.computer e2e' },
+    asset: { version: '2.0', generator: 'OAIY Agent e2e' },
     scene: 0,
     scenes: [{ nodes: [0] }],
     nodes: [{ mesh: 0 }],

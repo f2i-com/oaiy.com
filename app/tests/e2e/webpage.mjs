@@ -180,7 +180,7 @@ await check('a page renders from the project, and its scripts run on Zipp agains
   expect(!result.isError && result.content.includes('Page: /site/index.html'), result.content);
   const shown = await tool('page_inspect', {});
   expect(shown.content.includes('# The Bakery') && shown.content.includes('Sourdough') && shown.content.includes('3 breads'), shown.content);
-  const styled = await frame().evaluate(() => [getComputedStyle(document.querySelector('header')).backgroundColor, document.querySelector('img').naturalWidth, document.querySelector('script') === null || !!document.querySelector('script[data-bot-computer-bridge]')]);
+  const styled = await frame().evaluate(() => [getComputedStyle(document.querySelector('header')).backgroundColor, document.querySelector('img').naturalWidth, document.querySelector('script') === null || !!document.querySelector('script[data-oaiy-agent-bridge]')]);
   expect(styled[0] === 'rgb(122, 62, 18)' && styled[1] === 20 && styled[2], JSON.stringify(styled));
 });
 

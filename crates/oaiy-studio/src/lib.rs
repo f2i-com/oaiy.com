@@ -1351,7 +1351,7 @@ mod tests {
             assert_eq!(status(&studio, &req("GET", "/v1/videos", &[("Host", host)])), None, "{host}");
         }
         assert_eq!(status(&studio, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "https://evil.example")])), Some(403));
-        assert_eq!(status(&studio, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "https://bot.computer")])), None, "a listed origin");
+        assert_eq!(status(&studio, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "https://oaiy.com")])), None, "a listed origin");
         // listening beyond loopback: any name (the key, required there for the controls, guards it)
         let mut cfg = config::default_json();
         let mut g = cfg.get("gateway").unwrap().clone();

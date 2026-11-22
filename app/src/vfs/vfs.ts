@@ -53,7 +53,7 @@ export class VfsError extends Error {
 }
 
 /** Directories a project walk skips unless asked for them. */
-export const IGNORED_DIRS = new Set(['.git', 'node_modules', 'target', 'dist', 'build', '.venv', 'venv', '__pycache__', '.cache', '.next', '.turbo']);
+export const IGNORED_DIRS = new Set(['.git', '.oaiy', 'node_modules', 'target', 'dist', 'build', '.venv', 'venv', '__pycache__', '.cache', '.next', '.turbo']);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });

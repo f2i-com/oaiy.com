@@ -540,7 +540,7 @@ header `X-OAIY-Incognito: 1` or a body field `"incognito": true`.
   reads only what is new. Any request from outside the session wipes it first,
   and so does ending the session: `POST /v1/chat/completions` with the body
   `{"oaiy_forget_session": "<id>"}` (a model that is not running is not started
-  for this). bot.computer names its incognito project as the session, and ends
+  for this). OAIY Agent names its incognito project as the session, and ends
   it when the project is cleared or incognito is turned off.
 - **Images and video:** the job writes into a private folder under
   `outputs/.incognito/`, with no video prompt cache and uploads kept inside it. It
@@ -686,10 +686,10 @@ Saving a non-loopback `ui.host` is refused until `gateway.api_key` is set.
 The gateway is reachable by web pages too, so without an API key it refuses
 browser requests (those carrying `Origin`) from origins not listed in
 `gateway.cors_origins` (`*` allows any). Apps and SDKs outside a browser are
-unaffected. The list starts with bot.computer's origins: the web app
-(`https://bot.computer`), bot.computer served on this machine
+unaffected. The list starts with OAIY Agent's origins: the web app
+(`https://oaiy.com`), OAIY Agent served on this machine
 (`http://localhost:5317`, `http://127.0.0.1:5317`) and its desktop app
-(`http://botcomputer.localhost` on Windows, `botcomputer://localhost` on macOS and Linux).
+(`http://oaiyagent.localhost` on Windows, `oaiyagent://localhost` on macOS and Linux).
 A configuration written before that gains them once (`origins_version`);
 remove any you do not want and they stay removed. oaiy-llm-server is always started with `--local-images off`, so nothing
 reaching the gateway can have the vision model read files from this machine.

@@ -2,7 +2,7 @@
  * package's runtime JavaScript, ahead of the program; see pystd/package.ts).
  *
  * The program's files are the whole project, "/" its root. OAIY
- * writes the run's settings into the file map under `.botcomputer/`: the
+ * writes the run's settings into the file map under `.oaiy/`: the
  * shell's working folder, the environment, stdin, argv[0], and names to keep
  * out of listings (modules beside the script, aliased at the root so
  * `import helper` finds them as CPython's sys.path[0] would). From those:
@@ -16,7 +16,7 @@
     "use strict";
     const rt = R.__rt, E = rt.E, T = rt.T;
     const list = rt.list, tuple = rt.tuple, fail = rt.fail, builtin = rt.builtin;
-    const CONF = ".botcomputer";
+    const CONF = ".oaiy";
     const raw = {};
     for (const k of Object.keys(rt.vfs)) raw[k] = rt.vfs[k];
     const decode = (bytes) => rt.decodeBytes({ items: bytes }, "utf-8", "replace");

@@ -13,8 +13,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const TAGS = [
-  ['data-bot-computer-bridge', '<script src="./bot-bridge.js" data-bot-computer-bridge></script>'],
-  ['data-bot-computer-capture', '<script src="./bot-capture.js" data-bot-computer-capture></script>'],
+  ['data-oaiy-agent-bridge', '<script src="./bot-bridge.js" data-oaiy-agent-bridge></script>'],
+  ['data-oaiy-agent-capture', '<script src="./bot-capture.js" data-oaiy-agent-capture></script>'],
 ];
 
 /** modern-screenshot's UMD build (window.modernScreenshot), from node_modules. */

@@ -98,6 +98,10 @@ export function helpText(inOaiy: boolean): string {
       the network gate: on | off | allowlist | allow <host> | deny <host> | forget <host> | reset | status
   /softn …
       SoftN apps: new | import | export | check | preview | apps (/softn alone says what each does)
+  /compact
+      prune older tool outputs and summarize earlier turns to free context room
+  /plan [on|off]
+      toggle collaborative Plan Mode (inspect & design a plan for review before editing files)
   /clear
       start a new conversation (the project's files stay)
   /help

@@ -19,7 +19,7 @@ import RUNTIME from './runtime.js?raw';
 
 const SOURCES = import.meta.glob('./*.py', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
 
-export const PACKAGE_NAME = 'botcomputer-stdlib';
+export const PACKAGE_NAME = 'oaiy-stdlib';
 
 /** The modules: dotted name and source. */
 export function packageModules(): Array<{ name: string; source: string }> {

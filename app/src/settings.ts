@@ -14,7 +14,7 @@ import type { NetGateSettings } from './gate/netgate';
 import type { ProviderConfig } from './agent/providers/types';
 import { EMPTY_MEDIA, type MediaSettings } from './agent/media';
 
-const DB = 'bot.computer';
+const DB = 'oaiy-agent';
 const STORE = 'kv';
 
 function db(): Promise<IDBDatabase> {

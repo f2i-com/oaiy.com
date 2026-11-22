@@ -2103,7 +2103,7 @@
     return R();
   }, "sleep SECONDS");
   B("whoami", () => R("sandbox\n"));
-  B("hostname uname", (args) => R(args.includes("-a") ? "bot-computer zipp\n" : "bot-computer\n"));
+  B("hostname uname", (args) => R(args.includes("-a") ? "oaiy-agent zipp\n" : "oaiy-agent\n"));
   B("id", () => R("uid=1000(sandbox) gid=1000(sandbox)\n"));
   B("clear reset history", () => R());
   B("type which command", function (args) {

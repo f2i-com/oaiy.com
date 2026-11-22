@@ -9,7 +9,7 @@ const at = (env: HostEnv): Host => readHost(env);
 const HOSTS: Record<string, Host> = {
   "OAIY's own window (given a desktop)": at({ location: { hostname: 'oaiy.localhost', protocol: 'http:', port: '', href: 'http://oaiy.localhost/index.html' }, __OAIY_DESKTOP__: { origin: 'http://127.0.0.1:17972', token: 't' } }),
   "OAIY's own window on macOS and Linux (oaiy://)": at({ location: { hostname: 'localhost', protocol: 'oaiy:', port: '', href: 'oaiy://localhost/index.html' } }),
-  'the desktop shell (bot.computer)': at({ location: { hostname: 'botcomputer.localhost', protocol: 'http:', port: '', href: 'http://botcomputer.localhost/' } }),
+  'the desktop shell (OAIY Agent)': at({ location: { hostname: 'oaiyagent.localhost', protocol: 'http:', port: '', href: 'http://oaiyagent.localhost/' } }),
   'the desktop shell in `tauri dev` (a dev server address, Tauri behind it)': at({ location: { hostname: 'localhost', protocol: 'http:', port: '5317' }, __TAURI_INTERNALS__: {} }),
 };
 const TABS: Record<string, Host> = {
@@ -101,7 +101,7 @@ describe('the Agent has no other way to look at OAIY as it loads', () => {
     // and ui/where.ts, which says "this computer" for "this browser" in OAIY's own window)
     expect(naming(/\bpageHost\(/)).toEqual(['agent/providers/aiProvider.ts', 'commands.ts', 'main.ts', 'ui/settings.ts', 'ui/where.ts']);
     // (Not "any port of a host name": the origin OAIY serves from is matched exactly, once, in shared/capabilities/host.ts.)
-    expect(naming(/hostname\s*===\s*'(oaiy|oaiyflows|botcomputer)\.localhost'/)).toEqual([]);
+    expect(naming(/hostname\s*===\s*'(oaiy|oaiyflows|oaiyagent)\.localhost'/)).toEqual([]);
   });
 });
 
