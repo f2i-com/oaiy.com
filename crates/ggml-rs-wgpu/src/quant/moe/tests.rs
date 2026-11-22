@@ -766,6 +766,94 @@ fn a_kept_step_repeats_and_a_layer_gives_its_bytes_back() {
     assert!(!DeviceChain::holds_experts(&b, hosted.as_ref()), "Q4_0 experts are the host's");
 }
 
+/// Random `IQ4_NL` or `Q8_0` blocks for `matrices` of `[rows, cols]`.
+fn random_blk32(next: &mut impl FnMut() -> f32, t: GgmlType, matrices: usize, rows: usize, cols: usize) -> Vec<u8> {
+    let blocks = matrices * rows * cols / 32;
+    let mut bytes = Vec::with_capacity(blocks * t.type_size());
+    for _ in 0..blocks {
+        let d = (0.008 + 0.004 * next()) * if next() > 0.7 { -1.0 } else { 1.0 };
+        bytes.extend(half::f16::from_f32(d).to_bits().to_le_bytes());
+        bytes.extend((0..t.type_size() - 2).map(|_| ((next() + 1.0) * 127.99) as u8));
+    }
+    bytes
+}
+
+/// `IQ4_NL` and `Q8_0` experts (including Inkling-2's `SiTU` softcapped activation and sigmoid routing) match host
+/// reference for single-token decode (`rows = 1`), few-row (`rows = 4`), and Tensor-Core prefill (`rows = 32`).
+#[test]
+fn iq4_nl_q8_0_and_situ_experts_match_host() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let (hidden, ff, count, top_k) = (128usize, 64usize, 16usize, 4usize);
+    let (beta, linear_beta) = (4.0f32, 25.0f32);
+    let situ = |g: f32, u: f32| -> f32 {
+        (beta * (g / beta).tanh()) * (1.0 / (1.0 + (-g).exp())) * (linear_beta * (u / linear_beta).tanh())
+    };
+    for (seed, dtype) in [(41u64, GgmlType::IQ4_NL), (42u64, GgmlType::Q8_0)] {
+        let mut next = rng(seed);
+        let gate = random_blk32(&mut next, dtype, count, ff, hidden);
+        let up = random_blk32(&mut next, dtype, count, ff, hidden);
+        let down = random_blk32(&mut next, dtype, count, hidden, ff);
+        let bias: Vec<f32> = (0..count).map(|_| 0.2 * next()).collect();
+        let routing = Routing::Sigmoid { bias, scale: 8.0 };
+        let data = QuantExpertsData {
+            hidden,
+            ff,
+            experts: count,
+            gate: (dtype, gate.clone()),
+            up: (dtype, up.clone()),
+            down: (dtype, down.clone()),
+            shared: None,
+            routing: routing.clone(),
+        };
+        let moe = b.try_quant_experts_situ_leaving(data, 0, beta, linear_beta).unwrap().expect("IQ4_NL/Q8_0 fits on GPU");
+        assert!(DeviceChain::holds_experts(&b, moe.as_ref()));
+
+        // Dequantize all experts on host for exact reference comparison.
+        let deq_mat = |raw: &[u8], e: usize, r: usize, c: usize| -> Vec<f32> {
+            let each = r * (c / 32 * dtype.type_size());
+            let mut out = vec![0.0f32; r * c];
+            ggml_quants::dequantize(dtype, &raw[e * each..(e + 1) * each], &mut out).unwrap();
+            out
+        };
+
+        for rows in [1usize, 4, 32] {
+            let (x, logits) = inputs(seed + rows as u64, rows, hidden, count);
+            let (xd, ld, out) = (b.vec(rows * hidden), b.vec(rows * (count + 1)), b.vec(rows * hidden));
+            DeviceChain::upload(&b, &xd, &x);
+            DeviceChain::upload(&b, &ld, &logits);
+            let mut rec = b.begin();
+            rec.keep_groups(rows == 1);
+            assert!(rec.moe_routed(moe.as_ref(), &xd, &out, &ld, top_k, rows));
+            rec.read(&out);
+            let got = rec.finish().pop().unwrap();
+
+            let mut want = vec![0.0f32; rows * hidden];
+            for r in 0..rows {
+                let xr = &x[r * hidden..(r + 1) * hidden];
+                let assign = routing.route(&logits[r * (count + 1)..(r + 1) * (count + 1)], top_k);
+                for &(e, w) in &assign[..top_k] {
+                    let gm = deq_mat(&gate, e, ff, hidden);
+                    let um = deq_mat(&up, e, ff, hidden);
+                    let dm = deq_mat(&down, e, hidden, ff);
+                    let mut mid = vec![0.0f32; ff];
+                    for j in 0..ff {
+                        let g: f32 = gm[j * hidden..(j + 1) * hidden].iter().zip(xr).map(|(a, b)| a * b).sum();
+                        let u: f32 = um[j * hidden..(j + 1) * hidden].iter().zip(xr).map(|(a, b)| a * b).sum();
+                        mid[j] = situ(g, u);
+                    }
+                    for o in 0..hidden {
+                        let d: f32 = dm[o * ff..(o + 1) * ff].iter().zip(&mid).map(|(a, b)| a * b).sum();
+                        want[r * hidden + o] += w * d;
+                    }
+                }
+            }
+            let e = worst(&got, &want);
+            let tol = if rows >= 16 { 5e-3 } else { 5e-4 };
+            assert!(e < tol, "{dtype:?} SiTU rows={rows}: rel err {e} >= {tol}");
+        }
+    }
+}
+
 /// The experts' kernels' time (`--ignored --nocapture`): Flash-Next's layer (512 experts of 2560 by 640 in Q2_0,
 /// 10 a row), a prompt's 512 rows in f32 and on the tensor cores, routed on the host and on the GPU, and a step's
 /// one row.

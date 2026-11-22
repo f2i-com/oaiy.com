@@ -88,8 +88,16 @@ impl QuantizedTensor {
     pub fn from_device(storage: Box<dyn QuantizedDeviceStorage>, shape: Vec<usize>) -> Self {
         let dtype = storage.dtype();
         let numel: usize = shape.iter().product();
+        debug_assert_eq!(numel % dtype.block_size(), 0);
         let expected = (numel / dtype.block_size()) * dtype.type_size();
-        debug_assert_eq!(storage.nbytes(), expected);
+        // Device storage may pad block sizes for alignment (e.g. Q4_0 18→20, Q3_K 110→112),
+        // so device byte size is at least the unpadded GGML host byte size.
+        debug_assert!(
+            storage.nbytes() >= expected,
+            "QuantizedTensor::from_device: device nbytes {} < unpadded expected {}",
+            storage.nbytes(),
+            expected,
+        );
         Self {
             storage: QuantizedStorage::Device(storage),
             shape,

@@ -412,6 +412,14 @@ fn safetensors_file(path: &Path) -> Result<Detected, String> {
             return directory(dir);
         }
     }
+    // An Inkling-2 native safetensors weight shard stands for its checkpoint folder.
+    if has(&h, "model.llm.attn_res.") || (has(&h, "attn_res.") && (has(&h, "attn_sconv.") || has(&h, "middle_cycle_"))) {
+        if let Some(dir) = path.parent() {
+            if dir.join("config.json").is_file() {
+                return directory(dir);
+            }
+        }
+    }
     // MiVOLO v2's weights, the age check's age model.
     if has(&h, "mivolo.model.head.weight") && path.file_name().is_some_and(|n| n == "model.safetensors") {
         return mivolo(path.parent().unwrap_or(Path::new(".")));
@@ -779,6 +787,26 @@ fn directory(dir: &Path) -> Result<Detected, String> {
                 fields.push(("vision_projector", path_json(dir)));
             }
             return Ok(detected(Role::Llm, "checkpoint", format!("{label} — {} checkpoint folder ({arch})", if quant == "exl3" { "EXL3" } else { "safetensors" }), fields));
+        }
+        // Thinking Machines Lab Inkling-2 / Inkling-2-Mini native safetensors checkpoint.
+        if matches!(model_type, "inkling2" | "inkling2_loop")
+            || arch.starts_with("Inkling2")
+        {
+            if !has_ext(dir, "safetensors") {
+                return Err(format!("{label}: an Inkling-2 checkpoint folder needs its .safetensors weights"));
+            }
+            let mut fields = vec![("path", path_json(dir))];
+            if config.get("vision_config").is_some() {
+                fields.push(("vision_projector", path_json(dir)));
+            }
+            let mut d = detected(
+                Role::Llm,
+                "checkpoint",
+                format!("{label} — Inkling-2 safetensors checkpoint ({model_type})"),
+                fields,
+            );
+            d.architecture = Some(if model_type.is_empty() { "inkling2_loop".into() } else { model_type.into() });
+            return Ok(d);
         }
         // MiniMax Music 3: the whole pipeline in one folder.
         if model_type == "minimax_music3" {
@@ -1235,5 +1263,43 @@ mod tests {
         }
         std::fs::write(d.0.join("other.onnx"), b"\x08\x06").unwrap();
         assert!(detect(&d.0.join("other.onnx")).is_err());
+    }
+
+    #[test]
+    fn inkling2_gguf_and_safetensors_checkpoints_are_recognised() {
+        let d = tmp("inkling2");
+        let field = |r: &Detected, k: &str| r.fields.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.as_str()).unwrap_or("").to_string();
+        // GGUF + companion mmproj in a folder
+        let gdir = d.0.join("Inkling-2-Mini-GGUF");
+        std::fs::create_dir_all(&gdir).unwrap();
+        let gfile = gdir.join("Inkling-2-Mini-IQ4_NL.gguf");
+        gguf(&gfile, &[("general.architecture", "inkling2_loop"), ("general.name", "Inkling 2 Mini")], &["token_embd.weight"]);
+        let mfile = gdir.join("mmproj-Inkling-2-Mini-Q8_0.gguf");
+        gguf(&mfile, &[("general.architecture", "clip"), ("general.type", "mmproj")], &[]);
+        let r = detect(&gfile).unwrap();
+        assert_eq!(r.role, Role::Llm);
+        assert_eq!(r.architecture.as_deref(), Some("inkling2_loop"));
+        let rf = detect(&gdir).unwrap();
+        assert_eq!(rf.role, Role::Llm);
+        assert!(field(&rf, "vision_projector").ends_with("mmproj-Inkling-2-Mini-Q8_0.gguf"));
+
+        // Native Hugging Face safetensors folder (and picking config.json or shard file directly)
+        let sdir = d.0.join("Inkling-2-Mini");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join("config.json"),
+            r#"{"architectures":["Inkling2ForConditionalGeneration"],"model_type":"inkling2_loop","vision_config":{"depth":24}}"#,
+        ).unwrap();
+        assert!(detect(&sdir).unwrap_err().contains(".safetensors"));
+        let shard = sdir.join("model-00001-of-00001.safetensors");
+        safetensors(&shard, r#"{"model.llm.attn_res.attn_queries.0":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"model.llm.layers.0.attn_sconv.weight":{"dtype":"BF16","shape":[1],"data_offsets":[4,6]}}"#);
+        for p in [sdir.clone(), sdir.join("config.json"), shard] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.role, Role::Llm);
+            assert_eq!(r.format, "checkpoint");
+            assert_eq!(r.architecture.as_deref(), Some("inkling2_loop"));
+            assert!(field(&r, "path").ends_with("Inkling-2-Mini"));
+            assert!(field(&r, "vision_projector").ends_with("Inkling-2-Mini"));
+        }
     }
 }

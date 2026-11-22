@@ -21,7 +21,8 @@ pub(super) struct WgpuQuant {
     pub(super) chunks: Vec<(wgpu::Buffer, u32, u32)>,
     pub(super) row_bytes: usize,
     pub(super) nbytes: usize,
-    pub(super) used: Arc<AtomicU64>,
+    /// Budget counter charged for `nbytes` (None for unbudgeted scratch/slot views).
+    pub(super) used: Option<Arc<AtomicU64>>,
     /// Its chunks are in the host's memory, which the card reads over the bus ([`crate::quant::stream`]).
     pub(super) host: bool,
     /// Its bytes are in the model's file (no chunks): written into the card's slots each time a matmul takes it
@@ -37,7 +38,9 @@ impl std::fmt::Debug for WgpuQuant {
 
 impl Drop for WgpuQuant {
     fn drop(&mut self) {
-        self.used.fetch_sub(self.nbytes as u64, Ordering::Relaxed);
+        if let Some(used) = &self.used {
+            used.fetch_sub(self.nbytes as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -64,6 +67,9 @@ impl QuantizedDeviceStorage for WgpuQuant {
         "webgpu"
     }
     fn copy_to_host(&self) -> Vec<u8> {
+        if let Some((w, _)) = &self.file {
+            return w.bytes().to_vec();
+        }
         let out = self.gpu_bytes();
         // ggml's layout, where the GPU's blocks are padded
         match shaders::padded_block(self.dtype) {
@@ -82,14 +88,16 @@ impl QuantizedDeviceStorage for WgpuQuant {
             Some((w, padded)) => crate::quant::stream::card_bytes(w, *padded).into_owned(),
             None => self.gpu_bytes(),
         };
-        self.used.fetch_add(self.nbytes as u64, Ordering::Relaxed);
+        if let Some(used) = &self.used {
+            used.fetch_add(self.nbytes as u64, Ordering::Relaxed);
+        }
         Box::new(WgpuQuant {
             gpu: Arc::clone(&self.gpu),
             dtype: self.dtype,
             chunks: self.gpu.upload_rows(&bytes, self.row_bytes, self.chunks.len()),
             row_bytes: self.row_bytes,
             nbytes: self.nbytes,
-            used: Arc::clone(&self.used),
+            used: self.used.clone(),
             host: false,
             file: None,
         })

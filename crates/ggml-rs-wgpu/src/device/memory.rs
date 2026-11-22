@@ -34,10 +34,28 @@ pub(crate) fn heap_budget(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
         // SAFETY: the adapter's handles are only read, by a query that creates and frees nothing.
         let a = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
         let instance = a.shared_instance().raw_instance();
+        let phys = a.raw_physical_device();
+        // `get_physical_device_memory_properties2` requires Vulkan 1.1+ and `VK_EXT_memory_budget`
+        // must be supported by the physical device before chaining `PhysicalDeviceMemoryBudgetPropertiesEXT`.
+        let props1 = unsafe { instance.get_physical_device_properties(phys) };
+        if props1.api_version < ash::vk::API_VERSION_1_1 {
+            return None;
+        }
+        let has_budget = unsafe { instance.enumerate_device_extension_properties(phys) }
+            .ok()?
+            .iter()
+            .any(|ext| {
+                // SAFETY: `extension_name` is a NUL-terminated Vulkan C string.
+                let name = unsafe { std::ffi::CStr::from_ptr(ext.extension_name.as_ptr()) };
+                name == ash::ext::memory_budget::NAME
+            });
+        if !has_budget {
+            return None;
+        }
         let mut budget = ash::vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         let heaps = {
             let mut props = ash::vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-            unsafe { instance.get_physical_device_memory_properties2(a.raw_physical_device(), &mut props) };
+            unsafe { instance.get_physical_device_memory_properties2(phys, &mut props) };
             props.memory_properties
         };
         let n = (heaps.memory_heap_count as usize).min(heaps.memory_heaps.len());

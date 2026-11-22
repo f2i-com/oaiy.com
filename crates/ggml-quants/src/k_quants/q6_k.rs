@@ -21,10 +21,7 @@ pub fn dequantize_block(src: &[u8], dst: &mut [f32]) {
 
     let ql = &src[0..128];
     let qh = &src[128..192];
-    // scales are signed
-    let scales: &[i8] = unsafe {
-        std::slice::from_raw_parts(src[192..208].as_ptr() as *const i8, 16)
-    };
+    let scales = &src[192..208];
     let d = read_f16(&src[208..210]);
 
     let mut y_off = 0;
@@ -40,10 +37,10 @@ pub fn dequantize_block(src: &[u8], dst: &mut [f32]) {
             let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 0x3) << 4)) as i8 - 32;
             let q3 = ((ql[ql_off + l]      >> 4)   | (((qh[qh_off + l] >> 4) & 0x3) << 4)) as i8 - 32;
             let q4 = ((ql[ql_off + l + 32] >> 4)   | (((qh[qh_off + l] >> 6) & 0x3) << 4)) as i8 - 32;
-            dst[y_off + l]       = d * scales[sc_off + is]     as f32 * q1 as f32;
-            dst[y_off + l + 32]  = d * scales[sc_off + is + 2] as f32 * q2 as f32;
-            dst[y_off + l + 64]  = d * scales[sc_off + is + 4] as f32 * q3 as f32;
-            dst[y_off + l + 96]  = d * scales[sc_off + is + 6] as f32 * q4 as f32;
+            dst[y_off + l]       = d * (scales[sc_off + is]     as i8) as f32 * q1 as f32;
+            dst[y_off + l + 32]  = d * (scales[sc_off + is + 2] as i8) as f32 * q2 as f32;
+            dst[y_off + l + 64]  = d * (scales[sc_off + is + 4] as i8) as f32 * q3 as f32;
+            dst[y_off + l + 96]  = d * (scales[sc_off + is + 6] as i8) as f32 * q4 as f32;
         }
         y_off  += 128;
         ql_off += 64;
@@ -112,7 +109,7 @@ pub fn dot_row(row: &[u8], x: &[f32]) -> f32 {
                         ql[ql_base + l] & 0x0F
                     };
                     let q = (low | (((qh[l] >> shift) & 0x3) << 4)) as i8 - 32;
-                    let s = sc[sc_base + l / 16] as f32;
+                    let s = (sc[sc_base + l / 16] as i8) as f32;
                     acc += d * s * q as f32 * x[xi + l];
                 }
                 xi += 32;
@@ -145,6 +142,35 @@ pub fn dot_rows(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
     for rr in r..n_rows {
         out[rr] = dot_row(&w[rr * row_bytes..(rr + 1) * row_bytes], x);
     }
+}
+
+/// SIMD-accelerated `dot_row` (AVX-512 when available, otherwise scalar [`dot_row`]).
+#[inline]
+pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
+    assert_eq!(row.len() % BYTES_PER_BLOCK, 0, "q6_k::dot_row_fast: row not block-aligned");
+    assert_eq!(x.len(), row.len() / BYTES_PER_BLOCK * BLOCK_SIZE, "q6_k::dot_row_fast: x length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    if crate::q4_k::has_avx512_cached() {
+        // SAFETY: avx512f + avx512bw verified by has_avx512_cached(), lengths asserted above.
+        return unsafe { avx512::dot_row(row, x) };
+    }
+    dot_row(row, x)
+}
+
+/// SIMD-accelerated `dot_rows` (AVX-512 when available, otherwise scalar [`dot_rows`]).
+#[inline]
+pub fn dot_rows_fast(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
+    assert_eq!(k % BLOCK_SIZE, 0, "q6_k::dot_rows_fast: k not block-aligned");
+    let row_bytes = k / BLOCK_SIZE * BYTES_PER_BLOCK;
+    assert_eq!(w.len(), n_rows * row_bytes, "q6_k::dot_rows_fast: w length mismatch");
+    assert_eq!(x.len(), k, "q6_k::dot_rows_fast: x length mismatch");
+    assert_eq!(out.len(), n_rows, "q6_k::dot_rows_fast: out length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    if crate::q4_k::has_avx512_cached() {
+        // SAFETY: avx512f + avx512bw verified by has_avx512_cached(), dimensions asserted above.
+        return unsafe { avx512::dot_rows(w, x, n_rows, k, out) };
+    }
+    dot_rows(w, x, n_rows, k, out)
 }
 
 /// Whether this CPU can run the AVX-512 dot kernels.
@@ -445,6 +471,29 @@ mod fused_dot_tests {
             );
         }
         assert!(got.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    /// Regression test: Q6_K block scales are signed i8 (`-128..=127`). Bytes >= 128
+    /// must be interpreted as negative scales in `dot_row`, matching `dequantize_block`.
+    #[test]
+    fn dot_row_handles_negative_i8_scales() {
+        let mut blk = vec![0u8; BYTES_PER_BLOCK];
+        for i in 0..128 {
+            blk[i] = 0x55;
+        }
+        for i in 128..192 {
+            blk[i] = 0xAA;
+        }
+        for i in 0..16 {
+            blk[192 + i] = (-16i8 - i as i8) as u8;
+        }
+        // f16 1.0 = 0x3C00
+        blk[208] = 0x00;
+        blk[209] = 0x3C;
+        let x = xs(BLOCK_SIZE, 0x1234);
+        let want = oracle(&blk, &x);
+        let got = dot_row(&blk, &x);
+        assert_eq!(want.to_bits(), got.to_bits(), "negative i8 scale mismatch: {want} vs {got}");
     }
 }
 

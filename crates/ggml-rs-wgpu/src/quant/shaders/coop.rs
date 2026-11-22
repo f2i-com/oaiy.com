@@ -739,14 +739,14 @@ fn iq4(q: u32) -> vec4<f32> {
 }
 "#;
 
-/// IQ4_NL's decode for [`coop_tiled`] (18-byte blocks: the scale, 16 bytes of nibbles): a step a block, a thread's
-/// half its low nibbles' values or its high ones'.
+/// IQ4_NL's decode for [`coop_tiled`] (on the GPU 20-byte blocks, [`padded_block`]: the scale, a gap, 16 bytes of
+/// nibbles): a step a block, a thread's half its low nibbles' values or its high ones'.
 const COOP_IQ4_NL_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let base = rr * p.row_bytes + b * 18u;
+            let base = rr * p.row_bytes + b * 20u;
             let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
             for (var wi = 0u; wi < 4u; wi++) {
-                wt[at4 + wi] = vec4<f16>(d * iq4(word_at(base + 2u + 4u * wi) >> (lh * 4u)));
+                wt[at4 + wi] = vec4<f16>(d * iq4(word_at(base + 4u + 4u * wi) >> (lh * 4u)));
             }
         } else {
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }

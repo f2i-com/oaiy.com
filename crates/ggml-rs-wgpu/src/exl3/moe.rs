@@ -223,6 +223,14 @@ pub struct Exl3MoeGrouped {
     /// The routed experts' low-rank updates (a LoRA adapter's): the gate and up group's, the down group's.
     gu_lora: Option<GroupLora>,
     down_lora: Option<GroupLora>,
+    /// Budgeted bytes owned by `gu` + `down` (released on Drop; `shared` accounts for itself in `Exl3Gpu::drop`).
+    nbytes: u64,
+}
+
+impl Drop for Exl3MoeGrouped {
+    fn drop(&mut self) {
+        self.b.used.fetch_sub(self.nbytes, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Exl3MoeGrouped {
@@ -261,7 +269,8 @@ impl Exl3MoeGrouped {
         let d_bytes = (routed.len() * d_words * 4) as u64;
         let shared_bytes: u64 = shared.iter().map(|d| d.words.len() as u64 * 4).sum();
         let tables = (routed.len() * 3 * (hidden + ff) * 4) as u64;
-        let total = gu_bytes + d_bytes + shared_bytes + tables;
+        let group_bytes = gu_bytes + d_bytes + tables;
+        let total = group_bytes + shared_bytes;
         if gu_bytes > limit || d_bytes > limit {
             return Ok(None);
         }
@@ -270,8 +279,9 @@ impl Exl3MoeGrouped {
             b.used.fetch_sub(total, Ordering::Relaxed);
             return Ok(None);
         }
-        // the groups' words and tables; the shared expert's projections count themselves, so their share is given back
-        b.used.fetch_sub(shared_bytes, Ordering::Relaxed);
+        // `shared_bytes` stays added here because `Exl3Gpu::upload` does not add to `b.used`,
+        // while `Exl3Gpu::drop` subtracts each shared projection's `nbytes`. `group_bytes` is
+        // released in `Exl3MoeGrouped::drop` (or below on early return).
         let group = |which: &[usize], k: usize, n: usize, tw: usize| -> Group {
             let mw = mwords(k, n, tw);
             let mut bytes = Vec::with_capacity(routed.len() * which.len() * mw * 4);
@@ -299,11 +309,12 @@ impl Exl3MoeGrouped {
         let one = |d: &Exl3Data| Exl3Gpu::upload(b, Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None);
         let shared = [one(sg), one(su), one(sd)];
         if shared.iter().any(|s| s.single_chunk().is_none()) {
+            b.used.fetch_sub(group_bytes, Ordering::Relaxed);
             return Ok(None);
         }
         let shared = shared.map(|s| Arc::new(s) as Arc<dyn PackedLinear>);
         // the routed groups' bytes stay counted as long as the layer lives
-        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, gu_lora: None, down_lora: None }))
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: routed.len(), hidden, ff, gu, down, shared, gu_lora: None, down_lora: None, nbytes: group_bytes }))
     }
 
     /// `slots` places for experts of a layer of `hidden -> ff` experts (`tw` words a tile: the gate and up matrices',
@@ -311,7 +322,7 @@ impl Exl3MoeGrouped {
     /// makes a layer's experts, with slots where experts. None where the groups would be past a binding or the budget
     /// less `reserve`.
     pub(super) fn with_slots(b: &WgpuBackend, slots: usize, hidden: usize, ff: usize, tw: [usize; 2], shared: &[Exl3Data; 3], reserve: u64) -> Result<Option<Exl3MoeGrouped>, String> {
-        if slots == 0 || hidden % 128 != 0 || ff % 128 != 0 {
+        if slots == 0 || hidden == 0 || ff == 0 || hidden % 128 != 0 || ff % 128 != 0 {
             return Ok(None);
         }
         for d in shared {
@@ -321,11 +332,13 @@ impl Exl3MoeGrouped {
         let (gu_words, d_words) = (mwords(hidden, ff, tw[0]), mwords(ff, hidden, tw[1]));
         let (gu_bytes, d_bytes) = ((2 * slots * gu_words * 4) as u64, (slots * d_words * 4) as u64);
         let tables = (slots * 3 * (hidden + ff) * 4) as u64;
+        let shared_bytes: u64 = shared.iter().map(|d| d.words.len() as u64 * 4).sum();
         let limit = chunk_limit(&b.gpu.limits);
         if gu_bytes > limit || d_bytes > limit {
             return Ok(None);
         }
-        let total = gu_bytes + d_bytes + tables;
+        let group_bytes = gu_bytes + d_bytes + tables;
+        let total = group_bytes + shared_bytes;
         let prev = b.used.fetch_add(total, Ordering::Relaxed);
         if prev + total > b.budget.saturating_sub(reserve) {
             b.used.fetch_sub(total, Ordering::Relaxed);
@@ -347,11 +360,11 @@ impl Exl3MoeGrouped {
         let one = |d: &Exl3Data| Exl3Gpu::upload(b, Exl3Data { words: d.words.clone(), suh: d.suh.clone(), svh: d.svh.clone(), tile_words: d.tile_words, input_map: d.input_map.clone(), output_map: d.output_map.clone() }, None);
         let shared = [one(&shared[0]), one(&shared[1]), one(&shared[2])];
         if shared.iter().any(|s| s.single_chunk().is_none()) {
-            b.used.fetch_sub(total, Ordering::Relaxed);
+            b.used.fetch_sub(group_bytes, Ordering::Relaxed);
             return Ok(None);
         }
         let shared = shared.map(|s| Arc::new(s) as Arc<dyn PackedLinear>);
-        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: slots, hidden, ff, gu, down, shared, gu_lora: None, down_lora: None }))
+        Ok(Some(Exl3MoeGrouped { b: b.clone(), routed: slots, hidden, ff, gu, down, shared, gu_lora: None, down_lora: None, nbytes: group_bytes }))
     }
 
     /// Slot `slot`'s expert made `record`'s (as `layout` lays it out): its matrices' words and their transforms'

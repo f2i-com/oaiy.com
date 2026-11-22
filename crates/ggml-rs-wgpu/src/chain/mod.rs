@@ -488,19 +488,29 @@ impl Recorder<'_> {
     /// `b` written by what was just recorded: its int8 rows (if quantized) are stale.
     fn wrote(&mut self, b: &wgpu::Buffer) {
         let spare = &mut self.spare;
-        let mut stale = |(x, _, _, v): &(wgpu::Buffer, usize, usize, DeviceVec)| {
-            if x != b {
-                return true;
-            }
-            // what read its rows is recorded: the scratch may be written again (wgpu orders the two)
-            spare.push((buffer(v).size(), buffer(v).clone()));
-            false
-        };
+        // When `self.keep` is true, `q8` entries are persistent `Gpu::q8_kept` buffers (not pooled
+        // scratch) and must NEVER be recycled into `self.spare`, or later `scratch()` calls alias them.
         if !self.q8.is_empty() {
-            self.q8.retain(&mut stale);
+            let recycle_q8 = !self.keep;
+            self.q8.retain(|(x, _, _, v)| {
+                if x != b {
+                    return true;
+                }
+                if recycle_q8 {
+                    spare.push((buffer(v).size(), buffer(v).clone()));
+                }
+                false
+            });
         }
         if !self.x16.is_empty() {
-            self.x16.retain(&mut stale);
+            self.x16.retain(|(x, _, _, v)| {
+                if x != b {
+                    return true;
+                }
+                // `x16_tiled` always allocates from `self.scratch()`.
+                spare.push((buffer(v).size(), buffer(v).clone()));
+                false
+            });
         }
     }
 

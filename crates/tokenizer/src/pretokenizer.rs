@@ -74,15 +74,28 @@ pub fn split_qwen3(text:&str)->Vec<&str>{
     split_with_lookahead(re, text)
 }
 
+/// GPT-4o (`o200k_base`) / Inkling-2 pretokenizer regex, with its trailing
+/// `\s+(?!\S)|\s+` whitespace lookahead handled by [`split_with_lookahead`].
+pub fn split_gpt4o(text: &str) -> Vec<&str> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        Regex::new(
+            r#"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+"#
+        )
+        .expect("GPT-4o / Inkling-2 pretokenizer regex compiles")
+    });
+    split_with_lookahead(re, text)
+}
+
 #[cfg(test)]
 mod lookahead_tests {
     use super::*;
 
-    /// A run of whitespace before a word leaves its last character to the word, in both splitters; Llama's digits
-    /// come three at a time and Qwen's one by one.
+    /// A run of whitespace before a word leaves its last character to the word, in all splitters; Llama's & GPT-4o's
+    /// digits come three at a time and Qwen's one by one.
     #[test]
     fn whitespace_before_a_word_leaves_it_one_space() {
-        for split in [split_llama3 as fn(&str) -> Vec<&str>, split_qwen3] {
+        for split in [split_llama3 as fn(&str) -> Vec<&str>, split_qwen3, split_gpt4o] {
             assert_eq!(split("fn f() {\n    let v = 1;\n}"), ["fn", " f", "()", " {\n", "   ", " let", " v", " =", " ", "1", ";\n", "}"]);
             assert_eq!(split("a  b"), ["a", " ", " b"]);
             assert_eq!(split("a b"), ["a", " b"]);
@@ -91,7 +104,12 @@ mod lookahead_tests {
             assert_eq!(split("\t\tif"), ["\t", "\tif"]);
         }
         assert_eq!(split_llama3("in 2026 and 12345"), ["in", " ", "202", "6", " and", " ", "123", "45"]);
+        assert_eq!(split_gpt4o("in 2026 and 12345"), ["in", " ", "202", "6", " and", " ", "123", "45"]);
         assert_eq!(split_qwen3("in 2026"), ["in", " ", "2", "0", "2", "6"]);
+        // GPT-4o / Inkling-2 attaches English contractions to the preceding word and splits camelCase runs.
+        assert_eq!(split_gpt4o("don't CamelCase"), ["don't", " Camel", "Case"]);
+        assert_eq!(split_gpt4o("a/b"), ["a", "/b"]);
+        assert_eq!(split_gpt4o("a//b"), ["a", "//", "b"]);
     }
 }
 

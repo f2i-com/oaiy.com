@@ -76,6 +76,12 @@ pub enum Architecture {
     /// `leading_dense_block_count` layers and routed experts (sigmoid-gated, a selection bias) in the rest. Served as a
     /// Qwen3.5 hybrid whose recurrent layers are short convs (see `qwen35.rs`).
     Lfm2Moe,
+    /// Thinking Machines Lab Inkling-2 (`inkling2`): non-looped hybrid SWA/full-attention NoPE
+    /// + relative position bias + shortconv + depthwise AttnRes + SiTU MoE.
+    Inkling2,
+    /// Thinking Machines Lab Inkling-2-Mini (`inkling2_loop`): looped-core Inkling-2 with
+    /// prelude + 3-pass recurrent core with cross-pass message bank & 4-way controllers + postlude.
+    Inkling2Loop,
     /// Architectures recognized but not yet implemented.
     Unsupported(String),
 }
@@ -98,6 +104,8 @@ impl Architecture {
             "qwen36moevl"  => Self::Qwen36MoeVl,
             "glm5next"     => Self::Glm5Next,
             "lfm2moe"      => Self::Lfm2Moe,
+            "inkling2"     => Self::Inkling2,
+            "inkling2_loop" => Self::Inkling2Loop,
             other          => Self::Unsupported(other.to_string()),
         }
     }
@@ -121,6 +129,8 @@ impl Architecture {
             Self::Qwen36MoeVl => "qwen36moevl",
             Self::Glm5Next    => "glm5next",
             Self::Lfm2Moe     => "lfm2moe",
+            Self::Inkling2    => "inkling2",
+            Self::Inkling2Loop => "inkling2_loop",
             Self::Unsupported(s) => s.as_str(),
         }
     }
@@ -136,11 +146,11 @@ impl Architecture {
             Self::Qwen2 | Self::Qwen3 | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Moe |
             Self::Qwen3Vl | Self::Qwen3VlMoe | Self::Qwen36MoeVl |
             Self::Gemma3 | Self::Gemma3n | Self::Gemma4 | Self::Lfm2Moe => RopeType::NeoX,
-            // glm5next is NoPE — `rope.dimension_count` is 0 and
+            // glm5next and inkling2/inkling2_loop are NoPE — `rope.dimension_count` is 0 and
             // the GGUF carries no rope tensors, so this value is never applied.
             // It is reported rather than left to the fallback so `OAIY info`
             // does not imply a rotation the arch never performs.
-            Self::Glm5Next => RopeType::NeoX,
+            Self::Glm5Next | Self::Inkling2 | Self::Inkling2Loop => RopeType::NeoX,
             Self::Unsupported(_) => RopeType::NeoX,
         }
     }
@@ -246,7 +256,21 @@ impl ModelConfig {
         // Gemma 3n stores `feed_forward_length` as a per-layer array, not a
         // scalar — the stub loader doesn't use the value, so 0 is a safe sentinel.
         let ff_dim         = get_u64("feed_forward_length").map(|v| v as usize).unwrap_or(0);
-        let n_heads        = get_u64("attention.head_count")? as usize;
+        // Inkling-2 stores `attention.head_count` as a per-layer array (e.g. 24 on SWA, 16 on full).
+        let n_heads        = match get_u64("attention.head_count") {
+            Ok(v) => v as usize,
+            Err(e) => g.metadata()
+                .get(&format!("{ns}.attention.head_count"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| match a {
+                    Array::U32(v) => v.iter().copied().max().map(|x| x as usize),
+                    Array::I32(v) => v.iter().copied().max().map(|x| x.max(0) as usize),
+                    Array::U64(v) => v.iter().copied().max().map(|x| x as usize),
+                    Array::I64(v) => v.iter().copied().max().map(|x| x.max(0) as usize),
+                    _ => None,
+                })
+                .ok_or(e)?,
+        };
 
         // glm5next stores `attention.head_count_kv` as a 0/1
         // array (0 = KDA linear-attention layer, 1 = full MLA), not a scalar.
@@ -292,10 +316,9 @@ impl ModelConfig {
                 "attention.head_count_kv array marks every layer recurrent; the arch needs \n                 at least one full-attention layer".into())),
             None => get_u64_or("attention.head_count_kv", n_heads as u64) as usize,
         };
-        // Gemma 4's array holds each layer's real KV head count: the sliding layers' and the full-attention layers'
-        // differ (8 and 1 in a 12B whose full layers share K as V, 8 and 2 in the 26B-A4B). The scalar is the largest,
-        // as for LFM2; a layer's own is `layer_kv_heads`.
-        let kv_heads_per_layer: Option<Vec<usize>> = (arch == Architecture::Gemma4)
+        // Gemma 4 and Inkling-2 store each layer's real KV head count as an array;
+        // the scalar `n_kv_heads` is the largest (or min for clean divisibility).
+        let kv_heads_per_layer: Option<Vec<usize>> = matches!(arch, Architecture::Gemma4 | Architecture::Inkling2 | Architecture::Inkling2Loop)
             .then(|| g.metadata().get(&format!("{ns}.attention.head_count_kv")).and_then(|v| v.as_array()).and_then(|a| match a {
                 Array::U32(v) => Some(v.iter().map(|&x| x as usize).collect::<Vec<usize>>()),
                 Array::I32(v) => Some(v.iter().map(|&x| x.max(0) as usize).collect()),

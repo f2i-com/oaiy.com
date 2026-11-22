@@ -349,6 +349,8 @@ impl<'g> TensorIndex<'g> {
     }
 
     pub fn has(&self, name: &str) -> bool { self.by_name.contains_key(name) }
+
+    pub fn info(&self, name: &str) -> Option<&'g TensorInfo> { self.by_name.get(name).copied() }
 }
 
 /// FFN gate & up projections for a SwiGLU/GeGLU MLP.

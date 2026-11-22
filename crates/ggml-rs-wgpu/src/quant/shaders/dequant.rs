@@ -81,10 +81,11 @@ fn dequant(bb: u32, sub: u32) {
 "#;
 
 pub(super) const IQ4_NL: &str = r#"
+// (on the GPU its nibbles after a 2-byte gap: `padded_block`)
 fn dequant(bb: u32, sub: u32) {
     let d = f16at(bb);
     for (var i = 0u; i < 16u; i++) {
-        let q = byte(bb + 2u + i);
+        let q = byte(bb + 4u + i);
         v[i] = d * KVALUES[q & 15u];
         v[i + 16u] = d * KVALUES[q >> 4u];
     }

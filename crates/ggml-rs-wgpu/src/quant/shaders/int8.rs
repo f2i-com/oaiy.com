@@ -206,7 +206,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
         GgmlType::Q6_K => (false, if mr == 1 { 4u32 } else { 16u32 }, 256u32),
-        GgmlType::Q4_0 | GgmlType::Q8_0 => (false, 1u32, 32u32),
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::IQ4_NL => (false, 1u32, 32u32),
         _ => return None,
     };
     let mut s = String::new();
@@ -235,6 +235,18 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
     l("fn q3_bytes(qw: u32, hw: u32, j: u32, h: u32) -> u32 {");
     l("    return ((qw >> (2u * j)) & 0x03030303u) | (((hw >> (j + 4u * h)) & 0x01010101u) << 2u);");
     l("}");
+    if dtype == GgmlType::IQ4_NL {
+        l("// IQ4_NL: branchless nibble -> signed i8 LUT (KVALUES_IQ4NL packed into four u32 constants, zero constant-array spills).");
+        l("fn iq4_byte(k: u32) -> u32 {");
+        l("    let w01 = select(0xbfad9881u, 0xf6eaddcfu, (k & 4u) != 0u);");
+        l("    let w23 = select(0x26190d01u, 0x71594535u, (k & 4u) != 0u);");
+        l("    let ww = select(w01, w23, (k & 8u) != 0u);");
+        l("    return (ww >> ((k & 3u) * 8u)) & 0xffu;");
+        l("}");
+        l("fn iq4_pack(q: u32) -> u32 {");
+        l("    return iq4_byte(q & 15u) | (iq4_byte((q >> 8u) & 15u) << 8u) | (iq4_byte((q >> 16u) & 15u) << 16u) | (iq4_byte((q >> 24u) & 15u) << 24u);");
+        l("}");
+    }
     l(&format!("@compute @workgroup_size({})", q8_threads(subgroups)));
     if subgroups {
         // (a subgroup's lanes and which of the eight it is as the device has them: its sums are its own lanes')
@@ -393,6 +405,30 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
                     let dh: Vec<String> = comps.iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(hi{i}_{wi}, xhi{m}.{comp})")).collect();
                     l(&format!("        let pq{i}_{m} = {} + {};", dl.join(" + "), dh.join(" + ")));
                     l(&format!("        acc{i}_{m} += d{i} * (sx{m}.x * f32(pq{i}_{m}) - 8.0 * (sx{m}.y + sx{m}.z));"));
+                }
+            }
+        }
+        GgmlType::IQ4_NL => {
+            // a block of 32 a task (padded to 20 bytes like Q4_0), each nibble mapped directly to its signed i8 LUT value
+            l("        let blk = c;");
+            for m in 0..mr {
+                l(&format!("        let xlo{m} = x8[xr{m} * k16 + blk * 2u];"));
+                l(&format!("        let xhi{m} = x8[xr{m} * k16 + blk * 2u + 1u];"));
+                l(&format!("        let sx{m} = bitcast<vec4<f32>>(x8[p.xs_at + xr{m} * k32 + blk]);"));
+            }
+            for i in 0..r {
+                l(&format!("        let bw{i} = (rr{i} * p.row_bytes + blk * 20u) / 4u;"));
+                l(&format!("        let d{i} = unpack2x16float(w[bw{i}] & 0xffffu).x;"));
+                for wi in 0..4 {
+                    l(&format!("        let qw{i}_{wi} = w[bw{i} + {}u];", wi + 1));
+                    l(&format!("        let lo{i}_{wi} = iq4_pack(qw{i}_{wi} & 0x0f0f0f0fu);"));
+                    l(&format!("        let hi{i}_{wi} = iq4_pack((qw{i}_{wi} >> 4u) & 0x0f0f0f0fu);"));
+                }
+                for m in 0..mr {
+                    let dl: Vec<String> = comps.iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(lo{i}_{wi}, xlo{m}.{comp})")).collect();
+                    let dh: Vec<String> = comps.iter().enumerate().map(|(wi, comp)| format!("dot4I8Packed(hi{i}_{wi}, xhi{m}.{comp})")).collect();
+                    l(&format!("        let pq{i}_{m} = {} + {};", dl.join(" + "), dh.join(" + ")));
+                    l(&format!("        acc{i}_{m} += d{i} * sx{m}.x * f32(pq{i}_{m});"));
                 }
             }
         }

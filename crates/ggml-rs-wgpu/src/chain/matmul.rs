@@ -389,8 +389,8 @@ impl Recorder<'_> {
     fn matmul_rows_q8_into(&mut self, w: &QuantizedTensor, x: &DeviceVec, y: &DeviceVec, m: usize, add: bool) -> bool {
         let q = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).expect("a weight this adapter holds");
         let (n, k) = (w.shape()[0], w.shape()[1]);
-        let block = if matches!(q.dtype, ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) { 32 } else { 256 };
-        if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0) || k % block != 0 {
+        let block = if matches!(q.dtype, ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0 | ggml_quants::GgmlType::IQ4_NL) { 32 } else { 256 };
+        if !matches!(q.dtype, ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K | ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0 | ggml_quants::GgmlType::IQ4_NL) || k % block != 0 {
             return false;
         }
         // (Q8_0 not where a recording's rows are alike: its rows by f32 there, as before. A few rows' int8 kernel for
@@ -421,6 +421,8 @@ impl Recorder<'_> {
             (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-multi",
             (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode",
             (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-multi",
+            (ggml_quants::GgmlType::IQ4_NL, true) => "chain-q8-IQ4_NL-decode",
+            (ggml_quants::GgmlType::IQ4_NL, false) => "chain-q8-IQ4_NL-multi",
             (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode",
             (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-multi",
             (_, true) => "chain-q8-Q6_K-decode",
@@ -439,12 +441,14 @@ impl Recorder<'_> {
                     (ggml_quants::GgmlType::Q4_K, false) => "chain-q8-Q4_K-decode-split",
                     (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-decode-split",
                     (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-decode-split",
+                    (ggml_quants::GgmlType::IQ4_NL, false) => "chain-q8-IQ4_NL-decode-split",
                     (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-decode-split",
                     (_, false) => "chain-q8-Q6_K-decode-split",
                     (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode-split-add",
                     (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode-split-add",
                     (ggml_quants::GgmlType::Q5_K, true) => "chain-q8-Q5_K-decode-split-add",
                     (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode-split-add",
+                    (ggml_quants::GgmlType::IQ4_NL, true) => "chain-q8-IQ4_NL-decode-split-add",
                     (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode-split-add",
                     (_, true) => "chain-q8-Q6_K-decode-split-add",
                 };
@@ -504,7 +508,7 @@ fn moe_fused() -> bool {
 pub(crate) fn decode_in_int8(backend: &WgpuBackend, w: &QuantizedTensor) -> bool {
     use ggml_quants::GgmlType;
     let Some(dtype) = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).map(|q| q.dtype) else { return false };
-    if !matches!(dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q4_0 | GgmlType::Q8_0) {
+    if !matches!(dtype, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::IQ4_NL) {
         return false;
     }
     let gpu = &backend.gpu;
@@ -669,7 +673,7 @@ fn time_decode(backend: &WgpuBackend, dtype: ggml_quants::GgmlType) -> Option<(f
     use ggml_quants::GgmlType;
     let (n, k) = (4096usize, 4096usize);
     let (block, bytes) = match dtype {
-        GgmlType::Q4_0 => (32, 18),
+        GgmlType::Q4_0 | GgmlType::IQ4_NL => (32, 18),
         GgmlType::Q8_0 => (32, 34),
         GgmlType::Q3_K => (256, 110),
         GgmlType::Q4_K => (256, 144),

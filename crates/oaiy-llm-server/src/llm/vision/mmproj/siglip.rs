@@ -160,6 +160,7 @@ impl SigLipMmProj {
             ProjectorKind::Gemma4V => unreachable!("Gemma4V loader not yet implemented"),
             ProjectorKind::Qwen3Vl => unreachable!("Qwen3Vl handled by separate loader (returns Err in MmProj::from_gguf)"),
             ProjectorKind::MiniCpmV => unreachable!("MiniCpmV has its own loader"),
+            ProjectorKind::Inkling2V => unreachable!("Inkling2V has its own loader"),
         };
 
         verify_shapes(&config, &patch_embd, &patch_embd_b, &position_embd,

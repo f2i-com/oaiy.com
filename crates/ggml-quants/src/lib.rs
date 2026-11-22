@@ -12,6 +12,7 @@
 
 pub mod dtype;
 pub mod error;
+pub mod f32_dot;
 
 // The block formats, a module each under the name GGML gives it (`q4_k`, `iq4_xs`, ...), their files grouped by
 // family: ggml's first formats (32 values a block and a scale, Q4_1's and Q5_1's a minimum too) with Q2_0; the
@@ -126,6 +127,23 @@ pub(crate) fn read_f16(bytes: &[u8]) -> f32 {
     f16::from_bits(bits).to_f32()
 }
 
+/// Fast branch-minimal IEEE-754 f16 -> f32 bit decode (identical to `half::f16::to_f32`
+/// for every finite and infinite value, without table lookups).
+#[inline(always)]
+pub(crate) fn read_f16_fast(bytes: &[u8]) -> f32 {
+    let h = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
+    let sign = (h & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let mant = h & 0x03FF;
+    if exp == 0 {
+        f32::from_bits(sign | ((mant as f32) * (1.0 / 16_777_216.0)).to_bits())
+    } else if exp == 0x1F {
+        f32::from_bits(sign | 0x7F80_0000 | (mant << 13))
+    } else {
+        f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +170,20 @@ mod tests {
         dequantize(GgmlType::F16, &bytes, &mut out).unwrap();
         for (a, b) in out.iter().zip(xs.iter()) {
             assert!((a - b).abs() < 1e-3, "f16 dequant: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn read_f16_fast_matches_half_for_all_u16() {
+        for bits in 0u16..=u16::MAX {
+            let b = bits.to_le_bytes();
+            let got = read_f16_fast(&b);
+            let want = read_f16(&b);
+            if want.is_nan() {
+                assert!(got.is_nan(), "bits=0x{bits:04x}: expected NaN, got {got}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "bits=0x{bits:04x}: {got} vs {want}");
+            }
         }
     }
 

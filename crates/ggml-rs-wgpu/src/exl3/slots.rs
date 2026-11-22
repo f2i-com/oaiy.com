@@ -126,7 +126,7 @@ impl WgpuBackend {
     }
 
     fn exl3_slots_with(&self, slots: usize, hidden: usize, ff: usize, tw: [usize; 2], mapped: bool) -> Option<Exl3Slots> {
-        if slots == 0 || hidden % 128 != 0 || ff % 128 != 0 || !tw.iter().all(|t| matches!(t, 16 | 24 | 32 | 40 | 48 | 56 | 64 | 80 | 96 | 112 | 128)) {
+        if slots == 0 || hidden == 0 || ff == 0 || hidden % 128 != 0 || ff % 128 != 0 || !tw.iter().all(|t| matches!(t, 16 | 24 | 32 | 40 | 48 | 56 | 64 | 80 | 96 | 112 | 128)) {
             return None;
         }
         let mwords = |k: usize, n: usize, tw: usize| k / 16 * n / 16 * (tw / 2);

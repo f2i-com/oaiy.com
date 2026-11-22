@@ -1638,9 +1638,9 @@ pub fn moe_route_topk_host(logits: &[f32], top_k: usize, n_experts: usize) -> (V
     let mut weights = Vec::with_capacity(seq * k);
     for row in logits.chunks_exact(n_experts) {
         let mut pairs: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
-        pairs.select_nth_unstable_by(k.saturating_sub(1), |a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.select_nth_unstable_by(k.saturating_sub(1), |a, b| b.1.total_cmp(&a.1));
         pairs.truncate(k);
-        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
         let max_l = pairs[0].1;
         let exps: Vec<f32> = pairs.iter().map(|(_, l)| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();

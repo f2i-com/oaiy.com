@@ -50,6 +50,8 @@ pub enum Kind {
     OrcaSaq,
     /// Qwen3.8-Flash-Next (`qwen4_exp`) with EXL3 trellis safetensors.
     FlashNext,
+    /// Thinking Machines Lab Inkling-2 / Inkling-2-Mini native safetensors checkpoint directory.
+    Inkling2,
     /// `dsv41-cuda`: a safetensors checkpoint directory with Engram tables.
     Deepseek,
     /// `llm`: a GGUF file, or a directory holding one.
@@ -57,11 +59,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Recognize EXL3 Qwen checkpoints by config, GGUF by extension, then
+    /// Recognize EXL3 Qwen checkpoints and Inkling-2 safetensors by config, GGUF by extension, then
     /// fall back to the existing DeepSeek checkpoint loader.
     pub fn detect(path: &Path) -> Kind {
         if orcasaq_checkpoint(path) { return Kind::OrcaSaq; }
         if flashnext_checkpoint(path) { return Kind::FlashNext; }
+        if crate::llm::arch::inkling2::safetensors::is_inkling2_checkpoint(path) { return Kind::Inkling2; }
         // (DeepSeek-V4.1 from a GGUF, llama.cpp's `deepseek41`: the DeepSeek engine reads it)
         if crate::dsv41::gguf_file::backbone(path).is_some() { return Kind::Deepseek; }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
@@ -128,6 +131,9 @@ pub enum Flavour {
     Chatml(Arc<tokenizer::Tokenizer>, Option<String>),
     /// LFM2 (`lfm2moe`, served as a Qwen3.5 hybrid): its own template and Python-list calls (`crate::engines::lfm2`).
     Lfm2(Arc<tokenizer::Tokenizer>),
+    /// Thinking Machines Lab Inkling-2 / Inkling-2-Mini (GGUF or native safetensors):
+    /// native `<|message_*|>` / `<|content_*|>` chat template, tool declarations, and optional vision (`bool`).
+    Inkling2(Arc<tokenizer::Tokenizer>, bool),
     /// A dense GGUF (Llama, Mistral, Qwen2, Qwen3, Gemma 3 / 3n / 4): its own architecture's template, whether its
     /// own template opens the reply on an empty thought channel (see `dense_prompt`), the marker a picture
     /// stands as in its prompt where it reads pictures (Gemma 4's `<|image|>`, with its vision projector), and the
@@ -140,7 +146,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // `llm` applies BOS through the template, so not again here.
-            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Chatml(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Chatml(t, _) | Self::Lfm2(t) | Self::Inkling2(t, _) | Self::Dense(t, ..) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -150,7 +156,8 @@ impl Flavour {
             Self::Deepseek(_) => Some(crate::dsv41::chat::IMAGE),
             Self::Qwen(..) | Self::Chatml(..) => Some("<|image_pad|>"),
             Self::Gguf(_, marker) | Self::Dense(_, _, _, marker, _) => *marker,
-            Self::Lfm2(_) => None,
+            Self::Inkling2(_, true) => Some(crate::engines::inkling2::IMAGE_PLACEHOLDER),
+            Self::Inkling2(_, false) | Self::Lfm2(_) => None,
         }
     }
 
@@ -160,7 +167,7 @@ impl Flavour {
         let keep = self.written_picture();
         match self {
             Self::Deepseek(t) => t.literal(text, keep).into_owned(),
-            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Chatml(t, _) | Self::Lfm2(t) | Self::Dense(t, ..) => t.literal(text, keep).into_owned(),
+            Self::Gguf(t, _) | Self::Qwen(t, _) | Self::Chatml(t, _) | Self::Lfm2(t) | Self::Inkling2(t, _) | Self::Dense(t, ..) => t.literal(text, keep).into_owned(),
         }
     }
 
@@ -226,6 +233,7 @@ impl Flavour {
             Self::Qwen(_, style) => crate::engines::qwen::chat_prompt_as(msgs, opts, *style),
             Self::Chatml(_, system) => crate::engines::qwen::chatml_prompt(msgs, opts, system.as_deref()),
             Self::Lfm2(_) => crate::engines::lfm2::chat_prompt(msgs, opts),
+            Self::Inkling2(_, allow_images) => crate::engines::inkling2::chat_prompt(msgs, opts, *allow_images),
             Self::Gguf(_, marker) => {
                 // The same messages through `llm`'s GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
@@ -743,8 +751,8 @@ impl Models {
             }
         }
         for name in opts.vision_projectors.keys() {
-            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq | Kind::FlashNext | Kind::Deepseek)) {
-                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF, OrcaSAQ, Flash-Next or DeepSeek-V4.1 model")));
+            if !specs.iter().any(|s| &s.name==name && matches!(s.kind, Kind::Gguf | Kind::OrcaSaq | Kind::FlashNext | Kind::Inkling2 | Kind::Deepseek)) {
+                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF, OrcaSAQ, Flash-Next, Inkling-2 or DeepSeek-V4.1 model")));
             }
         }
         for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
@@ -788,7 +796,7 @@ impl Models {
         let models = self.specs.iter().map(|s| Json::obj([
             ("model",Json::str(&s.name)),
             ("loaded",Json::Bool(loaded.as_deref()==Some(&s.name))),
-            ("vision_configured",Json::Bool(self.opts.vision && self.opts.vision_projectors.contains_key(&s.name))),
+            ("vision_configured",Json::Bool(self.opts.vision && (self.opts.vision_projectors.contains_key(&s.name) || s.kind == Kind::Inkling2))),
             ("timing",timings.get(&s.name).cloned().unwrap_or(Json::Null)),
         ])).collect();
         Json::obj([("models",Json::Arr(models)),("resident_model_limit",Json::Int(1)),
@@ -923,6 +931,7 @@ impl Models {
                 "{} is a DeepSeek checkpoint, which needs the CUDA or the WebGPU build; this build serves GGUF models",
                 spec.name
             ))),
+            Kind::Inkling2 => self.load_inkling2_safetensors(&spec),
             Kind::Gguf => self.load_gguf(&spec),
         }
         .map_err(|e| format!("loading {}: {e}", spec.name))?;
@@ -1004,6 +1013,7 @@ impl Models {
             minicpmv: None,
             gemma_vision: None,
             glm_vision: None,
+            inkling_vision: None,
             image_token_id: None,
             local_images: o.local_images_or_default(self.loopback),
         }
@@ -1584,6 +1594,96 @@ impl Models {
         let _ = (name, backend);
     }
 
+    // ---------------------------------------------------------------- Inkling-2
+    fn finish_inkling2(
+        &self,
+        spec: &Spec,
+        model: crate::llm::Inkling2Model,
+        vision: Option<crate::llm::arch::inkling2::vision::Inkling2Vision>,
+        backend: &Arc<dyn ggml_rs::Backend>,
+    ) -> Result<Live> {
+        let o = &self.opts;
+        self.say_placement(&spec.name, backend.as_ref());
+        let tok = Arc::new(model.tokenizer.clone());
+        let row = model.cfg.full_kv_bytes_per_position();
+        let spare = self.activations_spare();
+        let base = self.dense_context(model.cfg.context_length);
+        let max_seq = self.auto_context(&spec.name, base, model.cfg.context_length, AUTO_CTX, |n| {
+            Some(room_for(row.saturating_mul(n as u64), spare, None, host_free()?))
+        });
+        let mut cfg = self.base_cfg(spec, max_seq);
+        cfg.image_token_id = tok.token_id(crate::engines::inkling2::IMAGE_PLACEHOLDER);
+        if let Some(v) = &vision {
+            let max_tokens = o
+                .image_tokens
+                .unwrap_or(crate::llm::arch::inkling2::vision::DEFAULT_MAX_IMAGE_TOKENS);
+            cfg.inkling_vision = Some(api::InklingVision {
+                cfg: v.cfg.clone(),
+                max_tokens,
+            });
+        }
+        let has_vision = vision.is_some() && cfg.image_token_id.is_some();
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let engine = crate::engines::inkling2::Inkling2Engine::new(
+            model,
+            vision.map(Arc::new),
+            Arc::clone(&tok),
+            max_seq,
+            !o.quiet && !o.silent,
+        );
+        let thread = std::thread::Builder::new()
+            .name("inkling2-model".into())
+            .spawn(move || engine.run(rx))
+            .map_err(Error::Io)?;
+        Ok(Live {
+            name: spec.name.clone(),
+            jobs,
+            thread,
+            cfg: Arc::new(cfg),
+            flavour: Arc::new(Flavour::Inkling2(tok, has_vision)),
+        })
+    }
+
+    fn load_inkling2_safetensors(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        let devices = self.devices_of(spec);
+        let picked = crate::engines::backend::open(o, &devices)?;
+        self.say(format!(
+            "{} runs on {} (Inkling-2 native safetensors: BF16 dense trunk, NVFP4/MXFP8 routed experts)",
+            spec.name, picked.label
+        ));
+        let backend = Arc::clone(&picked.backend);
+        let expert_budget = o.expert_cache_bytes().min(usize::MAX as u64) as usize;
+        let (model, mut vision) = crate::llm::Inkling2Model::from_safetensors(
+            &spec.path,
+            Arc::clone(&backend),
+            expert_budget,
+            o.vision,
+        )
+        .map_err(|e| Error::Arg(e.to_string()))?;
+
+        if vision.is_some() {
+            self.say(format!("{}: built-in Inkling-2 vision tower loaded", spec.name));
+        } else if let Some(p) = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
+            if p.is_file() {
+                let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                let v = crate::llm::arch::inkling2::vision::Inkling2Vision::from_gguf(&file, Arc::clone(&backend))
+                    .map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                if v.cfg.text_hidden_size != model.cfg.hidden {
+                    return Err(Error::Arg(format!(
+                        "{}: vision projector width {} != model hidden {}",
+                        p.display(),
+                        v.cfg.text_hidden_size,
+                        model.cfg.hidden
+                    )));
+                }
+                self.say(format!("{}: Inkling-2 vision projector loaded from {}", spec.name, p.display()));
+                vision = Some(v);
+            }
+        }
+        self.finish_inkling2(spec, model, vision, &backend)
+    }
+
     // ---------------------------------------------------------------- GGUF
     /// A Qwen3.5-MoE GGUF (`qwen35moe`), or an LFM2-MoE one (`lfm2moe`), as a Qwen3.5 hybrid with routed experts: each layer's experts held by the GPU's
     /// kernels (`QuantMoe`: the K-quants, the GSQ-RCO types) where its budget has room, else run on the host; a chained
@@ -1631,6 +1731,49 @@ impl Models {
         self.say(format!("{} runs on {}", spec.name, picked.label));
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
+        if matches!(gguf.get_str("general.architecture").ok(), Some("inkling2" | "inkling2_loop")) {
+            let model = crate::llm::Inkling2Model::from_gguf(&gguf, Arc::clone(&backend))
+                .map_err(|e| Error::Arg(e.to_string()))?;
+            drop(gguf);
+            let vision = if o.vision {
+                match o.vision_projectors.get(&spec.name) {
+                    Some(p) => {
+                        let (tower_backend, said) = crate::engines::backend::for_vision(&backend);
+                        if let Some(said) = said {
+                            self.say(format!("{}: {said}", spec.name));
+                        }
+                        let v = if p.is_dir() {
+                            let st = oaiy_engine::safetensors::StIndex::open(p)
+                                .map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                            let (_, vc, _) = crate::llm::arch::inkling2::safetensors::parse_hf_config(p)
+                                .map_err(|e| Error::Arg(e.to_string()))?;
+                            let vc = vc.ok_or_else(|| Error::Arg(format!("{}: no vision_config in config.json", p.display())))?;
+                            crate::llm::arch::inkling2::vision::Inkling2Vision::from_safetensors(&st, vc, tower_backend)
+                                .map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?
+                        } else {
+                            let file = gguf::GgufFile::open(p)
+                                .map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
+                            crate::llm::arch::inkling2::vision::Inkling2Vision::from_gguf(&file, tower_backend)
+                                .map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?
+                        };
+                        if v.cfg.text_hidden_size != model.cfg.hidden {
+                            return Err(Error::Arg(format!(
+                                "{}: vision projector width {} != model hidden {}",
+                                p.display(),
+                                v.cfg.text_hidden_size,
+                                model.cfg.hidden
+                            )));
+                        }
+                        self.say(format!("{}: Inkling-2 vision projector loaded from {}", spec.name, p.display()));
+                        Some(v)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            return self.finish_inkling2(spec, model, vision, &backend);
+        }
         // (Qwen3.5-MoE, `qwen35moe`: Qwen3.6-35B-A3B's and MiniCPM-V 4.7 35B-A3B's architecture, the Qwen3.5 hybrid's
         // layers with routed experts, which a GPU's kernels hold; and LFM2-MoE, `lfm2moe`, a hybrid of short convs and
         // attention with experts, served as one: LFM2.5-24B-A2B's)

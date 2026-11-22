@@ -752,7 +752,7 @@ impl WgpuBackend {
             return None;
         }
         let chunks = self.gpu.upload_rows(&q.gpu_bytes(), q.row_bytes, 1);
-        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: Arc::clone(&self.used), host: false, file: None };
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: Some(Arc::clone(&self.used)), host: false, file: None };
         Some(QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec()))
     }
 
@@ -805,7 +805,7 @@ impl WgpuBackend {
             Some((host, gpu, at)) => self.gpu.upload_rows(&shaders::pad_blocks(w.bytes(), host, gpu, at), row_bytes, 1),
             None => self.gpu.upload_rows(w.bytes(), row_bytes, 1),
         };
-        let (nbytes, used) = if budgeted { (nbytes, Arc::clone(&self.used)) } else { (0, Arc::new(AtomicU64::new(0))) };
+        let used = budgeted.then(|| Arc::clone(&self.used));
         let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype: w.dtype(), chunks, row_bytes, nbytes, used, host: false, file: None };
         QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec())
     }

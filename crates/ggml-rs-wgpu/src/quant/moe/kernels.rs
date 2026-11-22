@@ -8,6 +8,8 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Kind {
     Q2_0,
+    IQ4_NL,
+    Q8_0,
     IQ2_S,
     IQ2_XXS,
     IQ2_XS,
@@ -21,6 +23,8 @@ impl Kind {
     pub(super) fn of(t: GgmlType) -> Option<Kind> {
         match t {
             GgmlType::Q2_0 => Some(Kind::Q2_0),
+            GgmlType::IQ4_NL => Some(Kind::IQ4_NL),
+            GgmlType::Q8_0 => Some(Kind::Q8_0),
             GgmlType::IQ2_S => Some(Kind::IQ2_S),
             GgmlType::IQ2_XXS => Some(Kind::IQ2_XXS),
             GgmlType::IQ2_XS => Some(Kind::IQ2_XS),
@@ -35,6 +39,8 @@ impl Kind {
     pub(super) fn tag(self) -> &'static str {
         match self {
             Kind::Q2_0 => "q2_0",
+            Kind::IQ4_NL => "iq4_nl",
+            Kind::Q8_0 => "q8_0",
             Kind::IQ2_S => "iq2_s",
             Kind::IQ2_XXS => "iq2_xxs",
             Kind::IQ2_XS => "iq2_xs",
@@ -49,7 +55,7 @@ impl Kind {
     /// to whole ones).
     fn block(self) -> Option<(usize, usize)> {
         match self {
-            Kind::Q2_0 => None,
+            Kind::Q2_0 | Kind::IQ4_NL | Kind::Q8_0 => None,
             Kind::IQ2_S => Some((82, 21)),
             Kind::IQ2_XXS => Some((66, 17)),
             Kind::IQ2_XS => Some((74, 19)),
@@ -62,22 +68,32 @@ impl Kind {
 
     /// Whether a row of `k` weights is whole blocks of the type.
     pub(super) fn fits(self, k: usize) -> bool {
-        k % if self.block().is_some() { 256 } else { 64 } == 0
+        let blk = match self {
+            Kind::Q2_0 => 64,
+            Kind::IQ4_NL | Kind::Q8_0 => 32,
+            _ => 256,
+        };
+        k % blk == 0
     }
 
     /// The words a row of `k` weights takes on the GPU.
     pub(super) fn row_words(self, k: usize) -> usize {
-        match self.block() {
-            // a word 16 weights' codes, then a word two blocks' scales
-            None => k / 16 + (k / 64).div_ceil(2),
-            Some((_, words)) => k / 256 * words,
+        match self {
+            // Q2_0: a word 16 weights' codes, then a word two blocks' scales
+            Kind::Q2_0 => k / 16 + (k / 64).div_ceil(2),
+            // IQ4_NL: 32 weights = 1 word f16 scale + 4 words of nibbles
+            Kind::IQ4_NL => (k / 32) * 5,
+            // Q8_0: 32 weights = 1 word f16 scale + 8 words of signed int8
+            Kind::Q8_0 => (k / 32) * 9,
+            _ => k / 256 * self.block().expect("256-weight super-block").1,
         }
     }
 
     /// A row's blocks (`src`, `k` weights as the GGUF has them) as the GPU holds it (`dst`, [`Self::row_words`] long).
     pub(super) fn pack_row(self, src: &[u8], k: usize, dst: &mut [u32]) {
-        match self.block() {
-            None => {
+        let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        match self {
+            Kind::Q2_0 => {
                 let kw = k / 16;
                 dst[kw..].fill(0);
                 for (b, block) in src.chunks_exact(18).enumerate() {
@@ -87,8 +103,24 @@ impl Kind {
                     dst[kw + b / 2] |= (u16::from_le_bytes([block[0], block[1]]) as u32) << (16 * (b % 2));
                 }
             }
-            Some((bytes, words)) => {
-                let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            Kind::IQ4_NL => {
+                for (block, out) in src.chunks_exact(18).zip(dst.chunks_exact_mut(5)) {
+                    out[0] = u16::from_le_bytes([block[0], block[1]]) as u32;
+                    for i in 0..4 {
+                        out[1 + i] = le(&block[2 + 4 * i..]);
+                    }
+                }
+            }
+            Kind::Q8_0 => {
+                for (block, out) in src.chunks_exact(34).zip(dst.chunks_exact_mut(9)) {
+                    out[0] = u16::from_le_bytes([block[0], block[1]]) as u32;
+                    for i in 0..8 {
+                        out[1 + i] = le(&block[2 + 4 * i..]);
+                    }
+                }
+            }
+            _ => {
+                let (bytes, words) = self.block().expect("256-weight super-block");
                 for (block, out) in src.chunks_exact(bytes).zip(dst.chunks_exact_mut(words)) {
                     match self {
                         // the GGUF's: the scale (f16), 32 index bytes, 32 sign bytes, 8 bytes of the indices' high
@@ -139,7 +171,7 @@ impl Kind {
     pub(super) fn grid(self) -> Option<(&'static [u64], bool)> {
         use ggml_quants::iq_tables as t;
         match self {
-            Kind::Q2_0 | Kind::Q4_K | Kind::Q5_K | Kind::Q6_K => None,
+            Kind::Q2_0 | Kind::IQ4_NL | Kind::Q8_0 | Kind::Q4_K | Kind::Q5_K | Kind::Q6_K => None,
             Kind::IQ2_S => Some((&t::IQ2S_GRID, false)),
             Kind::IQ2_XXS => Some((&t::IQ2XXS_GRID, false)),
             Kind::IQ2_XS => Some((&t::IQ2XS_GRID, false)),
@@ -153,12 +185,14 @@ impl Kind {
         self.grid().map(|(g, signed)| grid_codes(g, signed).0)
     }
 
-    /// The type's decoder. Q2_0: `fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8>`, weights `16 kt + 8 hf
-    /// ..` (eight of them) of the row whose words start at `rb` of `words`, a row of `16 kw` weights. A grid type:
-    /// `fn sub_of(bw: u32, sub: u32) -> Sub`, what the 32 weights `32 sub ..` of the block at `bw` share, and `fn
-    /// grp(h: Sub, l: u32) -> array<f32, 8>`, its group `l` of four; `BLOCK_WORDS`; and the grid's binding.
+    /// The type's decoder. Q2_0 / IQ4_NL / Q8_0: `fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8>`, weights
+    /// `16 kt + 8 hf ..` (eight of them) of the row whose words start at `rb` of `words`, a row of `16 kw` weights. A
+    /// grid type: `fn sub_of(bw: u32, sub: u32) -> Sub`, what the 32 weights `32 sub ..` of the block at `bw` share, and
+    /// `fn grp(h: Sub, l: u32) -> array<f32, 8>`, its group `l` of four; `BLOCK_WORDS`; and the grid's binding.
     fn wgsl(self) -> String {
         match self {
+            Kind::IQ4_NL => return W8_IQ4_NL.to_string(),
+            Kind::Q8_0 => return W8_Q8_0.to_string(),
             Kind::Q4_K => return SUB_Q4_K.to_string(),
             Kind::Q5_K => return SUB_Q5_K.to_string(),
             Kind::Q6_K => return SUB_Q6_K.to_string(),
@@ -456,6 +490,72 @@ fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
 }
 "#;
 
+const I8_AND_IQ4_HELPERS: &str = r#"
+fn i8x4_f4(w: u32) -> vec4<f32> {
+    let s = bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u);
+    return vec4<f32>(s);
+}
+fn iq4_byte(k: u32) -> u32 {
+    let w01 = select(0xbfad9881u, 0xf6eaddcfu, (k & 4u) != 0u);
+    let w23 = select(0x26190d01u, 0x71594535u, (k & 4u) != 0u);
+    let ww = select(w01, w23, (k & 8u) != 0u);
+    return (ww >> ((k & 3u) * 8u)) & 0xffu;
+}
+fn iq4_f4(q: u32) -> vec4<f32> {
+    let packed = iq4_byte(q & 15u)
+        | (iq4_byte((q >> 8u) & 15u) << 8u)
+        | (iq4_byte((q >> 16u) & 15u) << 16u)
+        | (iq4_byte((q >> 24u) & 15u) << 24u);
+    return i8x4_f4(packed);
+}
+"#;
+
+const W8_IQ4_NL: &str = r#"
+// IQ4_NL: 32 weights per 5-word block (1 f16 scale word + 4 words of nibbles; low nibbles 0..15, high nibbles 16..31).
+fn i8x4_f4(w: u32) -> vec4<f32> {
+    let s = bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u);
+    return vec4<f32>(s);
+}
+fn iq4_byte(k: u32) -> u32 {
+    let w01 = select(0xbfad9881u, 0xf6eaddcfu, (k & 4u) != 0u);
+    let w23 = select(0x26190d01u, 0x71594535u, (k & 4u) != 0u);
+    let ww = select(w01, w23, (k & 8u) != 0u);
+    return (ww >> ((k & 3u) * 8u)) & 0xffu;
+}
+fn iq4_f4(q: u32) -> vec4<f32> {
+    let packed = iq4_byte(q & 15u)
+        | (iq4_byte((q >> 8u) & 15u) << 8u)
+        | (iq4_byte((q >> 16u) & 15u) << 16u)
+        | (iq4_byte((q >> 24u) & 15u) << 24u);
+    return i8x4_f4(packed);
+}
+fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
+    let bw = rb + (kt / 2u) * 5u;
+    let d = unpack2x16float(words[bw]).x;
+    let sh = 4u * (kt % 2u);
+    let at = bw + 1u + 2u * hf;
+    let v0 = d * iq4_f4((words[at] >> sh) & 0x0f0f0f0fu);
+    let v1 = d * iq4_f4((words[at + 1u] >> sh) & 0x0f0f0f0fu);
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
+}
+"#;
+
+const W8_Q8_0: &str = r#"
+// Q8_0: 32 weights per 9-word block (1 f16 scale word + 8 words of signed int8 bytes).
+fn i8x4_f4(w: u32) -> vec4<f32> {
+    let s = bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u);
+    return vec4<f32>(s);
+}
+fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
+    let bw = rb + (kt / 2u) * 9u;
+    let d = unpack2x16float(words[bw]).x;
+    let at = bw + 1u + 4u * (kt % 2u) + 2u * hf;
+    let v0 = d * i8x4_f4(words[at]);
+    let v1 = d * i8x4_f4(words[at + 1u]);
+    return array<f32, 8>(v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w);
+}
+"#;
+
 /// Lanes an output row is shared out to in [`few_source`]'s kernel, for rows of `k` weights: 8, 16 or 32, some five
 /// words (80 weights) a lane or more. A lane's work must outweigh what every thread does whatever its share (its
 /// jobs' numbers, the barrier, its part in the sum): the experts' down projection is 640 wide, 40 words, and 32 lanes
@@ -464,6 +564,9 @@ fn w8(rb: u32, kt: u32, hf: u32, kw: u32) -> array<f32, 8> {
 /// A grid type's lanes take a group of eight weights at a turn, ten such a lane or more (the same 80 weights; 64 and
 /// 128 lanes of Flash-Next's 2,560 were slower: a check's four rows 1.78 ms a step's layers with 64 where 1.53).
 pub(super) fn few_lanes(kind: Kind, k: usize) -> usize {
+    if matches!(kind, Kind::IQ4_NL | Kind::Q8_0) {
+        return (k / 160).next_power_of_two().clamp(8, 32);
+    }
     let turn = if kind.block().is_some() { 8 } else { 16 };
     (k / turn / (80 / turn)).next_power_of_two().clamp(8, 32)
 }
@@ -490,6 +593,9 @@ fn job_ids(i: usize, rows: usize, skip: bool) -> String {
 fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
     assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
     assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
+    if matches!(kind, Kind::IQ4_NL | Kind::Q8_0) {
+        return few_source_32(kind, rows, lanes, skip);
+    }
     if kind != Kind::Q2_0 {
         return few_source_grid(kind, rows, lanes, skip);
     }
@@ -547,6 +653,118 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 "#,
         red_len = 256 * rows,
         per = 256 / lanes,
+    )
+}
+
+/// [`few_source`] for 32-weight block types (`IQ4_NL` = 5 words/block, `Q8_0` = 9 words/block): each lane decodes one
+/// full 32-weight block per iteration into eight `vec4<f32>` vectors and accumulates across all rows in the block.
+fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
+    let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
+    let ids = each(&|i| job_ids(i, rows, skip));
+    let sums = each(&|i| {
+        format!(
+            "            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u]) + dot(c4, x[xb{i} + at + 4u]) + dot(c5, x[xb{i} + at + 5u]) + dot(c6, x[xb{i} + at + 6u]) + dot(c7, x[xb{i} + at + 7u])); }}\n"
+        )
+    });
+    let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
+    let out = each(&|i| {
+        format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n")
+    });
+    let use_iq4_lut = kind == Kind::IQ4_NL && rows > 1;
+    let lut_decl = if use_iq4_lut {
+        "var<workgroup> iq4_lut: array<f32, 16>;\n"
+    } else {
+        ""
+    };
+    let lut_init = if use_iq4_lut {
+        "    if (t < 16u) { iq4_lut[t] = f32(bitcast<i32>(iq4_byte(t) << 24u) >> 24u); }\n    workgroupBarrier();\n"
+    } else {
+        ""
+    };
+    let lut_fn = if use_iq4_lut {
+        "fn iq4_lut_f4(q: u32) -> vec4<f32> {\n    return vec4<f32>(iq4_lut[q & 15u], iq4_lut[(q >> 8u) & 15u], iq4_lut[(q >> 16u) & 15u], iq4_lut[(q >> 24u) & 15u]);\n}\n"
+    } else {
+        ""
+    };
+    let decode_block = match kind {
+        Kind::IQ4_NL if use_iq4_lut => r#"            let bw = rb + bi * 5u;
+            let d = unpack2x16float(words[bw]).x;
+            let w0 = words[bw + 1u];
+            let w1 = words[bw + 2u];
+            let w2 = words[bw + 3u];
+            let w3 = words[bw + 4u];
+            let c0 = iq4_lut_f4(w0 & 0x0f0f0f0fu);
+            let c1 = iq4_lut_f4(w1 & 0x0f0f0f0fu);
+            let c2 = iq4_lut_f4(w2 & 0x0f0f0f0fu);
+            let c3 = iq4_lut_f4(w3 & 0x0f0f0f0fu);
+            let c4 = iq4_lut_f4((w0 >> 4u) & 0x0f0f0f0fu);
+            let c5 = iq4_lut_f4((w1 >> 4u) & 0x0f0f0f0fu);
+            let c6 = iq4_lut_f4((w2 >> 4u) & 0x0f0f0f0fu);
+            let c7 = iq4_lut_f4((w3 >> 4u) & 0x0f0f0f0fu);"#,
+        Kind::IQ4_NL => r#"            let bw = rb + bi * 5u;
+            let d = unpack2x16float(words[bw]).x;
+            let w0 = words[bw + 1u];
+            let w1 = words[bw + 2u];
+            let w2 = words[bw + 3u];
+            let w3 = words[bw + 4u];
+            let c0 = iq4_f4(w0 & 0x0f0f0f0fu);
+            let c1 = iq4_f4(w1 & 0x0f0f0f0fu);
+            let c2 = iq4_f4(w2 & 0x0f0f0f0fu);
+            let c3 = iq4_f4(w3 & 0x0f0f0f0fu);
+            let c4 = iq4_f4((w0 >> 4u) & 0x0f0f0f0fu);
+            let c5 = iq4_f4((w1 >> 4u) & 0x0f0f0f0fu);
+            let c6 = iq4_f4((w2 >> 4u) & 0x0f0f0f0fu);
+            let c7 = iq4_f4((w3 >> 4u) & 0x0f0f0f0fu);"#,
+        Kind::Q8_0 => r#"            let bw = rb + bi * 9u;
+            let d = unpack2x16float(words[bw]).x;
+            let c0 = i8x4_f4(words[bw + 1u]);
+            let c1 = i8x4_f4(words[bw + 2u]);
+            let c2 = i8x4_f4(words[bw + 3u]);
+            let c3 = i8x4_f4(words[bw + 4u]);
+            let c4 = i8x4_f4(words[bw + 5u]);
+            let c5 = i8x4_f4(words[bw + 6u]);
+            let c6 = i8x4_f4(words[bw + 7u]);
+            let c7 = i8x4_f4(words[bw + 8u]);"#,
+        _ => unreachable!("few_source_32 called for non-32-block kind"),
+    };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> red: array<f32, {red_len}>;
+{lut_decl}{helpers}{lut_fn}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+{lut_init}    let n = p[0].x;
+    let k = p[0].y;
+    let rw = p[0].z;
+    let identity = p[0].w == 1u;
+    let blk = p[1].y + wg.z;
+    let slot = t / {lanes}u;
+    let lane = t % {lanes}u;
+{ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
+    let live = on0 && row < n;
+    let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
+    let nblocks = k / 32u;
+    if (live) {{
+        for (var bi = lane; bi < nblocks; bi += {lanes}u) {{
+{decode_block}
+            let at = bi * 8u;
+{sums}        }}
+    }}
+{store}    workgroupBarrier();
+    if (live) {{
+{out}    }}
+}}
+"#,
+        red_len = 256 * rows,
+        per = 256 / lanes,
+        helpers = I8_AND_IQ4_HELPERS,
     )
 }
 
@@ -742,6 +960,72 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let c = i % ff;
     let g = y[2u * pair * ff + c];
     act[i] = (g / (1.0 + exp(-g))) * y[(2u * pair + 1u) * ff + c];
+}
+"#;
+
+/// Each pair's Inkling-2 SiTU activation (`Inkling2SoftcappedSwiGLU`), as its down projection reads it:
+/// `act[j] = (beta * tanh(g / beta)) * sigmoid(g) * (linear_beta * tanh(u / linear_beta))`.
+/// `p[0]`: ff, pairs, beta bits, linear_beta bits.
+pub(super) const SITU_PAIRS: &str = r#"
+@group(0) @binding(0) var<storage, read> y: array<f32>;
+@group(0) @binding(6) var<storage, read_write> act: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    let ff = p[0].x;
+    if (i >= p[0].y * ff) { return; }
+    let pair = i / ff;
+    let c = i % ff;
+    let g = y[2u * pair * ff + c];
+    let u = y[(2u * pair + 1u) * ff + c];
+    let beta = bitcast<f32>(p[0].z);
+    let lbeta = bitcast<f32>(p[0].w);
+    let g_cap = beta * tanh(clamp(g / beta, -20.0, 20.0));
+    let sig = 1.0 / (1.0 + exp(-g));
+    let u_cap = lbeta * tanh(clamp(u / lbeta, -20.0, 20.0));
+    act[i] = g_cap * sig * u_cap;
+}
+"#;
+
+/// Fused routed-expert weighted sum (no shared expert, `rows == 1`) + static causal short conv +
+/// residual add: updates `hist` in place and writes `out[ch] = residual[ch] + static_conv(sum_e w[e]*d[e, ch])`.
+/// Eliminates the `moe-wsum-rows` -> `post-conv-add` serial barrier on all 48 Inkling-2 layers.
+/// `p[0]`: hidden, top_k, kernel, 0.
+pub(super) const WSUM_POST_CONV_ADD: &str = r#"
+@group(0) @binding(0) var<storage, read> d: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read> conv_w: array<f32>;
+@group(0) @binding(3) var<storage, read> residual: array<f32>;
+@group(0) @binding(6) var<storage, read_write> hist: array<f32>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ch = id.x + id.y * 16776960u;
+    let h = p[0].x;
+    if (ch >= h) { return; }
+    let top_k = p[0].y;
+    let k = p[0].z;
+    var cur_v = 0.0;
+    for (var e = 0u; e < top_k; e++) {
+        cur_v += d[e * h + ch] * w[e];
+    }
+    let past = k - 1u;
+    var acc = 0.0;
+    for (var j = 0u; j < past; j++) {
+        acc += hist[j * h + ch] * conv_w[ch * k + j];
+    }
+    acc += cur_v * conv_w[ch * k + past];
+    out[ch] = residual[ch] + (acc + cur_v) * inverseSqrt(f32(k + 1u));
+    for (var j = 0u; j + 1u < past; j++) {
+        hist[j * h + ch] = hist[(j + 1u) * h + ch];
+    }
+    if (past > 0u) {
+        hist[(past - 1u) * h + ch] = cur_v;
+    }
 }
 "#;
 

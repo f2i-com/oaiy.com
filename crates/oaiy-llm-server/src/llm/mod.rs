@@ -56,6 +56,8 @@ pub use arch::qwen3::Qwen3Model;
 pub use arch::qwen3moe::{Qwen3MoeBlock, Qwen3MoeModel};
 // GLM-5.3-Flash
 pub use arch::glm5next::{Glm5NextBlock, Glm5NextConfig, Glm5NextModel, LayerKind};
+// Thinking Machines Lab Inkling-2 & Inkling-2-Mini
+pub use arch::inkling2::{Inkling2Config, Inkling2Model};
 pub use arch::qwen35::{ExpertBlocks, ExpertsMaker, Qwen35Block, Qwen35Model, Qwen35Moe, SsmConfig};
 pub mod multimodal_rope;
 pub use arch::qwen35moe::{Qwen35MoeBlock, Qwen35MoeModel};
@@ -139,6 +141,10 @@ pub enum Model {
     /// 256-expert MoE + sigmoid-gated shared expert per layer (DeepSeek-V2 /
     /// Qwen3-Next pattern). See `qwen35moe.rs`.
     Qwen35Moe(Qwen35MoeModel),
+    /// Thinking Machines Lab Inkling-2 / Inkling-2-Mini (`arch=inkling2` / `inkling2_loop`).
+    /// Hybrid SWA/full-attention NoPE with learned relative position bias, causal short
+    /// convolutions, depthwise AttnRes, SiTU MoE, and optional 3-pass recurrent core.
+    Inkling2(Box<Inkling2Model>),
 }
 
 impl Model {
@@ -185,6 +191,9 @@ impl Model {
             // LFM2-MoE as a Qwen3.5 hybrid of short convs, its experts a GPU's (the server's
             // `Qwen35Model::from_gguf_with`): refused here, where nothing holds them
             Architecture::Lfm2Moe => Ok(Self::Qwen35(Qwen35Model::from_gguf(g, backend)?)),
+            Architecture::Inkling2 | Architecture::Inkling2Loop => {
+                Ok(Self::Inkling2(Box::new(Inkling2Model::from_gguf(g, backend)?)))
+            }
             Architecture::Qwen36MoeVl => Err(LlamaError::Config(
                 "Qwen3.6-VL-MoE arch detected. Three pending pieces: MoE loader \
                  (#85), Qwen3-VL vision tower (#84), and integration of both \
@@ -208,6 +217,7 @@ impl Model {
             Self::Mixtral(m)  => &m.config,
             Self::Gemma4Moe(m) => &m.config,
             Self::Qwen35Moe(m) => &m.config,
+            Self::Inkling2(m)  => &m.config,
         }
     }
 
@@ -224,6 +234,7 @@ impl Model {
             Self::Mixtral(m)  => &m.tokenizer,
             Self::Gemma4Moe(m) => &m.tokenizer,
             Self::Qwen35Moe(m) => &m.tokenizer,
+            Self::Inkling2(m)  => &m.tokenizer,
         }
     }
 
@@ -240,6 +251,7 @@ impl Model {
             Self::Mixtral(m)  => &m.backend,
             Self::Gemma4Moe(m) => &m.backend,
             Self::Qwen35Moe(m) => &m.backend,
+            Self::Inkling2(m)  => &m.backend,
         }
     }
 
@@ -256,15 +268,17 @@ impl Model {
             Self::Mixtral(m)  => m.forward(tokens, kv),
             Self::Gemma4Moe(m) => m.forward(tokens, kv),
             Self::Qwen35Moe(m) => m.forward(tokens, kv).expect("Qwen3.6-MoE forward error"),
+            Self::Inkling2(m)  => m.forward(tokens, kv).unwrap_or_else(|e| panic!("Inkling-2 forward error: {e}")),
         }
     }
 
     /// [`Self::forward`] with `soft` rows (`(position in tokens, [n, d] values)`) in place of their
-    /// tokens' embeddings (a picture's soft tokens): Gemma 4's and GLM-5.3 Flash's; None for a model that takes none.
+    /// tokens' embeddings (a picture's soft tokens): Gemma 4's, GLM-5.3 Flash's, and Inkling-2's; None for a model that takes none.
     pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Option<Tensor> {
         match self {
             Self::Gemma4(m) => Some(m.forward_spliced(tokens, soft, kv)),
             Self::Glm5Next(m) => Some(m.forward_spliced(tokens, soft, kv).unwrap_or_else(|e| panic!("{e}"))),
+            Self::Inkling2(m) => Some(m.forward_spliced(tokens, soft, kv).unwrap_or_else(|e| panic!("Inkling-2 forward error: {e}"))),
             _ => None,
         }
     }
@@ -272,6 +286,10 @@ impl Model {
     pub fn new_kv_cache(&self, max_len: usize) -> KvCache {
         let cfg = self.config();
         let len = max_len.min(cfg.context_length);
+        // Inkling-2 owns its 48-slot SWA/full KV + causal shortconv state internally; keep a tiny placeholder.
+        if matches!(self, Self::Inkling2(_)) {
+            return KvCache::new(self.backend().as_ref(), 1, 1, 1, 1);
+        }
         // Recurrent Qwen blocks use ssm_state/ssm_conv, never attention K/V.
         // Keep tiny nonzero placeholders (CUDA does not require zero-byte allocs)
         // and allocate full K/V only for actual attention layers.
@@ -334,6 +352,9 @@ impl Model {
     /// width). That cache is made whole for its length at the start, so this times the context is what it takes
     /// before the first token.
     pub fn kv_bytes_per_position(&self) -> u64 {
+        if let Self::Inkling2(m) = self {
+            return m.cfg.full_kv_bytes_per_position();
+        }
         let cfg = self.config();
         let values: usize = if let Self::Qwen35(m) = self {
             m.attention_layers.iter().map(|&a| if a { cfg.n_kv_heads * cfg.head_dim } else { 1 }).sum()

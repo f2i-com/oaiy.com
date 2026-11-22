@@ -433,8 +433,9 @@ mod avx512 {
             }
             xidx[m] = ld(&at);
         }
-        // the tile's words past the first sixteen (a tile of 3 bits a weight has 24)
-        let rest: __mmask16 = if nw >= 32 { 0xffff } else { ((1u32 << (nw - 16)) - 1) as __mmask16 };
+        // the tile's first up-to-sixteen words (8 for 1-bit tiles, 16 for 2..4-bit) and any words past sixteen
+        let head: __mmask16 = if nw >= 16 { 0xffff } else { ((1u32 << nw) - 1) as __mmask16 };
+        let rest: __mmask16 = if nw >= 32 { 0xffff } else if nw <= 16 { 0 } else { ((1u32 << (nw - 16)) - 1) as __mmask16 };
         // each column's warps' four vectors of sums: lanes 0..16's lo and hi, lanes 16..32's (the thread's own, kept
         // from task to task: a task's 147 KB of them made anew was most of its time, 32 threads at the heap at once)
         thread_local! {
@@ -447,9 +448,9 @@ mod avx512 {
             acc.clear();
             acc.resize(cols.len(), [[0f32; 64]; 8]);
             if vbmi2 {
-                sums_into_vbmi2(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, rest);
+                sums_into_vbmi2(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, head, rest);
             } else {
-                sums_into(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, rest);
+                sums_into(acc, trellis, ntiles, nw, xh, rows, cols.clone(), &codes, &xidx, head, rest);
             }
             // each column's sums as `super::column_sums` adds them: lane l's lo (columns 0..8) or hi, the warps in order
             let mut out = vec![0f32; cols.len() * 16];
@@ -509,6 +510,7 @@ mod avx512 {
                 cols: std::ops::Range<usize>,
                 codes: &Codes,
                 xidx: &[__m512i; 4],
+                head: __mmask16,
                 rest: __mmask16,
             ) {
                 let (mul, ones, base) = (_mm512_set1_epi32(0x83dc_d12du32 as i32), _mm512_set1_epi32(0x0101_0101), _mm512_set1_epi32(1024));
@@ -520,10 +522,10 @@ mod avx512 {
                     let xv = [_mm512_permutexvar_ps(xidx[0], x), _mm512_permutexvar_ps(xidx[1], x), _mm512_permutexvar_ps(xidx[2], x), _mm512_permutexvar_ps(xidx[3], x)];
                     for nt in cols.clone() {
                         let at = trellis.as_ptr().add((kt * ntiles + nt) * nw * 4);
-                        // (the tile's nw words lie within `trellis`, asserted above; the second load reads only the
-                        // words past sixteen, masked)
-                        let t0 = _mm512_loadu_si512(at as *const __m512i);
-                        let t1 = _mm512_maskz_loadu_epi32(rest, at.add(64) as *const i32);
+                        // (the tile's nw words lie within `trellis`, asserted above; 1-bit tiles have 8 words so mask
+                        // t0 and skip t1 to avoid reading or offsetting past the slice end)
+                        let t0 = if nw >= 16 { _mm512_loadu_si512(at as *const __m512i) } else { _mm512_maskz_loadu_epi32(head, at as *const i32) };
+                        let t1 = if rest != 0 { _mm512_maskz_loadu_epi32(rest, at.add(64) as *const i32) } else { _mm512_setzero_si512() };
                         let sums = acc[nt - cols.start][w].as_mut_ptr();
                         let mut a = [_mm512_loadu_ps(sums), _mm512_loadu_ps(sums.add(16)), _mm512_loadu_ps(sums.add(32)), _mm512_loadu_ps(sums.add(48))];
                         for h in 0..2 {

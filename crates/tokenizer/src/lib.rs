@@ -54,12 +54,18 @@ pub enum TokenizerModel {
     Other(Arc<str>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreTokenizer {
+    Llama3,
+    Qwen3,
+    Gpt4o,
+}
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
-    // HF Qwen3.8 uses NFC, combining marks and single digits.
-    qwen3_pre: bool,
+    pre: PreTokenizer,
     // a piece that is a token whole is that token, merges or no (Hugging Face's `ignore_merges`, as
-    // LFM2's tokenizer has it and llama.cpp reads `tokenizer.ggml.pre` lfm2).
+    // LFM2's and Inkling-2's tokenizers have it).
     ignore_merges: bool,
     model: TokenizerModel,
 
@@ -148,8 +154,59 @@ impl Tokenizer {
         special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
         // (a checkpoint's added tokens are all here, `special` or not, so their spelling is all there is to go on)
         let (control,control_ids)=control_tokens(tokens.len(),special_tokens.iter().filter(|t|chat_marker(&t.0)).map(|t|(t.0.as_str(),t.1)));
-        Ok(Self{qwen3_pre:true,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,space_first_only:false,spm_by_merge_rank:false,token_types:None,
+        Ok(Self{pre:PreTokenizer::Qwen3,ignore_merges:false,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,add_space_prefix:false,space_first_only:false,spm_by_merge_rank:false,token_types:None,
             merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens,control,control_ids})
+    }
+
+    /// Construct a GPT-4o / Inkling-2 (`o200k_base`) byte-level BPE tokenizer from HF `tokenizer.json` parts.
+    pub fn from_gpt4o_bpe_parts(
+        tokens: Vec<String>,
+        merges: Vec<(String, String)>,
+        special_ids: Vec<u32>,
+        eos: u32,
+        pad: Option<u32>,
+    ) -> Result<Self> {
+        if eos as usize >= tokens.len()
+            || pad.is_some_and(|p| p as usize >= tokens.len())
+            || special_ids.iter().any(|&i| i as usize >= tokens.len())
+        {
+            return Err(TokenizerError::MissingMetadata("valid special token IDs"));
+        }
+        let token_to_id = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let merges_rank = merges.into_iter().enumerate().map(|(i, m)| (m, i as u32)).collect();
+        let mut special_tokens: Vec<_> = special_ids
+            .into_iter()
+            .map(|i| (tokens[i as usize].clone(), i))
+            .filter(|t| !t.0.is_empty())
+            .collect();
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let (control, control_ids) = control_tokens(
+            tokens.len(),
+            special_tokens
+                .iter()
+                .filter(|t| chat_marker(&t.0))
+                .map(|t| (t.0.as_str(), t.1)),
+        );
+        Ok(Self {
+            pre: PreTokenizer::Gpt4o,
+            ignore_merges: true,
+            model: TokenizerModel::Gpt2,
+            tokens,
+            token_to_id,
+            scores: None,
+            add_space_prefix: false,
+            space_first_only: false,
+            spm_by_merge_rank: false,
+            token_types: None,
+            merges_rank,
+            bos: None,
+            eos: Some(eos),
+            unk: None,
+            pad,
+            special_tokens,
+            control,
+            control_ids,
+        })
     }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let model_name = gguf.get_str("tokenizer.ggml.model").unwrap_or("llama");
@@ -233,12 +290,22 @@ impl Tokenizer {
                 .map(|(s, id)| (s.as_str(), *id)),
         );
 
-        // (a Qwen GGUF's own pre-tokenizer, `tokenizer.ggml.pre` qwen2 or qwen35: its letters with their marks, its
-        // digits one by one and NFC first, as its Hugging Face tokenizer has them; Llama's splitter otherwise)
-        let qwen3_pre = model == TokenizerModel::Gpt2 && matches!(gguf.get_str("tokenizer.ggml.pre"), Ok("qwen2" | "qwen35"));
-        let ignore_merges = model == TokenizerModel::Gpt2 && gguf.get_str("tokenizer.ggml.pre").is_ok_and(|p| p == "lfm2");
+        // Select pretokenizer from `tokenizer.ggml.pre`: Qwen uses NFC + single digits,
+        // Inkling-2 / GPT-4o use `o200k_base` with `ignore_merges`, others default to Llama-3.
+        let pre_name = gguf.get_str("tokenizer.ggml.pre").ok();
+        let pre = if model == TokenizerModel::Gpt2 {
+            match pre_name {
+                Some("qwen2" | "qwen35") => PreTokenizer::Qwen3,
+                Some("inkling2" | "gpt-4o" | "gpt4o") => PreTokenizer::Gpt4o,
+                _ => PreTokenizer::Llama3,
+            }
+        } else {
+            PreTokenizer::Llama3
+        };
+        let ignore_merges = model == TokenizerModel::Gpt2
+            && matches!(pre_name, Some("lfm2" | "inkling2" | "gpt-4o" | "gpt4o"));
         Ok(Self {
-            qwen3_pre,
+            pre,
             ignore_merges,
             model,
             tokens,

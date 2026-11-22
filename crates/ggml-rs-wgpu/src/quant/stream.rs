@@ -150,7 +150,7 @@ impl WgpuBackend {
         let chunks = self.gpu.host_rows(bytes, row_bytes)?;
         let nbytes = bytes.len();
         self.streamed.fetch_add(nbytes as u64, Ordering::Relaxed);
-        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype, chunks, row_bytes, nbytes, used: Arc::clone(&self.streamed), host: true, file: None };
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype, chunks, row_bytes, nbytes, used: Some(Arc::clone(&self.streamed)), host: true, file: None };
         Some(QuantizedTensor::from_device(Box::new(storage), shape.to_vec()))
     }
 
@@ -165,7 +165,7 @@ impl WgpuBackend {
         }
         self.filed.fetch_add(nbytes as u64, Ordering::Relaxed);
         let (dtype, shape) = (w.dtype(), w.shape().to_vec());
-        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype, chunks: Vec::new(), row_bytes, nbytes, used: Arc::clone(&self.filed), host: false, file: Some((w, padded)) };
+        let storage = WgpuQuant { gpu: Arc::clone(&self.gpu), dtype, chunks: Vec::new(), row_bytes, nbytes, used: Some(Arc::clone(&self.filed)), host: false, file: Some((w, padded)) };
         QuantizedTensor::from_device(Box::new(storage), shape)
     }
 
@@ -244,7 +244,7 @@ impl Recorder<'_> {
         } else {
             return None;
         };
-        let storage = WgpuQuant { gpu: Arc::clone(&q.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: 0, used: Arc::new(AtomicU64::new(0)), host: false, file: None };
+        let storage = WgpuQuant { gpu: Arc::clone(&q.gpu), dtype: q.dtype, chunks, row_bytes: q.row_bytes, nbytes: q.nbytes, used: None, host: false, file: None };
         Some(QuantizedTensor::from_device(Box::new(storage), w.shape().to_vec()))
     }
 }

@@ -429,7 +429,7 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
                 (jobs.iter().all(|&(m, _)| (m as usize) < g.count()) && before(*x)? >= rows * k).then_some(jobs.len() * n)?
             }
             ProgramStep::CopyColsBf16 { src, src_stride, src_at, dst, dst_stride, dst_at, width, rows } => {
-                let ok = before(*src)? >= (rows - 1) * src_stride + src_at + width && before(*dst)? >= (rows - 1) * dst_stride + dst_at + width;
+                let ok = *rows > 0 && before(*src)? >= (rows - 1) * src_stride + src_at + width && before(*dst)? >= (rows - 1) * dst_stride + dst_at + width;
                 ok.then_some(0)?
             }
             ProgramStep::Norm { x, weight, rows, width, .. } => (before(*x)? >= rows * width && weight.len() == *width && *width <= 1 << 20).then_some(rows * width)?,

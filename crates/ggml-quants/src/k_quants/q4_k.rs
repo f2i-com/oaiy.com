@@ -165,6 +165,42 @@ pub fn dot_rows(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
     }
 }
 
+/// Cached runtime AVX-512 check for hot dispatch paths.
+#[inline]
+pub fn has_avx512_cached() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(has_avx512)
+}
+
+/// SIMD-accelerated `dot_row` (AVX-512 when available, otherwise scalar [`dot_row`]).
+#[inline]
+pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
+    assert_eq!(row.len() % BYTES_PER_BLOCK, 0, "q4_k::dot_row_fast: row not block-aligned");
+    assert_eq!(x.len(), row.len() / BYTES_PER_BLOCK * BLOCK_SIZE, "q4_k::dot_row_fast: x length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512_cached() {
+        // SAFETY: avx512f + avx512bw verified by has_avx512_cached(), lengths asserted above.
+        return unsafe { avx512::dot_row(row, x) };
+    }
+    dot_row(row, x)
+}
+
+/// SIMD-accelerated `dot_rows` (AVX-512 when available, otherwise scalar [`dot_rows`]).
+#[inline]
+pub fn dot_rows_fast(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
+    assert_eq!(k % BLOCK_SIZE, 0, "q4_k::dot_rows_fast: k not block-aligned");
+    let row_bytes = k / BLOCK_SIZE * BYTES_PER_BLOCK;
+    assert_eq!(w.len(), n_rows * row_bytes, "q4_k::dot_rows_fast: w length mismatch");
+    assert_eq!(x.len(), k, "q4_k::dot_rows_fast: x length mismatch");
+    assert_eq!(out.len(), n_rows, "q4_k::dot_rows_fast: out length mismatch");
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512_cached() {
+        // SAFETY: avx512f + avx512bw verified by has_avx512_cached(), dimensions asserted above.
+        return unsafe { avx512::dot_rows(w, x, n_rows, k, out) };
+    }
+    dot_rows(w, x, n_rows, k, out)
+}
+
 /// Whether this CPU can run the AVX-512 dot kernels.
 ///
 /// Checked once by the caller and cached; the detection macro itself is cheap but

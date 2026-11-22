@@ -87,21 +87,46 @@ impl Team {
         s.pending.store(n, Ordering::Relaxed);
         s.next.store((generation & 0xffff_ffff) << 32, Ordering::Relaxed);
         *s.job.lock().unwrap_or_else(|p| p.into_inner()) = Some(Job { f, n, generation });
+        // Guard ensures `job` is cleared and all in-flight workers finish before `f` drops even if
+        // a task panics on the caller thread.
+        struct RunGuard<'a>(&'a Shared, u64, usize);
+        impl Drop for RunGuard<'_> {
+            fn drop(&mut self) {
+                let s = self.0;
+                // Advance `next` past `n` so no worker claims further tasks if we are unwinding.
+                let tag = (self.1 & 0xffff_ffff) << 32;
+                let done_val = tag | (self.2 as u64 & 0xffff_ffff);
+                let prev = s.next.swap(done_val, Ordering::AcqRel);
+                if prev & !0xffff_ffff == tag {
+                    let claimed = (prev & 0xffff_ffff) as usize;
+                    if claimed < self.2 {
+                        s.pending.fetch_sub(self.2 - claimed, Ordering::Release);
+                    }
+                }
+                while s.pending.load(Ordering::Acquire) != 0 {
+                    std::hint::spin_loop();
+                }
+                *s.job.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
+        let _guard = RunGuard(s, generation, n);
         s.generation.store(generation, Ordering::Release);
         {
             let _g = s.sleep.lock().unwrap_or_else(|p| p.into_inner());
             s.wake.notify_all();
         }
         take_tasks(s, Job { f, n, generation });
-        while s.pending.load(Ordering::Acquire) != 0 {
-            std::hint::spin_loop();
-        }
-        *s.job.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
 /// Claim and run `job`'s tasks while there are any.
 fn take_tasks(s: &Shared, job: Job) {
+    struct PendingGuard<'a>(&'a AtomicUsize);
+    impl Drop for PendingGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Release);
+        }
+    }
     let tag = (job.generation & 0xffff_ffff) << 32;
     loop {
         let v = s.next.load(Ordering::Acquire);
@@ -111,9 +136,9 @@ fn take_tasks(s: &Shared, job: Job) {
         if s.next.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             continue;
         }
+        let _done = PendingGuard(&s.pending);
         // SAFETY: a task of this job was claimed, so its caller is still waiting for it ([`Team::run`]).
         unsafe { (*job.f)((v & 0xffff_ffff) as usize) };
-        s.pending.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -139,7 +164,7 @@ fn work(s: &Shared) {
         seen = s.generation.load(Ordering::Acquire);
         let job = *s.job.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = job.filter(|j| j.generation == seen) {
-            take_tasks(s, job);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_tasks(s, job)));
         }
     }
 }

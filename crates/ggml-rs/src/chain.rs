@@ -954,6 +954,108 @@ pub trait ChainRecorder {
         let _ = (x, out, h, w, cin, cout, ft);
         unimplemented!("an upsampling shortcut on this device")
     }
+    /// Inkling-2 cross-pass gated control blend:
+    /// `out[i] = (1.0 - tanh(forget[i])) * cur[cur_off + i] + tanh(gain[i]) * msg[msg_off + i]` for `i < len`.
+    #[allow(clippy::too_many_arguments)]
+    fn control_blend_at(&mut self, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, gain: &DeviceVec, forget: &DeviceVec, out: &DeviceVec, len: usize) {
+        let _ = (cur, cur_off, msg, msg_off, gain, forget, out, len);
+        unimplemented!("control_blend_at on this device")
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn control_blend(&mut self, cur: &DeviceVec, msg: &DeviceVec, gain: &DeviceVec, forget: &DeviceVec, out: &DeviceVec, len: usize) {
+        self.control_blend_at(cur, 0, msg, 0, gain, forget, out, len)
+    }
+    /// Inkling-2 Block Attention Residuals (`mix_depth`) for `seq == 1`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_mix_depth(&mut self, blocks: &DeviceVec, cur: &DeviceVec, query: &DeviceVec, out: &DeviceVec, n_blocks: usize, n_queries: usize, hidden: usize, cur_is_normed: bool) {
+        let _ = (blocks, cur, query, out, n_blocks, n_queries, hidden, cur_is_normed);
+        unimplemented!("inkling2_mix_depth on this device")
+    }
+    /// Inkling-2 cross-pass controller input: `concat(rms_norm(cur[cur_off..]), rms_norm(msg[msg_off..]))`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_control_cat(&mut self, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize) {
+        let _ = (cur, cur_off, msg, msg_off, out, hidden);
+        unimplemented!("inkling2_control_cat on this device")
+    }
+    /// Inkling-2 single-token causal depthwise short convolution (static if `n_heads == 0`, else dynamic).
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_short_conv_step(&mut self, x: &DeviceVec, weight: &DeviceVec, dyn_taps: Option<&DeviceVec>, hist: &DeviceVec, out: &DeviceVec, channels: usize, kernel: usize, n_heads: usize) {
+        let _ = (x, weight, dyn_taps, hist, out, channels, kernel, n_heads);
+        unimplemented!("inkling2_short_conv_step on this device")
+    }
+    /// Inkling-2 per-head optional scale + L2 clipping + optional `tau` from `step_params[1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_l2_clip_heads(&mut self, x: &DeviceVec, scale_w: Option<&DeviceVec>, step_params: &DeviceVec, n_heads: usize, head_dim: usize, threshold: f32, use_tau: bool) {
+        let _ = (x, scale_w, step_params, n_heads, head_dim, threshold, use_tau);
+        unimplemented!("inkling2_l2_clip_heads on this device")
+    }
+    /// Inkling-2 K store + unweighted-RMSNorm V store into ring-buffered KV cache at `step_params[0] % kv_cap`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_v_norm_kv_store(&mut self, k_in: &DeviceVec, v_in: &DeviceVec, step_params: &DeviceVec, k_cache: &DeviceVec, v_cache: &DeviceVec, n_kv_heads: usize, head_dim: usize, kv_cap: usize, rms_eps: f32) {
+        let _ = (k_in, v_in, step_params, k_cache, v_cache, n_kv_heads, head_dim, kv_cap, rms_eps);
+        unimplemented!("inkling2_v_norm_kv_store on this device")
+    }
+    /// Inkling-2 GQA causal attention with on-the-fly relative-position bias and per-query sinks (`seq == 1`).
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_attend_step(&mut self, q: &DeviceVec, r: &DeviceVec, sinks: &DeviceVec, rel_bias: &DeviceVec, k_cache: &DeviceVec, v_cache: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize) {
+        let _ = (q, r, sinks, rel_bias, k_cache, v_cache, out, step_params, n_heads, n_kv_heads, head_dim, d_rel, rel_extent, kv_cap, sliding_window);
+        unimplemented!("inkling2_attend_step on this device")
+    }
+    /// Inkling-2 block-boundary push (`block_slot = Some(slot)`) or residual add (`block_slot = None`).
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_block_push(&mut self, inp_sa: &DeviceVec, attn_conv: &DeviceVec, blocks: &DeviceVec, ffn_inp: &DeviceVec, hidden: usize, block_slot: Option<usize>, skip_ffn_inp: bool) {
+        let _ = (inp_sa, attn_conv, blocks, ffn_inp, hidden, block_slot, skip_ffn_inp);
+        unimplemented!("inkling2_block_push on this device")
+    }
+    /// Inkling-2 final logit softcap in place: `cap * tanh(logits / cap)`.
+    fn inkling2_softcap(&mut self, logits: &DeviceVec, len: usize, cap: f32) {
+        let _ = (logits, len, cap);
+        unimplemented!("inkling2_softcap on this device")
+    }
+    /// Inkling-2 fused cross-pass controller norm-concat + F16 down-projection (`[gate_rank, 2 * hidden]`).
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_ctrl_cat_down(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize) {
+        let _ = (w_down_f16, cur, cur_off, msg, msg_off, mid_out, hidden, gate_rank);
+        unimplemented!("inkling2_ctrl_cat_down on this device")
+    }
+    /// Inkling-2 fused cross-pass controller up-projection (`[2 * hidden, gate_rank]` F16) + tanh blend.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_ctrl_up_blend(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize) {
+        let _ = (w_gf_f16, mid, cur, cur_off, msg, msg_off, out, hidden, gate_rank);
+        unimplemented!("inkling2_ctrl_up_blend on this device")
+    }
+    /// Inkling-2 fused K/V short conv + K L2 clip + V RMSNorm + packed ring-buffer KV cache store.
+    /// `packed_dyn`: when true, dynamic conv taps are packed directly after `kv_dim` inside `k_raw`/`v_raw`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_kv_conv_clip_store(&mut self, k_raw: &DeviceVec, v_raw: &DeviceVec, kv_conv_w: &DeviceVec, dyn_k: Option<&DeviceVec>, dyn_v: Option<&DeviceVec>, packed_dyn: bool, step_params: &DeviceVec, kv_hist: &DeviceVec, kv_cache: &DeviceVec, n_kv_heads: usize, head_dim: usize, kernel: usize, kv_cap: usize, qk_clip: f32, rms_eps: f32) {
+        let _ = (k_raw, v_raw, kv_conv_w, dyn_k, dyn_v, packed_dyn, step_params, kv_hist, kv_cache, n_kv_heads, head_dim, kernel, kv_cap, qk_clip, rms_eps);
+        unimplemented!("inkling2_kv_conv_clip_store on this device")
+    }
+    /// Inkling-2 fused Q/R clip+tau + GQA rel-bias sink attention + sigmoid output gate (returns false if device cannot run fused subgroup path).
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_attend_fused(&mut self, q: &DeviceVec, r: &DeviceVec, sinks: &DeviceVec, attn_consts: &DeviceVec, kv_cache: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize, qk_clip: f32, rel_clip: f32) -> bool {
+        let _ = (q, r, sinks, attn_consts, kv_cache, gate, out, step_params, n_heads, n_kv_heads, head_dim, d_rel, rel_extent, kv_cap, sliding_window, qk_clip, rel_clip);
+        false
+    }
+    /// Inkling-2 fused attention on packed `qrsg` (`[q_dim, r_dim, n_heads, q_dim]`) with read-only `step_params`
+    /// and optional inline Q8 quantization of `out` for the following `wo` projection.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_attend_fused_packed(&mut self, qrsg: &DeviceVec, attn_consts: &DeviceVec, kv_cache: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize, qk_clip: f32, rel_clip: f32) -> bool {
+        let _ = (qrsg, attn_consts, kv_cache, out, step_params, n_heads, n_kv_heads, head_dim, d_rel, rel_extent, kv_cap, sliding_window, qk_clip, rel_clip);
+        false
+    }
+    /// Inkling-2 fused static short conv + residual add: `out = residual + static_conv(x)`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_post_conv_add(&mut self, x: &DeviceVec, weight: &DeviceVec, residual: &DeviceVec, hist: &DeviceVec, out: &DeviceVec, channels: usize, kernel: usize) {
+        let _ = (x, weight, residual, hist, out, channels, kernel);
+        unimplemented!("inkling2_post_conv_add on this device")
+    }
+    /// Single-token (`rows == 1`, no shared expert) routed MoE fused with static post-FFN short conv + residual add.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_routed_post_conv_add(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, logits: &DeviceVec, conv_w: &DeviceVec, residual: &DeviceVec, conv_state: &DeviceVec, out: &DeviceVec, top_k: usize, kernel: usize) -> bool {
+        let _ = (experts, x, logits, conv_w, residual, conv_state, out, top_k, kernel);
+        false
+    }
     /// Read `v` back once the chain has run.
     fn read(&mut self, v: &DeviceVec) {
         self.read_range(v, 0, v.len)

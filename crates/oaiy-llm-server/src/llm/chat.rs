@@ -62,6 +62,8 @@ pub fn apply_chat_template(arch: &Architecture, messages: &[ChatMessage], add_as
         Architecture::Lfm2Moe => lfm2_template(messages, add_assistant),
         // GLM-5.3-Flash.
         Architecture::Glm5Next => glm5next_template(messages, add_assistant),
+        // Thinking Machines Lab Inkling-2 / Inkling-2-Mini.
+        Architecture::Inkling2 | Architecture::Inkling2Loop => inkling2_template(messages, add_assistant),
         // Qwen3 ships with "thinking mode" enabled by default. To get a normal
         // (non-thinking) chat response, the official template appends
         // `<think>\n\n</think>\n\n` after the assistant turn opener — that
@@ -388,6 +390,7 @@ pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
         // `<|observation|>`. GLM ends an assistant turn by emitting the *next*
         // role marker, so `<|user|>` is a stop token rather than a prompt-only one.
         Architecture::Glm5Next => &["<|endoftext|>", "<|user|>", "<|observation|>"],
+        Architecture::Inkling2 | Architecture::Inkling2Loop => &["<|content_model_end_sampling|>"],
         Architecture::Llama => &["<|eot_id|>", "<|end_of_text|>"],
         Architecture::Mistral => &["</s>"],
         Architecture::Unsupported(_) => &[],
@@ -408,6 +411,40 @@ fn lfm2_template(messages: &[ChatMessage], add_assistant: bool) -> String {
     }
     if add_assistant {
         out.push_str("<|im_start|>assistant\n<think>");
+    }
+    out
+}
+
+/// Thinking Machines Lab Inkling-2 / Inkling-2-Mini chat template (text-only CLI form;
+/// matches `thinkingmachines/Inkling-2-Mini/chat_template.jinja` with effort level `0`).
+fn inkling2_template(messages: &[ChatMessage], _add_assistant: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 128);
+    let mut effort_emitted = false;
+    for m in messages {
+        if !effort_emitted && m.role != Role::System {
+            out.push_str("<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>");
+            effort_emitted = true;
+        }
+        match m.role {
+            Role::System => {
+                out.push_str("<|message_system|><|content_text|>");
+                out.push_str(&m.content);
+                out.push_str("<|end_message|>");
+            }
+            Role::User => {
+                out.push_str("<|message_user|><|content_text|>");
+                out.push_str(&m.content);
+                out.push_str("<|end_message|>");
+            }
+            Role::Assistant => {
+                out.push_str("<|message_model|><|content_text|>");
+                out.push_str(&m.content);
+                out.push_str("<|end_message|><|content_model_end_sampling|>");
+            }
+        }
+    }
+    if !effort_emitted {
+        out.push_str("<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>");
     }
     out
 }

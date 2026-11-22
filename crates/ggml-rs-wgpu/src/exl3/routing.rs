@@ -301,19 +301,58 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) j
 }
 "#;
 
+/// Single-row (`rows == 1`, `routed <= 256`, `top_k <= 32`) fused sigmoid + bias top-k ranking
+/// into `jd` in ONE dispatch with zero `pick` scratch allocation (ties to lower index).
+/// `p[0]`: routed, top_k.
+pub(crate) const ROUTE_SIGMOID_RANK_STEP: &str = r#"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> jd: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> pk: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    if (li < n) {
+        pk[li] = 1.0 / (1.0 + exp(-logits[li])) + bias[li];
+    }
+    workgroupBarrier();
+    if (li < n) {
+        let v = pk[li];
+        var above = 0u;
+        for (var e = 0u; e < n; e++) {
+            let u = pk[e];
+            if (u > v || (u == v && e < li)) { above += 1u; }
+        }
+        if (above < k) {
+            jd[2u * above] = li;
+            jd[2u * above + 1u] = above;
+        }
+    }
+}
+"#;
+
 /// [`record_route`] for LFM2's routing: the scores and their bias into `pick` (`[rows, routed + 1]`, a scratch
 /// vector), ranked there, then weighted from the logits ([`ROUTE_SIGMOID_PICK`], [`ROUTE_RANK`],
-/// [`ROUTE_SIGMOID_WEIGHTS`]).
+/// [`ROUTE_SIGMOID_WEIGHTS`]). For `rows == 1 && routed <= 256`, fuses pick+rank in workgroup memory with zero scratch.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn record_route_sigmoid(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::Buffer, bias: &wgpu::Buffer, pick: &wgpu::Buffer, st: &Step, routed: usize, top_k: usize, rows: usize, scale: f32) {
+pub(crate) fn record_route_sigmoid(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::Buffer, bias: &wgpu::Buffer, pick: Option<&wgpu::Buffer>, st: &Step, routed: usize, top_k: usize, rows: usize, scale: f32) {
     let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
     assert!(routed <= 1024 && top_k <= 32 && top_k <= routed, "moe: the top {top_k} of {routed} experts");
     let d = rec.gpu().dummy().clone();
     let drw = rec.gpu().dummy_rw().clone();
-    let places = (rows * (routed + 1)) as u32;
-    rec.dispatch_wide("moe-route-sigmoid-pick", ROUTE_SIGMOID_PICK, [logits, bias, &d, &d, &d, &d, pick, &drw], &[routed as u32, rows as u32], (places.div_ceil(256), 1, 1));
     let jd = buf(&st.jobs_d);
-    rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [pick, &d, &d, &d, &d, &d, &jd, &drw], &[routed as u32, top_k as u32], (rows as u32, (routed as u32).div_ceil(64), 1));
+    if rows == 1 && routed <= 256 {
+        rec.dispatch_wide("moe-route-sigmoid-rank-step", ROUTE_SIGMOID_RANK_STEP, [logits, bias, &d, &d, &d, &d, &jd, &drw], &[routed as u32, top_k as u32], (1, 1, 1));
+    } else {
+        let pick = pick.expect("pick scratch for multi-row or wide sigmoid routing");
+        let places = (rows * (routed + 1)) as u32;
+        rec.dispatch_wide("moe-route-sigmoid-pick", ROUTE_SIGMOID_PICK, [logits, bias, &d, &d, &d, &d, pick, &drw], &[routed as u32, rows as u32], (places.div_ceil(256), 1, 1));
+        rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [pick, &d, &d, &d, &d, &d, &jd, &drw], &[routed as u32, top_k as u32], (rows as u32, (routed as u32).div_ceil(64), 1));
+    }
     rec.dispatch_wide("moe-route-sigmoid-weights", ROUTE_SIGMOID_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[routed as u32, top_k as u32, scale.to_bits()], (rows as u32, 1, 1));
 }
 

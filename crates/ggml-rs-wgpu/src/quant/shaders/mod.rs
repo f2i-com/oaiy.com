@@ -38,7 +38,7 @@ pub fn padded_block(dtype: GgmlType) -> Option<(usize, usize, usize)> {
     match dtype {
         GgmlType::Q3_K => Some((110, 112, 110)),
         // its scale, then 2 bytes of gap so the 16 bytes of nibbles are words
-        GgmlType::Q4_0 => Some((18, 20, 2)),
+        GgmlType::Q4_0 | GgmlType::IQ4_NL => Some((18, 20, 2)),
         _ => None,
     }
 }
@@ -67,7 +67,7 @@ pub fn layout(dtype: GgmlType) -> Option<(u32, u32, &'static str)> {
         GgmlType::Q5_0 => (32, 22, Q5_0),
         GgmlType::Q5_1 => (32, 24, Q5_1),
         GgmlType::Q8_0 => (32, 34, Q8_0),
-        GgmlType::IQ4_NL => (32, 18, IQ4_NL),
+        GgmlType::IQ4_NL => (32, 20, IQ4_NL),
         GgmlType::Q2_0 => (64, 18, Q2_0),
         GgmlType::Q2_K => (256, 84, Q2_K),
         GgmlType::Q3_K => (256, 112, Q3_K),

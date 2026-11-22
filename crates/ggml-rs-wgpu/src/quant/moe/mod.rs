@@ -138,6 +138,8 @@ pub struct QuantMoe {
     bytes: u64,
     /// Where the card holds only some of the routed experts: which, and the rest's place in the host's memory.
     cache: Option<Arc<Cache>>,
+    /// Optional Inkling-2 SiTU softcapped activation `(beta, linear_beta)`; `None` uses SwiGLU.
+    situ: Option<(f32, f32)>,
 }
 
 impl std::fmt::Debug for QuantMoe {
@@ -258,7 +260,7 @@ impl QuantMoe {
                 counts: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
             })
         });
-        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, routing: data.routing, bias, coop, bytes: total, cache })
+        Ok(QuantMoe { b: b.clone(), routed: e, hidden: h, ff: f, gu, down, shared, routing: data.routing, bias, coop, bytes: total, cache, situ: None })
     }
 
     pub(crate) fn is_on(&self, gpu: &Arc<Gpu>) -> bool {
@@ -432,8 +434,12 @@ impl QuantMoe {
         let drw = rec.gpu().dummy_rw().clone();
         match (&self.routing, &self.bias) {
             (Routing::Sigmoid { scale, .. }, Some(bias)) => {
-                let pick = rec.scratch(rows * (self.routed + 1));
-                record_route_sigmoid(rec, &buf(logits), &buf(bias), &buf(&pick), &st, self.routed, top_k, rows, *scale);
+                if rows == 1 && self.routed <= 256 {
+                    record_route_sigmoid(rec, &buf(logits), &buf(bias), None, &st, self.routed, top_k, rows, *scale);
+                } else {
+                    let pick = rec.scratch(rows * (self.routed + 1));
+                    record_route_sigmoid(rec, &buf(logits), &buf(bias), Some(&buf(&pick)), &st, self.routed, top_k, rows, *scale);
+                }
             }
             _ => record_route(rec, &buf(logits), &st, self.routed, top_k, rows),
         }
@@ -491,7 +497,11 @@ impl QuantMoe {
             self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs / 10, gu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
         }
         let groups = ((pairs * f) as u32).div_ceil(256);
-        rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        if let Some((beta, linear_beta)) = self.situ {
+            rec.dispatch_wide("quant-moe-situ", SITU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32, beta.to_bits(), linear_beta.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        } else {
+            rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        }
         self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
         if let Some([_, down]) = tail {
             self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs / 10, down, &st.out_d, stage.as_ref().map(|s| &s[1]));
@@ -520,6 +530,77 @@ impl QuantMoe {
             }
             None => rec.dispatch_wide("moe-wsum-rows", WSUM_ROWS, [&buf(&st.out_d), &sd, &buf(&st.w), &d, &d, &d, &buf(out), &drw], &[h as u32, top_k as u32, rows as u32], groups),
         }
+    }
+
+    /// Single-token (`rows == 1`, no shared expert) routed MoE fused with static post-FFN causal
+    /// short convolution + residual add: replaces `moe-wsum-rows` + `post-conv-add` with 1 dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_routed_post_conv_add(
+        &self,
+        rec: &mut crate::chain::Recorder<'_>,
+        x: &DeviceVec,
+        logits: &DeviceVec,
+        conv_w: &DeviceVec,
+        residual: &DeviceVec,
+        conv_state: &DeviceVec,
+        out: &DeviceVec,
+        top_k: usize,
+        kernel: usize,
+    ) -> bool {
+        if self.shared.is_some()
+            || self.routed > 1024
+            || top_k == 0
+            || top_k > 32.min(self.routed)
+            || kernel == 0
+            || logits.len < self.routed + 1
+        {
+            return false;
+        }
+        let (h, f) = (self.hidden, self.ff);
+        assert!(
+            x.len >= h && residual.len >= h && out.len >= h && conv_w.len >= h * kernel && conv_state.len >= (kernel - 1) * h,
+            "moe_post_conv_add: hidden={h} kernel={kernel}"
+        );
+        let st = if rec.keeps() {
+            self.step(1, top_k)
+        } else {
+            Arc::new(self.scratch(&mut |n| rec.scratch(n), 1, top_k, false))
+        };
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        match (&self.routing, &self.bias) {
+            (Routing::Sigmoid { scale, .. }, Some(bias)) => {
+                if self.routed <= 256 {
+                    record_route_sigmoid(rec, &buf(logits), &buf(bias), None, &st, self.routed, top_k, 1, *scale);
+                } else {
+                    let pick = rec.scratch(self.routed + 1);
+                    record_route_sigmoid(rec, &buf(logits), &buf(bias), Some(&buf(&pick)), &st, self.routed, top_k, 1, *scale);
+                }
+            }
+            _ => record_route(rec, &buf(logits), &st, self.routed, top_k, 1),
+        }
+        let stage = self.cache.as_ref().and_then(|c| {
+            c.watch(rec);
+            c.admit(rec, &st.jobs_d, top_k, false)
+        });
+        self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * top_k, Order::Jobs, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+        let groups = ((top_k * f) as u32).div_ceil(256);
+        if let Some((beta, linear_beta)) = self.situ {
+            rec.dispatch_wide("quant-moe-situ", SITU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, top_k as u32, beta.to_bits(), linear_beta.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        } else {
+            rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, top_k as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        }
+        self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, top_k, Order::Jobs, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        let wsum_groups = ((h as u32).div_ceil(256), 1, 1);
+        rec.dispatch_wide(
+            "moe-wsum-post-conv-add",
+            WSUM_POST_CONV_ADD,
+            [&buf(&st.out_d), &buf(&st.w), &buf(conv_w), &buf(residual), &d, &d, &buf(conv_state), &buf(out)],
+            &[h as u32, top_k as u32, kernel as u32, 0],
+            wsum_groups,
+        );
+        true
     }
 }
 
@@ -576,6 +657,20 @@ impl WgpuBackend {
         match QuantMoe::try_new(self, data, reserve) {
             Ok(g) => Ok(Box::new(g)),
             Err(data) => crate::quant::host::quant_experts_host_beside(self, data),
+        }
+    }
+
+    /// Try uploading a MoE layer's experts directly to GPU VRAM with Inkling-2 SiTU activation (`beta`, `linear_beta`),
+    /// leaving `reserve` bytes of the budget free. Returns `Ok(None)` without leaking budget if the types are not
+    /// supported on GPU or do not fit within the remaining VRAM budget.
+    pub fn try_quant_experts_situ_leaving(&self, data: QuantExpertsData, reserve: u64, beta: f32, linear_beta: f32) -> Result<Option<Box<dyn Experts>>, String> {
+        data.validate()?;
+        match QuantMoe::try_new(self, data, reserve) {
+            Ok(mut g) => {
+                g.situ = Some((beta, linear_beta));
+                Ok(Some(Box::new(g)))
+            }
+            Err(_) => Ok(None),
         }
     }
 }

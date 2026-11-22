@@ -80,6 +80,10 @@ pub enum ProjectorKind {
     /// each its own size, a window-attention merger inside it (16x) and a 2x2 merger MLP after it
     /// ([`MiniCpmVMmProj`]).
     MiniCpmV,
+    /// Thinking Machines Lab Inkling-2 (`projector_type = "inkling2v"`): pre-LN ViT with CLS token,
+    /// bilinear interpolated position embeddings, 2D axial pairwise RoPE, LayerScale, exact GELU,
+    /// 2×2 spatial merge, and biasless 2-layer MLP projector.
+    Inkling2V,
 }
 
 impl ProjectorKind {
@@ -146,6 +150,8 @@ impl MmProjConfig {
             ProjectorKind::Qwen3Vl => self.n_patches() / 4,
             // MiniCPM-V: a picture's count depends on its slices; a 448 x 448 tile's, 16x
             ProjectorKind::MiniCpmV => self.n_patches() / 16,
+            // Inkling-2: 2x2 spatial merge -> patches/4.
+            ProjectorKind::Inkling2V => self.n_patches() / 4,
         }
     }
 
@@ -186,6 +192,7 @@ impl MmProjConfig {
             Some("gemma4v")         => ProjectorKind::Gemma4V,
             Some("qwen3vl_merger")  => ProjectorKind::Qwen3Vl,
             Some("minicpmv4_7")     => ProjectorKind::MiniCpmV,
+            Some("inkling2v")       => ProjectorKind::Inkling2V,
             Some("mlp")     => ProjectorKind::Mlp,
             None            => ProjectorKind::Gemma3,  // legacy default
             Some(other)     => return Err(LlamaError::Config(
@@ -255,6 +262,8 @@ pub enum MmProj {
     /// MiniCPM-V 4.7's tower and mergers: a picture as tiles ([`MiniCpmVMmProj::tiles`]), each tile's tokens by
     /// [`MmProj::forward`].
     MiniCpmV(MiniCpmVMmProj),
+    /// Thinking Machines Lab Inkling-2 vision tower (`inkling2v`).
+    Inkling2V(Box<crate::llm::arch::inkling2::vision::Inkling2Vision>, MmProjConfig),
 }
 
 impl MmProj {
@@ -285,6 +294,8 @@ impl MmProj {
                 Ok(Self::Qwen3Vl(Qwen3VlMmProj::from_gguf_with_config(g, config, backend.clone())?)),
             ProjectorKind::MiniCpmV =>
                 Ok(Self::MiniCpmV(MiniCpmVMmProj::from_gguf_with_config(g, config, backend.clone())?)),
+            ProjectorKind::Inkling2V =>
+                Ok(Self::Inkling2V(Box::new(crate::llm::arch::inkling2::vision::Inkling2Vision::from_gguf(g, backend.clone())?), config)),
         }
     }
 
@@ -294,6 +305,7 @@ impl MmProj {
             Self::Gemma4V(m) => &m.config,
             Self::Qwen3Vl(m) => &m.config,
             Self::MiniCpmV(m) => &m.config,
+            Self::Inkling2V(_, c) => c,
         }
     }
 
@@ -303,6 +315,7 @@ impl MmProj {
             Self::Gemma4V(m) => &m.backend,
             Self::Qwen3Vl(m) => &m.backend,
             Self::MiniCpmV(m) => &m.backend,
+            Self::Inkling2V(m, _) => m.backend(),
         }
     }
 
@@ -312,6 +325,7 @@ impl MmProj {
             Self::Gemma4V(m) => m.blocks.len(),
             Self::Qwen3Vl(m) => m.blocks.len(),
             Self::MiniCpmV(m) => m.blocks.len(),
+            Self::Inkling2V(m, _) => m.n_blocks(),
         }
     }
 
@@ -322,6 +336,9 @@ impl MmProj {
             Self::Gemma4V(m) => m.forward(image),
             Self::Qwen3Vl(m) => m.forward(image),
             Self::MiniCpmV(m) => m.forward(image),
+            Self::Inkling2V(_, _) => Err(LlamaError::Config(
+                "Inkling2V takes PreparedInkling2Image via Inkling2Vision::encode".into(),
+            )),
         }
     }
 

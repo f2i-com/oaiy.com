@@ -203,6 +203,32 @@
       "add": ["LFM2.5-24B-A2B-GGUF/LFM2.5-24B-A2B-Q4_K_M.gguf"]
     },
     {
+      "id": "inkling-2-mini",
+      "group": "llm",
+      "name": "Inkling-2-Mini (GGUF)",
+      "about": "Thinking Machines Lab's looped multimodal MoE model (~26B total, ~1.5B active per pass over a 3-pass recurrent core) with reasoning, tool use, and vision: ggml-org's IQ4_NL GGUF with its Q8_0 vision projector.",
+      "license": "Apache-2.0",
+      "size_gb": 18.0,
+      "vram_gb": 8,
+      "ram_gb": 24,
+      "agent_tools": true,
+      "parts": [{ "repo": "ggml-org/Inkling-2-Mini-GGUF", "include": ["Inkling-2-Mini-IQ4_NL.gguf", "mmproj-Inkling-2-Mini-Q8_0.gguf"], "into": "Inkling-2-Mini-GGUF" }],
+      "add": ["Inkling-2-Mini-GGUF/Inkling-2-Mini-IQ4_NL.gguf", "Inkling-2-Mini-GGUF/mmproj-Inkling-2-Mini-Q8_0.gguf"]
+    },
+    {
+      "id": "inkling-2-mini-safetensors",
+      "group": "llm",
+      "name": "Inkling-2-Mini (Official Safetensors)",
+      "about": "Thinking Machines Lab's official Inkling-2-Mini checkpoint read directly in place (BF16 trunk, NVFP4/MXFP8 routed experts, built-in vision tower), with reasoning, tool use, and vision.",
+      "license": "Apache-2.0",
+      "size_gb": 19.6,
+      "vram_gb": 8,
+      "ram_gb": 24,
+      "agent_tools": true,
+      "parts": [{ "repo": "thinkingmachines/Inkling-2-Mini", "include": ["config.json", "generation_config.json", "hf_quant_config.json", "processor_config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "model.safetensors.index.json", "model-00001-of-00001.safetensors"], "into": "Inkling-2-Mini" }],
+      "add": ["Inkling-2-Mini"]
+    },
+    {
       "id": "gemma-3-4b",
       "group": "llm",
       "name": "Gemma 3 4B",

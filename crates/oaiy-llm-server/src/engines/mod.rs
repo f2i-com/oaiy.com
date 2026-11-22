@@ -9,6 +9,8 @@ pub(crate) mod disk;
 
 // GLM-5.3-Flash served through the same job/event contract.
 pub mod glm;
+// Thinking Machines Lab Inkling-2 & Inkling-2-Mini (GGUF + native safetensors + vision).
+pub(crate) mod inkling2;
 // Qwen's dense hybrids, Qwen3.8-Flash-Next and OrcaSAQ (its cache, the conversations it parks in host RAM, the vision
 // tower an EXL3 checkpoint comes with).
 pub(crate) mod qwen;

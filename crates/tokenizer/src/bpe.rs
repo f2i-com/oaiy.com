@@ -71,8 +71,12 @@ fn encode_text_segment(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Resul
     // preserve added-token matching before NFC normalization.
     use unicode_normalization::UnicodeNormalization;
     let normalized;
-    let text = if tok.qwen3_pre { normalized=text.nfc().collect::<String>(); &normalized } else {text};
-    let pieces=if tok.qwen3_pre {pretokenizer::split_qwen3(text)} else {pretokenizer::split_llama3(text)};
+    let text = if tok.pre == crate::PreTokenizer::Qwen3 { normalized = text.nfc().collect::<String>(); &normalized } else { text };
+    let pieces = match tok.pre {
+        crate::PreTokenizer::Qwen3 => pretokenizer::split_qwen3(text),
+        crate::PreTokenizer::Gpt4o => pretokenizer::split_gpt4o(text),
+        crate::PreTokenizer::Llama3 => pretokenizer::split_llama3(text),
+    };
     for piece in pieces {
         for part in piece.as_bytes().chunks(MAX_PIECE) {
             let visible = bytes_to_visible(part);

@@ -222,6 +222,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Inkling-2 cross-pass gated control blend over `p[0].x` elements:
+/// `out[i] = (1.0 - tanh(forget[i])) * cur[p[0].y + i] + tanh(gain[i]) * msg[p[0].z + i]`.
+pub(in crate::chain) const CONTROL_BLEND: &str = r#"
+@group(0) @binding(0) var<storage, read> cur: array<f32>;
+@group(0) @binding(1) var<storage, read> msg: array<f32>;
+@group(0) @binding(2) var<storage, read> gain: array<f32>;
+@group(0) @binding(3) var<storage, read> forget: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x + id.y * 16776960u;
+    if (i >= p[0].x) { return; }
+    let g = tanh(clamp(gain[i], -20.0, 20.0));
+    let f = tanh(clamp(forget[i], -20.0, 20.0));
+    out[i] = (1.0 - f) * cur[p[0].y + i] + g * msg[p[0].z + i];
+}
+"#;
+
 /// `y[r] = silu(x[r][..ff]) * x[r][ff..]` for each of `p[0].y` rows, `ff = p[0].x`.
 pub(in crate::chain) const SILU_MUL_SPLIT: &str = r#"
 @compute @workgroup_size(256)

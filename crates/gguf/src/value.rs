@@ -233,7 +233,11 @@ impl fmt::Display for Value {
             Self::Bool(v) => write!(f, "{v}"),
             Self::String(s) => {
                 if s.len() > 80 {
-                    write!(f, "{:?}…({} bytes)", &s[..80], s.len())
+                    let mut end = 80;
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    write!(f, "{:?}…({} bytes)", &s[..end], s.len())
                 } else {
                     write!(f, "{s:?}")
                 }
