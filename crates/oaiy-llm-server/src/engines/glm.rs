@@ -433,6 +433,7 @@ impl GlmEngine {
         }
         self.kv.len = 0;
         self.covered.clear();
+        self.soft.clear();
     }
 
     /// The soft tokens of each of a job's pictures (`[n, d]` each), by Gemma 4's vision tower, or as kept from a
@@ -440,9 +441,11 @@ impl GlmEngine {
     fn pictures(&mut self, job: &Job) -> Result<Vec<Arc<Vec<f32>>>> {
         let mut out = Vec::with_capacity(job.images.len());
         for (i, image) in job.images.iter().enumerate() {
-            if let Some((_, t)) = self.soft.iter().find(|(h, _)| *h == image.hash) {
-                out.push(Arc::clone(t));
-                continue;
+            if !job.forget {
+                if let Some((_, t)) = self.soft.iter().find(|(h, _)| *h == image.hash) {
+                    out.push(Arc::clone(t));
+                    continue;
+                }
             }
             if let (Some(tower), crate::engines::job::ImagePrep::Glm { pixels, width, height, tokens }) = (&self.glm_vision, &image.prep) {
                 let t = std::time::Instant::now();
@@ -454,9 +457,11 @@ impl GlmEngine {
                     eprintln!("  picture {} ({width}x{height}, {tokens} tokens) read in {:.2}s", i + 1, t.elapsed().as_secs_f64());
                 }
                 let soft = Arc::new(soft);
-                self.soft.push_back((image.hash, Arc::clone(&soft)));
-                if self.soft.len() > SOFT_KEPT {
-                    self.soft.pop_front();
+                if !job.forget {
+                    self.soft.push_back((image.hash, Arc::clone(&soft)));
+                    if self.soft.len() > SOFT_KEPT {
+                        self.soft.pop_front();
+                    }
                 }
                 out.push(soft);
                 continue;
@@ -474,9 +479,11 @@ impl GlmEngine {
                 eprintln!("  picture {} ({}x{}, {tokens} tokens) read in {:.2}s", i + 1, pixels.dim(2), pixels.dim(1), t.elapsed().as_secs_f64());
             }
             let soft = Arc::new(soft.data().to_vec());
-            self.soft.push_back((image.hash, Arc::clone(&soft)));
-            if self.soft.len() > SOFT_KEPT {
-                self.soft.pop_front();
+            if !job.forget {
+                self.soft.push_back((image.hash, Arc::clone(&soft)));
+                if self.soft.len() > SOFT_KEPT {
+                    self.soft.pop_front();
+                }
             }
             out.push(soft);
         }

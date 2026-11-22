@@ -379,11 +379,21 @@ pub fn reason(status: u16) -> &'static str {
 // Network Access); which origins are served is still the gateway's decision.
 const COMMON: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\n";
 
+fn valid_header_part(s: &str) -> bool {
+    !s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
 /// Only the head of a response whose `len`-byte body the caller writes next
 /// (a file copied in pieces rather than read whole).
 pub fn respond_head(w: &mut impl Write, status: u16, content_type: &str, extra: &[(&str, &str)], len: u64, keep_alive: bool) -> io::Result<()> {
+    if !valid_header_part(content_type) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid response Content-Type header"));
+    }
     let mut head = format!("HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n{COMMON}", reason(status));
     for (k, v) in extra {
+        if !valid_header_part(k) || !valid_header_part(v) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid response header"));
+        }
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str(if keep_alive { "Connection: keep-alive\r\n\r\n" } else { "Connection: close\r\n\r\n" });
@@ -404,12 +414,18 @@ pub fn respond_with(
     body: &[u8],
     keep_alive: bool,
 ) -> io::Result<()> {
+    if !valid_header_part(content_type) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid response Content-Type header"));
+    }
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{COMMON}",
         reason(status),
         body.len(),
     );
     for (k, v) in extra {
+        if !valid_header_part(k) || !valid_header_part(v) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid response header"));
+        }
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str(if keep_alive { "Connection: keep-alive\r\n\r\n" } else { "Connection: close\r\n\r\n" });
@@ -430,6 +446,9 @@ impl<'a> Stream<'a> {
 
     /// A stream with a status other than 200 (a proxied error that streams, say).
     pub fn start_status(w: &'a mut TcpStream, status: u16, content_type: &str) -> io::Result<Stream<'a>> {
+        if !valid_header_part(content_type) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid stream Content-Type header"));
+        }
         let head = format!(
             "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n{COMMON}Connection: keep-alive\r\n\r\n",
             reason(status)

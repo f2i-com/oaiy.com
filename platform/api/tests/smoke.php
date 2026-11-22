@@ -29,6 +29,11 @@ declare(strict_types=1);
  * Exit code is 0 only when every assertion passes, so it is CI-usable.
  */
 
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit;
+}
+
 $base = rtrim($argv[1] ?? 'http://127.0.0.1:8081', '/');
 
 $pass = 0;

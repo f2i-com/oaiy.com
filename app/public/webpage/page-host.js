@@ -37,7 +37,7 @@
   let dead = false;
   let files = {};
   let pagePath = '';
-  let storage = { local: {}, session: {} };
+  let storage = { local: Object.create(null), session: Object.create(null) };
   const notes = [];
 
   // --- paths and files -----------------------------------------------------------
@@ -409,15 +409,32 @@
     if (src) el.dispatchEvent(new Event(typeof failed === 'string' ? 'error' : 'load'));
   };
 
+  const BLOCKED_WIN_PROPS = new Set([
+    'parent', 'top', 'opener', 'frames', 'frameElement', 'location',
+    'eval', 'Function', 'postMessage', 'open', 'close',
+    'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker',
+    '__botComputerListening', '__botComputerBridge',
+  ]);
+  const isBlockedProp = (obj, prop) => {
+    const p = String(prop);
+    if (p.startsWith('__botComputer') || p.startsWith('__zdom')) return true;
+    return obj === window && BLOCKED_WIN_PROPS.has(p);
+  };
+  const isForbiddenHostVal = (val) => val === parentWindow || (window.top && window.top !== window && val === window.top);
+
   const OPS = {
     window: () => ({ $h: handle(window), c: ['Window'] }),
     document: () => toGuest(document),
     get(id, prop) {
       const obj = target(id);
-      return obj[prop];
+      if (isBlockedProp(obj, prop)) return undefined;
+      const val = obj[prop];
+      if (isForbiddenHostVal(val)) return undefined;
+      return val;
     },
     set(id, prop, value) {
       const obj = target(id);
+      if (isBlockedProp(obj, prop)) return undefined;
       let v = fromGuest(value);
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
@@ -433,12 +450,18 @@
       if (typeof prop === 'string' && prop.startsWith('on') && typeof v === 'function') markListener(obj, prop.slice(2).toLowerCase());
       return undefined;
     },
-    has: (id, prop) => prop in target(id),
+    has: (id, prop) => {
+      const obj = target(id);
+      return !isBlockedProp(obj, prop) && prop in obj;
+    },
     del(id, prop) {
-      delete target(id)[prop];
+      const obj = target(id);
+      if (isBlockedProp(obj, prop)) return;
+      delete obj[prop];
     },
     call(id, method, args) {
       const obj = target(id);
+      if (isBlockedProp(obj, method)) throw new TypeError(`${method} is not allowed`);
       let list = (args || []).map(fromGuest);
       if (typeof obj[method] !== 'function') throw new TypeError(`${method} is not a function`);
       if (method === 'addEventListener' && typeof list[0] === 'string') markListener(obj, list[0].toLowerCase());
@@ -526,10 +549,13 @@
     },
     storage(area, action, arg) {
       const store = storage[area === 'session' ? 'session' : 'local'];
-      if (action === 'get') return Object.prototype.hasOwnProperty.call(store, arg) ? store[arg] : null;
-      if (action === 'set') store[arg[0]] = arg[1];
-      else if (action === 'remove') delete store[arg];
-      else if (action === 'clear') for (const k of Object.keys(store)) delete store[k];
+      const badKey = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype';
+      if (action === 'get') return !badKey(arg) && Object.prototype.hasOwnProperty.call(store, arg) ? store[arg] : null;
+      if (action === 'set') {
+        if (!badKey(arg[0])) store[arg[0]] = arg[1];
+      } else if (action === 'remove') {
+        if (!badKey(arg)) delete store[arg];
+      } else if (action === 'clear') for (const k of Object.keys(store)) delete store[k];
       else if (action === 'key') return Object.keys(store)[arg] ?? null;
       else if (action === 'length') return Object.keys(store).length;
       else if (action === 'keys') return Object.keys(store);

@@ -40,6 +40,39 @@ const stripLead = (s: string) => s.replace(/^[/\\]+/, '');
  * `path.join` collapses `..`, so we canonicalise and check the prefix with a
  * trailing separator (so a sibling dir sharing the name prefix can't match).
  */
+/**
+ * Resolve the deepest existing ancestor of `target` with `fs.realpathSync` and ensure the
+ * resolved real path stays inside `allowedRoots` (closing symlink escapes under confinement).
+ */
+function assertNoSymlinkEscape(target: string, allowedRoots: string[]): void {
+  const realRoots = allowedRoots.map((r) => {
+    try {
+      return fs.realpathSync(r);
+    } catch {
+      return path.resolve(r);
+    }
+  });
+  let probe = path.resolve(target);
+  while (true) {
+    try {
+      const real = fs.realpathSync(probe);
+      if (realRoots.some((root) => real === root || real.startsWith(root + path.sep))) {
+        return;
+      }
+      throw new Error(`symlink target escapes the server fs sandbox: ${target}`);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        const parent = path.dirname(probe);
+        if (parent === probe) return;
+        probe = parent;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 export function within(root: string, rel: string): string {
   const base = path.resolve(root);
   const real = path.resolve(path.join(base, rel));
@@ -50,7 +83,10 @@ export function within(root: string, rel: string): string {
   // DATA_DIR (an allowed root), so `/oaiy/secrets.json` would otherwise resolve here and leak
   // every stored API key. get_secret/store_secret read it DIRECTLY (not via this), so app-level
   // secret access is unaffected; desktop / `oaiy run` (not confined) is unchanged.
-  if (confineEnabled()) refuseSecretStore(real);
+  if (confineEnabled()) {
+    assertNoSymlinkEscape(real, [base]);
+    refuseSecretStore(real);
+  }
   return real;
 }
 
@@ -121,6 +157,7 @@ export function confineAbsolute(p: string): string {
   // an allowed root, so block it here too — same reason as `within`.
   refuseSecretStore(real);
   if (ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + path.sep))) {
+    assertNoSymlinkEscape(real, ALLOWED_ROOTS);
     return real;
   }
   throw new Error(`absolute path is outside the server fs sandbox: ${p}`);

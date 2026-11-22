@@ -100,6 +100,13 @@ export async function createSession(args: Any): Promise<Any> {
     }
     if (config.headers) ctxOpts.extraHTTPHeaders = config.headers;
     if (config.proxy?.server) {
+      if (browserGuardOn()) {
+        // Under worker confinement, validate the proxy server URL against the SSRF guard so a
+        // flow cannot pivot Chromium through localhost / LAN / metadata proxies.
+        const raw = String(config.proxy.server);
+        const checkUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+        await assertUrlAllowed(checkUrl);
+      }
       ctxOpts.proxy = {
         server: config.proxy.server,
         username: config.proxy.username,

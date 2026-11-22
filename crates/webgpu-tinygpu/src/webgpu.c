@@ -91,6 +91,8 @@ struct WGPUCommandBufferImpl { OBJECT; WGPUDevice device; TgwCommandBuffer* rs; 
         (void)label;                                                                  \
     }
 
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void instance_fini(WGPUInstance o) { (void)o; }
 static void adapter_fini(WGPUAdapter o) { tgw_adapter_free(o->rs); }
 static void device_fini(WGPUDevice o) {
@@ -98,7 +100,9 @@ static void device_fini(WGPUDevice o) {
     wgpuAdapterRelease(o->adapter);
 }
 static void queue_fini(WGPUQueue o) {
-    o->device->queue = NULL;
+    pthread_mutex_lock(&queue_lock);
+    if (o->device->queue == o) o->device->queue = NULL;
+    pthread_mutex_unlock(&queue_lock);
     wgpuDeviceRelease(o->device);
 }
 #define CHILD_FINI(NAME, T, FREE)  \
@@ -203,6 +207,7 @@ static void fire(Event* e) {
     case EV_LOST: {
         WGPUDevice d = e->object;
         ((WGPUDeviceLostCallback)e->callback)(&d, e->status, m, u1, u2);
+        wgpuDeviceRelease(d);
         break;
     }
     }
@@ -474,15 +479,25 @@ API WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescripto
 // ---- device ----
 
 API WGPUQueue wgpuDeviceGetQueue(WGPUDevice device) {
+    pthread_mutex_lock(&queue_lock);
     if (device->queue) {
-        wgpuQueueAddRef(device->queue);
-        return device->queue;
+        size_t cur = atomic_load(&device->queue->refs);
+        while (cur > 0) {
+            if (atomic_compare_exchange_weak(&device->queue->refs, &cur, cur + 1)) {
+                WGPUQueue existing = device->queue;
+                pthread_mutex_unlock(&queue_lock);
+                return existing;
+            }
+        }
+        // Dying queue whose refs already hit 0; detach and allocate a fresh handle.
+        device->queue = NULL;
     }
     WGPUQueue q = NEW(WGPUQueue);
     q->refs = 1;
     q->device = device;
     wgpuDeviceAddRef(device);
     device->queue = q;
+    pthread_mutex_unlock(&queue_lock);
     return q;
 }
 
@@ -528,6 +543,7 @@ API void wgpuDeviceDestroy(WGPUDevice device) {
     tgw_device_destroy(device->rs);
     if (!device->lost_told && device->lost.callback) {
         device->lost_told = 1;
+        wgpuDeviceAddRef(device);
         post(EV_LOST, device->lost.mode, (void (*)(void))device->lost.callback, device->lost.userdata1, device->lost.userdata2, WGPUDeviceLostReason_Destroyed, 0, device,
              dup_of("the device was destroyed"));
     }

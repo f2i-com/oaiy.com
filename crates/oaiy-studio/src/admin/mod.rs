@@ -73,12 +73,13 @@ pub fn gate(studio: &Studio, req: &Request, port: u16, peer_loopback: bool) -> O
         }
     }
     // Reached from another machine (or by another name): the gateway key guards the controls too.
-    let exposed = !oaiy_engine::http::listens_on_loopback(&ui_host);
+    // Never gate this on live `ui.host` alone, because switching `ui.host` back to loopback before
+    // restart still leaves the socket bound on all interfaces.
     let local = peer_loopback && host.is_some_and(oaiy_engine::http::loopback_name);
     let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
     let route = req.route();
     let font = FONTS.iter().any(|(path, _)| *path == route);
-    if exposed && !local && route != "/" && !font && !key.is_empty() {
+    if !local && route != "/" && !font && !key.is_empty() {
         let given = req.query("key");
         let keyed = oaiy_engine::http::key_matches(req.header("authorization"), &key) || given.is_some_and(|g| oaiy_engine::http::same_secret(g.as_bytes(), key.as_bytes()));
         if !keyed {
@@ -91,11 +92,10 @@ pub fn gate(studio: &Studio, req: &Request, port: u16, peer_loopback: bool) -> O
 /// One request (its head passed [`gate`] first).
 pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let cfg = studio.config();
-    // (a client other than this computer's own, as [`gate`] tells them: one that reached a control port listening beyond
-    // loopback by another address or name)
-    let ui_host = cfg.get("ui").map_or("127.0.0.1", |u| str_or(u, "host", "127.0.0.1"));
+    // (a client other than this computer's own, as [`gate`] tells them: one that did not connect
+    // over loopback naming loopback, independent of live `ui.host` edits awaiting restart)
     let local = w.peer_addr().is_ok_and(|a| a.ip().to_canonical().is_loopback()) && req.header("host").is_some_and(oaiy_engine::http::loopback_name);
-    let remote = !oaiy_engine::http::listens_on_loopback(ui_host) && !local;
+    let remote = !local;
     let route = req.route().to_string();
     let font = FONTS.iter().find(|(path, _)| *path == route).map(|(_, bytes)| *bytes);
     let method = req.method.as_str();
@@ -437,10 +437,14 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Res
             }
         }
         ("POST", "/api/open-outputs") => {
-            let dir = studio.output_root();
-            let _ = std::fs::create_dir_all(&dir);
-            crate::open_path(&dir.to_string_lossy());
-            Ok(Json::obj([("opened", Json::str(dir.to_string_lossy()))]))
+            if remote {
+                Err((403, "the outputs folder opens on this computer for its own window alone".into()))
+            } else {
+                let dir = studio.output_root();
+                let _ = std::fs::create_dir_all(&dir);
+                crate::open_path(&dir.to_string_lossy());
+                Ok(Json::obj([("opened", Json::str(dir.to_string_lossy()))]))
+            }
         }
         _ => Err((404, format!("no route {method} {route}"))),
     };

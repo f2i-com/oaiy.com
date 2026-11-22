@@ -57,6 +57,8 @@ pub struct Config {
     pub gemma_vision: Option<GemmaVision>,
     /// GLM-5.3 Flash's pictures, where its vision projector is loaded.
     pub glm_vision: Option<GlmVision>,
+    /// Inkling-2 / Inkling-2-Mini's pictures, where its built-in or mmproj vision tower is loaded.
+    pub inkling_vision: Option<InklingVision>,
     /// The token a picture stands as in a prompt; none on a model with no picture token. (No number can mean none:
     /// every id is some model's token, and id 0 is `!` in a byte-level vocabulary, so a text-only model that said 0
     /// refused any prompt with a `!` in it.)
@@ -89,6 +91,13 @@ pub struct GemmaVision {
 #[derive(Clone, Debug)]
 pub struct GlmVision {
     pub shape: crate::llm::arch::glm5next::vision::VisionShape,
+    pub max_tokens: usize,
+}
+
+/// Inkling-2 / Inkling-2-Mini's pictures: its vision tower config and maximum merged image tokens.
+#[derive(Clone, Debug)]
+pub struct InklingVision {
+    pub cfg: crate::llm::arch::inkling2::vision::Inkling2VisionConfig,
     pub max_tokens: usize,
 }
 
@@ -561,17 +570,32 @@ impl Server {
         let no_vision = || bad(format!("{} has no vision here (no vision projector is set for it, or the server runs with --no-vision); images are not supported", a.cfg.model_name));
         // (each vision config below is set with its token: a model with no token has none of them)
         let Some(image) = a.cfg.image_token_id else { return Err(no_vision()) };
-        if let Some(m) = &a.cfg.minicpmv {
-            return crate::engines::qwen::prepare_minicpmv(records, prompt, image, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(image_refusal);
-        }
-        if let Some(vc) = &a.cfg.qwen_vision {
-            return crate::engines::qwen::prepare_images(records, prompt, image, vc, self.local_images, a.cfg.max_seq).map_err(image_refusal);
-        }
-        if let Some(gv) = &a.cfg.gemma_vision {
-            return gemma_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
-        }
-        if let Some(gv) = &a.cfg.glm_vision {
-            return glm_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
+        if a.cfg.minicpmv.is_some()
+            || a.cfg.qwen_vision.is_some()
+            || a.cfg.gemma_vision.is_some()
+            || a.cfg.glm_vision.is_some()
+            || a.cfg.inkling_vision.is_some()
+        {
+            let _turn = vision::decoding_turn().ok_or_else(|| ApiError {
+                status: 503,
+                message: "the server is busy decoding other pictures: try again shortly".into(),
+                code: "busy",
+            })?;
+            if let Some(m) = &a.cfg.minicpmv {
+                return crate::engines::qwen::prepare_minicpmv(records, prompt, image, m, |s| a.flavour.encode(s), self.local_images, a.cfg.max_seq).map_err(image_refusal);
+            }
+            if let Some(vc) = &a.cfg.qwen_vision {
+                return crate::engines::qwen::prepare_images(records, prompt, image, vc, self.local_images, a.cfg.max_seq).map_err(image_refusal);
+            }
+            if let Some(gv) = &a.cfg.gemma_vision {
+                return gemma_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
+            }
+            if let Some(gv) = &a.cfg.glm_vision {
+                return glm_images(records, prompt, image, gv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
+            }
+            if let Some(iv) = &a.cfg.inkling_vision {
+                return inkling_images(records, prompt, image, iv, self.local_images, a.cfg.max_seq).map_err(image_refusal);
+            }
         }
         let Some(vc) = &a.cfg.vision else { return Err(no_vision()) };
         let mut preps = Vec::with_capacity(records.len());
@@ -687,6 +711,50 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
     Ok((ids, images))
 }
 
+/// Inkling-2 / Inkling-2-Mini's pictures: each preprocessed via `Inkling2ImageProcessor`
+/// (checkerboard alpha composite, pad to multiple of 40 with `-1.0`, rescale & normalize),
+/// expanding each `<|unused_200054|>` placeholder token into `rows * cols` placeholder tokens.
+pub(crate) fn inkling_images(
+    records: &[Json],
+    prompt: Vec<u32>,
+    image_id: u32,
+    iv: &InklingVision,
+    local: bool,
+    max_seq: usize,
+) -> Result<(Vec<u32>, Vec<JobImage>), String> {
+    let count = prompt.iter().filter(|&&t| t == image_id).count();
+    if count != records.len() {
+        return Err("the pictures' markers in the prompt are not one a picture".into());
+    }
+    let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
+    for id in prompt {
+        if id != image_id {
+            ids.push(id);
+            continue;
+        }
+        let i = images.len() + 1;
+        let bytes = vision::image_bytes(records.next().expect("a record a marker"), local)
+            .map_err(|e| format!("image {i}: {e}"))?;
+        let prep = crate::llm::arch::inkling2::vision::preprocess_image_bytes(
+            &bytes,
+            &iv.cfg,
+            iv.max_tokens,
+        )
+        .map_err(|e| format!("image {i}: {e}"))?;
+        let tokens = prep.n_tokens();
+        images.push(JobImage {
+            start: ids.len(),
+            prep: crate::engines::job::ImagePrep::Inkling2(prep),
+            hash: crate::engines::disk::fnv(&bytes, 0),
+        });
+        ids.extend(std::iter::repeat_n(image_id, tokens));
+    }
+    if ids.len() >= max_seq {
+        return Err(past_context(ids.len(), max_seq));
+    }
+    Ok((ids, images))
+}
+
 /// Whether a request asked to leave nothing behind: `"incognito": true` in its
 /// body, or an `X-OAIY-Incognito: 1` header.
 pub fn incognito_request(req: &Request, body: Option<&Json>) -> bool {
@@ -788,7 +856,12 @@ impl Server {
         // An incognito session (X-OAIY-Session, or oaiy_session): its state is reused by its next request, in memory only.
         let session = req.header("x-oaiy-session").map(str::to_owned).or_else(|| body.get("oaiy_session").and_then(Json::as_str).map(str::to_owned))
             .map(|s| s.trim().to_owned()).filter(|s| !s.is_empty() && s.len() <= 128);
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec(), forget, session)?;
+        let active_tools = if body.get("tool_choice").and_then(Json::as_str) == Some("none") {
+            Vec::new()
+        } else {
+            body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec()
+        };
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), active_tools, forget, session)?;
         let _stop = StopOnReturn(&cancel);
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
@@ -1650,7 +1723,12 @@ fn observer_context(body: &Json) -> String {
         .filter(|m|m.get("role").and_then(Json::as_str)!=Some("system")).rev().take(6)
         .map(|m|Json::obj([("role",m.get("role").cloned().unwrap_or(Json::Null)),
             ("content_excerpt",Json::str(m.get("content").map(Json::to_json).unwrap_or_default().chars().take(800).collect::<String>()))])).collect();
-    Json::obj([("latest_user_request", task), ("tools", body.get("tools").cloned().unwrap_or(Json::Null)),
+    let active_tools = if body.get("tool_choice").and_then(Json::as_str) == Some("none") {
+        Json::Null
+    } else {
+        body.get("tools").cloned().unwrap_or(Json::Null)
+    };
+    Json::obj([("latest_user_request", task), ("tools", active_tools),
         ("review_progress",body.get("oaiy_review_progress").cloned().unwrap_or(Json::Bool(false))),
         ("tool_context",body.get("oaiy_tool_context").cloned().unwrap_or(Json::Bool(false))),
         ("review_policy",body.get("oaiy_observer_review").cloned().unwrap_or(Json::str("off"))),

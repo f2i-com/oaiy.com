@@ -417,10 +417,15 @@ fn models(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<
             }
         }
     }
-    if data.is_empty() {
-        for m in cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap_or(&[]) {
-            if bool_or(m, "enabled", true) {
-                data.push(model_entry(str_or(m, "name", ""), "llm", false));
+    let seen: std::collections::HashSet<String> = data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Json::as_str).map(str::to_string))
+        .collect();
+    for m in cfg.get("llm").and_then(|l| l.get("models")).and_then(Json::as_array).unwrap_or(&[]) {
+        if bool_or(m, "enabled", true) {
+            let name = str_or(m, "name", "");
+            if !name.is_empty() && !seen.contains(name) {
+                data.push(model_entry(name, "llm", false));
             }
         }
     }
@@ -598,7 +603,7 @@ fn edit_body(req: &Request) -> Result<(Json, Uploads), Reply> {
                         Json::Str(text.clone())
                     } else if let Ok(n) = t.parse::<i64>() {
                         Json::Int(n)
-                    } else if let Ok(x) = t.parse::<f64>() {
+                    } else if let Some(x) = t.parse::<f64>().ok().filter(|x| x.is_finite()) {
                         Json::Num(x)
                     } else if t == "true" || t == "false" {
                         Json::Bool(t == "true")
@@ -1376,7 +1381,7 @@ fn videos_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method:
         }
         ("GET", [id]) => send(w, video(id).map(|j| Reply { status: 200, body: video_object(&j) }).ok_or_else(|| fail(404, "no such video"))),
         ("DELETE", [id]) => {
-            let deleted = studio.media.remove(id);
+            let deleted = video(id).is_some() && studio.media.remove(id);
             send(w, Ok(Reply { status: if deleted { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("object", Json::str("video.deleted")), ("deleted", Json::Bool(deleted))]) }))
         }
         // (as a song's or a sound's: the render stops and the GPU is let go; a flow's Stop sends it)

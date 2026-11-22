@@ -754,6 +754,15 @@ export interface ImageResult {
   revisedPrompt?: string;
 }
 
+function apiKeyFor(media: MediaSettings, targetUrl: string): string {
+  if (!media.apiKey) return '';
+  try {
+    return new URL(targetUrl).origin === new URL(media.baseUrl).origin ? media.apiKey : '';
+  } catch {
+    return '';
+  }
+}
+
 export async function generateImage(media: MediaSettings, req: ImageRequest, signal?: AbortSignal): Promise<ImageResult> {
   const ep = endpointsOf(media);
   const model = req.model || media.imageModel;
@@ -784,7 +793,8 @@ export async function generateImage(media: MediaSettings, req: ImageRequest, sig
     const b64 = str(item.b64_json);
     if (b64) images.push(base64ToBytes(b64));
     else if (str(item.url)) {
-      const file = await request(String(item.url), { apiKey: media.apiKey, what: 'Downloading the image' }, signal);
+      const target = String(item.url);
+      const file = await request(target, { apiKey: apiKeyFor(media, target), what: 'Downloading the image' }, signal);
       images.push(new Uint8Array(await file.arrayBuffer()));
     }
   }
@@ -810,7 +820,10 @@ async function pictureTool(media: MediaSettings, url: string | undefined, body: 
   const item = list(json.data)[0];
   let bytes: Uint8Array | undefined;
   if (str(item?.b64_json)) bytes = base64ToBytes(String(item!.b64_json));
-  else if (str(item?.url)) bytes = new Uint8Array(await (await request(String(item!.url), { apiKey: media.apiKey, what: `${what}: downloading` }, signal)).arrayBuffer());
+  else if (str(item?.url)) {
+    const target = String(item!.url);
+    bytes = new Uint8Array(await (await request(target, { apiKey: apiKeyFor(media, target), what: `${what}: downloading` }, signal)).arrayBuffer());
+  }
   if (!bytes?.length) throw new MediaError(`${what}: the service answered without a picture.`);
   return { bytes, width: num(json.width), height: num(json.height), model: str(json.model) ?? 'default', seconds: num(json.seconds_taken) };
 }

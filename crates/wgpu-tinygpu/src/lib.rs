@@ -186,12 +186,25 @@ impl Conn {
                 s.write_all(p).map_err(|e| format!("tinygpu: {e}"))?;
             }
         }
+        link.unread += 1;
         if !wait {
-            link.unread += 1;
             return Ok(Vec::new());
         }
-        Self::answers(link)?;
-        Self::answer(&mut link.stream)
+        // Drain all earlier pipelined answers AND always consume this request's answer so the
+        // TCP/Unix socket stream never falls out of sync after an earlier error.
+        let mut prior_err = None;
+        while link.unread > 1 {
+            link.unread -= 1;
+            if let Err(e) = Self::answer(&mut link.stream) {
+                prior_err.get_or_insert(e);
+            }
+        }
+        link.unread -= 1;
+        let current = Self::answer(&mut link.stream);
+        match prior_err {
+            Some(e) => Err(format!("{e} (a request before this one)")),
+            None => current,
+        }
     }
 
     /// The answers not read yet, read: the first error among them, if one failed (an earlier request's).

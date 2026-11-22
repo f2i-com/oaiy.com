@@ -50,6 +50,8 @@ pub enum ImagePrep {
     /// One tile of a MiniCPM-V 4.7 picture (its overview or a slice: `[3, h, w]`, normalised), its patch grid
     /// (`size`: rows, columns) and the patches a side each of its tokens is (`merge`: 4, or 2 in 4x).
     MiniCpmV { pixels: ggml_rs::Tensor, size: (usize, usize), merge: usize },
+    /// Inkling-2 / Inkling-2-Mini picture: merged-block HWC patches + merged grid dimensions.
+    Inkling2(crate::llm::arch::inkling2::vision::PreparedInkling2Image),
 }
 impl ImagePrep {
     pub fn n_tokens(&self) -> usize {
@@ -58,6 +60,7 @@ impl ImagePrep {
             Self::Qwen { side, .. } => side * side,
             Self::Gemma { tokens, .. } | Self::Glm { tokens, .. } => *tokens,
             Self::MiniCpmV { size, merge, .. } => crate::llm::vision::mmproj::minicpmv::tile_tokens(*size, *merge),
+            Self::Inkling2(p) => p.n_tokens(),
         }
     }
     pub(crate) fn deepseek(&self) -> oaiy_engine::Result<&Prepared> {

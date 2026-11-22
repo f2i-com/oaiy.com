@@ -36,9 +36,9 @@ function base64ToBytes(text: string): Uint8Array {
   return out;
 }
 
-/** A host as the gate compares it: lower case, IPv6 without brackets. */
+/** A host as the gate compares it: lower case, IPv6 without brackets, no trailing DNS root dot. */
 function hostKey(host: string): string {
-  return host.toLowerCase().replace(/^\[|\]$/g, '');
+  return host.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
 }
 
 /**

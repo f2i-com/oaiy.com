@@ -115,18 +115,31 @@ export class FlowDatabaseManager {
   }
 
   /**
+   * Validate a single path segment (`flowId` or `packageId`) so SQLite files
+   * stay strictly inside `${basePath}`.
+   */
+  private safeSegment(id: string, label: string): string {
+    if (!id || id === '.' || id === '..' || id.includes('..') || !/^[A-Za-z0-9._-]+$/.test(id)) {
+      throw new Error(`Invalid ${label} for database path`);
+    }
+    return id;
+  }
+
+  /**
    * Get the path to a flow's database file
    */
   async getFlowDatabasePath(flowId: string, packageId?: string): Promise<string> {
     const basePath = await this.ensureBasePath();
+    const safeFlow = this.safeSegment(flowId, 'flowId');
 
     if (packageId) {
+      const safePkg = this.safeSegment(packageId, 'packageId');
       // Package flow: databases/packages/{packageId}/{flowId}.sqlite
-      return `${basePath}/packages/${packageId}/${flowId}.sqlite`;
+      return `${basePath}/packages/${safePkg}/${safeFlow}.sqlite`;
     }
 
     // User flow: databases/{flowId}.sqlite
-    return `${basePath}/${flowId}.sqlite`;
+    return `${basePath}/${safeFlow}.sqlite`;
   }
 
   /**

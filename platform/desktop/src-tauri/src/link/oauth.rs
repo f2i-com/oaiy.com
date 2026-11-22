@@ -290,6 +290,7 @@ pub fn exchange_code(
     let url = join(base_url, &o.token_path);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("could not build the token client: {e}"))?;
 

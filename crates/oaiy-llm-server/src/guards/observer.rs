@@ -360,13 +360,20 @@ pub(crate) fn validate_tools(context: &str, draft: &str) -> std::result::Result<
     if !parser.tool_calls_ready() { return Err("incomplete tool call".into()); }
     let (_, calls) = parser.finish();
     for call in calls {
-        let name = call.namespace.as_ref().map_or_else(||call.name.clone(),|ns|format!("{ns}.{}",call.name));
+        let (canonical, alt) = match &call.namespace {
+            Some(ns) => (format!("{ns}::{}", call.name), Some(format!("{ns}.{}", call.name))),
+            None => (call.name.clone(), None),
+        };
         let function = tools.iter().filter_map(|t|t.get("function"))
-            .find(|f|f.get("name").and_then(Json::as_str)==Some(name.as_str()))
-            .ok_or_else(||format!("unknown tool {name}"))?;
+            .find(|f| {
+                let fname = f.get("name").and_then(Json::as_str);
+                fname == Some(canonical.as_str()) || alt.as_deref().is_some_and(|a| fname == Some(a))
+            })
+            .ok_or_else(||format!("unknown tool {canonical}"))?;
         let value = Json::parse(call.arguments.as_bytes()).map_err(|e|e.to_string())?;
-        let schema = function.get("parameters").ok_or("tool parameters missing")?;
-        check_schema(&value, schema, "$", 0).map_err(|e|format!("tool {name}: {e}; required arguments: {}",schema.get("required").map(Json::to_json).unwrap_or_else(||"[]".into())))?;
+        if let Some(schema) = function.get("parameters").filter(|s| !matches!(s, Json::Null)) {
+            check_schema(&value, schema, "$", 0).map_err(|e|format!("tool {canonical}: {e}; required arguments: {}",schema.get("required").map(Json::to_json).unwrap_or_else(||"[]".into())))?;
+        }
     }
     Ok(())
 }

@@ -13,6 +13,7 @@
 
 use std::io::{BufReader, Read, Write};
 use crate::HiddenCommand as _;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -348,16 +349,36 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
         .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
+    let sums_url = format!("https://nodejs.org/dist/v{NODE_VERSION}/SHASUMS256.txt");
+    let expected_sha = super::python::fetch_expected_sha256(&client, &sums_url, &asset)?;
+
     let mut resp = client.get(&url).send().map_err(|e| format!("download request: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download returned HTTP {}", resp.status()));
     }
     let total = resp.content_length();
 
-    let tmp = std::env::temp_dir().join(&asset);
+    // Stage the downloaded archive inside our private data_dir with a unique name and
+    // `create_new(true)` (never a predictable path in world-writable `/tmp`).
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let tmp = parent.join(format!(
+        "node-download-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut hasher = Sha256::new();
     {
-        let mut file =
-            std::fs::File::create(&tmp).map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
         let mut buf = vec![0u8; 64 * 1024];
         let (mut got, mut last) = (0u64, 0u64);
         loop {
@@ -365,6 +386,7 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
             if n == 0 {
                 break;
             }
+            hasher.update(&buf[..n]);
             file.write_all(&buf[..n]).map_err(|e| format!("write temp: {e}"))?;
             got += n as u64;
             if got - last >= 8 * 1024 * 1024 {
@@ -380,7 +402,14 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
         }
     }
 
-    logs.push("stdout", "extracting…".into());
+    let actual_sha = super::python::hex_lower(&hasher.finalize());
+    if actual_sha != expected_sha {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "SHA-256 mismatch for {asset}: expected {expected_sha}, got {actual_sha}"
+        ));
+    }
+    logs.push("stdout", "verified SHA-256; extracting…".into());
     let out = if is_zip {
         extract_zip_stripped(&tmp, dest)
     } else {
@@ -426,9 +455,12 @@ fn extract_tar_gz_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
         // A link (Node's own `bin/npm` is one) points within the package: one to an absolute path, or climbing out of
         // it, would let a later entry be written through it, outside the folder.
         let kind = entry.header().entry_type();
-        if kind.is_symlink() || kind.is_hard_link() {
+        if kind.is_hard_link() {
+            return Err(format!("archive entry {:?} uses an unsupported hard link", path.display()));
+        }
+        if kind.is_symlink() {
             let target = entry.link_name().map_err(|e| format!("link target: {e}"))?.map(|t| t.into_owned()).unwrap_or_default();
-            let from = if kind.is_hard_link() { strip_first(&target).unwrap_or_default() } else { rel.parent().unwrap_or(Path::new("")).join(&target) };
+            let from = rel.parent().unwrap_or(Path::new("")).join(&target);
             if target.is_absolute() || !stays_inside(&from) {
                 return Err(format!("archive entry {:?} links outside the package", path.display()));
             }

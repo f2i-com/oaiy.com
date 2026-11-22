@@ -922,7 +922,11 @@ pub(crate) async fn studio_json(ui: &str, method: reqwest::Method, path: &str, b
 
 /// As [`studio_json`], waiting `wait` for the answer (a model's plan asks Hugging Face and the computers on the network).
 pub(crate) async fn studio_json_within(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>, wait: std::time::Duration) -> Result<serde_json::Value, (u16, String)> {
-    let mut req = reqwest::Client::new().request(method, format!("{ui}{path}")).timeout(wait);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| (502, format!("could not build engines client: {e}")))?;
+    let mut req = client.request(method, format!("{ui}{path}")).timeout(wait);
     if let Some(body) = body {
         req = req.json(&body);
     }

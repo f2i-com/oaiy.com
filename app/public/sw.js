@@ -127,12 +127,18 @@ self.addEventListener('message', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => Promise.all(urls.map((u) => cache.add(u).catch(() => {})))));
 });
 
-function isolate(response) {
+function isolate(response, pathname) {
   if (!response || response.status === 0 || response.type === 'opaque') return response;
   const headers = new Headers(response.headers);
   headers.set('Cross-Origin-Opener-Policy', 'same-origin');
   headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
-  headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  const existingCorp = headers.get('Cross-Origin-Resource-Policy');
+  const isPreviewAsset = pathname && (/\/(?:softn|webpage|modelview)\//.test(pathname));
+  if (existingCorp !== 'cross-origin' && !isPreviewAsset) {
+    headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  } else if (isPreviewAsset) {
+    headers.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -154,16 +160,16 @@ self.addEventListener('fetch', (event) => {
         })
         .catch(() => null);
       // A page: fresh when online, cached when not.
-      if (request.mode === 'navigate') return isolate((await network) ?? (await cache.match(key)) ?? (await fromEarlierBuild(key)) ?? new Response('offline', { status: 503 }));
+      if (request.mode === 'navigate') return isolate((await network) ?? (await cache.match(key)) ?? (await fromEarlierBuild(key)) ?? new Response('offline', { status: 503 }), url.pathname);
       const cached = await cache.match(key);
       if (cached) {
         event.waitUntil(network);
-        return isolate(cached);
+        return isolate(cached, url.pathname);
       }
       const response = await network;
-      if (response?.ok) return isolate(response);
+      if (response?.ok) return isolate(response, url.pathname);
       // Not on the host (or no host): a tab that is still on an earlier build finds its own files in that build's cache.
-      return isolate((await fromEarlierBuild(key)) ?? response ?? new Response('offline', { status: 503 }));
+      return isolate((await fromEarlierBuild(key)) ?? response ?? new Response('offline', { status: 503 }), url.pathname);
     })(),
   );
 });

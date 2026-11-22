@@ -80,8 +80,9 @@ pub struct Kernel {
     pub scratch: bool,
 }
 
-/// The scratch a kernel with [`Kernel::scratch`] takes, in bytes: 1 KB for each of 64 warps on each of 160 SMs.
-pub const SCRATCH_BYTES: u64 = 160 * 64 * 1024;
+/// The scratch a kernel with [`Kernel::scratch`] takes, in bytes: 1 KB for each of 64 warps on each of 256 SMs
+/// (covers RTX 5090's 170 SMs and Blackwell workstation GPUs up to 256 SMs).
+pub const SCRATCH_BYTES: u64 = 256 * 64 * 1024;
 
 /// `wgsl`'s compute entry point (its first, or the one called `entry`) as a CUDA kernel.
 pub fn translate(wgsl: &str, entry: Option<&str>) -> Result<Kernel, String> {
@@ -792,7 +793,14 @@ impl<'a> Writer<'a> {
                 let b = self.expr(ctx, *base)?;
                 self.as_vec3(ctx, h, format!("{b}{}", self.member(self.resolve(ctx, *base), *index)?))
             }
-            E::Load { pointer } => self.as_vec3(ctx, h, self.lvalue(ctx, *pointer)?),
+            E::Load { pointer } => {
+                let lv = self.lvalue(ctx, *pointer)?;
+                if self.points_to_atomic(ctx, *pointer) {
+                    format!("atomicAdd(&{lv}, 0)")
+                } else {
+                    self.as_vec3(ctx, h, lv)
+                }
+            }
             E::Unary { op, expr } => {
                 let v = self.expr(ctx, *expr)?;
                 match op {

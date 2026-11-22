@@ -494,10 +494,18 @@ impl Engine {
             }
             // (an incognito request leaves the experts' counts as it found them: the profile keeps nothing of it)
             let before = job.forget.then(|| self.model.expert_uses().counts());
-            if let Err(e) = self.generate(&job) {
-                // The state's extent is unknown after a failure: start clean.
-                self.forget_state();
-                let _ = job.events.send(Event::Error(e.to_string()));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // The state's extent is unknown after a failure: start clean.
+                    self.forget_state();
+                    let _ = job.events.send(Event::Error(e.to_string()));
+                }
+                Err(_) => {
+                    self.forget_state();
+                    let _ = job.events.send(Event::Error("DeepSeek inference panicked".into()));
+                }
             }
             // Incognito: kept in memory alone, for its session's next request ([`crate::engines::job::INCOGNITO_KEPT`] at most unused).
             if job.forget {

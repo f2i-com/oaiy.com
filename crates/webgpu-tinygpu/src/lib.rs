@@ -411,12 +411,12 @@ pub unsafe extern "C" fn tgw_device_poll(d: *mut TgwDevice, wait: i32) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_device_destroy(d: *mut TgwDevice) {
-    (*d).device.destroy();
+    let _ = catch_unwind(AssertUnwindSafe(|| (*d).device.destroy()));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_device_free(d: *mut TgwDevice) {
-    free(d)
+    let _ = catch_unwind(AssertUnwindSafe(|| free(d)));
 }
 
 // ---- buffers ----
@@ -432,11 +432,15 @@ pub unsafe extern "C" fn tgw_buffer_create(d: *mut TgwDevice, size: u64, usage: 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_buffer_map(d: *mut TgwDevice, b: *mut TgwBuffer, write: i32, offset: u64, size: u64) -> i32 {
     let (d, b) = (&*d, &mut *b);
+    let Some(end) = offset.checked_add(size) else {
+        d.report(TGW_VALIDATION, "buffer map range overflow".into());
+        return 1;
+    };
     let mode = if write != 0 { wgpu::MapMode::Write } else { wgpu::MapMode::Read };
     let result = Arc::new(Mutex::new(None));
     let done = Arc::clone(&result);
     let ok = d.guard(|| {
-        b.buffer.slice(offset..offset + size).map_async(mode, move |r| *done.lock().unwrap_or_else(|p| p.into_inner()) = Some(r));
+        b.buffer.slice(offset..end).map_async(mode, move |r| *done.lock().unwrap_or_else(|p| p.into_inner()) = Some(r));
         let _ = d.device.poll(wgpu::PollType::wait_indefinitely());
     });
     let outcome = result.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -454,38 +458,52 @@ pub unsafe extern "C" fn tgw_buffer_map(d: *mut TgwDevice, b: *mut TgwBuffer, wr
 #[no_mangle]
 pub unsafe extern "C" fn tgw_buffer_range(d: *mut TgwDevice, b: *mut TgwBuffer, offset: u64, size: u64, write: i32) -> *mut c_void {
     let (d, b) = (&*d, &mut *b);
-    let slice = b.buffer.slice(offset..offset + size);
-    let got = if write != 0 {
-        slice.get_mapped_range_mut().map(|mut v| {
-            let p = v.slice(..).as_raw_ptr().as_ptr() as *mut u8 as *mut c_void;
-            b.views.push(View::Write(v));
-            p
-        })
-    } else {
-        slice.get_mapped_range().map(|v| {
-            let p = v.as_ptr() as *mut c_void;
-            b.views.push(View::Read(v));
-            p
-        })
+    let Some(end) = offset.checked_add(size) else {
+        d.report(TGW_VALIDATION, "buffer range overflow".into());
+        return std::ptr::null_mut();
     };
-    got.unwrap_or_else(|e| {
-        d.report(TGW_VALIDATION, e.to_string());
-        std::ptr::null_mut()
-    })
+    let got = d.guard(|| {
+        let slice = b.buffer.slice(offset..end);
+        if write != 0 {
+            slice.get_mapped_range_mut().map(|mut v| {
+                let p = v.slice(..).as_raw_ptr().as_ptr() as *mut u8 as *mut c_void;
+                b.views.push(View::Write(v));
+                p
+            })
+        } else {
+            slice.get_mapped_range().map(|v| {
+                let p = v.as_ptr() as *mut c_void;
+                b.views.push(View::Read(v));
+                p
+            })
+        }
+    });
+    match got {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            d.report(TGW_VALIDATION, e.to_string());
+            std::ptr::null_mut()
+        }
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_buffer_unmap(b: *mut TgwBuffer) {
-    let b = &mut *b;
-    b.views.clear();
-    b.buffer.unmap();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let b = &mut *b;
+        b.views.clear();
+        b.buffer.unmap();
+    }));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_buffer_destroy(b: *mut TgwBuffer) {
-    let b = &mut *b;
-    b.views.clear();
-    b.buffer.destroy();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let b = &mut *b;
+        b.views.clear();
+        b.buffer.destroy();
+    }));
 }
 
 #[no_mangle]
@@ -675,7 +693,7 @@ pub unsafe extern "C" fn tgw_pass_dispatch_indirect(d: *mut TgwDevice, p: *mut T
 
 #[no_mangle]
 pub unsafe extern "C" fn tgw_pass_end(p: *mut TgwPass) {
-    drop((*p).0.take());
+    let _ = catch_unwind(AssertUnwindSafe(|| drop((*p).0.take())));
 }
 
 #[no_mangle]

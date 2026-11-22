@@ -1496,10 +1496,11 @@ impl QwenEngine {
         let mut by_fifty: Vec<f64> = Vec::new();
         let (mut cycles, mut turned) = (crate::guards::repetition::CycleGuard::default(), 0usize);
         self.replying = true;
+        let mut cancelled = false;
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) {
-                if let (Some(m), false) = (drafter, pending.is_empty()) { m.rollback(&mut self.kv, check_rows, check_rows - pending.len()); }
-                return Ok(());
+                cancelled = true;
+                break;
             }
             let clock = std::time::Instant::now();
             let in_prose = !in_thought && !in_call && crate::engines::job::penalizes(&job.sampling);
@@ -1683,9 +1684,14 @@ impl QwenEngine {
         }
         let raw = tok.decode(&generated);
         // The client is told what the model wrote, so a rejected call can be read
-        // and fixed; the server log never holds it.
-        let text = stream.push(&raw, &job.tools, true)
-            .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
+        // and fixed; the server log never holds it. Skip final tool-contract check when
+        // cancelled early (client closed or stop string hit), but still send Done & settle checkpoints.
+        let text = if cancelled {
+            String::new()
+        } else {
+            stream.push(&raw, &job.tools, true)
+                .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?
+        };
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken ({checks} checks of {rows_checked} rows {t_check:.2}s, drafting {t_draft:.2}s, undoing {t_undo:.2}s)") } else { String::new() }); }
         #[cfg(feature = "webgpu")]
         if self.log {

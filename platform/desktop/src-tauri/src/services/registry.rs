@@ -2612,6 +2612,9 @@ impl Registry {
         let mut hay = serde_json::to_string(&t).unwrap_or_default();
         if let InstallSpec::Script { windows, unix } = &t.install {
             for n in [windows.as_deref(), unix.as_deref()].into_iter().flatten() {
+                if !is_safe_script_name(n) {
+                    continue;
+                }
                 hay.push(' ');
                 hay.push_str(n);
                 if let Ok(s) = std::fs::read_to_string(scripts_dir.join(n)) {
@@ -2624,8 +2627,12 @@ impl Registry {
         let mut files = HashMap::new();
         // The template's own declared files are authoritative — always include
         // them (re-read for hand-edits), so a self-contained package round-trips
-        // even if a name doesn't happen to appear in the haystack.
+        // even if a name doesn't happen to appear in the haystack. Validate every
+        // name so a crafted template cannot read files outside `scripts_dir`.
         for name in &declared {
+            if !is_safe_script_name(name) {
+                continue;
+            }
             if let Ok(body) = std::fs::read_to_string(scripts_dir.join(name)) {
                 files.insert(name.clone(), body);
             }

@@ -218,7 +218,7 @@ const CoreImageCompiler: ModuleCompiler = {
             const nodeId = cfg.nodeId || '';
             const title = cfg.title || cfg.label || '';
             const nodeType = cfg.nodeType || cfg.inputName || 'LoadImage';
-            const allowBypass = cfg.allowBypass ?? false;
+            const allowBypass = Boolean(cfg.allowBypass);
             return `{nodeId:"${escapeString(nodeId)}",title:"${escapeString(title)}",nodeType:"${escapeString(nodeType)}",allowBypass:${allowBypass}}`;
           });
           comfyImageInputConfigsCode = `[${configItems.join(',')}]`;

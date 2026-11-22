@@ -27,9 +27,10 @@ pub fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
-    // Authority ends at the first path, query or fragment delimiter.
+    // Authority ends at the first path, query or fragment delimiter (including `\`
+    // which WHATWG URL treats as a path separator for http/https).
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '\\', '?', '#'])
         .next()
         .filter(|a| !a.is_empty())?;
     if authority.contains('@') {

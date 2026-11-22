@@ -62,6 +62,12 @@ function resolveArg(a: string): string {
     if (/^[A-Za-z]:(?![\\/])/.test(a) || path.isAbsolute(a)) {
       return confineAbsolute(a);
     }
+    // Block filtergraph expressions and virtual inputs that read arbitrary files from disk
+    // without going through `-i` (e.g., `movie=`, `amovie=`, `subtitles=`, `ass=`,
+    // `drawtext=...textfile=`, `sendcmd`, `asendcmd`, `lut3d`, `haldclut`, `lavfi`).
+    if (/(^|[;,[\]\s])(a?movie|subtitles|ass|a?sendcmd|lut3d|haldclut)\s*=/i.test(a) || /(^|[;,:[\]\s])textfile\s*=/i.test(a)) {
+      throw new Error(`ffmpeg filtergraph file-reading expression is not allowed in server mode: ${a}`);
+    }
     // A bare relative path that traverses upward escapes the worker CWD/sandbox — reject it.
     // Value tokens (`copy`, `concat`, `0`, filtergraphs) contain no `..`, so they pass through.
     if (/(^|\/)\.\.(\/|$)/.test(n)) {
@@ -137,6 +143,9 @@ export async function runCommand(args: Record<string, unknown>): Promise<RunComm
         i++;
         continue;
       }
+      if (a === '-f' && resolved[i + 1] && String(resolved[i + 1]).toLowerCase() === 'lavfi') {
+        throw new Error('ffmpeg -f lavfi is not allowed in server mode');
+      }
       if (a === '-i') {
         guarded.push('-protocol_whitelist', 'file,pipe');
         const list = resolved[i + 1];
@@ -173,10 +182,13 @@ export async function runCommand(args: Record<string, unknown>): Promise<RunComm
 export async function getVideoInfo(args: Record<string, unknown>): Promise<VideoInfoLite> {
   const p = resolvePath(String(args.path ?? ''));
   const empty: VideoInfoLite = { duration: 0, width: 0, height: 0, fps: 0, codec: '', format: '' };
+  const probeArgs = fsConfinementOn()
+    ? ['-v', 'quiet', '-protocol_whitelist', 'file,pipe', '-print_format', 'json', '-show_format', '-show_streams', p]
+    : ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', p];
   try {
     const { stdout } = await pexecFile(
       FFPROBE,
-      ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', p],
+      probeArgs,
       { maxBuffer: 1024 * 1024 * 16 },
     );
     const j = JSON.parse(stdout.toString()) as {

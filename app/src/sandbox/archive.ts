@@ -128,6 +128,9 @@ function tarUnpack(bytes: Uint8Array): Array<[string, Uint8Array]> {
     const name = text(at, 100);
     if (!name && bytes[at] === 0) break;
     const size = parseInt(text(at + 124, 12).trim() || '0', 8);
+    if (!Number.isFinite(size) || size < 0 || at + 512 + size > bytes.byteLength) {
+      throw new Error('corrupt tar archive: invalid entry size');
+    }
     const type = String.fromCharCode(bytes[at + 156] || 48);
     const prefix = text(at + 345, 155);
     const data = bytes.subarray(at + 512, at + 512 + size);
@@ -145,7 +148,7 @@ function tarUnpack(bytes: Uint8Array): Array<[string, Uint8Array]> {
 }
 
 function safe(path: string): string | null {
-  const clean = path.replace(/^\.\//, '');
+  const clean = path.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '');
   if (!clean || clean.split('/').includes('..') || clean.startsWith('/')) return null;
   return clean;
 }

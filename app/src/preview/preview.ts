@@ -415,6 +415,7 @@ export class Preview {
     this.link?.close();
     this.link = null;
     this.target = null;
+    this.storage.clear();
     this.refreshApps();
     this.stale = true;
     this.current = { ok: false, errors: [], at: 0 };

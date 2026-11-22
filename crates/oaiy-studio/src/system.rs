@@ -204,7 +204,7 @@ fn parse_windows_adapters(text: &str) -> Vec<Json> {
         }
         let id = id.to_ascii_lowercase();
         let field = |key: &str| id.split(key).nth(1).and_then(|v| v.get(..4)).and_then(|v| u32::from_str_radix(v, 16).ok());
-        let vendor = id.split("ven_").nth(1).map(|v| vendor_of(&v[..v.len().min(4)])).unwrap_or("other");
+        let vendor = id.split("ven_").nth(1).and_then(|v| v.get(..4)).map(vendor_of).unwrap_or("other");
         out.push(adapter(out.len(), name.trim(), vendor, field("ven_").zip(field("dev_")), Some(bytes / (1024 * 1024))));
     }
     out

@@ -75,8 +75,8 @@ fn serve<R: Runtime>(app: &AppHandle<R>, request: &Request<Vec<u8>>) -> Response
         .header("Cross-Origin-Embedder-Policy", "credentialless")
         .header("Cross-Origin-Resource-Policy", "cross-origin")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-    // The SoftN preview frame has an opaque origin: its module scripts are cross-origin loads.
-    if path.starts_with("/softn/") {
+    // Preview frames have opaque origins: their module scripts are cross-origin loads.
+    if path.starts_with("/softn/") || path.starts_with("/webpage/") || path.starts_with("/modelview/") {
         response = response.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
     }
     response.body(asset.bytes).unwrap()

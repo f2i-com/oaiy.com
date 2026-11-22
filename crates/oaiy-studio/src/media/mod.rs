@@ -1121,7 +1121,7 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             let dir = crate::media::speech::voices_dir(cfg, root);
             let saved = match crate::media::speech::inline_voice(s) {
                 Some(v) => crate::media::speech::inline_sample(v, &output_dir(output_root, "video")).map_err(|e| format!("speech: {e}"))?,
-                None => s.get("voice").and_then(Json::as_str).map(|n| crate::media::speech::sample_file(&dir, n)).filter(|p| p.is_file()),
+                None => s.get("voice").and_then(Json::as_str).filter(|n| crate::media::speech::valid_name(n)).map(|n| crate::media::speech::sample_file(&dir, n)).filter(|p| p.is_file()),
             };
             if let Some(sample) = saved {
                 f.push(("reference_voice".into(), Json::str(sample.to_string_lossy())));

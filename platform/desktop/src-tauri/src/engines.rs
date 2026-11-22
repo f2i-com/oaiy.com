@@ -427,13 +427,18 @@ fn parse_activity(state: &serde_json::Value, downloads: &serde_json::Value) -> R
     Ok((media, running))
 }
 
-/// GGUF architectures the language-model engine loads (oaiy-llm-server's `load_gguf`): Qwen3.5, the dense families it
-/// loads whole, and the MoE families whose experts it streams. A file of another is refused when it is added, rather
-/// than chosen and failing on the first message.
-const ENGINE_RUNS: [&str; 11] = ["qwen35", "llama", "mistral", "qwen2", "qwen3", "gemma3", "gemma3n", "gemma4", "qwen3moe", "qwen3vlmoe", "glm5next"];
-/// Of those, the ones whose tool calls the engine reads (the Qwen3.5 and GLM formats): the Agent's tools need one.
-/// The others chat.
-const ENGINE_TOOLS: [&str; 2] = ["qwen35", "glm5next"];
+/// GGUF architectures the language-model engine loads (oaiy-llm-server's `load_gguf`): Qwen3.5, Inkling-2, the dense
+/// families it loads whole, and the MoE families whose experts it streams. A file of another is refused when it is
+/// added, rather than chosen and failing on the first message.
+const ENGINE_RUNS: [&str; 17] = [
+    "qwen35", "qwen35moe", "qwen3vl", "qwen4exp", "lfm2moe",
+    "inkling2", "inkling2_loop",
+    "llama", "mistral", "qwen2", "qwen3", "gemma3", "gemma3n", "gemma4",
+    "qwen3moe", "qwen3vlmoe", "glm5next",
+];
+/// Of those, the ones whose tool calls the engine reads (Qwen3.5, LFM2, Inkling-2, and GLM formats): the Agent's
+/// tools need one. The others chat.
+const ENGINE_TOOLS: [&str; 7] = ["qwen35", "qwen35moe", "qwen4exp", "lfm2moe", "inkling2", "inkling2_loop", "glm5next"];
 /// The tensor types the engine decodes (`ggml_quants::is_supported`): the K-quants, the legacy ones, IQ4 and the
 /// floats. The other IQ types (IQ1, IQ2, IQ3), the ternary ones and MXFP4 fail when the model loads.
 const ENGINE_TYPES: [&str; 15] = ["F32", "F16", "BF16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"];
@@ -491,7 +496,7 @@ fn runnable(detected: &serde_json::Value, name: &str) -> Result<(String, bool), 
     let arch = text("architecture");
     if !ENGINE_RUNS.contains(&arch) {
         return Err(format!(
-            "{name} is a {} model, which OAIY's engine does not run yet. It runs Qwen3.5, Qwen3, Qwen2, Llama, Mistral, Gemma 3 and 4, and GLM models.",
+            "{name} is a {} model, which OAIY's engine does not run yet. It runs Qwen3.5, Qwen3, Qwen2, Inkling-2, LFM2, Llama, Mistral, Gemma 3 and 4, and GLM models.",
             if arch.is_empty() { "kind of" } else { arch }
         ));
     }
@@ -594,8 +599,12 @@ mod tests {
     fn only_a_language_model_the_engine_loads_is_added_and_the_agent_tools_follow_its_architecture() {
         let llm = |arch: &str| serde_json::json!({ "kind": "llm", "section": "llm", "summary": "x — GGUF LLM", "architecture": arch });
         assert_eq!(runnable(&llm("qwen35"), "a.gguf").unwrap(), ("qwen35".to_string(), true));
+        assert_eq!(runnable(&llm("qwen35moe"), "a.gguf").unwrap(), ("qwen35moe".to_string(), true));
+        assert_eq!(runnable(&llm("lfm2moe"), "a.gguf").unwrap(), ("lfm2moe".to_string(), true));
+        assert_eq!(runnable(&llm("inkling2_loop"), "a.gguf").unwrap(), ("inkling2_loop".to_string(), true));
+        assert_eq!(runnable(&llm("inkling2"), "a.gguf").unwrap(), ("inkling2".to_string(), true));
         assert_eq!(runnable(&llm("glm5next"), "a.gguf").unwrap(), ("glm5next".to_string(), true));
-        for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma3", "gemma3n", "gemma4", "qwen3moe"] {
+        for arch in ["llama", "mistral", "qwen2", "qwen3", "qwen3vl", "gemma3", "gemma3n", "gemma4", "qwen3moe"] {
             assert_eq!(runnable(&llm(arch), "a.gguf").unwrap(), (arch.to_string(), false), "{arch} chats only");
         }
         let phi = runnable(&llm("phi3"), "phi.gguf").unwrap_err();

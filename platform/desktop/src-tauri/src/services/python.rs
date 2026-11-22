@@ -20,6 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -463,6 +464,11 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
         .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
+    let sums_url = format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{RELEASE}/SHA256SUMS"
+    );
+    let expected_sha = fetch_expected_sha256(&client, &sums_url, &asset)?;
+
     let mut resp = client
         .get(&url)
         .send()
@@ -472,9 +478,26 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     }
     let total = resp.content_length();
 
-    let tmp = std::env::temp_dir().join(&asset);
+    // Stage the downloaded archive inside our private data_dir with a unique name and
+    // `create_new(true)` (never a predictable path in world-writable `/tmp`).
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let tmp = parent.join(format!(
+        "python-download-{}-{}.tar.gz.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut hasher = Sha256::new();
     {
-        let mut file = std::fs::File::create(&tmp)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&tmp)
             .map_err(|e| format!("create temp {}: {e}", tmp.display()))?;
         let mut buf = vec![0u8; 64 * 1024];
         let mut got: u64 = 0;
@@ -484,6 +507,7 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
             if n == 0 {
                 break;
             }
+            hasher.update(&buf[..n]);
             file.write_all(&buf[..n]).map_err(|e| format!("write temp: {e}"))?;
             got += n as u64;
             if got - last >= 8 * 1024 * 1024 {
@@ -501,7 +525,14 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
         }
     }
 
-    logs.push("stdout", "extracting...".into());
+    let actual_sha = hex_lower(&hasher.finalize());
+    if actual_sha != expected_sha {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "SHA-256 mismatch for {asset}: expected {expected_sha}, got {actual_sha}"
+        ));
+    }
+    logs.push("stdout", "verified SHA-256; extracting...".into());
     let staged = install_from_tarball(&tmp, dest);
     let _ = std::fs::remove_file(&tmp);
     let python = staged?;
@@ -523,6 +554,44 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     }
     logs.push("stdout", format!("done. python is at {}", python.display()));
     Ok(())
+}
+
+/// Fetch a `SHA256SUMS` / `SHASUMS256.txt` manifest and return the lowercase 64-hex digest for `asset`.
+pub(super) fn fetch_expected_sha256(
+    client: &reqwest::blocking::Client,
+    sums_url: &str,
+    asset: &str,
+) -> Result<String, String> {
+    let resp = client
+        .get(sums_url)
+        .send()
+        .map_err(|e| format!("fetch checksums {sums_url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("checksums returned HTTP {}", resp.status()));
+    }
+    let body = resp
+        .text()
+        .map_err(|e| format!("read checksums {sums_url}: {e}"))?;
+    for line in body.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let name = name.trim_start_matches('*');
+        if name == asset && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(hash.to_ascii_lowercase());
+        }
+    }
+    Err(format!("no SHA-256 entry for {asset} in {sums_url}"))
+}
+
+pub(super) fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// The bundled interpreter inside an extracted PBS tree.

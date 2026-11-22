@@ -1084,10 +1084,18 @@ impl crate::llm::Model {
         ram_budget_bytes: u64,
     ) -> crate::llm::Result<Self> {
         use crate::llm::config::{Architecture, ModelConfig};
-        use crate::llm::{Glm5NextModel, LlamaError, MixtralModel, Qwen3MoeModel};
-        let g = GgufFile::open_streaming(gguf_path)?;
+        use crate::llm::{Glm5NextModel, Inkling2Model, LlamaError, MixtralModel, Qwen3MoeModel};
+        let g = GgufFile::open_streaming(&gguf_path)?;
         let arch_str = g.architecture()?.to_string();
         let arch = Architecture::from_str(&arch_str);
+
+        if matches!(arch, Architecture::Inkling2 | Architecture::Inkling2Loop) {
+            // Inkling-2 already keeps stacked GGUF experts zero-copy via mmap and caches only
+            // small bounded slices on demand.
+            drop(g);
+            let mapped = GgufFile::open(gguf_path)?;
+            return Ok(Self::Inkling2(Box::new(Inkling2Model::from_gguf(&mapped, backend)?)));
+        }
 
         let is_qwen3moe = matches!(arch, Architecture::Qwen3Moe | Architecture::Qwen3VlMoe);
         // glm5next streams too, but its first 3 blocks are dense.

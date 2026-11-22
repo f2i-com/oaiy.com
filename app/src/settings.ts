@@ -45,12 +45,20 @@ async function put(key: string, value: unknown): Promise<void> {
   });
 }
 
-async function secretKey(): Promise<CryptoKey> {
-  const existing = await get<CryptoKey>('secret-key');
-  if (existing) return existing;
-  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-  await put('secret-key', key);
-  return key;
+let secretKeyPending: Promise<CryptoKey> | null = null;
+
+function secretKey(): Promise<CryptoKey> {
+  secretKeyPending ??= (async () => {
+    const existing = await get<CryptoKey>('secret-key');
+    if (existing) return existing;
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    await put('secret-key', key);
+    return key;
+  })().catch((err) => {
+    secretKeyPending = null;
+    throw err;
+  });
+  return secretKeyPending;
 }
 
 interface Sealed {

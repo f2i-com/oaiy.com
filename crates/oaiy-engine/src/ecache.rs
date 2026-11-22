@@ -214,18 +214,19 @@ impl Book {
     }
 
     /// Free a place for one more record; false when every record is leased
-    /// or still being read.
+    /// or still being read (or capacity is 0). Loops so a shrunk budget
+    /// converges back within `capacity` once previously leased entries clear.
     fn make_room(&mut self, capacity: usize, policy: CachePolicy) -> bool {
-        if self.entries.len() < capacity {
-            return true;
+        if capacity == 0 {
+            return false;
         }
-        match self.victim(policy) {
-            Some(k) => {
-                self.evict(k);
-                true
+        while self.entries.len() >= capacity {
+            match self.victim(policy) {
+                Some(k) => self.evict(k),
+                None => return false,
             }
-            None => false,
         }
+        true
     }
 
     fn publish(&mut self, k: Key, bytes: Arc<Vec<u8>>) {
@@ -436,9 +437,30 @@ impl Ecache {
         g.entries.insert(key, Entry { bytes: None, uses: 1, last: now, slot: usize::MAX });
         drop(g);
 
+        // Guard removes the in-flight placeholder and wakes waiters if `store.fetch` panics.
+        struct InFlightGuard<'a> {
+            cache: &'a Ecache,
+            key: Key,
+            active: bool,
+        }
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let mut g = self.cache.book();
+                    if g.entries.get(&self.key).is_some_and(|e| !e.loaded()) {
+                        g.entries.remove(&self.key);
+                    }
+                    drop(g);
+                    self.cache.read_done.notify_all();
+                }
+            }
+        }
+        let mut inflight = InFlightGuard { cache: self, key, active: true };
+
         let read = store.fetch(layer, expert, &mut buf);
 
         let mut g = self.book();
+        inflight.active = false;
         let out = match read {
             Ok(()) => {
                 let bytes = Arc::new(buf);

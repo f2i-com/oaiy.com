@@ -417,7 +417,7 @@ const CoreVideoCompiler: ModuleCompiler = {
           const title = cfg.title || cfg.label || '';
           const nodeType = cfg.nodeType || cfg.inputName || 'LoadImage';
           const handleId = cfg.handleId || '';
-          const allowBypass = cfg.allowBypass ?? false;
+          const allowBypass = Boolean(cfg.allowBypass);
           return `{nodeId:"${escapeString(nodeId)}",title:"${escapeString(title)}",nodeType:"${escapeString(nodeType)}",handleId:"${escapeString(handleId)}",allowBypass:${allowBypass}}`;
         });
         comfyImageInputConfigsCode = `[${configItems.join(',')}]`;

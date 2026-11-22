@@ -474,6 +474,10 @@ jobs:
           hdiutil create -volname "OAIY" -srcfolder "$stage" -ov -format UDZO "$image" > /dev/null
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" "$image"
           codesign --verify --verbose=2 "$image"
+          # Destroy the temporary signing keychain immediately after signing so no later step
+          # (including executing the newly built binary during smoke testing) can reach it.
+          security delete-keychain "$keychain" 2>/dev/null || true
+          rm -f "$keychain" "$RUNNER_TEMP/developer-id.p12"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
 
       - name: Have Apple notarise the image
@@ -526,11 +530,12 @@ jobs:
           else
             spctl --assess --type execute -vv "$apps/OAIY.app" || echo "(as expected of an app that is not notarised)"
           fi
-          node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
+          # Hash the signed DMG before executing the newly built binary for smoke testing.
           ( cd signed && shasum -a 256 *.dmg > SHA256SUMS.txt && cat SHA256SUMS.txt )
           # The image's digest as this job's own word: it travels apart from the artifact store, where the job that
           # adds the image to a release takes the file from.
           echo "sha256=$(shasum -a 256 "$IMAGE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          node platform/desktop/scripts/smoke-desktop.mjs "$apps/OAIY.app/Contents/MacOS/oaiy-desktop"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

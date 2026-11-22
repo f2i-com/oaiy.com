@@ -21,15 +21,19 @@ use std::path::Path;
 /// Alignment that satisfies direct I/O on every NVMe/SATA device we target.
 pub const DIRECT_ALIGN: usize = 4096;
 
-/// Fill `buf` from `file` at `offset`, looping over short reads.
+/// Fill `buf` from `file` at `offset`, looping over short reads and EINTR.
 pub fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
-        let n = read_at(file, buf, offset)?;
+        let n = match read_at(file, buf, offset) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
         }
         buf = &mut buf[n..];
-        offset += n as u64;
+        offset = offset.checked_add(n as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
     }
     Ok(())
 }
@@ -110,8 +114,9 @@ impl AlignedScratch {
 pub fn read_direct(file: &File, dst: &mut [u8], offset: u64, scratch: &mut AlignedScratch) -> io::Result<()> {
     let a = DIRECT_ALIGN as u64;
     let start = offset / a * a;
-    let end = (offset + dst.len() as u64).div_ceil(a) * a;
-    let span = (end - start) as usize;
+    let end_raw = offset.checked_add(dst.len() as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "direct read offset overflow"))?;
+    let end = end_raw.div_ceil(a).checked_mul(a).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "direct read alignment overflow"))?;
+    let span = usize::try_from(end - start).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "direct read span overflow"))?;
     let head = (offset - start) as usize;
     // The aligned tail can run past EOF; a short final read is fine as long
     // as the bytes we need arrived. An unbuffered read only stops short at
@@ -121,7 +126,11 @@ pub fn read_direct(file: &File, dst: &mut [u8], offset: u64, scratch: &mut Align
     let window = scratch.window(span);
     let mut got = 0;
     while got < span {
-        let n = read_at(file, &mut window[got..], start + got as u64)?;
+        let n = match read_at(file, &mut window[got..], start + got as u64) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         got += n;
         if n == 0 || got % DIRECT_ALIGN != 0 {
             break;

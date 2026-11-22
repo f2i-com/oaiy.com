@@ -15,10 +15,17 @@
  * a function of the page {$f: id}, undefined {$u: 1}, a promise {$p: id},
  * a typed array {$ta: name, d: [...]}, a date {$date: ms}.
  */
+(function () {
 var window = globalThis;
 var self = window;
 var __MAGIC = '\u0000bot.computer.page:';
 var __channel = typeof __zippHostCall === 'function' ? __zippHostCall : null;
+try {
+  delete globalThis.__zippHostCall;
+} catch (_e) {
+  // non-configurable on some hosts; overwrite if writable
+  try { globalThis.__zippHostCall = undefined; } catch (_e2) {}
+}
 var __wrappers = new Map();
 var __expando = new Map();
 var __fnIds = new Map();
@@ -749,3 +756,46 @@ function XMLHttpRequest() {
     }, 0);
   };
 }
+
+// Expose only public browser globals and host entry hooks; internal bridge state
+// (__MAGIC, __channel, __host, __win, __wrappers, __fns) remains closed inside this IIFE.
+var __exports = {
+  window: window,
+  self: self,
+  document: document,
+  parent: parent,
+  top: top,
+  frames: frames,
+  console: console,
+  localStorage: localStorage,
+  sessionStorage: sessionStorage,
+  location: location,
+  history: history,
+  PopStateEvent: PopStateEvent,
+  alert: alert,
+  confirm: confirm,
+  prompt: prompt,
+  print: print,
+  open: open,
+  close: close,
+  focus: focus,
+  blur: blur,
+  performance: performance,
+  crypto: crypto,
+  atob: atob,
+  btoa: btoa,
+  structuredClone: structuredClone,
+  queueMicrotask: queueMicrotask,
+  fetch: fetch,
+  XMLHttpRequest: XMLHttpRequest,
+  __zdom_cb: __zdom_cb,
+  __zdom_settle: __zdom_settle,
+  __zdom_inline: __zdom_inline,
+  __zdom_run: __zdom_run,
+};
+for (var __k in __exports) {
+  try {
+    globalThis[__k] = __exports[__k];
+  } catch (_e) {}
+}
+})();

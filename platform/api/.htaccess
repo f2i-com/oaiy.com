@@ -20,7 +20,7 @@ RewriteEngine On
 # Suspenders: the same protection via mod_rewrite (works on 2.2 + 2.4, and
 # covers whole directories). 403 on source/data/tooling dirs, dotfiles
 # (except ACME's .well-known), the SQLite DB sidecars, and Composer manifests.
-RewriteRule (^|/)(src|var|migrations|bin|vendor|storage)/ - [F,L]
+RewriteRule (^|/)(src|var|migrations|bin|vendor|storage|tests)/ - [F,L]
 RewriteRule (^|/)\.(?!well-known) - [F,L]
 RewriteRule \.(env|sqlite|sqlite-wal|sqlite-shm|sqlite-journal)$ - [F,L]
 RewriteRule (^|/)composer\.(json|lock)$ - [F,L]
