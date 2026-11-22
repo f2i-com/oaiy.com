@@ -105,6 +105,26 @@ describe('Model files', () => {
     expect(host.textContent).not.toContain('edit it to add your own');
   });
 
+  it('labels mmproj GGUF files clearly as companion vision projectors', async () => {
+    m.list.mockResolvedValue({
+      rootDir: '/Users/sam/models',
+      models: [
+        { name: 'Inkling-2-Mini-GGUF/Inkling-2-Mini-IQ4_NL.gguf', path: '/Users/sam/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-IQ4_NL.gguf', sizeBytes: 17_600_000_000, modified: null },
+        { name: 'Inkling-2-Mini-GGUF/mmproj-Inkling-2-Mini-Q8_0.gguf', path: '/Users/sam/models/Inkling-2-Mini-GGUF/mmproj-Inkling-2-Mini-Q8_0.gguf', sizeBytes: 345_900_000, modified: null },
+      ],
+      total: 2,
+      offset: 0,
+      limit: 200,
+      freeBytes: 212e9,
+    });
+    await render();
+    const rows = Array.from(host.querySelectorAll('.model-row'));
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).not.toContain('Vision projector');
+    expect(rows[1].textContent).toContain('Vision projector');
+    expect(rows[1].textContent).toContain('companion vision encoder');
+  });
+
   it('says OAIY is not answering, once, with a way to ask again', async () => {
     m.list.mockRejectedValue(new ApiError(0, NOT_ANSWERING));
     await render();

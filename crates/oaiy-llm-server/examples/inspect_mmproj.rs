@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MmProj::Gemma4V(_) => ("Gemma 4 V tower (RMSNorm + SwiGLU + sandwich norms) + single linear projector", false),
         MmProj::Qwen3Vl(_) => ("Qwen3-VL tower (LN + fused QKV + GeLU MLP + post-LN) + 2x2 spatial-merge MLP head", false),
         MmProj::MiniCpmV(_) => ("MiniCPM-V 4.7 SigLIP tower (window merger inside) + 2x2 merger MLP head", false),
+        MmProj::Inkling2V(_, _) => ("Inkling-2 SigLIP2-NaFlex vision tower + 2x2 spatial-merge projector", false),
     };
     println!("  vision blocks:  {}", mm.n_blocks());
     println!("  flavour:        {kind_label}");

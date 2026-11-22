@@ -24,8 +24,10 @@ use oaiy_engine::Result;
 use tokenizer::Tokenizer;
 
 use crate::dsv41::chat::{Encoded, Mode, Options, DSML};
+use crate::engines::disk::DiskCache;
 use crate::engines::glm::ThinkBudget;
 use crate::engines::job::{penalize_reply, sample, Event, Finish, ImagePrep, Job};
+use crate::llm::arch::inkling2::state::{Inkling2ConvSnapshot, Inkling2StateSnapshot};
 use crate::llm::arch::inkling2::vision::Inkling2Vision;
 use crate::llm::arch::inkling2::Inkling2Model;
 
@@ -372,7 +374,9 @@ pub fn chat_prompt(msgs: &[Json], opts: &Options, allow_images: bool) -> std::re
 /// Token IDs for Inkling-2's structural control markers.
 #[derive(Clone, Copy, Debug)]
 pub struct SpecialIds {
+    pub msg_user: Option<u32>,
     pub msg_model: Option<u32>,
+    pub msg_tool: Option<u32>,
     pub content_text: Option<u32>,
     pub content_thinking: Option<u32>,
     pub content_invoke_tool: Option<u32>,
@@ -383,7 +387,9 @@ pub struct SpecialIds {
 impl SpecialIds {
     pub fn from_tokenizer(tok: &Tokenizer) -> Self {
         Self {
+            msg_user: tok.token_id(MSG_USER),
             msg_model: tok.token_id(MSG_MODEL),
+            msg_tool: tok.token_id(MSG_TOOL),
             content_text: tok.token_id(CONTENT_TEXT),
             content_thinking: tok.token_id(CONTENT_THINKING),
             content_invoke_tool: tok.token_id(CONTENT_INVOKE_TOOL_JSON),
@@ -608,16 +614,154 @@ fn format_tool_call_as_dsml(header_name: &str, json_str: &str) -> Option<String>
 }
 
 const SOFT_KEPT: usize = 4;
-const PREFILL_CHUNK: usize = 64;
+/// Maximum lightweight conv-only checkpoints retained for the active live conversation (~3.7 MiB each).
+const MAX_LIVE_CHECKPOINTS: usize = 8;
+/// Minimum prompt prefix length worth snapshotting into host RAM or persistent disk cache.
+const MIN_SNAPSHOT_TOKENS: usize = 64;
+/// Avoid re-writing conversation disk checkpoints when an earlier non-base disk entry already
+/// sits within this many tokens (keeps SSD writes low during short multi-step tool turns).
+const DISK_NEAR_TOKENS: usize = 256;
 
-/// Dedicated worker engine serving an `Inkling2Model` (GGUF or Safetensors) with optional vision.
+/// Token position of the immutable system+tools+effort base prefix: the index of the first
+/// `<|message_user|>` token (strictly inside `0..prompt.len()`).
+pub(crate) fn base_boundary(prompt: &[u32], specials: SpecialIds) -> Option<usize> {
+    let msg_user = specials.msg_user?;
+    prompt
+        .iter()
+        .position(|&t| t == msg_user)
+        .filter(|&p| p >= MIN_SNAPSHOT_TOKENS && p < prompt.len())
+}
+
+/// Natural message-boundary checkpoint positions inside `prompt`:
+///   * `base`: right before the first `<|message_user|>` (system prompt + tools + effort),
+///   * last `<|message_user|>` and last `<|message_tool|>` boundaries,
+///   * `prompt.len() - 1` (so exact retries still leave 1 token for logits).
+pub(crate) fn checkpoint_positions(prompt: &[u32], specials: SpecialIds) -> Vec<usize> {
+    let mut stops = Vec::with_capacity(4);
+    if let Some(u) = specials.msg_user {
+        if let Some(first_u) = prompt.iter().position(|&t| t == u) {
+            stops.push(first_u);
+        }
+        if let Some(last_u) = prompt.iter().rposition(|&t| t == u) {
+            stops.push(last_u);
+        }
+    }
+    if let Some(tool) = specials.msg_tool {
+        if let Some(last_t) = prompt.iter().rposition(|&t| t == tool) {
+            stops.push(last_t);
+        }
+    }
+    if prompt.len() > 1 {
+        stops.push(prompt.len() - 1);
+    }
+    stops.retain(|&p| p > 0 && p < prompt.len());
+    stops.sort_unstable();
+    stops.dedup();
+    stops
+}
+
+struct RamEntry {
+    keys: Vec<u64>,
+    snap: Arc<Inkling2StateSnapshot>,
+    bytes: usize,
+    base: bool,
+    used: u64,
+}
+
+/// Byte-budgeted host-RAM prefix snapshot cache (LRU; protects `base` system-prompt entries
+/// against eviction by ordinary conversation snapshots).
+#[derive(Default)]
+pub(crate) struct RamCache {
+    entries: Vec<RamEntry>,
+    budget: usize,
+    held: usize,
+    clock: u64,
+}
+
+impl RamCache {
+    pub(crate) fn new(budget: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            budget,
+            held: 0,
+            clock: 0,
+        }
+    }
+
+    pub(crate) fn has(&self, keys: &[u64]) -> bool {
+        self.entries.iter().any(|e| e.keys == keys)
+    }
+
+    pub(crate) fn best(&mut self, prompt: &[u64], limit: usize, after: usize) -> Option<(Vec<u64>, Arc<Inkling2StateSnapshot>)> {
+        let best_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.keys.len() > after
+                    && e.keys.len() <= limit
+                    && prompt.starts_with(&e.keys)
+            })
+            .max_by_key(|(_, e)| (e.keys.len(), e.used))
+            .map(|(i, _)| i)?;
+        self.clock += 1;
+        let entry = &mut self.entries[best_idx];
+        entry.used = self.clock;
+        Some((entry.keys.clone(), Arc::clone(&entry.snap)))
+    }
+
+    pub(crate) fn insert(&mut self, keys: Vec<u64>, snap: Arc<Inkling2StateSnapshot>, base: bool) -> bool {
+        if self.budget == 0 || keys.is_empty() {
+            return false;
+        }
+        let bytes = snap.bytes().saturating_add(keys.len() * 8);
+        if bytes > self.budget {
+            return false;
+        }
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.keys == keys) {
+            self.clock += 1;
+            existing.used = self.clock;
+            existing.base |= base;
+            return true;
+        }
+        // Evict LRU non-base entries first; evict oldest base entry only if required.
+        while self.held.saturating_add(bytes) > self.budget && !self.entries.is_empty() {
+            let victim = (0..self.entries.len())
+                .min_by_key(|&i| (self.entries[i].base, self.entries[i].used))
+                .expect("non-empty entries");
+            let removed = self.entries.remove(victim);
+            self.held = self.held.saturating_sub(removed.bytes);
+        }
+        if self.held.saturating_add(bytes) > self.budget {
+            return false;
+        }
+        self.clock += 1;
+        self.held = self.held.saturating_add(bytes);
+        self.entries.push(RamEntry {
+            keys,
+            snap,
+            bytes,
+            base,
+            used: self.clock,
+        });
+        true
+    }
+}
+
+/// Dedicated worker engine serving an `Inkling2Model` (GGUF or Safetensors) with optional vision
+/// and 3-tier prompt prefix caching (live GPU conv checkpoints, host RAM LRU snapshots, and
+/// persistent on-disk `DiskCache`).
 pub struct Inkling2Engine {
     model: Inkling2Model,
     vision: Option<Arc<Inkling2Vision>>,
     tok: Arc<Tokenizer>,
     specials: SpecialIds,
     max_seq: usize,
-    covered: Vec<u32>,
+    covered: Vec<u64>,
+    checkpoints: Vec<(Vec<u64>, Inkling2ConvSnapshot, bool)>,
+    ram_cache: RamCache,
+    pub(crate) disk: Option<DiskCache<Arc<Inkling2StateSnapshot>>>,
+    image_disk_cache: bool,
     soft: VecDeque<(u64, Arc<Vec<f32>>)>,
     private_session: Option<Option<String>>,
     private_at: std::time::Instant,
@@ -640,6 +784,10 @@ impl Inkling2Engine {
             specials,
             max_seq,
             covered: Vec::new(),
+            checkpoints: Vec::new(),
+            ram_cache: RamCache::default(),
+            disk: None,
+            image_disk_cache: false,
             soft: VecDeque::new(),
             private_session: None,
             private_at: std::time::Instant::now(),
@@ -647,11 +795,108 @@ impl Inkling2Engine {
         }
     }
 
+    pub fn with_ram_budget(mut self, bytes: usize) -> Self {
+        self.ram_cache = RamCache::new(bytes);
+        self
+    }
+
+    pub fn with_disk(
+        mut self,
+        disk: Option<DiskCache<Arc<Inkling2StateSnapshot>>>,
+        image_disk_cache: bool,
+    ) -> Self {
+        self.disk = disk;
+        self.image_disk_cache = image_disk_cache;
+        self
+    }
+
     fn reset(&mut self) {
         self.private_session = None;
         self.model.reset();
         self.covered.clear();
+        self.checkpoints.clear();
         self.soft.clear();
+    }
+
+    fn push_live_checkpoint(&mut self, keys: Vec<u64>, ckpt: Inkling2ConvSnapshot, base: bool) {
+        if let Some(existing) = self.checkpoints.iter_mut().find(|(k, _, _)| *k == keys) {
+            existing.1 = ckpt;
+            existing.2 |= base;
+            return;
+        }
+        self.checkpoints.push((keys, ckpt, base));
+        while self.checkpoints.len() > MAX_LIVE_CHECKPOINTS {
+            if let Some(idx) = self.checkpoints.iter().position(|(_, _, is_base)| !*is_base) {
+                self.checkpoints.remove(idx);
+            } else {
+                self.checkpoints.remove(0);
+            }
+        }
+    }
+
+    /// Park the current live conversation into host RAM (and optionally disk) before switching
+    /// to an unrelated prompt so returning to it later restores in ~15 ms instead of re-prefilling.
+    fn park_displaced_live(&mut self, incoming: &[u64], incoming_forget: bool) {
+        if incoming_forget || self.private_session.is_some() || self.covered.len() < MIN_SNAPSHOT_TOKENS {
+            return;
+        }
+        let common = self
+            .covered
+            .iter()
+            .zip(incoming)
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Only park when the incoming prompt diverges substantially (< 50% shared).
+        if common * 2 >= self.covered.len() {
+            return;
+        }
+        if self.ram_cache.has(&self.covered) {
+            return;
+        }
+        let est = self.model.estimate_snapshot_bytes(self.covered.len());
+        if est as usize > self.ram_cache.budget {
+            return;
+        }
+        if let Ok(snap) = self.model.capture_state_snapshot() {
+            if snap.pos == self.covered.len() {
+                let snap = Arc::new(snap);
+                self.ram_cache.insert(self.covered.clone(), snap, false);
+            }
+        }
+    }
+
+    fn store_snapshot_tiers(
+        &mut self,
+        keys: Vec<u64>,
+        snap: Arc<Inkling2StateSnapshot>,
+        base: bool,
+        base_pos: Option<usize>,
+        allow_disk: bool,
+        forget: bool,
+    ) {
+        if forget || keys.len() < MIN_SNAPSHOT_TOKENS {
+            return;
+        }
+        self.ram_cache.insert(keys.clone(), Arc::clone(&snap), base);
+        if allow_disk {
+            if let Some(disk) = self.disk.as_mut() {
+                let est = snap.encoded_len() as u64;
+                let near_base = !base
+                    && base_pos.is_some_and(|bp| {
+                        keys.len() >= bp
+                            && keys.len() - bp < DISK_NEAR_TOKENS
+                            && disk.has(&keys[..bp])
+                    });
+                let near_skip = near_base || (!base && disk.near(&keys, DISK_NEAR_TOKENS));
+                if !near_skip
+                    && !disk.has(&keys)
+                    && disk.takes(est)
+                    && disk.worth(&keys, est, base, &self.covered)
+                {
+                    disk.save(keys, snap, base);
+                }
+            }
+        }
     }
 
     pub fn run(mut self, jobs: Receiver<Job>) {
@@ -720,12 +965,16 @@ impl Inkling2Engine {
         }
     }
 
-    fn encode_pictures(&mut self, job: &Job) -> Result<Vec<Arc<Vec<f32>>>> {
+    fn encode_pictures(&mut self, job: &Job, start: usize) -> Result<Vec<Option<Arc<Vec<f32>>>>> {
         let mut out = Vec::with_capacity(job.images.len());
         for (i, img) in job.images.iter().enumerate() {
+            if img.start + img.prep.n_tokens() <= start {
+                out.push(None);
+                continue;
+            }
             if !job.forget {
                 if let Some((_, cached)) = self.soft.iter().find(|(h, _)| *h == img.hash) {
-                    out.push(Arc::clone(cached));
+                    out.push(Some(Arc::clone(cached)));
                     continue;
                 }
             }
@@ -762,7 +1011,7 @@ impl Inkling2Engine {
                     self.soft.pop_front();
                 }
             }
-            out.push(soft);
+            out.push(Some(soft));
         }
         Ok(out)
     }
@@ -777,48 +1026,182 @@ impl Inkling2Engine {
             ));
         }
 
-        let pictures = self.encode_pictures(job)?;
-        let keyed: Vec<u32> = {
-            let mut k = job.prompt.clone();
+        let keyed: Vec<u64> = {
+            let mut k: Vec<u64> = job.prompt.iter().map(|&t| u64::from(t)).collect();
             for img in &job.images {
                 for (off, id) in k[img.start..img.start + img.prep.n_tokens()]
                     .iter_mut()
                     .enumerate()
                 {
-                    *id = 0x8000_0000
-                        | ((img.hash.rotate_left(17) ^ off as u64) as u32 & 0x7fff_ffff);
+                    *id = (1u64 << 63) ^ img.hash.rotate_left(17) ^ (off as u64);
                 }
             }
             k
         };
 
-        let started = std::time::Instant::now();
+        let cache_clock = std::time::Instant::now();
+        let max_prefix = keyed.len().saturating_sub(1);
+        let disk_limit = match job.images.iter().map(|i| i.start).min() {
+            Some(first_img) if !self.image_disk_cache => first_img.min(max_prefix),
+            _ => max_prefix,
+        };
+
+        // 1. Evaluate Tier-1 live GPU/CPU state & live multi-boundary conv checkpoints.
         let common = self
             .covered
             .iter()
             .zip(&keyed)
             .take_while(|(a, b)| a == b)
             .count();
-        let start = if common == self.covered.len() && common < keyed.len() {
+        let swa_slack = self.model.swa_checkpoint_slack();
+        let live_exact = if common == self.covered.len() && common < keyed.len() {
             common
         } else {
-            self.model.reset();
-            self.covered.clear();
             0
         };
-        let source = if start > 0 { "memory" } else { "none" };
+        let best_live_ckpt = self
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, (saved, ckpt, _))| {
+                saved.len() > live_exact
+                    && saved.len() <= common
+                    && saved.len() < keyed.len()
+                    && self.covered.len().saturating_sub(ckpt.pos) <= swa_slack
+                    && keyed.starts_with(saved)
+            })
+            .max_by_key(|(_, (saved, _, _))| saved.len())
+            .map(|(idx, (saved, _, _))| (idx, saved.len()));
+        let live_potential = best_live_ckpt.map_or(live_exact, |(_, len)| len);
+
+        // 2. Check Tier-2 Host RAM cache & Tier-3 persistent DiskCache for a strictly longer match.
+        let ram_candidate = if !job.forget {
+            self.ram_cache.best(&keyed, max_prefix, live_potential)
+        } else {
+            None
+        };
+        let after_ram = ram_candidate
+            .as_ref()
+            .map_or(live_potential, |(k, _)| k.len());
+        let disk_candidate = if !job.forget && disk_limit > after_ram {
+            self.disk
+                .as_mut()
+                .and_then(|d| d.load_best(&keyed, disk_limit, after_ram, self.log))
+        } else {
+            None
+        };
+
+        let (mut start, mut source) = (0usize, "none");
+
+        if let Some((saved_keys, snap)) = disk_candidate {
+            self.park_displaced_live(&keyed, job.forget);
+            match self.model.restore_state_snapshot(&snap) {
+                Ok(()) => {
+                    let conv = snap.to_conv_snapshot();
+                    let is_base = base_boundary(&job.prompt, self.specials) == Some(snap.pos);
+                    self.checkpoints.clear();
+                    self.push_live_checkpoint(saved_keys.clone(), conv, is_base);
+                    self.ram_cache
+                        .insert(saved_keys.clone(), Arc::clone(&snap), is_base);
+                    self.covered = saved_keys;
+                    start = snap.pos;
+                    source = "disk";
+                }
+                Err(e) => {
+                    if self.log {
+                        eprintln!("  Inkling-2 disk prompt state skipped: {e}");
+                    }
+                }
+            }
+        }
+
+        if start == 0 {
+            if let Some((saved_keys, snap)) = ram_candidate {
+                self.park_displaced_live(&keyed, job.forget);
+                match self.model.restore_state_snapshot(&snap) {
+                    Ok(()) => {
+                        let conv = snap.to_conv_snapshot();
+                        let is_base = base_boundary(&job.prompt, self.specials) == Some(snap.pos);
+                        self.checkpoints.clear();
+                        self.push_live_checkpoint(saved_keys.clone(), conv, is_base);
+                        self.covered = saved_keys;
+                        start = snap.pos;
+                        source = "ram";
+                    }
+                    Err(e) => {
+                        if self.log {
+                            eprintln!("  Inkling-2 RAM prompt state skipped: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        if start == 0 {
+            if let Some((idx, _)) = best_live_ckpt {
+                let (saved_keys, ckpt, _) = self.checkpoints[idx].clone();
+                if self.model.restore_conv_checkpoint(&ckpt) {
+                    self.covered = saved_keys;
+                    self.checkpoints
+                        .retain(|(k, _, _)| k.len() <= self.covered.len() && keyed.starts_with(k));
+                    start = self.covered.len();
+                    source = "checkpoint";
+                }
+            } else if live_exact > 0 {
+                self.checkpoints
+                    .retain(|(k, _, _)| k.len() <= live_exact && keyed.starts_with(k));
+                start = live_exact;
+                source = "memory";
+            }
+        }
+
+        if start == 0 {
+            self.park_displaced_live(&keyed, job.forget);
+            self.model.reset();
+            self.covered.clear();
+            self.checkpoints.clear();
+        }
+
         let _ = job.events.send(Event::CacheReuse {
             cached: start,
             source,
             common,
         });
+        if self.log && (start > 0 || self.disk.is_some()) {
+            eprintln!(
+                "  Inkling-2 cache: {start}/{} tokens from {source} (common {common}) in {:.3}s",
+                keyed.len(),
+                cache_clock.elapsed().as_secs_f64()
+            );
+        }
 
+        // Encode only images that extend past the cached prefix (cached image spans are skipped!).
+        let pictures = self.encode_pictures(job, start)?;
+
+        let started = std::time::Instant::now();
         let total = keyed.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
+
+        let base_pos = base_boundary(&job.prompt, self.specials);
+        let need_base_snapshot = base_pos.is_some_and(|bp| {
+            bp > start
+                && !job.forget
+                && (!self.ram_cache.has(&keyed[..bp])
+                    || self.disk.as_ref().is_some_and(|d| {
+                        bp <= disk_limit
+                            && !d.has(&keyed[..bp])
+                            && d.takes(self.model.estimate_snapshot_bytes(bp))
+                    }))
+        });
+        let stops = checkpoint_positions(&job.prompt, self.specials);
+        let keep_at = keyed.len().saturating_sub(1);
 
         let mut pos = start;
         let mut logits = Vec::new();
         let d = self.model.cfg.hidden;
+        let chunk = self.model.preferred_prefill_chunk().max(1);
+        let mut keep_at_ckpt: Option<Inkling2ConvSnapshot> = None;
+
         while pos < keyed.len() {
             if job.cancel.load(Ordering::Relaxed) {
                 let _ = job.events.send(Event::Done {
@@ -827,24 +1210,82 @@ impl Inkling2Engine {
                 });
                 return Ok(());
             }
-            let take = PREFILL_CHUNK.min(keyed.len() - pos);
+
+            // Stop cleanly at `base_pos` (only on first encounter, so system+tools gets pinned)
+            // and at `keep_at = keyed.len() - 1` (so exact retries & post-turn disk snapshots work).
+            let mut next_stop = (pos + chunk).min(keyed.len());
+            if need_base_snapshot {
+                if let Some(bp) = base_pos {
+                    if bp > pos && bp < next_stop {
+                        next_stop = bp;
+                    }
+                }
+            }
+            if keep_at > pos && keep_at < next_stop {
+                next_stop = keep_at;
+            }
+            // Also record lightweight conv checkpoints on turn boundaries when crossing them
+            // without breaking large chunks into tiny fragments (only when chunk is already small
+            // or boundary matches a stop).
+            let take = next_stop - pos;
             let ids = &job.prompt[pos..pos + take];
             let soft: Vec<(usize, &[f32])> = job
                 .images
                 .iter()
                 .zip(&pictures)
-                .filter_map(|(img, rows)| {
+                .filter_map(|(img, rows_opt)| {
+                    let rows = rows_opt.as_ref()?;
                     let lo = img.start.max(pos);
                     let hi = (img.start + img.prep.n_tokens()).min(pos + take);
                     (lo < hi).then(|| (lo - pos, &rows[(lo - img.start) * d..(hi - img.start) * d]))
                 })
                 .collect();
-            logits = self
-                .model
-                .forward_last(ids, &soft)
-                .map_err(|e| oaiy_engine::Error::Arg(e.to_string()))?;
+            let is_final = pos + take >= keyed.len();
+            if is_final {
+                logits = self
+                    .model
+                    .forward_last(ids, &soft)
+                    .map_err(|e| oaiy_engine::Error::Arg(e.to_string()))?;
+            } else {
+                self.model
+                    .prefill_only(ids, &soft)
+                    .map_err(|e| oaiy_engine::Error::Arg(e.to_string()))?;
+            }
             self.covered.extend_from_slice(&keyed[pos..pos + take]);
             pos += take;
+
+            // Pin the base system+tools prefix snapshot the very first time we cross it.
+            if need_base_snapshot && base_pos == Some(pos) {
+                if let Ok(snap) = self.model.capture_state_snapshot() {
+                    if snap.pos == pos {
+                        let conv = snap.to_conv_snapshot();
+                        let keys_prefix = keyed[..pos].to_vec();
+                        self.push_live_checkpoint(keys_prefix.clone(), conv, true);
+                        self.store_snapshot_tiers(
+                            keys_prefix,
+                            Arc::new(snap),
+                            true,
+                            base_pos,
+                            pos <= disk_limit,
+                            job.forget,
+                        );
+                    }
+                }
+            }
+
+            // Capture lightweight (~0.4 ms) conv checkpoint at `keep_at = keyed.len() - 1` and
+            // at the end of prefill (`keyed.len()`).
+            if pos == keep_at && keep_at > 0 {
+                if let Some(conv) = self.model.capture_conv_checkpoint() {
+                    self.push_live_checkpoint(keyed[..pos].to_vec(), conv.clone(), base_pos == Some(pos));
+                    keep_at_ckpt = Some(conv);
+                }
+            } else if stops.contains(&pos) && pos != keyed.len() && base_pos != Some(pos) {
+                if let Some(conv) = self.model.capture_conv_checkpoint() {
+                    self.push_live_checkpoint(keyed[..pos].to_vec(), conv, false);
+                }
+            }
+
             let _ = job.events.send(Event::Progress {
                 done: pos - start,
                 total,
@@ -852,6 +1293,9 @@ impl Inkling2Engine {
         }
 
         let prefill_s = started.elapsed().as_secs_f64();
+        if let Some(conv) = self.model.capture_conv_checkpoint() {
+            self.push_live_checkpoint(keyed.clone(), conv, false);
+        }
         let _ = job.events.send(Event::Prefilled { cached: start });
 
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
@@ -863,6 +1307,7 @@ impl Inkling2Engine {
         let max_seq = self.model.cfg.context_length.min(self.max_seq);
 
         let mut n = 0usize;
+        let mut keep_at_persisted = false;
         let decode_start = std::time::Instant::now();
         let finish = loop {
             if translator.in_text() && !reply_hist.is_empty() {
@@ -911,11 +1356,33 @@ impl Inkling2Engine {
                 break Finish::Stop;
             }
 
+            // Before decode wraps the SWA ring buffer past `keep_at_ckpt`, snapshot `keep_at`
+            // into host RAM & DiskCache so long thinking turns NEVER lose their prompt cache.
+            if !keep_at_persisted && !job.forget && keep_at >= MIN_SNAPSHOT_TOKENS {
+                if let Some(ref ckpt) = keep_at_ckpt {
+                    let slack = self.model.swa_checkpoint_slack();
+                    if pos.saturating_sub(ckpt.pos) + 2 >= slack {
+                        if let Some(snap) = self.model.capture_snapshot_at_conv_checkpoint(ckpt) {
+                            let is_base = base_pos == Some(keep_at);
+                            self.store_snapshot_tiers(
+                                keyed[..keep_at].to_vec(),
+                                Arc::new(snap),
+                                is_base,
+                                base_pos,
+                                keep_at <= disk_limit,
+                                false,
+                            );
+                        }
+                        keep_at_persisted = true;
+                    }
+                }
+            }
+
             logits = self
                 .model
                 .forward_last(&[next], &[])
                 .map_err(|e| oaiy_engine::Error::Arg(e.to_string()))?;
-            self.covered.push(next);
+            self.covered.push(u64::from(next));
             pos += 1;
         };
 
@@ -926,7 +1393,7 @@ impl Inkling2Engine {
         let decode_s = decode_start.elapsed().as_secs_f64();
         if self.log {
             eprintln!(
-                "  {} prompt tokens ({start} reused) in {prefill_s:.1}s; {n} generated in {decode_s:.1}s ({:.1} tok/s)",
+                "  {} prompt tokens ({start} reused from {source}) in {prefill_s:.1}s; {n} generated in {decode_s:.1}s ({:.1} tok/s)",
                 keyed.len(),
                 n as f64 / decode_s.max(1e-9)
             );
@@ -947,6 +1414,45 @@ impl Inkling2Engine {
             finish,
             completion_tokens: n,
         });
+
+        // Persist `keep_at` into RAM & DiskCache AFTER sending `Event::Done` so streaming
+        // TTFT and token generation have zero added latency.
+        if !keep_at_persisted
+            && !job.forget
+            && keep_at >= MIN_SNAPSHOT_TOKENS
+            && keep_at > start
+        {
+            if let Some(ref ckpt) = keep_at_ckpt {
+                let need_ram = !self.ram_cache.has(&keyed[..keep_at]);
+                    let need_disk = keep_at <= disk_limit
+                    && self.disk.as_ref().is_some_and(|d| {
+                        let is_base = base_pos == Some(keep_at);
+                        let est = self.model.estimate_snapshot_bytes(keep_at);
+                        let near_base = !is_base
+                            && base_pos.is_some_and(|bp| {
+                                keep_at >= bp
+                                    && keep_at - bp < DISK_NEAR_TOKENS
+                                    && d.has(&keyed[..bp])
+                            });
+                        let near_skip = near_base || (!is_base && d.near(&keyed[..keep_at], DISK_NEAR_TOKENS));
+                        !near_skip && !d.has(&keyed[..keep_at]) && d.takes(est)
+                    });
+                if need_ram || need_disk {
+                    if let Some(snap) = self.model.capture_snapshot_at_conv_checkpoint(ckpt) {
+                        let is_base = base_pos == Some(keep_at);
+                        self.store_snapshot_tiers(
+                            keyed[..keep_at].to_vec(),
+                            Arc::new(snap),
+                            is_base,
+                            base_pos,
+                            keep_at <= disk_limit,
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -1160,5 +1666,75 @@ mod tests {
             Json::parse(calls3[1].arguments.as_bytes()).unwrap(),
             Json::parse(br#"{"msg":"hi"}"#).unwrap()
         );
+    }
+
+    #[test]
+    fn ram_cache_pins_base_entries_and_selects_longest_prefix() {
+        let make_snap = |pos: usize, floats: usize| {
+            Arc::new(Inkling2StateSnapshot {
+                pos,
+                hidden: 4,
+                conv_kernel: 2,
+                sliding_window: 4,
+                slots: vec![crate::llm::arch::inkling2::state::Inkling2SlotSnapshot {
+                    is_swa: false,
+                    kv_dim: 2,
+                    base_pos: 0,
+                    stored_rows: floats,
+                    k_cache: vec![0.0; floats * 2],
+                    v_cache: vec![0.0; floats * 2],
+                    k_conv: vec![0.0; 2],
+                    v_conv: vec![0.0; 2],
+                    attn_post_conv: vec![0.0; 4],
+                    ffn_post_conv: vec![0.0; 4],
+                }],
+            })
+        };
+        // Budget holds ~2 entries (each ~224 bytes).
+        let s1 = make_snap(3, 10);
+        let s2 = make_snap(5, 10);
+        let s3 = make_snap(6, 10);
+        let unit = s1.bytes() + 6 * 8;
+        let mut cache = RamCache::new(unit * 2 + 32);
+
+        // Insert base prefix [1,2,3] and conversation [1,2,3,4,5].
+        assert!(cache.insert(vec![1, 2, 3], s1, true));
+        assert!(cache.insert(vec![1, 2, 3, 4, 5], s2, false));
+
+        // Longest matching prefix for [1,2,3,4,5,99] is [1,2,3,4,5].
+        let (k, snap) = cache.best(&[1, 2, 3, 4, 5, 99], 5, 0).unwrap();
+        assert_eq!(k, vec![1, 2, 3, 4, 5]);
+        assert_eq!(snap.pos, 5);
+
+        // Inserting a third conversation [1,2,3,7,8,9] evicts the non-base entry [1,2,3,4,5],
+        // NOT the protected base entry [1,2,3]!
+        assert!(cache.insert(vec![1, 2, 3, 7, 8, 9], s3, false));
+        assert!(cache.has(&[1, 2, 3]), "base system-prompt entry must survive conversation eviction");
+        assert!(!cache.has(&[1, 2, 3, 4, 5]), "older non-base conversation entry should evict first");
+        assert!(cache.has(&[1, 2, 3, 7, 8, 9]));
+
+        // A brand-new conversation sharing [1,2,3] still hits the pinned base entry!
+        let (k_new, _) = cache.best(&[1, 2, 3, 42, 43], 4, 0).unwrap();
+        assert_eq!(k_new, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn base_and_checkpoint_boundaries_find_system_and_turn_markers() {
+        let tok = test_tokenizer();
+        let ids = SpecialIds::from_tokenizer(&tok);
+        let msg_u = ids.msg_user.unwrap();
+        let msg_t = ids.msg_tool.unwrap();
+
+        let mut prompt = vec![10u32; 80]; // 80-token system+tools prefix
+        prompt.push(msg_u); // index 80: first user turn
+        prompt.extend_from_slice(&[11, 12, 13]);
+        prompt.push(msg_t); // index 84: tool result
+        prompt.extend_from_slice(&[14, 15]);
+        prompt.push(msg_u); // index 87: second user turn
+        prompt.extend_from_slice(&[16, 17, 18]);
+
+        assert_eq!(base_boundary(&prompt, ids), Some(80));
+        let stops = checkpoint_positions(&prompt, ids);
+        assert_eq!(stops, vec![80, 84, 87, prompt.len() - 1]);
     }
 }

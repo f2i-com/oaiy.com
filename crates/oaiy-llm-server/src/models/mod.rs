@@ -1598,6 +1598,8 @@ impl Models {
     fn finish_inkling2(
         &self,
         spec: &Spec,
+        weights_path: &std::path::Path,
+        vision_path: Option<&std::path::Path>,
         model: crate::llm::Inkling2Model,
         vision: Option<crate::llm::arch::inkling2::vision::Inkling2Vision>,
         backend: &Arc<dyn ggml_rs::Backend>,
@@ -1613,7 +1615,7 @@ impl Models {
         });
         let mut cfg = self.base_cfg(spec, max_seq);
         cfg.image_token_id = tok.token_id(crate::engines::inkling2::IMAGE_PLACEHOLDER);
-        if let Some(v) = &vision {
+        let max_image_tokens = if let Some(v) = &vision {
             let max_tokens = o
                 .image_tokens
                 .unwrap_or(crate::llm::arch::inkling2::vision::DEFAULT_MAX_IMAGE_TOKENS);
@@ -1621,8 +1623,77 @@ impl Models {
                 cfg: v.cfg.clone(),
                 max_tokens,
             });
-        }
+            Some(max_tokens)
+        } else {
+            None
+        };
         let has_vision = vision.is_some() && cfg.image_token_id.is_some();
+
+        // Host RAM prompt prefix stash budget (parks displaced conversations & pins system+tools).
+        let ram_budget = crate::engines::qwen::park::budget(o.park_gb, host_free());
+
+        // Persistent on-disk prompt state cache (`--prompt-cache`, `--prompt-cache-gb`).
+        let mut image_disk_cache = false;
+        let disk_cache = if let Some(dir) = &o.prompt_cache {
+            let hash_file = |p: &std::path::Path, mut fp: u64| -> u64 {
+                fp = disk::fnv(p.as_os_str().as_encoded_bytes(), fp);
+                if let Ok(meta) = std::fs::metadata(p) {
+                    fp = disk::fnv(&meta.len().to_le_bytes(), fp);
+                    if let Ok(m) = meta
+                        .modified()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other))
+                    {
+                        fp = disk::fnv(&m.as_nanos().to_le_bytes(), fp);
+                    }
+                }
+                fp
+            };
+            let mut fp = disk::fnv(b"inkling2-state-v1", 0);
+            if weights_path.is_dir() {
+                fp = hash_file(&weights_path.join("config.json"), fp);
+                if let Ok(entries) = std::fs::read_dir(weights_path) {
+                    let mut shards: Vec<PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+                        .collect();
+                    shards.sort();
+                    for shard in shards {
+                        fp = hash_file(&shard, fp);
+                    }
+                }
+            } else {
+                fp = hash_file(weights_path, fp);
+            }
+            if let Some(max_toks) = max_image_tokens {
+                fp = disk::fnv(b"inkling2-vision-v1", fp);
+                fp = disk::fnv(&(max_toks as u64).to_le_bytes(), fp);
+                if let Some(vp) = vision_path {
+                    fp = hash_file(vp, fp);
+                }
+                image_disk_cache = true;
+            }
+            match disk::DiskCache::open(dir, fp, (o.prompt_cache_gb * 1e9) as u64) {
+                Ok(cache) => {
+                    self.say(format!(
+                        "{} Inkling-2 prompt states on disk in {}",
+                        cache.len(),
+                        dir.display()
+                    ));
+                    Some(cache)
+                }
+                Err(err) => {
+                    self.say(format!(
+                        "Inkling-2 prompt states are not kept ({}: {err})",
+                        dir.display()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let (jobs, rx) = std::sync::mpsc::channel();
         let engine = crate::engines::inkling2::Inkling2Engine::new(
             model,
@@ -1630,7 +1701,9 @@ impl Models {
             Arc::clone(&tok),
             max_seq,
             !o.quiet && !o.silent,
-        );
+        )
+        .with_ram_budget(ram_budget)
+        .with_disk(disk_cache, image_disk_cache);
         let thread = std::thread::Builder::new()
             .name("inkling2-model".into())
             .spawn(move || engine.run(rx))
@@ -1662,8 +1735,10 @@ impl Models {
         )
         .map_err(|e| Error::Arg(e.to_string()))?;
 
+        let mut vision_path: Option<PathBuf> = None;
         if vision.is_some() {
             self.say(format!("{}: built-in Inkling-2 vision tower loaded", spec.name));
+            vision_path = Some(spec.path.clone());
         } else if let Some(p) = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten() {
             if p.is_file() {
                 let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(format!("{}: {e}", p.display())))?;
@@ -1678,10 +1753,11 @@ impl Models {
                     )));
                 }
                 self.say(format!("{}: Inkling-2 vision projector loaded from {}", spec.name, p.display()));
+                vision_path = Some(p.clone());
                 vision = Some(v);
             }
         }
-        self.finish_inkling2(spec, model, vision, &backend)
+        self.finish_inkling2(spec, &spec.path, vision_path.as_deref(), model, vision, &backend)
     }
 
     // ---------------------------------------------------------------- GGUF
@@ -1772,7 +1848,8 @@ impl Models {
             } else {
                 None
             };
-            return self.finish_inkling2(spec, model, vision, &backend);
+            let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten().cloned();
+            return self.finish_inkling2(spec, &path, vision_path.as_deref(), model, vision, &backend);
         }
         // (Qwen3.5-MoE, `qwen35moe`: Qwen3.6-35B-A3B's and MiniCPM-V 4.7 35B-A3B's architecture, the Qwen3.5 hybrid's
         // layers with routed experts, which a GPU's kernels hold; and LFM2-MoE, `lfm2moe`, a hybrid of short convs and

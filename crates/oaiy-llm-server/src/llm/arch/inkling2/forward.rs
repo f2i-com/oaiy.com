@@ -38,12 +38,15 @@ struct StepProfile {
 }
 
 use crate::llm::loader::Weight;
-use crate::llm::Result;
+use crate::llm::{LlamaError, Result};
 
 use super::experts::{
     f32_axpy_fast, f32_dot_fast, f32_dot_rows_fast, gguf_dot_rows_any, quant_row_bytes, Bf16Linear,
 };
-use super::state::Inkling2State;
+use super::state::{
+    Inkling2ConvSlotSnapshot, Inkling2ConvSnapshot, Inkling2SlotSnapshot, Inkling2State,
+    Inkling2StateSnapshot,
+};
 use super::{AttnNorms, AttnNormsDev, Inkling2Layer, Inkling2LoopLayer, Inkling2Model};
 
 /// Per-logical-slot GPU-resident packed KV ring cache (`[2, kv_cap, kv_dim]`: K then V) and
@@ -59,6 +62,17 @@ pub(crate) struct GpuSlotState {
     pub(crate) ffn_post_conv: DeviceVec,
 }
 
+/// What logits [`Inkling2Model::forward_internal`] should compute and read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputMode {
+    /// Intermediate prefill chunk: advance KV/conv states only, skip unembed & readback.
+    None,
+    /// Compute & return only the final token's logits `[1, unpadded_vocab]`.
+    LastOnly,
+    /// Compute & return logits for every input token `[seq, unpadded_vocab]`.
+    All,
+}
+
 /// Persistent GPU decode state + fixed-address per-token working buffers enabling 1-submit
 /// 48-layer decode with 100% bind-group cache hits and zero per-token Vulkan allocations.
 #[derive(Debug)]
@@ -67,7 +81,13 @@ pub(crate) struct GpuDecodeState {
     pub(crate) host_dirty: bool,
     pub(crate) recipe: Option<ChainRecipe>,
     pub(crate) slots: Vec<GpuSlotState>,
+    /// Lightweight GPU-side prefill-end checkpoint of short-convolution histories (~3.7 MiB)
+    /// enabling instant KV prefix reuse across multi-turn chats & agent loops even when
+    /// generated thinking blocks are stripped from the next turn's prompt.
+    pub(crate) ckpt_pos: Option<usize>,
+    pub(crate) ckpt_slots: Vec<(DeviceVec, DeviceVec, DeviceVec)>,
     pub(crate) step_params: DeviceVec,
+    pub(crate) attn_split: DeviceVec,
     pub(crate) cur: DeviceVec,
     pub(crate) prelude_cur: DeviceVec,
     pub(crate) blocks: DeviceVec,
@@ -86,6 +106,40 @@ pub(crate) struct GpuDecodeState {
     pub(crate) logits: DeviceVec,
 }
 
+/// Persistent GPU working buffers for single-submit full-GPU batched prefill (`seq >= 1`),
+/// kept separate from [`GpuDecodeState`] so multi-turn prefills never invalidate decode's
+/// captured [`ChainRecipe`].
+#[derive(Debug)]
+pub(crate) struct GpuPrefillScratch {
+    pub(crate) cap_seq: usize,
+    pub(crate) max_blocks: usize,
+    pub(crate) tau_params: DeviceVec,
+    pub(crate) cur: DeviceVec,
+    pub(crate) prelude_cur: DeviceVec,
+    pub(crate) blocks: DeviceVec,
+    pub(crate) bank: DeviceVec,
+    pub(crate) bank_out: DeviceVec,
+    pub(crate) msgs: DeviceVec,
+    pub(crate) mix_out: DeviceVec,
+    pub(crate) mid_qkv: DeviceVec,
+    pub(crate) ctrl_qkv: DeviceVec,
+    pub(crate) ffn_inp: DeviceVec,
+    pub(crate) ffn_x: DeviceVec,
+    pub(crate) attn_gated: DeviceVec,
+    pub(crate) attn_proj: DeviceVec,
+    pub(crate) attn_conv: DeviceVec,
+    pub(crate) moe_out: DeviceVec,
+    pub(crate) norm_bufs: Vec<DeviceVec>,
+    pub(crate) ctrl_out: Vec<DeviceVec>,
+    pub(crate) y_bufs: Vec<DeviceVec>,
+    pub(crate) router_buf: DeviceVec,
+    pub(crate) x_bufs: Vec<DeviceVec>,
+    pub(crate) mid_bufs: Vec<DeviceVec>,
+    pub(crate) ctrl_gain: Vec<DeviceVec>,
+    pub(crate) ctrl_forget: Vec<DeviceVec>,
+    pub(crate) logits_all: Option<DeviceVec>,
+}
+
 /// Reusable GPU device vectors for `DeviceChain` batched matmuls and fused layer chains,
 /// eliminating per-token GPU buffer allocations and enabling 100% bind-group cache hits during
 /// decode (`seq == 1`).
@@ -102,6 +156,7 @@ pub(crate) struct GpuScratch {
     norm_bufs: Vec<DeviceVec>,
     router_buf: Option<DeviceVec>,
     decode_state: Option<GpuDecodeState>,
+    prefill_scratch: Option<GpuPrefillScratch>,
 }
 
 impl GpuScratch {
@@ -110,6 +165,7 @@ impl GpuScratch {
             ds.synced = false;
             ds.host_dirty = false;
             ds.recipe = None;
+            ds.ckpt_pos = None;
         }
     }
 
@@ -759,14 +815,556 @@ fn project_rel_bias(
 }
 
 impl Inkling2Model {
-    /// Forward pass returning last-token (or all-token when `last_only == false`) logits
-    /// of shape `[out_rows, unpadded_vocab_size]`.
+    /// Maximum batch size supported by [`Self::forward_prefill_gpu`] on the active device.
+    pub(crate) fn max_gpu_prefill_seq(&self) -> usize {
+        if !self.full_gpu_decode {
+            return 0;
+        }
+        let Some(chain) = self.backend.chain() else {
+            return 0;
+        };
+        let mut max_rows = 65535usize;
+        for layer in &self.layers {
+            if let Some(qmoe) = layer.experts.quant_moe() {
+                max_rows = max_rows.min(chain.moe_routed_max_rows(qmoe));
+            } else {
+                return 0;
+            }
+        }
+        max_rows
+    }
+
+    /// Optimal prompt prefill chunk size for this model and device:
+    /// `1024` (Tensor-Core MoE peak: ~64 tokens/expert, >2,100 tok/s on RTX 5090 + 1,024-token
+    /// SWA ring-buffer slack for instant multi-turn checkpoint rewind) on cooperative-matrix
+    /// full-GPU devices, `64` otherwise. Override with `OAIY_INKLING2_CHUNK=<16..=2048>`.
+    pub fn preferred_prefill_chunk(&self) -> usize {
+        let max_gpu = self.max_gpu_prefill_seq();
+        if max_gpu >= 512 {
+            let default_chunk = if max_gpu >= 1024 { 1024 } else { 512 };
+            std::env::var("OAIY_INKLING2_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| (16..=2048).contains(&n))
+                .unwrap_or(default_chunk)
+                .min(max_gpu)
+        } else {
+            64
+        }
+    }
+
+    /// Snapshot all GPU-resident short-convolution histories at the end of prompt prefill so
+    /// subsequent multi-turn / agent steps can rewind back to this exact prefix position in
+    /// < 0.2 ms (as long as decoded tokens stayed within SWA ring-buffer slack).
+    pub fn save_prefill_checkpoint(&self) -> bool {
+        let Some(chain) = self.backend.chain() else {
+            return false;
+        };
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = st.pos;
+        if pos == 0 {
+            return false;
+        }
+        let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(ds) = scratch_guard.as_mut().and_then(|s| s.decode_state.as_mut()) else {
+            return false;
+        };
+        if !ds.synced {
+            return false;
+        }
+        if ds.ckpt_slots.len() != ds.slots.len() {
+            ds.ckpt_slots = ds
+                .slots
+                .iter()
+                .map(|s| {
+                    (
+                        chain.vec(s.kv_conv.len),
+                        chain.vec(s.attn_post_conv.len),
+                        chain.vec(s.ffn_post_conv.len),
+                    )
+                })
+                .collect();
+        }
+        let mut rec = chain.begin();
+        rec.keep_groups(false);
+        for (slot, (c_kv, c_ap, c_fp)) in ds.slots.iter().zip(&ds.ckpt_slots) {
+            rec.copy(&slot.kv_conv, 0, c_kv, 0, slot.kv_conv.len);
+            rec.copy(&slot.attn_post_conv, 0, c_ap, 0, slot.attn_post_conv.len);
+            rec.copy(&slot.ffn_post_conv, 0, c_fp, 0, slot.ffn_post_conv.len);
+        }
+        let _ = rec.finish();
+        ds.ckpt_pos = Some(pos);
+        true
+    }
+
+    /// Restore the GPU short-convolution checkpoint saved at `target_pos` and rewind `state.pos`
+    /// to `target_pos`. Returns `false` if no matching checkpoint exists or if subsequent decoding
+    /// exceeded any SWA slot's ring-buffer slack (`kv_cap - sliding_window`).
+    pub fn restore_prefill_checkpoint(&self, target_pos: usize) -> bool {
+        let Some(chain) = self.backend.chain() else {
+            return false;
+        };
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if target_pos == 0 || target_pos > st.pos {
+            return false;
+        }
+        let decoded = st.pos - target_pos;
+        let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(ds) = scratch_guard.as_mut().and_then(|s| s.decode_state.as_mut()) else {
+            return false;
+        };
+        if !ds.synced || ds.ckpt_pos != Some(target_pos) || ds.ckpt_slots.len() != ds.slots.len() {
+            return false;
+        }
+        let swa = self.cfg.sliding_window;
+        if ds
+            .slots
+            .iter()
+            .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
+        {
+            return false;
+        }
+        let mut rec = chain.begin();
+        rec.keep_groups(false);
+        for (slot, (c_kv, c_ap, c_fp)) in ds.slots.iter().zip(&ds.ckpt_slots) {
+            rec.copy(c_kv, 0, &slot.kv_conv, 0, slot.kv_conv.len);
+            rec.copy(c_ap, 0, &slot.attn_post_conv, 0, slot.attn_post_conv.len);
+            rec.copy(c_fp, 0, &slot.ffn_post_conv, 0, slot.ffn_post_conv.len);
+        }
+        let _ = rec.finish();
+        st.pos = target_pos;
+        true
+    }
+
+    /// Maximum tokens that may be decoded past a live checkpoint before SWA ring buffers
+    /// overwrite its sliding-window rows.
+    pub fn swa_checkpoint_slack(&self) -> usize {
+        let scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ds) = scratch_guard.as_ref().and_then(|s| s.decode_state.as_ref()) {
+            let swa = self.cfg.sliding_window;
+            return ds
+                .slots
+                .iter()
+                .filter(|s| s.is_swa)
+                .map(|s| s.kv_cap.saturating_sub(swa))
+                .min()
+                .unwrap_or(usize::MAX);
+        }
+        self.cfg.sliding_window
+    }
+
+    /// Exact serialized byte size of a full [`Inkling2StateSnapshot`] at `pos` tokens, computed
+    /// before capturing so RAM & DiskCache budgets can gate capture cheaply.
+    pub fn estimate_snapshot_bytes(&self, pos: usize) -> u64 {
+        let swa = self.cfg.sliding_window;
+        let past = self.cfg.conv_kernel.saturating_sub(1);
+        let hidden = self.cfg.hidden;
+        let n_slots = self.cfg.n_logical_slots();
+        let mut total: u64 = 48; // SNAPSHOT_HEADER_BYTES
+        for il in 0..n_slots {
+            let ip = self.cfg.layer_phys(il);
+            let is_swa = self.cfg.is_swa[ip];
+            let kv_dim = self.cfg.kv_head_counts[ip] * self.cfg.head_dims[ip];
+            let rows = if is_swa { pos.min(swa) } else { pos };
+            let floats = 2 * rows * kv_dim + 2 * past * kv_dim + 2 * past * hidden;
+            total = total.saturating_add(25 + 4 * floats as u64);
+        }
+        total
+    }
+
+    /// Capture a lightweight (~3.7 MiB) host-RAM snapshot of all logical slots' short-convolution
+    /// histories at the current position. Works on both GPU and CPU paths without mutating state.
+    pub fn capture_conv_checkpoint(&self) -> Option<Inkling2ConvSnapshot> {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.pos == 0 {
+            return None;
+        }
+        let scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(chain), Some(ds)) = (
+            self.backend.chain(),
+            scratch_guard
+                .as_ref()
+                .and_then(|s| s.decode_state.as_ref())
+                .filter(|ds| ds.synced),
+        ) {
+            let past = self.cfg.conv_kernel.saturating_sub(1);
+            let hidden = self.cfg.hidden;
+            if past == 0 {
+                let slots = (0..ds.slots.len())
+                    .map(|_| Inkling2ConvSlotSnapshot {
+                        k_conv: Vec::new(),
+                        v_conv: Vec::new(),
+                        attn_post_conv: Vec::new(),
+                        ffn_post_conv: Vec::new(),
+                    })
+                    .collect();
+                return Some(Inkling2ConvSnapshot { pos: st.pos, slots });
+            }
+            let mut rec = chain.begin();
+            rec.keep_groups(false);
+            for g_slot in &ds.slots {
+                let c_len = past * g_slot.kv_dim;
+                rec.read_range(&g_slot.kv_conv, 0, c_len);
+                rec.read_range(&g_slot.kv_conv, c_len, c_len);
+                rec.read_range(&g_slot.attn_post_conv, 0, past * hidden);
+                rec.read_range(&g_slot.ffn_post_conv, 0, past * hidden);
+            }
+            let mut reads = rec.finish().into_iter();
+            let slots = (0..ds.slots.len())
+                .map(|_| Inkling2ConvSlotSnapshot {
+                    k_conv: reads.next().expect("k_conv"),
+                    v_conv: reads.next().expect("v_conv"),
+                    attn_post_conv: reads.next().expect("attn_post_conv"),
+                    ffn_post_conv: reads.next().expect("ffn_post_conv"),
+                })
+                .collect();
+            return Some(Inkling2ConvSnapshot { pos: st.pos, slots });
+        }
+        Some(st.capture_conv_checkpoint())
+    }
+
+    /// Rewind the live model state (GPU or CPU) back to `ckpt.pos` using a lightweight conv
+    /// checkpoint. Returns `false` if SWA ring rows for `ckpt.pos` were already overwritten or
+    /// dimensions do not match.
+    pub fn restore_conv_checkpoint(&self, ckpt: &Inkling2ConvSnapshot) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let target_pos = ckpt.pos;
+        if target_pos == 0 || target_pos > st.pos || ckpt.slots.len() != st.slots.len() {
+            return false;
+        }
+        let decoded = st.pos - target_pos;
+        let swa = self.cfg.sliding_window;
+        let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(chain), Some(ds)) = (
+            self.backend.chain(),
+            scratch_guard
+                .as_mut()
+                .and_then(|s| s.decode_state.as_mut())
+                .filter(|ds| ds.synced),
+        ) {
+            if ds.slots.len() != ckpt.slots.len() {
+                return false;
+            }
+            if ds
+                .slots
+                .iter()
+                .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
+            {
+                return false;
+            }
+            for (g_slot, c_slot) in ds.slots.iter().zip(&ckpt.slots) {
+                if !c_slot.k_conv.is_empty() {
+                    chain.upload_at(&g_slot.kv_conv, 0, &c_slot.k_conv);
+                    chain.upload_at(&g_slot.kv_conv, c_slot.k_conv.len(), &c_slot.v_conv);
+                    chain.upload(&g_slot.attn_post_conv, &c_slot.attn_post_conv);
+                    chain.upload(&g_slot.ffn_post_conv, &c_slot.ffn_post_conv);
+                }
+            }
+            ds.ckpt_pos = None;
+            st.pos = target_pos;
+            return true;
+        }
+        // CPU path: verify every slot still holds the rows needed at `target_pos` before mutating.
+        for s in &st.slots {
+            let need_first = if s.is_swa {
+                target_pos.saturating_sub(swa)
+            } else {
+                0
+            };
+            if s.base_pos > need_first || s.base_pos + s.stored_rows < target_pos {
+                return false;
+            }
+        }
+        for (s, c_slot) in st.slots.iter_mut().zip(&ckpt.slots) {
+            let keep_rows = target_pos - s.base_pos;
+            s.stored_rows = keep_rows;
+            s.k_cache.truncate(keep_rows * s.kv_dim);
+            s.v_cache.truncate(keep_rows * s.kv_dim);
+            s.k_conv.set_hist(&c_slot.k_conv);
+            s.v_conv.set_hist(&c_slot.v_conv);
+            s.attn_post_conv.set_hist(&c_slot.attn_post_conv);
+            s.ffn_post_conv.set_hist(&c_slot.ffn_post_conv);
+        }
+        st.pos = target_pos;
+        true
+    }
+
+    /// Capture a complete, self-contained KV + conv snapshot at the current position (GPU or CPU)
+    /// without mutating the live inference state.
+    pub fn capture_state_snapshot(&self) -> Result<Inkling2StateSnapshot> {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = st.pos;
+        let swa = self.cfg.sliding_window;
+        let past = self.cfg.conv_kernel.saturating_sub(1);
+        let hidden = self.cfg.hidden;
+        let scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(chain), Some(ds)) = (
+            self.backend.chain(),
+            scratch_guard
+                .as_ref()
+                .and_then(|s| s.decode_state.as_ref())
+                .filter(|ds| ds.synced),
+        ) {
+            return Ok(self.read_gpu_snapshot(chain, ds, pos, None, swa, past, hidden));
+        }
+        Ok(st.capture_snapshot(hidden, self.cfg.conv_kernel, swa))
+    }
+
+    /// Extract a complete KV + conv snapshot at an earlier [`Inkling2ConvSnapshot`] position
+    /// after prefill/decode has moved past it, as long as SWA ring rows at `ckpt.pos` are still
+    /// live. Returns `None` if `ckpt.pos` has been overwritten.
+    pub fn capture_snapshot_at_conv_checkpoint(
+        &self,
+        ckpt: &Inkling2ConvSnapshot,
+    ) -> Option<Inkling2StateSnapshot> {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let target_pos = ckpt.pos;
+        if target_pos == 0 || target_pos > st.pos || ckpt.slots.len() != st.slots.len() {
+            return None;
+        }
+        let decoded = st.pos - target_pos;
+        let swa = self.cfg.sliding_window;
+        let past = self.cfg.conv_kernel.saturating_sub(1);
+        let hidden = self.cfg.hidden;
+        let scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(chain), Some(ds)) = (
+            self.backend.chain(),
+            scratch_guard
+                .as_ref()
+                .and_then(|s| s.decode_state.as_ref())
+                .filter(|ds| ds.synced),
+        ) {
+            if ds.slots.len() != ckpt.slots.len() {
+                return None;
+            }
+            if ds
+                .slots
+                .iter()
+                .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
+            {
+                return None;
+            }
+            return Some(self.read_gpu_snapshot(chain, ds, target_pos, Some(ckpt), swa, past, hidden));
+        }
+        // CPU path: verify every slot holds `[k_first..target_pos)` intact.
+        for s in &st.slots {
+            let need_first = if s.is_swa {
+                target_pos.saturating_sub(swa)
+            } else {
+                0
+            };
+            if s.base_pos > need_first || s.base_pos + s.stored_rows < target_pos {
+                return None;
+            }
+        }
+        let slots = st
+            .slots
+            .iter()
+            .zip(&ckpt.slots)
+            .map(|(s, c)| {
+                let k_first = if s.is_swa {
+                    target_pos.saturating_sub(swa)
+                } else {
+                    0
+                };
+                let count = target_pos.saturating_sub(k_first);
+                let row0 = k_first - s.base_pos;
+                let off = row0 * s.kv_dim;
+                let len = count * s.kv_dim;
+                Inkling2SlotSnapshot {
+                    is_swa: s.is_swa,
+                    kv_dim: s.kv_dim,
+                    base_pos: k_first,
+                    stored_rows: count,
+                    k_cache: s.k_cache[off..off + len].to_vec(),
+                    v_cache: s.v_cache[off..off + len].to_vec(),
+                    k_conv: c.k_conv.clone(),
+                    v_conv: c.v_conv.clone(),
+                    attn_post_conv: c.attn_post_conv.clone(),
+                    ffn_post_conv: c.ffn_post_conv.clone(),
+                }
+            })
+            .collect();
+        Some(Inkling2StateSnapshot {
+            pos: target_pos,
+            hidden,
+            conv_kernel: self.cfg.conv_kernel,
+            sliding_window: swa,
+            slots,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_gpu_snapshot(
+        &self,
+        chain: &dyn DeviceChain,
+        ds: &GpuDecodeState,
+        pos: usize,
+        conv_override: Option<&Inkling2ConvSnapshot>,
+        swa: usize,
+        past: usize,
+        hidden: usize,
+    ) -> Inkling2StateSnapshot {
+        let mut rec = chain.begin();
+        rec.keep_groups(false);
+        let mut plan: Vec<(usize, usize, usize)> = Vec::with_capacity(ds.slots.len());
+        for g_slot in &ds.slots {
+            let kv_dim = g_slot.kv_dim;
+            let k_first = if g_slot.is_swa {
+                pos.saturating_sub(swa)
+            } else {
+                0
+            };
+            let count = pos.saturating_sub(k_first);
+            let ring_start = if count > 0 { k_first % g_slot.kv_cap } else { 0 };
+            let first_part = count.min(g_slot.kv_cap - ring_start);
+            plan.push((k_first, count, first_part));
+
+            if conv_override.is_none() && past > 0 {
+                let c_len = past * kv_dim;
+                rec.read_range(&g_slot.kv_conv, 0, c_len);
+                rec.read_range(&g_slot.kv_conv, c_len, c_len);
+                rec.read_range(&g_slot.attn_post_conv, 0, past * hidden);
+                rec.read_range(&g_slot.ffn_post_conv, 0, past * hidden);
+            }
+            if count > 0 {
+                let off_a = ring_start * kv_dim;
+                let len_a = first_part * kv_dim;
+                let v_base = g_slot.kv_cap * kv_dim;
+                rec.read_range(&g_slot.kv_cache, off_a, len_a);
+                rec.read_range(&g_slot.kv_cache, v_base + off_a, len_a);
+                if first_part < count {
+                    let rem = (count - first_part) * kv_dim;
+                    rec.read_range(&g_slot.kv_cache, 0, rem);
+                    rec.read_range(&g_slot.kv_cache, v_base, rem);
+                }
+            }
+        }
+        let mut reads = rec.finish().into_iter();
+        let slots = ds
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(il, g_slot)| {
+                let (k_first, count, first_part) = plan[il];
+                let (k_conv, v_conv, attn_post_conv, ffn_post_conv) = if let Some(ov) = conv_override {
+                    let c = &ov.slots[il];
+                    (
+                        c.k_conv.clone(),
+                        c.v_conv.clone(),
+                        c.attn_post_conv.clone(),
+                        c.ffn_post_conv.clone(),
+                    )
+                } else if past > 0 {
+                    (
+                        reads.next().expect("k_conv"),
+                        reads.next().expect("v_conv"),
+                        reads.next().expect("attn_post_conv"),
+                        reads.next().expect("ffn_post_conv"),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                };
+                let (k_cache, v_cache) = if count > 0 {
+                    let mut k_buf = reads.next().expect("k_a");
+                    let mut v_buf = reads.next().expect("v_a");
+                    if first_part < count {
+                        k_buf.extend_from_slice(&reads.next().expect("k_b"));
+                        v_buf.extend_from_slice(&reads.next().expect("v_b"));
+                    }
+                    (k_buf, v_buf)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                Inkling2SlotSnapshot {
+                    is_swa: g_slot.is_swa,
+                    kv_dim: g_slot.kv_dim,
+                    base_pos: k_first,
+                    stored_rows: count,
+                    k_cache,
+                    v_cache,
+                    k_conv,
+                    v_conv,
+                    attn_post_conv,
+                    ffn_post_conv,
+                }
+            })
+            .collect();
+        Inkling2StateSnapshot {
+            pos,
+            hidden,
+            conv_kernel: self.cfg.conv_kernel,
+            sliding_window: swa,
+            slots,
+        }
+    }
+
+    /// Validate and restore a complete [`Inkling2StateSnapshot`] into live host + GPU state.
+    /// Rejects incompatible snapshots before mutating the live model state.
+    pub fn restore_state_snapshot(&self, snap: &Inkling2StateSnapshot) -> Result<()> {
+        let n_slots = self.cfg.n_logical_slots();
+        let past = self.cfg.conv_kernel.saturating_sub(1);
+        let bad = |msg: &str| Err(LlamaError::Config(format!("inkling2 snapshot: {msg}")));
+        if snap.pos == 0 || snap.pos > self.cfg.context_length {
+            return bad("position out of range");
+        }
+        if snap.hidden != self.cfg.hidden
+            || snap.conv_kernel != self.cfg.conv_kernel
+            || snap.sliding_window != self.cfg.sliding_window
+            || snap.slots.len() != n_slots
+        {
+            return bad("model config mismatch");
+        }
+        for (il, slot) in snap.slots.iter().enumerate() {
+            let ip = self.cfg.layer_phys(il);
+            let want_swa = self.cfg.is_swa[ip];
+            let want_kv_dim = self.cfg.kv_head_counts[ip] * self.cfg.head_dims[ip];
+            let want_first = if want_swa {
+                snap.pos.saturating_sub(self.cfg.sliding_window)
+            } else {
+                0
+            };
+            let want_rows = snap.pos - want_first;
+            if slot.is_swa != want_swa
+                || slot.kv_dim != want_kv_dim
+                || slot.base_pos != want_first
+                || slot.stored_rows != want_rows
+                || slot.k_cache.len() != want_rows * want_kv_dim
+                || slot.v_cache.len() != want_rows * want_kv_dim
+                || slot.k_conv.len() != past * want_kv_dim
+                || slot.v_conv.len() != past * want_kv_dim
+                || slot.attn_post_conv.len() != past * self.cfg.hidden
+                || slot.ffn_post_conv.len() != past * self.cfg.hidden
+            {
+                return bad("slot shape mismatch");
+            }
+        }
+
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.apply_snapshot(snap);
+        let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if self.full_gpu_decode {
+            if let Some(chain) = self.backend.chain() {
+                let scratch = scratch_guard.get_or_insert_with(GpuScratch::default);
+                let ds = scratch
+                    .decode_state
+                    .get_or_insert_with(|| self.init_gpu_decode_state(chain, st.pos, 1));
+                ds.ckpt_pos = None;
+                self.sync_host_to_gpu(chain, &st, ds);
+            }
+        } else if let Some(scratch) = scratch_guard.as_mut() {
+            scratch.reset_decode_state();
+        }
+        Ok(())
+    }
+
+    /// Forward pass returning last-token, all-token, or empty logits depending on `out_mode`.
     pub(crate) fn forward_internal(
         &self,
         tokens: &[u32],
         soft: &[(usize, &[f32])],
         state: &mut Inkling2State,
-        last_only: bool,
+        out_mode: OutputMode,
     ) -> Result<Tensor> {
         let seq = tokens.len();
         let hidden = self.cfg.hidden;
@@ -814,13 +1412,21 @@ impl Inkling2Model {
             .collect();
 
         // Single-submit full-GPU decode (`seq == 1`, no soft vision tokens, last-token logits):
-        // runs all 48 logical layers + output unembed + softcap in ONE `DeviceChain` submission.
-        if self.full_gpu_decode && seq == 1 && soft.is_empty() && last_only {
+        // runs all 48 logical layers + output unembed + softcap in ONE `DeviceChain` submission
+        // with `ChainRecipe` replay and Split-K attention.
+        if self.full_gpu_decode && seq == 1 && soft.is_empty() && out_mode == OutputMode::LastOnly {
             return self.forward_decode_gpu(&cur, tau[0], state, scratch, t_step_start);
         }
 
-        // If GPU decode advanced ahead of host `state`, pull GPU KV + conv histories back before
-        // running a multi-token prefill / soft-vision pass (e.g. multi-turn prefix cache reuse).
+        // Single-submit full-GPU batched prefill (`seq >= 1`, supports soft vision tokens and
+        // `OutputMode::{None, LastOnly, All}`): keeps GPU KV + conv histories live for zero-stall
+        // transition into `forward_decode_gpu`!
+        if self.full_gpu_decode && seq <= self.max_gpu_prefill_seq() {
+            return self.forward_prefill_gpu(&cur, seq, state, scratch, out_mode, t_step_start);
+        }
+
+        // If GPU decode/prefill advanced ahead of host `state`, pull GPU KV + conv histories back
+        // before running the CPU/partial-GPU fallback path.
         if let (Some(chain), Some(ds)) = (self.backend.chain(), scratch.decode_state.as_mut()) {
             if ds.host_dirty && state.pos > 0 {
                 self.sync_gpu_to_host(chain, state, ds);
@@ -909,6 +1515,22 @@ impl Inkling2Model {
         state.pos += seq;
 
         // Output AttnRes + RMSNorm
+        let unpadded = self.cfg.vocab_size_unpadded;
+        if out_mode == OutputMode::None {
+            if let Some(t0) = t_step_start {
+                let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[inkling2-prof] seq={seq} pos={past_len} total={total_ms:.1}ms | res_ctrl={:.1}ms attn_proj={:.1}ms attn_core={:.1}ms wo={:.1}ms ffn_pre={:.1}ms experts={:.1}ms output=0.0ms",
+                    prof.attn_res_ctrl_us as f64 / 1000.0,
+                    prof.attn_proj_us as f64 / 1000.0,
+                    prof.attn_core_us as f64 / 1000.0,
+                    prof.attn_wo_us as f64 / 1000.0,
+                    prof.ffn_pre_us as f64 / 1000.0,
+                    prof.experts_us as f64 / 1000.0,
+                );
+            }
+            return Ok(Tensor::from_vec(Vec::new(), vec![0, unpadded]));
+        }
         let t_out = if prof.enabled { Some(Instant::now()) } else { None };
         let final_mixed = mix_depth(&blocks, &cur, &self.output_res_query, 1, seq, hidden)
             .into_iter()
@@ -916,14 +1538,13 @@ impl Inkling2Model {
             .expect("1 output query");
         let normed = rms_norm_rows(&final_mixed, &self.output_norm, hidden, self.cfg.rms_eps);
 
-        let (head_in, out_rows) = if last_only {
+        let (head_in, out_rows) = if out_mode == OutputMode::LastOnly {
             (&normed[(seq - 1) * hidden..seq * hidden], 1usize)
         } else {
             (&normed[..], seq)
         };
 
         // Unembed (only computing/reading `unpadded` vocab rows) -> in-place softcap
-        let unpadded = self.cfg.vocab_size_unpadded;
         let mut logits = linear_host_fast(
             self.backend.as_ref(),
             scratch,
@@ -957,20 +1578,28 @@ impl Inkling2Model {
         Ok(Tensor::from_vec(logits, vec![out_rows, unpadded]))
     }
 
-    fn init_gpu_decode_state(&self, chain: &dyn DeviceChain, initial_pos: usize) -> GpuDecodeState {
+    fn init_gpu_decode_state(
+        &self,
+        chain: &dyn DeviceChain,
+        initial_pos: usize,
+        initial_seq: usize,
+    ) -> GpuDecodeState {
         let hidden = self.cfg.hidden;
         let past_conv = self.cfg.conv_kernel.saturating_sub(1);
         let n_slots = self.cfg.n_logical_slots();
-        let full_init_cap = (initial_pos + 1).next_power_of_two().max(2048);
+        let full_init_cap = (initial_pos + initial_seq.max(1)).next_power_of_two().max(2048);
+        let swa_init_cap = self.cfg.sliding_window + self.preferred_prefill_chunk().max(2048).max(initial_seq);
         let mut slots = Vec::with_capacity(n_slots);
         let mut max_q_dim = 1usize;
+        let mut max_heads = 1usize;
         for il in 0..n_slots {
             let ip = self.cfg.layer_phys(il);
             let is_swa = self.cfg.is_swa[ip];
             let q_dim = self.cfg.head_counts[ip] * self.cfg.head_dims[ip];
             let kv_dim = self.cfg.kv_head_counts[ip] * self.cfg.head_dims[ip];
             max_q_dim = max_q_dim.max(q_dim);
-            let kv_cap = if is_swa { self.cfg.sliding_window } else { full_init_cap };
+            max_heads = max_heads.max(self.cfg.head_counts[ip]);
+            let kv_cap = if is_swa { swa_init_cap } else { full_init_cap };
             slots.push(GpuSlotState {
                 is_swa,
                 kv_dim,
@@ -987,7 +1616,10 @@ impl Inkling2Model {
             host_dirty: false,
             recipe: None,
             slots,
+            ckpt_pos: None,
+            ckpt_slots: Vec::new(),
             step_params: chain.vec(4),
+            attn_split: chain.vec(max_heads * 16 * 132),
             cur: chain.vec(hidden),
             prelude_cur: chain.vec(hidden),
             blocks: chain.vec(32 * hidden),
@@ -1358,6 +1990,7 @@ impl Inkling2Model {
                 &slot.kv_cache,
                 &ds.attn_gated,
                 &ds.step_params,
+                Some(&ds.attn_split),
                 n_heads,
                 n_kv_heads,
                 head_dim,
@@ -1503,7 +2136,7 @@ impl Inkling2Model {
         scratch.ensure_router(chain, n_exp + 1);
 
         if scratch.decode_state.is_none() {
-            scratch.decode_state = Some(self.init_gpu_decode_state(chain, past_len));
+            scratch.decode_state = Some(self.init_gpu_decode_state(chain, past_len, 1));
         }
         let ds = scratch.decode_state.as_mut().expect("decode_state initialized");
         if !ds.synced {
@@ -1645,6 +2278,532 @@ impl Inkling2Model {
             );
         }
         Ok(Tensor::from_vec(logits, vec![1, unpadded]))
+    }
+
+    fn init_gpu_prefill_scratch(
+        &self,
+        chain: &dyn DeviceChain,
+        cap_seq: usize,
+    ) -> GpuPrefillScratch {
+        let hidden = self.cfg.hidden;
+        let gate_rank = self.cfg.loop_cfg.as_ref().map_or(1, |l| l.gate_rank);
+        let n_exp = self.cfg.n_experts;
+        let max_blocks = (self.cfg.n_phys_layers.div_ceil(self.cfg.attn_res_block_size) + 2).min(32);
+        let max_q_dim = self
+            .cfg
+            .head_counts
+            .iter()
+            .zip(&self.cfg.head_dims)
+            .map(|(h, d)| h * d)
+            .max()
+            .unwrap_or(hidden);
+        let max_kv_dim = self
+            .cfg
+            .kv_head_counts
+            .iter()
+            .zip(&self.cfg.head_dims)
+            .map(|(h, d)| h * d)
+            .max()
+            .unwrap_or(hidden);
+        let max_r_dim = self.cfg.head_counts.iter().copied().max().unwrap_or(1) * self.cfg.d_rel;
+        let max_sinks = self.cfg.head_counts.iter().copied().max().unwrap_or(1);
+        let max_dyn = self.cfg.kv_head_counts.iter().copied().max().unwrap_or(1) * self.cfg.conv_kernel;
+        let max_qrsg = 2 * max_q_dim + max_r_dim + max_sinks;
+        let need_fallback_ctrl = self.loop_layers.iter().any(|ll| {
+            ll.ctrl_down_qkv_f16.is_none()
+                || ll.ctrl_gf_qkv_f16.is_none()
+                || ll.ctrl_down_ffn_f16.is_none()
+                || ll.ctrl_gf_ffn_f16.is_none()
+        });
+        let sh = cap_seq * hidden;
+        let tau_params = chain.vec(4);
+        chain.upload(
+            &tau_params,
+            &[
+                self.cfg.qk_clip,
+                self.cfg.rel_clip,
+                f32::from_bits(self.cfg.log_scale_floor as u32),
+                self.cfg.log_scale_alpha,
+            ],
+        );
+        let y_bufs = vec![
+            chain.vec(cap_seq * max_qrsg.max(hidden)),
+            chain.vec(cap_seq * (max_kv_dim + max_dyn)),
+            chain.vec(cap_seq * (max_kv_dim + max_dyn)),
+            chain.vec(cap_seq * max_r_dim),
+            chain.vec(cap_seq * max_sinks),
+            chain.vec(cap_seq * max_q_dim),
+            chain.vec(cap_seq * max_dyn),
+            chain.vec(cap_seq * max_dyn),
+        ];
+        let (x_bufs, mid_bufs, ctrl_gain, ctrl_forget) = if need_fallback_ctrl {
+            (
+                (0..3).map(|_| chain.vec(2 * sh)).collect(),
+                (0..3).map(|_| chain.vec(cap_seq * gate_rank)).collect(),
+                (0..3).map(|_| chain.vec(sh)).collect(),
+                (0..3).map(|_| chain.vec(sh)).collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        GpuPrefillScratch {
+            cap_seq,
+            max_blocks,
+            tau_params,
+            cur: chain.vec(sh),
+            prelude_cur: chain.vec(sh),
+            blocks: chain.vec(max_blocks * sh),
+            bank: chain.vec(max_blocks * sh),
+            bank_out: chain.vec(sh),
+            msgs: chain.vec(4 * sh),
+            mix_out: chain.vec(3 * sh),
+            mid_qkv: chain.vec(3 * cap_seq * gate_rank),
+            ctrl_qkv: chain.vec(3 * sh),
+            ffn_inp: chain.vec(sh),
+            ffn_x: chain.vec(sh),
+            attn_gated: chain.vec(cap_seq * max_q_dim),
+            attn_proj: chain.vec(sh),
+            attn_conv: chain.vec(sh),
+            moe_out: chain.vec(sh),
+            norm_bufs: (0..3).map(|_| chain.vec(sh)).collect(),
+            ctrl_out: (0..3).map(|_| chain.vec(sh)).collect(),
+            y_bufs,
+            router_buf: chain.vec(cap_seq * (n_exp + 1)),
+            x_bufs,
+            mid_bufs,
+            ctrl_gain,
+            ctrl_forget,
+            logits_all: None,
+        }
+    }
+
+    /// Record one logical layer into an active single-submit full-GPU batched prefill recording.
+    #[allow(clippy::too_many_arguments)]
+    fn record_prefill_layer_gpu(
+        &self,
+        rec: &mut dyn ChainRecorder,
+        il: usize,
+        ip: usize,
+        n_blocks: &mut usize,
+        has_msgs: bool,
+        loop_layer: Option<&Inkling2LoopLayer>,
+        past_len: usize,
+        seq: usize,
+        ds: &GpuDecodeState,
+        pf: &GpuPrefillScratch,
+    ) {
+        let layer = &self.layers[ip];
+        let dev = layer.decode_dev.as_ref().expect("LayerDecodeDev present");
+        let norms_dev = layer.attn_norms_dev.as_ref().expect("attn_norms_dev present");
+        let ffn_norm_dev = layer.ffn_norm_dev.as_ref().expect("ffn_norm_dev present");
+        let router_dev = layer.ffn_gate_inp_padded_dev.as_ref().expect("router_dev present");
+        let qmoe = layer.experts.quant_moe().expect("QuantMoe present");
+        let slot = &ds.slots[il];
+
+        let hidden = self.cfg.hidden;
+        let sh = seq * hidden;
+        let is_swa = layer.is_swa;
+        let n_heads = layer.n_heads;
+        let n_kv_heads = layer.n_kv_heads;
+        let head_dim = layer.head_dim;
+        let q_dim = n_heads * head_dim;
+        let d_rel = self.cfg.d_rel;
+        let rel_extent = if is_swa { self.cfg.sliding_window } else { self.cfg.rel_extent };
+        let conv_k = self.cfg.conv_kernel;
+        let n_exp = self.cfg.n_experts;
+        let gate_rank = self.cfg.loop_cfg.as_ref().map_or(0, |l| l.gate_rank);
+
+        // 1. Attention input via Block Attention Residuals (`mix_depth_rows`).
+        if let Some(ref q_dev) = dev.attn_res_query {
+            let nq = if is_swa { 1 } else { 3 };
+            rec.inkling2_mix_depth_rows(&pf.blocks, &pf.cur, q_dev, &pf.mix_out, *n_blocks, nq, seq, hidden, false);
+        } else {
+            rec.copy(&pf.cur, 0, &pf.mix_out, 0, sh);
+            if !is_swa {
+                rec.copy(&pf.cur, 0, &pf.mix_out, sh, sh);
+                rec.copy(&pf.cur, 0, &pf.mix_out, 2 * sh, sh);
+            }
+        }
+
+        // 2. Optional Q/K/V cross-pass controllers + attention pre-norms.
+        let has_ctrl = has_msgs && loop_layer.is_some();
+        let shared_x = matches!(norms_dev, AttnNormsDev::Shared(_)) && !has_ctrl;
+        let (k_idx, v_idx) = if shared_x { (0usize, 0usize) } else { (1usize, 2usize) };
+
+        if let (true, Some(ll)) = (has_msgs, loop_layer) {
+            let norm_ws: [&DeviceVec; 3] = match norms_dev {
+                AttnNormsDev::Shared(w) => [w, w, w],
+                AttnNormsDev::Separate { q, k, v, .. } => [q, k, v],
+            };
+            if let (Some(dqkv), Some(gfqkv)) = (&ll.ctrl_down_qkv_f16, &ll.ctrl_gf_qkv_f16) {
+                let cur_stride = if is_swa { 0 } else { sh };
+                rec.inkling2_ctrl_cat_down_rows(dqkv, &pf.mix_out, 0, cur_stride, &pf.msgs, 0, &pf.mid_qkv, seq, hidden, gate_rank, 3);
+                rec.inkling2_ctrl_up_blend_rows(gfqkv, &pf.mid_qkv, &pf.mix_out, 0, cur_stride, &pf.msgs, 0, &pf.ctrl_qkv, seq, hidden, gate_rank, 3);
+                let in0 = GpuScratch::view(&pf.ctrl_qkv, sh);
+                let out0 = GpuScratch::view(&pf.norm_bufs[0], sh);
+                rec.rmsnorm_rows(&in0, norm_ws[0], &out0, seq, self.cfg.rms_eps);
+                for i in 1..3 {
+                    rec.copy(&pf.ctrl_qkv, i * sh, &pf.ctrl_out[i], 0, sh);
+                    let in_v = GpuScratch::view(&pf.ctrl_out[i], sh);
+                    let out_v = GpuScratch::view(&pf.norm_bufs[i], sh);
+                    rec.rmsnorm_rows(&in_v, norm_ws[i], &out_v, seq, self.cfg.rms_eps);
+                }
+            } else {
+                for i in 0..3 {
+                    let cur_off = if is_swa { 0 } else { i * sh };
+                    let msg_off = i * sh;
+                    rec.inkling2_control_cat_rows(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.x_bufs[i], seq, hidden);
+                    record_weight(rec, &ll.ctrl_down[i], &pf.x_bufs[i], &pf.mid_bufs[i], seq);
+                    record_weight(rec, &ll.ctrl_gain[i], &pf.mid_bufs[i], &pf.ctrl_gain[i], seq);
+                    record_weight(rec, &ll.ctrl_forget[i], &pf.mid_bufs[i], &pf.ctrl_forget[i], seq);
+                    rec.control_blend_at(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.ctrl_gain[i], &pf.ctrl_forget[i], &pf.ctrl_out[i], sh);
+                    let in_v = GpuScratch::view(&pf.ctrl_out[i], sh);
+                    let out_v = GpuScratch::view(&pf.norm_bufs[i], sh);
+                    rec.rmsnorm_rows(&in_v, norm_ws[i], &out_v, seq, self.cfg.rms_eps);
+                }
+            }
+        } else {
+            match norms_dev {
+                AttnNormsDev::Shared(w) => {
+                    let in_v = GpuScratch::view(&pf.mix_out, sh);
+                    let out_v = GpuScratch::view(&pf.norm_bufs[0], sh);
+                    rec.rmsnorm_rows(&in_v, w, &out_v, seq, self.cfg.rms_eps);
+                }
+                AttnNormsDev::Separate { q, k, v, .. } => {
+                    let in0 = GpuScratch::view(&pf.mix_out, sh);
+                    let out0 = GpuScratch::view(&pf.norm_bufs[0], sh);
+                    rec.rmsnorm_rows(&in0, q, &out0, seq, self.cfg.rms_eps);
+                    for (i, nw) in [(1usize, k), (2usize, v)] {
+                        rec.copy(&pf.mix_out, i * sh, &pf.ctrl_out[i], 0, sh);
+                        let in_v = GpuScratch::view(&pf.ctrl_out[i], sh);
+                        let out_v = GpuScratch::view(&pf.norm_bufs[i], sh);
+                        rec.rmsnorm_rows(&in_v, nw, &out_v, seq, self.cfg.rms_eps);
+                    }
+                }
+            }
+        }
+
+        // 3. Attention projections (Tensor Core `matmul_rows` on packed `wqrsg`/`wk_dyn`/`wv_dyn`).
+        let rec_attn_w = |rec: &mut dyn ChainRecorder, w: &Weight, stream_idx: usize, out: &DeviceVec| {
+            let x_v = GpuScratch::view(&pf.norm_bufs[stream_idx], sh);
+            record_weight(rec, w, &x_v, out, seq);
+        };
+        let packed_qrsg = if let Some(ref wqrsg) = layer.wqrsg {
+            rec_attn_w(rec, wqrsg, 0, &pf.y_bufs[0]);
+            true
+        } else {
+            rec_attn_w(rec, &layer.wq, 0, &pf.y_bufs[0]);
+            rec_attn_w(rec, &layer.attn_rel, 0, &pf.y_bufs[3]);
+            rec_attn_w(rec, &layer.attn_sink_proj, 0, &pf.y_bufs[4]);
+            rec_attn_w(rec, &layer.attn_gate, 0, &pf.y_bufs[5]);
+            false
+        };
+        let (packed_dyn, dyn_k_v, dyn_v_v) = if let (Some(ref wkd), Some(ref wvd)) = (&layer.wk_dyn, &layer.wv_dyn) {
+            rec_attn_w(rec, wkd, k_idx, &pf.y_bufs[1]);
+            rec_attn_w(rec, wvd, v_idx, &pf.y_bufs[2]);
+            (true, None, None)
+        } else {
+            rec_attn_w(rec, &layer.wk, k_idx, &pf.y_bufs[1]);
+            rec_attn_w(rec, &layer.wv, v_idx, &pf.y_bufs[2]);
+            let dk = if let Some(ref kp) = layer.attn_k_conv_proj {
+                rec_attn_w(rec, kp, k_idx, &pf.y_bufs[6]);
+                Some(&pf.y_bufs[6])
+            } else {
+                None
+            };
+            let dv = if let Some(ref vp) = layer.attn_v_conv_proj {
+                rec_attn_w(rec, vp, v_idx, &pf.y_bufs[7]);
+                Some(&pf.y_bufs[7])
+            } else {
+                None
+            };
+            (false, dk, dv)
+        };
+
+        // 4. Batched K/V conv+clip+norm+store+hist + Q-tiled FlashAttention + sigmoid gate.
+        rec.inkling2_kv_conv_clip_store_rows(
+            &pf.y_bufs[1],
+            &pf.y_bufs[2],
+            &dev.kv_conv_w,
+            dyn_k_v,
+            dyn_v_v,
+            packed_dyn,
+            &slot.kv_conv,
+            &slot.kv_cache,
+            past_len,
+            seq,
+            n_kv_heads,
+            head_dim,
+            conv_k,
+            slot.kv_cap,
+            self.cfg.qk_clip,
+            self.cfg.rms_eps,
+        );
+        let prefill_attn_ok = rec.inkling2_attend_prefill(
+            &pf.y_bufs[0],
+            (!packed_qrsg).then_some(&pf.y_bufs[3]),
+            (!packed_qrsg).then_some(&pf.y_bufs[4]),
+            (!packed_qrsg).then_some(&pf.y_bufs[5]),
+            packed_qrsg,
+            &dev.attn_consts,
+            &slot.kv_cache,
+            &pf.attn_gated,
+            &pf.tau_params,
+            past_len,
+            seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_rel,
+            rel_extent,
+            slot.kv_cap,
+            if is_swa { self.cfg.sliding_window } else { 0 },
+        );
+        debug_assert!(prefill_attn_ok, "inkling2_attend_prefill must succeed");
+
+        // 5. Wo + post-attention static short conv + block boundary push / residual add.
+        let ag_v = GpuScratch::view(&pf.attn_gated, seq * q_dim);
+        record_weight(rec, &layer.wo, &ag_v, &pf.attn_proj, seq);
+        if ip % self.cfg.attn_res_block_size == 0 {
+            rec.inkling2_post_conv_rows(&pf.attn_proj, &dev.attn_post_conv, None, &slot.attn_post_conv, &pf.attn_conv, seq, hidden, conv_k);
+            rec.inkling2_block_push_rows(&pf.cur, &pf.attn_conv, &pf.blocks, &pf.ffn_inp, seq, hidden, Some(*n_blocks), false);
+            *n_blocks += 1;
+        } else {
+            rec.inkling2_post_conv_rows(&pf.attn_proj, &dev.attn_post_conv, Some(&pf.cur), &slot.attn_post_conv, &pf.ffn_inp, seq, hidden, conv_k);
+        }
+
+        // 6. MoE FFN: AttnRes -> optional FFN ctrl -> RMSNorm -> Router -> Tensor Core QuantMoe -> post-FFN conv + residual.
+        rec.inkling2_mix_depth_rows(&pf.blocks, &pf.ffn_inp, &dev.ffn_res_query, &pf.ffn_x, *n_blocks, 1, seq, hidden, false);
+        let norm_v = GpuScratch::view(&pf.norm_bufs[0], sh);
+        if let (true, Some(ll)) = (has_msgs, loop_layer) {
+            if let Some(ref df) = ll.ctrl_down_ffn_f16 {
+                rec.inkling2_ctrl_cat_down_rows(df, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.mid_qkv, seq, hidden, gate_rank, 1);
+            } else {
+                rec.inkling2_control_cat_rows(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.x_bufs[0], seq, hidden);
+                record_weight(rec, &ll.ctrl_down[3], &pf.x_bufs[0], &pf.mid_bufs[0], seq);
+            }
+            if let Some(ref gf) = ll.ctrl_gf_ffn_f16 {
+                rec.inkling2_ctrl_up_blend_rows(gf, &pf.mid_qkv, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.ctrl_out[0], seq, hidden, gate_rank, 1);
+            } else {
+                let mid_src = if ll.ctrl_down_ffn_f16.is_some() { &pf.mid_qkv } else { &pf.mid_bufs[0] };
+                record_weight(rec, &ll.ctrl_gain[3], mid_src, &pf.ctrl_gain[0], seq);
+                record_weight(rec, &ll.ctrl_forget[3], mid_src, &pf.ctrl_forget[0], seq);
+                rec.control_blend_at(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.ctrl_gain[0], &pf.ctrl_forget[0], &pf.ctrl_out[0], sh);
+            }
+            let in_v = GpuScratch::view(&pf.ctrl_out[0], sh);
+            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+        } else {
+            let in_v = GpuScratch::view(&pf.ffn_x, sh);
+            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+        }
+        let router_v = GpuScratch::view(&pf.router_buf, seq * (n_exp + 1));
+        rec.matmul_f32_rows(router_dev, n_exp + 1, hidden, &norm_v, &router_v, seq);
+        let moe_v = GpuScratch::view(&pf.moe_out, sh);
+        let routed_ok = rec.moe_routed(qmoe, &norm_v, &moe_v, &router_v, self.cfg.n_experts_used, seq);
+        assert!(routed_ok, "QuantMoe::record_routed must succeed for full-GPU prefill seq={seq}");
+        rec.inkling2_post_conv_rows(&pf.moe_out, &dev.ffn_post_conv, Some(&pf.ffn_inp), &slot.ffn_post_conv, &pf.cur, seq, hidden, conv_k);
+    }
+
+    /// Single-submit full-GPU batched prefill (`seq >= 1`): executes ALL 48 logical layers on GPU
+    /// (with Tensor Core matmuls, Tensor Core QuantMoe, Q-tiled FlashAttention, and live GPU KV/conv
+    /// caches) in ONE `DeviceChain` submission, transitioning into `forward_decode_gpu` with zero
+    /// KV-cache upload stall!
+    fn forward_prefill_gpu(
+        &self,
+        cur_embed: &[f32],
+        seq: usize,
+        state: &mut Inkling2State,
+        scratch: &mut GpuScratch,
+        out_mode: OutputMode,
+        t_step_start: Option<Instant>,
+    ) -> Result<Tensor> {
+        let chain = self.backend.chain().expect("full_gpu_decode requires DeviceChain");
+        let hidden = self.cfg.hidden;
+        let sh = seq * hidden;
+        let past_len = state.pos;
+        let swa = self.cfg.sliding_window;
+
+        if scratch.decode_state.is_none() {
+            scratch.decode_state = Some(self.init_gpu_decode_state(chain, past_len, seq));
+        }
+        let ds = scratch.decode_state.as_mut().expect("decode_state initialized");
+
+        // Ensure SWA slots have `kv_cap >= swa + seq` so writing `seq` new rows never overwrites
+        // earlier keys still needed by token `t = 0` in the same chunk.
+        let need_swa_grow = ds.slots.iter().any(|s| s.is_swa && s.kv_cap < swa + seq);
+        if need_swa_grow {
+            if ds.synced && ds.host_dirty && past_len > 0 {
+                self.sync_gpu_to_host(chain, state, ds);
+            }
+            let new_swa_cap = (swa + seq).max(swa + self.preferred_prefill_chunk());
+            for g_slot in &mut ds.slots {
+                if g_slot.is_swa && g_slot.kv_cap < new_swa_cap {
+                    g_slot.kv_cache = chain.vec(2 * new_swa_cap * g_slot.kv_dim);
+                    g_slot.kv_cap = new_swa_cap;
+                }
+            }
+            ds.synced = false;
+            ds.recipe = None;
+        }
+
+        if !ds.synced {
+            // Also ensure full-attention slots fit `past_len + seq` before syncing.
+            for g_slot in &mut ds.slots {
+                if !g_slot.is_swa && past_len + seq > g_slot.kv_cap {
+                    let new_cap = (past_len + seq).next_power_of_two().max(2048);
+                    g_slot.kv_cache = chain.vec(2 * new_cap * g_slot.kv_dim);
+                    g_slot.kv_cap = new_cap;
+                }
+            }
+            self.sync_host_to_gpu(chain, state, ds);
+        } else {
+            let mut grew_kv = false;
+            for g_slot in &mut ds.slots {
+                if !g_slot.is_swa && past_len + seq > g_slot.kv_cap {
+                    let old_cap = g_slot.kv_cap;
+                    let new_cap = (past_len + seq).next_power_of_two().max(2048);
+                    let kv_dim = g_slot.kv_dim;
+                    let new_kv = chain.vec(2 * new_cap * kv_dim);
+                    if past_len > 0 {
+                        let mut grow = chain.begin();
+                        grow.keep_groups(false);
+                        grow.copy(&g_slot.kv_cache, 0, &new_kv, 0, past_len * kv_dim);
+                        grow.copy(&g_slot.kv_cache, old_cap * kv_dim, &new_kv, new_cap * kv_dim, past_len * kv_dim);
+                        let _ = grow.finish();
+                    }
+                    g_slot.kv_cache = new_kv;
+                    g_slot.kv_cap = new_cap;
+                    grew_kv = true;
+                }
+            }
+            if grew_kv {
+                ds.recipe = None;
+            }
+        }
+
+        let need_pf_init = scratch.prefill_scratch.as_ref().is_none_or(|pf| pf.cap_seq < seq);
+        if need_pf_init {
+            let cap_seq = seq.next_power_of_two().max(self.preferred_prefill_chunk().min(512).max(64));
+            scratch.prefill_scratch = Some(self.init_gpu_prefill_scratch(chain, cap_seq));
+        }
+        if out_mode == OutputMode::All {
+            let pf_mut = scratch.prefill_scratch.as_mut().expect("prefill_scratch");
+            let need = seq * self.cfg.vocab_size_padded;
+            if pf_mut.logits_all.as_ref().is_none_or(|v| v.len < need) {
+                pf_mut.logits_all = Some(chain.vec(need));
+            }
+        }
+
+        let ds = scratch.decode_state.as_ref().expect("decode_state");
+        let pf = scratch.prefill_scratch.as_ref().expect("prefill_scratch");
+        chain.upload_at(&pf.cur, 0, cur_embed);
+
+        let unpadded = self.cfg.vocab_size_unpadded;
+        let padded = self.cfg.vocab_size_padded;
+        let mut rec = chain.begin();
+        rec.keep_groups(false);
+
+        let mut n_blocks = 0usize;
+        let n_phys = self.cfg.n_phys_layers;
+
+        if let Some(lc) = &self.cfg.loop_cfg {
+            for il in 0..lc.core_start {
+                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+            }
+            rec.copy(&pf.cur, 0, &pf.prelude_cur, 0, sh);
+            let prelude_n_blocks = n_blocks;
+            let core_len = lc.core_end - lc.core_start;
+
+            for pass in 0..lc.num_passes {
+                let mut n_bank = 0usize;
+                if pass > 0 {
+                    let skip = (prelude_n_blocks + 1).min(n_blocks);
+                    n_bank = n_blocks - skip;
+                    if n_bank > 0 {
+                        rec.copy(&pf.blocks, skip * sh, &pf.bank, 0, n_bank * sh);
+                    }
+                    // Write `rms_norm_no_weight(pf.cur)` into `pf.bank_out[0..sh]`.
+                    rec.inkling2_block_push_rows(&pf.cur, &pf.attn_conv, &pf.bank_out, &pf.ffn_inp, seq, hidden, Some(0), true);
+                    rec.copy(&pf.prelude_cur, 0, &pf.cur, 0, sh);
+                    n_blocks = prelude_n_blocks;
+                }
+                for ip in lc.core_start..lc.core_end {
+                    let il = if pass == 0 {
+                        ip
+                    } else {
+                        n_phys + (pass - 1) * core_len + (ip - lc.core_start)
+                    };
+                    if pass == 0 {
+                        self.record_prefill_layer_gpu(&mut *rec, il, ip, &mut n_blocks, false, None, past_len, seq, ds, pf);
+                    } else {
+                        let ll = &self.loop_layers[ip - lc.core_start];
+                        let mq_dev = ll.msg_query_dev.as_ref().expect("msg_query_dev");
+                        rec.inkling2_mix_depth_rows(&pf.bank, &pf.bank_out, mq_dev, &pf.msgs, n_bank, 4, seq, hidden, true);
+                        self.record_prefill_layer_gpu(&mut *rec, il, ip, &mut n_blocks, true, Some(ll), past_len, seq, ds, pf);
+                    }
+                }
+            }
+            for il in lc.core_end..n_phys {
+                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+            }
+        } else {
+            for il in 0..n_phys {
+                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+            }
+        }
+
+        let out_tensor = match out_mode {
+            OutputMode::None => {
+                let _ = rec.finish();
+                Tensor::from_vec(Vec::new(), vec![0, unpadded])
+            }
+            OutputMode::LastOnly => {
+                let oq_dev = self.output_res_query_dev.as_ref().expect("output_res_query_dev");
+                let on_dev = self.output_norm_dev.as_ref().expect("output_norm_dev");
+                rec.inkling2_mix_depth_rows(&pf.blocks, &pf.cur, oq_dev, &pf.ffn_x, n_blocks, 1, seq, hidden, false);
+                rec.copy(&pf.ffn_x, (seq - 1) * hidden, &ds.ffn_x, 0, hidden);
+                let in_v = GpuScratch::view(&ds.ffn_x, hidden);
+                let norm_v = GpuScratch::view(&pf.norm_bufs[0], hidden);
+                rec.rmsnorm(&in_v, on_dev, &norm_v, self.cfg.rms_eps);
+                record_weight(&mut *rec, &self.output, &norm_v, &ds.logits, 1);
+                if self.cfg.final_logit_softcap > 0.0 {
+                    rec.inkling2_softcap(&ds.logits, unpadded, self.cfg.final_logit_softcap);
+                }
+                rec.read_range(&ds.logits, 0, unpadded);
+                let logits = rec.finish().into_iter().next().expect("prefill last logits");
+                Tensor::from_vec(logits, vec![1, unpadded])
+            }
+            OutputMode::All => {
+                let oq_dev = self.output_res_query_dev.as_ref().expect("output_res_query_dev");
+                let on_dev = self.output_norm_dev.as_ref().expect("output_norm_dev");
+                let logits_all = pf.logits_all.as_ref().expect("logits_all allocated");
+                rec.inkling2_mix_depth_rows(&pf.blocks, &pf.cur, oq_dev, &pf.ffn_x, n_blocks, 1, seq, hidden, false);
+                let in_v = GpuScratch::view(&pf.ffn_x, sh);
+                let norm_v = GpuScratch::view(&pf.norm_bufs[0], sh);
+                rec.rmsnorm_rows(&in_v, on_dev, &norm_v, seq, self.cfg.rms_eps);
+                record_weight(&mut *rec, &self.output, &norm_v, logits_all, seq);
+                if self.cfg.final_logit_softcap > 0.0 {
+                    rec.inkling2_softcap(logits_all, seq * padded, self.cfg.final_logit_softcap);
+                }
+                rec.read_range(logits_all, 0, seq * padded);
+                let full = rec.finish().into_iter().next().expect("prefill all logits");
+                Tensor::from_vec(trim_rows(full, seq, padded, unpadded), vec![seq, unpadded])
+            }
+        };
+
+        state.pos += seq;
+        if let Some(ds_mut) = scratch.decode_state.as_mut() {
+            ds_mut.synced = true;
+            ds_mut.host_dirty = true;
+        }
+        if let Some(t0) = t_step_start {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[inkling2-prof] seq={seq} pos={past_len} total={ms:.2}ms ({:.1} tok/s, 1-submit full-GPU prefill, out={out_mode:?})",
+                seq as f64 / (ms / 1000.0).max(1e-9)
+            );
+        }
+        Ok(out_tensor)
     }
 
     /// Fused single-submit GPU execution of optional Q/K/V cross-pass controllers + attention

@@ -8,6 +8,9 @@
 //!   * Four causal short-convolution histories (`k_conv`, `v_conv`, `attn_post_conv`,
 //!     `ffn_post_conv`), each storing the last `kernel - 1` inputs oldest-first.
 
+use std::io::{Read, Write};
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use super::experts::{f32_axpy_fast, f32_dot_fast};
@@ -378,6 +381,351 @@ impl Inkling2State {
         }
         self.pos = 0;
     }
+
+    /// Capture a host-side conv-only checkpoint (~3.7 MiB for Inkling-2-Mini).
+    pub fn capture_conv_checkpoint(&self) -> Inkling2ConvSnapshot {
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| Inkling2ConvSlotSnapshot {
+                k_conv: s.k_conv.hist().to_vec(),
+                v_conv: s.v_conv.hist().to_vec(),
+                attn_post_conv: s.attn_post_conv.hist().to_vec(),
+                ffn_post_conv: s.ffn_post_conv.hist().to_vec(),
+            })
+            .collect();
+        Inkling2ConvSnapshot {
+            pos: self.pos,
+            slots,
+        }
+    }
+
+    /// Capture a complete, self-contained KV + conv snapshot of `self` on the host.
+    pub fn capture_snapshot(&self, hidden: usize, conv_kernel: usize, sliding_window: usize) -> Inkling2StateSnapshot {
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| {
+                let k_first = if s.is_swa {
+                    self.pos.saturating_sub(sliding_window)
+                } else {
+                    0
+                }
+                .max(s.base_pos);
+                let k_end = self.pos.min(s.base_pos + s.stored_rows);
+                let count = k_end.saturating_sub(k_first);
+                let (k_cache, v_cache) = if count > 0 {
+                    let row0 = k_first - s.base_pos;
+                    let off = row0 * s.kv_dim;
+                    let len = count * s.kv_dim;
+                    (
+                        s.k_cache[off..off + len].to_vec(),
+                        s.v_cache[off..off + len].to_vec(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                Inkling2SlotSnapshot {
+                    is_swa: s.is_swa,
+                    kv_dim: s.kv_dim,
+                    base_pos: k_first,
+                    stored_rows: count,
+                    k_cache,
+                    v_cache,
+                    k_conv: s.k_conv.hist().to_vec(),
+                    v_conv: s.v_conv.hist().to_vec(),
+                    attn_post_conv: s.attn_post_conv.hist().to_vec(),
+                    ffn_post_conv: s.ffn_post_conv.hist().to_vec(),
+                }
+            })
+            .collect();
+        Inkling2StateSnapshot {
+            pos: self.pos,
+            hidden,
+            conv_kernel,
+            sliding_window,
+            slots,
+        }
+    }
+
+    /// Restore `self` from a previously validated [`Inkling2StateSnapshot`].
+    pub fn apply_snapshot(&mut self, snap: &Inkling2StateSnapshot) {
+        for (dst, src) in self.slots.iter_mut().zip(&snap.slots) {
+            dst.base_pos = src.base_pos;
+            dst.stored_rows = src.stored_rows;
+            dst.k_cache.clear();
+            dst.k_cache.extend_from_slice(&src.k_cache);
+            dst.v_cache.clear();
+            dst.v_cache.extend_from_slice(&src.v_cache);
+            dst.k_conv.set_hist(&src.k_conv);
+            dst.v_conv.set_hist(&src.v_conv);
+            dst.attn_post_conv.set_hist(&src.attn_post_conv);
+            dst.ffn_post_conv.set_hist(&src.ffn_post_conv);
+        }
+        self.pos = snap.pos;
+    }
+}
+
+/// Per-logical-slot short-convolution history snapshot.
+#[derive(Debug, Clone)]
+pub struct Inkling2ConvSlotSnapshot {
+    pub k_conv: Vec<f32>,
+    pub v_conv: Vec<f32>,
+    pub attn_post_conv: Vec<f32>,
+    pub ffn_post_conv: Vec<f32>,
+}
+
+/// Lightweight host-RAM checkpoint of all logical slots' short-convolution histories at `pos`
+/// (~3.7 MiB total for Inkling-2-Mini). Rewinds the live KV cache in < 0.3 ms while SWA ring
+/// rows for `pos` remain intact.
+#[derive(Debug, Clone)]
+pub struct Inkling2ConvSnapshot {
+    pub pos: usize,
+    pub slots: Vec<Inkling2ConvSlotSnapshot>,
+}
+
+impl Inkling2ConvSnapshot {
+    pub fn bytes(&self) -> usize {
+        4 * self
+            .slots
+            .iter()
+            .map(|s| s.k_conv.len() + s.v_conv.len() + s.attn_post_conv.len() + s.ffn_post_conv.len())
+            .sum::<usize>()
+    }
+}
+
+/// Full per-logical-slot KV window + short-convolution snapshot.
+#[derive(Debug, Clone)]
+pub struct Inkling2SlotSnapshot {
+    pub is_swa: bool,
+    pub kv_dim: usize,
+    pub base_pos: usize,
+    pub stored_rows: usize,
+    pub k_cache: Vec<f32>,
+    pub v_cache: Vec<f32>,
+    pub k_conv: Vec<f32>,
+    pub v_conv: Vec<f32>,
+    pub attn_post_conv: Vec<f32>,
+    pub ffn_post_conv: Vec<f32>,
+}
+
+/// Complete, self-contained KV + short-convolution snapshot for RAM parking and persistent disk cache.
+#[derive(Debug, Clone)]
+pub struct Inkling2StateSnapshot {
+    pub pos: usize,
+    pub hidden: usize,
+    pub conv_kernel: usize,
+    pub sliding_window: usize,
+    pub slots: Vec<Inkling2SlotSnapshot>,
+}
+
+const SNAPSHOT_MAGIC: &[u8; 8] = b"INK2SNP1";
+const SNAPSHOT_HEADER_BYTES: usize = 8 + 5 * 8; // magic + pos, hidden, conv_kernel, sliding_window, n_slots
+const SLOT_HEADER_BYTES: usize = 1 + 3 * 8; // is_swa + kv_dim, base_pos, stored_rows
+
+fn write_f32_slice(out: &mut dyn Write, data: &[f32]) -> std::io::Result<()> {
+    const CHUNK_FLOATS: usize = 16_384; // 64 KiB scratch buffer
+    let mut buf = [0u8; CHUNK_FLOATS * 4];
+    for chunk in data.chunks(CHUNK_FLOATS) {
+        let byte_len = chunk.len() * 4;
+        for (i, &v) in chunk.iter().enumerate() {
+            buf[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out.write_all(&buf[..byte_len])?;
+    }
+    Ok(())
+}
+
+fn read_f32_vec(input: &mut dyn Read, count: usize) -> oaiy_engine::Result<Vec<f32>> {
+    const CHUNK_FLOATS: usize = 16_384;
+    let mut out = Vec::with_capacity(count);
+    let mut buf = [0u8; CHUNK_FLOATS * 4];
+    let mut remaining = count;
+    while remaining > 0 {
+        let take = remaining.min(CHUNK_FLOATS);
+        let byte_len = take * 4;
+        input.read_exact(&mut buf[..byte_len])?;
+        for c in buf[..byte_len].chunks_exact(4) {
+            out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        remaining -= take;
+    }
+    Ok(out)
+}
+
+impl Inkling2StateSnapshot {
+    /// Approximate heap RAM bytes occupied by this snapshot.
+    pub fn bytes(&self) -> usize {
+        4 * self
+            .slots
+            .iter()
+            .map(|s| {
+                s.k_cache.len()
+                    + s.v_cache.len()
+                    + s.k_conv.len()
+                    + s.v_conv.len()
+                    + s.attn_post_conv.len()
+                    + s.ffn_post_conv.len()
+            })
+            .sum::<usize>()
+    }
+
+    /// Extract a lightweight conv-only checkpoint from this complete snapshot.
+    pub fn to_conv_snapshot(&self) -> Inkling2ConvSnapshot {
+        Inkling2ConvSnapshot {
+            pos: self.pos,
+            slots: self
+                .slots
+                .iter()
+                .map(|s| Inkling2ConvSlotSnapshot {
+                    k_conv: s.k_conv.clone(),
+                    v_conv: s.v_conv.clone(),
+                    attn_post_conv: s.attn_post_conv.clone(),
+                    ffn_post_conv: s.ffn_post_conv.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Exact encoded payload byte size for `DiskCache`.
+    pub fn encoded_len(&self) -> usize {
+        let past = self.conv_kernel.saturating_sub(1);
+        let mut total = SNAPSHOT_HEADER_BYTES;
+        for s in &self.slots {
+            let kv_floats = 2 * s.stored_rows * s.kv_dim;
+            let conv_floats = 2 * past * s.kv_dim + 2 * past * self.hidden;
+            total += SLOT_HEADER_BYTES + 4 * (kv_floats + conv_floats);
+        }
+        total
+    }
+
+    /// Stream this snapshot directly into `out` without duplicating the payload in memory.
+    pub fn write_to(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let mut w = std::io::BufWriter::with_capacity(256 * 1024, out);
+        w.write_all(SNAPSHOT_MAGIC)?;
+        w.write_all(&(self.pos as u64).to_le_bytes())?;
+        w.write_all(&(self.hidden as u64).to_le_bytes())?;
+        w.write_all(&(self.conv_kernel as u64).to_le_bytes())?;
+        w.write_all(&(self.sliding_window as u64).to_le_bytes())?;
+        w.write_all(&(self.slots.len() as u64).to_le_bytes())?;
+        for s in &self.slots {
+            w.write_all(&[u8::from(s.is_swa)])?;
+            w.write_all(&(s.kv_dim as u64).to_le_bytes())?;
+            w.write_all(&(s.base_pos as u64).to_le_bytes())?;
+            w.write_all(&(s.stored_rows as u64).to_le_bytes())?;
+            write_f32_slice(&mut w, &s.k_cache)?;
+            write_f32_slice(&mut w, &s.v_cache)?;
+            write_f32_slice(&mut w, &s.k_conv)?;
+            write_f32_slice(&mut w, &s.v_conv)?;
+            write_f32_slice(&mut w, &s.attn_post_conv)?;
+            write_f32_slice(&mut w, &s.ffn_post_conv)?;
+        }
+        w.flush()
+    }
+
+    /// Decode a snapshot streamed from `input` of exact declared byte `length`.
+    pub fn read_from(input: &mut dyn Read, length: u64) -> oaiy_engine::Result<Self> {
+        let mut limited = std::io::BufReader::with_capacity(256 * 1024, input.take(length));
+        let mut head = [0u8; SNAPSHOT_HEADER_BYTES];
+        limited.read_exact(&mut head)?;
+        if &head[..8] != SNAPSHOT_MAGIC {
+            return Err(oaiy_engine::Error::Format("invalid Inkling-2 prompt state magic".into()));
+        }
+        let read_u64 = |off: usize| -> usize {
+            u64::from_le_bytes(head[off..off + 8].try_into().expect("8 bytes")) as usize
+        };
+        let pos = read_u64(8);
+        let hidden = read_u64(16);
+        let conv_kernel = read_u64(24);
+        let sliding_window = read_u64(32);
+        let n_slots = read_u64(40);
+        if hidden == 0 || hidden > (1 << 20) || conv_kernel == 0 || conv_kernel > 64 || n_slots == 0 || n_slots > 1024 {
+            return Err(oaiy_engine::Error::Format("invalid Inkling-2 prompt state header".into()));
+        }
+        let past = conv_kernel.saturating_sub(1);
+        let mut slots = Vec::with_capacity(n_slots);
+        let mut sh = [0u8; SLOT_HEADER_BYTES];
+        for _ in 0..n_slots {
+            limited.read_exact(&mut sh)?;
+            let is_swa = match sh[0] {
+                0 => false,
+                1 => true,
+                _ => return Err(oaiy_engine::Error::Format("invalid Inkling-2 slot swa flag".into())),
+            };
+            let kv_dim = u64::from_le_bytes(sh[1..9].try_into().expect("8 bytes")) as usize;
+            let base_pos = u64::from_le_bytes(sh[9..17].try_into().expect("8 bytes")) as usize;
+            let stored_rows = u64::from_le_bytes(sh[17..25].try_into().expect("8 bytes")) as usize;
+            if kv_dim == 0 || kv_dim > (1 << 20) || base_pos.saturating_add(stored_rows) > pos {
+                return Err(oaiy_engine::Error::Format("invalid Inkling-2 slot dimensions".into()));
+            }
+            let kv_elems = stored_rows
+                .checked_mul(kv_dim)
+                .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 kv overflow".into()))?;
+            let kv_conv_elems = past
+                .checked_mul(kv_dim)
+                .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 kv_conv overflow".into()))?;
+            let post_conv_elems = past
+                .checked_mul(hidden)
+                .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 post_conv overflow".into()))?;
+            let k_cache = read_f32_vec(&mut limited, kv_elems)?;
+            let v_cache = read_f32_vec(&mut limited, kv_elems)?;
+            let k_conv = read_f32_vec(&mut limited, kv_conv_elems)?;
+            let v_conv = read_f32_vec(&mut limited, kv_conv_elems)?;
+            let attn_post_conv = read_f32_vec(&mut limited, post_conv_elems)?;
+            let ffn_post_conv = read_f32_vec(&mut limited, post_conv_elems)?;
+            slots.push(Inkling2SlotSnapshot {
+                is_swa,
+                kv_dim,
+                base_pos,
+                stored_rows,
+                k_cache,
+                v_cache,
+                k_conv,
+                v_conv,
+                attn_post_conv,
+                ffn_post_conv,
+            });
+        }
+        // Reject trailing garbage so corrupted files are caught immediately.
+        let mut extra = [0u8; 1];
+        if limited.read(&mut extra)? != 0 {
+            return Err(oaiy_engine::Error::Format("trailing bytes in Inkling-2 prompt state".into()));
+        }
+        Ok(Self {
+            pos,
+            hidden,
+            conv_kernel,
+            sliding_window,
+            slots,
+        })
+    }
+}
+
+impl crate::engines::disk::PromptState for Arc<Inkling2StateSnapshot> {
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn encoded_len(&self) -> usize {
+        Inkling2StateSnapshot::encoded_len(self)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        let _ = Inkling2StateSnapshot::write_to(self, out);
+    }
+
+    fn write_to(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        Inkling2StateSnapshot::write_to(self, out)
+    }
+
+    fn decode(bytes: &[u8]) -> oaiy_engine::Result<Self> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        Inkling2StateSnapshot::read_from(&mut cursor, bytes.len() as u64).map(Arc::new)
+    }
+
+    fn read_from(input: &mut dyn Read, length: u64) -> oaiy_engine::Result<Self> {
+        Inkling2StateSnapshot::read_from(input, length).map(Arc::new)
+    }
 }
 
 #[cfg(test)]
@@ -465,5 +813,59 @@ mod tests {
             let want: f32 = (0..3).map(|p| (exps[p] / sum) * v[p * 4 + d]).sum();
             assert!((got[d] - want).abs() < 1e-5, "dim {d}: got {} vs want {want}", got[d]);
         }
+    }
+
+    #[test]
+    fn state_snapshot_round_trips_and_rejects_corruption() {
+        use crate::engines::disk::PromptState;
+
+        let mut st = Inkling2State::new(&[false, true], &[4, 4], 3, 6, 4);
+        // Append 5 tokens to both full and SWA slots.
+        for t in 0..5 {
+            let k: Vec<f32> = (0..4).map(|i| (t * 4 + i) as f32 * 0.25 + 1.0).collect();
+            let v: Vec<f32> = (0..4).map(|i| (t * 4 + i) as f32 * -0.5 - 2.0).collect();
+            st.slots[0].append_kv(&k, &v, 1);
+            st.slots[1].append_kv(&k, &v, 1);
+        }
+        st.pos = 5;
+        st.slots[0].k_conv.set_hist(&vec![1.5; 12]);
+        st.slots[0].v_conv.set_hist(&vec![-0.5; 12]);
+        st.slots[0].attn_post_conv.set_hist(&vec![0.25; 18]);
+        st.slots[0].ffn_post_conv.set_hist(&vec![-0.75; 18]);
+        st.slots[1].k_conv.set_hist(&vec![2.0; 12]);
+
+        let snap = Arc::new(st.capture_snapshot(6, 4, 3));
+        assert_eq!(snap.pos, 5);
+        assert_eq!(snap.slots[0].base_pos, 0);
+        assert_eq!(snap.slots[0].stored_rows, 5);
+        // SWA slot only retains the last `sliding_window = 3` rows (`[2..5)`).
+        assert_eq!(snap.slots[1].base_pos, 2);
+        assert_eq!(snap.slots[1].stored_rows, 3);
+
+        let mut raw = Vec::new();
+        snap.write_to(&mut raw).unwrap();
+        assert_eq!(raw.len(), snap.encoded_len());
+
+        let decoded = <Arc<Inkling2StateSnapshot> as PromptState>::decode(&raw).unwrap();
+        assert_eq!(decoded.pos, 5);
+        assert_eq!(decoded.slots[0].k_cache, snap.slots[0].k_cache);
+        assert_eq!(decoded.slots[1].base_pos, 2);
+        assert_eq!(decoded.slots[1].v_cache, snap.slots[1].v_cache);
+        assert_eq!(decoded.slots[0].ffn_post_conv, snap.slots[0].ffn_post_conv);
+
+        // Apply to a fresh state and verify exact equality.
+        let mut restored = Inkling2State::new(&[false, true], &[4, 4], 3, 6, 4);
+        restored.apply_snapshot(&decoded);
+        assert_eq!(restored.pos, 5);
+        assert_eq!(restored.slots[0].k_cache, snap.slots[0].k_cache);
+        assert_eq!(restored.slots[1].base_pos, 2);
+        assert_eq!(restored.slots[1].stored_rows, 3);
+        assert_eq!(restored.slots[0].attn_post_conv.hist(), &vec![0.25; 18]);
+
+        // Truncated and extended payloads must be rejected cleanly.
+        assert!(<Arc<Inkling2StateSnapshot> as PromptState>::decode(&raw[..raw.len() - 1]).is_err());
+        let mut extended = raw.clone();
+        extended.push(0);
+        assert!(<Arc<Inkling2StateSnapshot> as PromptState>::decode(&extended).is_err());
     }
 }

@@ -69,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MmProj::MiniCpmV(_) => "MiniCPM-V 4.7 SigLIP tower (window merger inside) + 2x2 merger MLP head",
         MmProj::SigLip(_)  => return Err("expected a Qwen3-VL mmproj; got SigLIP".into()),
         MmProj::Gemma4V(_) => return Err("expected a Qwen3-VL mmproj; got Gemma 4 V".into()),
+        MmProj::Inkling2V(_, _) => return Err("expected a Qwen3-VL mmproj; got Inkling-2 V".into()),
     };
     eprintln!("  mmproj loaded in {:.2?} ({} blocks, {})",
               t1.elapsed(), mmproj.n_blocks(), kind_label);

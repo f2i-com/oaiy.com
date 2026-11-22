@@ -333,11 +333,29 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
             </button>
           </div>
         )}
-        {snapshot?.models.map((m) => (
+        {snapshot?.models.map((m) => {
+          const isProjector = /(^|[/\\])mmproj[^/\\]*\.gguf$/i.test(m.name);
+          return (
           <div key={m.path} className="model-row">
             <div className="model-info" title={m.path}>
-              <div className="model-name">{m.name}</div>
-              <div className="model-meta">{formatBytes(m.sizeBytes)}</div>
+              <div className="model-name">
+                {m.name}
+                {isProjector && (
+                  <>
+                    {' '}
+                    <span
+                      className="badge badge-idle"
+                      title="Companion multimodal vision projector — pairs with the main GGUF language model weights rather than replacing them"
+                    >
+                      Vision projector
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="model-meta">
+                {formatBytes(m.sizeBytes)}
+                {isProjector && ' · companion vision encoder (pairs with main LLM weights)'}
+              </div>
             </div>
             <div className="row-actions">
               <button
@@ -363,7 +381,8 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
               </button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </section>
 
       {finished.length > 0 && (

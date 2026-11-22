@@ -378,6 +378,15 @@ impl DeviceChain for WgpuBackend {
         })
     }
 
+    fn moe_routed_max_rows(&self, e: &dyn ggml_rs::exl3::Experts) -> usize {
+        if let Some(q) = e.as_any().and_then(|a| a.downcast_ref::<crate::quant::moe::QuantMoe>()) {
+            if q.is_on(&self.gpu) && q.coop_enabled() {
+                return 65535;
+            }
+        }
+        64
+    }
+
     fn holds(&self, w: &QuantizedTensor) -> bool {
         w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()).is_some_and(|q| Arc::ptr_eq(&q.gpu, &self.gpu))
     }

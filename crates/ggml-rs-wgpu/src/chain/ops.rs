@@ -1210,8 +1210,8 @@ impl ChainRecorder for Recorder<'_> {
         );
     }
 
-    fn inkling2_mix_depth(&mut self, blocks: &DeviceVec, cur: &DeviceVec, query: &DeviceVec, out: &DeviceVec, n_blocks: usize, n_queries: usize, hidden: usize, cur_is_normed: bool) {
-        assert!(n_blocks < 32 && n_queries > 0 && hidden > 0 && cur.len >= hidden && query.len >= n_queries * hidden && out.len >= n_queries * hidden, "chain: inkling2_mix_depth");
+    fn inkling2_mix_depth_rows(&mut self, blocks: &DeviceVec, cur: &DeviceVec, query: &DeviceVec, out: &DeviceVec, n_blocks: usize, n_queries: usize, seq: usize, hidden: usize, cur_is_normed: bool) {
+        assert!(n_blocks < 32 && n_queries > 0 && seq > 0 && hidden > 0 && cur.len >= seq * hidden && query.len >= n_queries * hidden && out.len >= n_queries * seq * hidden, "chain: inkling2_mix_depth_rows");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         let (name, src) = if hidden % 4 == 0 && self.gpu().subgroups32() {
@@ -1223,13 +1223,13 @@ impl ChainRecorder for Recorder<'_> {
             name,
             src,
             [buffer(blocks), buffer(cur), buffer(query), &d, &d, &d, buffer(out), &drw],
-            &[hidden as u32, n_blocks as u32, n_queries as u32, u32::from(cur_is_normed)],
-            (n_queries as u32, 1, 1),
+            &[hidden as u32, n_blocks as u32, n_queries as u32, u32::from(cur_is_normed), seq as u32],
+            (n_queries as u32, seq as u32, 1),
         );
     }
 
-    fn inkling2_control_cat(&mut self, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize) {
-        assert!(hidden > 0 && cur.len >= cur_off + hidden && msg.len >= msg_off + hidden && out.len >= 2 * hidden, "chain: inkling2_control_cat");
+    fn inkling2_control_cat_rows(&mut self, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, seq: usize, hidden: usize) {
+        assert!(seq > 0 && hidden > 0 && cur.len >= cur_off + seq * hidden && msg.len >= msg_off + seq * hidden && out.len >= seq * 2 * hidden, "chain: inkling2_control_cat_rows");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         self.dispatch_wide(
@@ -1237,7 +1237,7 @@ impl ChainRecorder for Recorder<'_> {
             INKLING2_CONTROL_CAT,
             [buffer(cur), buffer(msg), &d, &d, &d, &d, buffer(out), &drw],
             &[hidden as u32, cur_off as u32, msg_off as u32],
-            (2, 1, 1),
+            (2, seq as u32, 1),
         );
     }
 
@@ -1299,8 +1299,8 @@ impl ChainRecorder for Recorder<'_> {
         );
     }
 
-    fn inkling2_block_push(&mut self, inp_sa: &DeviceVec, attn_conv: &DeviceVec, blocks: &DeviceVec, ffn_inp: &DeviceVec, hidden: usize, block_slot: Option<usize>, skip_ffn_inp: bool) {
-        assert!(hidden > 0 && inp_sa.len >= hidden && attn_conv.len >= hidden && ffn_inp.len >= hidden, "chain: inkling2_block_push");
+    fn inkling2_block_push_rows(&mut self, inp_sa: &DeviceVec, attn_conv: &DeviceVec, blocks: &DeviceVec, ffn_inp: &DeviceVec, seq: usize, hidden: usize, block_slot: Option<usize>, skip_ffn_inp: bool) {
+        assert!(seq > 0 && hidden > 0 && inp_sa.len >= seq * hidden && (skip_ffn_inp || (attn_conv.len >= seq * hidden && ffn_inp.len >= seq * hidden)), "chain: inkling2_block_push_rows");
         let d = self.gpu().dummy().clone();
         let slot = block_slot.map_or(u32::MAX, |s| s as u32);
         let (name, src) = if self.gpu().subgroups32() {
@@ -1312,8 +1312,8 @@ impl ChainRecorder for Recorder<'_> {
             name,
             src,
             [buffer(inp_sa), buffer(attn_conv), &d, &d, &d, &d, buffer(blocks), buffer(ffn_inp)],
-            &[hidden as u32, slot, u32::from(skip_ffn_inp)],
-            (1, 1, 1),
+            &[hidden as u32, slot, u32::from(skip_ffn_inp), seq as u32],
+            (seq as u32, 1, 1),
         );
     }
 
@@ -1330,12 +1330,8 @@ impl ChainRecorder for Recorder<'_> {
         );
     }
 
-    fn inkling2_ctrl_cat_down(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize) {
-        self.inkling2_ctrl_cat_down_multi(w_down_f16, cur, cur_off, 0, msg, msg_off, mid_out, hidden, gate_rank, 1);
-    }
-
-    fn inkling2_ctrl_cat_down_multi(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
-        assert!(n_streams > 0 && hidden > 0 && hidden % 2 == 0 && gate_rank > 0 && w_down_f16.len >= n_streams * gate_rank * hidden && cur.len >= cur_off + (n_streams - 1) * cur_stride + hidden && msg.len >= msg_off + n_streams * hidden && mid_out.len >= n_streams * gate_rank, "chain: inkling2_ctrl_cat_down_multi");
+    fn inkling2_ctrl_cat_down_rows(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, seq: usize, hidden: usize, gate_rank: usize, n_streams: usize) {
+        assert!(seq > 0 && n_streams > 0 && hidden > 0 && hidden % 2 == 0 && gate_rank > 0 && w_down_f16.len >= n_streams * gate_rank * hidden && cur.len >= cur_off + (n_streams - 1) * cur_stride + seq * hidden && msg.len >= msg_off + n_streams * seq * hidden && mid_out.len >= n_streams * seq * gate_rank, "chain: inkling2_ctrl_cat_down_rows");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         let (name, src) = if self.gpu().subgroups32() {
@@ -1347,25 +1343,21 @@ impl ChainRecorder for Recorder<'_> {
             name,
             src,
             [buffer(w_down_f16), buffer(cur), buffer(msg), &d, &d, &d, buffer(mid_out), &drw],
-            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32],
-            (gate_rank as u32, n_streams as u32, 1),
+            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32, seq as u32],
+            (gate_rank as u32, n_streams as u32, seq as u32),
         );
     }
 
-    fn inkling2_ctrl_up_blend(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize) {
-        self.inkling2_ctrl_up_blend_multi(w_gf_f16, mid, cur, cur_off, 0, msg, msg_off, out, hidden, gate_rank, 1);
-    }
-
-    fn inkling2_ctrl_up_blend_multi(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
-        assert!(n_streams > 0 && hidden > 0 && gate_rank > 0 && gate_rank % 2 == 0 && gate_rank <= 256 && w_gf_f16.len * 2 >= n_streams * 2 * hidden * gate_rank && mid.len >= n_streams * gate_rank && cur.len >= cur_off + (n_streams - 1) * cur_stride + hidden && msg.len >= msg_off + n_streams * hidden && out.len >= n_streams * hidden, "chain: inkling2_ctrl_up_blend_multi");
+    fn inkling2_ctrl_up_blend_rows(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, seq: usize, hidden: usize, gate_rank: usize, n_streams: usize) {
+        assert!(seq > 0 && n_streams > 0 && hidden > 0 && gate_rank > 0 && gate_rank % 2 == 0 && gate_rank <= 256 && w_gf_f16.len * 2 >= n_streams * 2 * hidden * gate_rank && mid.len >= n_streams * seq * gate_rank && cur.len >= cur_off + (n_streams - 1) * cur_stride + seq * hidden && msg.len >= msg_off + n_streams * seq * hidden && out.len >= n_streams * seq * hidden, "chain: inkling2_ctrl_up_blend_rows");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         self.dispatch_wide(
             "chain-inkling2-ctrl-up-blend",
             INKLING2_CTRL_UP_BLEND,
             [buffer(w_gf_f16), buffer(mid), buffer(cur), buffer(msg), &d, &d, buffer(out), &drw],
-            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32],
-            ((hidden as u32).div_ceil(256), n_streams as u32, 1),
+            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32, seq as u32],
+            ((hidden as u32).div_ceil(256), n_streams as u32, seq as u32),
         );
     }
 
@@ -1394,6 +1386,46 @@ impl ChainRecorder for Recorder<'_> {
         );
     }
 
+    fn inkling2_kv_conv_clip_store_rows(&mut self, k_raw: &DeviceVec, v_raw: &DeviceVec, kv_conv_w: &DeviceVec, dyn_k: Option<&DeviceVec>, dyn_v: Option<&DeviceVec>, packed_dyn: bool, kv_hist: &DeviceVec, kv_cache: &DeviceVec, past_len: usize, seq: usize, n_kv_heads: usize, head_dim: usize, kernel: usize, kv_cap: usize, qk_clip: f32, rms_eps: f32) {
+        let kv_dim = n_kv_heads * head_dim;
+        let dyn_dim = n_kv_heads * kernel;
+        let kv_stride = kv_dim + if packed_dyn { dyn_dim } else { 0 };
+        let past = kernel - 1;
+        assert!(seq > 0 && kv_dim > 0 && head_dim <= 256 && kernel >= 2 && kv_cap > 0 && k_raw.len >= seq * kv_stride && v_raw.len >= seq * kv_stride && kv_conv_w.len >= 2 * kv_dim * kernel && kv_hist.len >= 2 * past * kv_dim && kv_cache.len >= 2 * kv_cap * kv_dim, "chain: inkling2_kv_conv_clip_store_rows");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let dyn_mode: u32 = if packed_dyn {
+            2
+        } else if dyn_k.is_some() && dyn_v.is_some() {
+            1
+        } else {
+            0
+        };
+        let (name, src) = if self.gpu().subgroups32() {
+            ("chain-inkling2-kv-conv-clip-store-rows-sg", INKLING2_KV_CONV_CLIP_STORE_ROWS_SG)
+        } else {
+            ("chain-inkling2-kv-conv-clip-store-rows", INKLING2_KV_CONV_CLIP_STORE_ROWS)
+        };
+        let p0x = (n_kv_heads as u32) | ((head_dim as u32) << 16);
+        let p0y = (kernel as u32) | (dyn_mode << 16);
+        self.dispatch_wide(
+            name,
+            src,
+            [buffer(k_raw), buffer(v_raw), buffer(kv_conv_w), dyn_k.map(buffer).unwrap_or(&d), dyn_v.map(buffer).unwrap_or(&d), buffer(kv_hist), buffer(kv_cache), &drw],
+            &[p0x, p0y, kv_cap as u32, past_len as u32, seq as u32, qk_clip.to_bits(), rms_eps.to_bits()],
+            (n_kv_heads as u32, seq as u32, 1),
+        );
+        if past > 0 {
+            self.dispatch_wide(
+                "chain-inkling2-conv-hist-update",
+                INKLING2_CONV_HIST_UPDATE,
+                [buffer(k_raw), buffer(v_raw), &d, &d, &d, &d, buffer(kv_hist), &drw],
+                &[kv_dim as u32, kv_stride as u32, past as u32, seq as u32, 2],
+                ((kv_dim as u32).div_ceil(256), 2, 1),
+            );
+        }
+    }
+
     fn inkling2_attend_fused(&mut self, q: &DeviceVec, r: &DeviceVec, sinks: &DeviceVec, attn_consts: &DeviceVec, kv_cache: &DeviceVec, gate: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize, qk_clip: f32, rel_clip: f32) -> bool {
         let kv_dim = n_kv_heads * head_dim;
         assert!(n_heads > 0 && n_kv_heads > 0 && head_dim > 0 && head_dim <= 256 && d_rel <= 64 && q.len >= n_heads * head_dim && r.len >= n_heads * d_rel && sinks.len >= n_heads && attn_consts.len >= rel_extent * d_rel + n_heads * head_dim + n_heads * d_rel && kv_cache.len >= 2 * kv_cap * kv_dim && gate.len >= n_heads * head_dim && out.len >= n_heads * head_dim && step_params.len >= 2, "chain: inkling2_attend_fused");
@@ -1418,7 +1450,7 @@ impl ChainRecorder for Recorder<'_> {
         true
     }
 
-    fn inkling2_attend_fused_packed(&mut self, qrsg: &DeviceVec, attn_consts: &DeviceVec, kv_cache: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize, qk_clip: f32, rel_clip: f32) -> bool {
+    fn inkling2_attend_fused_packed(&mut self, qrsg: &DeviceVec, attn_consts: &DeviceVec, kv_cache: &DeviceVec, out: &DeviceVec, step_params: &DeviceVec, split_buf: Option<&DeviceVec>, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize, qk_clip: f32, rel_clip: f32) -> bool {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let qrsg_need = q_dim + n_heads * d_rel + n_heads + q_dim;
@@ -1441,13 +1473,45 @@ impl ChainRecorder for Recorder<'_> {
             };
             let q8_buf = xq_opt.as_ref().map(buffer).unwrap_or(&drw);
             let h_word = (n_heads as u32) | if write_q8 { 0x8000_0000u32 } else { 0 };
-            self.dispatch_wide(
-                "chain-inkling2-attend-fused-sg-packed",
-                INKLING2_ATTEND_FUSED_SG_PACKED,
-                [buffer(qrsg), buffer(attn_consts), buffer(kv_cache), buffer(step_params), &d, &d, buffer(out), q8_buf],
-                &[h_word, n_kv_heads as u32, d_rel as u32, rel_extent as u32, kv_cap as u32, sliding_window as u32, qk_clip.to_bits(), rel_clip.to_bits()],
-                (n_heads as u32, 1, 1),
-            );
+
+            static NO_SPLITK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let n_splits: usize = if *NO_SPLITK.get_or_init(|| std::env::var_os("OAIY_INKLING2_NO_SPLITK").is_some()) {
+                1
+            } else if sliding_window == 0 {
+                16
+            } else if sliding_window >= 256 {
+                8
+            } else {
+                1
+            };
+
+            if let Some(sb) = split_buf.filter(|sb| n_splits > 1 && sb.len >= n_heads * n_splits * 132) {
+                let sink_buf_off = q_dim + n_heads * d_rel;
+                let gate_buf_off = sink_buf_off + n_heads;
+                let p0x = (n_heads as u32) | ((n_splits as u32) << 16);
+                self.dispatch_wide(
+                    "chain-inkling2-attend-split-part-sg",
+                    INKLING2_ATTEND_SPLIT_PART_SG,
+                    [buffer(qrsg), buffer(attn_consts), buffer(kv_cache), buffer(step_params), &d, &d, buffer(sb), &drw],
+                    &[p0x, n_kv_heads as u32, d_rel as u32, rel_extent as u32, kv_cap as u32, sliding_window as u32, qk_clip.to_bits(), rel_clip.to_bits()],
+                    (n_heads as u32, n_splits as u32, 1),
+                );
+                self.dispatch_wide(
+                    "chain-inkling2-attend-split-join-sg",
+                    INKLING2_ATTEND_SPLIT_JOIN_SG,
+                    [buffer(qrsg), buffer(sb), &d, &d, &d, &d, buffer(out), q8_buf],
+                    &[h_word, n_splits as u32, sink_buf_off as u32, gate_buf_off as u32],
+                    (n_heads as u32, 1, 1),
+                );
+            } else {
+                self.dispatch_wide(
+                    "chain-inkling2-attend-fused-sg-packed",
+                    INKLING2_ATTEND_FUSED_SG_PACKED,
+                    [buffer(qrsg), buffer(attn_consts), buffer(kv_cache), buffer(step_params), &d, &d, buffer(out), q8_buf],
+                    &[h_word, n_kv_heads as u32, d_rel as u32, rel_extent as u32, kv_cap as u32, sliding_window as u32, qk_clip.to_bits(), rel_clip.to_bits()],
+                    (n_heads as u32, 1, 1),
+                );
+            }
             if let Some(xq) = xq_opt {
                 self.q8.push((ob, 1, q_dim, xq));
             }
@@ -1464,6 +1528,40 @@ impl ChainRecorder for Recorder<'_> {
         true
     }
 
+    fn inkling2_attend_prefill(&mut self, q: &DeviceVec, r: Option<&DeviceVec>, sinks: Option<&DeviceVec>, gate: Option<&DeviceVec>, packed_qrsg: bool, attn_consts: &DeviceVec, kv_cache: &DeviceVec, out: &DeviceVec, tau_params: &DeviceVec, past_len: usize, seq: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, d_rel: usize, rel_extent: usize, kv_cap: usize, sliding_window: usize) -> bool {
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        assert!(seq > 0 && n_heads > 0 && n_kv_heads > 0 && head_dim > 0 && head_dim <= 256 && d_rel <= 64 && rel_extent <= 65535 && attn_consts.len >= rel_extent * d_rel + q_dim + n_heads * d_rel && kv_cache.len >= 2 * kv_cap * kv_dim && out.len >= seq * q_dim && tau_params.len >= 4, "chain: inkling2_attend_prefill");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let p0x = (n_heads as u32) | ((n_kv_heads as u32) << 16);
+        let p0y = (d_rel as u32) | ((rel_extent as u32) << 16);
+        if packed_qrsg && head_dim == 128 && d_rel <= 32 && self.gpu().subgroups32() {
+            let row_stride = 2 * q_dim + n_heads * d_rel + n_heads;
+            assert!(q.len >= seq * row_stride, "chain: inkling2_attend_prefill packed qrsg");
+            self.dispatch_wide(
+                "chain-inkling2-attend-prefill-sg-packed",
+                INKLING2_ATTEND_PREFILL_SG_PACKED,
+                [buffer(q), buffer(attn_consts), buffer(kv_cache), buffer(tau_params), &d, &d, buffer(out), &drw],
+                &[p0x, p0y, kv_cap as u32, sliding_window as u32, past_len as u32, seq as u32],
+                (n_heads as u32, (seq as u32).div_ceil(8), 1),
+            );
+        } else {
+            let rb = if packed_qrsg { buffer(q) } else { buffer(r.expect("unpacked r")) };
+            let sb = if packed_qrsg { buffer(q) } else { buffer(sinks.expect("unpacked sinks")) };
+            let gb = if packed_qrsg { buffer(q) } else { buffer(gate.expect("unpacked gate")) };
+            let hd_word = (head_dim as u32) | if packed_qrsg { 0x8000_0000u32 } else { 0 };
+            self.dispatch_wide(
+                "chain-inkling2-attend-prefill-portable",
+                INKLING2_ATTEND_PREFILL_PORTABLE,
+                [buffer(q), rb, sb, buffer(attn_consts), buffer(kv_cache), gb, buffer(out), buffer(tau_params)],
+                &[p0x, p0y, kv_cap as u32, sliding_window as u32, past_len as u32, seq as u32, hd_word],
+                (n_heads as u32, seq as u32, 1),
+            );
+        }
+        true
+    }
+
     fn inkling2_post_conv_add(&mut self, x: &DeviceVec, weight: &DeviceVec, residual: &DeviceVec, hist: &DeviceVec, out: &DeviceVec, channels: usize, kernel: usize) {
         assert!(channels > 0 && kernel >= 2 && x.len >= channels && weight.len >= channels * kernel && residual.len >= channels && hist.len >= (kernel - 1) * channels && out.len >= channels, "chain: inkling2_post_conv_add");
         let d = self.gpu().dummy().clone();
@@ -1474,6 +1572,30 @@ impl ChainRecorder for Recorder<'_> {
             &[channels as u32, kernel as u32],
             grid((channels as u32).div_ceil(256)),
         );
+    }
+
+    fn inkling2_post_conv_rows(&mut self, x: &DeviceVec, weight: &DeviceVec, residual: Option<&DeviceVec>, hist: &DeviceVec, out: &DeviceVec, seq: usize, channels: usize, kernel: usize) {
+        let past = kernel - 1;
+        assert!(seq > 0 && channels > 0 && kernel >= 2 && x.len >= seq * channels && weight.len >= channels * kernel && residual.is_none_or(|r| r.len >= seq * channels) && hist.len >= past * channels && out.len >= seq * channels, "chain: inkling2_post_conv_rows");
+        let d = self.gpu().dummy().clone();
+        let drw = self.gpu().dummy_rw().clone();
+        let res_buf = residual.map(buffer).unwrap_or(&d);
+        self.dispatch_wide(
+            "chain-inkling2-static-conv-rows",
+            INKLING2_STATIC_CONV_ROWS,
+            [buffer(x), buffer(weight), buffer(hist), res_buf, &d, &d, buffer(out), &drw],
+            &[channels as u32, kernel as u32, seq as u32, u32::from(residual.is_some())],
+            ((channels as u32).div_ceil(256), seq as u32, 1),
+        );
+        if past > 0 {
+            self.dispatch_wide(
+                "chain-inkling2-conv-hist-update",
+                INKLING2_CONV_HIST_UPDATE,
+                [buffer(x), &d, &d, &d, &d, &d, buffer(hist), &drw],
+                &[channels as u32, channels as u32, past as u32, seq as u32, 1],
+                ((channels as u32).div_ceil(256), 1, 1),
+            );
+        }
     }
 
     fn moe_routed_post_conv_add(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, logits: &DeviceVec, conv_w: &DeviceVec, residual: &DeviceVec, conv_state: &DeviceVec, out: &DeviceVec, top_k: usize, kernel: usize) -> bool {

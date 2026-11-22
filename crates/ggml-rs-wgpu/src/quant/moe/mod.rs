@@ -162,6 +162,11 @@ impl Drop for QuantMoe {
 const QUANT: usize = 1 << 40;
 
 impl QuantMoe {
+    /// Whether cooperative-matrix Tensor Core prefill (`rows > 64`) is active on this device.
+    pub(crate) fn coop_enabled(&self) -> bool {
+        self.coop
+    }
+
     /// The layer's experts as groups on `b`, if they can be: their types ones the kernels decode, each group within a
     /// binding, and all of them within the budget less `reserve`. Else `data` back, for the host.
     fn try_new(b: &WgpuBackend, data: QuantExpertsData, reserve: u64) -> Result<Self, QuantExpertsData> {

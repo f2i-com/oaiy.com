@@ -986,8 +986,11 @@ impl Inkling2Model {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if kv.len == 0 && st.pos != 0 {
             st.reset();
+            if let Some(scratch) = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                scratch.reset_decode_state();
+            }
         }
-        let logits = self.forward_internal(tokens, &[], &mut st, false)?;
+        let logits = self.forward_internal(tokens, &[], &mut st, forward::OutputMode::All)?;
         kv.len = st.pos;
         Ok(logits)
     }
@@ -1003,16 +1006,27 @@ impl Inkling2Model {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if kv.len == 0 && st.pos != 0 {
             st.reset();
+            if let Some(scratch) = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                scratch.reset_decode_state();
+            }
         }
-        let logits = self.forward_internal(tokens, soft, &mut st, true)?;
+        let logits = self.forward_internal(tokens, soft, &mut st, forward::OutputMode::LastOnly)?;
         kv.len = st.pos;
         Ok(logits)
+    }
+
+    /// Advance KV and short-convolution states across an intermediate prompt chunk without
+    /// computing unembed logits or transferring logits back to the host.
+    pub fn prefill_only(&self, tokens: &[u32], soft: &[(usize, &[f32])]) -> Result<()> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = self.forward_internal(tokens, soft, &mut st, forward::OutputMode::None)?;
+        Ok(())
     }
 
     /// Fast server step/prefill helper: returns last-token logits directly (`Vec<f32>` of length `vocab_size_unpadded`).
     pub fn forward_last(&self, tokens: &[u32], soft: &[(usize, &[f32])]) -> Result<Vec<f32>> {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let t = self.forward_internal(tokens, soft, &mut st, true)?;
+        let t = self.forward_internal(tokens, soft, &mut st, forward::OutputMode::LastOnly)?;
         Ok(t.data().to_vec())
     }
 }

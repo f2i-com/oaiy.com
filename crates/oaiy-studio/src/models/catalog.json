@@ -205,15 +205,28 @@
     {
       "id": "inkling-2-mini",
       "group": "llm",
-      "name": "Inkling-2-Mini (GGUF)",
-      "about": "Thinking Machines Lab's looped multimodal MoE model (~26B total, ~1.5B active per pass over a 3-pass recurrent core) with reasoning, tool use, and vision: ggml-org's IQ4_NL GGUF with its Q8_0 vision projector.",
+      "name": "Inkling-2-Mini (IQ4_NL)",
+      "about": "Thinking Machines Lab's looped multimodal MoE model (~26B total, ~1.5B active per pass over a 3-pass recurrent core) with reasoning, tool use, and vision: ggml-org's 4-bit IQ4_NL GGUF (17.6 GB) plus its 346 MB Q8_0 vision projector.",
       "license": "Apache-2.0",
       "size_gb": 18.0,
-      "vram_gb": 8,
+      "vram_gb": 20,
       "ram_gb": 24,
       "agent_tools": true,
       "parts": [{ "repo": "ggml-org/Inkling-2-Mini-GGUF", "include": ["Inkling-2-Mini-IQ4_NL.gguf", "mmproj-Inkling-2-Mini-Q8_0.gguf"], "into": "Inkling-2-Mini-GGUF" }],
       "add": ["Inkling-2-Mini-GGUF/Inkling-2-Mini-IQ4_NL.gguf", "Inkling-2-Mini-GGUF/mmproj-Inkling-2-Mini-Q8_0.gguf"]
+    },
+    {
+      "id": "inkling-2-mini-q8",
+      "group": "llm",
+      "name": "Inkling-2-Mini (Q8_0)",
+      "about": "Thinking Machines Lab's Inkling-2-Mini at 8 bits (27.8 GB Q8_0 GGUF + 346 MB Q8_0 vision projector), nearly indistinguishable from the original weights: fits on a single 32 GB GPU (such as an RTX 5090) or split across two GPUs.",
+      "license": "Apache-2.0",
+      "size_gb": 28.2,
+      "vram_gb": 30,
+      "ram_gb": 32,
+      "agent_tools": true,
+      "parts": [{ "repo": "ggml-org/Inkling-2-Mini-GGUF", "include": ["Inkling-2-Mini-Q8_0.gguf", "mmproj-Inkling-2-Mini-Q8_0.gguf"], "into": "Inkling-2-Mini-Q8_0" }],
+      "add": ["Inkling-2-Mini-Q8_0/Inkling-2-Mini-Q8_0.gguf", "Inkling-2-Mini-Q8_0/mmproj-Inkling-2-Mini-Q8_0.gguf"]
     },
     {
       "id": "inkling-2-mini-safetensors",
