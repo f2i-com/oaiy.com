@@ -827,9 +827,23 @@ fn iq4_nl_q8_0_and_situ_experts_match_host() {
             rec.read(&out);
             let got = rec.finish().pop().unwrap();
 
+            let q8_active = rows == 1 && b.gpu.int8_rows() && b.gpu.subgroups32() && std::env::var_os("OAIY_NO_Q8").is_none() && std::env::var_os("OAIY_MOE_NO_Q8").is_none();
+            let q8_round = |v: &[f32]| -> Vec<f32> {
+                let mut out = vec![0.0f32; v.len()];
+                for (src, dst) in v.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+                    let amax = src.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                    let d = amax / 127.0;
+                    let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+                    for (a, b) in src.iter().zip(dst.iter_mut()) {
+                        *b = (a * inv).round().clamp(-127.0, 127.0) * d;
+                    }
+                }
+                out
+            };
             let mut want = vec![0.0f32; rows * hidden];
             for r in 0..rows {
-                let xr = &x[r * hidden..(r + 1) * hidden];
+                let xr_raw = &x[r * hidden..(r + 1) * hidden];
+                let xr_q = if q8_active { q8_round(xr_raw) } else { xr_raw.to_vec() };
                 let assign = routing.route(&logits[r * (count + 1)..(r + 1) * (count + 1)], top_k);
                 for &(e, w) in &assign[..top_k] {
                     let gm = deq_mat(&gate, e, ff, hidden);
@@ -837,19 +851,20 @@ fn iq4_nl_q8_0_and_situ_experts_match_host() {
                     let dm = deq_mat(&down, e, hidden, ff);
                     let mut mid = vec![0.0f32; ff];
                     for j in 0..ff {
-                        let g: f32 = gm[j * hidden..(j + 1) * hidden].iter().zip(xr).map(|(a, b)| a * b).sum();
-                        let u: f32 = um[j * hidden..(j + 1) * hidden].iter().zip(xr).map(|(a, b)| a * b).sum();
+                        let g: f32 = gm[j * hidden..(j + 1) * hidden].iter().zip(&xr_q).map(|(a, b)| a * b).sum();
+                        let u: f32 = um[j * hidden..(j + 1) * hidden].iter().zip(&xr_q).map(|(a, b)| a * b).sum();
                         mid[j] = situ(g, u);
                     }
+                    let mid_q = if q8_active { q8_round(&mid) } else { mid };
                     for o in 0..hidden {
-                        let d: f32 = dm[o * ff..(o + 1) * ff].iter().zip(&mid).map(|(a, b)| a * b).sum();
+                        let d: f32 = dm[o * ff..(o + 1) * ff].iter().zip(&mid_q).map(|(a, b)| a * b).sum();
                         want[r * hidden + o] += w * d;
                     }
                 }
             }
             let e = worst(&got, &want);
             let tol = if rows >= 16 { 5e-3 } else { 5e-4 };
-            assert!(e < tol, "{dtype:?} SiTU rows={rows}: rel err {e} >= {tol}");
+            assert!(e < tol, "{dtype:?} SiTU rows={rows} (q8={q8_active}): rel err {e} >= {tol}");
         }
     }
 }

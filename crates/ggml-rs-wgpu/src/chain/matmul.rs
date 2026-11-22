@@ -100,7 +100,7 @@ impl Recorder<'_> {
 
     /// `x`'s `m` rows of `k` as int8 ([`crate::quant::shaders::QUANT_Q8`]), and where their scales start: made once for every
     /// int8 matmul that reads them until something writes `x`.
-    pub(super) fn x_q8(&mut self, x: &DeviceVec, m: usize, k: usize) -> (DeviceVec, usize) {
+    pub(crate) fn x_q8(&mut self, x: &DeviceVec, m: usize, k: usize) -> (DeviceVec, usize) {
         let (len, xs_at) = crate::quant::shaders::q8_len(m, k);
         let xb = buffer(x).clone();
         if let Some((.., xq)) = self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
@@ -138,6 +138,102 @@ impl Recorder<'_> {
         let d = self.gpu().dummy().clone();
         self.dispatch_wide("chain-rmsnorm-q8", crate::quant::shaders::NORM_Q8_LANES, [buffer(x), buffer(w), &d, &d, &d, &d, buffer(out), buffer(&xq)], &[k as u32, eps.to_bits(), xs_at as u32], ((k as u32 / 32).div_ceil(32), 1, 1));
         self.q8.push((ob, 1, k, xq));
+        true
+    }
+
+    /// Multi-stream variant of [`Self::rmsnorm_q8`]: normalizes `n_streams` rows of length `k` and
+    /// quantizes all `n_streams` rows into one cached Q8_0 buffer for [`Self::matmul_row_of_q8`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rmsnorm_q8_multi(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, n_streams: usize, k: usize, separate_w: bool, eps: f32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let need_w = if separate_w { n_streams * k } else { k };
+        if n_streams == 0
+            || k == 0
+            || k % 32 != 0
+            || x.len < n_streams * k
+            || out.len < n_streams * k
+            || w.len < need_w
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !q8_split()
+            || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0"))
+        {
+            return false;
+        }
+        let (len, xs_at) = crate::quant::shaders::q8_len(n_streams, k);
+        let ob = buffer(out).clone();
+        let xq = if self.keeps() {
+            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, n_streams, k, (len * 4) as u64)) }
+        } else {
+            self.scratch(len)
+        };
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide(
+            "chain-rmsnorm-q8-multi",
+            crate::quant::shaders::NORM_Q8_LANES_MULTI,
+            [buffer(x), buffer(w), &d, &d, &d, &d, buffer(out), buffer(&xq)],
+            &[k as u32, eps.to_bits(), xs_at as u32, u32::from(separate_w)],
+            ((k as u32 / 32).div_ceil(32), n_streams as u32, 1),
+        );
+        self.q8.push((ob, n_streams, k, xq));
+        true
+    }
+
+    /// Single-row split-Q8 matmul `y = W * x[row_idx]` reading row `row_idx` from a `rows`-row
+    /// Q8_0 activation buffer (populated by [`Self::rmsnorm_q8_multi`]).
+    pub(crate) fn matmul_row_of_q8(&mut self, w: &QuantizedTensor, x: &DeviceVec, rows: usize, row_idx: usize, y: &DeviceVec) -> bool {
+        let Some(q) = w.device_storage().and_then(|s| s.as_any().downcast_ref::<WgpuQuant>()) else {
+            return false;
+        };
+        let (n, k) = (w.shape()[0], w.shape()[1]);
+        let Some(block) = (match q.dtype {
+            ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K | ggml_quants::GgmlType::Q6_K => Some(256usize),
+            ggml_quants::GgmlType::Q4_0 | ggml_quants::GgmlType::Q8_0 | ggml_quants::GgmlType::IQ4_NL => Some(32usize),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if rows == 0
+            || row_idx >= rows
+            || k % block != 0
+            || self.alike
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !q8_split()
+            || !decode_in_int8(self.backend, w)
+        {
+            return false;
+        }
+        assert!(x.len >= rows * k && y.len >= n, "chain: matmul_row_of [{n}, {k}] row {row_idx}/{rows}");
+        let (xq, xs_at) = self.x_q8(x, rows, k);
+        let tasks_per_block = match q.dtype {
+            ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K => 8,
+            ggml_quants::GgmlType::Q6_K => 4,
+            _ => 1,
+        };
+        let warps = if (k / block) * tasks_per_block <= 128 { 4u32 } else { 8u32 };
+        let name = match (q.dtype, warps == 4) {
+            (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-decode-split",
+            (ggml_quants::GgmlType::Q4_K, false) => "chain-q8-Q4_K-decode-split",
+            (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-decode-split",
+            (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-decode-split",
+            (ggml_quants::GgmlType::IQ4_NL, false) => "chain-q8-IQ4_NL-decode-split",
+            (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-decode-split",
+            (_, false) => "chain-q8-Q6_K-decode-split",
+            (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode-split4",
+            (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode-split4",
+            (ggml_quants::GgmlType::Q5_K, true) => "chain-q8-Q5_K-decode-split4",
+            (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode-split4",
+            (ggml_quants::GgmlType::IQ4_NL, true) => "chain-q8-IQ4_NL-decode-split4",
+            (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode-split4",
+            (_, true) => "chain-q8-Q6_K-decode-split4",
+        };
+        let pipeline = self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8_split_warps(q.dtype, 4, warps, false).expect("int8 split kernel"));
+        for (chunk, row0, chunk_rows) in &q.chunks {
+            let words = [k as u32, n as u32, 1u32, *row0, *chunk_rows, q.row_bytes as u32, xs_at as u32, row_idx as u32];
+            let g = chunk_rows.div_ceil(4);
+            self.dispatch_kept(&pipeline, chunk, buffer(&xq), buffer(y), &words, (1, g.min(65535), g.div_ceil(65535)));
+        }
         true
     }
 
@@ -436,24 +532,43 @@ impl Recorder<'_> {
         let split = mr == 1 && subgroups && q8_split();
         let (pipeline, per) = match split {
             true => {
-                let name = match (q.dtype, add) {
-                    (ggml_quants::GgmlType::Q3_K, false) => "chain-q8-Q3_K-decode-split",
-                    (ggml_quants::GgmlType::Q4_K, false) => "chain-q8-Q4_K-decode-split",
-                    (ggml_quants::GgmlType::Q5_K, false) => "chain-q8-Q5_K-decode-split",
-                    (ggml_quants::GgmlType::Q4_0, false) => "chain-q8-Q4_0-decode-split",
-                    (ggml_quants::GgmlType::IQ4_NL, false) => "chain-q8-IQ4_NL-decode-split",
-                    (ggml_quants::GgmlType::Q8_0, false) => "chain-q8-Q8_0-decode-split",
-                    (_, false) => "chain-q8-Q6_K-decode-split",
-                    (ggml_quants::GgmlType::Q3_K, true) => "chain-q8-Q3_K-decode-split-add",
-                    (ggml_quants::GgmlType::Q4_K, true) => "chain-q8-Q4_K-decode-split-add",
-                    (ggml_quants::GgmlType::Q5_K, true) => "chain-q8-Q5_K-decode-split-add",
-                    (ggml_quants::GgmlType::Q4_0, true) => "chain-q8-Q4_0-decode-split-add",
-                    (ggml_quants::GgmlType::IQ4_NL, true) => "chain-q8-IQ4_NL-decode-split-add",
-                    (ggml_quants::GgmlType::Q8_0, true) => "chain-q8-Q8_0-decode-split-add",
-                    (_, true) => "chain-q8-Q6_K-decode-split-add",
+                let tasks_per_block = match q.dtype {
+                    ggml_quants::GgmlType::Q3_K | ggml_quants::GgmlType::Q4_K | ggml_quants::GgmlType::Q5_K => 8,
+                    ggml_quants::GgmlType::Q6_K => 4,
+                    _ => 1,
                 };
-                let make = if add { crate::quant::shaders::rb_kernel_q8_split_add } else { crate::quant::shaders::rb_kernel_q8_split };
-                (self.gpu().named_pipeline(name, || make(q.dtype, 4).expect("a K-quant's int8 kernel")), 4)
+                let warps = if (k / block) * tasks_per_block <= 128 { 4u32 } else { 8u32 };
+                let name = match (q.dtype, add, warps == 4) {
+                    (ggml_quants::GgmlType::Q3_K, false, false) => "chain-q8-Q3_K-decode-split",
+                    (ggml_quants::GgmlType::Q4_K, false, false) => "chain-q8-Q4_K-decode-split",
+                    (ggml_quants::GgmlType::Q5_K, false, false) => "chain-q8-Q5_K-decode-split",
+                    (ggml_quants::GgmlType::Q4_0, false, false) => "chain-q8-Q4_0-decode-split",
+                    (ggml_quants::GgmlType::IQ4_NL, false, false) => "chain-q8-IQ4_NL-decode-split",
+                    (ggml_quants::GgmlType::Q8_0, false, false) => "chain-q8-Q8_0-decode-split",
+                    (_, false, false) => "chain-q8-Q6_K-decode-split",
+                    (ggml_quants::GgmlType::Q3_K, true, false) => "chain-q8-Q3_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q4_K, true, false) => "chain-q8-Q4_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q5_K, true, false) => "chain-q8-Q5_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q4_0, true, false) => "chain-q8-Q4_0-decode-split-add",
+                    (ggml_quants::GgmlType::IQ4_NL, true, false) => "chain-q8-IQ4_NL-decode-split-add",
+                    (ggml_quants::GgmlType::Q8_0, true, false) => "chain-q8-Q8_0-decode-split-add",
+                    (_, true, false) => "chain-q8-Q6_K-decode-split-add",
+                    (ggml_quants::GgmlType::Q3_K, false, true) => "chain-q8-Q3_K-decode-split4",
+                    (ggml_quants::GgmlType::Q4_K, false, true) => "chain-q8-Q4_K-decode-split4",
+                    (ggml_quants::GgmlType::Q5_K, false, true) => "chain-q8-Q5_K-decode-split4",
+                    (ggml_quants::GgmlType::Q4_0, false, true) => "chain-q8-Q4_0-decode-split4",
+                    (ggml_quants::GgmlType::IQ4_NL, false, true) => "chain-q8-IQ4_NL-decode-split4",
+                    (ggml_quants::GgmlType::Q8_0, false, true) => "chain-q8-Q8_0-decode-split4",
+                    (_, false, true) => "chain-q8-Q6_K-decode-split4",
+                    (ggml_quants::GgmlType::Q3_K, true, true) => "chain-q8-Q3_K-decode-split4-add",
+                    (ggml_quants::GgmlType::Q4_K, true, true) => "chain-q8-Q4_K-decode-split4-add",
+                    (ggml_quants::GgmlType::Q5_K, true, true) => "chain-q8-Q5_K-decode-split4-add",
+                    (ggml_quants::GgmlType::Q4_0, true, true) => "chain-q8-Q4_0-decode-split4-add",
+                    (ggml_quants::GgmlType::IQ4_NL, true, true) => "chain-q8-IQ4_NL-decode-split4-add",
+                    (ggml_quants::GgmlType::Q8_0, true, true) => "chain-q8-Q8_0-decode-split4-add",
+                    (_, true, true) => "chain-q8-Q6_K-decode-split4-add",
+                };
+                (self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8_split_warps(q.dtype, 4, warps, add).expect("a K-quant's int8 kernel")), 4)
             }
             false => (
                 self.gpu().named_pipeline(name, || crate::quant::shaders::rb_kernel_q8(q.dtype, crate::quant::shaders::rb_rows_q8(q.dtype, mr), mr, subgroups).expect("a K-quant's int8 kernel")),

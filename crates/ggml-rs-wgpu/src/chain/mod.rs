@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ggml_rs::chain::{ChainRecorder, DeltaNet, DeviceChain, DeviceVec};
+use ggml_rs::chain::{ChainRecipe, ChainRecorder, DeltaNet, DeviceChain, DeviceVec};
 use ggml_rs::{QuantizedTensor, Tensor};
 
 use crate::{Gpu, WgpuBackend, WgpuQuant};
@@ -124,7 +124,7 @@ impl<'a> Recorder<'a> {
     /// A recording on `backend`, its bind groups kept (the crate's own measurements record kernels directly: its
     /// tests, and the timing of a step's row each way, `matmul::decode_in_int8`).
     pub(crate) fn new(backend: &'a WgpuBackend) -> Self {
-        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, joined: Vec::new(), places: Vec::new(), flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None }
+        Recorder { backend, dispatches: Vec::new(), reads: Vec::new(), keep: true, pooled: Vec::new(), spare: Vec::new(), low_rank: [None, None, None], q8: Vec::new(), x16: Vec::new(), att16: None, parts: None, exl3_tmp: None, moe_tmp: None, hold: false, held: Vec::new(), lists: Vec::new(), copied: 0, joined: Vec::new(), places: Vec::new(), flushed: None, stamps: None, stamped: None, timed: Vec::new(), weight: 0.0, alike: false, settles: Vec::new(), moe_stage: None, capture: None }
     }
 }
 
@@ -225,6 +225,14 @@ pub(crate) struct Recorder<'a> {
     /// A prompt's rows' experts copied from the host's memory for the tensor cores' kernels ([`crate::quant::moe::Cache`]):
     /// the gate and up group's and the down group's, each layer's in turn (their lengths).
     pub(crate) moe_stage: Option<([usize; 2], [DeviceVec; 2])>,
+    /// Multi-piece dispatch capture enabled by [`ChainRecorder::capture_recipe`].
+    capture: Option<Vec<Vec<Dispatch>>>,
+}
+
+/// Captured multi-piece WebGPU dispatch sequence stored inside [`ChainRecipe`].
+pub(super) struct WgpuRecipe {
+    pub(super) gpu: usize,
+    pub(super) pieces: Vec<Vec<Dispatch>>,
 }
 
 impl Recorder<'_> {
@@ -289,6 +297,11 @@ impl Recorder<'_> {
     }
 
     fn submit_piece(&mut self) {
+        if !self.dispatches.is_empty() {
+            if let Some(cap) = &mut self.capture {
+                cap.push(self.dispatches.clone());
+            }
+        }
         if !self.dispatches.is_empty() && self.fed() {
             let list = std::mem::take(&mut self.dispatches);
             self.weight = 0.0;
@@ -324,8 +337,13 @@ impl Recorder<'_> {
                 let i = self.next_stamp();
                 let timestamp_writes = self.stamp_writes(i);
                 let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
+                let mut last_pipe: Option<*const wgpu::ComputePipeline> = None;
                 for (pipeline, group, (x, y, z)) in &self.dispatches {
-                    pass.set_pipeline(pipeline);
+                    let ptr = Arc::as_ptr(pipeline);
+                    if last_pipe != Some(ptr) {
+                        pass.set_pipeline(pipeline);
+                        last_pipe = Some(ptr);
+                    }
                     pass.set_bind_group(0, group, &[]);
                     pass.dispatch_workgroups(*x, *y, *z);
                 }
@@ -592,29 +610,45 @@ impl Recorder<'_> {
             let g = rows.div_ceil(256 / lanes) as u32;
             return (pipeline, (g.min(65535), g.div_ceil(65535), 1));
         }
-        let pipeline = match (n % 4 == 0, silu) {
-            (true, false) => self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()),
-            (true, true) => self.gpu().named_pipeline("chain-rmsnorm-silu-rows4", || with_silu(RMSNORM_ROWS4.to_string())),
-            (false, _) => self.named("chain-rmsnorm-rows", RMSNORM_ROWS),
+        let use_sg = self.gpu().subgroups32();
+        let pipeline = match (n % 4 == 0, silu, use_sg) {
+            (true, false, true) => self.gpu().named_pipeline("chain-rmsnorm-rows4-sg", || RMSNORM_ROWS4_SG.to_string()),
+            (true, true, true) => self.gpu().named_pipeline("chain-rmsnorm-silu-rows4-sg", || with_silu(RMSNORM_ROWS4_SG.to_string())),
+            (true, false, false) => self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()),
+            (true, true, false) => self.gpu().named_pipeline("chain-rmsnorm-silu-rows4", || with_silu(RMSNORM_ROWS4.to_string())),
+            (false, _, _) => self.named("chain-rmsnorm-rows", RMSNORM_ROWS),
         };
         let r = rows as u32;
         (pipeline, (r.min(65535), r.div_ceil(65535), 1))
     }
 
-    /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout`), its bind group kept as `dispatch_kept`'s.
+    /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout` or `Gpu::wide_ro7_layout`), its bind group kept as
+    /// `dispatch_kept`'s. Shaders that do not reference `@binding(7)` use `wide_ro7_layout` with the read-only `dummy`
+    /// buffer at binding 7 so consecutive independent wide dispatches never serialize on a false `dummy_rw` WAW hazard.
     pub(crate) fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
+        let ro7 = !body.contains("@binding(7)");
         self.wrote(bufs[6]);
-        self.wrote(bufs[7]);
-        let pipeline = self.gpu().named_pipeline_wide(name, || body.to_string());
-        let key: WideKey = (Arc::as_ptr(&pipeline) as usize, bufs.map(|b| b.clone()), words8(words));
+        if !ro7 {
+            self.wrote(bufs[7]);
+        }
+        let dummy_ro;
+        let (pipeline, bg_layout, eff_bufs) = if ro7 {
+            dummy_ro = self.gpu().dummy().clone();
+            let mut b = bufs;
+            b[7] = &dummy_ro;
+            (self.gpu().named_pipeline_wide_ro7(name, || body.to_string()), &self.gpu().wide_ro7_layout().0, b)
+        } else {
+            (self.gpu().named_pipeline_wide(name, || body.to_string()), &self.gpu().wide_layout().0, bufs)
+        };
+        let key: WideKey = (Arc::as_ptr(&pipeline) as usize, eff_bufs.map(|b| b.clone()), words8(words));
         let kept = if self.keep { self.gpu().chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() } else { None };
         let group = match kept {
             Some(group) => group,
             None => {
                 let params = self.uniform(words);
-                let mut entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
+                let mut entries: Vec<wgpu::BindGroupEntry> = eff_bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
                 entries.push(wgpu::BindGroupEntry { binding: 8, resource: params.as_entire_binding() });
-                let group = self.gpu().device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("oaiy-chain-wide"), layout: &self.gpu().wide_layout().0, entries: &entries });
+                let group = self.gpu().device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("oaiy-chain-wide"), layout: bg_layout, entries: &entries });
                 if self.keep {
                     let mut groups = self.gpu().chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner());
                     if groups.len() >= KEEP_GROUPS {

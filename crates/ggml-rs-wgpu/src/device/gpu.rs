@@ -645,8 +645,40 @@ impl Gpu {
         source
     }
 
+    /// Variant of [`Self::wide_layout`] where binding 7 is read-only (only binding 6 is read-write):
+    /// eliminates false WAW barriers on `dummy_rw` between independent wide dispatches.
+    pub(crate) fn wide_ro7_layout(&self) -> &(wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+        self.wide_ro7.get_or_init(|| {
+            let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            };
+            let mut entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8).map(|b| storage(b, b != 6)).collect();
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            });
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("oaiy-chain-wide-ro7"), entries: &entries });
+            let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("oaiy-chain-wide-ro7"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            (layout, pipeline_layout)
+        })
+    }
+
     pub(crate) fn named_pipeline_wide(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
         let layout = &self.wide_layout().1;
+        self.named_pipeline_in(name, layout, source)
+    }
+
+    pub(crate) fn named_pipeline_wide_ro7(&self, name: &'static str, source: impl FnOnce() -> String) -> Arc<wgpu::ComputePipeline> {
+        let layout = &self.wide_ro7_layout().1;
         self.named_pipeline_in(name, layout, source)
     }
 

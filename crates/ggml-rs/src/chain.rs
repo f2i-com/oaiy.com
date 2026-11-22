@@ -57,6 +57,19 @@ impl std::fmt::Debug for DeviceVec {
     }
 }
 
+/// An opaque captured sequence of dispatches from a kept [`ChainRecorder`] pass, replayable
+/// on subsequent identical-shape steps without bind-group lookups or CPU recording overhead.
+#[derive(Clone)]
+pub struct ChainRecipe {
+    pub inner: Arc<dyn Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for ChainRecipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChainRecipe")
+    }
+}
+
 /// The shape of a gated delta net's recurrence over a run of tokens ([`ChainRecorder::delta_net`]).
 #[derive(Clone, Copy, Debug)]
 pub struct DeltaNet {
@@ -1054,6 +1067,50 @@ pub trait ChainRecorder {
     #[allow(clippy::too_many_arguments)]
     fn moe_routed_post_conv_add(&mut self, experts: &dyn crate::exl3::Experts, x: &DeviceVec, logits: &DeviceVec, conv_w: &DeviceVec, residual: &DeviceVec, conv_state: &DeviceVec, out: &DeviceVec, top_k: usize, kernel: usize) -> bool {
         let _ = (experts, x, logits, conv_w, residual, conv_state, out, top_k, kernel);
+        false
+    }
+    /// Multi-stream single-row RMSNorm + Q8_0 quantization: normalizes `n_streams` consecutive rows
+    /// of length `k` from `x` into `out` and caches their `n_streams` quantized Q8_0 rows for
+    /// [`Self::matmul_row_of`]. `separate_w = false` shares `w[0..k]`; `true` uses `w[s*k..(s+1)*k]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rmsnorm_multi_q8(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, n_streams: usize, k: usize, separate_w: bool, eps: f32) -> bool {
+        let _ = (x, w, out, n_streams, k, separate_w, eps);
+        false
+    }
+    /// Single-row quantized matmul `y = W * x[row_idx]` reading row `row_idx` of a `rows`-row
+    /// matrix `x` (sharing Q8_0 cache populated by [`Self::rmsnorm_multi_q8`]).
+    fn matmul_row_of(&mut self, w: &QuantizedTensor, x: &DeviceVec, rows: usize, row_idx: usize, y: &DeviceVec) -> bool {
+        let _ = (w, x, rows, row_idx, y);
+        false
+    }
+    /// Batched `n_streams` variant of [`Self::inkling2_ctrl_cat_down`]: `w_down_f16` holds
+    /// `n_streams` stacked `[gate_rank, 2 * hidden]` F16 matrices; stream `s` reads
+    /// `cur[cur_off + s * cur_stride..]` and `msg[msg_off + s * hidden..]` into `mid_out[s * gate_rank..]`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_ctrl_cat_down_multi(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
+        let _ = (w_down_f16, cur, cur_off, cur_stride, msg, msg_off, mid_out, hidden, gate_rank, n_streams);
+        unimplemented!("inkling2_ctrl_cat_down_multi on this device")
+    }
+    /// Batched `n_streams` variant of [`Self::inkling2_ctrl_up_blend`]: `w_gf_f16` holds
+    /// `n_streams` stacked `[2 * hidden, gate_rank]` F16 matrices; stream `s` reads `mid[s * gate_rank..]`,
+    /// `cur[cur_off + s * cur_stride..]`, `msg[msg_off + s * hidden..]` into `out[s * hidden..]`.
+    #[allow(clippy::too_many_arguments)]
+    fn inkling2_ctrl_up_blend_multi(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
+        let _ = (w_gf_f16, mid, cur, cur_off, cur_stride, msg, msg_off, out, hidden, gate_rank, n_streams);
+        unimplemented!("inkling2_ctrl_up_blend_multi on this device")
+    }
+    /// Begin capturing submitted dispatch pieces so [`Self::take_recipe`] can return a replayable
+    /// [`ChainRecipe`] right before [`Self::finish`].
+    fn capture_recipe(&mut self) {}
+    /// Return a replayable [`ChainRecipe`] captured since [`Self::capture_recipe`], or `None` if
+    /// the recording used transient scratch, profiling, or is not supported on this backend.
+    fn take_recipe(&mut self) -> Option<ChainRecipe> {
+        None
+    }
+    /// Replay a previously captured [`ChainRecipe`] in place of recording its ops. Returns `true`
+    /// if replayed on this backend.
+    fn replay_recipe(&mut self, recipe: &ChainRecipe) -> bool {
+        let _ = recipe;
         false
     }
     /// Read `v` back once the chain has run.

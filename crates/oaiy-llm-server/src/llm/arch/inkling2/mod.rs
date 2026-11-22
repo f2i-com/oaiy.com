@@ -353,6 +353,8 @@ pub(crate) enum AttnNormsDev {
         q: DeviceVec,
         k: DeviceVec,
         v: DeviceVec,
+        /// Stacked `[q, k, v]` (`[3 * hidden]`) for single-dispatch `rmsnorm_multi_q8`.
+        qkv: DeviceVec,
     },
 }
 
@@ -426,11 +428,14 @@ pub struct Inkling2LoopLayer {
     pub(crate) ctrl_down: [Weight; 4],
     pub(crate) ctrl_gain: [Weight; 4],
     pub(crate) ctrl_forget: [Weight; 4],
-    /// Optional F16 `[gate_rank, 2 * hidden]` per controller for single-dispatch `inkling2_ctrl_cat_down`.
-    pub(crate) ctrl_down_f16: Option<[DeviceVec; 4]>,
-    /// Optional stacked F16 `[2 * hidden, gate_rank]` (`gain` then `forget`) per controller for
-    /// single-dispatch `inkling2_ctrl_up_blend` / `inkling2_ctrl_up_blend_norm`.
-    pub(crate) ctrl_gf_f16: Option<[DeviceVec; 4]>,
+    /// Optional stacked Q+K+V F16 `[3 * gate_rank, 2 * hidden]` for single-dispatch `inkling2_ctrl_cat_down_multi`.
+    pub(crate) ctrl_down_qkv_f16: Option<DeviceVec>,
+    /// Optional FFN F16 `[gate_rank, 2 * hidden]` for single-dispatch `inkling2_ctrl_cat_down`.
+    pub(crate) ctrl_down_ffn_f16: Option<DeviceVec>,
+    /// Optional stacked Q+K+V F16 `[3 * 2 * hidden, gate_rank]` for single-dispatch `inkling2_ctrl_up_blend_multi`.
+    pub(crate) ctrl_gf_qkv_f16: Option<DeviceVec>,
+    /// Optional FFN F16 `[2 * hidden, gate_rank]` for single-dispatch `inkling2_ctrl_up_blend`.
+    pub(crate) ctrl_gf_ffn_f16: Option<DeviceVec>,
 }
 
 #[derive(Debug)]
@@ -643,11 +648,18 @@ impl Inkling2Model {
                 };
                 let an_dev = match &attn_norms {
                     AttnNorms::Shared(w) => AttnNormsDev::Shared(up_vec(w)),
-                    AttnNorms::Separate { q, k, v } => AttnNormsDev::Separate {
-                        q: up_vec(q),
-                        k: up_vec(k),
-                        v: up_vec(v),
-                    },
+                    AttnNorms::Separate { q, k, v } => {
+                        let mut stacked = Vec::with_capacity(q.len() + k.len() + v.len());
+                        stacked.extend_from_slice(q);
+                        stacked.extend_from_slice(k);
+                        stacked.extend_from_slice(v);
+                        AttnNormsDev::Separate {
+                            q: up_vec(q),
+                            k: up_vec(k),
+                            v: up_vec(v),
+                            qkv: up_vec(&stacked),
+                        }
+                    }
                 };
                 let mut attn_consts_host =
                     Vec::with_capacity(attn_rel_bias.len() + attn_q_clip.len() + attn_rel_clip.len());
@@ -753,24 +765,31 @@ impl Inkling2Model {
                 let mut ctrl_down = Vec::with_capacity(4);
                 let mut ctrl_gain = Vec::with_capacity(4);
                 let mut ctrl_forget = Vec::with_capacity(4);
-                let mut ctrl_down_vec: Vec<DeviceVec> = Vec::with_capacity(4);
-                let mut ctrl_gf_vec: Vec<DeviceVec> = Vec::with_capacity(4);
-                for name in ctrl_names {
+                let mut d_qkv_host: Vec<f32> = Vec::new();
+                let mut gf_qkv_host: Vec<f32> = Vec::new();
+                let mut ctrl_down_ffn_f16: Option<DeviceVec> = None;
+                let mut ctrl_gf_ffn_f16: Option<DeviceVec> = None;
+                for (ci, name) in ctrl_names.into_iter().enumerate() {
                     let d_raw = load_vec(&format!("blk.{ip}.loop_{name}_ctrl_down.weight"))?;
                     let g_raw = load_vec(&format!("blk.{ip}.loop_{name}_ctrl_gain.weight"))?;
                     let f_raw = load_vec(&format!("blk.{ip}.loop_{name}_ctrl_forget.weight"))?;
                     if let Some(chain) = backend.chain() {
                         if cfg.hidden % 2 == 0 {
-                            if let Some(df) = chain.vec_f16_rounded(&d_raw) {
-                                ctrl_down_vec.push(df);
+                            if ci < 3 {
+                                d_qkv_host.extend_from_slice(&d_raw);
+                            } else {
+                                ctrl_down_ffn_f16 = chain.vec_f16_rounded(&d_raw);
                             }
                         }
                         if lc.gate_rank % 2 == 0 && lc.gate_rank <= 256 {
-                            let mut both = Vec::with_capacity(g_raw.len() + f_raw.len());
-                            both.extend_from_slice(&g_raw);
-                            both.extend_from_slice(&f_raw);
-                            if let Some(gf) = chain.vec_f16_rounded(&both) {
-                                ctrl_gf_vec.push(gf);
+                            if ci < 3 {
+                                gf_qkv_host.extend_from_slice(&g_raw);
+                                gf_qkv_host.extend_from_slice(&f_raw);
+                            } else {
+                                let mut both = Vec::with_capacity(g_raw.len() + f_raw.len());
+                                both.extend_from_slice(&g_raw);
+                                both.extend_from_slice(&f_raw);
+                                ctrl_gf_ffn_f16 = chain.vec_f16_rounded(&both);
                             }
                         }
                     }
@@ -778,16 +797,24 @@ impl Inkling2Model {
                     ctrl_gain.push(load_ctrl_w(&format!("blk.{ip}.loop_{name}_ctrl_gain.weight"))?);
                     ctrl_forget.push(load_ctrl_w(&format!("blk.{ip}.loop_{name}_ctrl_forget.weight"))?);
                 }
-                let ctrl_down_f16: Option<[DeviceVec; 4]> = ctrl_down_vec.try_into().ok();
-                let ctrl_gf_f16: Option<[DeviceVec; 4]> = ctrl_gf_vec.try_into().ok();
+                let ctrl_down_qkv_f16 = backend
+                    .chain()
+                    .filter(|_| !d_qkv_host.is_empty())
+                    .and_then(|c| c.vec_f16_rounded(&d_qkv_host));
+                let ctrl_gf_qkv_f16 = backend
+                    .chain()
+                    .filter(|_| !gf_qkv_host.is_empty())
+                    .and_then(|c| c.vec_f16_rounded(&gf_qkv_host));
                 loop_layers.push(Inkling2LoopLayer {
                     msg_query,
                     msg_query_dev,
                     ctrl_down: ctrl_down.try_into().expect("4 controllers"),
                     ctrl_gain: ctrl_gain.try_into().expect("4 controllers"),
                     ctrl_forget: ctrl_forget.try_into().expect("4 controllers"),
-                    ctrl_down_f16,
-                    ctrl_gf_f16,
+                    ctrl_down_qkv_f16,
+                    ctrl_down_ffn_f16,
+                    ctrl_gf_qkv_f16,
+                    ctrl_gf_ffn_f16,
                 });
             }
         }
@@ -874,8 +901,9 @@ impl Inkling2Model {
                 })
                 && loop_layers.iter().all(|ll| {
                     ll.msg_query_dev.is_some()
-                        && (ll.ctrl_down_f16.is_some() || ll.ctrl_down.iter().all(&on_dev))
-                        && (ll.ctrl_gf_f16.is_some()
+                        && ((ll.ctrl_down_qkv_f16.is_some() && ll.ctrl_down_ffn_f16.is_some())
+                            || ll.ctrl_down.iter().all(&on_dev))
+                        && ((ll.ctrl_gf_qkv_f16.is_some() && ll.ctrl_gf_ffn_f16.is_some())
                             || (ll.ctrl_gain.iter().all(&on_dev)
                                 && ll.ctrl_forget.iter().all(&on_dev)))
                 })
@@ -1148,8 +1176,10 @@ mod tests {
                     det_w(hidden, gate_rank, s + 11, 0.15),
                     det_w(hidden, gate_rank, s + 12, 0.15),
                 ],
-                ctrl_down_f16: None,
-                ctrl_gf_f16: None,
+                ctrl_down_qkv_f16: None,
+                ctrl_down_ffn_f16: None,
+                ctrl_gf_qkv_f16: None,
+                ctrl_gf_ffn_f16: None,
             });
         }
 

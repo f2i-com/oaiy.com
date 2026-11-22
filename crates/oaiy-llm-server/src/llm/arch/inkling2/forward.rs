@@ -15,7 +15,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use ggml_rs::chain::{ChainRecorder, DeviceChain, DeviceVec};
+use ggml_rs::chain::{ChainRecipe, ChainRecorder, DeviceChain, DeviceVec};
 use ggml_rs::Tensor;
 use rayon::prelude::*;
 
@@ -65,6 +65,7 @@ pub(crate) struct GpuSlotState {
 pub(crate) struct GpuDecodeState {
     pub(crate) synced: bool,
     pub(crate) host_dirty: bool,
+    pub(crate) recipe: Option<ChainRecipe>,
     pub(crate) slots: Vec<GpuSlotState>,
     pub(crate) step_params: DeviceVec,
     pub(crate) cur: DeviceVec,
@@ -74,6 +75,9 @@ pub(crate) struct GpuDecodeState {
     pub(crate) bank_out: DeviceVec,
     pub(crate) msgs: DeviceVec,
     pub(crate) mix_out: DeviceVec,
+    pub(crate) mid_qkv: DeviceVec,
+    pub(crate) ctrl_qkv: DeviceVec,
+    pub(crate) norm_qkv: DeviceVec,
     pub(crate) ffn_inp: DeviceVec,
     pub(crate) ffn_x: DeviceVec,
     pub(crate) attn_gated: DeviceVec,
@@ -105,6 +109,7 @@ impl GpuScratch {
         if let Some(ds) = self.decode_state.as_mut() {
             ds.synced = false;
             ds.host_dirty = false;
+            ds.recipe = None;
         }
     }
 
@@ -822,6 +827,7 @@ impl Inkling2Model {
             }
             ds.synced = false;
             ds.host_dirty = false;
+            ds.recipe = None;
         }
 
         // `blocks` stores block residuals ALREADY normalized with unweighted RMSNorm (eps = 1e-6),
@@ -975,9 +981,11 @@ impl Inkling2Model {
                 ffn_post_conv: chain.vec((past_conv * hidden).max(1)),
             });
         }
+        let gate_rank = self.cfg.loop_cfg.as_ref().map_or(1, |l| l.gate_rank);
         GpuDecodeState {
             synced: false,
             host_dirty: false,
+            recipe: None,
             slots,
             step_params: chain.vec(4),
             cur: chain.vec(hidden),
@@ -987,6 +995,9 @@ impl Inkling2Model {
             bank_out: chain.vec(hidden),
             msgs: chain.vec(4 * hidden),
             mix_out: chain.vec(3 * hidden),
+            mid_qkv: chain.vec(3 * gate_rank),
+            ctrl_qkv: chain.vec(3 * hidden),
+            norm_qkv: chain.vec(3 * hidden),
             ffn_inp: chain.vec(hidden),
             ffn_x: chain.vec(hidden),
             attn_gated: chain.vec(max_q_dim),
@@ -1039,6 +1050,7 @@ impl Inkling2Model {
         }
         ds.synced = true;
         ds.host_dirty = false;
+        ds.recipe = None;
     }
 
     fn sync_gpu_to_host(&self, chain: &dyn DeviceChain, state: &mut Inkling2State, ds: &GpuDecodeState) {
@@ -1155,35 +1167,97 @@ impl Inkling2Model {
             }
         }
 
-        // 2. Optional Q/K/V cross-pass controllers + attention pre-norms (with fused `rmsnorm_q8`).
+        // 2. Optional Q/K/V cross-pass controllers + attention pre-norms (batched 3-stream Q/K/V
+        //    on quantized attention weights: 3 dispatches instead of 9, or 1 instead of 5 for Separate!).
         let has_ctrl = has_msgs && loop_layer.is_some();
         let shared_x = matches!(norms_dev, AttnNormsDev::Shared(_)) && !has_ctrl;
         let (k_idx, v_idx) = if shared_x { (0usize, 0usize) } else { (1usize, 2usize) };
 
+        let is_q8_split_w = |w: &Weight| -> bool {
+            matches!(
+                w,
+                Weight::Quant(q)
+                    if matches!(
+                        q.dtype(),
+                        ggml_quants::GgmlType::Q8_0
+                            | ggml_quants::GgmlType::Q4_0
+                            | ggml_quants::GgmlType::IQ4_NL
+                            | ggml_quants::GgmlType::Q4_K
+                            | ggml_quants::GgmlType::Q5_K
+                            | ggml_quants::GgmlType::Q6_K
+                            | ggml_quants::GgmlType::Q3_K
+                    )
+            )
+        };
+        let q_stream_q8 = if let Some(ref wqrsg) = layer.wqrsg {
+            is_q8_split_w(wqrsg)
+        } else {
+            is_q8_split_w(&layer.wq)
+                && is_q8_split_w(&layer.attn_rel)
+                && is_q8_split_w(&layer.attn_sink_proj)
+                && is_q8_split_w(&layer.attn_gate)
+        };
+        let kv_stream_q8 = if let (Some(ref wkd), Some(ref wvd)) = (&layer.wk_dyn, &layer.wv_dyn) {
+            is_q8_split_w(wkd) && is_q8_split_w(wvd)
+        } else {
+            is_q8_split_w(&layer.wk)
+                && is_q8_split_w(&layer.wv)
+                && layer.attn_k_conv_proj.as_ref().is_none_or(&is_q8_split_w)
+                && layer.attn_v_conv_proj.as_ref().is_none_or(&is_q8_split_w)
+        };
+        let all_qkv_q8 = q_stream_q8 && kv_stream_q8;
+
+        let mut use_norm_qkv = false;
         if let (true, Some(ll)) = (has_msgs, loop_layer) {
-            let norm_ws: [&DeviceVec; 3] = match norms_dev {
-                AttnNormsDev::Shared(w) => [w, w, w],
-                AttnNormsDev::Separate { q, k, v } => [q, k, v],
+            let (norm_w_multi, sep_w) = match norms_dev {
+                AttnNormsDev::Shared(w) => (w, false),
+                AttnNormsDev::Separate { qkv, .. } => (qkv, true),
             };
-            for i in 0..3 {
-                let cur_off = if is_swa { 0 } else { i * hidden };
-                let msg_off = i * hidden;
-                if let Some(ref df) = ll.ctrl_down_f16 {
-                    rec.inkling2_ctrl_cat_down(&df[i], &ds.mix_out, cur_off, &ds.msgs, msg_off, &mid_bufs[i], hidden, gate_rank);
+            if let (Some(dqkv), Some(gfqkv)) = (&ll.ctrl_down_qkv_f16, &ll.ctrl_gf_qkv_f16) {
+                let cur_stride = if is_swa { 0 } else { hidden };
+                rec.inkling2_ctrl_cat_down_multi(dqkv, &ds.mix_out, 0, cur_stride, &ds.msgs, 0, &ds.mid_qkv, hidden, gate_rank, 3);
+                rec.inkling2_ctrl_up_blend_multi(gfqkv, &ds.mid_qkv, &ds.mix_out, 0, cur_stride, &ds.msgs, 0, &ds.ctrl_qkv, hidden, gate_rank, 3);
+                if all_qkv_q8
+                    && rec.rmsnorm_multi_q8(&ds.ctrl_qkv, norm_w_multi, &ds.norm_qkv, 3, hidden, sep_w, self.cfg.rms_eps)
+                {
+                    use_norm_qkv = true;
                 } else {
+                    let norm_ws: [&DeviceVec; 3] = match norms_dev {
+                        AttnNormsDev::Shared(w) => [w, w, w],
+                        AttnNormsDev::Separate { q, k, v, .. } => [q, k, v],
+                    };
+                    for i in 0..3 {
+                        rec.copy(&ds.ctrl_qkv, i * hidden, &ctrl_out[i], 0, hidden);
+                    }
+                    for i in 0..3 {
+                        let in_v = GpuScratch::view(&ctrl_out[i], hidden);
+                        let out_v = GpuScratch::view(&norm_bufs[i], hidden);
+                        rec.rmsnorm(&in_v, norm_ws[i], &out_v, self.cfg.rms_eps);
+                    }
+                }
+            } else {
+                let norm_ws: [&DeviceVec; 3] = match norms_dev {
+                    AttnNormsDev::Shared(w) => [w, w, w],
+                    AttnNormsDev::Separate { q, k, v, .. } => [q, k, v],
+                };
+                for i in 0..3 {
+                    let cur_off = if is_swa { 0 } else { i * hidden };
+                    let msg_off = i * hidden;
                     rec.inkling2_control_cat(&ds.mix_out, cur_off, &ds.msgs, msg_off, &x_bufs[i], hidden);
                     record_weight(rec, &ll.ctrl_down[i], &x_bufs[i], &mid_bufs[i], 1);
                 }
-                if let Some(ref gf) = ll.ctrl_gf_f16 {
-                    rec.inkling2_ctrl_up_blend(&gf[i], &mid_bufs[i], &ds.mix_out, cur_off, &ds.msgs, msg_off, &ctrl_out[i], hidden, gate_rank);
-                } else {
+                for i in 0..3 {
+                    let cur_off = if is_swa { 0 } else { i * hidden };
+                    let msg_off = i * hidden;
                     record_weight(rec, &ll.ctrl_gain[i], &mid_bufs[i], &ctrl_gain[i], 1);
                     record_weight(rec, &ll.ctrl_forget[i], &mid_bufs[i], &ctrl_forget[i], 1);
                     rec.control_blend_at(&ds.mix_out, cur_off, &ds.msgs, msg_off, &ctrl_gain[i], &ctrl_forget[i], &ctrl_out[i], hidden);
                 }
-                let in_v = GpuScratch::view(&ctrl_out[i], hidden);
-                let out_v = GpuScratch::view(&norm_bufs[i], hidden);
-                rec.rmsnorm(&in_v, norm_ws[i], &out_v, self.cfg.rms_eps);
+                for i in 0..3 {
+                    let in_v = GpuScratch::view(&ctrl_out[i], hidden);
+                    let out_v = GpuScratch::view(&norm_bufs[i], hidden);
+                    rec.rmsnorm(&in_v, norm_ws[i], &out_v, self.cfg.rms_eps);
+                }
             }
         } else {
             match norms_dev {
@@ -1192,15 +1266,22 @@ impl Inkling2Model {
                     let out_v = GpuScratch::view(&norm_bufs[0], hidden);
                     rec.rmsnorm(&in_v, w, &out_v, self.cfg.rms_eps);
                 }
-                AttnNormsDev::Separate { q, k, v } => {
-                    let in0 = GpuScratch::view(&ds.mix_out, hidden);
-                    let out0 = GpuScratch::view(&norm_bufs[0], hidden);
-                    rec.rmsnorm(&in0, q, &out0, self.cfg.rms_eps);
-                    for (i, nw) in [(1usize, k), (2usize, v)] {
-                        rec.copy(&ds.mix_out, i * hidden, &ctrl_out[i], 0, hidden);
-                        let in_v = GpuScratch::view(&ctrl_out[i], hidden);
-                        let out_v = GpuScratch::view(&norm_bufs[i], hidden);
-                        rec.rmsnorm(&in_v, nw, &out_v, self.cfg.rms_eps);
+                AttnNormsDev::Separate { q, k, v, qkv } => {
+                    if all_qkv_q8
+                        && rec.rmsnorm_multi_q8(&ds.mix_out, qkv, &ds.norm_qkv, 3, hidden, true, self.cfg.rms_eps)
+                    {
+                        use_norm_qkv = true;
+                    } else {
+                        rec.copy(&ds.mix_out, hidden, &ctrl_out[1], 0, hidden);
+                        rec.copy(&ds.mix_out, 2 * hidden, &ctrl_out[2], 0, hidden);
+                        let in0 = GpuScratch::view(&ds.mix_out, hidden);
+                        let out0 = GpuScratch::view(&norm_bufs[0], hidden);
+                        rec.rmsnorm(&in0, q, &out0, self.cfg.rms_eps);
+                        for (i, nw) in [(1usize, k), (2usize, v)] {
+                            let in_v = GpuScratch::view(&ctrl_out[i], hidden);
+                            let out_v = GpuScratch::view(&norm_bufs[i], hidden);
+                            rec.rmsnorm(&in_v, nw, &out_v, self.cfg.rms_eps);
+                        }
                     }
                 }
             }
@@ -1208,34 +1289,42 @@ impl Inkling2Model {
 
         // 3. Attention projections: stacked Q-stream (`wqrsg`) + K-stream (`wk_dyn`) + V-stream (`wv_dyn`)
         //    so 6..8 separate Q8_0 matmuls collapse to 3 parallel dispatches per layer.
-        let n0 = GpuScratch::view(&norm_bufs[0], hidden);
-        let nk = GpuScratch::view(&norm_bufs[k_idx], hidden);
-        let nv = GpuScratch::view(&norm_bufs[v_idx], hidden);
+        let rec_attn_w = |rec: &mut dyn ChainRecorder, w: &Weight, stream_idx: usize, out: &DeviceVec| {
+            if use_norm_qkv {
+                if let Weight::Quant(qt) = w {
+                    let ok = rec.matmul_row_of(qt, &ds.norm_qkv, 3, stream_idx, out);
+                    debug_assert!(ok, "matmul_row_of must succeed when rmsnorm_multi_q8 succeeded");
+                    return;
+                }
+            }
+            let x_v = GpuScratch::view(&norm_bufs[stream_idx], hidden);
+            record_weight(rec, w, &x_v, out, 1);
+        };
         let packed_qrsg = if let Some(ref wqrsg) = layer.wqrsg {
-            record_weight(rec, wqrsg, &n0, &y_bufs[0], 1);
+            rec_attn_w(rec, wqrsg, 0, &y_bufs[0]);
             true
         } else {
-            record_weight(rec, &layer.wq, &n0, &y_bufs[0], 1);
-            record_weight(rec, &layer.attn_rel, &n0, &y_bufs[3], 1);
-            record_weight(rec, &layer.attn_sink_proj, &n0, &y_bufs[4], 1);
-            record_weight(rec, &layer.attn_gate, &n0, &y_bufs[5], 1);
+            rec_attn_w(rec, &layer.wq, 0, &y_bufs[0]);
+            rec_attn_w(rec, &layer.attn_rel, 0, &y_bufs[3]);
+            rec_attn_w(rec, &layer.attn_sink_proj, 0, &y_bufs[4]);
+            rec_attn_w(rec, &layer.attn_gate, 0, &y_bufs[5]);
             false
         };
         let (packed_dyn, dyn_k_v, dyn_v_v) = if let (Some(ref wkd), Some(ref wvd)) = (&layer.wk_dyn, &layer.wv_dyn) {
-            record_weight(rec, wkd, &nk, &y_bufs[1], 1);
-            record_weight(rec, wvd, &nv, &y_bufs[2], 1);
+            rec_attn_w(rec, wkd, k_idx, &y_bufs[1]);
+            rec_attn_w(rec, wvd, v_idx, &y_bufs[2]);
             (true, None, None)
         } else {
-            record_weight(rec, &layer.wk, &nk, &y_bufs[1], 1);
-            record_weight(rec, &layer.wv, &nv, &y_bufs[2], 1);
+            rec_attn_w(rec, &layer.wk, k_idx, &y_bufs[1]);
+            rec_attn_w(rec, &layer.wv, v_idx, &y_bufs[2]);
             let dk = if let Some(ref kp) = layer.attn_k_conv_proj {
-                record_weight(rec, kp, &nk, &y_bufs[6], 1);
+                rec_attn_w(rec, kp, k_idx, &y_bufs[6]);
                 Some(&y_bufs[6])
             } else {
                 None
             };
             let dv = if let Some(ref vp) = layer.attn_v_conv_proj {
-                record_weight(rec, vp, &nv, &y_bufs[7], 1);
+                rec_attn_w(rec, vp, v_idx, &y_bufs[7]);
                 Some(&y_bufs[7])
             } else {
                 None
@@ -1317,24 +1406,26 @@ impl Inkling2Model {
         rec.inkling2_mix_depth(&ds.blocks, &ds.ffn_inp, &dev.ffn_res_query, &ds.ffn_x, *n_blocks, 1, hidden, false);
         let norm_v = GpuScratch::view(&norm_bufs[0], hidden);
         if let (true, Some(ll)) = (has_msgs, loop_layer) {
-            if let Some(ref df) = ll.ctrl_down_f16 {
-                rec.inkling2_ctrl_cat_down(&df[3], &ds.ffn_x, 0, &ds.msgs, 3 * hidden, &mid_bufs[0], hidden, gate_rank);
+            if let Some(ref df) = ll.ctrl_down_ffn_f16 {
+                rec.inkling2_ctrl_cat_down(df, &ds.ffn_x, 0, &ds.msgs, 3 * hidden, &mid_bufs[0], hidden, gate_rank);
             } else {
                 rec.inkling2_control_cat(&ds.ffn_x, 0, &ds.msgs, 3 * hidden, &x_bufs[0], hidden);
                 record_weight(rec, &ll.ctrl_down[3], &x_bufs[0], &mid_bufs[0], 1);
             }
-            if let Some(ref gf) = ll.ctrl_gf_f16 {
-                rec.inkling2_ctrl_up_blend(&gf[3], &mid_bufs[0], &ds.ffn_x, 0, &ds.msgs, 3 * hidden, &ctrl_out[0], hidden, gate_rank);
+            if let Some(ref gf) = ll.ctrl_gf_ffn_f16 {
+                rec.inkling2_ctrl_up_blend(gf, &mid_bufs[0], &ds.ffn_x, 0, &ds.msgs, 3 * hidden, &ctrl_out[0], hidden, gate_rank);
             } else {
                 record_weight(rec, &ll.ctrl_gain[3], &mid_bufs[0], &ctrl_gain[0], 1);
                 record_weight(rec, &ll.ctrl_forget[3], &mid_bufs[0], &ctrl_forget[0], 1);
                 rec.control_blend_at(&ds.ffn_x, 0, &ds.msgs, 3 * hidden, &ctrl_gain[0], &ctrl_forget[0], &ctrl_out[0], hidden);
             }
             let in_v = GpuScratch::view(&ctrl_out[0], hidden);
-            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, 1, self.cfg.rms_eps);
+            // `rec.rmsnorm` runs `rmsnorm_q8`, producing BOTH exact-F32 `norm_v` (for router) and
+            // cached Q8_0 activations (for `QuantMoe::gu`) in 1 dispatch!
+            rec.rmsnorm(&in_v, ffn_norm_dev, &norm_v, self.cfg.rms_eps);
         } else {
             let in_v = GpuScratch::view(&ds.ffn_x, hidden);
-            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, 1, self.cfg.rms_eps);
+            rec.rmsnorm(&in_v, ffn_norm_dev, &norm_v, self.cfg.rms_eps);
         }
         let router_v = GpuScratch::view(router_buf, n_exp + 1);
         rec.matmul_f32_rows(router_dev, n_exp + 1, hidden, &norm_v, &router_v, 1);
@@ -1419,6 +1510,7 @@ impl Inkling2Model {
             self.sync_host_to_gpu(chain, state, ds);
         } else {
             // Dynamically double full-attention packed `[2, kv_cap, kv_dim]` KV cache if context crosses capacity.
+            let mut grew_kv = false;
             for g_slot in &mut ds.slots {
                 if !g_slot.is_swa && past_len >= g_slot.kv_cap {
                     let old_cap = g_slot.kv_cap;
@@ -1432,7 +1524,11 @@ impl Inkling2Model {
                     let _ = grow.finish();
                     g_slot.kv_cache = new_kv;
                     g_slot.kv_cap = new_cap;
+                    grew_kv = true;
                 }
+            }
+            if grew_kv {
+                ds.recipe = None;
             }
         }
 
@@ -1442,89 +1538,95 @@ impl Inkling2Model {
 
         let ds = scratch.decode_state.as_ref().expect("decode_state");
         let router_buf = scratch.router();
+        let unpadded = self.cfg.vocab_size_unpadded;
         let mut rec = chain.begin();
         rec.keep_groups(true);
 
-        let mut n_blocks = 0usize;
-        let n_phys = self.cfg.n_phys_layers;
+        let replayed = ds.recipe.as_ref().is_some_and(|r| rec.replay_recipe(r));
+        let mut captured_recipe: Option<ChainRecipe> = None;
+        if !replayed {
+            rec.capture_recipe();
+            let mut n_blocks = 0usize;
+            let n_phys = self.cfg.n_phys_layers;
 
-        if let Some(lc) = &self.cfg.loop_cfg {
-            for il in 0..lc.core_start {
-                self.record_decode_layer_gpu(
-                    &mut *rec, il, il, &mut n_blocks, false, None, ds,
-                    &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
-                    &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
-                );
-            }
-            rec.copy(&ds.cur, 0, &ds.prelude_cur, 0, hidden);
-            let prelude_n_blocks = n_blocks;
-            let core_len = lc.core_end - lc.core_start;
-
-            for pass in 0..lc.num_passes {
-                let mut n_bank = 0usize;
-                if pass > 0 {
-                    let skip = (prelude_n_blocks + 1).min(n_blocks);
-                    n_bank = n_blocks - skip;
-                    if n_bank > 0 {
-                        rec.copy(&ds.blocks, skip * hidden, &ds.bank, 0, n_bank * hidden);
-                    }
-                    // Write `rms_norm_no_weight(ds.cur)` into `ds.bank_out[0..hidden]`.
-                    rec.inkling2_block_push(&ds.cur, &ds.attn_conv, &ds.bank_out, &ds.ffn_inp, hidden, Some(0), true);
-                    rec.copy(&ds.prelude_cur, 0, &ds.cur, 0, hidden);
-                    n_blocks = prelude_n_blocks;
+            if let Some(lc) = &self.cfg.loop_cfg {
+                for il in 0..lc.core_start {
+                    self.record_decode_layer_gpu(
+                        &mut *rec, il, il, &mut n_blocks, false, None, ds,
+                        &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
+                        &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
+                    );
                 }
-                for ip in lc.core_start..lc.core_end {
-                    let il = if pass == 0 {
-                        ip
-                    } else {
-                        n_phys + (pass - 1) * core_len + (ip - lc.core_start)
-                    };
-                    if pass == 0 {
-                        self.record_decode_layer_gpu(
-                            &mut *rec, il, ip, &mut n_blocks, false, None, ds,
-                            &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
-                            &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
-                        );
-                    } else {
-                        let ll = &self.loop_layers[ip - lc.core_start];
-                        let mq_dev = ll.msg_query_dev.as_ref().expect("msg_query_dev");
-                        rec.inkling2_mix_depth(&ds.bank, &ds.bank_out, mq_dev, &ds.msgs, n_bank, 4, hidden, true);
-                        self.record_decode_layer_gpu(
-                            &mut *rec, il, ip, &mut n_blocks, true, Some(ll), ds,
-                            &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
-                            &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
-                        );
+                rec.copy(&ds.cur, 0, &ds.prelude_cur, 0, hidden);
+                let prelude_n_blocks = n_blocks;
+                let core_len = lc.core_end - lc.core_start;
+
+                for pass in 0..lc.num_passes {
+                    let mut n_bank = 0usize;
+                    if pass > 0 {
+                        let skip = (prelude_n_blocks + 1).min(n_blocks);
+                        n_bank = n_blocks - skip;
+                        if n_bank > 0 {
+                            rec.copy(&ds.blocks, skip * hidden, &ds.bank, 0, n_bank * hidden);
+                        }
+                        // Write `rms_norm_no_weight(ds.cur)` into `ds.bank_out[0..hidden]`.
+                        rec.inkling2_block_push(&ds.cur, &ds.attn_conv, &ds.bank_out, &ds.ffn_inp, hidden, Some(0), true);
+                        rec.copy(&ds.prelude_cur, 0, &ds.cur, 0, hidden);
+                        n_blocks = prelude_n_blocks;
+                    }
+                    for ip in lc.core_start..lc.core_end {
+                        let il = if pass == 0 {
+                            ip
+                        } else {
+                            n_phys + (pass - 1) * core_len + (ip - lc.core_start)
+                        };
+                        if pass == 0 {
+                            self.record_decode_layer_gpu(
+                                &mut *rec, il, ip, &mut n_blocks, false, None, ds,
+                                &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
+                                &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
+                            );
+                        } else {
+                            let ll = &self.loop_layers[ip - lc.core_start];
+                            let mq_dev = ll.msg_query_dev.as_ref().expect("msg_query_dev");
+                            rec.inkling2_mix_depth(&ds.bank, &ds.bank_out, mq_dev, &ds.msgs, n_bank, 4, hidden, true);
+                            self.record_decode_layer_gpu(
+                                &mut *rec, il, ip, &mut n_blocks, true, Some(ll), ds,
+                                &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
+                                &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
+                            );
+                        }
                     }
                 }
+                for il in lc.core_end..n_phys {
+                    self.record_decode_layer_gpu(
+                        &mut *rec, il, il, &mut n_blocks, false, None, ds,
+                        &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
+                        &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
+                    );
+                }
+            } else {
+                for il in 0..n_phys {
+                    self.record_decode_layer_gpu(
+                        &mut *rec, il, il, &mut n_blocks, false, None, ds,
+                        &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
+                        &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
+                    );
+                }
             }
-            for il in lc.core_end..n_phys {
-                self.record_decode_layer_gpu(
-                    &mut *rec, il, il, &mut n_blocks, false, None, ds,
-                    &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
-                    &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
-                );
-            }
-        } else {
-            for il in 0..n_phys {
-                self.record_decode_layer_gpu(
-                    &mut *rec, il, il, &mut n_blocks, false, None, ds,
-                    &scratch.x_bufs, &scratch.mid_bufs, &scratch.ctrl_gain, &scratch.ctrl_forget,
-                    &scratch.ctrl_out, &scratch.norm_bufs, &scratch.y_bufs, router_buf,
-                );
-            }
-        }
 
-        // Output AttnRes + RMSNorm (with fused `rmsnorm_q8`) + unembed + softcap -> ONE readback!
-        let oq_dev = self.output_res_query_dev.as_ref().expect("output_res_query_dev");
-        let on_dev = self.output_norm_dev.as_ref().expect("output_norm_dev");
-        let unpadded = self.cfg.vocab_size_unpadded;
-        rec.inkling2_mix_depth(&ds.blocks, &ds.cur, oq_dev, &ds.ffn_x, n_blocks, 1, hidden, false);
-        let in_v = GpuScratch::view(&ds.ffn_x, hidden);
-        let norm_v = GpuScratch::view(&scratch.norm_bufs[0], hidden);
-        rec.rmsnorm(&in_v, on_dev, &norm_v, self.cfg.rms_eps);
-        record_weight(&mut *rec, &self.output, &norm_v, &ds.logits, 1);
-        if self.cfg.final_logit_softcap > 0.0 {
-            rec.inkling2_softcap(&ds.logits, unpadded, self.cfg.final_logit_softcap);
+            // Output AttnRes + RMSNorm (with fused `rmsnorm_q8`) + unembed + softcap -> ONE readback!
+            let oq_dev = self.output_res_query_dev.as_ref().expect("output_res_query_dev");
+            let on_dev = self.output_norm_dev.as_ref().expect("output_norm_dev");
+            rec.inkling2_mix_depth(&ds.blocks, &ds.cur, oq_dev, &ds.ffn_x, n_blocks, 1, hidden, false);
+            let in_v = GpuScratch::view(&ds.ffn_x, hidden);
+            let norm_v = GpuScratch::view(&scratch.norm_bufs[0], hidden);
+            rec.rmsnorm(&in_v, on_dev, &norm_v, self.cfg.rms_eps);
+            record_weight(&mut *rec, &self.output, &norm_v, &ds.logits, 1);
+            if self.cfg.final_logit_softcap > 0.0 {
+                rec.inkling2_softcap(&ds.logits, unpadded, self.cfg.final_logit_softcap);
+            }
+            captured_recipe = rec.take_recipe();
         }
         rec.read_range(&ds.logits, 0, unpadded);
 
@@ -1532,6 +1634,9 @@ impl Inkling2Model {
         state.pos += 1;
         if let Some(ds_mut) = scratch.decode_state.as_mut() {
             ds_mut.host_dirty = true;
+            if let Some(r) = captured_recipe {
+                ds_mut.recipe = Some(r);
+            }
         }
         if let Some(t0) = t_step_start {
             eprintln!(
@@ -1699,7 +1804,7 @@ impl Inkling2Model {
             rec.keep_groups(seq == 1);
             let norm_ws: [&DeviceVec; 3] = match norms_dev {
                 AttnNormsDev::Shared(w) => [w, w, w],
-                AttnNormsDev::Separate { q, k, v } => [q, k, v],
+                AttnNormsDev::Separate { q, k, v, .. } => [q, k, v],
             };
             for i in 0..3 {
                 record_weight(&mut *rec, &ll.ctrl_down[i], &scratch.x_bufs[i], &scratch.mid_bufs[i], seq);
@@ -1749,7 +1854,7 @@ impl Inkling2Model {
                     rec.rmsnorm_rows(&in_v, w, &out_v, seq, self.cfg.rms_eps);
                 }
             }
-            AttnNormsDev::Separate { q, k, v } => {
+            AttnNormsDev::Separate { q, k, v, .. } => {
                 for (i, nw) in [q, k, v].into_iter().enumerate() {
                     let in_v = GpuScratch::view(&scratch.ctrl_out[i], sh);
                     let out_v = GpuScratch::view(&scratch.norm_bufs[i], sh);
@@ -1834,7 +1939,11 @@ impl Inkling2Model {
                 &scratch.ctrl_out[0],
                 sh,
             );
-            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+            if seq == 1 {
+                rec.rmsnorm(&in_v, ffn_norm_dev, &norm_v, self.cfg.rms_eps);
+            } else {
+                rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+            }
             rec.matmul_f32_rows(router_dev, n_exp + 1, hidden, &norm_v, &router_v, seq);
             if rec.moe_routed(qmoe, &norm_v, &out_v, &router_v, self.cfg.n_experts_used, seq) {
                 rec.read_range(&out_v, 0, sh);
@@ -1869,7 +1978,11 @@ impl Inkling2Model {
 
         let mut rec = chain.begin();
         rec.keep_groups(seq == 1);
-        rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+        if seq == 1 {
+            rec.rmsnorm(&in_v, ffn_norm_dev, &norm_v, self.cfg.rms_eps);
+        } else {
+            rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
+        }
         rec.matmul_f32_rows(router_dev, n_exp + 1, hidden, &norm_v, &router_v, seq);
         if rec.moe_routed(qmoe, &norm_v, &out_v, &router_v, self.cfg.n_experts_used, seq) {
             rec.read_range(&out_v, 0, sh);

@@ -80,8 +80,13 @@ pub(crate) fn encode(device: &wgpu::Device, dispatches: &[Dispatch]) -> wgpu::Co
     let mut piece = device.create_command_encoder(&Default::default());
     {
         let mut pass = piece.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut last_pipe: Option<*const wgpu::ComputePipeline> = None;
         for (pipeline, group, (x, y, z)) in dispatches {
-            pass.set_pipeline(pipeline);
+            let ptr = Arc::as_ptr(pipeline);
+            if last_pipe != Some(ptr) {
+                pass.set_pipeline(pipeline);
+                last_pipe = Some(ptr);
+            }
             pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups(*x, *y, *z);
         }

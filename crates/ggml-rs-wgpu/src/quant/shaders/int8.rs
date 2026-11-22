@@ -162,6 +162,69 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Multi-stream variant of [`NORM_Q8_LANES`]: normalizes `wg.y` streams (`0..n_streams - 1`) of length `k`
+/// from `x4` into `y4` and quantizes all `n_streams` rows into `q` (`q8_len(n_streams, k)` layout) in ONE dispatch.
+/// `p[0]`: k, eps bits, xs_at, separate_w (0 = share `w4[0..k/4]`, 1 = stream `s` uses `w4[s*k/4..]`).
+pub const NORM_Q8_LANES_MULTI: &str = r#"
+@group(0) @binding(0) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> red: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let k = p[0].x;
+    let eps = bitcast<f32>(p[0].y);
+    let xs_at = p[0].z;
+    let sep_w = p[0].w != 0u;
+    let s_idx = wg.y;
+    let k4 = k / 4u;
+    let x_base4 = s_idx * k4;
+    let w_base4 = select(0u, s_idx * k4, sep_w);
+    var s = 0.0;
+    for (var i = li; i < k4; i += 256u) {
+        let v = x4[x_base4 + i];
+        s += dot(v, v);
+    }
+    s = subgroupAdd(s);
+    if (lane == 0u) { red[sgi] = s; }
+    workgroupBarrier();
+    let total = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+    let inv = 1.0 / sqrt(total / f32(k) + eps);
+    let blocks = k / 32u;
+    let b_local = wg.x * 32u + li / 8u;
+    let part = li % 8u;
+    let at4 = min(b_local, blocks - 1u) * 8u + part;
+    let v = x4[x_base4 + at4] * inv * w4[w_base4 + at4];
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b_local < blocks) {
+        let b_global = s_idx * blocks + b_local;
+        y4[x_base4 + at4] = v;
+        q[b_global * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b_global) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
 /// Elements (4-byte) a buffer of [`QUANT_Q8`]'s output takes for `rows` rows of `k`: the packed rows, then the blocks'
 /// scales and sums; and where the scales start, in vec4s.
 pub fn q8_len(rows: usize, k: usize) -> (usize, usize) {
@@ -184,24 +247,33 @@ pub fn q8_threads(subgroups: bool) -> u32 {
 /// Qwen3.5 9B's Q4_K [12288, 4096] in 199 us where 222, its Q5_K [8192, 4096] in 160 where 179, its Q6_K output
 /// [248320, 4096] in 5.2 ms where 5.7.
 pub fn rb_kernel_q8(dtype: GgmlType, r: u32, mr: u32, subgroups: bool) -> Option<String> {
-    rb_kernel_q8_by(dtype, r, mr, subgroups, false, false)
+    rb_kernel_q8_by(dtype, r, mr, subgroups, 0, false)
 }
 
 /// [`rb_kernel_q8`] for a step's one row on a device whose subgroups are 32 lanes, each workgroup's `r` weight rows
-/// along `k` by all its 256 lanes (each subgroup a slice of a row's tasks in turn), the subgroups' sums added through
+/// along `k` by all its lanes (each subgroup a slice of a row's tasks in turn), the subgroups' sums added through
 /// the workgroup's memory: a lane walked a row's tasks 32 at a time, seven turns of a 7,168-wide row one after another
 /// (Nanbeige4.3's keys [1024, 7168] 12.7 us a step on an RTX 5090, 330 GB/s; its queries [7168, 7168] 25.4, 1,140).
 pub fn rb_kernel_q8_split(dtype: GgmlType, r: u32) -> Option<String> {
-    rb_kernel_q8_by(dtype, r, 1, true, true, false)
+    rb_kernel_q8_by(dtype, r, 1, true, 8, false)
+}
+
+/// [`rb_kernel_q8_split`] with `warps` subgroups per workgroup (`4` = 128 threads for narrower `k` with `<= 128`
+/// tasks so warps 4..7 are not launched idle; `8` = 256 threads for wider `k`).
+pub fn rb_kernel_q8_split_warps(dtype: GgmlType, r: u32, warps: u32, add: bool) -> Option<String> {
+    debug_assert!(matches!(warps, 4 | 8));
+    rb_kernel_q8_by(dtype, r, 1, true, warps, add)
 }
 
 /// [`rb_kernel_q8_split`] with each row's sum added to what `y` holds there (a residual stream: a row's one writer,
 /// after its workgroup's sums), the add's own pass not needed.
 pub fn rb_kernel_q8_split_add(dtype: GgmlType, r: u32) -> Option<String> {
-    rb_kernel_q8_by(dtype, r, 1, true, true, true)
+    rb_kernel_q8_by(dtype, r, 1, true, 8, true)
 }
 
-fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: bool, add: bool) -> Option<String> {
+fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split_warps: u32, add: bool) -> Option<String> {
+    let split = split_warps > 0;
+    let split_threads = split_warps * 32;
     let (vec4_weights, tasks, block) = match dtype {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K => (true, 8u32, 256u32),
         // (Q6_K's tasks for one row of `x` 64 weights, a few rows' 16: below)
@@ -216,7 +288,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
     };
     // (no `enable subgroups;`: naga 30 has not that directive, and takes subgroups' operations where the device was
     // given them)
-    l("struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, xs_at: u32, _pad1: u32, }");
+    l("struct Params { k: u32, n: u32, m: u32, row0: u32, rows: u32, row_bytes: u32, xs_at: u32, x_row: u32, }");
     l(if vec4_weights { "@group(0) @binding(0) var<storage, read> w4: array<vec4<u32>>;" } else { "@group(0) @binding(0) var<storage, read> w: array<u32>;" });
     l("@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;");
     l("@group(0) @binding(2) var<storage, read_write> y: array<f32>;");
@@ -225,7 +297,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         l(&format!("var<workgroup> partial: array<f32, {}>;", 128 * r * mr));
     }
     if split {
-        l(&format!("var<workgroup> sums: array<f32, {}>;", 8 * r));
+        l(&format!("var<workgroup> sums: array<f32, {}>;", split_warps * r));
     }
     l(RB_HELPERS);
     if !vec4_weights {
@@ -247,7 +319,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         l("    return iq4_byte(q & 15u) | (iq4_byte((q >> 8u) & 15u) << 8u) | (iq4_byte((q >> 16u) & 15u) << 16u) | (iq4_byte((q >> 24u) & 15u) << 24u);");
         l("}");
     }
-    l(&format!("@compute @workgroup_size({})", q8_threads(subgroups)));
+    l(&format!("@compute @workgroup_size({})", if split { split_threads } else { q8_threads(subgroups) }));
     if subgroups {
         // (a subgroup's lanes and which of the eight it is as the device has them: its sums are its own lanes')
         l("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {");
@@ -270,7 +342,11 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         l(&format!("    let rr{i} = min(rbase + {i}u, p.rows - 1u);"));
     }
     for m in 0..mr {
-        l(&format!("    let xr{m} = min(m0 + {m}u, p.m - 1u);"));
+        if split && m == 0 {
+            l("    let xr0 = p.x_row;");
+        } else {
+            l(&format!("    let xr{m} = min(m0 + {m}u, p.m - 1u);"));
+        }
     }
     for i in 0..r {
         for m in 0..mr {
@@ -278,7 +354,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         }
     }
     if split {
-        l(&format!("    for (var c = sgi * 32u + lane; c < blocks * {tasks}u; c += 256u) {{"));
+        l(&format!("    for (var c = sgi * 32u + lane; c < blocks * {tasks}u; c += {split_threads}u) {{"));
     } else {
         l(&format!("    for (var c = lane; c < blocks * {tasks}u; c += 32u) {{"));
     }
@@ -521,7 +597,7 @@ fn rb_kernel_q8_by(dtype: GgmlType, r: u32, mr: u32, subgroups: bool, split: boo
         l("    workgroupBarrier();");
         l(&format!("    if (sgi == 0u && lane < {r}u && rbase + lane < p.rows) {{"));
         l("        var t = 0.0;");
-        l(&format!("        for (var g = 0u; g < 8u; g++) {{ t += sums[g * {r}u + lane]; }}"));
+        l(&format!("        for (var g = 0u; g < {split_warps}u; g++) {{ t += sums[g * {r}u + lane]; }}"));
         l(if add { "        y[m0 * p.n + p.row0 + rbase + lane] += t;" } else { "        y[m0 * p.n + p.row0 + rbase + lane] = t;" });
         l("    }");
         l("}");

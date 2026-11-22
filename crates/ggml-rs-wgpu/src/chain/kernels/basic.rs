@@ -98,6 +98,35 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// [`RMSNORM_ROWS4`] for 32-lane subgroup devices: reduces across each warp via `subgroupAdd` and
+/// combines the 8 warps with a single `workgroupBarrier()` (down from 3 barriers).
+pub(in crate::chain) const RMSNORM_ROWS4_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> wpart: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let n4 = p[0].x / 4u;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].w) { return; }
+    let at = row * n4;
+    var wrows = p[0].z;
+    if (wrows == 0u) { wrows = 1u; }
+    let wat = (row % wrows) * n4;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < n4; i += 256u) { let v = x4[at + i]; s += v * v; }
+    let ws = subgroupAdd(s.x + s.y + s.z + s.w);
+    if (lane == 0u) { wpart[sgi] = ws; }
+    workgroupBarrier();
+    let total = ((wpart[0] + wpart[1]) + (wpart[2] + wpart[3])) + ((wpart[4] + wpart[5]) + (wpart[6] + wpart[7]));
+    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
+    for (var i = li; i < n4; i += 256u) { y4[at + i] = x4[at + i] * inv * w4[wat + i]; }
+}
+"#;
+
 /// [`RMSNORM_ROWS4`] for rows of at most `lanes` vec4s (8 to 128, a power of two): 256 / `lanes` rows a workgroup, a
 /// thread a vec4, where RMSNORM_ROWS4's workgroup a row left all but a row's threads idle through its barriers (a
 /// head's norm, 32 vec4s a row: Qwen Image 2.1's queries' and keys', 132,000 rows a block, 8.3 ms where 1.1 on an

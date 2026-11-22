@@ -257,11 +257,11 @@ pub(super) fn pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &DeviceVe
     let (ob, blocks, rows, identity) = match order {
         Order::Jobs => (d.clone(), count, 1, 1),
         Order::Blocks(o, blocks, rows) => (buf(o), blocks, rows, 0),
-        Order::At(..) => unreachable!("a slots' pass orders its blocks from the first"),
+        Order::At(..) | Order::DownFromGu => unreachable!("a slots' pass orders its blocks from the first"),
     };
     let coop = rows > FEW_MAX;
     let lanes = few_lanes(g.kind, g.k);
-    let (name, source) = kernel(g.kind, coop, rows, g.k, 0, false, lanes, skip);
+    let (name, source) = kernel(g.kind, coop, rows, g.k, 0, false, lanes, skip, rec.gpu().subgroups32());
     for first in (0..blocks).step_by(65535) {
         let these = 65535.min(blocks - first) as u32;
         let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, first as u32, 0, slots as u32];

@@ -335,6 +335,74 @@ fn main(@builtin(local_invocation_index) li: u32) {
 }
 "#;
 
+/// Single-row (`rows == 1`, `routed <= 256`, `top_k <= 32`) fully fused sigmoid+bias top-k routing:
+/// writes `jobs_gu` (binding 6: `[2*e, 0, 2*e+1, 0]` per rank) AND normalized expert weights `w`
+/// (binding 7: `sigmoid(logits[e]) / (sum + 1e-6) * scale`, with `w[k] = 0.0`) in ONE dispatch.
+/// `p[0]`: routed, top_k, scale bits, 0.
+pub(crate) const ROUTE_SIGMOID_STEP_FUSED: &str = r#"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(6) var<storage, read_write> jobs_gu: array<u32>;
+@group(0) @binding(7) var<storage, read_write> w: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> pk: array<f32, 256>;
+var<workgroup> sig: array<f32, 256>;
+var<workgroup> top_e: array<u32, 32>;
+var<workgroup> top_s: array<f32, 32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+    let n = p[0].x;
+    let k = p[0].y;
+    let scale = bitcast<f32>(p[0].z);
+    if (li < n) {
+        let s = 1.0 / (1.0 + exp(-logits[li]));
+        sig[li] = s;
+        pk[li] = s + bias[li];
+    }
+    workgroupBarrier();
+    if (li < n) {
+        let v = pk[li];
+        var above = 0u;
+        for (var e = 0u; e < n; e++) {
+            let u = pk[e];
+            if (u > v || (u == v && e < li)) { above += 1u; }
+        }
+        if (above < k) {
+            top_e[above] = li;
+            top_s[above] = sig[li];
+        }
+    }
+    workgroupBarrier();
+    if (li < k) {
+        var sum = 0.0;
+        for (var i = 0u; i < k; i++) { sum += top_s[i]; }
+        let e = top_e[li];
+        w[li] = top_s[li] / (sum + 1e-6) * scale;
+        let at = 4u * li;
+        jobs_gu[at] = 2u * e;
+        jobs_gu[at + 1u] = 0u;
+        jobs_gu[at + 2u] = 2u * e + 1u;
+        jobs_gu[at + 3u] = 0u;
+    }
+    if (li == 0u) {
+        w[k] = 0.0;
+    }
+}
+"#;
+
+/// Single-dispatch fused sigmoid routing for `rows == 1 && routed <= 256`: writes `st.jobs_gu` and `st.w`
+/// directly (down pass reads `e = jobs_gu[4*j] >> 1`, row `j` via `mode == 2`, eliminating `jobs_d` write
+/// and one full serial GPU dispatch per layer).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_route_sigmoid_step_fused(rec: &mut crate::chain::Recorder<'_>, logits: &wgpu::Buffer, bias: &wgpu::Buffer, st: &Step, routed: usize, top_k: usize, scale: f32) {
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+    assert!(routed <= 256 && top_k <= 32 && top_k <= routed, "moe: the top {top_k} of {routed} experts");
+    let d = rec.gpu().dummy().clone();
+    rec.dispatch_wide("moe-route-sigmoid-step-fused", ROUTE_SIGMOID_STEP_FUSED, [logits, bias, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[routed as u32, top_k as u32, scale.to_bits()], (1, 1, 1));
+}
+
 /// [`record_route`] for LFM2's routing: the scores and their bias into `pick` (`[rows, routed + 1]`, a scratch
 /// vector), ranked there, then weighted from the logits ([`ROUTE_SIGMOID_PICK`], [`ROUTE_RANK`],
 /// [`ROUTE_SIGMOID_WEIGHTS`]). For `rows == 1 && routed <= 256`, fuses pick+rank in workgroup memory with zero scratch.

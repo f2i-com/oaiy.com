@@ -21,7 +21,7 @@
 //!
 //! A model that routes and combines its experts itself keeps them in slots ([`QuantSlots`]), as an EXL3 checkpoint's
 //! are kept in [`crate::exl3::Exl3Slots`].
-use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, record_route_sigmoid, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
+use crate::exl3::{coop_on, many_order, moe_rows_for, record_route, record_route_sigmoid, record_route_sigmoid_step_fused, Step, FEW_MAX, GROUP, MANY_CLEAR, MANY_COUNT, MANY_SCAN, MANY_SCATTER, WSUM_APPLY, WSUM_ROWS};
 use crate::{chunk_limit, Gpu, WgpuBackend};
 use ggml_quants::GgmlType;
 use ggml_rs::exl3::{Experts, Routing};
@@ -64,6 +64,9 @@ struct Group {
 #[derive(Clone, Copy)]
 enum Order<'a> {
     Jobs,
+    /// Single-token down pass reading expert id `jobs_gu[4*blk] >> 1` and row `blk` directly from `st.jobs_gu`
+    /// (written by single-dispatch `record_route_sigmoid_step_fused`, eliminating `jobs_d` and 1 serial dispatch).
+    DownFromGu,
     Blocks(&'a DeviceVec, usize, usize),
     /// As `Blocks`, the order's first block not its vector's first (the vector, that block, the blocks, the jobs a
     /// block): a prompt's experts of few rows, kept after its others' blocks.
@@ -313,6 +316,17 @@ impl QuantMoe {
         self.group_pass_from(rec, g, x, jobs, count, order, y, None)
     }
 
+    /// Whether a single-row (`rows == 1`) pass over `g` can run the INT8 DP4A kernel (`few_source_32_q8`).
+    fn can_q8_group(rec: &crate::chain::Recorder<'_>, g: &Group, rows: usize) -> bool {
+        static NO_Q8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        rows == 1
+            && g.k % 32 == 0
+            && matches!(g.kind, Kind::IQ4_NL | Kind::Q8_0)
+            && rec.gpu().subgroups32()
+            && rec.gpu().int8_rows()
+            && !*NO_Q8.get_or_init(|| std::env::var_os("OAIY_NO_Q8").is_some() || std::env::var_os("OAIY_MOE_NO_Q8").is_some())
+    }
+
     /// [`Self::group_pass`]; `stage`: where a part-held layer's experts with no slot on the card were copied for this
     /// run ([`Cache::stage`]: a prompt's), else its kernels read them from the host's memory.
     #[allow(clippy::too_many_arguments)]
@@ -324,6 +338,7 @@ impl QuantMoe {
         let ntiles = (g.n / 16) as u32;
         let (ob, base, blocks, rows, identity) = match order {
             Order::Jobs => (d.clone(), 0, count, 1, 1),
+            Order::DownFromGu => (d.clone(), 0, count, 1, 2),
             Order::Blocks(o, blocks, rows) => (buf(o), 0, blocks, rows, 0),
             Order::At(o, base, blocks, rows) => (buf(o), base, blocks, rows, 0),
         };
@@ -331,7 +346,7 @@ impl QuantMoe {
         // (a prompt's experts of few rows: eight lanes a row, 32 output rows a workgroup. Most of that pass's blocks
         // are empty, an expert of more rows or of none, and a workgroup of an empty block still starts)
         let lanes = if matches!(order, Order::At(..)) { 8 } else { few_lanes(g.kind, g.k) };
-        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), lanes, false);
+        let (name, source) = kernel(g.kind, coop, rows, g.k, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), lanes, false, rec.gpu().subgroups32());
         // (a card holding some of the experts: the rest's rows in the host's memory or where this run's were copied,
         // and the layer's state)
         let staged = stage.map(|s| buf(s));
@@ -346,6 +361,38 @@ impl QuantMoe {
             let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, (base + first) as u32, 0, self.routed as u32];
             let groups = (g.n as u32).div_ceil((256 / lanes) as u32);
             let grid = if coop { (ntiles.div_ceil(8), 1, these) } else { (groups.min(65535), groups.div_ceil(65535), these) };
+            rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), cold, &yb, state], &words, grid);
+        }
+        rec.weigh(2.0 * count as f64 * (g.n * g.k) as f64);
+    }
+
+    /// Single-row (`rows == 1`) DP4A `dot4I8Packed` pass over `g` reading pre-quantized Q8_0 activations `xq`
+    /// (with per-block scales starting at `vec4` offset `xs_at`).
+    #[allow(clippy::too_many_arguments)]
+    fn group_pass_q8(&self, rec: &mut crate::chain::Recorder<'_>, g: &Group, xq: &DeviceVec, xs_at: usize, jobs: &DeviceVec, count: usize, order: Order<'_>, y: &DeviceVec, stage: Option<&DeviceVec>) {
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let (xb, jb, yb) = (buf(xq), buf(jobs), buf(y));
+        let (ob, base, blocks, identity) = match order {
+            Order::Jobs => (d.clone(), 0, count, 1),
+            Order::DownFromGu => (d.clone(), 0, count, 2),
+            Order::Blocks(o, blocks, _) => (buf(o), 0, blocks, 0),
+            Order::At(o, base, blocks, _) => (buf(o), base, blocks, 0),
+        };
+        let lanes = few_lanes(g.kind, g.k);
+        let (name, source) = kernel_q8(g.kind, lanes, if self.cache.is_some() { g.mats } else { 0 }, stage.is_some(), false);
+        let staged = stage.map(|s| buf(s));
+        let (cold, state) = match (&self.cache, &staged) {
+            (Some(c), Some(s)) => (s, &c.state),
+            (Some(c), None) => (g.cold.as_ref().expect("a part-held group's rows in the host's memory"), &c.state),
+            (None, _) => (&d, &drw),
+        };
+        for first in (0..blocks).step_by(65535) {
+            let these = 65535.min(blocks - first) as u32;
+            let words = [g.n as u32, g.k as u32, g.rw as u32, identity, g.mwords as u32, (base + first) as u32, xs_at as u32, self.routed as u32];
+            let groups = (g.n as u32).div_ceil((256 / lanes) as u32);
+            let grid = (groups.min(65535), groups.div_ceil(65535), these);
             rec.dispatch_wide(name, source, [&g.words, &xb, &jb, &ob, g.table.as_ref().unwrap_or(&d), cold, &yb, state], &words, grid);
         }
         rec.weigh(2.0 * count as f64 * (g.n * g.k) as f64);
@@ -432,9 +479,13 @@ impl QuantMoe {
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
         let drw = rec.gpu().dummy_rw().clone();
+        let mut fused_route = false;
         match (&self.routing, &self.bias) {
             (Routing::Sigmoid { scale, .. }, Some(bias)) => {
-                if rows == 1 && self.routed <= 256 {
+                if rows == 1 && self.routed <= 256 && self.cache.is_none() {
+                    record_route_sigmoid_step_fused(rec, &buf(logits), &buf(bias), &st, self.routed, top_k, *scale);
+                    fused_route = true;
+                } else if rows == 1 && self.routed <= 256 {
                     record_route_sigmoid(rec, &buf(logits), &buf(bias), None, &st, self.routed, top_k, rows, *scale);
                 } else {
                     let pick = rec.scratch(rows * (self.routed + 1));
@@ -469,6 +520,8 @@ impl QuantMoe {
         let (ogu, od) = if grouped {
             rec.dispatch_wide("moe-group", GROUP, [&buf(&st.jobs_d), &d, &d, &d, &d, &d, &buf(&st.order_gu), &buf(&st.order_d)], &[pairs as u32, rows as u32], (1, 1, 1));
             (Order::Blocks(&st.order_gu, 2 * pairs, rows), Order::Blocks(&st.order_d, pairs, rows))
+        } else if fused_route {
+            (Order::Jobs, Order::DownFromGu)
         } else {
             (Order::Jobs, Order::Jobs)
         };
@@ -476,11 +529,12 @@ impl QuantMoe {
         true
     }
 
-    /// The experts' work once `st` holds the jobs and weights: gate and up, each pair's SwiGLU, down, the shared
-    /// expert on every row, and each row's weighted sum (into `out`, or added to the streams `into` names). `tail`: a
-    /// prompt's experts of few rows, their gate and up order and their down one, run after the others' of each.
+    /// Routed experts' gate+up, activation (SwiGLU or SiTU), and down projections into `st.out_d`.
+    /// For single-token decode (`rows == 1`) with `IQ4_NL`/`Q8_0` on subgroup+DP4A GPUs, uses `few_source_32_q8`
+    /// and fused `SITU_PAIRS_Q8` / `SWIGLU_PAIRS_Q8` (sharing `rmsnorm_q8` cache for `gu` and zero extra quantize
+    /// pass for `down`).
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, tail: Option<[Order<'_>; 2]>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
+    fn run_routed(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, tail: Option<[Order<'_>; 2]>) {
         let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
         let pairs = rows * top_k;
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
@@ -492,20 +546,97 @@ impl QuantMoe {
             c.watch(rec);
             c.admit(rec, &st.jobs_d, pairs, matches!(ogu, Order::Blocks(_, _, rows) if rows > FEW_MAX))
         });
-        self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
-        if let Some([gu, _]) = tail {
-            self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs / 10, gu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+        let use_q8_gu = Self::can_q8_group(rec, &self.gu, rows) && matches!(ogu, Order::Jobs) && tail.is_none();
+        let use_q8_down = Self::can_q8_group(rec, &self.down, rows) && matches!(od, Order::Jobs | Order::DownFromGu) && tail.is_none();
+        let down_jobs = if matches!(od, Order::DownFromGu) { &st.jobs_gu } else { &st.jobs_d };
+        static NO_FUSE_GU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fuse_gu_act = use_q8_gu
+            && use_q8_down
+            && self.cache.is_none()
+            && f % 32 == 0
+            && !*NO_FUSE_GU.get_or_init(|| std::env::var_os("OAIY_MOE_NO_FUSE_GU").is_some());
+        if fuse_gu_act {
+            let (xq, xs_in) = rec.x_q8(x, 1, h);
+            let (q8_len, xs_out) = crate::quant::shaders::q8_len(pairs, f);
+            let xh_d_q8 = if rec.keeps() {
+                DeviceVec { len: q8_len, inner: Arc::new(rec.gpu().q8_kept(&buf(&st.xh_d), pairs, f, (q8_len * 4) as u64)) }
+            } else {
+                rec.scratch(q8_len)
+            };
+            let (name, source) = kernel_q8_gu_act(self.gu.kind, self.situ.is_some());
+            let (b_bits, lb_bits) = self.situ.map_or((0u32, 0u32), |(b, lb)| (b.to_bits(), lb.to_bits()));
+            let words = [f as u32, h as u32, self.gu.rw as u32, self.gu.mwords as u32, xs_in as u32, xs_out as u32, b_bits, lb_bits];
+            rec.dispatch_wide(
+                name,
+                source,
+                [&self.gu.words, &buf(&xq), &buf(&st.jobs_gu), &d, &d, &d, &buf(&xh_d_q8), &drw],
+                &words,
+                ((f / 32) as u32, 1, pairs as u32),
+            );
+            rec.weigh(2.0 * (2 * pairs) as f64 * (f * h) as f64);
+            self.group_pass_q8(rec, &self.down, &xh_d_q8, xs_out, down_jobs, pairs, od, &st.out_d, None);
+            return;
         }
-        let groups = ((pairs * f) as u32).div_ceil(256);
-        if let Some((beta, linear_beta)) = self.situ {
-            rec.dispatch_wide("quant-moe-situ", SITU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32, beta.to_bits(), linear_beta.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+        if use_q8_gu {
+            let (xq, xs_at) = rec.x_q8(x, 1, h);
+            self.group_pass_q8(rec, &self.gu, &xq, xs_at, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
         } else {
-            rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+            self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs, ogu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+            if let Some([gu, _]) = tail {
+                self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * pairs / 10, gu, &st.out_gu, stage.as_ref().map(|s| &s[0]));
+            }
         }
-        self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
-        if let Some([_, down]) = tail {
-            self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs / 10, down, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        if use_q8_down {
+            let (q8_len, xs_at) = crate::quant::shaders::q8_len(pairs, f);
+            let xh_d_q8 = if rec.keeps() {
+                DeviceVec { len: q8_len, inner: Arc::new(rec.gpu().q8_kept(&buf(&st.xh_d), pairs, f, (q8_len * 4) as u64)) }
+            } else {
+                rec.scratch(q8_len)
+            };
+            let blocks = (pairs * (f / 32)) as u32;
+            let groups = (blocks * 8).div_ceil(256);
+            if let Some((beta, linear_beta)) = self.situ {
+                rec.dispatch_wide(
+                    "quant-moe-situ-q8",
+                    SITU_PAIRS_Q8,
+                    [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&xh_d_q8), &drw],
+                    &[f as u32, pairs as u32, beta.to_bits(), linear_beta.to_bits(), xs_at as u32],
+                    (groups.min(65535), groups.div_ceil(65535).max(1), 1),
+                );
+            } else {
+                rec.dispatch_wide(
+                    "quant-moe-swiglu-q8",
+                    SWIGLU_PAIRS_Q8,
+                    [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&xh_d_q8), &drw],
+                    &[f as u32, pairs as u32, xs_at as u32],
+                    (groups.min(65535), groups.div_ceil(65535).max(1), 1),
+                );
+            }
+            self.group_pass_q8(rec, &self.down, &xh_d_q8, xs_at, down_jobs, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        } else {
+            let groups = ((pairs * f) as u32).div_ceil(256);
+            if let Some((beta, linear_beta)) = self.situ {
+                rec.dispatch_wide("quant-moe-situ", SITU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32, beta.to_bits(), linear_beta.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+            } else {
+                rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, pairs as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
+            }
+            self.group_pass_from(rec, &self.down, &st.xh_d, down_jobs, pairs, od, &st.out_d, stage.as_ref().map(|s| &s[1]));
+            if let Some([_, down]) = tail {
+                self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, pairs / 10, down, &st.out_d, stage.as_ref().map(|s| &s[1]));
+            }
         }
+    }
+
+    /// The experts' work once `st` holds the jobs and weights: gate and up, each pair's SwiGLU, down, the shared
+    /// expert on every row, and each row's weighted sum (into `out`, or added to the streams `into` names). `tail`: a
+    /// prompt's experts of few rows, their gate and up order and their down one, run after the others' of each.
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, rec: &mut crate::chain::Recorder<'_>, st: &Step, x: &DeviceVec, out: &DeviceVec, rows: usize, ogu: Order<'_>, od: Order<'_>, tail: Option<[Order<'_>; 2]>, into: Option<(&DeviceVec, &DeviceVec, usize)>) {
+        let (h, f, top_k) = (self.hidden, self.ff, st.top_k);
+        let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
+        let d = rec.gpu().dummy().clone();
+        let drw = rec.gpu().dummy_rw().clone();
+        self.run_routed(rec, st, x, rows, ogu, od, tail);
         // the shared expert on every row: its gate and up with their SwiGLU, then its down projection with the
         // experts' sum into the streams, each one dispatch for a step's row or a check's few
         if let Some(shared) = &self.shared {
@@ -556,7 +687,7 @@ impl QuantMoe {
         {
             return false;
         }
-        let (h, f) = (self.hidden, self.ff);
+        let h = self.hidden;
         assert!(
             x.len >= h && residual.len >= h && out.len >= h && conv_w.len >= h * kernel && conv_state.len >= (kernel - 1) * h,
             "moe_post_conv_add: hidden={h} kernel={kernel}"
@@ -568,10 +699,13 @@ impl QuantMoe {
         };
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let d = rec.gpu().dummy().clone();
-        let drw = rec.gpu().dummy_rw().clone();
+        let mut fused_route = false;
         match (&self.routing, &self.bias) {
             (Routing::Sigmoid { scale, .. }, Some(bias)) => {
-                if self.routed <= 256 {
+                if self.routed <= 256 && self.cache.is_none() {
+                    record_route_sigmoid_step_fused(rec, &buf(logits), &buf(bias), &st, self.routed, top_k, *scale);
+                    fused_route = true;
+                } else if self.routed <= 256 {
                     record_route_sigmoid(rec, &buf(logits), &buf(bias), None, &st, self.routed, top_k, 1, *scale);
                 } else {
                     let pick = rec.scratch(self.routed + 1);
@@ -580,18 +714,8 @@ impl QuantMoe {
             }
             _ => record_route(rec, &buf(logits), &st, self.routed, top_k, 1),
         }
-        let stage = self.cache.as_ref().and_then(|c| {
-            c.watch(rec);
-            c.admit(rec, &st.jobs_d, top_k, false)
-        });
-        self.group_pass_from(rec, &self.gu, x, &st.jobs_gu, 2 * top_k, Order::Jobs, &st.out_gu, stage.as_ref().map(|s| &s[0]));
-        let groups = ((top_k * f) as u32).div_ceil(256);
-        if let Some((beta, linear_beta)) = self.situ {
-            rec.dispatch_wide("quant-moe-situ", SITU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, top_k as u32, beta.to_bits(), linear_beta.to_bits()], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
-        } else {
-            rec.dispatch_wide("quant-moe-swiglu", SWIGLU_PAIRS, [&buf(&st.out_gu), &d, &d, &d, &d, &d, &buf(&st.xh_d), &drw], &[f as u32, top_k as u32], (groups.min(65535), groups.div_ceil(65535).max(1), 1));
-        }
-        self.group_pass_from(rec, &self.down, &st.xh_d, &st.jobs_d, top_k, Order::Jobs, &st.out_d, stage.as_ref().map(|s| &s[1]));
+        let od = if fused_route { Order::DownFromGu } else { Order::Jobs };
+        self.run_routed(rec, &st, x, 1, Order::Jobs, od, None);
         let wsum_groups = ((h as u32).div_ceil(256), 1, 1);
         rec.dispatch_wide(
             "moe-wsum-post-conv-add",

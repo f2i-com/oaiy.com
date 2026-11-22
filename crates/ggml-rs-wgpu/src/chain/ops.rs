@@ -1214,9 +1214,14 @@ impl ChainRecorder for Recorder<'_> {
         assert!(n_blocks < 32 && n_queries > 0 && hidden > 0 && cur.len >= hidden && query.len >= n_queries * hidden && out.len >= n_queries * hidden, "chain: inkling2_mix_depth");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
+        let (name, src) = if hidden % 4 == 0 && self.gpu().subgroups32() {
+            ("chain-inkling2-mix-depth-sg", INKLING2_MIX_DEPTH_SG)
+        } else {
+            ("chain-inkling2-mix-depth", INKLING2_MIX_DEPTH)
+        };
         self.dispatch_wide(
-            "chain-inkling2-mix-depth",
-            INKLING2_MIX_DEPTH,
+            name,
+            src,
             [buffer(blocks), buffer(cur), buffer(query), &d, &d, &d, buffer(out), &drw],
             &[hidden as u32, n_blocks as u32, n_queries as u32, u32::from(cur_is_normed)],
             (n_queries as u32, 1, 1),
@@ -1298,9 +1303,14 @@ impl ChainRecorder for Recorder<'_> {
         assert!(hidden > 0 && inp_sa.len >= hidden && attn_conv.len >= hidden && ffn_inp.len >= hidden, "chain: inkling2_block_push");
         let d = self.gpu().dummy().clone();
         let slot = block_slot.map_or(u32::MAX, |s| s as u32);
+        let (name, src) = if self.gpu().subgroups32() {
+            ("chain-inkling2-block-push-sg", INKLING2_BLOCK_PUSH_SG)
+        } else {
+            ("chain-inkling2-block-push", INKLING2_BLOCK_PUSH)
+        };
         self.dispatch_wide(
-            "chain-inkling2-block-push",
-            INKLING2_BLOCK_PUSH,
+            name,
+            src,
             [buffer(inp_sa), buffer(attn_conv), &d, &d, &d, &d, buffer(blocks), buffer(ffn_inp)],
             &[hidden as u32, slot, u32::from(skip_ffn_inp)],
             (1, 1, 1),
@@ -1321,28 +1331,41 @@ impl ChainRecorder for Recorder<'_> {
     }
 
     fn inkling2_ctrl_cat_down(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize) {
-        assert!(hidden > 0 && hidden % 2 == 0 && gate_rank > 0 && w_down_f16.len >= gate_rank * hidden && cur.len >= cur_off + hidden && msg.len >= msg_off + hidden && mid_out.len >= gate_rank, "chain: inkling2_ctrl_cat_down");
+        self.inkling2_ctrl_cat_down_multi(w_down_f16, cur, cur_off, 0, msg, msg_off, mid_out, hidden, gate_rank, 1);
+    }
+
+    fn inkling2_ctrl_cat_down_multi(&mut self, w_down_f16: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, mid_out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
+        assert!(n_streams > 0 && hidden > 0 && hidden % 2 == 0 && gate_rank > 0 && w_down_f16.len >= n_streams * gate_rank * hidden && cur.len >= cur_off + (n_streams - 1) * cur_stride + hidden && msg.len >= msg_off + n_streams * hidden && mid_out.len >= n_streams * gate_rank, "chain: inkling2_ctrl_cat_down_multi");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
+        let (name, src) = if self.gpu().subgroups32() {
+            ("chain-inkling2-ctrl-cat-down-sg", INKLING2_CTRL_CAT_DOWN_SG)
+        } else {
+            ("chain-inkling2-ctrl-cat-down", INKLING2_CTRL_CAT_DOWN)
+        };
         self.dispatch_wide(
-            "chain-inkling2-ctrl-cat-down",
-            INKLING2_CTRL_CAT_DOWN,
+            name,
+            src,
             [buffer(w_down_f16), buffer(cur), buffer(msg), &d, &d, &d, buffer(mid_out), &drw],
-            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32],
-            (gate_rank as u32, 1, 1),
+            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32],
+            (gate_rank as u32, n_streams as u32, 1),
         );
     }
 
     fn inkling2_ctrl_up_blend(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize) {
-        assert!(hidden > 0 && gate_rank > 0 && gate_rank % 2 == 0 && gate_rank <= 256 && w_gf_f16.len * 2 >= 2 * hidden * gate_rank && mid.len >= gate_rank && cur.len >= cur_off + hidden && msg.len >= msg_off + hidden && out.len >= hidden, "chain: inkling2_ctrl_up_blend");
+        self.inkling2_ctrl_up_blend_multi(w_gf_f16, mid, cur, cur_off, 0, msg, msg_off, out, hidden, gate_rank, 1);
+    }
+
+    fn inkling2_ctrl_up_blend_multi(&mut self, w_gf_f16: &DeviceVec, mid: &DeviceVec, cur: &DeviceVec, cur_off: usize, cur_stride: usize, msg: &DeviceVec, msg_off: usize, out: &DeviceVec, hidden: usize, gate_rank: usize, n_streams: usize) {
+        assert!(n_streams > 0 && hidden > 0 && gate_rank > 0 && gate_rank % 2 == 0 && gate_rank <= 256 && w_gf_f16.len * 2 >= n_streams * 2 * hidden * gate_rank && mid.len >= n_streams * gate_rank && cur.len >= cur_off + (n_streams - 1) * cur_stride + hidden && msg.len >= msg_off + n_streams * hidden && out.len >= n_streams * hidden, "chain: inkling2_ctrl_up_blend_multi");
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         self.dispatch_wide(
             "chain-inkling2-ctrl-up-blend",
             INKLING2_CTRL_UP_BLEND,
             [buffer(w_gf_f16), buffer(mid), buffer(cur), buffer(msg), &d, &d, buffer(out), &drw],
-            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32],
-            ((hidden as u32).div_ceil(256), 1, 1),
+            &[hidden as u32, gate_rank as u32, cur_off as u32, msg_off as u32, cur_stride as u32],
+            ((hidden as u32).div_ceil(256), n_streams as u32, 1),
         );
     }
 
@@ -1357,9 +1380,14 @@ impl ChainRecorder for Recorder<'_> {
         } else {
             0
         };
+        let (name, src) = if self.gpu().subgroups32() {
+            ("chain-inkling2-kv-conv-clip-store-sg", INKLING2_KV_CONV_CLIP_STORE_SG)
+        } else {
+            ("chain-inkling2-kv-conv-clip-store", INKLING2_KV_CONV_CLIP_STORE)
+        };
         self.dispatch_wide(
-            "chain-inkling2-kv-conv-clip-store",
-            INKLING2_KV_CONV_CLIP_STORE,
+            name,
+            src,
             [buffer(k_raw), buffer(v_raw), buffer(kv_conv_w), dyn_k.map(buffer).unwrap_or(&d), dyn_v.map(buffer).unwrap_or(&d), buffer(step_params), buffer(kv_hist), buffer(kv_cache)],
             &[n_kv_heads as u32, head_dim as u32, kernel as u32, dyn_mode, kv_cap as u32, qk_clip.to_bits(), rms_eps.to_bits()],
             (n_kv_heads as u32, 1, 1),
@@ -1457,6 +1485,77 @@ impl ChainRecorder for Recorder<'_> {
         false
     }
 
+    fn rmsnorm_multi_q8(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, n_streams: usize, k: usize, separate_w: bool, eps: f32) -> bool {
+        self.rmsnorm_q8_multi(x, w, out, n_streams, k, separate_w, eps)
+    }
+
+    fn matmul_row_of(&mut self, w: &QuantizedTensor, x: &DeviceVec, rows: usize, row_idx: usize, y: &DeviceVec) -> bool {
+        self.matmul_row_of_q8(w, x, rows, row_idx, y)
+    }
+
+    fn capture_recipe(&mut self) {
+        static NO_RECIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !crate::profile::chain_on()
+            && !crate::profile::pieces_on()
+            && !*NO_RECIPE.get_or_init(|| std::env::var_os("OAIY_NO_RECIPE").is_some())
+        {
+            self.capture = Some(Vec::new());
+        }
+    }
+
+    fn take_recipe(&mut self) -> Option<ChainRecipe> {
+        let mut pieces = self.capture.take()?;
+        let ok = self.pooled.is_empty()
+            && self.settles.is_empty()
+            && self.held.is_empty()
+            && self.lists.is_empty()
+            && self.flushed.is_none()
+            && self.timed.is_empty()
+            && self.stamps.is_none()
+            && !crate::profile::chain_on()
+            && !crate::profile::pieces_on();
+        if !ok {
+            return None;
+        }
+        if !self.dispatches.is_empty() {
+            pieces.push(self.dispatches.clone());
+        }
+        Some(ChainRecipe {
+            inner: Arc::new(WgpuRecipe {
+                gpu: Arc::as_ptr(&self.backend.gpu) as usize,
+                pieces,
+            }),
+        })
+    }
+
+    fn replay_recipe(&mut self, recipe: &ChainRecipe) -> bool {
+        if !self.dispatches.is_empty() || crate::profile::chain_on() || crate::profile::pieces_on() {
+            return false;
+        }
+        let Some(r) = recipe.inner.downcast_ref::<WgpuRecipe>() else {
+            return false;
+        };
+        if r.gpu != Arc::as_ptr(&self.backend.gpu) as usize {
+            return false;
+        }
+        if let Some((last, head)) = r.pieces.split_last() {
+            for piece in head {
+                if self.fed() {
+                    if self.hold {
+                        self.lists.push(piece.clone());
+                    } else {
+                        self.gpu().feed(piece.clone());
+                    }
+                } else {
+                    self.dispatches = piece.clone();
+                    self.submit_piece();
+                }
+            }
+            self.dispatches = last.clone();
+        }
+        true
+    }
+
     fn read_range(&mut self, v: &DeviceVec, offset: usize, len: usize) {
         assert!(offset + len <= v.len, "chain: reading {len} at {offset} of {}", v.len);
         let staging = self.gpu().staging(((len.max(1) * 4) as u64).next_power_of_two().max(256));
@@ -1511,8 +1610,13 @@ impl<'a> Recorder<'a> {
             let i = self.next_stamp();
             let timestamp_writes = self.stamp_writes(i);
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes });
+            let mut last_pipe: Option<*const wgpu::ComputePipeline> = None;
             for (pipeline, group, (x, y, z)) in &self.dispatches {
-                pass.set_pipeline(pipeline);
+                let ptr = Arc::as_ptr(pipeline);
+                if last_pipe != Some(ptr) {
+                    pass.set_pipeline(pipeline);
+                    last_pipe = Some(ptr);
+                }
                 pass.set_bind_group(0, group, &[]);
                 pass.dispatch_workgroups(*x, *y, *z);
             }

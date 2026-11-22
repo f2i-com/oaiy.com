@@ -501,12 +501,14 @@ fn iq4_byte(k: u32) -> u32 {
     let ww = select(w01, w23, (k & 8u) != 0u);
     return (ww >> ((k & 3u) * 8u)) & 0xffu;
 }
-fn iq4_f4(q: u32) -> vec4<f32> {
-    let packed = iq4_byte(q & 15u)
+fn iq4_pack(q: u32) -> u32 {
+    return iq4_byte(q & 15u)
         | (iq4_byte((q >> 8u) & 15u) << 8u)
         | (iq4_byte((q >> 16u) & 15u) << 16u)
         | (iq4_byte((q >> 24u) & 15u) << 24u);
-    return i8x4_f4(packed);
+}
+fn iq4_f4(q: u32) -> vec4<f32> {
+    return i8x4_f4(iq4_pack(q));
 }
 "#;
 
@@ -590,23 +592,55 @@ fn job_ids(i: usize, rows: usize, skip: bool) -> String {
 /// The first kernel gave an output row to 16 threads by sixteenths of its width, each decoding eight weights at a
 /// call into an array and reading x one at a time: a Flash-Next layer's ten experts for a step's one row took 77 us
 /// (1.3 TFLOPS), and this one 0.049 with 32 lanes for every width.
-fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
+/// Subgroup reduction of `a0` across `lanes` (8, 16, or 32) lanes of the same 32-lane subgroup (zero shared memory,
+/// zero workgroup barriers). Must execute uniformly across every lane in the subgroup.
+fn sg_reduce_a0(lanes: usize) -> &'static str {
+    match lanes {
+        8 => "    a0 += subgroupShuffleXor(a0, 1u);\n    a0 += subgroupShuffleXor(a0, 2u);\n    a0 += subgroupShuffleXor(a0, 4u);\n",
+        16 => "    a0 += subgroupShuffleXor(a0, 1u);\n    a0 += subgroupShuffleXor(a0, 2u);\n    a0 += subgroupShuffleXor(a0, 4u);\n    a0 += subgroupShuffleXor(a0, 8u);\n",
+        32 => "    a0 = subgroupAdd(a0);\n",
+        _ => unreachable!("lanes must be 8, 16, or 32"),
+    }
+}
+
+fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups: bool) -> String {
     assert!((1..=FEW_MAX).contains(&rows), "a block of 1 to {FEW_MAX} rows");
     assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
     if matches!(kind, Kind::IQ4_NL | Kind::Q8_0) {
-        return few_source_32(kind, rows, lanes, skip);
+        return few_source_32(kind, rows, lanes, skip, subgroups);
     }
     if kind != Kind::Q2_0 {
-        return few_source_grid(kind, rows, lanes, skip);
+        return few_source_grid(kind, rows, lanes, skip, subgroups);
     }
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
-    let ids = each(&|i| job_ids(i, rows, skip));
+    let mode_xr = if rows == 1 {
+        "    let down_gu = p[0].w == 2u;\n    let xb0 = select(jobs[2u * select(j0, 0u, !on0) + 1u], blk, down_gu) * (k / 4u);\n"
+    } else {
+        ""
+    };
+    let ids = if rows == 1 {
+        let on = if skip { "j0 != 0xffffffffu && jobs[2u * select(j0, 0u, j0 == 0xffffffffu)] != 0xffffffffu" } else { "j0 != 0xffffffffu" };
+        format!("    var j0 = blk;\n    if (!identity) {{ j0 = order[blk]; }}\n    let on0 = {on};\n{mode_xr}    var a0 = 0.0;\n")
+    } else {
+        each(&|i| job_ids(i, rows, skip))
+    };
+    let rb_eff = if rows == 1 {
+        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+    } else {
+        "    let rb_eff = rb;\n"
+    };
     let sums = each(&|i| {
         format!("            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u])); }}\n")
     });
-    let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    // (a row of the block's sum by a lane of its own: lane i adds row i's, the lanes in order)
-    let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    let use_sg = rows == 1 && subgroups;
+    let red_decl = if use_sg { String::new() } else { format!("// each thread's sums, [output row][lane][row of x]\nvar<workgroup> red: array<f32, {}>;\n", 256 * rows) };
+    let epilogue = if use_sg {
+        format!("{}    if (live && lane == 0u) {{\n        y[j0 * n + row] = a0;\n    }}\n", sg_reduce_a0(lanes))
+    } else {
+        let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
+        let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+        format!("{store}    workgroupBarrier();\n    if (live) {{\n{out}    }}\n")
+    };
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
@@ -616,28 +650,26 @@ fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-// each thread's sums, [output row][lane][row of x]
-var<workgroup> red: array<f32, {red_len}>;
-
+{red_decl}
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = p[0].x;
     let k = p[0].y;
     let rw = p[0].z;
-    let identity = p[0].w == 1u;
+    let identity = p[0].w != 0u;
     let blk = p[1].y + wg.z;
     let slot = t / {lanes}u;
     let lane = t % {lanes}u;
 {ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
-    let kw = k / 16u;
+{rb_eff}    let kw = k / 16u;
     if (live) {{
         for (var wi = lane; wi < kw; wi += {lanes}u) {{
             // Q2_0: a word 16 weights' codes (weight i its bits 2 i: -1, 0, 1 or 2 times its block's scale), a block
             // 64 weights, the blocks' scales f16 after the codes, two a word
-            let w = vec4<u32>(words[rb + wi]);
-            let d2 = unpack2x16float(words[rb + kw + wi / 8u]);
+            let w = vec4<u32>(words[rb_eff + wi]);
+            let d2 = unpack2x16float(words[rb_eff + kw + wi / 8u]);
             let d = select(d2.x, d2.y, ((wi >> 2u) & 1u) == 1u);
             let c0 = vec4<f32>((w >> vec4<u32>(0u, 2u, 4u, 6u)) & vec4<u32>(3u)) - 1.0;
             let c1 = vec4<f32>((w >> vec4<u32>(8u, 10u, 12u, 14u)) & vec4<u32>(3u)) - 1.0;
@@ -646,30 +678,48 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             let at = wi * 4u;
 {sums}        }}
     }}
-{store}    workgroupBarrier();
-    if (live) {{
-{out}    }}
-}}
+{epilogue}}}
 "#,
-        red_len = 256 * rows,
         per = 256 / lanes,
     )
 }
 
 /// [`few_source`] for 32-weight block types (`IQ4_NL` = 5 words/block, `Q8_0` = 9 words/block): each lane decodes one
 /// full 32-weight block per iteration into eight `vec4<f32>` vectors and accumulates across all rows in the block.
-fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
+fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups: bool) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
-    let ids = each(&|i| job_ids(i, rows, skip));
+    let mode_xr = if rows == 1 {
+        "    let down_gu = p[0].w == 2u;\n    let xb0 = select(jobs[2u * select(j0, 0u, !on0) + 1u], blk, down_gu) * (k / 4u);\n"
+    } else {
+        ""
+    };
+    let ids = if rows == 1 {
+        let on = if skip { "j0 != 0xffffffffu && jobs[2u * select(j0, 0u, j0 == 0xffffffffu)] != 0xffffffffu" } else { "j0 != 0xffffffffu" };
+        format!("    var j0 = blk;\n    if (!identity) {{ j0 = order[blk]; }}\n    let on0 = {on};\n{mode_xr}    var a0 = 0.0;\n")
+    } else {
+        each(&|i| job_ids(i, rows, skip))
+    };
+    let rb_eff = if rows == 1 {
+        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+    } else {
+        "    let rb_eff = rb;\n"
+    };
     let sums = each(&|i| {
         format!(
             "            if (on{i}) {{ a{i} += d * (dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]) + dot(c2, x[xb{i} + at + 2u]) + dot(c3, x[xb{i} + at + 3u]) + dot(c4, x[xb{i} + at + 4u]) + dot(c5, x[xb{i} + at + 5u]) + dot(c6, x[xb{i} + at + 6u]) + dot(c7, x[xb{i} + at + 7u])); }}\n"
         )
     });
-    let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    let out = each(&|i| {
-        format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n")
-    });
+    let use_sg = rows == 1 && subgroups;
+    let red_decl = if use_sg { String::new() } else { format!("var<workgroup> red: array<f32, {}>;\n", 256 * rows) };
+    let epilogue = if use_sg {
+        format!("{}    if (live && lane == 0u) {{\n        y[j0 * n + row] = a0;\n    }}\n", sg_reduce_a0(lanes))
+    } else {
+        let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
+        let out = each(&|i| {
+            format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n")
+        });
+        format!("{store}    workgroupBarrier();\n    if (live) {{\n{out}    }}\n")
+    };
     let use_iq4_lut = kind == Kind::IQ4_NL && rows > 1;
     let lut_decl = if use_iq4_lut {
         "var<workgroup> iq4_lut: array<f32, 16>;\n"
@@ -687,7 +737,7 @@ fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
         ""
     };
     let decode_block = match kind {
-        Kind::IQ4_NL if use_iq4_lut => r#"            let bw = rb + bi * 5u;
+        Kind::IQ4_NL if use_iq4_lut => r#"            let bw = rb_eff + bi * 5u;
             let d = unpack2x16float(words[bw]).x;
             let w0 = words[bw + 1u];
             let w1 = words[bw + 2u];
@@ -701,7 +751,7 @@ fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
             let c5 = iq4_lut_f4((w1 >> 4u) & 0x0f0f0f0fu);
             let c6 = iq4_lut_f4((w2 >> 4u) & 0x0f0f0f0fu);
             let c7 = iq4_lut_f4((w3 >> 4u) & 0x0f0f0f0fu);"#,
-        Kind::IQ4_NL => r#"            let bw = rb + bi * 5u;
+        Kind::IQ4_NL => r#"            let bw = rb_eff + bi * 5u;
             let d = unpack2x16float(words[bw]).x;
             let w0 = words[bw + 1u];
             let w1 = words[bw + 2u];
@@ -715,7 +765,7 @@ fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
             let c5 = iq4_f4((w1 >> 4u) & 0x0f0f0f0fu);
             let c6 = iq4_f4((w2 >> 4u) & 0x0f0f0f0fu);
             let c7 = iq4_f4((w3 >> 4u) & 0x0f0f0f0fu);"#,
-        Kind::Q8_0 => r#"            let bw = rb + bi * 9u;
+        Kind::Q8_0 => r#"            let bw = rb_eff + bi * 9u;
             let d = unpack2x16float(words[bw]).x;
             let c0 = i8x4_f4(words[bw + 1u]);
             let c1 = i8x4_f4(words[bw + 2u]);
@@ -736,35 +786,288 @@ fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-var<workgroup> red: array<f32, {red_len}>;
-{lut_decl}{helpers}{lut_fn}
+{red_decl}{lut_decl}{helpers}{lut_fn}
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
 {lut_init}    let n = p[0].x;
     let k = p[0].y;
     let rw = p[0].z;
-    let identity = p[0].w == 1u;
+    let identity = p[0].w != 0u;
     let blk = p[1].y + wg.z;
     let slot = t / {lanes}u;
     let lane = t % {lanes}u;
 {ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
-    let nblocks = k / 32u;
+{rb_eff}    let nblocks = k / 32u;
     if (live) {{
         for (var bi = lane; bi < nblocks; bi += {lanes}u) {{
 {decode_block}
             let at = bi * 8u;
 {sums}        }}
     }}
-{store}    workgroupBarrier();
-    if (live) {{
-{out}    }}
-}}
+{epilogue}}}
 "#,
-        red_len = 256 * rows,
         per = 256 / lanes,
         helpers = I8_AND_IQ4_HELPERS,
+    )
+}
+
+/// Single-row (`rows == 1`) DP4A `dot4I8Packed` kernel for `IQ4_NL` and `Q8_0` MoE experts on devices with 32-lane
+/// subgroups and native packed int8 dot products: reads pre-quantized Q8_0 activations (`x8` at binding 1, scales at
+/// `vec4` index `p[1].z`), uses hardware `dot4I8Packed` directly (zero f32 weight dequantization), and reduces across
+/// `lanes` via `subgroupShuffleXor`/`subgroupAdd` with zero workgroup memory and zero barriers.
+/// `p[0].w == 2u` reads down-pass `(mat = jobs[4*blk] >> 1, xr = blk)` directly from `jobs_gu`.
+fn few_source_32_q8(kind: Kind, lanes: usize, skip: bool) -> String {
+    assert!(matches!(kind, Kind::IQ4_NL | Kind::Q8_0), "few_source_32_q8 only supports IQ4_NL and Q8_0");
+    assert!(matches!(lanes, 8 | 16 | 32), "8, 16 or 32 lanes a row");
+    let on = if skip {
+        "j0 != 0xffffffffu && jobs[2u * select(j0, 0u, j0 == 0xffffffffu)] != 0xffffffffu"
+    } else {
+        "j0 != 0xffffffffu"
+    };
+    let dot_block = match kind {
+        Kind::IQ4_NL => r#"            let bw = rb_eff + bi * 5u;
+            let dw = unpack2x16float(words[bw]).x;
+            let w0 = words[bw + 1u];
+            let w1 = words[bw + 2u];
+            let w2 = words[bw + 3u];
+            let w3 = words[bw + 4u];
+            let dp = dot4I8Packed(iq4_pack(w0 & 0x0f0f0f0fu), xlo.x)
+                + dot4I8Packed(iq4_pack(w1 & 0x0f0f0f0fu), xlo.y)
+                + dot4I8Packed(iq4_pack(w2 & 0x0f0f0f0fu), xlo.z)
+                + dot4I8Packed(iq4_pack(w3 & 0x0f0f0f0fu), xlo.w)
+                + dot4I8Packed(iq4_pack((w0 >> 4u) & 0x0f0f0f0fu), xhi.x)
+                + dot4I8Packed(iq4_pack((w1 >> 4u) & 0x0f0f0f0fu), xhi.y)
+                + dot4I8Packed(iq4_pack((w2 >> 4u) & 0x0f0f0f0fu), xhi.z)
+                + dot4I8Packed(iq4_pack((w3 >> 4u) & 0x0f0f0f0fu), xhi.w);
+            a0 += dw * dx * f32(dp);"#,
+        Kind::Q8_0 => r#"            let bw = rb_eff + bi * 9u;
+            let dw = unpack2x16float(words[bw]).x;
+            let dp = dot4I8Packed(words[bw + 1u], xlo.x)
+                + dot4I8Packed(words[bw + 2u], xlo.y)
+                + dot4I8Packed(words[bw + 3u], xlo.z)
+                + dot4I8Packed(words[bw + 4u], xlo.w)
+                + dot4I8Packed(words[bw + 5u], xhi.x)
+                + dot4I8Packed(words[bw + 6u], xhi.y)
+                + dot4I8Packed(words[bw + 7u], xhi.z)
+                + dot4I8Packed(words[bw + 8u], xhi.w);
+            a0 += dw * dx * f32(dp);"#,
+        _ => unreachable!(),
+    };
+    let helpers = if kind == Kind::IQ4_NL { I8_AND_IQ4_HELPERS } else { "" };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(3) var<storage, read> order: array<u32>;
+@group(0) @binding(6) var<storage, read_write> y: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+{helpers}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let n = p[0].x;
+    let k = p[0].y;
+    let rw = p[0].z;
+    let down_gu = p[0].w == 2u;
+    let identity = p[0].w != 0u;
+    let blk = p[1].y + wg.z;
+    let xs_at = p[1].z;
+    let slot = t / {lanes}u;
+    let lane = t % {lanes}u;
+    var j0 = blk;
+    if (!identity) {{ j0 = order[blk]; }}
+    let on0 = {on};
+    let xr = select(jobs[2u * select(j0, 0u, !on0) + 1u], blk, down_gu);
+    var a0 = 0.0;
+    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
+    let live = on0 && row < n;
+    let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
+    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);
+    let k32 = k / 32u;
+    let k16 = k / 16u;
+    if (live) {{
+        for (var bi = lane; bi < k32; bi += {lanes}u) {{
+            let xlo = x8[xr * k16 + bi * 2u];
+            let xhi = x8[xr * k16 + bi * 2u + 1u];
+            let dx = bitcast<vec4<f32>>(x8[xs_at + xr * k32 + bi]).x;
+{dot_block}
+        }}
+    }}
+{sg_red}    if (live && lane == 0u) {{
+        y[j0 * n + row] = a0;
+    }}
+}}
+"#,
+        per = 256 / lanes,
+        sg_red = sg_reduce_a0(lanes),
+    )
+}
+
+/// Fused single-token (`rows == 1`, `ff % 32 == 0`, non-cached) `gate + up + SiTU/SwiGLU + Q8_0 quantize`
+/// DP4A kernel for `IQ4_NL` / `Q8_0` MoE experts:
+/// * Each workgroup computes one 32-element Q8_0 output block (`32` rows × `8` lanes = `256` threads)
+///   for one routed expert (`wg.z`), loading `x8` ONCE for BOTH `gate` (`2*e`) and `up` (`2*e + 1`).
+/// * Reduces `ag` and `au` via `subgroupShuffleXor` (0 barriers), computes `SiTU` or `SwiGLU` in registers,
+///   then quantizes the 32 activations straight into `q` (binding 6, `QUANT_Q8_LANES` layout) with 1 barrier.
+/// * Eliminates `quant-moe-situ-q8` / `quant-moe-swiglu-q8` dispatch AND all `out_gu` global traffic!
+/// `p[0]`: ff, hidden, rw, mwords; `p[1]`: xs_at_in, xs_at_out, beta_bits, lbeta_bits.
+fn few_source_32_q8_gu_act(kind: Kind, situ: bool) -> String {
+    assert!(matches!(kind, Kind::IQ4_NL | Kind::Q8_0), "few_source_32_q8_gu_act only supports IQ4_NL and Q8_0");
+    let dot_pair = match kind {
+        Kind::IQ4_NL => r#"        let bg = rb_g + bi * 5u;
+        let dg = unpack2x16float(words[bg]).x;
+        let g0 = words[bg + 1u];
+        let g1 = words[bg + 2u];
+        let g2 = words[bg + 3u];
+        let g3 = words[bg + 4u];
+        let dpg = dot4I8Packed(iq4_pack(g0 & 0x0f0f0f0fu), xlo.x)
+            + dot4I8Packed(iq4_pack(g1 & 0x0f0f0f0fu), xlo.y)
+            + dot4I8Packed(iq4_pack(g2 & 0x0f0f0f0fu), xlo.z)
+            + dot4I8Packed(iq4_pack(g3 & 0x0f0f0f0fu), xlo.w)
+            + dot4I8Packed(iq4_pack((g0 >> 4u) & 0x0f0f0f0fu), xhi.x)
+            + dot4I8Packed(iq4_pack((g1 >> 4u) & 0x0f0f0f0fu), xhi.y)
+            + dot4I8Packed(iq4_pack((g2 >> 4u) & 0x0f0f0f0fu), xhi.z)
+            + dot4I8Packed(iq4_pack((g3 >> 4u) & 0x0f0f0f0fu), xhi.w);
+        ag += dg * dx * f32(dpg);
+
+        let bu = rb_u + bi * 5u;
+        let du = unpack2x16float(words[bu]).x;
+        let u0 = words[bu + 1u];
+        let u1 = words[bu + 2u];
+        let u2 = words[bu + 3u];
+        let u3 = words[bu + 4u];
+        let dpu = dot4I8Packed(iq4_pack(u0 & 0x0f0f0f0fu), xlo.x)
+            + dot4I8Packed(iq4_pack(u1 & 0x0f0f0f0fu), xlo.y)
+            + dot4I8Packed(iq4_pack(u2 & 0x0f0f0f0fu), xlo.z)
+            + dot4I8Packed(iq4_pack(u3 & 0x0f0f0f0fu), xlo.w)
+            + dot4I8Packed(iq4_pack((u0 >> 4u) & 0x0f0f0f0fu), xhi.x)
+            + dot4I8Packed(iq4_pack((u1 >> 4u) & 0x0f0f0f0fu), xhi.y)
+            + dot4I8Packed(iq4_pack((u2 >> 4u) & 0x0f0f0f0fu), xhi.z)
+            + dot4I8Packed(iq4_pack((u3 >> 4u) & 0x0f0f0f0fu), xhi.w);
+        au += du * dx * f32(dpu);"#,
+        Kind::Q8_0 => r#"        let bg = rb_g + bi * 9u;
+        let dg = unpack2x16float(words[bg]).x;
+        let dpg = dot4I8Packed(words[bg + 1u], xlo.x)
+            + dot4I8Packed(words[bg + 2u], xlo.y)
+            + dot4I8Packed(words[bg + 3u], xlo.z)
+            + dot4I8Packed(words[bg + 4u], xlo.w)
+            + dot4I8Packed(words[bg + 5u], xhi.x)
+            + dot4I8Packed(words[bg + 6u], xhi.y)
+            + dot4I8Packed(words[bg + 7u], xhi.z)
+            + dot4I8Packed(words[bg + 8u], xhi.w);
+        ag += dg * dx * f32(dpg);
+
+        let bu = rb_u + bi * 9u;
+        let du = unpack2x16float(words[bu]).x;
+        let dpu = dot4I8Packed(words[bu + 1u], xlo.x)
+            + dot4I8Packed(words[bu + 2u], xlo.y)
+            + dot4I8Packed(words[bu + 3u], xlo.z)
+            + dot4I8Packed(words[bu + 4u], xlo.w)
+            + dot4I8Packed(words[bu + 5u], xhi.x)
+            + dot4I8Packed(words[bu + 6u], xhi.y)
+            + dot4I8Packed(words[bu + 7u], xhi.z)
+            + dot4I8Packed(words[bu + 8u], xhi.w);
+        au += du * dx * f32(dpu);"#,
+        _ => unreachable!(),
+    };
+    let act_expr = if situ {
+        r#"        let beta = bitcast<f32>(p[1].z);
+        let lbeta = bitcast<f32>(p[1].w);
+        let g_cap = beta * tanh(clamp(ag / beta, -20.0, 20.0));
+        let sig = 1.0 / (1.0 + exp(-ag));
+        let u_cap = lbeta * tanh(clamp(au / lbeta, -20.0, 20.0));
+        act[slot] = g_cap * sig * u_cap;"#
+    } else {
+        "        act[slot] = (ag / (1.0 + exp(-ag))) * au;"
+    };
+    let helpers = if kind == Kind::IQ4_NL { I8_AND_IQ4_HELPERS } else { "" };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> words: array<u32>;
+@group(0) @binding(1) var<storage, read> x8: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> jobs: array<u32>;
+@group(0) @binding(6) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> act: array<f32, 32>;
+{helpers}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
+    let ff = p[0].x;
+    let k = p[0].y;
+    let rw = p[0].z;
+    let mwords = p[0].w;
+    let xs_in = p[1].x;
+    let xs_out = p[1].y;
+    let pair = wg.z;
+    let g_mat = jobs[4u * pair];
+    let u_mat = jobs[4u * pair + 2u];
+    let xr = jobs[4u * pair + 1u];
+    let slot = t / 8u;
+    let lane = t % 8u;
+    let row = wg.x * 32u + slot;
+    let rb_g = g_mat * mwords + row * rw;
+    let rb_u = u_mat * mwords + row * rw;
+    let k32 = k / 32u;
+    let k16 = k / 16u;
+    var ag = 0.0;
+    var au = 0.0;
+    for (var bi = lane; bi < k32; bi += 8u) {{
+        let xlo = x8[xr * k16 + bi * 2u];
+        let xhi = x8[xr * k16 + bi * 2u + 1u];
+        let dx = bitcast<vec4<f32>>(x8[xs_in + xr * k32 + bi]).x;
+{dot_pair}
+    }}
+    ag += subgroupShuffleXor(ag, 1u);
+    ag += subgroupShuffleXor(ag, 2u);
+    ag += subgroupShuffleXor(ag, 4u);
+    au += subgroupShuffleXor(au, 1u);
+    au += subgroupShuffleXor(au, 2u);
+    au += subgroupShuffleXor(au, 4u);
+    if (lane == 0u) {{
+{act_expr}
+    }}
+    workgroupBarrier();
+    // All 8 warps execute the subgroup ops uniformly; only warp 0 writes the 32-element Q8_0 block.
+    let l = t & 31u;
+    let v = act[l];
+    var amax = abs(v);
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    amax = max(amax, subgroupShuffleXor(amax, 8u));
+    amax = max(amax, subgroupShuffleXor(amax, 16u));
+    let d = amax / 127.0;
+    let inv = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(i32(round(v * inv)), -127, 127);
+    let qb = bitcast<u32>(qv) & 0xffu;
+    let b1 = subgroupShuffleXor(qb, 1u);
+    let q01 = qb | (b1 << 8u);
+    let q23 = subgroupShuffleXor(q01, 2u);
+    let packed = q01 | (q23 << 16u);
+    var hs = qv;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    hs += subgroupShuffleXor(hs, 4u);
+    hs += subgroupShuffleXor(hs, 8u);
+    let other = subgroupShuffleXor(hs, 16u);
+    if (t < 32u) {{
+        let b_out = pair * (ff / 32u) + wg.x;
+        if ((l & 3u) == 0u) {{
+            q[b_out * 8u + (l >> 2u)] = packed;
+        }}
+        if (l == 0u) {{
+            let at = (xs_out + b_out) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }}
+    }}
+}}
+"#
     )
 }
 
@@ -776,13 +1079,34 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 /// for every count of lanes tried, 25 us and a check's four rows 86 where 45: the loop's body four times as long. A
 /// thread taking two or four output rows of a step's one row, x loaded once for them, was no faster either:
 /// DeepSeek-V4.1's six experts' gate and up (5120 to 2304, IQ1_M) 46 and 51 us a pass where 45.
-fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String {
+fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups: bool) -> String {
     let each = |f: &dyn Fn(usize) -> String| (0..rows).map(f).collect::<String>();
-    let ids = each(&|i| job_ids(i, rows, skip));
+    let mode_xr = if rows == 1 {
+        "    let down_gu = p[0].w == 2u;\n    let xb0 = select(jobs[2u * select(j0, 0u, !on0) + 1u], blk, down_gu) * (k / 4u);\n"
+    } else {
+        ""
+    };
+    let ids = if rows == 1 {
+        let on = if skip { "j0 != 0xffffffffu && jobs[2u * select(j0, 0u, j0 == 0xffffffffu)] != 0xffffffffu" } else { "j0 != 0xffffffffu" };
+        format!("    var j0 = blk;\n    if (!identity) {{ j0 = order[blk]; }}\n    let on0 = {on};\n{mode_xr}    var a0 = 0.0;\n")
+    } else {
+        each(&|i| job_ids(i, rows, skip))
+    };
+    let rb_eff = if rows == 1 {
+        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+    } else {
+        "    let rb_eff = rb;\n"
+    };
     let sums = each(&|i| format!("            if (on{i}) {{ a{i} += dot(c0, x[xb{i} + at]) + dot(c1, x[xb{i} + at + 1u]); }}\n"));
-    let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
-    // (a row of the block's sum by a lane of its own: lane i adds row i's, the lanes in order)
-    let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+    let use_sg = rows == 1 && subgroups;
+    let red_decl = if use_sg { String::new() } else { format!("// each thread's sums, [output row][lane][row of x]\nvar<workgroup> red: array<f32, {}>;\n", 256 * rows) };
+    let epilogue = if use_sg {
+        format!("{}    if (live && lane == 0u) {{\n        y[j0 * n + row] = a0;\n    }}\n", sg_reduce_a0(lanes))
+    } else {
+        let store = each(&|i| format!("    red[t * {rows}u + {i}u] = a{i};\n"));
+        let out = each(&|i| format!("        if (lane == {i}u && on{i}) {{\n            var s = 0.0;\n            for (var q = 0u; q < {lanes}u; q++) {{ s += red[(t - {i}u + q) * {rows}u + {i}u]; }}\n            y[j{i} * n + row] = s;\n        }}\n"));
+        format!("{store}    workgroupBarrier();\n    if (live) {{\n{out}    }}\n")
+    };
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> words: array<u32>;
@@ -792,36 +1116,30 @@ fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool) -> String 
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
-// each thread's sums, [output row][lane][row of x]
-var<workgroup> red: array<f32, {red_len}>;
-{decoder}
+{red_decl}{decoder}
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {{
     let n = p[0].x;
     let k = p[0].y;
     let rw = p[0].z;
-    let identity = p[0].w == 1u;
+    let identity = p[0].w != 0u;
     let blk = p[1].y + wg.z;
     let slot = t / {lanes}u;
     let lane = t % {lanes}u;
 {ids}    let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
-    if (live) {{
+{rb_eff}    if (live) {{
         for (var gi = lane; gi < k / 8u; gi += {lanes}u) {{
             let g = gi % 32u;
-            let v = grp(sub_of(rb + (gi / 32u) * BLOCK_WORDS, g / 4u), g % 4u);
+            let v = grp(sub_of(rb_eff + (gi / 32u) * BLOCK_WORDS, g / 4u), g % 4u);
             let c0 = vec4<f32>(v[0], v[1], v[2], v[3]);
             let c1 = vec4<f32>(v[4], v[5], v[6], v[7]);
             let at = gi * 2u;
 {sums}        }}
     }}
-{store}    workgroupBarrier();
-    if (live) {{
-{out}    }}
-}}
+{epilogue}}}
 "#,
-        red_len = 256 * rows,
         per = 256 / lanes,
         decoder = kind.wgsl(),
     )
@@ -989,6 +1307,112 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Fused SwiGLU + Q8_0 quantization (`QUANT_Q8_LANES` layout) for single-token `rows == 1` routed MoE:
+/// 8 lanes per 32-element block, writes packed int8 bytes and scales directly into `q` (binding 6) so
+/// `down` (`few_source_32_q8`) consumes it with zero extra quantization dispatch.
+/// `p[0]`: ff, pairs, xs_at, 0.
+pub(super) const SWIGLU_PAIRS_Q8: &str = r#"
+@group(0) @binding(0) var<storage, read> y4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ff = p[0].x;
+    let pairs = p[0].y;
+    let xs_at = p[0].z;
+    let b_per_pair = ff / 32u;
+    let blocks = pairs * b_per_pair;
+    let t = id.x + id.y * 65535u * 256u;
+    let b = t / 8u;
+    let part = t % 8u;
+    let bb = min(b, blocks - 1u);
+    let pair = bb / b_per_pair;
+    let blk = bb % b_per_pair;
+    let ff4 = ff / 4u;
+    let g = y4[2u * pair * ff4 + blk * 8u + part];
+    let u = y4[(2u * pair + 1u) * ff4 + blk * 8u + part];
+    let v = (g / (vec4<f32>(1.0) + exp(-g))) * u;
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let inv = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * inv)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
+/// Fused Inkling-2 SiTU activation + Q8_0 quantization (`QUANT_Q8_LANES` layout) for single-token routed MoE:
+/// 8 lanes per 32-element block, eliminates both F32 `xh_d` store and separate quantization dispatch.
+/// `p[0]`: ff, pairs, beta bits, linear_beta bits; `p[1].x`: xs_at.
+pub(super) const SITU_PAIRS_Q8: &str = r#"
+@group(0) @binding(0) var<storage, read> y4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let ff = p[0].x;
+    let pairs = p[0].y;
+    let beta = bitcast<f32>(p[0].z);
+    let lbeta = bitcast<f32>(p[0].w);
+    let xs_at = p[1].x;
+    let b_per_pair = ff / 32u;
+    let blocks = pairs * b_per_pair;
+    let t = id.x + id.y * 65535u * 256u;
+    let b = t / 8u;
+    let part = t % 8u;
+    let bb = min(b, blocks - 1u);
+    let pair = bb / b_per_pair;
+    let blk = bb % b_per_pair;
+    let ff4 = ff / 4u;
+    let g = y4[2u * pair * ff4 + blk * 8u + part];
+    let u = y4[(2u * pair + 1u) * ff4 + blk * 8u + part];
+    let g_cap = vec4<f32>(beta) * tanh(clamp(g / beta, vec4<f32>(-20.0), vec4<f32>(20.0)));
+    let sig = vec4<f32>(1.0) / (vec4<f32>(1.0) + exp(-g));
+    let u_cap = vec4<f32>(lbeta) * tanh(clamp(u / lbeta, vec4<f32>(-20.0), vec4<f32>(20.0)));
+    let v = g_cap * sig * u_cap;
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let inv = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * inv)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
 /// Fused routed-expert weighted sum (no shared expert, `rows == 1`) + static causal short conv +
 /// residual add: updates `hist` in place and writes `out[ch] = residual[ch] + static_conv(sum_e w[e]*d[e, ch])`.
 /// Eliminates the `moe-wsum-rows` -> `post-conv-add` serial barrier on all 48 Inkling-2 layers.
@@ -1039,22 +1463,58 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// `skip`: the few rows' kernel skips a job whose matrix is `u32::MAX` (its output rows left as they were): a device
 /// program's candidates the slots do not hold ([`QuantSlots::record_fused`]).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool, lanes: usize, skip: bool) -> (&'static str, &'static str) {
-    type Made = ((Kind, bool, usize, usize, usize, bool, bool), (&'static str, &'static str));
+pub(super) fn kernel(kind: Kind, coop: bool, rows: usize, k: usize, mats: usize, staged: bool, lanes: usize, skip: bool, subgroups: bool) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool, usize, usize, usize, bool, bool, bool), (&'static str, &'static str));
     static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
     // (the tensor cores' kernel is one for every width; the few-row one is written for its lanes a row)
     let lanes = if coop { 0 } else if lanes > 0 { lanes } else { few_lanes(kind, k) };
     let skip = skip && !coop;
-    let key = (kind, coop, rows, lanes, mats, staged, skip);
+    let use_sg = !coop && rows == 1 && subgroups;
+    let key = (kind, coop, rows, lanes, mats, staged, skip, use_sg);
     if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
         return *k;
     }
     let part = if mats > 0 { format!("-{}{mats}", if staged { "staged" } else { "part" }) } else { String::new() };
     let skipping = if skip { "-skipping" } else { "" };
-    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}{part}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}{part}{skipping}", kind.tag()) }.into_boxed_str());
-    let source = if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes, skip) };
+    let sg = if use_sg { "-sg" } else { "" };
+    let name: &'static str = Box::leak(if coop { format!("quant-moe-{}-coop-{rows}{part}", kind.tag()) } else { format!("quant-moe-{}-few-{rows}-{lanes}{part}{skipping}{sg}", kind.tag()) }.into_boxed_str());
+    let source = if coop { coop_source(kind, rows) } else { few_source(kind, rows, lanes, skip, use_sg) };
     let source: &'static str = Box::leak(if mats > 0 { cached_source(source, mats, staged) } else { source }.into_boxed_str());
+    made.push((key, (name, source)));
+    (name, source)
+}
+
+/// Single-row (`rows == 1`) DP4A `dot4I8Packed` MoE kernel (`few_source_32_q8`) for `IQ4_NL` / `Q8_0`.
+pub(super) fn kernel_q8(kind: Kind, lanes: usize, mats: usize, staged: bool, skip: bool) -> (&'static str, &'static str) {
+    type Made = ((Kind, usize, usize, bool, bool), (&'static str, &'static str));
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (kind, lanes, mats, staged, skip);
+    if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
+        return *k;
+    }
+    let part = if mats > 0 { format!("-{}{mats}", if staged { "staged" } else { "part" }) } else { String::new() };
+    let skipping = if skip { "-skipping" } else { "" };
+    let name: &'static str = Box::leak(format!("quant-moe-{}-q8-1-{lanes}{part}{skipping}", kind.tag()).into_boxed_str());
+    let source = few_source_32_q8(kind, lanes, skip);
+    let source: &'static str = Box::leak(if mats > 0 { cached_source(source, mats, staged) } else { source }.into_boxed_str());
+    made.push((key, (name, source)));
+    (name, source)
+}
+
+/// Fused single-row (`rows == 1`) `gate + up + SiTU/SwiGLU + Q8_0 quantize` DP4A MoE kernel.
+pub(super) fn kernel_q8_gu_act(kind: Kind, situ: bool) -> (&'static str, &'static str) {
+    type Made = ((Kind, bool), (&'static str, &'static str));
+    static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (kind, situ);
+    if let Some((_, k)) = made.iter().find(|(k, _)| *k == key) {
+        return *k;
+    }
+    let act = if situ { "situ" } else { "swiglu" };
+    let name: &'static str = Box::leak(format!("quant-moe-{}-q8-gu-{act}", kind.tag()).into_boxed_str());
+    let source: &'static str = Box::leak(few_source_32_q8_gu_act(kind, situ).into_boxed_str());
     made.push((key, (name, source)));
     (name, source)
 }

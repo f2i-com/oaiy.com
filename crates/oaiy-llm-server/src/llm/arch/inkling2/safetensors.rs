@@ -772,8 +772,10 @@ pub fn load_from_safetensors(
                 ctrl_down: ctrl_down.try_into().expect("4 controllers"),
                 ctrl_gain: ctrl_gain.try_into().expect("4 controllers"),
                 ctrl_forget: ctrl_forget.try_into().expect("4 controllers"),
-                ctrl_down_f16: None,
-                ctrl_gf_f16: None,
+                ctrl_down_qkv_f16: None,
+                ctrl_down_ffn_f16: None,
+                ctrl_gf_qkv_f16: None,
+                ctrl_gf_ffn_f16: None,
             });
         }
     }

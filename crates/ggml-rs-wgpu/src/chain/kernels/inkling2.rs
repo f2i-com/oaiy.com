@@ -97,6 +97,95 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Subgroup + `vec4<f32>` version of [`INKLING2_MIX_DEPTH`] for 32-lane subgroup devices and
+/// `hidden % 4 == 0`: fuses `cur` norm + `cur·query` into one pass and computes all `n_blocks`
+/// dot products using `subgroupAdd` with only 2 `workgroupBarrier()`s total (down from up to 89).
+pub(in crate::chain) const INKLING2_MIX_DEPTH_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> blocks4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> cur4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> query4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> out4: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> wsq: array<f32, 8>;
+var<workgroup> wdc: array<f32, 8>;
+var<workgroup> wdot: array<f32, 256>;
+var<workgroup> scores: array<f32, 32>;
+var<workgroup> cur_inv: f32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) warp: u32) {
+    let hidden = p[0].x;
+    let n_blocks = p[0].y;
+    let q_idx = wg.x;
+    if (q_idx >= p[0].z) { return; }
+
+    let h4 = hidden / 4u;
+    let q_off4 = q_idx * h4;
+    let inv_sqrt_d = inverseSqrt(f32(hidden));
+
+    var sq = 0.0;
+    var dc = 0.0;
+    for (var i = li; i < h4; i += 256u) {
+        let cv = cur4[i];
+        let qv = query4[q_off4 + i];
+        sq += dot(cv, cv);
+        dc += dot(cv, qv);
+    }
+    sq = subgroupAdd(sq);
+    dc = subgroupAdd(dc);
+    if (lane == 0u) {
+        wsq[warp] = sq;
+        wdc[warp] = dc;
+    }
+
+    for (var s = 0u; s < n_blocks; s++) {
+        let b_off4 = s * h4;
+        var d = 0.0;
+        for (var i = li; i < h4; i += 256u) {
+            d += dot(blocks4[b_off4 + i], query4[q_off4 + i]);
+        }
+        d = subgroupAdd(d);
+        if (lane == 0u) { wdot[s * 8u + warp] = d; }
+    }
+    workgroupBarrier();
+
+    if (li == 0u) {
+        let tot_sq = ((wsq[0] + wsq[1]) + (wsq[2] + wsq[3])) + ((wsq[4] + wsq[5]) + (wsq[6] + wsq[7]));
+        let inv = select(1.0, inverseSqrt(tot_sq / f32(hidden) + 1e-6), p[0].w == 0u);
+        cur_inv = inv;
+        let tot_dc = ((wdc[0] + wdc[1]) + (wdc[2] + wdc[3])) + ((wdc[4] + wdc[5]) + (wdc[6] + wdc[7]));
+        scores[n_blocks] = (tot_dc * inv) * inv_sqrt_d;
+        for (var s = 0u; s < n_blocks; s++) {
+            let b = s * 8u;
+            let ds = ((wdot[b] + wdot[b + 1u]) + (wdot[b + 2u] + wdot[b + 3u]))
+                + ((wdot[b + 4u] + wdot[b + 5u]) + (wdot[b + 6u] + wdot[b + 7u]));
+            scores[s] = ds * inv_sqrt_d;
+        }
+        var mx = scores[0];
+        for (var s = 1u; s <= n_blocks; s++) { mx = max(mx, scores[s]); }
+        var sum_e = 0.0;
+        for (var s = 0u; s <= n_blocks; s++) {
+            let e = exp(scores[s] - mx);
+            scores[s] = e;
+            sum_e += e;
+        }
+        let inv_sum = 1.0 / sum_e;
+        for (var s = 0u; s <= n_blocks; s++) { scores[s] *= inv_sum; }
+    }
+    workgroupBarrier();
+
+    let w_cur = scores[n_blocks] * cur_inv;
+    for (var i = li; i < h4; i += 256u) {
+        var acc = cur4[i] * w_cur;
+        for (var s = 0u; s < n_blocks; s++) {
+            acc += blocks4[s * h4 + i] * scores[s];
+        }
+        out4[q_off4 + i] = acc;
+    }
+}
+"#;
+
 /// Concatenated unweighted RMSNorm of `(cur[cur_off..], msg[msg_off..])` into `out[0..2*hidden]`.
 /// Grid: `(2, 1, 1)`. `p[0]`: hidden, cur_off, msg_off, 0.
 pub(in crate::chain) const INKLING2_CONTROL_CAT: &str = r#"
@@ -514,6 +603,47 @@ fn main(@builtin(local_invocation_index) li: u32) {
 }
 "#;
 
+/// Subgroup version of [`INKLING2_BLOCK_PUSH`]: 1 `workgroupBarrier()` instead of 9.
+pub(in crate::chain) const INKLING2_BLOCK_PUSH_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> inp_sa: array<f32>;
+@group(0) @binding(1) var<storage, read> attn_conv: array<f32>;
+@group(0) @binding(6) var<storage, read_write> blocks: array<f32>;
+@group(0) @binding(7) var<storage, read_write> ffn_inp: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> wpart: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) warp: u32) {
+    let hidden = p[0].x;
+    let slot = p[0].y;
+    let skip_ffn = p[0].z != 0u;
+    if (slot == 0xffffffffu) {
+        for (var i = li; i < hidden; i += 256u) {
+            ffn_inp[i] = inp_sa[i] + attn_conv[i];
+        }
+        return;
+    }
+    var sq = 0.0;
+    for (var i = li; i < hidden; i += 256u) {
+        let v = inp_sa[i];
+        sq += v * v;
+    }
+    sq = subgroupAdd(sq);
+    if (lane == 0u) { wpart[warp] = sq; }
+    workgroupBarrier();
+    let total = ((wpart[0] + wpart[1]) + (wpart[2] + wpart[3])) + ((wpart[4] + wpart[5]) + (wpart[6] + wpart[7]));
+    let inv = inverseSqrt(total / f32(hidden) + 1e-6);
+    let b_off = slot * hidden;
+    for (var i = li; i < hidden; i += 256u) {
+        blocks[b_off + i] = inp_sa[i] * inv;
+        if (!skip_ffn) {
+            ffn_inp[i] = attn_conv[i];
+        }
+    }
+}
+"#;
+
 /// Final logit softcapping in place: `logits[i] = cap * tanh(clamp(logits[i] / cap, -20.0, 20.0))`.
 /// `p[0]`: len, cap bits.
 pub(in crate::chain) const INKLING2_SOFTCAP: &str = r#"
@@ -530,9 +660,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// Fused cross-pass controller up-projection (`ctrl_gain` + `ctrl_forget`, stacked F16 `[2 * hidden, gate_rank]`)
-/// and tanh-gated blend: `out[c] = (1 - tanh(forget[c])) * cur[cur_off + c] + tanh(gain[c]) * msg[msg_off + c]`.
-/// Replaces 3 dispatches (`ctrl_gain`, `ctrl_forget`, `control_blend`) with 1.
-/// `p[0]`: hidden, gate_rank (even, <= 256), cur_off, msg_off.
+/// and tanh-gated blend: `out[s * hidden + c] = (1 - tanh(forget)) * cur[cur_off + s * cur_stride + c] + tanh(gain) * msg[msg_off + s * hidden + c]`.
+/// Supports batched `wg.y` streams (`n_streams = 1` or `3`); replaces 3..9 dispatches with 1.
+/// `p[0]`: hidden, gate_rank (even, <= 256), cur_off, msg_off; `p[1]`: cur_stride, 0, 0, 0.
 pub(in crate::chain) const INKLING2_CTRL_UP_BLEND: &str = r#"
 @group(0) @binding(0) var<storage, read> w_gf: array<u32>;
 @group(0) @binding(1) var<storage, read> mid: array<f32>;
@@ -547,15 +677,16 @@ var<workgroup> smid: array<f32, 256>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let hidden = p[0].x;
     let rank = p[0].y;
+    let s = wg.y;
     if (li < rank) {
-        smid[li] = mid[li];
+        smid[li] = mid[s * rank + li];
     }
     workgroupBarrier();
     let c = wg.x * 256u + li;
     if (c >= hidden) { return; }
     let rw = rank / 2u;
-    let g_base = c * rw;
-    let f_base = (hidden + c) * rw;
+    let g_base = (s * 2u * hidden + c) * rw;
+    let f_base = (s * 2u * hidden + hidden + c) * rw;
     var g = 0.0;
     var f = 0.0;
     for (var k = 0u; k < rw; k++) {
@@ -568,7 +699,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let gt = tanh(clamp(g, -20.0, 20.0));
     let ft = tanh(clamp(f, -20.0, 20.0));
-    out[c] = (1.0 - ft) * cur[p[0].z + c] + gt * msg[p[0].w + c];
+    out[s * hidden + c] = (1.0 - ft) * cur[p[0].z + s * p[1].x + c] + gt * msg[p[0].w + s * hidden + c];
 }
 "#;
 
@@ -673,6 +804,113 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let k_fac = min(1.0, qk_clip / (sqrt(pk[0]) + 1e-6));
     let v_inv = inverseSqrt(pv[0] / f32(head_dim) + rms_eps);
+    let write_row = step_params[0] % kv_cap;
+    let dst_k = write_row * kv_dim + h * head_dim;
+    let dst_v = kv_cap * kv_dim + dst_k;
+    for (var d = li; d < head_dim; d += 128u) {
+        kv_cache[dst_k + d] = tk[d] * k_fac;
+        kv_cache[dst_v + d] = tv[d] * v_inv;
+    }
+}
+"#;
+
+/// Subgroup version of [`INKLING2_KV_CONV_CLIP_STORE`] (4 warps = 128 threads): 1 `workgroupBarrier()`
+/// instead of 8.
+pub(in crate::chain) const INKLING2_KV_CONV_CLIP_STORE_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> k_raw: array<f32>;
+@group(0) @binding(1) var<storage, read> v_raw: array<f32>;
+@group(0) @binding(2) var<storage, read> kv_w: array<f32>;
+@group(0) @binding(3) var<storage, read> dyn_k: array<f32>;
+@group(0) @binding(4) var<storage, read> dyn_v: array<f32>;
+@group(0) @binding(5) var<storage, read> step_params: array<u32>;
+@group(0) @binding(6) var<storage, read_write> kv_hist: array<f32>;
+@group(0) @binding(7) var<storage, read_write> kv_cache: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> wpk: array<f32, 4>;
+var<workgroup> wpv: array<f32, 4>;
+var<workgroup> tk: array<f32, 256>;
+var<workgroup> tv: array<f32, 256>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) warp: u32) {
+    let n_kv = p[0].x;
+    let h = wg.x;
+    if (h >= n_kv) { return; }
+    let head_dim = p[0].y;
+    let k = p[0].z;
+    let past = k - 1u;
+    let dyn_mode = p[0].w;
+    let is_dyn = dyn_mode != 0u;
+    let packed_dyn = dyn_mode == 2u;
+    let kv_cap = p[1].x;
+    let qk_clip = bitcast<f32>(p[1].y);
+    let rms_eps = bitcast<f32>(p[1].z);
+
+    let kv_dim = n_kv * head_dim;
+    let v_w_off = kv_dim * k;
+    let v_h_off = past * kv_dim;
+    let conv_scale = select(inverseSqrt(f32(k + 1u)), inverseSqrt(f32(2u * k + 1u)), is_dyn);
+
+    var ksq = 0.0;
+    var vsq = 0.0;
+    for (var d = li; d < head_dim; d += 128u) {
+        let ch = h * head_dim + d;
+        let kc = k_raw[ch];
+        let vc = v_raw[ch];
+        var ak = 0.0;
+        var av = 0.0;
+        if (!is_dyn) {
+            for (var j = 0u; j < past; j++) {
+                ak += kv_hist[j * kv_dim + ch] * kv_w[ch * k + j];
+                av += kv_hist[v_h_off + j * kv_dim + ch] * kv_w[v_w_off + ch * k + j];
+            }
+            ak += kc * kv_w[ch * k + past];
+            av += vc * kv_w[v_w_off + ch * k + past];
+        } else if (packed_dyn) {
+            for (var j = 0u; j < past; j++) {
+                let lag = k - 1u - j;
+                ak += kv_hist[j * kv_dim + ch] * (kv_w[ch * k + j] + k_raw[kv_dim + h * k + lag]);
+                av += kv_hist[v_h_off + j * kv_dim + ch] * (kv_w[v_w_off + ch * k + j] + v_raw[kv_dim + h * k + lag]);
+            }
+            ak += kc * (kv_w[ch * k + past] + k_raw[kv_dim + h * k]);
+            av += vc * (kv_w[v_w_off + ch * k + past] + v_raw[kv_dim + h * k]);
+        } else {
+            for (var j = 0u; j < past; j++) {
+                let lag = k - 1u - j;
+                ak += kv_hist[j * kv_dim + ch] * (kv_w[ch * k + j] + dyn_k[h * k + lag]);
+                av += kv_hist[v_h_off + j * kv_dim + ch] * (kv_w[v_w_off + ch * k + j] + dyn_v[h * k + lag]);
+            }
+            ak += kc * (kv_w[ch * k + past] + dyn_k[h * k]);
+            av += vc * (kv_w[v_w_off + ch * k + past] + dyn_v[h * k]);
+        }
+        let ko = (ak + kc) * conv_scale;
+        let vo = (av + vc) * conv_scale;
+        tk[d] = ko;
+        tv[d] = vo;
+        ksq += ko * ko;
+        vsq += vo * vo;
+
+        for (var j = 0u; j + 1u < past; j++) {
+            kv_hist[j * kv_dim + ch] = kv_hist[(j + 1u) * kv_dim + ch];
+            kv_hist[v_h_off + j * kv_dim + ch] = kv_hist[v_h_off + (j + 1u) * kv_dim + ch];
+        }
+        if (past > 0u) {
+            kv_hist[(past - 1u) * kv_dim + ch] = kc;
+            kv_hist[v_h_off + (past - 1u) * kv_dim + ch] = vc;
+        }
+    }
+    ksq = subgroupAdd(ksq);
+    vsq = subgroupAdd(vsq);
+    if (lane == 0u) {
+        wpk[warp] = ksq;
+        wpv[warp] = vsq;
+    }
+    workgroupBarrier();
+    let k_tot = (wpk[0] + wpk[1]) + (wpk[2] + wpk[3]);
+    let v_tot = (wpv[0] + wpv[1]) + (wpv[2] + wpv[3]);
+    let k_fac = min(1.0, qk_clip / (sqrt(k_tot) + 1e-6));
+    let v_inv = inverseSqrt(v_tot / f32(head_dim) + rms_eps);
     let write_row = step_params[0] % kv_cap;
     let dst_k = write_row * kv_dim + h * head_dim;
     let dst_v = kv_cap * kv_dim + dst_k;
@@ -1124,9 +1362,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) l
 "#;
 
 /// Fused cross-pass controller norm-concat + F16 down-projection:
-/// `mid[r] = dot(w_down[r, 0..H], rms_norm(cur)) + dot(w_down[r, H..2H], rms_norm(msg))`.
-/// Replaces `control_cat` + `ctrl_down` matvec with 1 dispatch (`gate_rank` workgroups of 256 threads).
-/// `p[0]`: hidden (even), gate_rank, cur_off, msg_off.
+/// `mid[s * rank + r] = dot(w_down[s, r, 0..H], rms_norm(cur_s)) + dot(w_down[s, r, H..2H], rms_norm(msg_s))`.
+/// Supports batched `wg.y` streams (`n_streams = 1` or `3`); `p[0]`: hidden (even), gate_rank, cur_off, msg_off;
+/// `p[1]`: cur_stride, 0, 0, 0.
 pub(in crate::chain) const INKLING2_CTRL_CAT_DOWN: &str = r#"
 @group(0) @binding(0) var<storage, read> w_down: array<u32>;
 @group(0) @binding(1) var<storage, read> cur: array<f32>;
@@ -1143,15 +1381,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let rank = p[0].y;
     let r = wg.x;
     if (r >= rank) { return; }
-    let cur_off = p[0].z;
-    let msg_off = p[0].w;
+    let s = wg.y;
+    let cur_off = p[0].z + s * p[1].x;
+    let msg_off = p[0].w + s * hidden;
     let half_h = hidden / 2u;
 
     var sq_c = 0.0;
     var sq_m = 0.0;
     var acc_c = 0.0;
     var acc_m = 0.0;
-    let row_base = r * hidden;
+    let row_base = (s * rank + r) * hidden;
     for (var k = li; k < half_h; k += 256u) {
         let c0 = cur[cur_off + 2u * k];
         let c1 = cur[cur_off + 2u * k + 1u];
@@ -1184,7 +1423,72 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         workgroupBarrier();
     }
     if (li == 0u) {
-        mid[r] = part_c[0];
+        mid[s * rank + r] = part_c[0];
+    }
+}
+"#;
+
+/// Subgroup version of [`INKLING2_CTRL_CAT_DOWN`]: reduces all 4 sums (`sq_c`, `sq_m`, `acc_c`,
+/// `acc_m`) via `subgroupAdd` and combines the 8 warps in a SINGLE `workgroupBarrier()` (down from 17).
+pub(in crate::chain) const INKLING2_CTRL_CAT_DOWN_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> w_down: array<u32>;
+@group(0) @binding(1) var<storage, read> cur: array<f32>;
+@group(0) @binding(2) var<storage, read> msg: array<f32>;
+@group(0) @binding(6) var<storage, read_write> mid: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+var<workgroup> ws_c: array<f32, 8>;
+var<workgroup> ws_m: array<f32, 8>;
+var<workgroup> wa_c: array<f32, 8>;
+var<workgroup> wa_m: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) warp: u32) {
+    let hidden = p[0].x;
+    let rank = p[0].y;
+    let r = wg.x;
+    if (r >= rank) { return; }
+    let s = wg.y;
+    let cur_off = p[0].z + s * p[1].x;
+    let msg_off = p[0].w + s * hidden;
+    let half_h = hidden / 2u;
+
+    var sq_c = 0.0;
+    var sq_m = 0.0;
+    var acc_c = 0.0;
+    var acc_m = 0.0;
+    let row_base = (s * rank + r) * hidden;
+    for (var k = li; k < half_h; k += 256u) {
+        let c0 = cur[cur_off + 2u * k];
+        let c1 = cur[cur_off + 2u * k + 1u];
+        let m0 = msg[msg_off + 2u * k];
+        let m1 = msg[msg_off + 2u * k + 1u];
+        sq_c += c0 * c0 + c1 * c1;
+        sq_m += m0 * m0 + m1 * m1;
+        let wc = unpack2x16float(w_down[row_base + k]);
+        let wm = unpack2x16float(w_down[row_base + half_h + k]);
+        acc_c += wc.x * c0 + wc.y * c1;
+        acc_m += wm.x * m0 + wm.y * m1;
+    }
+    sq_c = subgroupAdd(sq_c);
+    sq_m = subgroupAdd(sq_m);
+    acc_c = subgroupAdd(acc_c);
+    acc_m = subgroupAdd(acc_m);
+    if (lane == 0u) {
+        ws_c[warp] = sq_c;
+        ws_m[warp] = sq_m;
+        wa_c[warp] = acc_c;
+        wa_m[warp] = acc_m;
+    }
+    workgroupBarrier();
+    if (li == 0u) {
+        let tsq_c = ((ws_c[0] + ws_c[1]) + (ws_c[2] + ws_c[3])) + ((ws_c[4] + ws_c[5]) + (ws_c[6] + ws_c[7]));
+        let tsq_m = ((ws_m[0] + ws_m[1]) + (ws_m[2] + ws_m[3])) + ((ws_m[4] + ws_m[5]) + (ws_m[6] + ws_m[7]));
+        let tacc_c = ((wa_c[0] + wa_c[1]) + (wa_c[2] + wa_c[3])) + ((wa_c[4] + wa_c[5]) + (wa_c[6] + wa_c[7]));
+        let tacc_m = ((wa_m[0] + wa_m[1]) + (wa_m[2] + wa_m[3])) + ((wa_m[4] + wa_m[5]) + (wa_m[6] + wa_m[7]));
+        let inv_c = inverseSqrt(tsq_c / f32(hidden) + 1e-6);
+        let inv_m = inverseSqrt(tsq_m / f32(hidden) + 1e-6);
+        mid[s * rank + r] = tacc_c * inv_c + tacc_m * inv_m;
     }
 }
 "#;
