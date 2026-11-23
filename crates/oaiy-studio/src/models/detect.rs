@@ -663,12 +663,35 @@ fn directory(dir: &Path) -> Result<Detected, String> {
     if let Some(d) = safetensors_file(&dir.join("model.safetensors")).ok().filter(|d| matches!(d.role, Role::Image { architecture: "flux3-klein" })) {
         return Ok(d);
     }
-    // Pixal3D: its pipeline.json names the checkpoints in ckpts/.
+    // Pixal3D and TRELLIS.2: their pipeline.json names the checkpoints in ckpts/.
+    // Pixal3D uses `image_attn_mode: "proj"` (needs NAF); TRELLIS.2 uses full DINOv3 cross-attention (no NAF).
     if let Some(pipeline) = read("pipeline.json") {
         let name = str_or(&pipeline, "name", "");
         if name == "Trellis2ImageTo3DPipeline" || name.contains("Pixal3D") {
             if !dir.join("ckpts").is_dir() {
-                return Err(format!("{label}: a Pixal3D folder needs its ckpts/ folder"));
+                return Err(format!("{label}: a 3D model folder needs its ckpts/ folder"));
+            }
+            let ss_rel = pipeline
+                .get("args")
+                .and_then(|a| a.get("models"))
+                .and_then(|m| m.get("sparse_structure_flow_model"))
+                .and_then(Json::as_str);
+            let ss_cfg = ss_rel
+                .and_then(|rel| std::fs::read(dir.join(rel).with_extension("json")).ok())
+                .and_then(|b| Json::parse(&b).ok());
+            let is_trellis2 = ss_cfg
+                .as_ref()
+                .and_then(|j| j.get("args"))
+                .is_some_and(|a| a.get("image_attn_mode").and_then(Json::as_str) != Some("proj"));
+            if is_trellis2 {
+                let mut d = detected(
+                    Role::Component { kind: "model3d" },
+                    "safetensors",
+                    "TRELLIS.2: 3D models from a picture (MIT)".into(),
+                    vec![("path", path_json(dir)), ("architecture", Json::str("trellis2"))],
+                );
+                d.missing = vec!["dino".into()];
+                return Ok(d);
             }
             let mut d = detected(Role::Component { kind: "model3d" }, "safetensors", "Pixal3D: 3D models from a picture (MIT)".into(), vec![("path", path_json(dir))]);
             d.missing = vec!["dino".into(), "naf".into()];
@@ -1301,5 +1324,27 @@ mod tests {
             assert!(field(&r, "path").ends_with("Inkling-2-Mini"));
             assert!(field(&r, "vision_projector").ends_with("Inkling-2-Mini"));
         }
+    }
+
+    #[test]
+    fn trellis2_folder_is_recognised_without_requiring_naf() {
+        let d = tmp("trellis2");
+        let root = d.0.join("TRELLIS.2-4B");
+        std::fs::create_dir_all(root.join("ckpts")).unwrap();
+        std::fs::write(
+            root.join("pipeline.json"),
+            r#"{"name":"Trellis2ImageTo3DPipeline","args":{"models":{"sparse_structure_flow_model":"ckpts/ss_flow_img_dit_1_3B_64_bf16"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ckpts").join("ss_flow_img_dit_1_3B_64_bf16.json"),
+            r#"{"name":"SparseStructureFlowModel","args":{"pe_mode":"rope","share_mod":true,"model_channels":1536}}"#,
+        )
+        .unwrap();
+        let r = detect(&root).unwrap();
+        assert_eq!(r.kind(), "model3d");
+        let field = |k: &str| r.fields.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.as_str()).unwrap_or("").to_string();
+        assert_eq!(field("architecture"), "trellis2");
+        assert_eq!(r.missing, vec!["dino".to_string()]);
     }
 }

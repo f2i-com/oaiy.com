@@ -457,7 +457,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// [`MANY_CLEAR`]'s second pass: each expert's jobs counted, a thread a pair. `p[0]`: the pairs, the blocks.
 pub(crate) const MANY_COUNT: &str = r#"
 @group(0) @binding(0) var<storage, read> jd: array<u32>;
-@group(0) @binding(7) var<storage, read_write> od: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> od: array<atomic<u32>>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 @compute @workgroup_size(256)
@@ -471,7 +471,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /// [`MANY_CLEAR`]'s third: each expert's first block, the blocks of the experts before it, one workgroup a thread an
 /// expert (1024 at most). `p[0]`: the pairs, the blocks, the experts, the jobs a block.
 pub(crate) const MANY_SCAN: &str = r#"
-@group(0) @binding(7) var<storage, read_write> od: array<u32>;
+@group(0) @binding(6) var<storage, read_write> od: array<u32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 var<workgroup> sums: array<u32, 1024>;

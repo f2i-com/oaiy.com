@@ -24,8 +24,9 @@ const KIND_BADGE: Record<DeliverableFile['kind'], { label: string; title: string
 
 export function renderDeliverablesCard(
   files: DeliverableFile[],
-  meta: { durationMs?: number; toolCount?: number },
+  meta: { durationMs?: number; toolCount?: number; checkpointId?: string },
   onOpen: (path: string) => void,
+  onRevert?: (checkpointId: string) => boolean | Promise<boolean>,
 ): HTMLElement {
   const totalAdded = files.reduce((s, f) => s + f.added, 0);
   const totalDeleted = files.reduce((s, f) => s + f.deleted, 0);
@@ -57,7 +58,7 @@ export function renderDeliverablesCard(
             onclick: (e: Event) => {
               e.preventDefault();
               e.stopPropagation();
-              onOpen(`/${file.path}`);
+              onOpen(file.path);
             },
           },
           'Open',
@@ -103,7 +104,7 @@ export function renderDeliverablesCard(
         'summary.deliverable-row',
         icon('chevron-right', 'deliverable-caret'),
         h('span.deliverable-badge', { class: `kind-${file.kind}`, title: badge.title }, badge.label),
-        h('span.deliverable-icon', { class: kind.tone }, icon(kind.icon)),
+        h('span.deliverable-icon', { class: `tone-${kind.tone}` }, icon(kind.icon)),
         h('span.deliverable-path', { title: `/${file.path}` }, file.path),
         stats,
         actions,
@@ -129,6 +130,11 @@ export function renderDeliverablesCard(
     },
     allExpanded ? 'Collapse diffs' : 'Expand diffs',
   );
+  const syncToggle = () => {
+    allExpanded = rows.length > 0 && rows.every((r) => r.open);
+    toggleBtn.textContent = allExpanded ? 'Collapse diffs' : 'Expand diffs';
+  };
+  for (const r of rows) r.addEventListener('toggle', syncToggle);
 
   const metaBits: string[] = [];
   if (meta.durationMs && meta.durationMs >= 200) metaBits.push(duration(meta.durationMs));
@@ -137,6 +143,32 @@ export function renderDeliverablesCard(
   const totalStats = h('span.deliverables-totals');
   if (totalAdded > 0) totalStats.append(h('span.diff-stat-add', `+${totalAdded}`));
   if (totalDeleted > 0) totalStats.append(h('span.diff-stat-del', `-${totalDeleted}`));
+
+  let revertEl: HTMLElement | null = null;
+  if (meta.checkpointId && onRevert) {
+    const cpId = meta.checkpointId;
+    const btn = h(
+      'button.deliverables-revert',
+      {
+        type: 'button',
+        title: 'Revert the file changes made in this turn (/undo)',
+        onclick: async () => {
+          btn.disabled = true;
+          const ok = await onRevert(cpId);
+          if (ok) {
+            btn.classList.add('reverted');
+            btn.replaceChildren(icon('check'), h('span', 'Reverted'));
+            btn.title = 'Turn changes reverted';
+          } else {
+            btn.disabled = false;
+          }
+        },
+      },
+      icon('undo'),
+      h('span', 'Revert'),
+    ) as HTMLButtonElement;
+    revertEl = btn;
+  }
 
   return h(
     'section.deliverables-card',
@@ -147,7 +179,7 @@ export function renderDeliverablesCard(
       h('span.deliverables-title', `${files.length} file${files.length === 1 ? '' : 's'} changed`),
       totalStats,
       ...(metaBits.length ? [h('span.deliverables-meta', metaBits.join(' · '))] : []),
-      toggleBtn,
+      h('span.deliverables-head-actions', ...(revertEl ? [revertEl] : []), toggleBtn),
     ),
     list,
   );

@@ -50,6 +50,42 @@
       "add": ["Qwen3.5-27B-GGUF/Qwen3.5-27B-Q4_K_M.gguf"]
     },
     {
+      "id": "qwen3.5-35b-a3b",
+      "group": "llm",
+      "name": "Qwen3.5 35B-A3B",
+      "about": "Qwen3.5's sparse mixture of experts (3B of its 35B weights active a token) with reasoning, coding, tool use and vision: fast on a 24-32 GB GPU (runs split with CPU on 24 GB or less). Its vision projector comes with it.",
+      "license": "Apache-2.0",
+      "size_gb": 22.9,
+      "vram_gb": 26,
+      "agent_tools": true,
+      "parts": [{ "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "include": ["Qwen3.5-35B-A3B-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "Qwen3.5-35B-A3B-GGUF" }],
+      "add": ["Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-Q4_K_M.gguf", "Qwen3.5-35B-A3B-GGUF/mmproj-F16.gguf"]
+    },
+    {
+      "id": "qwen3.5-4b-glb-3d-coder",
+      "group": "llm",
+      "name": "Qwen3.5 4B GLB 3D Coder",
+      "about": "A Qwen3.5 4B specialist fine-tuned for procedural Three.js 3D scenes with live preview and binary GLB export right inside the OAIY Agent, plus vision input. Fits on a 6 GB GPU.",
+      "license": "Apache-2.0",
+      "size_gb": 3.4,
+      "vram_gb": 5,
+      "agent_tools": true,
+      "parts": [{ "repo": "ccore/Qwen3.5-4B-GLB-3D-Coder", "include": ["Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf", "mmproj-Qwen3.5-4B-BF16.gguf", "LICENSE"], "into": "Qwen3.5-4B-GLB-3D-Coder" }],
+      "add": ["Qwen3.5-4B-GLB-3D-Coder/Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf", "Qwen3.5-4B-GLB-3D-Coder/mmproj-Qwen3.5-4B-BF16.gguf"]
+    },
+    {
+      "id": "qwen3.5-4b-3d-coder",
+      "group": "llm",
+      "name": "Qwen3.5 4B 3D Coder",
+      "about": "A Qwen3.5 4B specialist fine-tuned to write standalone Three.js 3D scenes and shaders from text or reference pictures, previewed live inside the OAIY Agent. Fits on a 6 GB GPU.",
+      "license": "Apache-2.0",
+      "size_gb": 3.4,
+      "vram_gb": 5,
+      "agent_tools": true,
+      "parts": [{ "repo": "ccore/Qwen3.5-4B-3D-Coder", "include": ["Qwen3.5-4B-3D-Coder-Q4_K_M.gguf", "mmproj-Qwen3.5-4B-BF16.gguf", "LICENSE"], "into": "Qwen3.5-4B-3D-Coder" }],
+      "add": ["Qwen3.5-4B-3D-Coder/Qwen3.5-4B-3D-Coder-Q4_K_M.gguf", "Qwen3.5-4B-3D-Coder/mmproj-Qwen3.5-4B-BF16.gguf"]
+    },
+    {
       "id": "qwen3.8-27b",
       "group": "llm",
       "name": "Qwen3.8 27B",
@@ -168,6 +204,39 @@
       "vram_gb": 5,
       "parts": [{ "repo": "unsloth/gemma-4-E2B-it-GGUF", "include": ["gemma-4-E2B-it-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "gemma-4-E2B-it-GGUF" }],
       "add": ["gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf", "gemma-4-E2B-it-GGUF/mmproj-F16.gguf"]
+    },
+    {
+      "id": "gemma-4-e4b",
+      "group": "llm",
+      "name": "Gemma 4 E4B",
+      "about": "Google's mid-size edge Gemma 4 for chat; on a GPU it reads pictures too (its vision projector comes with it). Fits on an 8 GB GPU.",
+      "license": "Apache-2.0",
+      "size_gb": 6.0,
+      "vram_gb": 8,
+      "parts": [{ "repo": "unsloth/gemma-4-E4B-it-GGUF", "include": ["gemma-4-E4B-it-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "gemma-4-E4B-it-GGUF" }],
+      "add": ["gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf", "gemma-4-E4B-it-GGUF/mmproj-F16.gguf"]
+    },
+    {
+      "id": "gemma-4-26b-a4b",
+      "group": "llm",
+      "name": "Gemma 4 26B-A4B",
+      "about": "Google's sparse mixture-of-experts Gemma 4 (4B active of 26B) for fast chat and multimodal reasoning on a GPU with 24 GB or more; on a GPU it reads pictures too (its vision projector comes with it).",
+      "license": "Apache-2.0",
+      "size_gb": 18.1,
+      "vram_gb": 24,
+      "parts": [{ "repo": "unsloth/gemma-4-26B-A4B-it-GGUF", "include": ["gemma-4-26B-A4B-it-UD-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "gemma-4-26B-A4B-it-GGUF" }],
+      "add": ["gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf", "gemma-4-26B-A4B-it-GGUF/mmproj-F16.gguf"]
+    },
+    {
+      "id": "gemma-4-31b",
+      "group": "llm",
+      "name": "Gemma 4 31B",
+      "about": "Google's flagship dense Gemma 4 for reasoning and writing on a GPU with 24 GB or more; on a GPU it reads pictures too (its vision projector comes with it).",
+      "license": "Apache-2.0",
+      "size_gb": 19.5,
+      "vram_gb": 24,
+      "parts": [{ "repo": "unsloth/gemma-4-31B-it-GGUF", "include": ["gemma-4-31B-it-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "gemma-4-31B-it-GGUF" }],
+      "add": ["gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf", "gemma-4-31B-it-GGUF/mmproj-F16.gguf"]
     },
     {
       "id": "minicpm-v-4.7-1b",
@@ -308,6 +377,20 @@
       "add": ["flux-3-image-klein/model.safetensors"]
     },
     {
+      "id": "flux-2-klein-4b",
+      "group": "image",
+      "name": "FLUX.2 Klein 4B",
+      "about": "Black Forest Labs' Apache-2.0 4B image model: fast four-step text-to-image pictures with no Hugging Face gate, conditioned by Qwen3-4B. Runs on a 12 GB GPU.",
+      "license": "Apache-2.0",
+      "size_gb": 16.1,
+      "vram_gb": 12,
+      "parts": [
+        { "repo": "Comfy-Org/flux2-klein", "include": ["split_files/diffusion_models/flux-2-klein-4b.safetensors", "split_files/text_encoders/qwen_3_4b.safetensors", "split_files/vae/flux2-vae.safetensors"], "into": "FLUX.2-klein-4B" },
+        { "repo": "black-forest-labs/FLUX.2-klein-4B", "include": ["tokenizer/tokenizer.json", "LICENSE.md"], "into": "FLUX.2-klein-4B" }
+      ],
+      "add": ["FLUX.2-klein-4B/split_files/diffusion_models/flux-2-klein-4b.safetensors", "FLUX.2-klein-4B/split_files/text_encoders/qwen_3_4b.safetensors", "FLUX.2-klein-4B/split_files/vae/flux2-vae.safetensors", "FLUX.2-klein-4B/tokenizer/tokenizer.json"]
+    },
+    {
       "id": "moss-image-sft",
       "group": "image",
       "name": "MOSS-Image SFT",
@@ -434,11 +517,28 @@
       "needs": ["birefnet", "real-esrgan"],
       "parts": [
         { "repo": "TencentARC/Pixal3D", "include": ["pipeline.json", "LICENSE", "NOTICE", "README.md", "ckpts/**"], "exclude": ["**_mv.*"], "into": "Pixal3D" },
-        { "repo": "facebook/dinov3-vitl16-pretrain-lvd1689m", "include": ["config.json", "model.safetensors", "preprocessor_config.json", "LICENSE.md", "README.md"], "into": "dinov3-vitl16" },
+        { "repo": "facebook/dinov3-vitl16-pretrain-lvd1689m", "gated": true, "include": ["config.json", "model.safetensors", "preprocessor_config.json", "LICENSE.md", "README.md"], "into": "dinov3-vitl16" },
         { "url": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth", "file": "naf_release.pth", "size": 2664431, "into": "NAF" },
         { "url": "https://raw.githubusercontent.com/valeoai/NAF/main/LICENSE", "file": "LICENSE", "into": "NAF" }
       ],
       "add": ["Pixal3D"]
+    },
+    {
+      "id": "trellis2-4b",
+      "group": "model3d",
+      "name": "TRELLIS.2 4B",
+      "about": "Microsoft's 4B native 3D generator: turns a picture of an object into a PBR-textured GLB mesh with DINOv3 conditioning (no NAF needed). Brings BiRefNet and Real-ESRGAN too. DINOv3 is gated on huggingface.co.",
+      "license": "MIT; DINOv3 under Meta's DINOv3 License",
+      "size_gb": 13.6,
+      "vram_gb": 16,
+      "gated": true,
+      "needs": ["birefnet", "real-esrgan"],
+      "parts": [
+        { "repo": "microsoft/TRELLIS.2-4B", "include": ["pipeline.json", "README.md", "ckpts/ss_flow_img_dit_1_3B_64_bf16.*", "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.*", "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.*", "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.*", "ckpts/shape_dec_next_dc_f16c32_fp16.*", "ckpts/tex_dec_next_dc_f16c32_fp16.*"], "into": "TRELLIS.2-4B" },
+        { "repo": "microsoft/TRELLIS-image-large", "include": ["ckpts/ss_dec_conv3d_16l8_fp16.json", "ckpts/ss_dec_conv3d_16l8_fp16.safetensors"], "into": "TRELLIS.2-4B" },
+        { "repo": "facebook/dinov3-vitl16-pretrain-lvd1689m", "gated": true, "include": ["config.json", "model.safetensors", "preprocessor_config.json", "LICENSE.md", "README.md"], "into": "dinov3-vitl16" }
+      ],
+      "add": ["TRELLIS.2-4B"]
     },
     {
       "id": "birefnet",

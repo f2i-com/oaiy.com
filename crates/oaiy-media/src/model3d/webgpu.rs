@@ -98,7 +98,7 @@ struct Block {
     cq_norm: DeviceVec,
     ck_norm: DeviceVec,
     cout: Lin,
-    proj: Lin,
+    proj: Option<Lin>,
     fc1: Lin,
     fc2: Lin,
 }
@@ -162,7 +162,7 @@ impl WgpuDit3 {
         let mut blocks = Vec::with_capacity(cfg.blocks);
         for i in 0..cfg.blocks {
             let p = format!("blocks.{i}");
-            let ca = format!("{p}.cross_attn.cross_attn_block");
+            let ca = if cfg.has_proj { format!("{p}.cross_attn.cross_attn_block") } else { format!("{p}.cross_attn") };
             blocks.push(Block {
                 modulation: f32s(s, &format!("{p}.modulation"))?,
                 qkv: Lin::load(s, gpu, &format!("{p}.self_attn.to_qkv"), false)?,
@@ -175,7 +175,7 @@ impl WgpuDit3 {
                 cq_norm: upload(gpu, &f32s(s, &format!("{ca}.q_rms_norm.gamma"))?),
                 ck_norm: upload(gpu, &f32s(s, &format!("{ca}.k_rms_norm.gamma"))?),
                 cout: Lin::load(s, gpu, &format!("{ca}.to_out"), false)?,
-                proj: Lin::load(s, gpu, &format!("{p}.cross_attn.proj_linear"), false)?,
+                proj: if cfg.has_proj { Some(Lin::load(s, gpu, &format!("{p}.cross_attn.proj_linear"), false)?) } else { None },
                 fc1: Lin::load(s, gpu, &format!("{p}.mlp.mlp.0"), false)?,
                 fc2: Lin::load(s, gpu, &format!("{p}.mlp.mlp.2"), false)?,
             });
@@ -202,27 +202,31 @@ impl WgpuDit3 {
     /// proj_channels]`); None for the unconditional branch (zeros).
     pub fn context(&self, gpu: &WgpuBackend, image: Option<&[f32]>, proj: Option<&[f32]>, tokens: usize) -> Context {
         let (c, heads) = (self.cfg.channels, self.cfg.heads);
+        // Unconditional CFG feeds all-zero image tokens, producing `tokens` identical K/V rows;
+        // softmax over identical keys returns the same value vector as a single token, saving ~1.5 GB VRAM
+        // and skipping 4,100x redundant cross-attention work on 1024-res stages.
+        let tok = if image.is_some() { tokens } else { 1 };
         let image = match image {
             Some(t) => upload(gpu, t),
-            None => upload(gpu, &vec![0f32; tokens * self.cfg.cond_channels]),
+            None => upload(gpu, &vec![0f32; tok * self.cfg.cond_channels]),
         };
         let mut rec = gpu.begin();
         rec.keep_groups(false);
         let r = rec.as_mut();
-        let (kv, k, kn) = (gpu.vec(tokens * 2 * c), gpu.vec(tokens * c), gpu.vec(tokens * c));
+        let (kv, k, kn) = (gpu.vec(tok * 2 * c), gpu.vec(tok * c), gpu.vec(tok * c));
         let mut out = Vec::with_capacity(self.blocks.len());
         for b in &self.blocks {
-            let normed = gpu.vec(tokens * 2 * c);
-            b.ckv.run(r, &image, &kv, tokens);
-            r.copy_cols(&kv, &k, tokens, c, 2 * c, 0);
-            r.rmsnorm_heads_rows(&k, &b.ck_norm, &kn, tokens, heads, HEAD_EPS);
-            r.store_rows(&kn, &normed, tokens, c, 0, 2 * c, 0);
-            r.copy_cols(&kv, &k, tokens, c, 2 * c, c);
-            r.store_rows(&k, &normed, tokens, c, 0, 2 * c, c);
+            let normed = gpu.vec(tok * 2 * c);
+            b.ckv.run(r, &image, &kv, tok);
+            r.copy_cols(&kv, &k, tok, c, 2 * c, 0);
+            r.rmsnorm_heads_rows(&k, &b.ck_norm, &kn, tok, heads, HEAD_EPS);
+            r.store_rows(&kn, &normed, tok, c, 0, 2 * c, 0);
+            r.copy_cols(&kv, &k, tok, c, 2 * c, c);
+            r.store_rows(&k, &normed, tok, c, 0, 2 * c, c);
             out.push(normed);
         }
         rec.finish();
-        Context { kv: out, tokens, proj: proj.map(|p| upload(gpu, p)) }
+        Context { kv: out, tokens: tok, proj: proj.map(|p| upload(gpu, p)) }
     }
 
     /// Every block's modulation at `timestep` (0-1000; `[blocks, 6 channels]`): the timestep's sinusoid through its MLP
@@ -239,8 +243,16 @@ impl WgpuDit3 {
 
     /// The work vectors of a pass over `n` voxels.
     pub fn scratch(&self, gpu: &WgpuBackend, n: usize) -> Scratch {
+        self.scratch_with_kv(gpu, n, n)
+    }
+
+    /// The work vectors of a pass over `n` voxels attending to up to `max_kv` conditioning tokens.
+    pub fn scratch_with_kv(&self, gpu: &WgpuBackend, n: usize, max_kv: usize) -> Scratch {
         let (c, hd, heads) = (self.cfg.channels, self.head_dim, self.cfg.heads);
         let v = |len: usize| gpu.vec(len);
+        let att_len = gpu
+            .attention_rows_full_out_len(n, heads, hd, n)
+            .max(gpu.attention_rows_full_out_len(n, heads, hd, max_kv.max(64)));
         Scratch {
             n,
             h: v(n * c),
@@ -252,7 +264,7 @@ impl WgpuDit3 {
             qn: v(n * c),
             kn: v(n * c),
             kv: v(n * 2 * c),
-            att: v(gpu.attention_rows_full_out_len(n, heads, hd, n).max(gpu.attention_rows_full_out_len(n, heads, hd, 64))),
+            att: v(att_len),
             o: v(n * c),
             f1: v(n * self.cfg.mlp),
             f1g: v(n * self.cfg.mlp),
@@ -291,12 +303,14 @@ impl WgpuDit3 {
             r.rmsnorm_heads_rows(q, &b.cq_norm, qn, n, heads, HEAD_EPS);
             r.attention_rows_full(qn, ckv, att, n, heads, heads, hd, ctx.tokens, scale);
             b.cout.run(r, att, o, n);
-            match &ctx.proj {
-                Some(p) => {
-                    b.proj.run(r, p, hn, n);
-                    r.add(o, hn);
+            if let Some(proj) = &b.proj {
+                match &ctx.proj {
+                    Some(p) => {
+                        proj.run(r, p, hn, n);
+                        r.add(o, hn);
+                    }
+                    None => r.add_bias_rows(o, &proj.b, n, c),
                 }
-                None => r.add_bias_rows(o, &b.proj.b, n, c),
             }
             r.add(h, o);
             // the MLP

@@ -271,9 +271,9 @@ impl GlmEngine {
     }
 
     /// A model whose state is its attention cache alone, which a prompt that diverges partway can keep the shared
-    /// part of (the dense families): GLM-5.3-Flash's MLA state and the MoE models' are not rewound.
+    /// part of (dense attention models and Gemma 4 MoE): GLM-5.3-Flash's MLA/KDA state is not rewound.
     fn rewinds(&self) -> bool {
-        matches!(self.model, Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_))
+        matches!(self.model, Model::Llama(_) | Model::Qwen3(_) | Model::Gemma3(_) | Model::Gemma3n(_) | Model::Gemma4(_) | Model::Gemma4Moe(_))
     }
 
     /// How many leading tokens of `prompt` the state already covers.

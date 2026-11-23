@@ -480,7 +480,8 @@ export function checkProject(vfs: Vfs, root = ''): Finding[] {
   const files = appFiles(vfs, root);
   const present = new Set(files.map(([p]) => p));
   if (manifest && isWebApp(vfs, root)) {
-    if (!present.has(manifest.main as string)) err('manifest.json', `Entry page ${manifest.main} is missing.`);
+    const mainPath = typeof manifest.main === 'string' ? normalizePath(manifest.main) : '';
+    if (!mainPath || !present.has(mainPath)) err('manifest.json', `Entry page ${manifest.main} is missing.`);
     if (typeof manifest.name !== 'string' || !manifest.name.trim()) warn('manifest.json', 'Give this app a name for the library.');
     // Validate optional embedded Container v2 backend configuration
     if (manifest.backend !== undefined) {

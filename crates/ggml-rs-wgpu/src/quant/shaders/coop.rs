@@ -725,28 +725,60 @@ const COOP_Q5_0_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
         }"#;
 
-/// [`COOP_Q6K_HELPERS`] and IQ4's values (a nibble's, ggml's `kvalues_iq4nl`), a word's four nibbles' at once.
+/// [`COOP_Q6K_HELPERS`] and IQ4's values (a nibble's, ggml's `kvalues_iq4nl`), branchless register-packed LUT
+/// (avoids dynamic indexing into WGSL `const` arrays which spills on NVIDIA SPIR-V).
 const COOP_IQ4_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
 fn word_at(o: u32) -> u32 {
     let i = o >> 2u;
     if ((o & 3u) == 0u) { return w[i]; }
     return (w[i] >> 16u) | (w[i + 1u] << 16u);
 }
-const KV4 = array<f32, 16>(-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+fn iq4_val(k: u32) -> f32 {
+    let w01 = select(0xbfad9881u, 0xf6eaddcfu, (k & 4u) != 0u);
+    let w23 = select(0x26190d01u, 0x71594535u, (k & 4u) != 0u);
+    let ww = select(w01, w23, (k & 8u) != 0u);
+    let b = (ww >> ((k & 3u) * 8u)) & 0xffu;
+    return f32(bitcast<i32>(b << 24u) >> 24u);
+}
 // the values of a word's four nibbles (each byte's low four bits)
 fn iq4(q: u32) -> vec4<f32> {
-    return vec4<f32>(KV4[q & 15u], KV4[(q >> 8u) & 15u], KV4[(q >> 16u) & 15u], KV4[(q >> 24u) & 15u]);
+    return vec4<f32>(iq4_val(q & 15u), iq4_val((q >> 8u) & 15u), iq4_val((q >> 16u) & 15u), iq4_val((q >> 24u) & 15u));
 }
 "#;
+
+/// Software-pipelined IQ4_NL & Q4_0 ahead-load for [`coop_tiled`] (20-byte 4-byte-aligned blocks: 5 u32 words).
+const COOP_PADDED20_AHEAD_REGS: &str = r#"    var p20w = vec4<u32>();
+    var p20d = 0u;"#;
+const COOP_PADDED20_AHEAD_LOAD: &str = r#"let lp20 = (rl * p.row_bytes + b * 20u) >> 2u;
+        p20d = w[lp20];
+        p20w = vec4<u32>(w[lp20 + 1u], w[lp20 + 2u], w[lp20 + 3u], w[lp20 + 4u]);"#;
+const COOP_IQ4_NL_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        {
+            let d = unpack2x16float(p20d & 0xffffu).x;
+            let sh = lh * 4u;
+            wt[at4] = vec4<f16>(d * iq4(p20w.x >> sh));
+            wt[at4 + 1u] = vec4<f16>(d * iq4(p20w.y >> sh));
+            wt[at4 + 2u] = vec4<f16>(d * iq4(p20w.z >> sh));
+            wt[at4 + 3u] = vec4<f16>(d * iq4(p20w.w >> sh));
+        }"#;
+const COOP_Q4_0_AHEAD_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
+        {
+            let d = unpack2x16float(p20d & 0xffffu).x;
+            let sh = lh * 4u;
+            wt[at4] = vec4<f16>(d * byte_less((p20w.x >> sh) & 0x0f0f0f0fu, 8.0));
+            wt[at4 + 1u] = vec4<f16>(d * byte_less((p20w.y >> sh) & 0x0f0f0f0fu, 8.0));
+            wt[at4 + 2u] = vec4<f16>(d * byte_less((p20w.z >> sh) & 0x0f0f0f0fu, 8.0));
+            wt[at4 + 3u] = vec4<f16>(d * byte_less((p20w.w >> sh) & 0x0f0f0f0fu, 8.0));
+        }"#;
 
 /// IQ4_NL's decode for [`coop_tiled`] (on the GPU 20-byte blocks, [`padded_block`]: the scale, a gap, 16 bytes of
 /// nibbles): a step a block, a thread's half its low nibbles' values or its high ones'.
 const COOP_IQ4_NL_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
-            let base = rr * p.row_bytes + b * 20u;
-            let d = unpack2x16float(byte(base) | (byte(base + 1u) << 8u)).x;
+            let bw = (rr * p.row_bytes + b * 20u) >> 2u;
+            let d = unpack2x16float(w[bw] & 0xffffu).x;
             for (var wi = 0u; wi < 4u; wi++) {
-                wt[at4 + wi] = vec4<f16>(d * iq4(word_at(base + 4u + 4u * wi) >> (lh * 4u)));
+                wt[at4 + wi] = vec4<f16>(d * iq4(w[bw + 1u + wi] >> (lh * 4u)));
             }
         } else {
             for (var i = 0u; i < 4u; i++) { wt[at4 + i] = vec4<f16>(0.0h); }
@@ -1311,6 +1343,8 @@ pub fn coop_tiled(dtype: GgmlType) -> Option<String> {
     match dtype {
         GgmlType::Q6_K => return Some(coop_source(words, COOP_AHEAD_HELPERS, COOP_Q6K_AHEAD_REGS, "", COOP_Q6K_AHEAD_LOAD, COOP_Q6K_AHEAD_STEP, COOP_X_TILED)),
         GgmlType::Q8_0 => return Some(coop_source(words, COOP_AHEAD_HELPERS, COOP_Q8_0_AHEAD_REGS, "", COOP_Q8_0_AHEAD_LOAD, COOP_Q8_0_AHEAD_STEP, COOP_X_TILED)),
+        GgmlType::IQ4_NL => return Some(coop_source(words, COOP_IQ4_HELPERS, COOP_PADDED20_AHEAD_REGS, "", COOP_PADDED20_AHEAD_LOAD, COOP_IQ4_NL_AHEAD_STEP, COOP_X_TILED)),
+        GgmlType::Q4_0 => return Some(coop_source(words, COOP_Q6K_HELPERS, COOP_PADDED20_AHEAD_REGS, "", COOP_PADDED20_AHEAD_LOAD, COOP_Q4_0_AHEAD_STEP, COOP_X_TILED)),
         _ => {}
     }
     let (binding, helpers, regs, load, step) = coop_parts_of(dtype)?;

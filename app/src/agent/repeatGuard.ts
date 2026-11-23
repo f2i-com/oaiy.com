@@ -73,9 +73,38 @@ function previewArguments(canonical: string, cap: number): string {
 
 export interface RepeatReminder {
   tier: 'gentle' | 'detailed';
+  kind?: 'consecutive' | 'cycle' | 'error-repeat';
+  hardStop?: boolean;
   count: number;
   toolName: string;
   message: string;
+}
+
+const READ_ONLY_OBSERVE_TOOLS = new Set([
+  'read_file',
+  'list_files',
+  'file_info',
+  'search_file',
+  'grep',
+  'glob',
+  'view_image',
+  'softn_docs',
+  'softn_components',
+  'softn_inspect',
+  'page_inspect',
+  'sqlite_list_databases',
+  'sqlite_schema',
+  'sqlite_query',
+]);
+
+const RECENT_RING_LIMIT = 15;
+
+function normalizeErrorSig(text: string): string {
+  return text
+    .slice(0, 240)
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export class RepeatToolGuard {
@@ -85,6 +114,8 @@ export class RepeatToolGuard {
   private readonly excluded: Set<string>;
   private lastKey = '';
   private count = 0;
+  private recent: Array<{ key: string; name: string; canonical: string }> = [];
+  private errorStreaks = new Map<string, number>();
 
   constructor(config: RepeatGuardConfig = {}) {
     const raw = config.thresholds ?? [...REPEAT_GUARD_DEFAULTS.thresholds];
@@ -103,16 +134,18 @@ export class RepeatToolGuard {
     this.excluded = new Set(config.exclude ?? ['update_plan']);
   }
 
-  /** Reset consecutive chain (e.g. when a new user request starts). */
+  /** Reset consecutive chain, cycle ring buffer, and error streaks (e.g. when a new user request starts). */
   reset(): void {
     this.lastKey = '';
     this.count = 0;
+    this.recent = [];
+    this.errorStreaks.clear();
   }
 
   /**
-   * Observe one executed tool call and return an escalating reminder if a threshold was crossed.
+   * Observe one executed tool call and return an escalating reminder if a repeat or oscillating cycle threshold was crossed.
    */
-  observe(call: Pick<ToolCall, 'name' | 'input'>): RepeatReminder | null {
+  observe(call: Pick<ToolCall, 'name' | 'input'>, outcome?: { isError?: boolean; errorText?: string }): RepeatReminder | null {
     if (this.excluded.has(call.name)) return null;
     const canonical = canonicalizeArgs(call.input);
     const key = `${call.name}\0${canonical}`;
@@ -122,20 +155,92 @@ export class RepeatToolGuard {
       this.lastKey = key;
       this.count = 1;
     }
-    if (!this.thresholdSet.has(this.count)) return null;
-    if (this.count === this.thresholds[0]) {
+
+    this.recent.push({ key, name: call.name, canonical });
+    if (this.recent.length > RECENT_RING_LIMIT) this.recent.shift();
+
+    // 1. Exact consecutive identical calls (`A, A, A, ...`).
+    if (this.thresholdSet.has(this.count)) {
+      if (this.count === this.thresholds[0]) {
+        return {
+          tier: 'gentle',
+          kind: 'consecutive',
+          count: this.count,
+          toolName: call.name,
+          message: `[OAIY] ${GENTLE_REMINDER}`,
+        };
+      }
       return {
-        tier: 'gentle',
+        tier: 'detailed',
+        kind: 'consecutive',
         count: this.count,
         toolName: call.name,
-        message: `[OAIY] ${GENTLE_REMINDER}`,
+        message: `[OAIY] ${detailedReminder(call.name, this.count, previewArguments(canonical, this.previewChars))}`,
       };
     }
-    return {
-      tier: 'detailed',
-      count: this.count,
-      toolName: call.name,
-      message: `[OAIY] ${detailedReminder(call.name, this.count, previewArguments(canonical, this.previewChars))}`,
-    };
+
+    // 2. Repeated identical failing call across intervening read-only inspection calls (e.g. edit_file fail -> read_file -> edit_file fail).
+    if (outcome?.isError) {
+      const errKey = `${key}\0${normalizeErrorSig(outcome.errorText ?? '')}`;
+      const errCount = (this.errorStreaks.get(errKey) ?? 0) + 1;
+      this.errorStreaks.set(errKey, errCount);
+      if (errCount === 3 || errCount >= 5) {
+        return {
+          tier: 'detailed',
+          kind: 'error-repeat',
+          hardStop: errCount >= 5,
+          count: errCount,
+          toolName: call.name,
+          message:
+            `[OAIY] Repeated failing tool call detected across steps:\n` +
+            `- tool: ${call.name}\n` +
+            `- failed_repeats: ${errCount}\n` +
+            `- arguments: ${previewArguments(canonical, this.previewChars)}\n` +
+            `The same call keeps failing with the same error. Stop repeating it and change your approach or arguments based on the error message.`,
+        };
+      }
+    } else if (outcome && !outcome.isError && !READ_ONLY_OBSERVE_TOOLS.has(call.name)) {
+      // A non-read-only tool succeeded — clear prior error streaks so fresh work starts clean.
+      this.errorStreaks.clear();
+    }
+
+    // 3. Oscillating Period-2 (`ABABAB`) and Period-3 (`ABCABCABC`) tool call cycles.
+    for (const period of [2, 3] as const) {
+      const n = this.recent.length;
+      if (n < period * 3) continue;
+      const tail = this.recent.slice(n - period);
+      // Skip degenerate all-equal tails (already handled by consecutive detector).
+      if (new Set(tail.map((e) => e.key)).size < 2) continue;
+      let cycles = 1;
+      while (n - (cycles + 1) * period >= 0) {
+        const start = n - (cycles + 1) * period;
+        let match = true;
+        for (let i = 0; i < period; i++) {
+          if (this.recent[start + i]!.key !== tail[i]!.key) {
+            match = false;
+            break;
+          }
+        }
+        if (!match) break;
+        cycles++;
+      }
+      const hardThreshold = period === 2 ? 5 : 4;
+      if (cycles === 3 || cycles >= hardThreshold) {
+        const seq = tail.map((e) => e.name).join(' -> ');
+        return {
+          tier: 'detailed',
+          kind: 'cycle',
+          hardStop: cycles >= hardThreshold,
+          count: cycles,
+          toolName: call.name,
+          message:
+            `[OAIY] Oscillating tool loop detected (${cycles} repeated cycles of: ${seq}):\n` +
+            `You are alternating between the exact same tool calls without making progress. ` +
+            `Break the cycle: change your arguments, inspect the underlying cause differently, or report what is blocking you.`,
+        };
+      }
+    }
+
+    return null;
   }
 }

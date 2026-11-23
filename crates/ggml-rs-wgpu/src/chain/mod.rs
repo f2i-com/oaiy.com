@@ -600,17 +600,26 @@ impl Recorder<'_> {
             body.replace(at, "let v = x4[at + i] * inv * w4[wat + i];\n        y4[at + i] = v / (vec4<f32>(1.0) + exp(-v));")
         };
         static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_sg = self.gpu().subgroups32();
         if n % 4 == 0 && (1..=128).contains(&(n / 4)) && *NARROW.get_or_init(|| std::env::var("OAIY_NARROW_NORMS").map_or(true, |v| v != "0")) {
             const NAMES: [[&str; 5]; 2] = [
                 ["chain-rmsnorm-narrow-8", "chain-rmsnorm-narrow-16", "chain-rmsnorm-narrow-32", "chain-rmsnorm-narrow-64", "chain-rmsnorm-narrow-128"],
                 ["chain-rmsnorm-silu-narrow-8", "chain-rmsnorm-silu-narrow-16", "chain-rmsnorm-silu-narrow-32", "chain-rmsnorm-silu-narrow-64", "chain-rmsnorm-silu-narrow-128"],
             ];
+            const NAMES_SG: [[&str; 3]; 2] = [
+                ["chain-rmsnorm-narrow-sg-8", "chain-rmsnorm-narrow-sg-16", "chain-rmsnorm-narrow-sg-32"],
+                ["chain-rmsnorm-silu-narrow-sg-8", "chain-rmsnorm-silu-narrow-sg-16", "chain-rmsnorm-silu-narrow-sg-32"],
+            ];
             let lanes = (n / 4).next_power_of_two().max(8);
-            let pipeline = self.gpu().named_pipeline(NAMES[usize::from(silu)][lanes.trailing_zeros() as usize - 3], || if silu { with_silu(rmsnorm_narrow4(lanes)) } else { rmsnorm_narrow4(lanes) });
+            let idx = lanes.trailing_zeros() as usize - 3;
+            let pipeline = if use_sg && lanes <= 32 {
+                self.gpu().named_pipeline(NAMES_SG[usize::from(silu)][idx], || if silu { with_silu(rmsnorm_narrow4_sg(lanes)) } else { rmsnorm_narrow4_sg(lanes) })
+            } else {
+                self.gpu().named_pipeline(NAMES[usize::from(silu)][idx], || if silu { with_silu(rmsnorm_narrow4(lanes)) } else { rmsnorm_narrow4(lanes) })
+            };
             let g = rows.div_ceil(256 / lanes) as u32;
             return (pipeline, (g.min(65535), g.div_ceil(65535), 1));
         }
-        let use_sg = self.gpu().subgroups32();
         let pipeline = match (n % 4 == 0, silu, use_sg) {
             (true, false, true) => self.gpu().named_pipeline("chain-rmsnorm-rows4-sg", || RMSNORM_ROWS4_SG.to_string()),
             (true, true, true) => self.gpu().named_pipeline("chain-rmsnorm-silu-rows4-sg", || with_silu(RMSNORM_ROWS4_SG.to_string())),
@@ -622,17 +631,24 @@ impl Recorder<'_> {
         (pipeline, (r.min(65535), r.div_ceil(65535), 1))
     }
 
-    /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout` or `Gpu::wide_ro7_layout`), its bind group kept as
-    /// `dispatch_kept`'s. Shaders that do not reference `@binding(7)` use `wide_ro7_layout` with the read-only `dummy`
-    /// buffer at binding 7 so consecutive independent wide dispatches never serialize on a false `dummy_rw` WAW hazard.
+    /// A dispatch of an eight-buffer kernel (`Gpu::wide_layout`, `Gpu::wide_ro7_layout`, or `Gpu::wide_rw3_layout`),
+    /// its bind group kept as `dispatch_kept`'s. Shaders that do not reference `@binding(7)` use `wide_ro7_layout`
+    /// with the read-only `dummy` buffer at binding 7 so consecutive independent wide dispatches never serialize
+    /// on a false `dummy_rw` WAW hazard.
     pub(crate) fn dispatch_wide(&mut self, name: &'static str, body: &str, bufs: [&wgpu::Buffer; 8], words: &[u32], groups: (u32, u32, u32)) {
-        let ro7 = !body.contains("@binding(7)");
+        let rw5 = body.contains("@binding(5) var<storage, read_write>");
+        let ro7 = !rw5 && !body.contains("@binding(7)");
+        if rw5 {
+            self.wrote(bufs[5]);
+        }
         self.wrote(bufs[6]);
         if !ro7 {
             self.wrote(bufs[7]);
         }
         let dummy_ro;
-        let (pipeline, bg_layout, eff_bufs) = if ro7 {
+        let (pipeline, bg_layout, eff_bufs) = if rw5 {
+            (self.gpu().named_pipeline_wide_rw3(name, || body.to_string()), &self.gpu().wide_rw3_layout().0, bufs)
+        } else if ro7 {
             dummy_ro = self.gpu().dummy().clone();
             let mut b = bufs;
             b[7] = &dummy_ro;

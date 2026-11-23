@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { peek, put } from './useCached';
 import {
@@ -8,12 +8,11 @@ import {
   formatTimestamp,
   models,
   openInExplorer,
-  type CatalogSnapshot,
   type DownloadProgress,
   type DownloadStatus,
   type ModelsSnapshot,
 } from './api';
-import { Check, Copy, Download, FolderOpen, Trash2 } from 'lucide-react';
+import { Copy, Download, FolderOpen, Search, Trash2, X } from 'lucide-react';
 import { useToast } from './Toasts';
 import { ask } from './ask';
 import LoadError from './LoadError';
@@ -52,7 +51,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
     () => peek('modelsSnapshot') ?? null,
   );
   const [downloads, setDownloads] = useState<DownloadProgress[]>([]);
-  const [catalog, setCatalog] = useState<CatalogSnapshot | null>(null);
+  const [diskFilter, setDiskFilter] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const [url, setUrl] = useState('');
@@ -69,13 +68,6 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
   // slow poll response can't clobber a newer one out of order.
   const firstPollRef = useRef(true);
   const reqSeqRef = useRef(0);
-
-  // Catalog only changes when the user edits the JSON, so we fetch once.
-  useEffect(() => {
-    models.catalog().then(setCatalog).catch(() => {
-      /* non-fatal — Quick add stays hidden if OAIY Desktop is offline */
-    });
-  }, []);
 
   const refresh = useCallback(async () => {
     const seq = ++reqSeqRef.current;
@@ -178,6 +170,17 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
         ['completed', 'cancelled'].includes(d.status),
       ),
     [downloads],
+  );
+
+  const filteredModels = useMemo(() => {
+    const list = snapshot?.models ?? [];
+    const q = diskFilter.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((m) => m.name.toLowerCase().includes(q) || m.path.toLowerCase().includes(q));
+  }, [snapshot, diskFilter]);
+  const totalBytes = useMemo(
+    () => filteredModels.reduce((sum, m) => sum + (m.sizeBytes || 0), 0),
+    [filteredModels],
   );
 
   return (
@@ -309,31 +312,71 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
       )}
 
       <section className="model-section">
-        <h3 className="section-title">
-          On disk{' '}
-          {snapshot && (
-            <span className="section-count">
-              {snapshot.models.length < snapshot.total
-                ? `(showing ${snapshot.models.length} of ${snapshot.total})`
-                : `(${snapshot.total})`}
-            </span>
+        <div className="model-section-head">
+          <h3 className="section-title">
+            On disk{' '}
+            {snapshot && (
+              <span className="section-count">
+                {diskFilter.trim()
+                  ? `(${filteredModels.length} matching · ${formatBytes(totalBytes)})`
+                  : snapshot.models.length < snapshot.total
+                    ? `(showing ${snapshot.models.length} of ${snapshot.total} · ${formatBytes(totalBytes)})`
+                    : `(${snapshot.total}${totalBytes > 0 ? ` · ${formatBytes(totalBytes)}` : ''})`}
+              </span>
+            )}
+          </h3>
+          {snapshot && snapshot.models.length > 0 && (
+            <div className="model-search-wrap">
+              <Search size={13} aria-hidden />
+              <input
+                type="text"
+                className="model-search"
+                aria-label="Filter files on disk"
+                placeholder="Filter files…"
+                value={diskFilter}
+                onChange={(e) => setDiskFilter(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape' && diskFilter) {
+                    e.preventDefault();
+                    setDiskFilter('');
+                  }
+                }}
+              />
+              {diskFilter && (
+                <button
+                  type="button"
+                  className="model-search-clear"
+                  aria-label="Clear file filter"
+                  title="Clear filter"
+                  onClick={() => setDiskFilter('')}
+                >
+                  <X size={12} aria-hidden />
+                </button>
+              )}
+            </div>
           )}
-        </h3>
+        </div>
         {snapshot?.models.length === 0 && (
           <div className="empty-state">No models downloaded yet.</div>
+        )}
+        {snapshot && snapshot.models.length > 0 && filteredModels.length === 0 && (
+          <div className="empty-state">
+            No {snapshot.models.length < snapshot.total ? 'loaded ' : ''}model files match “{diskFilter.trim()}”.
+          </div>
         )}
         {snapshot && snapshot.models.length < snapshot.total && (
           <div className="datadir-note datadir-row">
             <span>
-              {snapshot.total - snapshot.models.length} more model
-              {snapshot.total - snapshot.models.length === 1 ? '' : 's'} not shown.
+              {diskFilter.trim()
+                ? `Filtering ${snapshot.models.length} loaded files (${snapshot.total - snapshot.models.length} more on disk).`
+                : `${snapshot.total - snapshot.models.length} more model${snapshot.total - snapshot.models.length === 1 ? '' : 's'} not shown.`}
             </span>
             <button className="btn-tiny" onClick={() => setShown((n) => n + PAGE)}>
               Show more
             </button>
           </div>
         )}
-        {snapshot?.models.map((m) => {
+        {filteredModels.map((m) => {
           const isProjector = /(^|[/\\])mmproj[^/\\]*\.gguf$/i.test(m.name);
           return (
           <div key={m.path} className="model-row">
@@ -476,12 +519,16 @@ function DownloadRow({ dl, onPause, onResume, onCancel }: RowProps) {
             <button
               className="btn-tiny btn-danger"
               onClick={() =>
-                void ask(`Cancel the download of ${dl.filename}? Partial data will be discarded.`).then((yes) => {
+                void ask(
+                  dl.status === 'failed'
+                    ? `Discard the failed download of ${dl.filename}? Partial data will be removed.`
+                    : `Cancel the download of ${dl.filename}? Partial data will be discarded.`,
+                ).then((yes) => {
                   if (yes) onCancel();
                 })
               }
             >
-              Cancel
+              {dl.status === 'failed' ? 'Discard' : 'Cancel'}
             </button>
           )}
       </div>

@@ -1975,13 +1975,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) l
             let k_pos = k_block + j;
             let valid = is_active && (k_pos >= kv_first_t) && (k_pos <= q_pos);
             let kb = j * 128u + l4;
-            let k4 = vec4<f32>(sk[kb], sk[kb + 1u], sk[kb + 2u], sk[kb + 3u]);
-            let dot_qk = subgroupAdd(dot(q4, k4));
-            let dist = select(rel_extent, q_pos - k_pos, valid);
+            var k4 = vec4<f32>(0.0);
             var rb_term = 0.0;
-            if (dist < rel_extent && lane < d_rel) {
-                rb_term = r_val * attn_consts[dist * d_rel + lane];
+            if (valid) {
+                k4 = vec4<f32>(sk[kb], sk[kb + 1u], sk[kb + 2u], sk[kb + 3u]);
+                let dist = q_pos - k_pos;
+                if (dist < rel_extent && lane < d_rel) {
+                    rb_term = r_val * attn_consts[dist * d_rel + lane];
+                }
             }
+            let dot_qk = subgroupAdd(dot(q4, k4));
             let bias = subgroupAdd(rb_term);
             if (valid) {
                 let score = dot_qk * scale + bias;
@@ -2222,6 +2225,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) l
     let chunk = max(32u, (total + n_splits - 1u) / n_splits);
     let sp_lo = kv_first + sp * chunk;
     let sp_hi = min(kv_end, sp_lo + chunk);
+    if (sp_lo >= sp_hi) {
+        if (warp == 0u && lane == 0u) {
+            let sb_base = (h * n_splits + sp) * 132u;
+            split_buf[sb_base + 128u] = -1.0e30;
+            split_buf[sb_base + 129u] = 0.0;
+        }
+        return;
+    }
 
     let q_off = h * 128u + lane * 4u;
     let qc_off = q_clip_off + q_off;

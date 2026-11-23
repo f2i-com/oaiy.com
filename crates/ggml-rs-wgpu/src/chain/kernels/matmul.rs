@@ -534,6 +534,29 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Subgroup-reduced [`MATVEC_F32_4`] for 32-lane subgroup GPUs: 128 threads (4 warps) per output row,
+/// `subgroupAdd` + 1 `workgroupBarrier()` instead of 8 barriers (eliminates 336 barriers/tok on Inkling-2
+/// routers and 252 barriers/tok on Qwen3.5 `ba_f32`).
+pub(in crate::chain) const MATVEC_F32_4_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> wpart: array<f32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let k4 = p[0].y / 4u;
+    let o = wg.x;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < k4; i += 128u) { s += w4[o * k4 + i] * x4[i]; }
+    let ws = subgroupAdd(s.x + s.y + s.z + s.w);
+    if (lane == 0u) { wpart[sgi] = ws; }
+    workgroupBarrier();
+    if (li == 0u) { y[o] = (wpart[0] + wpart[1]) + (wpart[2] + wpart[3]); }
+}
+"#;
+
 /// [`MATVEC_F32_4`] for 2 to 8 rows (a check of drafts): a workgroup an output, each weight read once for every row,
 /// a row's sums in the workgroup's memory a slot each. `p[0]`: n, k, rows.
 pub(in crate::chain) const MATVEC_F32_4_ROWS: &str = r#"

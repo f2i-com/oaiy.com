@@ -557,7 +557,14 @@ export function StorageSettings() {
 
   return (
     <div className="panel is-form settings-page">
-      {error && <div className="banner banner-err" role="alert">⚠ {error}</div>}
+      {error && (
+        <div className="banner banner-err banner-dismissable" role="alert">
+          <span>⚠ {error}</span>
+          <button type="button" className="banner-dismiss" aria-label="Dismiss error" onClick={() => setError(null)}>
+            ×
+          </button>
+        </div>
+      )}
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>

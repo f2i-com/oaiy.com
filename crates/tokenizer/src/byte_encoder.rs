@@ -39,18 +39,31 @@ pub fn byte_to_char(b: u8) -> char {
 }
 
 /// Reverse mapping: `CHAR_TO_BYTE[c]` -> byte. Returns None for chars outside
-/// the byte-level alphabet.
+/// the byte-level alphabet. All 256 byte-level BPE symbols lie in `0..0x144`,
+/// so a direct flat table gives O(1) lookup without hashing.
+#[inline]
 pub fn char_to_byte(c: char) -> Option<u8> {
-    static REV: OnceLock<std::collections::HashMap<char, u8>> = OnceLock::new();
-    let m = REV.get_or_init(|| {
+    const TABLE_LEN: usize = 0x144;
+    const NONE: u16 = u16::MAX;
+    static REV: OnceLock<[u16; TABLE_LEN]> = OnceLock::new();
+    let tbl = REV.get_or_init(|| {
         let t = byte_to_char_table();
-        let mut m = std::collections::HashMap::with_capacity(256);
-        for (i, &c) in t.iter().enumerate() {
-            m.insert(c, i as u8);
+        let mut arr = [NONE; TABLE_LEN];
+        for (i, &ch) in t.iter().enumerate() {
+            let code = ch as usize;
+            debug_assert!(code < TABLE_LEN);
+            arr[code] = i as u16;
         }
-        m
+        arr
     });
-    m.get(&c).copied()
+    let code = c as usize;
+    if code < TABLE_LEN {
+        let v = tbl[code];
+        if v != NONE {
+            return Some(v as u8);
+        }
+    }
+    None
 }
 
 /// Encode a byte string as a chain of "visible" chars.
@@ -58,10 +71,23 @@ pub fn bytes_to_visible(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| byte_to_char(b)).collect()
 }
 
+/// Append raw bytes decoded from a visible-char string into `out`.
+#[inline]
+pub fn push_visible_bytes(s: &str, out: &mut Vec<u8>) {
+    out.reserve(s.len());
+    for c in s.chars() {
+        if let Some(b) = char_to_byte(c) {
+            out.push(b);
+        }
+    }
+}
+
 /// Reverse: turn a visible-char string back into raw bytes. Drops unknown
 /// chars rather than panicking — robust to corrupt inputs.
 pub fn visible_to_bytes(s: &str) -> Vec<u8> {
-    s.chars().filter_map(char_to_byte).collect()
+    let mut out = Vec::with_capacity(s.len());
+    push_visible_bytes(s, &mut out);
+    out
 }
 
 #[cfg(test)]

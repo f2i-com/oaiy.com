@@ -35,6 +35,15 @@ export function isParallelSafeTool(name: string): boolean {
   return PARALLEL_SAFE_TOOLS.has(name);
 }
 
+/** Call-aware parallel-safety check (treats mutating options like `softn_examples.install_to` as exclusive barriers). */
+export function isParallelSafeCall(call: Pick<ToolCall, 'name' | 'input'>): boolean {
+  if (!PARALLEL_SAFE_TOOLS.has(call.name)) return false;
+  if (call.name === 'softn_examples' && typeof call.input?.install_to === 'string' && call.input.install_to.trim().length > 0) {
+    return false;
+  }
+  return true;
+}
+
 export interface BatchCallSpec {
   index: number;
   call: ToolCall;
@@ -142,6 +151,7 @@ export async function executeToolBatch<TOutcome>(
       inFlight.delete(doneIdx);
       if (hasError) {
         await Promise.allSettled(inFlight.values());
+        await commitReady();
         throw firstError;
       }
       await commitReady();

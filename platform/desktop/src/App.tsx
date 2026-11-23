@@ -214,7 +214,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     // (beside the section's name on the one-line header: "Engines · This computer · Other computers", not "Engines · Engines")
     tab: 'This computer',
     icon: Cpu,
-    copy: 'The language, picture, video, speech, music and 3D models this computer runs, and their endpoints.',
+    copy: 'The language, picture, video, speech, music, sound effects and 3D models this computer runs, and their endpoints.',
   },
   'flow-workers': {
     tab: 'On other computers',

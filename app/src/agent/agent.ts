@@ -14,7 +14,7 @@ import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type FrameReview, type Reasoning, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, SENT_CODE_FILE, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ToolContext } from './tools';
+import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, SENT_CODE_FILE, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ReadSpanRecord, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
 import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
@@ -24,11 +24,11 @@ import { appLabel, findApps, resolveApp, softnAppOf } from '../softn/softn';
 import { findPages } from '../preview/page';
 import { findModels } from '../preview/model';
 import { imageMimeFor, viewImage, type ImagePart } from './images';
-import { diffSnapshots, snapshotVfs, type DeliverableFile } from './deliverables';
+import { createCheckpoint, diffSnapshots, revertCheckpoint, snapshotVfs, type DeliverableFile, type TurnCheckpoint } from './deliverables';
 import { pruneOldToolResults } from './pruner';
 import { RepeatToolGuard, type RepeatReminder } from './repeatGuard';
 import { WorkspaceInstructions } from './instructions';
-import { abortedToolResult, executeToolBatch, isParallelSafeTool, type BatchCallSpec } from './toolBatch';
+import { abortedToolResult, executeToolBatch, isParallelSafeCall, type BatchCallSpec } from './toolBatch';
 import { repairDanglingToolCalls } from './repair';
 import { ASK_USER_TOOL, parseAskUserInput, type AskUserHandler } from './askUser';
 import {
@@ -36,15 +36,16 @@ import {
   EXIT_PLAN_MODE_TOOL,
   PLAN_MODE_ENTER_NOTE,
   PLAN_MODE_EXIT_NOTE,
-  PLAN_MODE_RESTRICTED_TOOLS,
   extractPlanTitle,
+  isToolBlockedInPlanMode,
+  planModeAfter,
   planModeBlockedMessage,
   type PlanReviewDecision,
   type PlanReviewRequest,
 } from './planMode';
 import { extractFileMentions } from '../ui/chat/mentions';
 
-export type { DeliverableFile } from './deliverables';
+export type { DeliverableFile, TurnCheckpoint } from './deliverables';
 export type { AskUserHandler, UserQuestionAnswer, UserQuestionItem, UserQuestionResult } from './askUser';
 export type { PlanReviewDecision, PlanReviewRequest } from './planMode';
 
@@ -72,8 +73,8 @@ export type AgentEvent =
   | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' | 'pruned' }
   /** Live prompt read & decode write speed telemetry measured for the latest model step. */
   | { type: 'speed'; readTokPerSec: number | null; writeTokPerSec: number | null; ttftMs: number; promptTokens: number; cachedTokens: number; outputTokens: number }
-  /** Net workspace file changes produced during this run, with unified diff hunks. */
-  | { type: 'deliverables'; files: DeliverableFile[]; durationMs: number; toolCount: number }
+  /** Net workspace file changes produced during this run, with unified diff hunks and optional undo checkpoint ID. */
+  | { type: 'deliverables'; files: DeliverableFile[]; durationMs: number; toolCount: number; checkpointId?: string }
   /** The checklist changed (update_plan). */
   | { type: 'plan'; plan: Plan }
   /** Collaborative Plan Mode toggled on or off (via `/plan` or `exit_plan_mode`). */
@@ -571,7 +572,7 @@ ${APP_3D}- Run softn_check before finishing. Exercise controls with softn_intera
 const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it (say index.html, css/, js/, images/), linked by relative paths. The user watches it in a live preview as you build it; links between pages of the project open there too.
 - For a React or Vue project, use the app guide and its SoftN web starter. This standalone page preview runs classic browser JavaScript: <script src="js/app.js"> tags (several share globals and run in order), the DOM, addEventListener and on* attributes, timers and requestAnimationFrame, canvas, localStorage, and fetch of the project's own files (JSON, text). Not available: ES module import/export between files, JSX or anything needing a build step or npm packages, and the internet: CDN scripts, web fonts and remote images do not load, so put what the page needs in the project (use system font stacks).
 - After each change, page_check renders the page and reports script errors and files that did not load: fix them before anything else. page_inspect shows what the page displays; page_interact uses it like a person (click, fill, select, press keys), so test that it works, not just that it renders. preview_screenshot shows you how it looks: look at it, and fix what looks wrong (layout, spacing, alignment, overflow, contrast, cut-off text).
-- A page cannot show 3D: three.js and other WebGL libraries come from a CDN or as ES modules, and neither runs here. 3D scenes and models (.glb) belong in a SoftN app (Scene3D); preview_screenshot shows a .glb by itself.
+- 3D scenes with three.js run offline right inside the page preview (bundled three, OrbitControls, GLTFExporter, GLTFLoader, RoomEnvironment, RoundedBoxGeometry, BufferGeometryUtils, and EffectComposer/RenderPass/UnrealBloomPass/OutputPass — both ES <script type="module"> imports from "three" / "three/addons/..." or CDN URLs and classic <script src="...three...">). Exporting a .glb via GLTFExporter + <a download="model.glb"> saves it into /exports/ in the project (and opens in OAIY's 3D model viewer or SoftN's Scene3D).
 - Make pages responsive: preview_viewport sets the screen size (phone 390×844, tablet 820×1180, laptop 1366×768, desktop 1920×1080, or any size); check and screenshot at a phone size and a desktop size at least.
 - The page is done when page_check is clean, page_interact shows it working, and the screenshots at those sizes look right.
 `;
@@ -588,7 +589,7 @@ const APP_BRIEF = `- A SoftN app is a folder whose manifest.json names its main 
 const APP_3D_BRIEF = `- A 3D model (.glb) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), in the page's markup (asset() is not in logic): softn_components gives Scene3D's props.
 `;
 
-const WEB_BRIEF = `- For React or Vue, use the app guide and a SoftN framework starter. A standalone web page is an .html file of the project with its CSS, images and JavaScript beside it, linked by relative paths, shown in a live preview. Its scripts run on the Zipp VM against the page's real DOM: plain, classic browser JavaScript (<script src> tags sharing globals in order, the DOM, events, timers, requestAnimationFrame, canvas, localStorage, fetch of the project's own files). Not available: ES module import/export, JSX, build steps, npm packages and the internet (CDN scripts, web fonts, remote images: put what the page needs in the project, system font stacks), nor 3D (a SoftN app's Scene3D shows it).
+const WEB_BRIEF = `- For React or Vue, use the app guide and a SoftN framework starter. A standalone web page is an .html file of the project with its CSS, images and JavaScript beside it, linked by relative paths, shown in a live preview. Its scripts run on the Zipp VM against the page's real DOM: plain browser JavaScript (<script src> tags sharing globals in order, the DOM, events, timers, requestAnimationFrame, canvas, localStorage, fetch of the project's own files), plus bundled offline 3D (import * as THREE from "three", OrbitControls, GLTFExporter, GLTFLoader, RoomEnvironment, postprocessing; .glb downloads save to /exports/). Not available: other ES module imports, JSX, build steps, arbitrary npm packages, and the internet (other CDN scripts, web fonts, remote images: put what the page needs in the project, system font stacks).
 - After each change page_check reports script errors and files that did not load: fix them first. page_inspect shows what the page displays, page_interact uses it like a person, preview_screenshot shows how it looks (fix layout, spacing, overflow, contrast, cut-off text), preview_viewport sets the screen size (phone 390×844, desktop 1920×1080, or any). The page is done when page_check is clean, page_interact shows it working, and screenshots at a phone and a desktop size look right.
 `;
 
@@ -737,12 +738,21 @@ function estimateChars(turns: Turn[], charsPerToken = DEFAULT_CHARS_PER_TOKEN): 
   return turns.reduce((n, t) => n + turnChars(t, charsPerToken), 0);
 }
 
+/** Remove OAIY-injected project/workspace-instruction headers, hydrated @file blocks, and @file reference footers from a user turn's text. */
+export function stripInjectedUserContext(text: string): string {
+  return text
+    .replace(/^<project>[\s\S]*?<\/project>\n\n/, '')
+    .replace(/^<workspace-instructions>[\s\S]*?<\/workspace-instructions>\n\n/, '')
+    .replace(/\n\n<referenced-file path="[^"]*">[\s\S]*?<\/referenced-file>/g, '')
+    .replace(/\n\n\[Referenced project files: [^\]]*\]/g, '');
+}
+
 /** A turn as plain text, for the summarizer: long tool output is cut, the gist is kept. */
 function transcript(turn: Turn): string {
   const cutText = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)} […${text.length - max} more characters]` : text);
   if (turn.role === 'user') {
     if (turn.summary) return `Summary of what came before:\n${turn.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}`;
-    const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+    const text = stripInjectedUserContext(turn.text);
     return `${turn.automatic ? 'OAIY' : 'User'}: ${cutText(text, 6000)}${turn.images?.length ? ` [${turn.images.length} image(s)]` : ''}`;
   }
   if (turn.role === 'assistant') {
@@ -997,8 +1007,35 @@ export class Agent {
   /** Collaborative Plan Mode state (cache-friendly: narrated on transitions rather than mutating systemPrompt). */
   private planModeActive = false;
   private planModeEntered = false;
+  private planModeNotified = false;
   private pendingPlanNotice: string | null = null;
+  /** Non-destructive Stage-1 pruned tool contents (keeps saved `this.turns` verbatim for UI replay). */
+  private prunedToolContents = new WeakMap<ToolResult, string>();
+  private prunedToolCount = 0;
+  /** Guides loaded during this session (monotonically retained even if older tool outputs are pruned). */
+  private persistentGuides = new Set<GuideTopic>();
+  /** Memoized `usable` tool list keyed on VFS revision + guides + media/session state. */
+  private usableCache: { key: string; tools: ToolSpec[] } | null = null;
+  /** Ring buffer of recent turn-level VFS checkpoints (for `/undo` and Deliverables Card Revert). */
+  private checkpoints: TurnCheckpoint[] = [];
+  private checkpointSeq = 0;
   running = false;
+
+  /** Recent turn-level VFS checkpoints (oldest to newest, at most 10). */
+  listCheckpoints(): ReadonlyArray<TurnCheckpoint> {
+    return this.checkpoints;
+  }
+
+  /** Revert a specific checkpoint by ID (or the latest checkpoint when `id` is omitted). */
+  undoCheckpoint(id?: string): { checkpoint: TurnCheckpoint; restored: string[]; deleted: string[] } | null {
+    if (!this.checkpoints.length) return null;
+    const idx = id ? this.checkpoints.findIndex((c) => c.id === id) : this.checkpoints.length - 1;
+    if (idx < 0) return null;
+    const [checkpoint] = this.checkpoints.splice(idx, 1);
+    const outcome = revertCheckpoint(this.options.vfs, checkpoint!, this.toolContext.reads);
+    this.toolContext.readSpans?.clear();
+    return { checkpoint: checkpoint!, ...outcome };
+  }
 
   get planMode(): boolean {
     return this.planModeActive;
@@ -1008,9 +1045,29 @@ export class Agent {
   setPlanMode(active: boolean): boolean {
     if (this.planModeActive === active) return false;
     this.planModeActive = active;
-    if (active) this.planModeEntered = true;
-    this.pendingPlanNotice = active ? PLAN_MODE_ENTER_NOTE : PLAN_MODE_EXIT_NOTE;
+    if (active) {
+      this.planModeEntered = true;
+      this.pendingPlanNotice = this.pendingPlanNotice === PLAN_MODE_EXIT_NOTE ? null : PLAN_MODE_ENTER_NOTE;
+    } else if (this.pendingPlanNotice === PLAN_MODE_ENTER_NOTE) {
+      // Toggled on then off before the model ever saw Plan Mode active: cancel the pending note cleanly.
+      this.pendingPlanNotice = null;
+      if (!this.planModeNotified) this.planModeEntered = false;
+    } else {
+      this.pendingPlanNotice = PLAN_MODE_EXIT_NOTE;
+    }
     return true;
+  }
+
+  /** Restore Plan Mode & workspace-instruction baseline state after hydrating saved `this.turns`. */
+  restoreFromTurns(): void {
+    const restored = planModeAfter(this.turns);
+    this.planModeActive = restored.active;
+    this.planModeEntered = restored.entered;
+    this.planModeNotified = restored.entered;
+    this.pendingPlanNotice = null;
+    if (this.turns.length > 0 && !this.options.conversation) {
+      this.workspaceInstructions.seedBaseline(this.options.vfs);
+    }
   }
 
   constructor(private readonly options: AgentOptions) {
@@ -1022,6 +1079,18 @@ export class Agent {
       rawVfs: options.vfs,
       gate: options.gate,
       reads: new Map(),
+      readSpans: new Map<string, ReadSpanRecord>(),
+      isToolResultActive: (callId: string) => {
+        const start = viewStart(this.turns);
+        for (let i = start; i < this.turns.length; i++) {
+          const t = this.turns[i]!;
+          if (t.role !== 'tool') continue;
+          for (const r of t.results) {
+            if (r.id === callId) return !this.prunedToolContents.has(r);
+          }
+        }
+        return false;
+      },
       shell: { cwd: '/', env: {} },
       preview: options.preview,
       media: options.media,
@@ -1039,6 +1108,7 @@ export class Agent {
     this.looseFiles.clear();
     this.failingApps.clear();
     this.toolContext.reads.clear();
+    this.toolContext.readSpans?.clear();
     this.toolContext.shell = { cwd: '/', env: {} };
     // A flag given to the conversation before and not fixed yet goes first again, with the person's words: the new
     // conversation is given it whole (as the flags still waiting are), instead of being pushed to fix a picture it was
@@ -1049,7 +1119,13 @@ export class Agent {
     this.workspaceInstructions.reset();
     this.planModeActive = false;
     this.planModeEntered = false;
+    this.planModeNotified = false;
     this.pendingPlanNotice = null;
+    this.prunedToolContents = new WeakMap();
+    this.prunedToolCount = 0;
+    this.persistentGuides.clear();
+    this.usableCache = null;
+    this.checkpoints = [];
   }
 
   /** The checklist from the latest update_plan. */
@@ -1280,9 +1356,19 @@ export class Agent {
     return !p || !this.noImages.has(`${p.id}|${p.modelId}`);
   }
 
-  /** What the model reads: the latest summary and everything after it. */
+  /** What the model reads: the latest summary and everything after it, with non-destructive Stage-1 pruning applied. */
   view(): Turn[] {
-    return this.turns.slice(viewStart(this.turns));
+    return this.turns.slice(viewStart(this.turns)).map((turn): Turn => {
+      if (turn.role !== 'tool') return turn;
+      if (!turn.results.some((r) => this.prunedToolContents.has(r))) return turn;
+      return {
+        ...turn,
+        results: turn.results.map((r) => {
+          const pruned = this.prunedToolContents.get(r);
+          return pruned !== undefined ? { ...r, content: pruned } : r;
+        }),
+      };
+    });
   }
 
   private window(provider: ProviderConfig): number {
@@ -1301,11 +1387,12 @@ export class Agent {
   private get listed(): ToolSpec[] {
     const usable = this.usable;
     if (!this.discovering) return usable;
-    const base = usable.filter((t) => LISTED.has(t.name) || (this.planModeEntered && t.name === EXIT_PLAN_MODE_TOOL)).map(shortSpec);
+    const includePlanExit = !!this.options.reviewPlan || this.planModeEntered;
+    const base = usable.filter((t) => LISTED.has(t.name) || (includePlanExit && t.name === EXIT_PLAN_MODE_TOOL)).map(shortSpec);
     return [...base, FIND_TOOLS, USE_TOOL];
   }
 
-  /** Every tool this agent may use, listed or found. */
+  /** Every tool this agent may use, listed or found. Memoized on VFS revision + session/media state to avoid repeated tree walks per step. */
   private get usable(): ToolSpec[] {
     // A sub-agent gets its list from its parent, media tools and the conversation's own tools included (a call, a short
     // list of its own). Its own session tools join only those the list lacks (one that came since): a task listed each of
@@ -1315,19 +1402,37 @@ export class Agent {
       return [...this.options.tools, ...this.sessionToolList.map((t) => t.spec).filter((spec) => !listed.has(spec.name))];
     }
     const provider = this.options.provider();
-    // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
+    const includePlanExit = !!this.options.reviewPlan || this.planModeEntered;
+    const guides = this.loadedGuides();
+    const media = this.options.media?.();
+    const sessionTools = this.sessionToolList;
+    const cacheKey = [
+      this.options.vfs.revision,
+      lean ? '1' : '0',
+      this.discovering ? '1' : '0',
+      this.options.askUser ? '1' : '0',
+      includePlanExit ? '1' : '0',
+      [...guides].sort().join(','),
+      media
+        ? `${media.baseUrl}|${media.discovered?.origin ?? ''}|${media.imageModel ?? ''}|${media.videoModel ?? ''}|${media.speechModel ?? ''}|${media.musicModel ?? ''}|${media.soundModel ?? ''}|${media.model3dModel ?? ''}|${media.imageModels.length}|${media.videoModels.length}|${media.speechModels?.length ?? 0}|${media.musicModels?.length ?? 0}|${media.soundModels?.length ?? 0}|${media.model3dModels?.length ?? 0}|${media.backgroundModels?.length ?? 0}|${media.upscaleModels?.length ?? 0}|${media.voices?.length ?? 0}`
+        : 'none',
+      sessionTools.map((t) => t.spec.name).join(','),
+    ].join('\0');
+    if (this.usableCache && this.usableCache.key === cacheKey) return this.usableCache.tools;
+
+    // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const coreTools = (lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS).filter(
       (t) => t.name !== ASK_USER_TOOL || !!this.options.askUser,
     );
     const all = [
       ...coreTools,
-      ...(this.planModeEntered ? [EXIT_PLAN_MODE_SPEC] : []),
-      ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs)),
+      ...(includePlanExit ? [EXIT_PLAN_MODE_SPEC] : []),
+      ...mediaTools(media, readProjectVoices(this.options.vfs)),
     ];
     // The app tools only once there is an app to work on: otherwise they only distract.
-    const apps = this.loadedGuides().has('app') || findApps(this.options.vfs).length > 0;
-    const web = this.loadedGuides().has('web') || findPages(this.options.vfs).length > 0;
+    const apps = guides.has('app') || findApps(this.options.vfs).length > 0;
+    const web = guides.has('web') || findPages(this.options.vfs).length > 0;
     // The preview also shows 3D models: those in the project, and those the agent can make.
     const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
     const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
@@ -1336,11 +1441,13 @@ export class Agent {
     const description = this.discovering
       ? `Read the guide for a kind of work before you start it (${topics.join(', ')}): it comes back as the result.`
       : `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`;
-    return [...tools, ...this.sessionToolList.map((t) => t.spec), {
+    const built: ToolSpec[] = [...tools, ...sessionTools.map((t) => t.spec), {
       name: 'guide',
       description,
       parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
     }];
+    this.usableCache = { key: cacheKey, tools: built };
+    return built;
   }
 
   /**
@@ -1390,16 +1497,17 @@ export class Agent {
   }
 
   /** Guides read so far: the parent's, those read with a request, and those read since (their note in a result). */
-  private guideCache: { turns: Turn[]; length: number; loaded: Set<GuideTopic> } | null = null;
+  private guideCache: { turns: Turn[]; length: number; persistentSize: number; loaded: Set<GuideTopic> } | null = null;
   private loadedGuides(): Set<GuideTopic> {
     const c = this.guideCache;
-    if (c && c.turns === this.turns && c.length === this.turns.length) return c.loaded;
-    const loaded = new Set<GuideTopic>((this.options.guides ?? []) as GuideTopic[]);
+    if (c && c.turns === this.turns && c.length === this.turns.length && c.persistentSize === this.persistentGuides.size) return c.loaded;
+    const loaded = new Set<GuideTopic>([...((this.options.guides ?? []) as GuideTopic[]), ...this.persistentGuides]);
     for (const t of this.turns) {
       if (t.role === 'user') for (const g of t.guides ?? []) loaded.add(g as GuideTopic);
       else if (t.role === 'tool') for (const r of t.results) for (const m of r.content.matchAll(GUIDE_MARK)) loaded.add(m[1] as GuideTopic);
     }
-    this.guideCache = { turns: this.turns, length: this.turns.length, loaded };
+    for (const g of loaded) this.persistentGuides.add(g);
+    this.guideCache = { turns: this.turns, length: this.turns.length, persistentSize: this.persistentGuides.size, loaded };
     return loaded;
   }
 
@@ -1426,6 +1534,8 @@ export class Agent {
     // (where the tools are found, the guide is its result, again when asked again: an early one may be summarized away)
     if (this.discovering) return { id: call.id, name: call.name, content: this.guideGivenText(topic, names), isError: false };
     if (this.loadedGuides().has(topic)) return { id: call.id, name: call.name, content: `The ${topic} guide is already in your instructions: follow it.`, isError: false };
+    this.persistentGuides.add(topic);
+    this.guideCache = null;
     const tools = topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, sqlite_list_databases, sqlite_schema, sqlite_query, sqlite_execute, preview_screenshot, preview_viewport) are yours from now on too.' : topic === 'web' ? ' The page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours from now on too.' : '';
     return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${tools}`, isError: false };
   }
@@ -1489,7 +1599,9 @@ export class Agent {
     // (whole, unless too long for the window: its start and its end then, the cut marked).
     const video = read.includes('video') && !this.options.role;
     const summarized = this.requestOutOfView();
-    const request = video || summarized ? this.requestWords(true) : '';
+    // Avoid mutating systemPrompt on live mid-run interjections that are still verbatim in `this.view()`;
+    // only include interjections that were compacted out of view so the prompt KV-cache prefix stays warm.
+    const request = video || summarized ? this.requestWords(true, summarized) : '';
     const quoted = summarized ? headAndTail(request, video ? Math.max(4000, this.quoteRoom()) : this.quoteRoom(), "to fit the model's context") : request.length > 4000 ? `${request.slice(0, 4000)} […]` : request;
     const why = [summarized ? 'the part of the conversation it was in was summarized to make room' : '', video ? "the script and everything made follow it; the guide's rules only fill in what it leaves open" : ''].filter(Boolean).join('; ');
     const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (${why}):\n"""\n${quoted}\n"""` : '';
@@ -1610,9 +1722,9 @@ ${personInstructionsText(own)}` : ''}`;
     const own = this.options.personInstructions?.().trim() ?? '';
     const child = new Agent({
       ...this.options,
-      // (every file it wrote, whichever tool wrote it: code it ran, a picture it made, as well as write_file's)
+      // (every file it wrote, whichever tool wrote it: code it ran, a picture it made, as well as write_file's; skip internal .oaiy/ spill files)
       vfs: trackedVfs(this.options.vfs, (path) => {
-        if (path && this.options.vfs.stat(`/${path}`)?.type !== 'dir') files.add(path);
+        if (path && path !== '.oaiy' && !path.startsWith('.oaiy/') && this.options.vfs.stat(`/${path}`)?.type !== 'dir') files.add(path);
       }),
       provider: () => provider,
       tools: this.usable.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
@@ -1622,6 +1734,11 @@ ${personInstructionsText(own)}` : ''}`;
       maxSteps: SUB_AGENT_STEPS,
       maxContext: contextTokens,
       subAgents: undefined,
+      askUser: undefined,
+      reviewPlan: undefined,
+      keepStopped: undefined,
+      waitingOnCall: undefined,
+      onFailure: undefined,
     });
     const calls = new Map<string, ToolCall>();
     let final = '';
@@ -1942,10 +2059,35 @@ ${personInstructionsText(own)}` : ''}`;
     return Math.ceil(estimateChars(withoutOldImages(turns, this.keepImages), this.charsPerToken) / this.charsPerToken);
   }
 
+  /** Apply Stage-1 tool-result pruning into `prunedToolContents` without mutating `this.turns` (saved chat history stays verbatim). */
+  private applyStage1Pruning(minReclaimChars = 0): { prunedResults: number; charsRemoved: number } {
+    const start = viewStart(this.turns);
+    const currentView = this.view();
+    const pruned = pruneOldToolResults(currentView, 0);
+    if (pruned.prunedResults > 0 && pruned.charsRemoved >= minReclaimChars) {
+      for (let i = 0; i < currentView.length; i++) {
+        const origTurn = this.turns[start + i];
+        const prunedTurn = pruned.turns[i];
+        if (origTurn?.role !== 'tool' || prunedTurn?.role !== 'tool') continue;
+        for (let j = 0; j < origTurn.results.length; j++) {
+          const origRes = origTurn.results[j]!;
+          const prunedRes = prunedTurn.results[j];
+          const prevContent = this.prunedToolContents.get(origRes) ?? origRes.content;
+          if (prunedRes && prunedRes.content !== prevContent) {
+            if (!this.prunedToolContents.has(origRes)) this.prunedToolCount++;
+            this.prunedToolContents.set(origRes, prunedRes.content);
+          }
+        }
+      }
+      return { prunedResults: pruned.prunedResults, charsRemoved: pruned.charsRemoved };
+    }
+    return { prunedResults: 0, charsRemoved: 0 };
+  }
+
   /**
    * Before a request: if the prompt would pass the compaction threshold, first run Stage-1
-   * deterministic, model-free tool-result pruning; if still over threshold (or forced),
-   * run Stage-2 LLM summarization.
+   * deterministic, model-free tool-result pruning (with hysteresis so tiny prunes don't bust KV cache
+   * on every step); if still over threshold (or forced), run Stage-2 LLM summarization.
    */
   private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
     const b = this.budget(provider);
@@ -1957,10 +2099,12 @@ ${personInstructionsText(own)}` : ''}`;
     if (!force && used <= threshold) return;
 
     // Stage 1: deterministic, model-free, code-point-safe pruning of oversized older tool results.
-    const pruned = pruneOldToolResults(this.turns, viewStart(this.turns));
+    // Hysteresis: require reclaiming a meaningful batch (min 12 KB or 12% of prompt budget) unless forced,
+    // avoiding 1-turn prefix mutations on every consecutive step near the threshold.
+    const minBatchChars = force ? 0 : Math.min(12_000, Math.floor(b.prompt * this.charsPerToken * 0.12));
+    const pruned = this.applyStage1Pruning(minBatchChars);
     if (pruned.prunedResults > 0) {
       const before = used + b.fixed;
-      this.turns = pruned.turns;
       const usedAfter = this.estimate(this.view());
       const after = usedAfter + b.fixed;
       emit({ type: 'compact', turns: pruned.prunedResults, before, after, how: 'pruned' });
@@ -1990,9 +2134,8 @@ ${personInstructionsText(own)}` : ''}`;
       }
       emit(e);
     };
-    const pruned = pruneOldToolResults(this.turns, viewStart(this.turns));
+    const pruned = this.applyStage1Pruning(0);
     if (pruned.prunedResults > 0) {
-      this.turns = pruned.turns;
       const mid = this.estimate(this.view()) + b.fixed;
       capture({ type: 'compact', turns: pruned.prunedResults, before: initial, after: mid, how: 'pruned' });
       capture({ type: 'context', used: mid, window: b.window });
@@ -2010,7 +2153,8 @@ ${personInstructionsText(own)}` : ''}`;
    */
   private async compact(provider: ProviderConfig, b: { window: number; fixed: number; prompt: number; reply: number }, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<void> {
     const start = viewStart(this.turns);
-    const view = this.turns.slice(start);
+    // Respect Stage-1 pruned tool contents so already-pruned turns don't blow up tail sizing or summarizer input.
+    const view = this.view();
     const before = this.estimate(view) + b.fixed;
     const tailChars = b.prompt * 0.3 * this.charsPerToken;
     let keepFrom = view.length;
@@ -2047,14 +2191,54 @@ ${personInstructionsText(own)}` : ''}`;
       text: `[OAIY] The conversation before this point (${old.length} turns) was summarized to fit the model's context.\n<project>\n${this.options.projectSummary()}\n</project>\n\n${summary}`,
     };
     this.turns.splice(start + keepFrom, 0, note);
+    // Earlier read_file results are now summarized out of view — allow fresh full reads if requested again.
+    this.toolContext.readSpans?.clear();
     // (the instructions now quote the request, if it was among the turns summarized: counted with them)
     const after = this.estimate(this.view()) + this.budget(provider).fixed;
     emit({ type: 'compact', turns: old.length, before, after, how });
   }
 
-  /** The model writes the summary, a chunk at a time when the old part is bigger than it can read. */
+  /**
+   * The model writes the summary. When `old` fits inside the warm context budget, sends a prefix-aligned
+   * request reusing the identical `systemPrompt` and `listed` tools so local/cloud KV caches hit ~99%;
+   * falls back transparently to tool-free chunked summarization on overflow or if the model tries to call a tool.
+   */
   private async summarize(old: Turn[], provider: ProviderConfig, b: { window: number; reply: number }, signal?: AbortSignal): Promise<string> {
-    const room = Math.max(2000, (b.window - Math.min(4096, b.reply) - 2000) * 0.8 * this.charsPerToken);
+    const maxSummaryTokens = Math.min(4096, b.reply);
+    const silentSink = { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} };
+
+    // Fast path: prefix-aligned compaction reusing the warm systemPrompt + tools + conversation prefix.
+    const prefixTurns = wellFormed([
+      ...withoutOldImages(old, 0),
+      {
+        role: 'user',
+        text: `${SUMMARIZER_PROMPT}\n\nDo NOT call any tools. Write only the summary of the conversation above.`,
+      },
+    ]);
+    const warmLimitChars = Math.max(0, (b.window - maxSummaryTokens - 1024) * 0.78 * this.charsPerToken);
+    if (this.fixedChars() + estimateChars(prefixTurns, this.charsPerToken) < warmLimitChars) {
+      let emptyReply = false;
+      try {
+        const reply = await sendTurn(provider, this.systemPrompt, prefixTurns, this.listed, {
+          signal,
+          maxOutputTokens: maxSummaryTokens,
+          reasoning: 'none',
+          plainProse: true,
+          stripAnthropicThinking: provider.type === 'anthropic',
+          sink: silentSink,
+        });
+        if (!reply.calls.length) {
+          if (reply.text.trim()) return reply.text.trim();
+          emptyReply = true;
+        }
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        // Fall through to tool-free chunked summarization below.
+      }
+      if (emptyReply) throw new Error('the summary came back empty');
+    }
+
+    const room = Math.max(2000, (b.window - maxSummaryTokens - 2000) * 0.8 * this.charsPerToken);
     const chunks: string[] = [];
     let current = '';
     for (const turn of old) {
@@ -2072,7 +2256,7 @@ ${personInstructionsText(own)}` : ''}`;
       const prompt = `${summary ? `The summary so far:\n${summary}\n\n` : ''}The conversation to ${summary ? 'add to it' : 'summarize'}:\n${chunk}\nWrite the ${summary ? 'updated ' : ''}summary.`;
       // (no thinking first: an engine that thinks by default spent the summary's whole reply thinking, and it came back
       // empty; and no repeat penalty on its prose, which made a summary word salad three times as long as asked)
-      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), reasoning: 'none', plainProse: true, sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
+      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: maxSummaryTokens, reasoning: 'none', plainProse: true, sink: silentSink });
       if (!reply.text.trim()) throw new Error('the summary came back empty');
       summary = reply.text.trim();
     }
@@ -2086,10 +2270,22 @@ ${personInstructionsText(own)}` : ''}`;
    */
   private mechanicalSummary(old: Turn[], from: number): string {
     const asked = requestIndex(this.turns);
-    const requests = old.filter((t, i): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic && !t.summary && (asked < 0 || from + i < asked)).map((t) => `- ${t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '').slice(0, 300)}`);
+    const requests = old.filter((t, i): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic && !t.summary && (asked < 0 || from + i < asked)).map((t) => `- ${stripInjectedUserContext(t.text).slice(0, 300)}`);
     const touched = new Set<string>();
-    // (append_file among them: long documents are written with it)
-    for (const t of old) if (t.role === 'assistant') for (const c of t.calls) if (typeof c.input.path === 'string' && /write|edit|delete|append/.test(c.name)) touched.add(c.input.path);
+    // (append_file and apply_patch among them: long documents and multi-file patches)
+    for (const t of old) {
+      if (t.role !== 'assistant') continue;
+      for (const c of t.calls) {
+        if (typeof c.input.path === 'string' && /write|edit|delete|append/.test(c.name)) {
+          touched.add(c.input.path);
+        } else if (c.name === 'apply_patch' && typeof c.input.patch === 'string') {
+          for (const m of c.input.patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)) {
+            const p = m[1]?.trim();
+            if (p) touched.add(p);
+          }
+        }
+      }
+    }
     const earlier = old.find((t) => t.role === 'user' && t.summary) as Extract<Turn, { role: 'user' }> | undefined;
     return [
       earlier ? `Earlier summary:\n${earlier.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}` : '',
@@ -2110,9 +2306,13 @@ ${personInstructionsText(own)}` : ''}`;
     // thinking on left a call's path out twice in a row, and wrote it whole on a third try about half the time)
     let callRetries = 0;
     let repeatRetried = false;
+    let rateRetries = 0;
+    let networkRetries = 0;
     let serverRetries = 0;
+    let stripAnthropicThinking = provider.type === 'anthropic' && this.prunedToolCount > 0;
+    const jitter = (ms: number) => Math.round(ms * (0.8 + Math.random() * 0.4));
     // (each kind of failure below has a bound of its own; this one ends a step that meets several)
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < 10; attempt++) {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
       this.streamed = '';
@@ -2138,6 +2338,7 @@ ${personInstructionsText(own)}` : ''}`;
           maxOutputTokens: b.reply,
           signal,
           varied,
+          stripAnthropicThinking,
           ...this.thinking(b.reply),
           sink: {
             text: (delta) => {
@@ -2269,6 +2470,12 @@ ${personInstructionsText(own)}` : ''}`;
           emit({ type: 'status', message: 'The model got stuck repeating itself; asking again' });
           continue;
         }
+        // Anthropic signed thinking block invalidated after prefix mutation / model switch: strip and retry once.
+        if (provider.type === 'anthropic' && !stripAnthropicThinking && error.kind === 'http' && error.status === 400 && /thinking|signature|redacted_thinking/i.test(said)) {
+          stripAnthropicThinking = true;
+          emit({ type: 'status', message: 'Retrying without cached thinking signatures' });
+          continue;
+        }
         // A model without vision refuses image content: carry on in text (an image that is too big is not that).
         if (this.imagesAccepted && error.kind === 'http' && !unreadableCall && /image|vision|multimodal|image_url|content.*array/i.test(said) && !/too (large|big)|exceeds?|dimension|resolution|megapixel/i.test(said) && this.turns.some(hasImages)) {
           this.noImages.add(`${provider.id}|${provider.modelId}`);
@@ -2276,26 +2483,37 @@ ${personInstructionsText(own)}` : ''}`;
           emit({ type: 'status', message: `This model does not take images (the server said: ${error.message.slice(0, 200)}); continuing with text only` });
           continue;
         }
-        if (error.kind === 'rate-limited' && attempt < 3) {
-          const wait = Math.min(error.retryAfterMs ?? 5000 * (attempt + 1), 60_000);
+        if (error.kind === 'rate-limited' && rateRetries < 3) {
+          rateRetries++;
+          const baseWait = error.retryAfterMs ?? 5000 * rateRetries;
+          // Keep the first default retry predictable (5 s); jitter subsequent exponential retries.
+          const wait = Math.min(error.retryAfterMs !== undefined || rateRetries === 1 ? baseWait : jitter(baseWait), 60_000);
           emit({ type: 'status', message: `The provider is busy; retrying in ${Math.round(wait / 1000)} s` });
           await sleep(wait, signal);
           continue;
         }
-        if ((error.kind === 'timeout' || error.kind === 'network') && attempt < 1) {
+        if ((error.kind === 'timeout' || error.kind === 'network') && networkRetries < 1) {
+          networkRetries++;
+          const wait = jitter(250);
           emit({ type: 'status', message: 'The request failed; retrying once' });
+          await sleep(wait, signal);
           continue;
         }
         // The server's own failure, which may pass: asked again after a pause; failing so again, asked once more with the
-        // conversation compacted (a shorter prompt needs less of a GPU's room); then the run ends on it, to be tried again.
+        // conversation compacted for local/OAIY engines or high-context prompts (a shorter prompt needs less GPU room),
+        // or after a backoff pause for low-context remote APIs; then the run ends on it, to be tried again.
         if (serverFailure(error) && serverRetries < 2 && !overflow.overflow && !limit && !unreadableCall && !/generation_repetition/.test(said)) {
           serverRetries++;
           if (serverRetries === 1) {
             emit({ type: 'status', message: `The provider failed (${failureWords(error)}); retrying in ${SERVER_RETRY_MS / 1000} s` });
             await sleep(SERVER_RETRY_MS, signal);
-          } else {
+          } else if (provider.type === 'local' || provider.serverKind === 'oaiy' || this.estimate(this.view()) > b.prompt * 0.55) {
             emit({ type: 'status', message: `The provider failed again (${failureWords(error)}); compacting the conversation and retrying once more` });
             await this.compact(provider, this.budget(provider), emit, signal);
+          } else {
+            const wait = jitter(6_000);
+            emit({ type: 'status', message: `The provider failed again (${failureWords(error)}); retrying in ${Math.round(wait / 1000)} s` });
+            await sleep(wait, signal);
           }
           continue;
         }
@@ -2536,12 +2754,13 @@ ${personInstructionsText(own)}` : ''}`;
     return text.length > 8000 ? `${text.slice(0, 8000)} […]` : text;
   }
 
-  /** The same, whole; `bare`: without the guides given with it where the tools are found (OAIY's words, not the user's). */
-  private requestWords(bare = false): string {
+  /** The same, whole; `bare`: without the guides given with it where the tools are found; `includeLater`: include live interjections (skip in systemPrompt while they are still in `view()`). */
+  private requestWords(bare = false, includeLater = true): string {
     const at = requestIndex(this.turns);
     if (at < 0) return '';
-    const own = (t: Turn) => (t.role === 'user' ? t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '') : '');
+    const own = (t: Turn) => (t.role === 'user' ? stripInjectedUserContext(t.text) : '');
     const first = bare ? own(this.turns[at]).replace(/\n\n\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide follows[\s\S]*$/, '') : own(this.turns[at]);
+    if (!includeLater) return first.trim();
     const later = this.turns.slice(at + 1).filter((t) => t.role === 'user' && !t.automatic && t.text.startsWith(DURING_PREFIX)).map((t) => own(t).replace(/^\[[^\]]*\]\n\n/, ''));
     return [first, ...later.map((t) => `Then, while you worked: ${t}`)].join('\n\n').trim();
   }
@@ -2601,6 +2820,7 @@ ${personInstructionsText(own)}` : ''}`;
     }
     emit({ type: 'status', message: 'Waiting for your answer…' });
     const answer = await this.options.askUser(questions, signal);
+    if (signal?.aborted) throw signal.reason ?? new AIProviderError('cancelled', 'Stopped.');
     return {
       id: call.id,
       name: call.name,
@@ -2633,6 +2853,7 @@ ${personInstructionsText(own)}` : ''}`;
     if (this.options.reviewPlan) {
       emit({ type: 'status', message: 'Waiting for plan approval…' });
       decision = await this.options.reviewPlan({ title, plan }, signal);
+      if (signal?.aborted) throw signal.reason ?? new AIProviderError('cancelled', 'Stopped.');
     } else {
       // Headless / test environment without UI handler: auto-approve so runs don't hang.
       decision = { approved: true };
@@ -2681,86 +2902,144 @@ ${personInstructionsText(own)}` : ''}`;
     if (repaired.repairedCalls > 0) this.turns = repaired.turns;
 
     this.running = true;
-    this.toolContext.signal = signal;
-    this.toolContext.progress = (message) => emit({ type: 'status', message });
-    if (!again || this.turns.length === 0) {
-      const first = this.turns.length === 0;
-      const baselineInstr = first && !this.options.conversation ? this.workspaceInstructions.loadBaseline(this.options.vfs) : null;
-      const mentions = extractFileMentions(prompt).filter((p) => this.options.vfs.exists(`/${p}`));
-      const mentionHint = mentions.length ? `\n\n[Referenced project files: ${mentions.map((p) => `/${p}`).join(', ')}]` : '';
-      const head = first ? `<project>\n${this.options.projectSummary()}\n</project>${baselineInstr ? `\n\n${baselineInstr}` : ''}\n\n` : '';
-      const text = `${head}${prompt}${mentionHint}`;
-      const guides = this.guidesFor(prompt);
-      // (where the tools are found, the request's guides come with it: the instructions stay the same)
-      const names = new Set(this.usable.map((t) => t.name));
-      const given = this.discovering && guides.length ? `\n\n${guides.map((g) => this.guideGivenText(g, names)).join('\n\n')}` : '';
-      this.turns.push({ role: 'user', text: `${text}${given}`, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
-      const carry = this.carryOver();
-      if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
-    }
-    let failures = 0;
-    let lastFailure = '';
-    // What each step changes, by the index of the call that changed it.
-    let callIndex = -1;
-    let changes: Array<{ path: string; index: number }> = [];
-    this.onWrite = (path) => {
-      changes.push({ path, index: callIndex });
-      // Written now, for the plan step in progress now (a step marked done later in the same reply had it).
-      this.noteStepFile(path);
-    };
-    this.toolContext.images = this.imagesAccepted;
-    const unwatch = () => {
-      this.onWrite = null;
-    };
-    // The results of the step in progress: kept if the run stops part-way.
+    let unwatch = () => {};
     let stepResults: ToolResult[] = [];
-    this.sameCheck = { signature: '', count: 0 };
-    this.sameStep = { signature: '', count: 0 };
-    let planThisRun = false;
-    let planNoted = false;
-    // Steps since the plan last changed, for a reminder when the work drifts.
-    let sincePlan = 0;
-    // Progress, for deciding whether asking to carry on is still worth it.
-    const changedThisRun = new Set<string>();
-    // How many times each file was written in full, this run; written with what it already held (once a step at most); and
-    // the parts appended to it (for writtenAlready).
-    const rewrites = new Map<string, number>();
-    const unchangedWrites = new Map<string, number>();
-    const appended = new Map<string, AppendedPart[]>();
-    // Replies cut off in the middle of a tool call, in a row.
-    let cutOff = 0;
-    let idleNudges = 0;
-    let progressAtNudge = { done: -1, changed: -1, acted: -1 };
-    this.checkedRoots.clear();
-    this.tasksThisRun = 0;
-    let nudges = 0;
-    // Tool calls this run, and whether it was asked to start after only saying what it would do.
-    let acted = 0;
-    let startNudged = false;
-    // The last reply without a tool call, to notice the same words again.
-    let lastSaid = '';
-    let repeatNudged = false;
-    // This run started calls (a tool says so): their results come to it by themselves.
-    let startedCalls = false;
-    // How many times it was asked to say what it started (its own limit: a tool call in between is not progress).
-    let speakNudges = 0;
-    const maxSteps = this.options.maxSteps ?? MAX_STEPS;
-    const runStartMs = Date.now();
-    const trackDeliverables = !this.options.role && !this.options.conversation;
-    const beforeSnapshot = trackDeliverables ? snapshotVfs(this.options.vfs) : null;
-    const repeatGuard = new RepeatToolGuard();
-    const emitDeliverables = () => {
-      if (!beforeSnapshot) return;
-      const files = diffSnapshots(beforeSnapshot, snapshotVfs(this.options.vfs));
-      if (files.length) {
-        emit({ type: 'deliverables', files, durationMs: Math.max(0, Date.now() - runStartMs), toolCount: acted });
-      }
-    };
+    let stepStartedCallIds = new Set<string>();
+    let emitDeliverables = () => {};
     try {
+      this.toolContext.signal = signal;
+      this.toolContext.progress = (message) => emit({ type: 'status', message });
+      if (!again || this.turns.length === 0) {
+        const first = this.turns.length === 0;
+        let baselineInstr: string | null = null;
+        if (!this.options.conversation) {
+          if (first) baselineInstr = this.workspaceInstructions.loadBaseline(this.options.vfs);
+          else this.workspaceInstructions.seedBaseline(this.options.vfs);
+        }
+        const safeExists = (p: string) => {
+          try {
+            return this.options.vfs.exists(`/${p}`);
+          } catch {
+            return false;
+          }
+        };
+        const mentions = extractFileMentions(prompt).filter(safeExists);
+        const mentionHint = mentions.length ? `\n\n[Referenced project files: ${mentions.map((p) => `/${p}`).join(', ')}]` : '';
+        // Hydrate up to 3 small UTF-8 @mentioned files inline (<=10 KB each, <=20 KB total) and mark them read
+        // so the model can edit them immediately on step 1 without an extra read_file round-trip.
+        const hydratedBlocks: string[] = [];
+        let hydratedBytes = 0;
+        const MAX_HYDRATE_FILES = 3;
+        const MAX_HYDRATE_FILE_BYTES = 10 * 1024;
+        const MAX_HYDRATE_TOTAL_BYTES = 20 * 1024;
+        for (const rel of mentions) {
+          if (hydratedBlocks.length >= MAX_HYDRATE_FILES) break;
+          try {
+            const st = this.options.vfs.stat(`/${rel}`);
+            if (!st || st.type !== 'file' || st.size === 0 || st.size > MAX_HYDRATE_FILE_BYTES) continue;
+            if (hydratedBytes + st.size > MAX_HYDRATE_TOTAL_BYTES) continue;
+            if (!this.options.vfs.isText(`/${rel}`)) continue;
+            const fileText = this.options.vfs.readText(`/${rel}`);
+            const key = normalizePath(rel);
+            const ver = this.options.vfs.version(`/${key}`);
+            this.toolContext.reads.set(key, ver);
+            this.toolContext.reads.delete(`${key}#partial`);
+            const numbered = fileText
+              .split('\n')
+              .map((l, idx) => `${idx + 1}\t${l.replace(/\r$/, '')}`)
+              .join('\n');
+            hydratedBlocks.push(`\n\n<referenced-file path="/${key}">\n${numbered}\n</referenced-file>`);
+            hydratedBytes += st.size;
+          } catch {
+            /* skip unreadable mention */
+          }
+        }
+        const head = first ? `<project>\n${this.options.projectSummary()}\n</project>${baselineInstr ? `\n\n${baselineInstr}` : ''}\n\n` : '';
+        const text = `${head}${prompt}${mentionHint}${hydratedBlocks.join('')}`;
+        const guides = this.guidesFor(prompt);
+        // (where the tools are found, the request's guides come with it: the instructions stay the same)
+        const names = new Set(this.usable.map((t) => t.name));
+        const given = this.discovering && guides.length ? `\n\n${guides.map((g) => this.guideGivenText(g, names)).join('\n\n')}` : '';
+        this.turns.push({ role: 'user', text: `${text}${given}`, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
+        const carry = this.carryOver();
+        if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
+      }
+      let failures = 0;
+      let lastFailure = '';
+      // What each step changes, by the index of the call that changed it.
+      let callIndex = -1;
+      let changes: Array<{ path: string; index: number }> = [];
+      this.onWrite = (path) => {
+        changes.push({ path, index: callIndex });
+        // Written now, for the plan step in progress now (a step marked done later in the same reply had it).
+        this.noteStepFile(path);
+      };
+      this.toolContext.images = this.imagesAccepted;
+      unwatch = () => {
+        this.onWrite = null;
+      };
+      this.sameCheck = { signature: '', count: 0 };
+      this.sameStep = { signature: '', count: 0 };
+      let planThisRun = false;
+      let planNoted = false;
+      // Steps since the plan last changed, for a reminder when the work drifts.
+      let sincePlan = 0;
+      // Progress, for deciding whether asking to carry on is still worth it.
+      const changedThisRun = new Set<string>();
+      // How many times each file was written in full, this run; written with what it already held (once a step at most); and
+      // the parts appended to it (for writtenAlready).
+      const rewrites = new Map<string, number>();
+      const unchangedWrites = new Map<string, number>();
+      const appended = new Map<string, AppendedPart[]>();
+      // Replies cut off in the middle of a tool call, in a row.
+      let cutOff = 0;
+      let idleNudges = 0;
+      let progressAtNudge = { done: -1, changed: -1, acted: -1 };
+      this.checkedRoots.clear();
+      this.tasksThisRun = 0;
+      let nudges = 0;
+      // Tool calls this run, and whether it was asked to start after only saying what it would do.
+      let acted = 0;
+      let startNudged = false;
+      // The last reply without a tool call, to notice the same words again.
+      let lastSaid = '';
+      let repeatNudged = false;
+      // This run started calls (a tool says so): their results come to it by themselves.
+      let startedCalls = false;
+      // How many times it was asked to say what it started (its own limit: a tool call in between is not progress).
+      let speakNudges = 0;
+      const maxSteps = this.options.maxSteps ?? MAX_STEPS;
+      const runStartMs = Date.now();
+      const trackDeliverables = !this.options.role && !this.options.conversation;
+      const beforeSnapshot = trackDeliverables ? snapshotVfs(this.options.vfs) : null;
+      const repeatGuard = new RepeatToolGuard();
+      let deliverablesEmitted = false;
+      emitDeliverables = () => {
+        if (deliverablesEmitted || !beforeSnapshot) return;
+        deliverablesEmitted = true;
+        const afterSnapshot = snapshotVfs(this.options.vfs);
+        const files = diffSnapshots(beforeSnapshot, afterSnapshot);
+        if (files.length) {
+          const cpLabel = stripInjectedUserContext(prompt).trim().replace(/\s+/g, ' ').slice(0, 80) || 'Agent turn';
+          const cp = createCheckpoint(`cp-${++this.checkpointSeq}`, cpLabel, beforeSnapshot, afterSnapshot);
+          if (cp) {
+            this.checkpoints.push(cp);
+            if (this.checkpoints.length > 10) this.checkpoints.shift();
+          }
+          emit({
+            type: 'deliverables',
+            files,
+            durationMs: Math.max(0, Date.now() - runStartMs),
+            toolCount: acted,
+            ...(cp ? { checkpointId: cp.id } : {}),
+          });
+        }
+      };
       for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
         this.readInbox(emit);
         if (this.pendingPlanNotice) {
+          if (this.pendingPlanNotice === PLAN_MODE_ENTER_NOTE) this.planModeNotified = true;
           this.turns.push({ role: 'user', text: this.pendingPlanNotice, automatic: true });
           this.pendingPlanNotice = null;
         }
@@ -2839,9 +3118,10 @@ ${personInstructionsText(own)}` : ''}`;
         // (the calls as they ran, one to a result: a found tool's through use_tool, one a flow changed)
         const ran: ToolCall[] = [];
         stepResults = results;
+        stepStartedCallIds = new Set<string>();
         changes = [];
-        // A reply cut off at the output limit mid-call: the call is incomplete, so say why rather than run it.
-        if (reply.truncated && reply.calls.some((c) => c.parseError)) {
+        // A reply cut off at the output limit mid-call: the call(s) may be incomplete (even if args are empty `{}`), so do not run them.
+        if (reply.truncated && reply.calls.length > 0) {
           for (const call of reply.calls) {
             const result: ToolResult = { id: call.id, name: call.name, content: `Error: your reply was cut off at the output limit (about ${formatTokens(this.budget(provider).reply)} tokens) before this call was complete, so it did not run. Keep each call smaller: write a large file in parts (write_file with the first part, then append_file for each next part), and keep reasoning short.`, isError: true };
             results.push(result);
@@ -2874,25 +3154,27 @@ ${personInstructionsText(own)}` : ''}`;
           usedInsteadHook: boolean;
         };
 
+        const sessionToolNames = new Set(this.sessionToolList.map((t) => t.spec.name));
         const batchSpecs: BatchCallSpec[] = reply.calls.map((asked, index) => {
           const call = asked.name === 'use_tool' && this.discovering ? this.unwrapped(asked) : asked;
           const finding = call.name === 'find_tools' && this.discovering;
           const allowed = finding || this.usable.some((t) => t.name === call.name);
           const hooks = allowed ? this.hooksFor(call.name) : {};
-          const isSession = this.sessionToolList.some((t) => t.spec.name === call.name);
+          const isSession = sessionToolNames.has(call.name);
+          // Read-only calls run in parallel even in Plan Mode (mutating calls are already non-parallel and blocked).
           const parallel =
-            isParallelSafeTool(call.name) &&
+            isParallelSafeCall(call) &&
             !hooks.before &&
             !hooks.instead &&
-            !isSession &&
-            !this.planModeActive;
+            !isSession;
           return { index, call, parallel };
         });
 
-        await executeToolBatch<PreparedOutcome>(batchSpecs, {
+        const batch = await executeToolBatch<PreparedOutcome>(batchSpecs, {
           signal,
           dispatch: async (spec): Promise<PreparedOutcome> => {
             signal?.throwIfAborted();
+            stepStartedCallIds.add(spec.call.id);
             if (!spec.parallel) callIndex = spec.index;
             let call = spec.call;
             emit({ type: 'tool_call', call });
@@ -2911,8 +3193,8 @@ ${personInstructionsText(own)}` : ''}`;
                 flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
               }
             }
-            // Plan Mode guard: block mutating / code-execution tools until user approves via exit_plan_mode.
-            if (!stopped && this.planModeActive && PLAN_MODE_RESTRICTED_TOOLS.has(call.name)) {
+            // Plan Mode guard: block mutating / code-execution / session tools until user approves via exit_plan_mode.
+            if (!stopped && this.planModeActive && isToolBlockedInPlanMode(call.name, call.input, sessionToolNames)) {
               stopped = { id: call.id, name: call.name, content: planModeBlockedMessage(call.name), isError: true };
             }
             const guideNote = allowed && !stopped ? this.guideFirst(call) : null;
@@ -2990,18 +3272,27 @@ ${personInstructionsText(own)}` : ''}`;
               rewrites.set(path, times);
               if (times >= 3) result.content += `\n\n[OAIY] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
             }
-            // Writing an app's files reads the app guide (and gives the app tools).
-            if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.usable.some((t) => t.name === 'guide')) {
+            // Writing an app's or web page's files (including via apply_patch) reads its guide and unlocks its tools.
+            const writtenPaths =
+              !result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string'
+                ? [call.input.path]
+                : !result.isError && call.name === 'apply_patch'
+                  ? changes.filter((c) => c.index === _spec.index).map((c) => c.path)
+                  : [];
+            if (writtenPaths.some((p) => APP_FILE.test(p)) && !this.loadedGuides().has('app') && this.usable.some((t) => t.name === 'guide')) {
+              this.persistentGuides.add('app');
+              this.guideCache = null;
               result.content += this.discovering ? `\n\n${this.guideGivenText('app', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
             }
-            // Writing a web page reads the web guide (and gives the page tools).
-            if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && softnAppOf(this.options.vfs, call.input.path) === null && !this.loadedGuides().has('web') && this.usable.some((t) => t.name === 'guide')) {
+            if (writtenPaths.some((p) => WEB_FILE.test(p) && softnAppOf(this.options.vfs, p) === null) && !this.loadedGuides().has('web') && this.usable.some((t) => t.name === 'guide')) {
+              this.persistentGuides.add('web');
+              this.guideCache = null;
               result.content += this.discovering ? `\n\n${this.guideGivenText('web', new Set(this.usable.map((t) => t.name)))}` : `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
             }
             if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
             if (result.startedCalls) startedCalls = true;
             // A picture for a scripted video is reviewed before anything else is made.
-            if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
+            if (result.review?.length && !result.isError && !signal?.aborted) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
             results.push(result);
             ran.push(call);
             // softn_check keeps the record of failing apps current, as the automatic check does.
@@ -3023,36 +3314,41 @@ ${personInstructionsText(own)}` : ''}`;
             lastFailure = result.isError ? result.content : '';
           },
         });
+        if (batch.aborted || signal?.aborted) {
+          throw signal?.reason ?? new AIProviderError('cancelled', 'Stopped.');
+        }
         callIndex = reply.calls.length;
         for (const c of changes) {
           changedThisRun.add(c.path);
           touchedPaths.push(c.path);
         }
-        // Reconcile nested or modified AGENTS.md / OAIY.md workspace instructions without mutating systemPrompt.
-        if (!this.options.conversation && touchedPaths.length && results.length) {
+        // Reconcile root, nested, or modified AGENTS.md / OAIY.md workspace instructions without mutating systemPrompt.
+        if (!this.options.conversation && results.length) {
           const instrDelta = this.workspaceInstructions.reconcile(this.options.vfs, touchedPaths);
           if (instrDelta) results[results.length - 1].content += `\n\n${instrDelta}`;
         }
-        const stop = await this.autoCheck(reply.calls, results, changes, emit);
+        const stop = await this.autoCheck(ran, results, changes, emit);
         // (read from what the tools and the automatic check said, before the notes below are added to it: a step
         // given the plan's reminder read as another step, and a call repeated with the same result 11 times was
         // stopped only at the 11th)
-        const same = this.repeatedStep(reply.calls, results, changes.length > 0 || reply.calls.some((c) => c.name === 'update_plan'));
+        const same = this.repeatedStep(ran, results, changes.length > 0 || ran.some((c) => c.name === 'update_plan'));
+        let lastReminder: RepeatReminder | null = null;
+        if (results.length) {
+          // Always observe every call + outcome so consecutive repeat, error-repeat, and Period-2/3 cycle detectors stay in sync.
+          for (let i = 0; i < ran.length; i++) {
+            const c = ran[i]!;
+            const res = results[i];
+            const rem = repeatGuard.observe(c, res ? { isError: res.isError, errorText: res.isError ? res.content : undefined } : undefined);
+            if (rem) lastReminder = rem;
+          }
+        }
         if (same >= SAME_STEP_NOTE && results.length) {
           results[results.length - 1].content += `\n\n${sameStepNote(same, ran, results)}`;
           // (and its next step sampled anew: told what to change, a model at its server's temperature wrote the same call)
           this.varyNext = true;
-        } else if (results.length) {
-          // Escalating per-tool consecutive repeat guard (`[3, 5, 8]`, canonical deep-key-sorted args).
-          let lastReminder: RepeatReminder | null = null;
-          for (const c of ran) {
-            const rem = repeatGuard.observe(c);
-            if (rem) lastReminder = rem;
-          }
-          if (lastReminder) {
-            results[results.length - 1].content += `\n\n${lastReminder.message}`;
-            if (lastReminder.tier === 'detailed') this.varyNext = true;
-          }
+        } else if (lastReminder && results.length) {
+          results[results.length - 1].content += `\n\n${lastReminder.message}`;
+          if (lastReminder.tier === 'detailed') this.varyNext = true;
         }
         // Many steps on one plan step without the plan moving: where the work is, and what to do about it.
         const openStep = planThisRun ? this.plan?.items.findIndex((i) => i.status === 'active') ?? -1 : -1;
@@ -3072,29 +3368,41 @@ ${personInstructionsText(own)}` : ''}`;
         }
         this.turns.push({ role: 'tool', results });
         if (stop) {
+          emitDeliverables();
           emit({ type: 'error', message: stop });
           return;
         }
         if (same >= SAME_STEP_STOP) {
+          emitDeliverables();
           emit({ type: 'error', message: `The agent ran the same calls with the same results ${same} times in a row without changing anything, so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
+        if (lastReminder?.hardStop) {
+          emitDeliverables();
+          emit({ type: 'error', message: `The agent got stuck in a repeating tool loop (${lastReminder.kind === 'cycle' ? `${lastReminder.count} oscillating cycles` : `${lastReminder.count} identical failing calls on ${lastReminder.toolName}`}), so the run stopped. Say how to proceed, or "continue" to let it try again.` });
+          return;
+        }
         if (unchangedStopRef.value) {
+          emitDeliverables();
           emit({ type: 'error', message: `The model kept writing /${unchangedStopRef.value.path} with what it already holds (${unchangedStopRef.value.times} times this run, told each time), so the run stopped. Say how to proceed, or "continue" to let it try again.` });
           return;
         }
         // Its finishing tool has done its job: nothing more to ask the model.
         if (this.options.finish?.done()) {
+          emitDeliverables();
           emit({ type: 'done', text: '', steps: step });
           return;
         }
         if (failures >= 3) {
+          emitDeliverables();
           emit({ type: 'error', message: 'The same step failed three times in a row, so the run stopped. Say how to proceed.' });
           return;
         }
       }
+      emitDeliverables();
       emit({ type: 'error', message: `The run reached its ${maxSteps}-step limit. Say "continue" to keep going.` });
     } catch (error) {
+      emitDeliverables();
       if (signal?.aborted || (error instanceof AIProviderError && error.kind === 'cancelled')) {
         emit({ type: 'notice', message: 'Stopped.' });
       } else {
@@ -3107,11 +3415,11 @@ ${personInstructionsText(own)}` : ''}`;
         emit({ type: 'error', message: error instanceof Error ? error.message : String(error), retry: true });
       }
       // A turn left waiting for tool results cannot be sent again: keep the results
-      // that came in (their changes happened) and mark the rest as not run.
+      // that came in (their changes happened) and repair the rest accurately (TOOL_OUTCOME_UNKNOWN for started, TOOL_NOT_STARTED for unstarted).
       const last = this.turns[this.turns.length - 1];
       if (last?.role === 'assistant' && last.calls.length) {
-        const done = new Map(stepResults.map((r) => [r.id, r]));
-        this.turns.push({ role: 'tool', results: last.calls.map((c) => done.get(c.id) ?? { id: c.id, name: c.name, content: 'Error: the run stopped before this tool ran', isError: true }) });
+        if (stepResults.length) this.turns.push({ role: 'tool', results: [...stepResults] });
+        this.turns = repairDanglingToolCalls(this.turns, 'interrupted', stepStartedCallIds).turns;
       } else if (this.options.keepStopped && signal?.aborted && (last?.role === 'user' || last?.role === 'tool')) {
         // Stopped as it answered: what it wrote stays its reply, and it is told the reply was stopped (else the next
         // request would be joined to this one, as one message, and answered as if this one were still to do).

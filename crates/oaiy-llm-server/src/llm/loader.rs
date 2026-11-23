@@ -98,6 +98,7 @@ pub(crate) fn dtype_supports_packed_matmul(dtype: GgmlType) -> bool {
         GgmlType::Q8_0
             | GgmlType::IQ4_NL
             | GgmlType::IQ4_XS
+            | GgmlType::Q2_0
             | GgmlType::Q2_K
             | GgmlType::Q3_K
             | GgmlType::Q4_0
@@ -698,3 +699,16 @@ impl CommonTensors {
 
 pub type ModelTensors = CommonTensors;
 pub type BlockTensors = CommonBlockTensors;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_matmul_supports_ternary_q2_0() {
+        assert!(dtype_supports_packed_matmul(GgmlType::Q2_0));
+        assert!(dtype_supports_packed_matmul(GgmlType::Q4_K));
+        assert!(dtype_supports_packed_matmul(GgmlType::IQ4_NL));
+        assert!(!dtype_supports_packed_matmul(GgmlType::F32));
+    }
+}

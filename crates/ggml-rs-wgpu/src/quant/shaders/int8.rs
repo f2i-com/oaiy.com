@@ -162,6 +162,228 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Single-dispatch fused residual add + RMSNorm + Q8_0 quantization for one decode row (`k % 32 == 0`):
+/// `x += y; out = rmsnorm(x, eps) * w; q = quant_q8(out)`.
+/// Runs in 1 workgroup of 256 threads with 1 barrier (no cross-WG race on in-place `x += y`, `x` stays hot in L1).
+/// Uses `wide_rw3_layout`: `y4` at 0, `w4` at 1, `x4` (rw) at 5, `out4` (rw) at 6, `q` (rw) at 7.
+pub const ADD_RMSNORM_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> yv: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> x4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> out4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> red: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let k = p[0].x;
+    let eps = bitcast<f32>(p[0].y);
+    let xs_at = p[0].z;
+    let k4 = k / 4u;
+    var s = 0.0;
+    for (var i = li; i < k4; i += 256u) {
+        let sum = x4[i] + yv[i];
+        x4[i] = sum;
+        s += dot(sum, sum);
+    }
+    s = subgroupAdd(s);
+    if (lane == 0u) { red[sgi] = s; }
+    workgroupBarrier();
+    storageBarrier();
+    let total = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+    let inv = 1.0 / sqrt(total / f32(k) + eps);
+    let blocks = k / 32u;
+    let part = li % 8u;
+    for (var b_base = 0u; b_base < blocks; b_base += 32u) {
+        let b = b_base + li / 8u;
+        let at4 = b * 8u + part;
+        var v = vec4<f32>(0.0);
+        if (b < blocks) {
+            v = x4[at4] * inv * w4[at4];
+        }
+        var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+        amax = max(amax, subgroupShuffleXor(amax, 1u));
+        amax = max(amax, subgroupShuffleXor(amax, 2u));
+        amax = max(amax, subgroupShuffleXor(amax, 4u));
+        let d = amax / 127.0;
+        let id = select(0.0, 1.0 / d, d > 0.0);
+        let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+        let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+        var hs = qv.x + qv.y + qv.z + qv.w;
+        hs += subgroupShuffleXor(hs, 1u);
+        hs += subgroupShuffleXor(hs, 2u);
+        let other = subgroupShuffleXor(hs, 4u);
+        if (b < blocks) {
+            out4[at4] = v;
+            q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+            if (part == 0u) {
+                let at = (xs_at + b) * 4u;
+                q[at] = bitcast<u32>(d);
+                q[at + 1u] = bitcast<u32>(d * f32(hs));
+                q[at + 2u] = bitcast<u32>(d * f32(other));
+                q[at + 3u] = 0u;
+            }
+        }
+    }
+}
+"#;
+
+/// Fused `silu(fused[..ff]) * fused[ff..]` + Q8_0 quantization for one decode row (`ff % 32 == 0`).
+/// Eliminates the standalone `chain-q8-quantize-lanes` pass before `ffn_down` (32–64 dispatches/token).
+pub const SILU_MUL_SPLIT_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let ff = p[0].x;
+    let xs_at = p[0].y;
+    let ff4 = ff / 4u;
+    let blocks = ff / 32u;
+    let b = wg.x * 32u + li / 8u;
+    let part = li % 8u;
+    let at4 = min(b, blocks - 1u) * 8u + part;
+    let g = x4[at4];
+    let u = x4[ff4 + at4];
+    let v = vec4<f32>(
+        (g.x / (1.0 + exp(-g.x))) * u.x,
+        (g.y / (1.0 + exp(-g.y))) * u.y,
+        (g.z / (1.0 + exp(-g.z))) * u.z,
+        (g.w / (1.0 + exp(-g.w))) * u.w,
+    );
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        y4[at4] = v;
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
+/// Fused `silu(gate) * up` + Q8_0 quantization for one decode row (`len % 32 == 0`, split FFN weights).
+pub const SILU_MUL_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> g4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> u4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let ff = p[0].x;
+    let xs_at = p[0].y;
+    let blocks = ff / 32u;
+    let b = wg.x * 32u + li / 8u;
+    let part = li % 8u;
+    let at4 = min(b, blocks - 1u) * 8u + part;
+    let g = g4[at4];
+    let u = u4[at4];
+    let v = vec4<f32>(
+        (g.x / (1.0 + exp(-g.x))) * u.x,
+        (g.y / (1.0 + exp(-g.y))) * u.y,
+        (g.z / (1.0 + exp(-g.z))) * u.z,
+        (g.w / (1.0 + exp(-g.w))) * u.w,
+    );
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        y4[at4] = v;
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
+/// Fused `gelu_approx(fused[..ff]) * fused[ff..]` + Q8_0 quantization for one decode row (`ff % 32 == 0`).
+pub const GELU_MUL_SPLIT_Q8_LANES: &str = r#"
+@group(0) @binding(0) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> q: array<u32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let ff = p[0].x;
+    let xs_at = p[0].y;
+    let ff4 = ff / 4u;
+    let blocks = ff / 32u;
+    let b = wg.x * 32u + li / 8u;
+    let part = li % 8u;
+    let at4 = min(b, blocks - 1u) * 8u + part;
+    let g = x4[at4];
+    let u = x4[ff4 + at4];
+    let ix = 0.7978845608028654 * (g.x + 0.044715 * g.x * g.x * g.x);
+    let iy = 0.7978845608028654 * (g.y + 0.044715 * g.y * g.y * g.y);
+    let iz = 0.7978845608028654 * (g.z + 0.044715 * g.z * g.z * g.z);
+    let iw = 0.7978845608028654 * (g.w + 0.044715 * g.w * g.w * g.w);
+    let v = vec4<f32>(
+        0.5 * g.x * (1.0 + tanh(clamp(ix, -15.0, 15.0))) * u.x,
+        0.5 * g.y * (1.0 + tanh(clamp(iy, -15.0, 15.0))) * u.y,
+        0.5 * g.z * (1.0 + tanh(clamp(iz, -15.0, 15.0))) * u.z,
+        0.5 * g.w * (1.0 + tanh(clamp(iw, -15.0, 15.0))) * u.w,
+    );
+    var amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = max(amax, subgroupShuffleXor(amax, 1u));
+    amax = max(amax, subgroupShuffleXor(amax, 2u));
+    amax = max(amax, subgroupShuffleXor(amax, 4u));
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let qv = clamp(vec4<i32>(round(v * id)), vec4<i32>(-127), vec4<i32>(127));
+    let qb = bitcast<vec4<u32>>(qv) & vec4<u32>(0xffu);
+    var hs = qv.x + qv.y + qv.z + qv.w;
+    hs += subgroupShuffleXor(hs, 1u);
+    hs += subgroupShuffleXor(hs, 2u);
+    let other = subgroupShuffleXor(hs, 4u);
+    if (b < blocks) {
+        y4[at4] = v;
+        q[b * 8u + part] = qb.x | (qb.y << 8u) | (qb.z << 16u) | (qb.w << 24u);
+        if (part == 0u) {
+            let at = (xs_at + b) * 4u;
+            q[at] = bitcast<u32>(d);
+            q[at + 1u] = bitcast<u32>(d * f32(hs));
+            q[at + 2u] = bitcast<u32>(d * f32(other));
+            q[at + 3u] = 0u;
+        }
+    }
+}
+"#;
+
 /// Multi-stream variant of [`NORM_Q8_LANES`]: normalizes `wg.y` streams (`0..n_streams - 1`) of length `k`
 /// from `x4` into `y4` and quantizes all `n_streams` rows into `q` (`q8_len(n_streams, k)` layout) in ONE dispatch.
 /// `p[0]`: k, eps bits, xs_at, separate_w (0 = share `w4[0..k/4]`, 1 = stream `s` uses `w4[s*k/4..]`).

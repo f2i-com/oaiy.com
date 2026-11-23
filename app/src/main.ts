@@ -54,6 +54,7 @@ import { HERE, KEPT_HERE } from './ui/where';
 import { TerminalPane } from './ui/terminal';
 import { Preview, type PreviewTarget } from './preview/preview';
 import { findPages, isPagePath } from './preview/page';
+import { findModels } from './preview/model';
 import { isModelPath } from './preview/model';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
 import { askText, confirmAction } from './ui/modal';
@@ -69,7 +70,9 @@ import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, SETUP_NOTE, SETUP_PROJECT, S
 import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
-import type { Vfs } from './vfs/vfs';
+import { normalizePath, type Vfs } from './vfs/vfs';
+import { SESSION_SLASH_COMMANDS, SLASH_COMMANDS } from './ui/chat/mentions';
+import { mountPlanReviewCard, mountQuestionCard } from './ui/chat/questionCard';
 import { isOutreachPath, readView } from './vfs/readView';
 import { mayReloadForIsolation } from './pwa/reloadGuard';
 import { startInstall } from './pwa/install';
@@ -534,8 +537,29 @@ async function main(): Promise<void> {
     togglePlanMode: () => {
       if (!viewing) void submit(agent.planMode ? '/plan off' : '/plan on', []);
     },
+    revert: async (checkpointId) => {
+      if (viewing || currentRun) {
+        if (currentRun) chat.system('Stop the agent first before reverting a turn.', 'error');
+        return false;
+      }
+      const reverted = agent.undoCheckpoint(checkpointId);
+      if (!reverted) {
+        chat.system('That turn checkpoint is no longer available to revert.');
+        return false;
+      }
+      await project.flush();
+      const summaryBits: string[] = [];
+      if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
+      if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
+      chat.system(`Reverted turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
+      return true;
+    },
     getVfs: () => (viewing ? frontDesk?.vfs ?? null : project?.vfs ?? null),
+    getSlashCommands: () => (viewing ? SESSION_SLASH_COMMANDS : SLASH_COMMANDS),
   });
+
+  /** Live interactive prompt card (`ask_user_question` / `exit_plan_mode`) preserved across session tab switches. */
+  let pendingPrompt: { projectId: string; wrap: HTMLElement; kind: 'question' | 'plan' } | null = null;
 
   /** Who a conversation's lane is with, as the chat says it: their name, or (none yet) their number as it is read. */
   const sessionName = (s: Session): string => (s.title === s.key && !s.hidden ? displayNumber(s.key) : s.title);
@@ -1228,10 +1252,13 @@ async function main(): Promise<void> {
     }
   };
 
-  /** The project files to export (the sandbox git's .git/ is its own format, which a real git would read as broken). */
+  /** The project files to export (skip sandbox .git/ and internal .oaiy/ spill files). */
   const exportFiles = () => {
     editor.flush();
-    return project.vfs.files().filter(([path]) => !path.split('/').includes('.git'));
+    return project.vfs.files().filter(([path]) => {
+      const parts = path.split('/');
+      return !parts.includes('.git') && !parts.includes('.oaiy');
+    });
   };
 
   /** The run in progress, to wait for when it has to stop. */
@@ -1346,8 +1373,30 @@ async function main(): Promise<void> {
           ? {
               reasoning: chosenReasoning,
               personInstructions: () => ownInstructions(kind(), place().meta, agentSettings.instructions),
-              askUser: (questions, sig) => chat.askUser(questions, sig),
-              reviewPlan: (request, sig) => chat.reviewPlan(request, sig),
+              askUser: (questions, sig) => {
+                const runProject = place();
+                const wrap = h('div.msg.ask-wrap');
+                const entry = { projectId: runProject.meta.id, wrap, kind: 'question' as const };
+                pendingPrompt = entry;
+                const p = mountQuestionCard(wrap, questions, sig);
+                if (project === runProject && viewing === null) chat.attachInteractiveCard(wrap);
+                else renderSessions();
+                return p.finally(() => {
+                  if (pendingPrompt === entry) pendingPrompt = null;
+                });
+              },
+              reviewPlan: (request, sig) => {
+                const runProject = place();
+                const wrap = h('div.msg.plan-review-wrap');
+                const entry = { projectId: runProject.meta.id, wrap, kind: 'plan' as const };
+                pendingPrompt = entry;
+                const p = mountPlanReviewCard(wrap, request, sig);
+                if (project === runProject && viewing === null) chat.attachInteractiveCard(wrap);
+                else renderSessions();
+                return p.finally(() => {
+                  if (pendingPrompt === entry) pendingPrompt = null;
+                });
+              },
             }
           : {}),
         projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
@@ -1715,9 +1764,11 @@ async function main(): Promise<void> {
     const agentOptions = projectOptions;
     agent = new Agent(agentOptions());
     agent.turns = await project.loadChat();
-    // The plan goes on where the saved conversation left it.
+    // The plan and Plan Mode state resume where the saved conversation left them.
     agent.plan = planAfter(agent.turns);
+    agent.restoreFromTurns();
     chat.setPlanMode(agent.planMode);
+    chat.setPlanToggleVisible(true);
     // The phone's conversations stay in the front desk: the project's own conversation shows.
     viewing = null;
     swapDraft(was);
@@ -1729,9 +1780,9 @@ async function main(): Promise<void> {
     workspace.inert = false;
     shownFiles = null;
     showFiles(project);
-    // A SoftN app or a web page opens on its preview, so the person sees it being built; a project with nothing to
+    // A SoftN app, web page or 3D model opens on its preview, so the person sees it being built; a project with nothing to
     // preview opens on the editor, not on an empty preview left up by the last one.
-    if (isSoftnProject(project.vfs) || findPages(project.vfs).length) showPane('preview');
+    if (isSoftnProject(project.vfs) || findPages(project.vfs).length || findModels(project.vfs).length) showPane('preview');
     else if (center.dataset.pane === 'preview') showPane('editor');
     chat.replay(agent.turns);
     renderSessions();
@@ -1932,19 +1983,21 @@ async function main(): Promise<void> {
   /** A file (or an unpacked .softn's app) clicked in the chat. */
   function openFromChat(path: string, app?: string): void {
     const place = shownFiles ?? project;
-    if (app !== undefined && place.vfs.exists(`/${app}`)) {
-      preview.setApp(app);
+    const appKeyClean = app !== undefined ? normalizePath(app) : undefined;
+    if (appKeyClean !== undefined && place.vfs.exists(`/${appKeyClean}`)) {
+      preview.setApp(appKeyClean);
       showPane('preview');
       if (window.matchMedia('(max-width: 900px)').matches) showView('preview');
       return;
     }
-    if (!place.vfs.exists(`/${path}`)) {
+    const key = normalizePath(path);
+    if (!key || !place.vfs.exists(`/${key}`)) {
       chat.system(`${path} is no longer in ${place === frontDesk ? 'the Front desk' : 'the project'}.`, 'error');
       return;
     }
     showPane('editor');
-    editor.open(`/${path}`);
-    tree.select(`/${path}`);
+    editor.open(`/${key}`);
+    tree.select(`/${key}`);
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }
 
@@ -1980,6 +2033,10 @@ async function main(): Promise<void> {
             chat.system(`Plan Mode is currently ${agent.planMode ? 'ON (inspect & plan before editing)' : 'OFF'}. Use /plan on or /plan off to toggle.`);
             return;
           }
+          if (pendingPrompt?.kind === 'plan' && pendingPrompt.projectId === project.meta.id) {
+            chat.system('A plan is waiting for your review above — use Approve & execute or Keep planning on the card first.');
+            return;
+          }
           const want = arg === 'off' || arg === 'false' || arg === '0' ? false : arg === 'on' || arg === 'true' || arg === '1' ? true : !agent.planMode;
           agent.setPlanMode(want);
           chat.setPlanMode(want);
@@ -1990,28 +2047,80 @@ async function main(): Promise<void> {
           );
           return;
         }
-        case 'compact':
+        case 'compact': {
           if (currentRun) {
             chat.system('The agent is working: stop it first, then compact the conversation.', 'error');
             return;
           }
           chat.setBusy(true);
+          controller = new AbortController();
+          const runController = controller;
+          const runProject = project;
+          const runAgent = agent;
+          let finish!: () => void;
+          currentRun = new Promise<void>((resolve) => (finish = resolve));
+          renderSessions();
           try {
-            const outcome = await agent.compactNow((e) => {
-              if (e.type === 'context') lastContext.set(agent, { used: e.used, window: e.window });
-              chat.event(e);
-            });
+            const outcome = await runAgent.compactNow((e) => {
+              if (e.type === 'context') lastContext.set(runAgent, { used: e.used, window: e.window });
+              if (project === runProject && viewing === null) chat.event(e);
+            }, runController.signal);
             if (outcome.compacted) {
-              await project.saveChat(agent.savedTurns());
-            } else {
+              await runProject.saveChat(runAgent.savedTurns());
+            } else if (project === runProject && viewing === null) {
               chat.system('Conversation is already compact — nothing older to prune or summarize yet.');
             }
           } catch (error) {
-            chat.system(error instanceof Error ? error.message : String(error), 'error');
+            if (project === runProject && viewing === null) {
+              chat.system(
+                runController.signal.aborted
+                  ? 'Compaction cancelled.'
+                  : error instanceof Error
+                    ? error.message
+                    : String(error),
+                runController.signal.aborted ? 'info' : 'error',
+              );
+            }
           } finally {
-            chat.setBusy(false);
+            if (controller === runController) controller = null;
+            currentRun = null;
+            finish();
+            if (project === runProject && viewing === null) chat.setBusy(false);
+            renderSessions();
           }
           return;
+        }
+        case 'undo': {
+          if (currentRun) {
+            chat.system('The agent is working: stop it first, then undo a turn.', 'error');
+            return;
+          }
+          const sub = (args[0] ?? '').toLowerCase();
+          const cps = agent.listCheckpoints();
+          if (sub === 'list' || sub === 'status' || sub === '?') {
+            if (!cps.length) {
+              chat.system('No turn checkpoints available to undo in this session.');
+              return;
+            }
+            const lines = [...cps]
+              .reverse()
+              .map((cp, i) => `${i === 0 ? '• (latest)' : `  (${i + 1})`} ${cp.id} — ${cp.files.length} file${cp.files.length === 1 ? '' : 's'} · ${cp.label}`);
+            chat.system(`Recent turn checkpoints (use /undo or /undo <id>):\n${lines.join('\n')}`);
+            return;
+          }
+          const targetId = sub ? args[0] : undefined;
+          const reverted = agent.undoCheckpoint(targetId);
+          if (!reverted) {
+            chat.system(targetId ? `No checkpoint found with id "${targetId}". Run /undo list to see available checkpoints.` : 'Nothing to undo — no file-changing agent turns recorded in this session.');
+            return;
+          }
+          await project.flush();
+          const summaryBits: string[] = [];
+          if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
+          if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
+          chat.system(`Undid turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
+          return;
+        }
         case 'help': case '?':
           chat.system(HELP);
           return;
@@ -2535,8 +2644,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   function showPane(pane: 'editor' | 'preview'): void {
     center.dataset.pane = pane;
     selectTab(centerTabs, (b) => b.dataset.pane === pane);
-    preview.setVisible(pane === 'preview' || workspace?.dataset.view === 'preview');
-    if (window.matchMedia('(max-width: 900px)').matches && workspace && workspace.dataset.view !== 'agent') showView(pane);
+    if (narrow.matches && workspace && workspace.dataset.view !== 'agent') showView(pane);
+    else showPreview();
   }
 
   // On a narrow screen one pane shows at a time, chosen from a tab bar.
@@ -2556,7 +2665,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   }
   /** Whether the preview is on screen: its pane chosen, and its tab too on a narrow screen (one pane at a time). */
   function showPreview(): void {
-    preview.setVisible(center.dataset.pane === 'preview' && (workspace.dataset.view === 'preview' || !narrow.matches));
+    preview.setVisible(center.dataset.pane === 'preview' && (!workspace || workspace.dataset.view === 'preview' || !narrow.matches));
   }
   const narrow = window.matchMedia('(max-width: 900px)');
   // The window resized across the narrow layout's edge: back to three panes, a preview hidden behind another tab is on
@@ -2566,7 +2675,31 @@ A project can hold several apps, each in its own folder (any folder whose manife
   showView('agent');
   // A tap anywhere outside the open project menu closes it, as focus leaving it does.
   document.addEventListener('pointerdown', (e) => {
-    if (header.classList.contains('menu-open') && !header.contains(e.target as Node)) closeMenu();
+    const target = e.target as Node;
+    if (header.classList.contains('menu-open') && !actions.contains(target) && !menuToggle.contains(target)) closeMenu();
+  });
+  // Global workspace shortcuts: Ctrl/Cmd+B toggles files sidebar, Ctrl+` toggles terminal, Ctrl/Cmd+L focuses composer.
+  document.addEventListener('keydown', (e) => {
+    if (e.defaultPrevented || e.isComposing) return;
+    if (document.querySelector('dialog[open]')) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'b') {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+      e.preventDefault();
+      if (narrow.matches) showView(workspace.dataset.view === 'files' ? 'agent' : 'files');
+      else workspace.classList.toggle('files-hidden');
+    } else if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key === '`') {
+      e.preventDefault();
+      if (narrow.matches) showView(workspace.dataset.view === 'terminal' ? 'agent' : 'terminal');
+      else terminal.toggleFold();
+    } else if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'l') {
+      const active = document.activeElement as HTMLElement | null;
+      if (active?.classList.contains('term-input')) return;
+      e.preventDefault();
+      if (narrow.matches) showView('agent');
+      chat.focus();
+    }
   });
   actions.addEventListener('focusout', (e) => {
     const to = e.relatedTarget as Node | null;
@@ -3132,6 +3265,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     drawnTo.clear();
     buffered.clear();
     showFiles(thread ? frontDesk : project);
+    chat.setPlanToggleVisible(!thread);
     if (thread) {
       chat.replay(sessions!.turnsOf(thread.id), undefined, chatKind(thread));
       for (const lane of thread.lanes) drawnTo.set(lane, lane.agent.turns.length);
@@ -3139,8 +3273,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       sessions!.seen(thread);
     } else {
       chat.replay(agent.turns);
+      chat.setPlanMode(agent.planMode);
       showLastContext();
       chat.setBusy(!!currentRun);
+      if (pendingPrompt && pendingPrompt.projectId === project.meta.id) {
+        chat.attachInteractiveCard(pendingPrompt.wrap);
+      }
     }
     renderSessions();
     chat.focus();

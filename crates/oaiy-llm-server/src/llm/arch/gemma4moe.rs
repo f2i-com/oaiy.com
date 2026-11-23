@@ -273,6 +273,30 @@ impl Gemma4MoeModel {
         self.forward_embeds(&embeds, tokens, kv)
     }
 
+    /// `tokens` with `soft` rows (`(position in tokens, [n, d] values)`) spliced in place of
+    /// their token embeddings (e.g. Gemma 4 vision soft tokens).
+    pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Tensor {
+        let d = self.config.embedding_dim;
+        let embeds = self.embed_text(tokens);
+        let mut host = if embeds.is_device() { embeds.to_host() } else { embeds };
+        for (at, rows) in soft {
+            let n = rows.len() / d;
+            assert!(rows.len() % d == 0 && at + n <= tokens.len(), "soft tokens of width {d} within the tokens");
+            host.data_mut()[at * d..(at + n) * d].copy_from_slice(rows);
+        }
+        let embeds = self.backend.to_device(host);
+        if self.global.is_some() {
+            let soft_ids: Vec<u32> = ["<|image|>", "<|audio|>", "<|video|>"]
+                .iter()
+                .filter_map(|t| self.tokenizer.token_id(t))
+                .collect();
+            let ple_tokens: Vec<u32> = tokens.iter().map(|t| if soft_ids.contains(t) { 0 } else { *t }).collect();
+            self.forward_embeds(&embeds, &ple_tokens, kv)
+        } else {
+            self.forward_embeds(&embeds, tokens, kv)
+        }
+    }
+
     pub fn forward_embeds(
         &self,
         embeds: &Tensor,

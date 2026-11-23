@@ -7,9 +7,13 @@
  */
 import { AIProviderError, isOpenAIHost, isRecord, postProviderJSON, postProviderStream, sanitizeCount, type SSEEvent } from './providers/aiProvider';
 import { providerEndpoints } from './providers/providerConnection';
-import { AnthropicStream, OpenAIStream, type StreamSink } from './providers/stream';
+import { AnthropicStream, OpenAIStream, parseToolArgs, type StreamSink } from './providers/stream';
 import type { ProviderConfig } from './providers/types';
 import type { ImagePart } from './images';
+
+export { parseToolArgs };
+
+let fallbackCallSeq = 0;
 
 export interface ToolSpec {
   name: string;
@@ -133,38 +137,74 @@ export interface RequestOptions {
   plainProse?: boolean;
   /** A step after the same step again and again: sampled anew where the server can be asked (variedFields). */
   varied?: boolean;
+  /** Strip Anthropic thinking / redacted_thinking blocks when replaying turns (used on signature-error fallback or after prefix pruning). */
+  stripAnthropicThinking?: boolean;
 }
 
-function anthropicMessages(turns: Turn[]): unknown[] {
+function anthropicMessages(turns: Turn[], stripThinking = false): unknown[] {
   const out: Array<{ role: string; content: unknown[] }> = [];
   const push = (role: string, blocks: unknown[]) => {
     const last = out[out.length - 1];
     if (last && last.role === role) last.content.push(...blocks);
-    else out.push({ role, content: blocks });
+    else out.push({ role, content: [...blocks] });
   };
-  for (const turn of turns) {
-    if (turn.role === 'user') push('user', [{ type: 'text', text: turn.text }, ...(turn.images ?? []).map(anthropicImage)]);
-    else if (turn.role === 'assistant') {
-      if (turn.anthropicContent?.length) push('assistant', turn.anthropicContent);
-      else {
-        const blocks: unknown[] = [];
-        if (turn.text) blocks.push({ type: 'text', text: turn.text });
-        for (const call of turn.calls) blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
-        if (blocks.length) push('assistant', blocks);
-      }
-    } else {
-      push('user', turn.results.map((r) => ({
-        type: 'tool_result',
-        tool_use_id: r.id,
-        content: r.images?.length ? [{ type: 'text', text: r.content }, ...r.images.map(anthropicImage)] : r.content,
-        is_error: r.isError,
-      })));
+  // Thinking blocks from earlier user turns are ignored by Anthropic and can carry invalidated signatures
+  // after pruning or image omission; only retain signed thinking blocks within the active user turn unless
+  // full stripping was explicitly requested.
+  let lastUserIdx = -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i]!;
+    if (t.role === 'user' && !t.automatic) {
+      lastUserIdx = i;
+      break;
     }
   }
-  // Cache the conversation up to its last message.
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i]!;
+    if (turn.role === 'user') {
+      const blocks: unknown[] = [];
+      if (turn.text) blocks.push({ type: 'text', text: turn.text });
+      for (const img of turn.images ?? []) blocks.push(anthropicImage(img));
+      if (!blocks.length) blocks.push({ type: 'text', text: ' ' });
+      push('user', blocks);
+    } else if (turn.role === 'assistant') {
+      const dropThinking = stripThinking || (lastUserIdx >= 0 && i < lastUserIdx);
+      if (turn.anthropicContent?.length) {
+        const mapped = turn.anthropicContent
+          .filter((b) => !(dropThinking && isRecord(b) && (b.type === 'thinking' || b.type === 'redacted_thinking')))
+          .map((b) => (isRecord(b) ? { ...b } : b));
+        if (mapped.length) {
+          push('assistant', mapped);
+          continue;
+        }
+      }
+      const blocks: unknown[] = [];
+      if (turn.text) blocks.push({ type: 'text', text: turn.text });
+      for (const call of turn.calls) blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
+      if (blocks.length) push('assistant', blocks);
+    } else {
+      push('user', turn.results.map((r) => {
+        if (r.images?.length) {
+          const parts: unknown[] = [];
+          if (r.content) parts.push({ type: 'text', text: r.content });
+          for (const img of r.images) parts.push(anthropicImage(img));
+          return { type: 'tool_result', tool_use_id: r.id, content: parts, is_error: r.isError };
+        }
+        return { type: 'tool_result', tool_use_id: r.id, content: r.content, is_error: r.isError };
+      }));
+    }
+  }
+  // Cache the conversation up to its last cacheable block (Anthropic rejects cache_control on thinking blocks).
   const last = out[out.length - 1];
-  const block = last?.content[last.content.length - 1];
-  if (isRecord(block)) block.cache_control = { type: 'ephemeral' };
+  if (last) {
+    for (let i = last.content.length - 1; i >= 0; i--) {
+      const block = last.content[i];
+      if (isRecord(block) && block.type !== 'thinking' && block.type !== 'redacted_thinking') {
+        last.content[i] = { ...block, cache_control: { type: 'ephemeral' } };
+        break;
+      }
+    }
+  }
   return out;
 }
 
@@ -176,9 +216,20 @@ function openAIImage(image: ImagePart): unknown {
   return { type: 'image_url', image_url: { url: `data:${image.mediaType};base64,${image.data}` } };
 }
 
-function openAIMessages(system: string, turns: Turn[]): unknown[] {
+function openAIMessages(system: string, turns: Turn[], includeReasoning = false): unknown[] {
   const out: unknown[] = [{ role: 'system', content: system }];
-  for (const turn of turns) {
+  let lastUserIdx = -1;
+  if (includeReasoning) {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i]!;
+      if (t.role === 'user' && !t.automatic) {
+        lastUserIdx = i;
+        break;
+      }
+    }
+  }
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i]!;
     if (turn.role === 'user') {
       const content = turn.images?.length ? [{ type: 'text', text: turn.text }, ...turn.images.map(openAIImage)] : turn.text;
       // Right after a tool's pictures (a user message of their own, below): one user message, the pictures first. Two in
@@ -193,6 +244,10 @@ function openAIMessages(system: string, turns: Turn[]): unknown[] {
       const message: Record<string, unknown> = { role: 'assistant', content: turn.text || (turn.calls.length ? null : '') };
       if (turn.calls.length) {
         message.tool_calls = turn.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.input) } }));
+        // DeepSeek Reasoner requires `reasoning_content` on assistant tool-call turns within the active user turn.
+        if (includeReasoning && i > lastUserIdx && turn.thinking) {
+          message.reasoning_content = turn.thinking;
+        }
       }
       out.push(message);
     } else {
@@ -220,7 +275,7 @@ function decodeAnthropic(data: Record<string, unknown>, parseErrors?: Map<string
     if (block.type === 'text' && typeof block.text === 'string') text += block.text;
     else if (block.type === 'thinking' && typeof block.thinking === 'string') thinking += block.thinking;
     else if (block.type === 'tool_use') {
-      const id = String(block.id ?? `call_${calls.length}`);
+      const id = typeof block.id === 'string' && block.id ? block.id : `call_${Date.now().toString(36)}_${++fallbackCallSeq}_${calls.length}`;
       calls.push({ id, name: String(block.name ?? ''), input: isRecord(block.input) ? block.input : {}, parseError: parseErrors?.get(id) });
     }
   }
@@ -254,15 +309,11 @@ function decodeOpenAI(data: Record<string, unknown>): Reply {
     const args = fn.arguments;
     if (isRecord(args)) input = args;
     else if (typeof args === 'string' && args.trim()) {
-      try {
-        const parsed: unknown = JSON.parse(args);
-        if (isRecord(parsed)) input = parsed;
-        else parseError = 'arguments are not a JSON object';
-      } catch (error) {
-        parseError = `arguments are not valid JSON (${(error as Error).message})`;
-      }
+      const parsed = parseToolArgs(args);
+      input = parsed.input;
+      parseError = parsed.parseError;
     }
-    calls.push({ id: typeof raw.id === 'string' && raw.id ? raw.id : `call_${Date.now().toString(36)}_${i}`, name: String(fn.name ?? ''), input, parseError });
+    calls.push({ id: typeof raw.id === 'string' && raw.id ? raw.id : `call_${Date.now().toString(36)}_${++fallbackCallSeq}_${i}`, name: String(fn.name ?? ''), input, parseError });
   }
   const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : typeof message.reasoning === 'string' ? message.reasoning : '';
   const usage = isRecord(data.usage) ? data.usage : {};
@@ -400,18 +451,19 @@ export async function sendTurn(
       stream: true,
       system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })),
-      messages: anthropicMessages(turns),
+      messages: anthropicMessages(turns, options.stripAnthropicThinking === true),
     };
     const stream = new AnthropicStream(options.sink);
     const outcome = await postStreamed(provider, url, body, options, (event) => stream.accept(event));
     return decodeAnthropic(outcome.streamed ? stream.result() : outcome.data, stream.parseErrors);
   }
+  const includeReasoning = /deepseek/i.test(url) || /deepseek[-_]?(?:r1|reasoner)/i.test(model);
   const body: Record<string, unknown> = {
     // Following OAIY's Engines: no model named, so the engine uses the one chosen there (naming the last one seen would load it back).
     ...(provider.followEngine ? {} : { model }),
     stream: true,
     stream_options: { include_usage: true },
-    messages: openAIMessages(system, turns),
+    messages: openAIMessages(system, turns, includeReasoning),
   };
   if (tools.length) body.tools = tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
   // OpenAI's reasoning models take max_completion_tokens; other servers read max_tokens.

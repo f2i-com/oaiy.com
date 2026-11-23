@@ -5,16 +5,37 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>3D model preview</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe2e7; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe2e7; color: #242b38; font: 12.5px system-ui, -apple-system, "Segoe UI", sans-serif; }
+  html[data-stage='dark'], html[data-stage='dark'] body { background: #141923; color: #e6ecf7; }
   canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
   canvas:active { cursor: grabbing; }
-  #status { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; color: #3a4150; text-align: center; pointer-events: none; }
-  #status.error { color: #a4262c; }
-  #hint { position: fixed; left: 50%; bottom: 10px; transform: translateX(-50%); padding: 4px 10px; border-radius: 11px; background: rgba(255, 255, 255, 0.8); color: #3a4150; pointer-events: none; white-space: nowrap; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; color: inherit; opacity: 0.78; text-align: center; pointer-events: none; }
+  #status.error { color: #c43a2c; opacity: 1; }
+  html[data-stage='dark'] #status.error { color: #ff6e78; }
+  #stats { position: fixed; top: 10px; left: 10px; padding: 4px 10px; border-radius: 999px; background: rgba(255, 255, 255, 0.78); border: 1px solid rgba(30, 38, 52, 0.12); color: #2d3544; font: 500 11.5px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; backdrop-filter: blur(8px); pointer-events: none; white-space: nowrap; }
+  html[data-stage='dark'] #stats { background: rgba(14, 20, 34, 0.78); border-color: rgba(255, 255, 255, 0.12); color: #cbd5e8; }
+  #hud { position: fixed; right: 10px; top: 10px; display: flex; align-items: center; gap: 4px; padding: 4px; border-radius: 999px; background: rgba(255, 255, 255, 0.8); border: 1px solid rgba(30, 38, 52, 0.12); backdrop-filter: blur(8px); }
+  html[data-stage='dark'] #hud { background: rgba(14, 20, 34, 0.8); border-color: rgba(255, 255, 255, 0.12); }
+  #hud[hidden], #stats[hidden], #hint[hidden], #status[hidden] { display: none; }
+  #hud button { height: 24px; padding: 0 9px; border: 0; border-radius: 999px; background: transparent; color: #343d4e; font: 550 11.5px/1 inherit; cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+  #hud button:hover { background: rgba(30, 38, 52, 0.08); color: #111622; }
+  #hud button[aria-pressed='true'] { background: #2457e6; color: #fff; }
+  html[data-stage='dark'] #hud button { color: #b7c3d8; }
+  html[data-stage='dark'] #hud button:hover { background: rgba(255, 255, 255, 0.09); color: #f4f7ff; }
+  html[data-stage='dark'] #hud button[aria-pressed='true'] { background: #7167ff; color: #fff; }
+  #hint { position: fixed; left: 50%; bottom: 10px; transform: translateX(-50%); padding: 4px 11px; border-radius: 999px; background: rgba(255, 255, 255, 0.8); border: 1px solid rgba(30, 38, 52, 0.1); color: #3a4150; pointer-events: none; white-space: nowrap; font-size: 12px; }
+  html[data-stage='dark'] #hint { background: rgba(14, 20, 34, 0.8); border-color: rgba(255, 255, 255, 0.1); color: #b7c3d8; }
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
+<div id="stats" hidden></div>
+<div id="hud" role="toolbar" aria-label="3D viewer controls" hidden>
+  <button type="button" id="btn-reset" title="Reset camera view">Reset</button>
+  <button type="button" id="btn-wire" aria-pressed="false" title="Toggle wireframe overlay">Wireframe</button>
+  <button type="button" id="btn-grid" aria-pressed="true" title="Toggle floor grid">Grid</button>
+  <button type="button" id="btn-stage" aria-pressed="false" title="Toggle light or dark studio stage">Stage</button>
+</div>
 <div id="hint" hidden>Drag to turn · right-drag to move · scroll to zoom</div>
 <!-- OAIY's 3D model viewer with three.js: built by scripts/modelview/build.mjs. -->
 <script src="./model-viewer.js"></script>

@@ -182,11 +182,21 @@ fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> 
     let value = field_of(d, field).ok_or("detected part has no path")?;
     let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "speech", "models"]) else { return Err("no speech section".into()) };
     // (a Breeze TTS 2 model lacks both halves, and is not one of them: the half went into it, Breeze answered for it,
-    // and Qwen3-TTS was in effect never added)
+    // and Qwen3-TTS was in effect never added; also never cross-merge 0.6B and 1.7B checkpoints whose hidden sizes differ)
+    let incoming_size = |p: &str| {
+        let low = p.to_ascii_lowercase();
+        if low.contains("0.6b") { Some("0.6b") } else if low.contains("1.7b") { Some("1.7b") } else { None }
+    };
+    let in_sz = value.as_str().and_then(incoming_size);
+    let other_field = if field == "design" { "base" } else { "design" };
+    let size_matches = |m: &Json| match (in_sz, incoming_size(str_or(m, other_field, ""))) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
     let chosen = models
         .iter()
         .position(|(n, _)| target.is_some_and(|(_, t)| n == t))
-        .or_else(|| models.iter().position(|(_, m)| str_or(m, field, "").trim().is_empty() && str_or(m, "breeze", "").trim().is_empty()));
+        .or_else(|| models.iter().position(|(_, m)| str_or(m, field, "").trim().is_empty() && str_or(m, "breeze", "").trim().is_empty() && size_matches(m)));
     let name = match chosen {
         Some(i) => {
             set(&mut models[i].1, field, value);
@@ -337,11 +347,16 @@ fn attach_sound(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> R
     Ok(Added { section: "sound", name, missing: Vec::new(), enabled: true })
 }
 
-/// The fields a 3D model needs: the Pixal3D folder, DINOv3 and NAF.
+/// The fields a 3D model needs: Pixal3D needs `path`, `dino` and `naf`; TRELLIS.2 needs `path` and `dino`.
 const MODEL3D_PARTS: [&str; 3] = ["path", "dino", "naf"];
 /// The fields that help it when they are there: BiRefNet (cuts objects out of
 /// any background) and Real-ESRGAN (enlarges small pictures).
 const MODEL3D_HELPERS: [&str; 2] = ["matte", "upscaler"];
+
+/// True when a 3D model entry requires NAF projection weights (Pixal3D); false for standard TRELLIS.2.
+pub fn model3d_needs_naf(model: &Json) -> bool {
+    str_or(model, "architecture", "") != "trellis2"
+}
 
 /// A 3D model's part from files near `picked` (the release folders usually sit
 /// side by side): a DINOv3 folder, NAF's folder or weights, BiRefNet's folder,
@@ -395,25 +410,35 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
             models.iter().position(|(n, _)| *n == default).or_else(|| (models.len() == 1).then_some(0)).or_else(|| models.iter().position(|(_, m)| lacks(m)))
         }
     });
+    let arch_hint = field_of(d, "architecture");
+    let base_name = if arch_hint.as_ref().and_then(Json::as_str) == Some("trellis2") { "trellis2-4b" } else { "pixal3d" };
     let i = match chosen {
         Some(i) => i,
         None => {
             let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
-            models.push((unique(&taken, "pixal3d"), Json::Obj(Vec::new())));
+            models.push((unique(&taken, base_name), Json::Obj(Vec::new())));
             models.len() - 1
         }
     };
     let (name, model) = &mut models[i];
     let name = name.clone();
     set(model, field, value);
-    for key in MODEL3D_PARTS.iter().chain(&MODEL3D_HELPERS).filter(|k| **k != "path") {
+    if let Some(arch) = arch_hint {
+        set(model, "architecture", arch);
+    }
+    let needs_naf = model3d_needs_naf(model);
+    for key in MODEL3D_PARTS.iter().chain(&MODEL3D_HELPERS).filter(|k| **k != "path" && (needs_naf || **k != "naf")) {
         if str_or(model, key, "").trim().is_empty() {
             if let Some(v) = lend.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).or_else(|| model3d_nearby(picked, key)) {
                 set(model, key, v);
             }
         }
     }
-    let missing: Vec<String> = MODEL3D_PARTS.iter().filter(|k| str_or(model, k, "").trim().is_empty()).map(|k| k.to_string()).collect();
+    let missing: Vec<String> = MODEL3D_PARTS
+        .iter()
+        .filter(|k| (needs_naf || **k != "naf") && str_or(model, k, "").trim().is_empty())
+        .map(|k| k.to_string())
+        .collect();
     let enabled = missing.is_empty();
     set(model, "enabled", Json::Bool(enabled));
     let section = obj_mut(cfg, &["media", "model3d"]).ok_or("no 3D model section")?;
@@ -538,7 +563,15 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
     let missing = missing_fields(section, model);
     let enabled = missing.is_empty();
     set(model, "enabled", Json::Bool(enabled));
-    Ok(Added { section: if section == "image" { "image" } else { "video" }, name: name.clone(), missing, enabled })
+    let name = name.clone();
+    if enabled {
+        if let Some(sec) = obj_mut(cfg, &["media", section]) {
+            if str_or(sec, "default_model", "").is_empty() {
+                set(sec, "default_model", Json::str(&name));
+            }
+        }
+    }
+    Ok(Added { section: if section == "image" { "image" } else { "video" }, name, missing, enabled })
 }
 
 /// Whether MOSS-Image's text encoder at `te` brings its own tokenizer: a GGUF's, or a tokenizer.json beside its weights

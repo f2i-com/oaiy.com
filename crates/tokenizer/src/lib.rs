@@ -379,6 +379,53 @@ impl Tokenizer {
         }
     }
 
+    /// Incrementally decode a single token into `out`, holding any incomplete trailing UTF-8
+    /// multi-byte sequence in `pending` until subsequent tokens complete it. Calling this for
+    /// each token in `ids` followed by [`Self::flush_incremental`] yields the exact same string
+    /// as [`Self::decode`] in O(1) amortized time per token instead of O(N²).
+    pub fn decode_token_incremental(&self, id: u32, pending: &mut Vec<u8>, out: &mut String) {
+        let Some(s) = self.token(id) else { return };
+        match self.model {
+            TokenizerModel::Gpt2 => {
+                byte_encoder::push_visible_bytes(s, pending);
+                drain_valid_utf8(pending, out);
+            }
+            TokenizerModel::Llama => {
+                if let Some(byte) = spm::parse_byte_fallback(s) {
+                    pending.push(byte);
+                    drain_valid_utf8(pending, out);
+                    return;
+                }
+                Self::flush_incremental(pending, out);
+                if let Some(types) = self.token_types() {
+                    if let Some(&ty) = types.get(id as usize) {
+                        if matches!(ty, 2 | 3 | 5) {
+                            return;
+                        }
+                        if ty == 4 {
+                            out.push_str(s);
+                            return;
+                        }
+                    }
+                }
+                out.push_str(&s.replace(spm::SPM_SPACE_STR, " "));
+            }
+            TokenizerModel::Bert | TokenizerModel::Rwkv | TokenizerModel::Other(_) => {
+                Self::flush_incremental(pending, out);
+                out.push_str(s);
+            }
+        }
+    }
+
+    /// Flush any incomplete UTF-8 bytes held in `pending` at end-of-stream (matching
+    /// `String::from_utf8_lossy`).
+    pub fn flush_incremental(pending: &mut Vec<u8>, out: &mut String) {
+        if !pending.is_empty() {
+            out.push_str(&String::from_utf8_lossy(pending));
+            pending.clear();
+        }
+    }
+
     pub(crate) fn id_of(&self, s: &str) -> Option<u32> {
         self.token_to_id.get(s).copied()
     }
@@ -419,5 +466,62 @@ impl Tokenizer {
     #[allow(dead_code)]
     pub(crate) fn token_types(&self) -> Option<&[i32]> {
         self.token_types.as_deref()
+    }
+}
+
+/// Drain every complete UTF-8 prefix and truly-invalid byte sequence from `pending` into `out`,
+/// keeping only an incomplete trailing multi-byte sequence (1..3 bytes) for the next token.
+fn drain_valid_utf8(pending: &mut Vec<u8>, out: &mut String) {
+    while !pending.is_empty() {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    out.push_str(std::str::from_utf8(&pending[..valid]).expect("valid utf8 prefix"));
+                    pending.drain(..valid);
+                }
+                if let Some(err_len) = e.error_len() {
+                    out.push('\u{FFFD}');
+                    pending.drain(..err_len);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod incremental_decode_tests {
+    use super::*;
+
+    #[test]
+    fn incremental_bpe_matches_full_decode_across_split_utf8_and_invalid_bytes() {
+        let emoji = "🚀".as_bytes(); // 4 bytes: F0 9F 9A 80
+        let tokens = vec![
+            byte_encoder::bytes_to_visible(b"Hello "),
+            byte_encoder::bytes_to_visible(&emoji[..2]),
+            byte_encoder::bytes_to_visible(&emoji[2..]),
+            byte_encoder::bytes_to_visible(&[0xFF]),
+            byte_encoder::bytes_to_visible(b" world"),
+            byte_encoder::bytes_to_visible(&[0xF0, 0x9F]), // incomplete at EOF
+            "<|im_end|>".to_string(),
+        ];
+        let tok = Tokenizer::from_qwen3_bpe_parts(tokens, vec![], vec![6], 6).unwrap();
+        let ids = [0u32, 1, 2, 3, 4, 5];
+        let mut pending = Vec::new();
+        let mut inc = String::new();
+        for &id in &ids {
+            tok.decode_token_incremental(id, &mut pending, &mut inc);
+        }
+        // Before flush, incomplete trailing sequence [0xF0, 0x9F] is held back (no spurious FFFD).
+        assert_eq!(inc, "Hello 🚀\u{FFFD} world");
+        Tokenizer::flush_incremental(&mut pending, &mut inc);
+        assert_eq!(inc, tok.decode(&ids));
     }
 }

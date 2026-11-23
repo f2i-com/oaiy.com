@@ -10,7 +10,7 @@
  * are shown without the labels the agent reads them with (transcript.ts), and
  * tool calls made one after another fold into one "Used N tools" row.
  */
-import type { AgentEvent, PlanReviewDecision, PlanReviewRequest, UserQuestionItem, UserQuestionResult } from '../agent/agent';
+import { stripInjectedUserContext, type AgentEvent, type PlanReviewDecision, type PlanReviewRequest, type UserQuestionItem, type UserQuestionResult } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
 import type { Vfs } from '../vfs/vfs';
 import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } from '../agent/tools';
@@ -46,7 +46,7 @@ import { outreachCard, outreachNoteElement, type OutreachHost } from './chat/out
 import { Follow, anchorIndex, anchoredScrollTop } from './chat/scroll';
 import { thinkingLabel, thinkingStatus, type ThinkingCount } from './chat/thinking';
 import { renderDeliverablesCard } from './chat/deliverablesCard';
-import { attachComposerAutocomplete, type ComposerAutocomplete } from './chat/mentions';
+import { SLASH_COMMANDS, attachComposerAutocomplete, type ComposerAutocomplete, type SlashCommandItem } from './chat/mentions';
 import { mountPlanReviewCard, mountQuestionCard } from './chat/questionCard';
 
 /** How long a flag waits for a comment before it goes without one. */
@@ -170,7 +170,19 @@ export class ChatPane {
   /** Visible while the agent is busy and the user starts typing a mid-turn steer note. */
   private readonly steerPill = h('span.steer-pill', { hidden: true, title: 'Your message will steer the agent at its next step without stopping the run' }, 'Steer');
   /** Collaborative Plan Mode toggle pill inside the composer toolbar (`/plan`). */
-  private readonly planToggleBtn = h('button.plan-pill', { type: 'button', 'aria-pressed': 'false', title: 'Toggle Plan Mode (/plan): agent inspects & presents a plan for approval before editing files' }, icon('list'), h('span', 'Plan')) as HTMLButtonElement;
+  private readonly planToggleLabel = h('span', 'Plan');
+  private readonly planToggleBtn = h('button.plan-pill', { type: 'button', 'aria-pressed': 'false', title: 'Toggle Plan Mode (/plan): agent inspects & presents a plan for approval before editing files' }, icon('list'), this.planToggleLabel) as HTMLButtonElement;
+  /** Persistent slim indicator strip inside the composer while Plan Mode is active. */
+  private readonly planModeBanner = h(
+    'div.plan-mode-banner',
+    { hidden: true, role: 'status' },
+    icon('list', 'plan-mode-banner-icon'),
+    h('span.plan-mode-banner-text', 'Plan Mode active — read-only inspection until you approve a plan'),
+    h('button.plan-mode-banner-exit', { type: 'button', title: 'Exit Plan Mode (/plan off)', onclick: () => this.handlers.togglePlanMode?.() }, 'Exit'),
+  );
+  private planModeActive = false;
+  private statCtxBtn: HTMLButtonElement | null = null;
+  private contextTrigger: 'top' | 'bottom' = 'top';
   private autocomplete: ComposerAutocomplete | null = null;
   /** Compact StatsPills strip beneath the composer (context fill + compact button + live read/write tok/s). */
   private readonly statsStrip = h('div.composer-stats', { hidden: true, 'aria-label': 'Session telemetry' });
@@ -302,8 +314,12 @@ export class ChatPane {
       compact?: () => void;
       /** Toggle collaborative Plan Mode (`/plan`). */
       togglePlanMode?: () => void;
+      /** Revert the workspace files changed in a specific turn checkpoint (`/undo <id>`). */
+      revert?: (checkpointId: string) => boolean | Promise<boolean>;
       /** Active project VFS for `@file` composer mention autocomplete. */
       getVfs?: () => Vfs | null;
+      /** Slash commands available in the currently viewed conversation. */
+      getSlashCommands?: () => readonly SlashCommandItem[];
     },
   ) {
     this.planBox.hidden = true;
@@ -324,20 +340,20 @@ export class ChatPane {
     });
     this.clearButton.addEventListener('click', () => void this.askToClear());
     // The meter opens what is behind it; Escape, or a click anywhere else, closes it.
-    this.meter.addEventListener('click', () => this.openContext(this.contextPop.hidden));
+    this.meter.addEventListener('click', () => this.openContext(this.contextPop.hidden, 'top'));
     // (Escape with the focus on the meter, where a click leaves it, or inside what it opened)
     for (const el of [this.meter, this.contextPop] as HTMLElement[]) {
       el.addEventListener('keydown', (e: KeyboardEvent) => {
         if (e.key !== 'Escape' || this.contextPop.hidden) return;
         e.stopPropagation();
         this.openContext(false);
-        this.meter.focus();
+        (this.contextTrigger === 'bottom' ? (this.statCtxBtn ?? this.meter) : this.meter).focus();
       });
     }
     document.addEventListener('pointerdown', (e) => {
       if (this.contextPop.hidden) return;
       const at = e.target as Node | null;
-      if (at && (this.contextPop.contains(at) || this.meter.contains(at))) return;
+      if (at && (this.contextPop.contains(at) || this.meter.contains(at) || this.statCtxBtn?.contains(at))) return;
       this.openContext(false);
     });
     this.log.addEventListener('scroll', () => {
@@ -367,6 +383,7 @@ export class ChatPane {
     });
     const composer = h(
       'div.composer',
+      this.planModeBanner,
       this.pending,
       this.input,
       h('div.composer-bar', this.attachButton, this.planToggleBtn, this.steerPill, this.hint, this.send),
@@ -374,12 +391,18 @@ export class ChatPane {
     this.composerEl = composer;
     this.planToggleBtn.hidden = !this.handlers.togglePlanMode;
     this.planToggleBtn.addEventListener('click', () => this.handlers.togglePlanMode?.());
-    this.autocomplete = attachComposerAutocomplete(this.input, composer, () => this.handlers.getVfs?.() ?? null);
+    this.autocomplete = attachComposerAutocomplete(
+      this.input,
+      composer,
+      () => this.handlers.getVfs?.() ?? null,
+      () => this.handlers.getSlashCommands?.() ?? SLASH_COMMANDS,
+    );
     composer.addEventListener('click', (e) => {
       if (e.target === composer) this.input.focus();
     });
     this.element.append(
-      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), h('span.chat-head-tools', this.meter, this.clearButton), this.contextPop),
+      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), h('span.chat-head-tools', this.meter, this.clearButton)),
+      this.contextPop,
       this.sessionTabs,
       this.liveBar,
       this.planBox,
@@ -582,6 +605,9 @@ export class ChatPane {
       // (the receptionist, as its lines in the conversation are headed)
       return (this.to ?? this.kind) === 'sms' ? 'Tell the receptionist what to text…' : 'Ask about this call, or tell the receptionist something…';
     }
+    if (this.planModeActive && !this.planToggleBtn.hidden) {
+      return 'Describe what you want to plan… (read-only until you approve)';
+    }
     return this.runner ? 'Tell the runner what the phone should know…' : this.own === 'setup' ? 'Tell the Agent what OAIY should do…' : 'Ask OAIY…';
   }
 
@@ -602,14 +628,44 @@ export class ChatPane {
     this.send.disabled = !stop && !this.hasMessage();
     this.steerPill.hidden = !steer;
     if (this.composerEl) this.composerEl.dataset.mode = steer ? 'steer' : stop ? 'busy' : 'idle';
-    this.hint.textContent = stop ? 'Type to steer mid-turn, or Stop' : steer ? 'Queued for next step' : 'Enter to send · @file · /plan · /help';
+    const planShown = !this.planToggleBtn.hidden;
+    this.hint.textContent = stop
+      ? 'Type to steer mid-turn, or Stop'
+      : steer
+        ? 'Queued for next step'
+        : this.planModeActive && planShown
+          ? 'Enter to plan · @file · /plan off'
+          : planShown
+            ? 'Enter to send · @file · /plan · /help'
+            : 'Enter to send · /help';
   }
 
-  /** Update the visual state of the Plan Mode toggle pill in the composer. */
+  /** Update the visual state of the Plan Mode toggle pill and banner in the composer. */
   setPlanMode(active: boolean): void {
+    this.planModeActive = active;
     this.planToggleBtn.classList.toggle('active', active);
     this.planToggleBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
-    if (this.composerEl) this.composerEl.dataset.planMode = active ? 'on' : 'off';
+    this.planToggleLabel.textContent = active ? 'Plan: ON' : 'Plan';
+    this.planModeBanner.hidden = !active || this.planToggleBtn.hidden;
+    if (this.composerEl) this.composerEl.dataset.planMode = active && !this.planToggleBtn.hidden ? 'on' : 'off';
+    this.input.placeholder = this.placeholder();
+    this.updateSend();
+  }
+
+  /** Show or hide the Plan Mode toggle pill (hidden in phone/flow sessions where Plan Mode does not apply). */
+  setPlanToggleVisible(visible: boolean): void {
+    this.planToggleBtn.hidden = !visible || !this.handlers.togglePlanMode;
+    this.planModeBanner.hidden = !this.planModeActive || this.planToggleBtn.hidden;
+    if (this.composerEl) this.composerEl.dataset.planMode = this.planModeActive && !this.planToggleBtn.hidden ? 'on' : 'off';
+    this.input.placeholder = this.placeholder();
+    this.updateSend();
+  }
+
+  /** Attach (or re-attach after session tab switch) a live interactive card into the chat feed. */
+  attachInteractiveCard(wrap: HTMLElement): void {
+    this.finishReply();
+    if (!wrap.isConnected) this.add(wrap, 'agent');
+    this.scroll();
   }
 
   /** Mount an interactive clarifying-question card in the chat stream and wait for the user's answer. */
@@ -878,23 +934,33 @@ export class ChatPane {
     const sep = () => h('span.stat-sep', { 'aria-hidden': 'true' }, '·');
     const fmtRate = (tps: number) => (tps >= 1000 ? `${(tps / 1000).toFixed(1)}k` : `${Math.round(tps)}`);
 
+    this.statCtxBtn = null;
     if (ctx && ctx.used > 0) {
       const pct = Math.min(100, Math.round((ctx.used / Math.max(1, ctx.window)) * 100));
       const level = pct >= 85 ? 'high' : pct >= 65 ? 'mid' : 'low';
-      items.push(
-        h(
-          'button.stat-pill.stat-ctx',
-          {
-            type: 'button',
-            'data-level': level,
-            title: `${formatTokens(ctx.used)} of ${formatTokens(ctx.window)} context tokens (${pct}%). Click to inspect or compact.`,
-            onclick: () => this.openContext(this.contextPop.hidden),
+      const ctxBtn = h(
+        'button.stat-pill.stat-ctx',
+        {
+          type: 'button',
+          'data-level': level,
+          'aria-haspopup': 'dialog',
+          'aria-expanded': String(!this.contextPop.hidden),
+          'aria-controls': 'context-pop',
+          title: `${formatTokens(ctx.used)} of ${formatTokens(ctx.window)} context tokens (${pct}%). Click to inspect or compact.`,
+          onclick: () => this.openContext(this.contextPop.hidden, 'bottom'),
+          onkeydown: (e: KeyboardEvent) => {
+            if (e.key !== 'Escape' || this.contextPop.hidden) return;
+            e.stopPropagation();
+            this.openContext(false);
+            ctxBtn.focus();
           },
-          h('span.stat-dot', { 'aria-hidden': 'true' }),
-          h('span.stat-label', `Context ${pct}%`),
-          h('span.stat-sub', `${formatTokens(ctx.used)}/${formatTokens(ctx.window)}`),
-        ),
-      );
+        },
+        h('span.stat-dot', { 'aria-hidden': 'true' }),
+        h('span.stat-label', `Context ${pct}%`),
+        h('span.stat-sub', `${formatTokens(ctx.used)}/${formatTokens(ctx.window)}`),
+      ) as HTMLButtonElement;
+      this.statCtxBtn = ctxBtn;
+      items.push(ctxBtn);
       if (pct >= 50 && this.handlers.compact && !this.busy) {
         items.push(
           h(
@@ -968,9 +1034,24 @@ export class ChatPane {
   }
 
   /** Show or hide what is behind the meter. */
-  private openContext(open: boolean): void {
+  private openContext(open: boolean, from: 'top' | 'bottom' = 'top'): void {
     this.contextPop.hidden = !open;
+    if (open) {
+      this.contextTrigger = from;
+      this.contextPop.dataset.from = from;
+      if (from === 'bottom' && this.statCtxBtn) {
+        const hostRect = this.element.getBoundingClientRect();
+        const btnRect = this.statCtxBtn.getBoundingClientRect();
+        const bottomPx = Math.max(52, Math.round(hostRect.bottom - btnRect.top + 8));
+        this.contextPop.style.top = 'auto';
+        this.contextPop.style.bottom = `${bottomPx}px`;
+      } else {
+        this.contextPop.style.top = '';
+        this.contextPop.style.bottom = '';
+      }
+    }
     this.meter.setAttribute('aria-expanded', String(open));
+    this.statCtxBtn?.setAttribute('aria-expanded', String(open));
     if (open) this.drawContext();
   }
 
@@ -1147,9 +1228,14 @@ export class ChatPane {
     this.follow.jump();
     this.showJump();
     this.cards.clear();
+    for (const timer of this.redrawTimers.values()) clearTimeout(timer);
+    this.redrawTimers.clear();
+    this.redraws.clear();
     this.current = null;
     this.thinking = null;
     this.quiet = null;
+    this.draft = null;
+    this.draftName = '';
     this.callOver = false;
     for (const dispose of this.disposers.splice(0)) dispose();
     this.updateEmpty();
@@ -1470,6 +1556,34 @@ export class ChatPane {
     this.add(h('div.day-divider', { class: `way-${way}`, 'data-way': way }, h('span.day-divider-text', icon(way === 'sms' ? 'message' : 'phone'), ...(when ? [h('strong', when), h('span', label)] : [h('strong', label)]))));
   }
 
+  /** Build a subtle Copy action button for user/assistant messages. */
+  private makeCopyBtn(getText: () => string, title = 'Copy message'): HTMLButtonElement {
+    const btn = h('button.msg-act-btn', { type: 'button', title, 'aria-label': title }, icon('copy')) as HTMLButtonElement;
+    let resetTimer: ReturnType<typeof setTimeout> | null = null;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const text = getText();
+      if (!text) return;
+      void navigator.clipboard?.writeText(text).then(() => {
+        btn.replaceChildren(icon('check'));
+        btn.classList.add('copied');
+        if (resetTimer) clearTimeout(resetTimer);
+        resetTimer = setTimeout(() => {
+          btn.replaceChildren(icon('copy'));
+          btn.classList.remove('copied');
+        }, 1500);
+      }).catch(() => {});
+    });
+    return btn;
+  }
+
+  /** Attach an unobtrusive hover/focus Copy action bar to a finished assistant message. */
+  private attachAssistantActions(box: HTMLElement, text: string): void {
+    if (!text.trim() || box.dataset.hasActions === '1') return;
+    box.dataset.hasActions = '1';
+    box.append(h('div.msg-actions', this.makeCopyBtn(() => text, 'Copy response as Markdown')));
+  }
+
   /** The person's own words, and what they attached. */
   private ownBubble(text: string, attachments: Attachment[], during: boolean, note: string): void {
     const body = h('div.msg-body', text || (attachments.length ? '' : ' '));
@@ -1488,6 +1602,26 @@ export class ChatPane {
     }
     if (during) box.append(h('div.msg-note', note));
     if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
+    if (text.trim()) {
+      const editBtn = h(
+        'button.msg-act-btn',
+        {
+          type: 'button',
+          title: 'Load message into composer to edit & resend',
+          'aria-label': 'Edit and resend message',
+          onclick: (e: Event) => {
+            e.stopPropagation();
+            this.input.value = text;
+            this.grow();
+            this.input.focus();
+            this.input.setSelectionRange(text.length, text.length);
+            this.autocomplete?.refresh();
+          },
+        },
+        icon('pencil'),
+      );
+      box.append(h('div.msg-actions', this.makeCopyBtn(() => text, 'Copy message'), editBtn));
+    }
     this.add(box, 'you');
   }
 
@@ -1514,17 +1648,29 @@ export class ChatPane {
     if (!this.replaying) this.announce(first);
   }
 
-  /** The model's thinking stays shown once the reply moves on: it says why the model did what it did (and how long it was, where the engine counted it). */
+  /** The model's thinking stays collapsible once the reply moves on; auto-collapses unless the user manually toggled it. */
   private doneThinking(): void {
-    const label = this.thinking?.box.querySelector('.thinking-label');
-    if (label) label.textContent = thinkingLabel(this.thinking?.count, false);
-    this.thinking?.box.classList.remove('streaming');
+    const thinking = this.thinking;
+    if (!thinking) return;
+    this.cancelRedraw(thinking.box);
+    const pre = thinking.box.querySelector('pre');
+    if (pre && thinking.text) pre.textContent = thinking.text;
+    const label = thinking.box.querySelector('.thinking-label');
+    if (label) label.textContent = thinkingLabel(thinking.count, false);
+    thinking.box.classList.remove('streaming');
+    if (thinking.box.dataset.userToggled !== '1') {
+      (thinking.box as HTMLDetailsElement).open = false;
+    }
     this.thinking = null;
   }
 
-  /** A box with the model's thinking, open to read. */
+  /** A box with the model's thinking: open while streaming, collapsed by default on replay. */
   private thoughtBox(text: string, streaming = false): HTMLElement {
-    const box = h('details.thinking', { open: true, class: streaming ? 'streaming' : '' }, h('summary', icon('sparkle'), h('span.thinking-label', streaming ? 'Thinking…' : 'What the model thought')), h('pre', text));
+    const summary = h('summary', icon('sparkle'), h('span.thinking-label', streaming ? 'Thinking…' : 'What the model thought'));
+    const box = h('details.thinking', { open: streaming, class: streaming ? 'streaming' : '' }, summary, h('pre', text));
+    summary.addEventListener('click', () => {
+      box.dataset.userToggled = '1';
+    });
     this.add(box, 'agent');
     return box;
   }
@@ -1600,18 +1746,31 @@ export class ChatPane {
 
   /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls for the same box came before it ran (each box is drawn: a replayed conversation has many). */
   private redraws = new Map<HTMLElement, () => void>();
+  private redrawTimers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+  private cancelRedraw(key: HTMLElement): void {
+    this.redraws.delete(key);
+    const timer = this.redrawTimers.get(key);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.redrawTimers.delete(key);
+    }
+  }
   private redraw(key: HTMLElement, draw: () => void): void {
     const queued = this.redraws.has(key);
     this.redraws.set(key, draw);
     if (queued) return;
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      this.redrawTimers.delete(key);
       const latest = this.redraws.get(key);
       this.redraws.delete(key);
+      if (!latest) return;
       requestAnimationFrame(() => {
-        latest?.();
+        if (!key.isConnected) return;
+        latest();
         this.scroll();
       });
     }, STREAM_REDRAW_MS);
+    this.redrawTimers.set(key, timer);
   }
 
   private assistantText(delta: string): void {
@@ -1627,6 +1786,7 @@ export class ChatPane {
     // above what the reader sees keep it where it is, only if nothing grows after.
     if (this.replaying) {
       target.body.innerHTML = renderMarkdown(target.text, true);
+      this.attachAssistantActions(target.box, target.text);
       return;
     }
     // A long reply streams in many pieces: drawn a few times a second, not for each.
@@ -2109,7 +2269,12 @@ export class ChatPane {
         if (e.files.length) {
           this.finishReply();
           this.add(
-            renderDeliverablesCard(e.files, { durationMs: e.durationMs, toolCount: e.toolCount }, (path) => this.handlers.open(path)),
+            renderDeliverablesCard(
+              e.files,
+              { durationMs: e.durationMs, toolCount: e.toolCount, checkpointId: e.checkpointId },
+              (path) => this.handlers.open(path),
+              this.handlers.revert,
+            ),
             'agent',
           );
           this.scroll();
@@ -2189,8 +2354,9 @@ export class ChatPane {
     const reply = this.current;
     if (reply) {
       // (a redraw still queued for it would draw it unfinished again, its code block open)
-      this.redraws.delete(reply.box);
+      this.cancelRedraw(reply.box);
       reply.body.innerHTML = renderMarkdown(reply.text, true);
+      this.attachAssistantActions(reply.box, reply.text);
       // Written whole: said once (not as it streamed).
       if (!this.replaying && !this.sink) this.announce(`${this.agentName()}: ${reply.body.textContent ?? ''}`);
     }
@@ -2398,7 +2564,7 @@ export class ChatPane {
     let cut: typeof this.quiet = null;
     if (this.current && this.live && parseCallEnd(turn.text) !== null) {
       const reply = this.current;
-      this.redraws.delete(reply.box);
+      this.cancelRedraw(reply.box);
       this.current = null;
       this.removeEntry(reply.box);
       this.quietText(reply.text, 'Not said: the call ended as it was written');
@@ -2448,7 +2614,7 @@ export class ChatPane {
     if (turn.role === 'user') {
       // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
       const during = /^\[The user sent this while you[^\]]*\]\n\n/.exec(turn.text);
-      const text = (during ? turn.text.slice(during[0].length) : turn.text).replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+      const text = stripInjectedUserContext(during ? turn.text.slice(during[0].length) : turn.text);
       const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
       // Chats saved before attachments were kept on the turn: read them from the note.
       const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];

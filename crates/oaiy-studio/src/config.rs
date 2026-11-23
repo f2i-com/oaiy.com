@@ -979,7 +979,7 @@ pub fn validate(v: &Json) -> Result<(), String> {
     let model3d = object(media, "model3d")?;
     for (name, m) in object(model3d, "models")?.members() {
         if bool_or(m, "enabled", true) && str_or(m, "path", "").trim().is_empty() {
-            return Err(format!("3D model {name} needs its Pixal3D folder (path)"));
+            return Err(format!("3D model {name} needs its model folder (path)"));
         }
     }
     for (kind, section, models) in [("image", image, image_models), ("video", video, object(video, "models")?), ("speech", speech, object(speech, "models")?), ("music", music, object(music, "models")?), ("sound", sound, object(sound, "models")?), ("model3d", model3d, object(model3d, "models")?)] {

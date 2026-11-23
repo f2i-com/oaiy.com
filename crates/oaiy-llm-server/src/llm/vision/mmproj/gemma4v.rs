@@ -74,6 +74,10 @@ pub struct Gemma4VMmProj {
     pub patch_embd:    Tensor,            // [D, 3, P, P]
     pub position_embd: Tensor,            // [N_max, D] — slice first n_patches
     pub blocks:        Vec<Gemma4VBlock>,
+    /// Optional feature-level standardization (`(x - std_bias) * std_scale` in F32 after 3x3 pooling,
+    /// before pre-projection RMSNorm), present on larger Gemma 4 vision towers (26B-A4B, 31B).
+    pub std_bias:      Option<Tensor>,    // [D]
+    pub std_scale:     Option<Tensor>,    // [D]
     pub projector:     Gemma4VProjector,
     pub backend:       Arc<dyn Backend>,
     /// the tower chained on the backend's device (`chain::gemma4v`), made at the first picture.
@@ -138,6 +142,15 @@ impl Gemma4VMmProj {
             });
         }
 
+        // ----- optional post-pool standardization (Gemma 4 26B-A4B / 31B) -
+        let std_bias  = idx.take("v.std_bias",  &[]).ok();
+        let std_scale = idx.take("v.std_scale", &[]).ok();
+        if std_bias.is_some() != std_scale.is_some() {
+            return Err(LlamaError::Config(
+                "Gemma 4 vision projector must provide both v.std_bias and v.std_scale or neither".into(),
+            ));
+        }
+
         // ----- projector (single linear, NO transpose) ------------------
         // Unlike Gemma 3 (which stores `mm.input_projection` as
         // `[vision_dim, lm_hidden]` and needs transposing), Gemma 4 V already
@@ -148,7 +161,7 @@ impl Gemma4VMmProj {
             clamps: Clamp::of(&idx, "mm.input_projection.weight"),
         };
 
-        verify_gemma4v_shapes(&config, &patch_embd, &position_embd, &blocks, &projector)?;
+        verify_gemma4v_shapes(&config, &patch_embd, &position_embd, &blocks, std_bias.as_ref(), std_scale.as_ref(), &projector)?;
 
         // ----- upload to backend ----------------------------------------
         // Vision is one-shot per image; 1 GB safety margin is plenty.
@@ -175,9 +188,9 @@ impl Gemma4VMmProj {
             clamps: projector.clamps,
         };
         let position_embd = upload(position_embd);
-        // patch_embd kept on host until forward time (unfold runs CPU-side).
+        // patch_embd and std_bias/std_scale kept on host until chain tower init.
 
-        Ok(Self { config, patch_embd, position_embd, blocks, projector, backend, chain: Default::default() })
+        Ok(Self { config, patch_embd, position_embd, blocks, std_bias, std_scale, projector, backend, chain: Default::default() })
     }
 
     /// `image` (`[3, h, w]`, values in `[0, 1]`, each side a multiple of `patch_size * 3`, as
@@ -215,6 +228,8 @@ fn verify_gemma4v_shapes(
     patch_embd:    &Tensor,
     position_embd: &Tensor,
     blocks:        &[Gemma4VBlock],
+    std_bias:      Option<&Tensor>,
+    std_scale:     Option<&Tensor>,
     projector:     &Gemma4VProjector,
 ) -> Result<()> {
     let bad = |name: &str, got: &[usize], expected: &[usize]| -> LlamaError {
@@ -268,6 +283,13 @@ fn verify_gemma4v_shapes(
         check_w    (&blk.ffn_up,      &[ff, d], &format!("v.blk.{i}.ffn_up"))?;
         check_w    (&blk.ffn_down,    &[d, ff], &format!("v.blk.{i}.ffn_down"))?;
         check_dense(&blk.ffn_post,    &[d],     &format!("v.blk.{i}.ffn_post_norm"))?;
+    }
+
+    if let Some(b) = std_bias {
+        check_dense(b, &[d], "v.std_bias")?;
+    }
+    if let Some(s) = std_scale {
+        check_dense(s, &[d], "v.std_scale")?;
     }
 
     // Projector: [lm_hidden, vision_dim] after our transpose. Inner dim = d.

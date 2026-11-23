@@ -24,6 +24,10 @@ export class FileTree {
   /** Whose files these are, when they are not the open project's (the Front desk's). */
   private readonly place = h('div.tree-place', { hidden: true });
   private readonly title = h('div.pane-title.tree-head', h('span.pane-kicker', 'Files'));
+  private readonly filterInput = h('input.tree-filter', { type: 'text', placeholder: 'Filter files…', 'aria-label': 'Filter files', spellcheck: false, autocomplete: 'off' }) as HTMLInputElement;
+  private readonly filterClear = h('button.icon.tree-filter-clear', { type: 'button', hidden: true, title: 'Clear filter (Esc)', 'aria-label': 'Clear filter' }, icon('x')) as HTMLButtonElement;
+  private readonly filterBar = h('div.tree-filter-bar', icon('search', 'tree-filter-icon'), this.filterInput, this.filterClear);
+  private filterQuery = '';
 
   constructor(
     private vfs: Vfs,
@@ -40,9 +44,32 @@ export class FileTree {
         this.render();
       }),
     ));
+    this.filterInput.addEventListener('input', () => {
+      this.filterQuery = this.filterInput.value.trim().toLowerCase();
+      this.filterClear.hidden = !this.filterQuery;
+      this.render();
+    });
+    this.filterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && this.filterInput.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.clearFilter();
+      }
+    });
+    this.filterClear.addEventListener('click', () => {
+      this.clearFilter();
+      this.filterInput.focus();
+    });
     this.list.setAttribute('role', 'tree');
     this.list.setAttribute('aria-label', 'Project files');
-    this.element.append(this.title, this.place, this.list);
+    this.element.append(this.title, this.place, this.filterBar, this.list);
+    this.render();
+  }
+
+  private clearFilter(): void {
+    this.filterInput.value = '';
+    this.filterQuery = '';
+    this.filterClear.hidden = true;
     this.render();
   }
 
@@ -62,6 +89,9 @@ export class FileTree {
     this.vfs = vfs;
     this.expanded = new Set(['', ...(shown?.expanded ?? [])]);
     this.selected = shown?.selected ?? null;
+    this.filterInput.value = '';
+    this.filterQuery = '';
+    this.filterClear.hidden = true;
     this.render();
   }
 
@@ -76,13 +106,15 @@ export class FileTree {
   }
 
   /** Select a path (its folders opened), or nothing. */
-  select(path: string | null): void {
+  select(rawPath: string | null): void {
+    const key = rawPath ? normalizePath(rawPath) : '';
+    const path = key ? `/${key}` : null;
     this.selected = path;
     if (!path) {
       this.refresh();
       return;
     }
-    const parts = path.replace(/^\//, '').split('/');
+    const parts = key.split('/');
     for (let i = 1; i < parts.length; i++) this.expanded.add(parts.slice(0, i).join('/'));
     this.refresh();
   }
@@ -104,8 +136,8 @@ export class FileTree {
     return `/${normalizePath(value.trim(), `/${dir}`)}`;
   }
 
-  private async create(kind: 'file' | 'dir'): Promise<void> {
-    const dir = this.targetDir();
+  private async create(kind: 'file' | 'dir', inDir?: string): Promise<void> {
+    const dir = inDir !== undefined ? inDir : this.targetDir();
     const name = await askText({
       title: kind === 'file' ? 'New file' : 'New folder',
       message: dir ? `In /${dir}/. A name that starts with / goes from the project root instead.` : 'At the project root.',
@@ -141,11 +173,35 @@ export class FileTree {
   }
 
   private async rename(path: string): Promise<void> {
-    const name = await askText({ title: 'Rename', message: 'A path from the project root: change the folder part to move it.', label: 'New path', value: path.slice(1), ok: 'Rename' });
-    const to = `/${name?.replace(/^\/+/, '').replace(/\/+$/, '') ?? ''}`;
-    if (!name || to === path || to === '/') return;
+    const isDir = this.vfs.stat(path)?.type === 'dir';
+    const name = await askText({
+      title: 'Rename',
+      message: 'A path from the project root: change the folder part to move it.',
+      label: 'New path',
+      value: path.slice(1),
+      ok: 'Rename',
+      validate: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) return 'Give a file or folder name.';
+        if (!isDir && trimmed.endsWith('/')) return `"${trimmed}" ends with /, which names a folder.`;
+        let norm: string;
+        try {
+          norm = normalizePath(trimmed, '/');
+        } catch (err) {
+          return (err as Error).message;
+        }
+        const target = `/${norm}`;
+        if (target === '/') return 'That is the project root: give it a name.';
+        if (target === path) return null;
+        if (isDir && target.startsWith(`${path}/`)) return `Cannot move ${path} inside itself.`;
+        if (this.vfs.exists(target)) return `${target} already exists: choose another name.`;
+        return null;
+      },
+    });
+    if (!name) return;
+    const to = `/${normalizePath(name.trim(), '/')}`;
+    if (to === path || to === '/') return;
     try {
-      // (not over a file or folder that is there: a rename does not overwrite or merge)
       if (this.vfs.exists(to)) {
         this.onNotice(`${to} is there already: choose another name, or delete that one first.`);
         return;
@@ -182,6 +238,20 @@ export class FileTree {
   private render(): void {
     const focused = (document.activeElement as HTMLElement | null)?.closest?.('.tree-row')?.getAttribute('title') ?? null;
     clear(this.list);
+    const q = this.filterQuery;
+    let visibleKeys: Set<string> | null = null;
+    if (q) {
+      visibleKeys = new Set<string>();
+      const walked = this.vfs.walk('/', { includeIgnored: true, limit: 10_000 });
+      for (const e of walked.entries) {
+        if (e.path === '.oaiy' || e.path.startsWith('.oaiy/')) continue;
+        if (e.path.toLowerCase().includes(q)) {
+          visibleKeys.add(e.path);
+          const parts = e.path.split('/');
+          for (let i = 1; i < parts.length; i++) visibleKeys.add(parts.slice(0, i).join('/'));
+        }
+      }
+    }
     const rows: HTMLElement[] = [];
     const walk = (dir: string, depth: number) => {
       let entries;
@@ -194,9 +264,10 @@ export class FileTree {
       for (const entry of entries) {
         if (dir === '' && entry.name === '.oaiy') continue;
         const key = dir ? `${dir}/${entry.name}` : entry.name;
+        if (visibleKeys && !visibleKeys.has(key)) continue;
         const path = `/${key}`;
         const isDir = entry.type === 'dir';
-        const open = this.expanded.has(key);
+        const open = visibleKeys ? true : this.expanded.has(key);
         const kind = fileIcon(entry.name, isDir, open);
         const toggle = () => {
           if (open) this.expanded.delete(key);
@@ -265,6 +336,7 @@ export class FileTree {
           h(
             'span.row-actions',
             { 'aria-hidden': 'true' },
+            ...(isDir ? [h('button.icon', { type: 'button', tabindex: -1, title: `New file in ${entry.name}`, 'aria-label': `New file in ${entry.name}`, onclick: (e: Event) => { e.stopPropagation(); void this.create('file', key); } }, icon('plus'))] : []),
             h('button.icon', { type: 'button', tabindex: -1, title: 'Rename', 'aria-label': `Rename ${entry.name}`, onclick: (e: Event) => { e.stopPropagation(); void this.rename(path); } }, icon('pencil')),
             h('button.icon', { type: 'button', tabindex: -1, title: 'Delete', 'aria-label': `Delete ${entry.name}`, onclick: (e: Event) => { e.stopPropagation(); void this.remove(path); } }, icon('trash')),
           ),
@@ -275,6 +347,14 @@ export class FileTree {
     };
     walk('', 0);
     if (!rows.length) {
+      if (q) {
+        this.list.append(h(
+          'div.tree-empty',
+          h('p', `No files matching “${this.filterInput.value.trim()}”`),
+          h('button', { type: 'button', onclick: () => this.clearFilter() }, h('span', 'Clear filter')),
+        ));
+        return;
+      }
       this.list.append(h(
         'div.tree-empty',
         h('span.tree-empty-icon', icon('folder-open')),

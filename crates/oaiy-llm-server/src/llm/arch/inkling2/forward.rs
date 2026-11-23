@@ -1394,11 +1394,31 @@ impl Inkling2Model {
                 }
             }
         }
-        for t in 0..seq {
-            if !is_soft[t] {
-                let raw = self.embed_row(tokens[t])?;
-                let normed = rms_norm_rows(&raw, &self.embed_norm, hidden, self.cfg.rms_eps);
-                cur[t * hidden..(t + 1) * hidden].copy_from_slice(&normed);
+        if seq >= 64 {
+            cur.par_chunks_mut(hidden)
+                .enumerate()
+                .try_for_each(|(t, dst)| -> Result<()> {
+                    if !is_soft[t] {
+                        let raw = self.embed_row(tokens[t])?;
+                        let sum_sq: f32 = raw.iter().map(|&v| v * v).sum();
+                        let inv = 1.0 / (sum_sq / hidden as f32 + self.cfg.rms_eps).sqrt();
+                        for c in 0..hidden {
+                            dst[c] = raw[c] * inv * self.embed_norm[c];
+                        }
+                    }
+                    Ok(())
+                })?;
+        } else {
+            for t in 0..seq {
+                if !is_soft[t] {
+                    let raw = self.embed_row(tokens[t])?;
+                    let sum_sq: f32 = raw.iter().map(|&v| v * v).sum();
+                    let inv = 1.0 / (sum_sq / hidden as f32 + self.cfg.rms_eps).sqrt();
+                    let dst = &mut cur[t * hidden..(t + 1) * hidden];
+                    for c in 0..hidden {
+                        dst[c] = raw[c] * inv * self.embed_norm[c];
+                    }
+                }
             }
         }
 
@@ -2336,12 +2356,13 @@ impl Inkling2Model {
             chain.vec(cap_seq * max_dyn),
             chain.vec(cap_seq * max_dyn),
         ];
-        let (x_bufs, mid_bufs, ctrl_gain, ctrl_forget) = if need_fallback_ctrl {
+        let want_ctrl_gemm = cap_seq >= 16 && !self.loop_layers.is_empty();
+        let (x_bufs, mid_bufs, ctrl_gain, ctrl_forget) = if need_fallback_ctrl || want_ctrl_gemm {
             (
-                (0..3).map(|_| chain.vec(2 * sh)).collect(),
-                (0..3).map(|_| chain.vec(cap_seq * gate_rank)).collect(),
-                (0..3).map(|_| chain.vec(sh)).collect(),
-                (0..3).map(|_| chain.vec(sh)).collect(),
+                vec![chain.vec(2 * sh)],
+                vec![chain.vec(cap_seq * gate_rank)],
+                vec![chain.vec(sh)],
+                vec![chain.vec(sh)],
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -2381,6 +2402,7 @@ impl Inkling2Model {
     #[allow(clippy::too_many_arguments)]
     fn record_prefill_layer_gpu(
         &self,
+        chain: &dyn DeviceChain,
         rec: &mut dyn ChainRecorder,
         il: usize,
         ip: usize,
@@ -2435,7 +2457,19 @@ impl Inkling2Model {
                 AttnNormsDev::Shared(w) => [w, w, w],
                 AttnNormsDev::Separate { q, k, v, .. } => [q, k, v],
             };
-            if let (Some(dqkv), Some(gfqkv)) = (&ll.ctrl_down_qkv_f16, &ll.ctrl_gf_qkv_f16) {
+            // For `seq >= 16`, prefer Tensor Core FP16 GEMM (`HalfLinear` / `record_weight`) over
+            // the decode-oriented per-token fused F16 matvec, avoiding `seq` redundant weight reads
+            // and 2 extra `[seq, hidden]` copies across 24 looped layers!
+            let use_qkv_gemm = seq >= 16
+                && !pf.x_bufs.is_empty()
+                && (0..3).all(|i| {
+                    weight_on_chain(chain, &ll.ctrl_down[i]).is_some()
+                        && weight_on_chain(chain, &ll.ctrl_gain[i]).is_some()
+                        && weight_on_chain(chain, &ll.ctrl_forget[i]).is_some()
+                });
+            if !use_qkv_gemm && ll.ctrl_down_qkv_f16.is_some() && ll.ctrl_gf_qkv_f16.is_some() {
+                let dqkv = ll.ctrl_down_qkv_f16.as_ref().expect("ctrl_down_qkv_f16");
+                let gfqkv = ll.ctrl_gf_qkv_f16.as_ref().expect("ctrl_gf_qkv_f16");
                 let cur_stride = if is_swa { 0 } else { sh };
                 rec.inkling2_ctrl_cat_down_rows(dqkv, &pf.mix_out, 0, cur_stride, &pf.msgs, 0, &pf.mid_qkv, seq, hidden, gate_rank, 3);
                 rec.inkling2_ctrl_up_blend_rows(gfqkv, &pf.mid_qkv, &pf.mix_out, 0, cur_stride, &pf.msgs, 0, &pf.ctrl_qkv, seq, hidden, gate_rank, 3);
@@ -2452,11 +2486,11 @@ impl Inkling2Model {
                 for i in 0..3 {
                     let cur_off = if is_swa { 0 } else { i * sh };
                     let msg_off = i * sh;
-                    rec.inkling2_control_cat_rows(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.x_bufs[i], seq, hidden);
-                    record_weight(rec, &ll.ctrl_down[i], &pf.x_bufs[i], &pf.mid_bufs[i], seq);
-                    record_weight(rec, &ll.ctrl_gain[i], &pf.mid_bufs[i], &pf.ctrl_gain[i], seq);
-                    record_weight(rec, &ll.ctrl_forget[i], &pf.mid_bufs[i], &pf.ctrl_forget[i], seq);
-                    rec.control_blend_at(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.ctrl_gain[i], &pf.ctrl_forget[i], &pf.ctrl_out[i], sh);
+                    rec.inkling2_control_cat_rows(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.x_bufs[0], seq, hidden);
+                    record_weight(rec, &ll.ctrl_down[i], &pf.x_bufs[0], &pf.mid_bufs[0], seq);
+                    record_weight(rec, &ll.ctrl_gain[i], &pf.mid_bufs[0], &pf.ctrl_gain[0], seq);
+                    record_weight(rec, &ll.ctrl_forget[i], &pf.mid_bufs[0], &pf.ctrl_forget[0], seq);
+                    rec.control_blend_at(&pf.mix_out, cur_off, &pf.msgs, msg_off, &pf.ctrl_gain[0], &pf.ctrl_forget[0], &pf.ctrl_out[i], sh);
                     let in_v = GpuScratch::view(&pf.ctrl_out[i], sh);
                     let out_v = GpuScratch::view(&pf.norm_bufs[i], sh);
                     rec.rmsnorm_rows(&in_v, norm_ws[i], &out_v, seq, self.cfg.rms_eps);
@@ -2576,19 +2610,32 @@ impl Inkling2Model {
         rec.inkling2_mix_depth_rows(&pf.blocks, &pf.ffn_inp, &dev.ffn_res_query, &pf.ffn_x, *n_blocks, 1, seq, hidden, false);
         let norm_v = GpuScratch::view(&pf.norm_bufs[0], sh);
         if let (true, Some(ll)) = (has_msgs, loop_layer) {
-            if let Some(ref df) = ll.ctrl_down_ffn_f16 {
-                rec.inkling2_ctrl_cat_down_rows(df, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.mid_qkv, seq, hidden, gate_rank, 1);
-            } else {
+            let use_ffn_gemm = seq >= 16
+                && !pf.x_bufs.is_empty()
+                && weight_on_chain(chain, &ll.ctrl_down[3]).is_some()
+                && weight_on_chain(chain, &ll.ctrl_gain[3]).is_some()
+                && weight_on_chain(chain, &ll.ctrl_forget[3]).is_some();
+            if use_ffn_gemm {
                 rec.inkling2_control_cat_rows(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.x_bufs[0], seq, hidden);
                 record_weight(rec, &ll.ctrl_down[3], &pf.x_bufs[0], &pf.mid_bufs[0], seq);
-            }
-            if let Some(ref gf) = ll.ctrl_gf_ffn_f16 {
-                rec.inkling2_ctrl_up_blend_rows(gf, &pf.mid_qkv, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.ctrl_out[0], seq, hidden, gate_rank, 1);
-            } else {
-                let mid_src = if ll.ctrl_down_ffn_f16.is_some() { &pf.mid_qkv } else { &pf.mid_bufs[0] };
-                record_weight(rec, &ll.ctrl_gain[3], mid_src, &pf.ctrl_gain[0], seq);
-                record_weight(rec, &ll.ctrl_forget[3], mid_src, &pf.ctrl_forget[0], seq);
+                record_weight(rec, &ll.ctrl_gain[3], &pf.mid_bufs[0], &pf.ctrl_gain[0], seq);
+                record_weight(rec, &ll.ctrl_forget[3], &pf.mid_bufs[0], &pf.ctrl_forget[0], seq);
                 rec.control_blend_at(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.ctrl_gain[0], &pf.ctrl_forget[0], &pf.ctrl_out[0], sh);
+            } else {
+                if let Some(ref df) = ll.ctrl_down_ffn_f16 {
+                    rec.inkling2_ctrl_cat_down_rows(df, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.mid_qkv, seq, hidden, gate_rank, 1);
+                } else {
+                    rec.inkling2_control_cat_rows(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.x_bufs[0], seq, hidden);
+                    record_weight(rec, &ll.ctrl_down[3], &pf.x_bufs[0], &pf.mid_bufs[0], seq);
+                }
+                if let Some(ref gf) = ll.ctrl_gf_ffn_f16 {
+                    rec.inkling2_ctrl_up_blend_rows(gf, &pf.mid_qkv, &pf.ffn_x, 0, 0, &pf.msgs, 3 * sh, &pf.ctrl_out[0], seq, hidden, gate_rank, 1);
+                } else {
+                    let mid_src = if ll.ctrl_down_ffn_f16.is_some() { &pf.mid_qkv } else { &pf.mid_bufs[0] };
+                    record_weight(rec, &ll.ctrl_gain[3], mid_src, &pf.ctrl_gain[0], seq);
+                    record_weight(rec, &ll.ctrl_forget[3], mid_src, &pf.ctrl_forget[0], seq);
+                    rec.control_blend_at(&pf.ffn_x, 0, &pf.msgs, 3 * sh, &pf.ctrl_gain[0], &pf.ctrl_forget[0], &pf.ctrl_out[0], sh);
+                }
             }
             let in_v = GpuScratch::view(&pf.ctrl_out[0], sh);
             rec.rmsnorm_rows(&in_v, ffn_norm_dev, &norm_v, seq, self.cfg.rms_eps);
@@ -2708,7 +2755,7 @@ impl Inkling2Model {
 
         if let Some(lc) = &self.cfg.loop_cfg {
             for il in 0..lc.core_start {
-                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+                self.record_prefill_layer_gpu(chain, &mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
             }
             rec.copy(&pf.cur, 0, &pf.prelude_cur, 0, sh);
             let prelude_n_blocks = n_blocks;
@@ -2734,27 +2781,27 @@ impl Inkling2Model {
                         n_phys + (pass - 1) * core_len + (ip - lc.core_start)
                     };
                     if pass == 0 {
-                        self.record_prefill_layer_gpu(&mut *rec, il, ip, &mut n_blocks, false, None, past_len, seq, ds, pf);
+                        self.record_prefill_layer_gpu(chain, &mut *rec, il, ip, &mut n_blocks, false, None, past_len, seq, ds, pf);
                     } else {
                         let ll = &self.loop_layers[ip - lc.core_start];
                         let mq_dev = ll.msg_query_dev.as_ref().expect("msg_query_dev");
                         rec.inkling2_mix_depth_rows(&pf.bank, &pf.bank_out, mq_dev, &pf.msgs, n_bank, 4, seq, hidden, true);
-                        self.record_prefill_layer_gpu(&mut *rec, il, ip, &mut n_blocks, true, Some(ll), past_len, seq, ds, pf);
+                        self.record_prefill_layer_gpu(chain, &mut *rec, il, ip, &mut n_blocks, true, Some(ll), past_len, seq, ds, pf);
                     }
                 }
             }
             for il in lc.core_end..n_phys {
-                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+                self.record_prefill_layer_gpu(chain, &mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
             }
         } else {
             for il in 0..n_phys {
-                self.record_prefill_layer_gpu(&mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
+                self.record_prefill_layer_gpu(chain, &mut *rec, il, il, &mut n_blocks, false, None, past_len, seq, ds, pf);
             }
         }
 
         let out_tensor = match out_mode {
             OutputMode::None => {
-                let _ = rec.finish();
+                rec.send();
                 Tensor::from_vec(Vec::new(), vec![0, unpadded])
             }
             OutputMode::LastOnly => {

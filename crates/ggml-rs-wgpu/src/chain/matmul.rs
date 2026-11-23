@@ -128,7 +128,16 @@ impl Recorder<'_> {
     pub(super) fn rmsnorm_q8(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let k = x.len;
-        if k == 0 || k % 32 != 0 || w.len < k || out.len < k || !self.gpu().subgroups32() || !self.gpu().int8_rows() || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0")) {
+        if k == 0
+            || k % 32 != 0
+            || w.len < k
+            || out.len < k
+            || Arc::ptr_eq(&x.inner, &out.inner)
+            || Arc::ptr_eq(&w.inner, &out.inner)
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0"))
+        {
             return false;
         }
         let (len, xs_at) = crate::quant::shaders::q8_len(1, k);
@@ -138,6 +147,114 @@ impl Recorder<'_> {
         let d = self.gpu().dummy().clone();
         self.dispatch_wide("chain-rmsnorm-q8", crate::quant::shaders::NORM_Q8_LANES, [buffer(x), buffer(w), &d, &d, &d, &d, buffer(out), buffer(&xq)], &[k as u32, eps.to_bits(), xs_at as u32], ((k as u32 / 32).div_ceil(32), 1, 1));
         self.q8.push((ob, 1, k, xq));
+        true
+    }
+
+    /// Fused `x += y; out = rmsnorm(x, eps) * w; q8 = quant_q8(out)` for one decode row (`k % 32 == 0`).
+    pub(super) fn add_rmsnorm_q8(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, eps: f32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let k = x.len;
+        if k == 0
+            || k % 32 != 0
+            || y.len < k
+            || w.len < k
+            || out.len < k
+            || Arc::ptr_eq(&x.inner, &out.inner)
+            || Arc::ptr_eq(&y.inner, &out.inner)
+            || Arc::ptr_eq(&x.inner, &y.inner)
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0"))
+        {
+            return false;
+        }
+        let (len, xs_at) = crate::quant::shaders::q8_len(1, k);
+        let ob = buffer(out).clone();
+        let xq = if self.keeps() {
+            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, k, (len * 4) as u64)) }
+        } else {
+            self.scratch(len)
+        };
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide(
+            "chain-add-rmsnorm-q8",
+            crate::quant::shaders::ADD_RMSNORM_Q8_LANES,
+            [buffer(y), buffer(w), &d, &d, &d, buffer(x), buffer(out), buffer(&xq)],
+            &[k as u32, eps.to_bits(), xs_at as u32],
+            (1, 1, 1),
+        );
+        self.q8.push((ob, 1, k, xq));
+        true
+    }
+
+    /// Fused `silu_mul_split` / `gelu_mul_split` + Q8_0 quantization for one decode row (`ff % 32 == 0`).
+    pub(super) fn act_mul_split_q8(&mut self, fused: &DeviceVec, out: &DeviceVec, gelu: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ff = out.len;
+        if ff < 512
+            || ff % 32 != 0
+            || fused.len < 2 * ff
+            || Arc::ptr_eq(&fused.inner, &out.inner)
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0"))
+        {
+            return false;
+        }
+        let (len, xs_at) = crate::quant::shaders::q8_len(1, ff);
+        let ob = buffer(out).clone();
+        let xq = if self.keeps() {
+            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, ff, (len * 4) as u64)) }
+        } else {
+            self.scratch(len)
+        };
+        let d = self.gpu().dummy().clone();
+        let (name, src) = if gelu {
+            ("chain-gelu-mul-split-q8", crate::quant::shaders::GELU_MUL_SPLIT_Q8_LANES)
+        } else {
+            ("chain-silu-mul-split-q8", crate::quant::shaders::SILU_MUL_SPLIT_Q8_LANES)
+        };
+        self.dispatch_wide(name, src, [buffer(fused), &d, &d, &d, &d, &d, buffer(out), buffer(&xq)], &[ff as u32, xs_at as u32], ((ff as u32 / 32).div_ceil(32), 1, 1));
+        self.q8.push((ob, 1, ff, xq));
+        true
+    }
+
+    /// Fused `silu(gate) * up` + Q8_0 quantization for one decode row (`len % 32 == 0`).
+    pub(super) fn silu_mul_q8(&mut self, gate: &DeviceVec, up: &DeviceVec, out: &DeviceVec, len: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if len < 512
+            || len > 65536
+            || len % 32 != 0
+            || !self.keeps()
+            || out.len != len
+            || gate.len < len
+            || up.len < len
+            || Arc::ptr_eq(&gate.inner, &out.inner)
+            || Arc::ptr_eq(&up.inner, &out.inner)
+            || !self.gpu().subgroups32()
+            || !self.gpu().int8_rows()
+            || !*ON.get_or_init(|| std::env::var("OAIY_NORM_Q8").map_or(true, |v| v != "0"))
+        {
+            return false;
+        }
+        let (qlen, xs_at) = crate::quant::shaders::q8_len(1, len);
+        let ob = buffer(out).clone();
+        // Never pin a pooled scratch buffer in `Gpu::q8_kept` (which is keyed by buffer identity).
+        let is_pooled = self.pooled.iter().any(|(_, b)| b == &ob) || self.spare.iter().any(|(_, b)| b == &ob);
+        let xq = if self.keeps() && !is_pooled {
+            DeviceVec { len: qlen, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, len, (qlen * 4) as u64)) }
+        } else {
+            self.scratch(qlen)
+        };
+        let d = self.gpu().dummy().clone();
+        self.dispatch_wide(
+            "chain-silu-mul-q8",
+            crate::quant::shaders::SILU_MUL_Q8_LANES,
+            [buffer(gate), buffer(up), &d, &d, &d, &d, buffer(out), buffer(&xq)],
+            &[len as u32, xs_at as u32],
+            ((len as u32 / 32).div_ceil(32), 1, 1),
+        );
+        self.q8.push((ob, 1, len, xq));
         true
     }
 
@@ -153,6 +270,8 @@ impl Recorder<'_> {
             || x.len < n_streams * k
             || out.len < n_streams * k
             || w.len < need_w
+            || Arc::ptr_eq(&x.inner, &out.inner)
+            || Arc::ptr_eq(&w.inner, &out.inner)
             || !self.gpu().subgroups32()
             || !self.gpu().int8_rows()
             || !q8_split()

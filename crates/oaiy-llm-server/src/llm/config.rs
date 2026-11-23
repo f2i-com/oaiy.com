@@ -224,6 +224,14 @@ impl ModelConfig {
         if !arch.supported() {
             return Err(LlamaError::UnsupportedArch(arch_str));
         }
+        // PrismML Hadamard-rotated ternary checkpoints require blockwise Walsh-Hadamard
+        // input rotations and grouped DeltaNet V-heads; fail explicitly rather than
+        // decoding garbage with standard linear projections.
+        if g.metadata().contains_key("prism.hadamard.version") {
+            return Err(LlamaError::Config(
+                "PrismML Hadamard-rotated checkpoints (prism.hadamard.version) are not supported yet".into(),
+            ));
+        }
 
         // Metadata keys are namespaced by architecture name. Most schemas
         // mirror Llama's, so we fall back to the `llama.*` namespace.

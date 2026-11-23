@@ -77,6 +77,7 @@ export class TerminalPane {
   private readonly input = h('input.term-input', { spellcheck: false, autocomplete: 'off', 'aria-label': 'Terminal command', placeholder: READY }) as HTMLInputElement;
   /** While a command runs: stops it, as Ctrl+C in the input does (shown so the way to stop it is seen). */
   private readonly stopButton = h('button.term-stop', { type: 'button', hidden: true, title: 'Stop the command that is running (Ctrl+C)' }, 'Stop', h('kbd', 'Ctrl+C')) as HTMLButtonElement;
+  private readonly clearButton = h('button.term-clear', { type: 'button', title: 'Clear terminal output (Ctrl+L)', 'aria-label': 'Clear terminal output' }, icon('trash')) as HTMLButtonElement;
   private readonly toggle = h('button.term-toggle', { type: 'button' }) as HTMLButtonElement;
   private readonly where = h('span.term-where');
   private cwd = '/';
@@ -87,6 +88,8 @@ export class TerminalPane {
   private queue: string[] = [];
   /** Stops the command that is running (Ctrl+C). */
   private stop: AbortController | null = null;
+  /** Bumped on `setVfs` so an in-flight command from a previous project never writes into the new one. */
+  private generation = 0;
 
   constructor(private vfs: Vfs, private readonly gate: NetGate) {
     const head = h(
@@ -97,11 +100,16 @@ export class TerminalPane {
       // the whole of it, with the Zipp VM, is the bar's tooltip)
       h('span.term-about', 'an emulated shell, kept to the project'),
       this.where,
+      this.clearButton,
       this.toggle,
     );
     // The header folds it too (not its button's own click, which does it already).
     head.addEventListener('click', (e) => {
       if (!(e.target as Element).closest('button')) this.fold(!this.element.classList.contains('folded'));
+    });
+    this.clearButton.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.out.textContent = '';
     });
     this.toggle.addEventListener('click', (e) => {
       // Its icon changes as it folds: the header must not take the same click again.
@@ -164,11 +172,20 @@ export class TerminalPane {
     if (!folded && save) this.input.focus();
   }
 
+  /** Toggle terminal folded state (used by global shortcut Ctrl+`). */
+  toggleFold(): void {
+    this.fold(!this.element.classList.contains('folded'));
+  }
+
   setVfs(vfs: Vfs): void {
+    this.generation++;
+    this.stop?.abort();
+    this.stop = null;
+    this.queue = [];
+    this.setRunning(false);
     this.vfs = vfs;
     this.cwd = '/';
     this.env = {};
-    this.queue = [];
     this.showPrompt();
     this.out.textContent = '';
   }
@@ -182,6 +199,8 @@ export class TerminalPane {
     const span = h('span', text);
     if (cls) span.className = cls;
     this.out.append(span);
+    // Bound DOM scrollback so long-running loops cannot bog down the tab.
+    while (this.out.childElementCount > 2_000) this.out.firstElementChild?.remove();
     this.out.scrollTop = this.out.scrollHeight;
   }
 
@@ -202,13 +221,16 @@ export class TerminalPane {
       this.out.textContent = '';
       return;
     }
+    const gen = this.generation;
+    const ctrl = new AbortController();
     this.setRunning(true);
-    this.stop = new AbortController();
+    this.stop = ctrl;
     try {
       const host = new SandboxHost(this.vfs, this.gate, 'terminal', 60_000);
-      host.signal = this.stop.signal;
+      host.signal = ctrl.signal;
       const cwd = this.vfs.stat(this.cwd)?.type === 'dir' ? this.cwd : '/';
-      const outcome = await runInSandbox({ lang: 'shell', source: command, cwd, env: this.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs: 60_000, signal: this.stop.signal });
+      const outcome = await runInSandbox({ lang: 'shell', source: command, cwd, env: this.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs: 60_000, signal: ctrl.signal });
+      if (gen !== this.generation) return;
       const shell = outcome.result?.shell;
       if (shell && !outcome.result?.error) {
         this.cwd = shell.cwd;
@@ -218,17 +240,21 @@ export class TerminalPane {
         const { stdout, stderr } = summarize(outcome);
         if (stdout) this.write(stdout);
         // (stopped with Ctrl+C or Stop: the ^C says so, not "sandbox failed")
-        if (!this.stop.signal.aborted) this.write(stderr || 'the command did not finish\n', 'term-err');
+        if (!ctrl.signal.aborted) this.write(stderr || 'the command did not finish\n', 'term-err');
       }
     } catch (error) {
-      if (!this.stop?.signal.aborted) this.write(`${(error as Error).message}\n`, 'term-err');
+      if (gen !== this.generation) return;
+      if (!ctrl.signal.aborted) this.write(`${(error as Error).message}\n`, 'term-err');
     } finally {
-      this.setRunning(false);
-      this.showPrompt();
-      this.stop = null;
-      // Back to the prompt only when the person was typing in the terminal, not somewhere else meanwhile.
-      if (document.activeElement === document.body || this.element.contains(document.activeElement)) this.input.focus();
+      if (gen === this.generation) {
+        this.setRunning(false);
+        this.showPrompt();
+        if (this.stop === ctrl) this.stop = null;
+        // Back to the prompt only when the person was typing in the terminal, not somewhere else meanwhile.
+        if (document.activeElement === document.body || this.element.contains(document.activeElement)) this.input.focus();
+      }
     }
+    if (gen !== this.generation) return;
     const next = this.queue.shift();
     if (next !== undefined) await this.run(next);
   }

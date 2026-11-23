@@ -342,8 +342,11 @@ table.routes td.path input { font-family: var(--code); }
 .msg .actions { display: flex; gap: 4px; margin: 4px 0 -4px -8px; opacity: 0; transition: opacity .15s; }
 .msg .actions .btn { min-height: 26px; padding: 0 8px; font-size: 12px; }
 .msg:hover .actions, .msg:focus-within .actions { opacity: 1; }
+@media (hover: none) { .msg .actions { opacity: .82; } }
 .msg.user { justify-self: end; background: var(--panel-2); padding: 9px 13px; border-radius: var(--r); white-space: pre-wrap; }
-.msg .think { color: var(--faint); font-size: 13px; border-left: 2px solid var(--line-2); padding-left: 10px; margin-bottom: 8px; }
+.msg details.think { color: var(--faint); font-size: 13px; border-left: 2px solid var(--line-2); padding-left: 10px; margin-bottom: 8px; }
+.msg details.think > summary { cursor: pointer; font-size: 12px; font-weight: 550; color: var(--muted); user-select: none; }
+.msg details.think > pre { margin: 6px 0 0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--faint); max-height: 260px; overflow-y: auto; }
 .msg .meta { color: var(--faint); font-size: 11.5px; margin-top: 6px; font-variant-numeric: tabular-nums; }
 .composer { border-top: 1px solid var(--line); padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
 .composer textarea { min-height: 46px; max-height: 38vh; border: 0; background: transparent; padding: 6px; resize: none; }
@@ -712,6 +715,7 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-q.failed > span { color: var(--bad); }
 @media (max-width: 560px) { .dl-q { grid-template-columns: minmax(0, 1fr) auto; } .dl-q .meter { grid-column: 1 / -1; grid-row: 2; } }
 .dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 14px; }
+.dl-grid > .empty { grid-column: 1 / -1; padding: 36px 20px; text-align: center; }
 .dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: var(--r-card); background: var(--panel); box-shadow: var(--shadow-card); overflow: hidden; transition: border-color .15s; }
 .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: var(--accent); opacity: .9; }
 .dl-card:hover { border-color: var(--line-2); }
@@ -723,6 +727,25 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-card[data-group=image] { --accent: var(--ram); } .dl-card[data-group=video] { --accent: var(--ssd); }
 .dl-card[data-group=speech], .dl-card[data-group=music], .dl-card[data-group=sound] { --accent: var(--magenta); }
 .dl-card[data-group=model3d] { --accent: var(--azure); } .dl-card[data-group=picture] { --accent: var(--good); }
+.dl-card[data-group=check] { --accent: var(--gpu); }
+.dl-toolbar { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin: 12px 0 14px; }
+.dl-toolbar .chips { margin: 0; }
+.dl-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dl-search-wrap { position: relative; flex: 1 1 220px; max-width: 340px; display: flex; align-items: center; }
+input.dl-search { width: 100%; height: 32px; min-height: 32px; padding: 0 28px 0 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); color: var(--text); font: inherit; font-size: 12.5px; }
+input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0 0 2px color-mix(in srgb, var(--gpu) 22%, transparent); }
+.dl-search-clear { position: absolute; right: 5px; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font: 600 15px/1 var(--body); cursor: pointer; }
+.dl-search-clear:hover { color: var(--text); background: var(--hover); }
+.dl-search-clear[hidden] { display: none; }
+.dl-chip-toggle { min-height: 32px; padding: 0 11px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--muted); font: 500 12px/1 var(--body); cursor: pointer; transition: border-color .15s, background .15s, color .15s; white-space: nowrap; }
+.dl-chip-toggle:hover { border-color: var(--line-2); color: var(--text); }
+.dl-chip-toggle[aria-pressed="true"] { border-color: color-mix(in srgb, var(--gpu) 55%, var(--line)); background: var(--gpu-soft); color: var(--text); }
+.dl-count-note { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dl-cnt { opacity: .65; font: 500 11px/1 var(--code); margin-left: 4px; }
+.dl-facts span.dl-fit-ok { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); background: color-mix(in srgb, var(--good) 9%, var(--panel-2)); }
+.dl-facts span.dl-fit-tight { color: var(--ssd-text); border-color: color-mix(in srgb, var(--ssd) 38%, var(--line)); background: color-mix(in srgb, var(--ssd) 9%, var(--panel-2)); }
+.dl-facts span.dl-fit-no { color: var(--muted); border-style: dashed; }
+.dl-facts span.dl-cap { color: var(--text); border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); background: color-mix(in srgb, var(--accent) 8%, var(--panel-2)); font-weight: 500; }
 .dl-card.installed { background: color-mix(in srgb, var(--good) 5%, var(--panel)); }
 .dl-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .dl-icon { width: 28px; height: 28px; border-radius: var(--r); display: grid; place-items: center; flex: none; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
@@ -1271,7 +1294,18 @@ dialog::backdrop { background: var(--backdrop); }
         </div>
       </div>
       <div class="dl-queue" id="dl-queue"></div>
-      <div class="chips" id="dl-groups" role="toolbar" aria-label="Show"></div>
+      <div class="dl-toolbar">
+        <div class="chips" id="dl-groups" role="toolbar" aria-label="Show"></div>
+        <div class="dl-filters" role="search" aria-label="Filter models">
+          <div class="dl-search-wrap">
+            <input type="text" class="dl-search" id="dl-search" placeholder="Filter by name, capability, or license…" aria-label="Filter models" autocomplete="off" spellcheck="false">
+            <button type="button" class="dl-search-clear" id="dl-search-clear" hidden aria-label="Clear search" title="Clear search (Esc)">×</button>
+          </div>
+          <button type="button" class="dl-chip-toggle" id="dl-fit-btn" aria-pressed="false" title="Only show models that fit in this computer's GPU memory and RAM">Fits this computer</button>
+          <button type="button" class="dl-chip-toggle" id="dl-inst-btn" aria-pressed="false" title="Only show models already downloaded or in your settings">Installed</button>
+          <span class="dl-count-note muted small" id="dl-count-note"></span>
+        </div>
+      </div>
       <div class="dl-grid" id="dl-grid"></div>
     </section>
 
@@ -1755,7 +1789,10 @@ function renderJump(view) {
 if (document.documentElement.classList.contains("in-oaiy")) {
   for (const [view, name] of [["overview", "Status"], ["settings", "Engine settings"]]) { const b = $(`.sections button[data-view="${view}"]`); if (b) b.title = name; }
 }
-function show(view) {
+function show(target) {
+  const [view, sub] = String(target || "").split(":");
+  if (!view || !$("#v-" + view)) return;
+  if (view === "get" && sub) dlGroup = sub;
   const moved = !$("#v-" + view)?.classList.contains("on");
   $$(".sections button[data-view]").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
   sections.classList.toggle("in-more", !!$(`.sections button[data-more][data-view="${view}"]`));
@@ -1767,15 +1804,21 @@ function show(view) {
   $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
   renderJump(view);
   // Another section starts at its top, not where the last one was scrolled to.
-  if (moved) scrollTo(0, 0);
+  if (moved && !(view === "models" && sub)) scrollTo(0, 0);
   try { localStorage.setItem("studio-view", view); } catch {}
   if (location.hash.split(":")[0] !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
-  requestAnimationFrame(() => pathEnds($("#v-" + view)));
+  requestAnimationFrame(() => {
+    pathEnds($("#v-" + view));
+    if (view === "models" && sub) {
+      const dest = $("#m-" + sub) || (sub === "llm" ? $("#m-llm") : null);
+      dest?.closest(".block")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  });
   if (view === "play") requestAnimationFrame(fitPlayground);
   if (view === "gallery") refreshGallery();
   if (view === "endpoints") renderCompanion();
-  if (view === "get") refreshDownloads(true);
+  if (view === "get") { if (!sys) refreshSystem(); refreshDownloads(true); }
 }
 // A press on a section goes to its top, the one already shown too.
 $$(".sections button[data-view]").forEach(b => b.onclick = () => { show(b.dataset.view); scrollTo(0, 0); });
@@ -1987,7 +2030,7 @@ function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
   if (section === "speech") return empty("design") && empty("base") && empty("breeze") ? ["design"] : [];
   if (section === "music" || section === "sound") return empty("path") ? ["path"] : [];
-  if (section === "model3d") return ["path", "dino", "naf"].filter(empty);
+  if (section === "model3d") return (m.architecture === "trellis2" ? ["path", "dino"] : ["path", "dino", "naf"]).filter(empty);
   if (section === "image" && m.architecture === "flux2-klein-4b") return ["transformer", "text_encoder", "vae", "tokenizer"].filter(empty);
   if (section === "image" && m.architecture === "flux3-klein") return ["transformer", "text_encoder", "vae"].filter(empty);
   if (section === "image" && m.architecture === "moss-image") return ["transformer", "text_encoder", "vae"].filter(empty);
@@ -2120,14 +2163,15 @@ function renderModels() {
 
   const m3d = Object.entries(cfg.media.model3d?.models || {});
   $("#m-model3d").innerHTML = m3d.length ? m3d.map(([name, m]) => {
+    const isTrellis = m.architecture === "trellis2";
     const miss = missingOf("model3d", m);
-    const fields = field("Pixal3D folder (MIT)", "model3d", name, "path", m.path, {dir: true, missing: miss.includes("path")})
+    const fields = field(isTrellis ? "TRELLIS.2 folder (MIT)" : "Pixal3D folder (MIT)", "model3d", name, "path", m.path, {dir: true, missing: miss.includes("path")})
       + field("DINOv3 ViT-L/16 folder (Meta's DINOv3 License)", "model3d", name, "dino", m.dino, {dir: true, missing: miss.includes("dino")})
-      + field("NAF weights (naf_release.pth, Apache-2.0)", "model3d", name, "naf", m.naf, {missing: miss.includes("naf")})
+      + (isTrellis ? "" : field("NAF weights (naf_release.pth, Apache-2.0)", "model3d", name, "naf", m.naf, {missing: miss.includes("naf")}))
       + field("BiRefNet folder: removes the background (optional, MIT)", "model3d", name, "matte", m.matte, {dir: true})
       + field("Real-ESRGAN weights: enlarges small pictures (optional, RealESRGAN_x4plus.pth, BSD-3-Clause)", "model3d", name, "upscaler", m.upscaler, {});
-    return mediaItem("model3d", name, m, "Pixal3D", miss, fields);
-  }).join("") : '<div class="empty">No 3D model yet. Get one under Get models, or add its folder above: the parts it needs (among them naf_release.pth) are found when they sit beside it, or add them after.</div>';
+    return mediaItem("model3d", name, m, isTrellis ? "TRELLIS.2 4B" : "Pixal3D", miss, fields);
+  }).join("") : '<div class="empty">No 3D model yet. Get one under Get models, or add its folder above: the parts it needs are found when they sit beside it, or add them after.</div>';
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -2656,7 +2700,7 @@ function renderChosen(llmLabel, llmTag) {
     return `<div class="chosen-row"><span class="chosen-kind">${names[kind]}</span>
       <span class="chosen-name">${name ? `<strong>${esc(name)}</strong>` : '<span class="muted">No model yet</span>'}${p ? `<small class="muted">OAIY's chats use ${esc(p.model)} on ${esc(p.node_name)}</small>` : ""}</span>
       <span class="tag ${tag}">${esc(said)}</span>
-      <button class="btn quiet" type="button" data-goto="${name ? "models" : "get"}" aria-label="${name ? `Change the ${names[kind].toLowerCase()} model` : `Get a ${names[kind].toLowerCase()} model`}">${name ? "Change" : "Get one"}</button></div>`;
+      <button class="btn quiet" type="button" data-goto="${name ? `models:${kind}` : `get:${kind}`}" aria-label="${name ? `Change the ${names[kind].toLowerCase()} model` : `Get a ${names[kind].toLowerCase()} model`}">${name ? "Change" : "Get one"}</button></div>`;
   }).join("");
   // (written again only when it changes: read every 1.5 s, it would take the keyboard's place away)
   if (box.dataset.was !== rows) { box.innerHTML = rows; box.dataset.was = rows; }
@@ -2743,10 +2787,12 @@ function renderState() {
   $("#now-block").hidden = !now;
   if (now) {
     const active = now, hidden = !("prompt" in now);
-    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
+    const tpl = document.createElement("template");
+    tpl.innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
       <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${[esc(active.model), esc(jobSize(active))].filter(Boolean).join(", ")}`}: ${statusText(active)}</div></div>
       <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
+    morph($("#now"), tpl.content);
   }
   const busy = all.filter(j => j.status === "in_progress" || j.status === "queued").length;
   $("#gallery-count").hidden = !busy; $("#gallery-count").textContent = busy;
@@ -2971,7 +3017,7 @@ function addMsg(role, text = "") {
   $("#chat-empty")?.remove();
   const el = document.createElement("div"); el.className = "msg " + role;
   const c = chosen("#chat-model");
-  el.innerHTML = role === "user" ? esc(text) : `<div class="who">${esc(c.node ? `${c.model} · ${c.nodeName}` : c.model || "Assistant")}</div><div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>`;
+  el.innerHTML = role === "user" ? esc(text) : `<div class="who">${esc(c.node ? `${c.model} · ${c.nodeName}` : c.model || "Assistant")}</div><details class="think" hidden open><summary>Thinking…</summary><pre></pre></details><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>`;
   $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
 }
 async function sendChat() {
@@ -2988,9 +3034,12 @@ async function sendChat() {
   chatLog.push({role: "user", content: text}); const sent = addMsg("user", text);
   // A turn that produced nothing leaves the conversation; its bubble says so.
   const unsend = () => { if (!ours()) return; chatLog.pop(); sent.classList.add("unsent"); sent.title = "Not part of the conversation: the model did not answer it"; if (!$("#chat-input").value) { $("#chat-input").value = text; autoGrow(); } };
-  const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
+  const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), thinkPre = $(".think pre", el), thinkSum = $(".think summary", el), meta = $(".meta", el);
+  thinkSum.onclick = () => { think.dataset.userToggled = "1"; };
+  const msgsBox = $("#msgs");
+  const nearBottom = () => msgsBox.scrollHeight - msgsBox.scrollTop - msgsBox.clientHeight < 140;
   meta.textContent = c.node ? `Asking ${c.nodeName}…` : state?.llm?.state === "ready" ? "Thinking…" : "Loading the model (the first reply takes longer)…";
-  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0, written = 0;
+  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0, written = 0, collapsedThink = false;
   $(".copy-msg", el).onclick = () => navigator.clipboard.writeText(content).then(() => toast("Copied"));
   const system = $("#chat-system").value.trim();
   const messages = system ? [{role: "system", content: system}, ...chatLog] : chatLog;
@@ -3012,11 +3061,24 @@ async function sendChat() {
           if (j.oaiy_progress) meta.textContent = `Reading the prompt: ${j.oaiy_progress.prompt_done} / ${j.oaiy_progress.prompt_total} tokens`;
           if (j.usage?.completion_tokens) written = j.usage.completion_tokens;
           const d = j.choices?.[0]?.delta; if (!d) continue;
-          if (d.reasoning_content) { reasoning += d.reasoning_content; think.hidden = false; think.textContent = reasoning; }
-          if (d.content) { content += d.content; tokens++; if (performance.now() - drawn > 60) { renderReply(el, content); drawn = performance.now(); } }
-          if (tokens % 8 === 1) el.scrollIntoView({block: "end"});
+          const stick = nearBottom();
+          if (d.reasoning_content) { reasoning += d.reasoning_content; think.hidden = false; thinkPre.textContent = reasoning; }
+          if (d.content) {
+            if (reasoning && !collapsedThink) {
+              collapsedThink = true;
+              thinkSum.textContent = "Thought process";
+              if (think.dataset.userToggled !== "1") think.open = false;
+            }
+            content += d.content; tokens++;
+            if (performance.now() - drawn > 60) { renderReply(el, content); drawn = performance.now(); }
+          }
+          if (stick && tokens % 8 === 1) el.scrollIntoView({block: "end"});
         }
       }
+    }
+    if (reasoning && !collapsedThink) {
+      thinkSum.textContent = "Thought process";
+      if (think.dataset.userToggled !== "1") think.open = false;
     }
     renderReply(el, content);
     const secs = (performance.now() - t0) / 1000;
@@ -3037,7 +3099,7 @@ async function sendChat() {
 }
 $("#chat-send").onclick = sendChat;
 $("#chat-stop").onclick = () => chatAbort?.abort();
-$("#chat-input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
+$("#chat-input").onkeydown = e => { if (e.isComposing || e.keyCode === 229) return; if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
 const SUGGESTIONS = ["Explain how mixture-of-experts models save memory, briefly.", "Write a haiku about a lighthouse in fog.", "Give me three dinner ideas using rice and eggs.", "Summarise the plot of Hamlet in four sentences."];
 function chatEmpty() {
   // (with no language model, here or on a paired computer, nothing would answer: said, with where to get one)
@@ -3517,7 +3579,7 @@ function renderGallery(fresh) {
   keepRows($("#gallery"), items, j => {
     const done = j.status === "completed";
     const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
-      : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play()" onmouseleave="this.pause()"></video>`
+      : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play().catch(()=>{})" onmouseleave="this.pause()"></video>`
       : j.kind === "speech" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg></div>`
       : j.kind === "music" && !j.files.length ? `<div class="fail" style="color:var(--muted)">Smaller language model written</div>`
       : j.kind === "music" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`
@@ -3625,7 +3687,39 @@ async function pollLogs(reset) {
 
 
 /* ---------- get models ---------- */
-let dl = null, dlGroup = "recommended", dlDirEdited = false, dlLastDone = new Set();
+let dl = null, dlGroup = "recommended", dlQuery = "", dlFitsOnly = false, dlInstalledOnly = false, dlDirEdited = false, dlLastDone = new Set();
+const DL_CAP_LABEL = { tools: "Tools", vision: "Vision", "3d-code": "3D Code", glb: "GLB" };
+function hostHardware() {
+  const known = !!sys;
+  const unified = macMemory();
+  const gpus = (sys?.gpus || []).map(g => g.memory_total_mb ? g.memory_total_mb / 1024 : 0).filter(v => v > 0);
+  const egpuMb = state?.egpu?.available && state.egpu.enabled ? (state.egpu.usage?.memory_total_mb || state.egpu.memory_total_mb || 0) : 0;
+  const egpuGb = egpuMb ? egpuMb / 1024 : 0;
+  if (egpuGb > 0) gpus.push(egpuGb);
+  const maxGpuGb = gpus.length ? Math.max(...gpus) : 0;
+  const totalGpuGb = gpus.reduce((a, b) => a + b, 0);
+  const ramMb = state?.ram_total_mb || sys?.ram?.total_mb || 0;
+  const ramGb = ramMb ? ramMb / 1024 : 0;
+  return { known, unified, egpuGb, maxGpuGb, totalGpuGb, gpuCount: gpus.length, ramGb };
+}
+function modelFit(m, hw) {
+  if (!m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "CPU", title: "Runs on the CPU — no GPU memory needed" };
+  if (!hw.known) return { fits: true, cls: "", label: "", title: "" };
+  const ramShort = m.ram_gb && hw.ramGb && hw.ramGb + 2 < m.ram_gb;
+  if (ramShort) return { fits: false, cls: "dl-fit-no", label: `Needs ${m.ram_gb} GB RAM`, title: `Needs about ${m.ram_gb} GB system memory (detected ${Math.round(hw.ramGb)} GB)` };
+  // Apple Silicon unified memory (when not using a larger discrete eGPU): ~72% of total unified memory is available for weights.
+  if (hw.unified && hw.ramGb > 0 && hw.egpuGb < m.vram_gb) {
+    const usableGb = hw.ramGb * 0.72;
+    if (usableGb >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "Fits unified memory", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory)` };
+    if (hw.ramGb * 0.85 >= m.vram_gb) return { fits: true, cls: "dl-fit-tight", label: "Tight fit", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory)` };
+    return { fits: false, cls: "dl-fit-no", label: "Streams from SSD", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory) — streams layers from SSD` };
+  }
+  if (!hw.maxGpuGb) return { fits: false, cls: "dl-fit-no", label: "CPU only", title: `Needs ~${m.vram_gb} GB VRAM — no GPU detected, runs on CPU` };
+  if (hw.maxGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: hw.egpuGb >= m.vram_gb ? "Fits eGPU" : "Fits your GPU", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB)` };
+  if (hw.gpuCount > 1 && hw.totalGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "Fits across GPUs", title: `Needs ~${m.vram_gb} GB VRAM across ${hw.gpuCount} GPUs (${Math.round(hw.totalGpuGb)} GB total)` };
+  if (hw.maxGpuGb + 2 >= m.vram_gb) return { fits: true, cls: "dl-fit-tight", label: "Tight fit", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB)` };
+  return { fits: false, cls: "dl-fit-no", label: "Split / CPU", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB) — runs split or streamed` };
+}
 const DL_ICONS = {
   llm: '<path d="M4 5h16v11H9l-5 4z"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/>',
@@ -3691,11 +3785,48 @@ function renderDownloads() {
   if (dl.token_host && $("#dl-token-line").dataset.said !== tokenSays) { $("#dl-token-line").innerHTML = tokenLine(); $("#dl-token-line").dataset.said = tokenSays; }
   // (each part kept from one render to the next where it is what it was: the cards are read every second, and a
   // card written whole each time closed its open list of files, took the keyboard's place away, and lost a click)
+  const hw = hostHardware();
+  const q = dlQuery.trim().toLowerCase();
+  const matchesFilters = m => {
+    if (dlInstalledOnly && !m.installed && !m.configured && !m.partial && !dlBusy(m.download)) return false;
+    if (dlFitsOnly && !modelFit(m, hw).fits) return false;
+    if (!q) return true;
+    const tags = (m.tags || []).map(t => DL_CAP_LABEL[t] || t).join(" ");
+    const hay = `${m.name} ${m.id} ${m.about} ${m.license} ${m.group} ${tags} ${m.gated ? "gated" : ""}`.toLowerCase();
+    return q.split(/\s+/).every(tok => hay.includes(tok));
+  };
+  const baseModels = dl.models.filter(matchesFilters);
+  const countOf = id => id === "all" ? baseModels.length : id === "recommended" ? baseModels.filter(m => m.recommended).length : baseModels.filter(m => m.group === id).length;
   const groups = [{id: "recommended", name: "Recommended"}, {id: "all", name: "All"}, ...dl.groups];
-  keepRows($("#dl-groups"), groups, g => `<button aria-pressed="${g.id === dlGroup}" data-group="${esc(g.id)}">${esc(g.name)}</button>`, "");
+  // Update category pills in place so keyboard focus is never disrupted during 1 s download polls.
+  const grpBox = $("#dl-groups");
+  const grpKey = groups.map(g => g.id).join(",");
+  if (grpBox.dataset.keys !== grpKey) {
+    grpBox.innerHTML = groups.map(g => `<button type="button" aria-pressed="${g.id === dlGroup}" data-group="${esc(g.id)}">${esc(g.name)}<span class="dl-cnt"></span></button>`).join("");
+    grpBox.dataset.keys = grpKey;
+  }
+  for (const g of groups) {
+    const btn = grpBox.querySelector(`button[data-group="${CSS.escape(g.id)}"]`);
+    if (!btn) continue;
+    const pressed = String(g.id === dlGroup);
+    if (btn.getAttribute("aria-pressed") !== pressed) btn.setAttribute("aria-pressed", pressed);
+    const cnt = btn.querySelector(".dl-cnt");
+    const wantCnt = String(countOf(g.id));
+    if (cnt && cnt.textContent !== wantCnt) cnt.textContent = wantCnt;
+  }
   const groupName = Object.fromEntries(dl.groups.map(g => [g.id, g.name]));
-  const shown = dl.models.filter(m => dlGroup === "all" || (dlGroup === "recommended" ? m.recommended : m.group === dlGroup));
-  keepRows($("#dl-grid"), shown, m => dlCard(m, groupName[m.group] || m.group), '<div class="empty">Nothing here.</div>');
+  const shown = baseModels.filter(m => dlGroup === "all" || (dlGroup === "recommended" ? m.recommended : m.group === dlGroup));
+  $("#dl-search-clear").hidden = !dlQuery;
+  const countNote = $("#dl-count-note");
+  if (countNote) {
+    countNote.textContent = (q || dlFitsOnly || dlInstalledOnly)
+      ? `Showing ${shown.length} of ${dl.models.length}`
+      : `${shown.length} model${shown.length === 1 ? "" : "s"}`;
+  }
+  const emptyMsg = (q || dlFitsOnly || dlInstalledOnly)
+    ? '<div class="empty">No models match your filters. <button class="btn quiet" type="button" data-dl-clear>Clear filters</button></div>'
+    : '<div class="empty">Nothing here.</div>';
+  keepRows($("#dl-grid"), shown, m => dlCard(m, groupName[m.group] || m.group, hw), emptyMsg);
   restorePlanLists();
   // The queue: what is downloading, waiting or paused, and what failed (in red, its first words: the card says the rest).
   const active = dl.models.filter(m => m.download && ["queued", "downloading", "adding", "paused", "failed"].includes(m.download.status));
@@ -3762,11 +3893,20 @@ function getLabel(p) {
   if ((p.needs || []).length || p.files.some(f => f.status === "elsewhere" && !f.checked)) return "Get it";
   return "Add it (all here)";
 }
-function dlCard(m, group) {
+function dlCard(m, group, hw = hostHardware()) {
   const d = m.download, busy = dlBusy(d);
   // (a Mac's GPU has no memory of its own: what a model needs of it is the GPU's share of the unified memory)
   const need = !m.vram_gb ? `<span title="It runs on the processor and needs no graphics card">CPU</span>` : macMemory() ? `<span title="Of this Mac's unified memory, for its GPU">Memory <b>${m.vram_gb} GB+</b></span>` : `<span title="The GPU's own memory (VRAM)">GPU <b>${m.vram_gb} GB+</b></span>`;
-  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, need, `<span title="${esc(m.license)}">${esc(m.license)}</span>`];
+  const fit = modelFit(m, hw);
+  const fitPill = fit.label && m.vram_gb ? `<span class="${fit.cls}" title="${esc(fit.title)}">${esc(fit.label)}</span>` : "";
+  const caps = (m.tags || []).filter(t => DL_CAP_LABEL[t]).map(t => `<span class="dl-cap">${esc(DL_CAP_LABEL[t])}</span>`);
+  const facts = [
+    `<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`,
+    need,
+    ...(fitPill ? [fitPill] : []),
+    ...caps,
+    `<span title="${esc(m.license)}">${esc(m.license)}</span>`,
+  ];
   // (what to do, before the download: said as done, "is accepted … then a token is saved", it read as done already)
   const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener">its page on huggingface.co</a>` : "its page on huggingface.co";
   const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>${dl.token
@@ -3849,11 +3989,50 @@ async function dlAct(what, id) {
   } catch (e) { toast(e.message, true); }
 }
 $("#dl-grid").addEventListener("click", e => {
+  if (e.target.closest("[data-dl-clear]")) {
+    dlQuery = ""; dlFitsOnly = false; dlInstalledOnly = false; dlGroup = "all";
+    $("#dl-search").value = "";
+    $("#dl-fit-btn").setAttribute("aria-pressed", "false");
+    $("#dl-inst-btn").setAttribute("aria-pressed", "false");
+    renderDownloads();
+    return;
+  }
   if (e.target.closest("[data-goto-models]")) return show("models");
   const b = e.target.closest("[data-dl]");
   if (b) dlAct(b.dataset.dl, b.dataset.id);
 });
 $("#dl-groups").addEventListener("click", e => { const b = e.target.closest("[data-group]"); if (b) { dlGroup = b.dataset.group; renderDownloads(); } });
+$("#dl-search").addEventListener("input", e => {
+  dlQuery = e.target.value;
+  if (dlQuery.trim() && dlGroup === "recommended") dlGroup = "all";
+  renderDownloads();
+});
+$("#dl-search").addEventListener("keydown", e => {
+  if (e.key === "Escape" && dlQuery) {
+    e.preventDefault();
+    dlQuery = "";
+    $("#dl-search").value = "";
+    renderDownloads();
+  }
+});
+$("#dl-search-clear").addEventListener("click", () => {
+  dlQuery = "";
+  $("#dl-search").value = "";
+  renderDownloads();
+  $("#dl-search").focus();
+});
+$("#dl-fit-btn").addEventListener("click", e => {
+  dlFitsOnly = !dlFitsOnly;
+  e.currentTarget.setAttribute("aria-pressed", String(dlFitsOnly));
+  if (dlFitsOnly && !sys) refreshSystem();
+  renderDownloads();
+});
+$("#dl-inst-btn").addEventListener("click", e => {
+  dlInstalledOnly = !dlInstalledOnly;
+  e.currentTarget.setAttribute("aria-pressed", String(dlInstalledOnly));
+  if (dlInstalledOnly && dlGroup === "recommended") dlGroup = "all";
+  renderDownloads();
+});
 document.addEventListener("click", e => { const b = e.target.closest("[data-copy]"); if (b) navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")); });
 // (a result opened from the keyboard too: Enter or Space on a gallery picture or an Overview thumbnail)
 document.addEventListener("keydown", e => {
@@ -3894,7 +4073,7 @@ async function refresh() {
   // (the eGPU's memory and load are the state's: shown as they come)
   if (sys && state?.egpu?.usage && $("#v-overview").classList.contains("on")) renderHardware();
 }
-async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); macWords(); } catch {} }
+async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); macWords(); if (dl && $("#v-get").classList.contains("on")) renderDownloads(); } catch {} }
 (async () => {
   await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware(); loadVoices();
   try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); } catch {}

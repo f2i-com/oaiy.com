@@ -182,7 +182,7 @@ async function exampleFiles(slug: string): Promise<Record<string, Uint8Array> | 
   return files;
 }
 
-const TEXT_FILE = /\.(ui|logic|py|json|md|txt|xdb|wgsl|css|svg|html?|[cm]?js|jsx|ts|tsx|vue)$/i;
+const TEXT_FILE = /\.(ui|logic|py|sql|php|phtml|rs|toml|json|md|txt|xdb|wgsl|css|svg|html?|[cm]?js|jsx|ts|tsx|vue)$/i;
 
 async function corpus(guide: string): Promise<Doc[]> {
   const out: Doc[] = [];

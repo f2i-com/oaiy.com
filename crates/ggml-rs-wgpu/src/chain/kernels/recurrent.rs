@@ -118,7 +118,7 @@ pub(in crate::chain) const SSM_CONV_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
 @group(0) @binding(1) var<storage, read> cw: array<f32>;
 @group(0) @binding(2) var<storage, read> cs: array<f32>;
-@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 @compute @workgroup_size(256)
@@ -230,7 +230,7 @@ pub(in crate::chain) const SHORT_CONV_ROWS: &str = r#"
 @group(0) @binding(0) var<storage, read> bcx: array<f32>;
 @group(0) @binding(1) var<storage, read> cw: array<f32>;
 @group(0) @binding(2) var<storage, read> cs: array<f32>;
-@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 @compute @workgroup_size(256)
@@ -593,7 +593,7 @@ pub(in crate::chain) fn delta_net_step() -> String {
 pub(in crate::chain) const DELTA_NET_NORM: &str = r#"
 @group(0) @binding(1) var<storage, read> zz: array<f32>;
 @group(0) @binding(5) var<storage, read> nm: array<f32>;
-@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
 @group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
 
 const DK: u32 = DK_VALUEu;
@@ -614,6 +614,90 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
         workgroupBarrier();
     }
     let inv = 1.0 / sqrt(red[0] / f32(DK) + eps);
+    let zv = zz[o];
+    var gate = zv / (1.0 + exp(-zv));
+    if (sig != 0u) { gate = 1.0 / (1.0 + exp(-zv)); }
+    out[o] = core * inv * nm[i] * gate;
+}
+"#;
+
+/// Subgroup-reduced [`DELTA_NET_PREP`] for `DK = 128` on 32-lane subgroup GPUs (1 barrier instead of 7).
+pub(in crate::chain) const DELTA_NET_PREP_SG_128: &str = r#"
+@group(0) @binding(0) var<storage, read> cv: array<f32>;
+@group(0) @binding(2) var<storage, read> ba: array<f32>;
+@group(0) @binding(3) var<storage, read> sa: array<f32>;
+@group(0) @binding(4) var<storage, read> dt: array<f32>;
+@group(0) @binding(6) var<storage, read_write> qk: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = 128u;
+var<workgroup> wq: array<f32, 4>;
+var<workgroup> wk: array<f32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let nv = p[0].x;
+    let nk = p[0].y;
+    let rows = p[1].x;
+    let scale_q = bitcast<f32>(p[1].y);
+    let eps = bitcast<f32>(p[1].z);
+    let hk = wg.x;
+    let t = wg.y;
+    let r0 = t * (2u * nk * DK + nv * DK);
+    let q = cv[r0 + hk * DK + i];
+    let k = cv[r0 + nk * DK + hk * DK + i];
+    let sq = subgroupAdd(q * q);
+    let sk = subgroupAdd(k * k);
+    if (lane == 0u) {
+        wq[sgi] = sq;
+        wk[sgi] = sk;
+    }
+    workgroupBarrier();
+    let tot_q = (wq[0] + wq[1]) + (wq[2] + wq[3]);
+    let tot_k = (wk[0] + wk[1]) + (wk[2] + wk[3]);
+    let inv_q = 1.0 / sqrt(tot_q + eps);
+    let inv_k = 1.0 / sqrt(tot_k + eps);
+    let o = (t * nk + hk) * 2u * DK;
+    qk[o + i] = q * inv_q * scale_q;
+    qk[o + DK + i] = k * inv_k;
+    if (i < nv / nk) {
+        let h = hk + i * nk;
+        let bt = 1.0 / (1.0 + exp(-ba[t * 2u * nv + h]));
+        let ab = ba[t * 2u * nv + nv + h] + dt[h];
+        var sp = ab;
+        if (ab <= 20.0) {
+            let e = exp(ab);
+            sp = select(log(1.0 + e), e * (1.0 - 0.5 * e), e < 1e-4);
+        }
+        let bg = rows * nk * 2u * DK + (t * nv + h) * 2u;
+        qk[bg] = bt;
+        qk[bg + 1u] = exp(sp * sa[h]);
+    }
+}
+"#;
+
+/// Subgroup-reduced [`DELTA_NET_NORM`] for `DK = 128` on 32-lane subgroup GPUs (1 barrier instead of 7).
+pub(in crate::chain) const DELTA_NET_NORM_SG_128: &str = r#"
+@group(0) @binding(1) var<storage, read> zz: array<f32>;
+@group(0) @binding(5) var<storage, read> nm: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+
+const DK: u32 = 128u;
+var<workgroup> wpart: array<f32, 4>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let nv = p[0].x;
+    let eps = bitcast<f32>(p[1].z);
+    let sig = p[1].w;
+    let o = (wg.y * nv + wg.x) * DK + i;
+    let core = out[o];
+    let ws = subgroupAdd(core * core);
+    if (lane == 0u) { wpart[sgi] = ws; }
+    workgroupBarrier();
+    let total = (wpart[0] + wpart[1]) + (wpart[2] + wpart[3]);
+    let inv = 1.0 / sqrt(total / f32(DK) + eps);
     let zv = zz[o];
     var gate = zv / (1.0 + exp(-zv));
     if (sig != 0u) { gate = 1.0 / (1.0 + exp(-zv)); }

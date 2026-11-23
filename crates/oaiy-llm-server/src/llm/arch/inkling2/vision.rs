@@ -15,8 +15,9 @@
 //!   * Drop CLS token, 2×2 spatial merge (`4 * 1024 = 4096`), biasless 2-layer GELU MLP
 //!     (`4096 -> 4096 -> 2304`).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use ggml_rs::chain::{ChainRecorder, DeviceChain, DeviceVec, RowNorm};
 use ggml_rs::{Backend, Tensor};
 use gguf::GgufFile;
 use oaiy_engine::safetensors::StIndex;
@@ -132,6 +133,9 @@ pub fn preprocess_rgb(
     height: usize,
     cfg: &Inkling2VisionConfig,
 ) -> std::result::Result<PreparedInkling2Image, String> {
+    if width == 0 || height == 0 {
+        return Err("image has zero width or height".into());
+    }
     if rgb.len() != height * width * 3 {
         return Err(format!("expected {} RGB bytes, got {}", height * width * 3, rgb.len()));
     }
@@ -208,6 +212,82 @@ struct ViTLayer {
     fc2_b: Vec<f32>,
 }
 
+#[derive(Debug)]
+enum GpuVisionLin {
+    /// Weight is already resident on `DeviceChain` as `Weight::Quant` or `Weight::Packed`.
+    OnDevice,
+    /// Dense F32/F16 weight uploaded once as packed F16 for Tensor Core `matmul_f16_rows_ranged`.
+    Half { w: DeviceVec, out_dim: usize, in_dim: usize },
+    /// Fallback dense F32 weight on `DeviceChain`.
+    F32 { w: DeviceVec, out_dim: usize, in_dim: usize },
+}
+
+impl GpuVisionLin {
+    fn from_weight(chain: &dyn DeviceChain, w: &Weight) -> Option<Self> {
+        match w {
+            Weight::Quant(qt) if chain.holds(qt) => Some(Self::OnDevice),
+            Weight::Packed(p) if chain.holds_exl3(p.as_ref()) => Some(Self::OnDevice),
+            Weight::Dense(t) if t.rank() == 2 => {
+                let (out_dim, in_dim) = (t.dim(0), t.dim(1));
+                let host = if t.is_device() { t.to_host() } else { t.clone() };
+                if in_dim % 2 == 0 {
+                    if let Some(hw) = chain.vec_f16_rounded(host.data()) {
+                        return Some(Self::Half { w: hw, out_dim, in_dim });
+                    }
+                }
+                let fw = chain.vec(host.numel());
+                chain.upload(&fw, host.data());
+                Some(Self::F32 { w: fw, out_dim, in_dim })
+            }
+            _ => None,
+        }
+    }
+
+    fn record(&self, rec: &mut dyn ChainRecorder, weight: &Weight, x: &DeviceVec, y: &DeviceVec, rows: usize) {
+        match self {
+            Self::OnDevice => match weight {
+                Weight::Quant(qt) => rec.matmul_rows(qt, x, y, rows),
+                Weight::Packed(p) => rec.exl3_rows(p.as_ref(), x, y, rows),
+                _ => unreachable!("GpuVisionLin::OnDevice on non-device weight"),
+            },
+            Self::Half { w, out_dim, in_dim } => {
+                rec.matmul_f16_rows_ranged(w, *out_dim, *in_dim, x, y, rows);
+            }
+            Self::F32 { w, out_dim, in_dim } => {
+                rec.matmul_f32_rows(w, *out_dim, *in_dim, x, y, rows);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GpuViTLayer {
+    ln1: DeviceVec,
+    ln2: DeviceVec,
+    ls1: DeviceVec,
+    ls2: DeviceVec,
+    q: GpuVisionLin,
+    q_b: DeviceVec,
+    k: GpuVisionLin,
+    k_b: DeviceVec,
+    v: GpuVisionLin,
+    v_b: DeviceVec,
+    o: GpuVisionLin,
+    o_b: DeviceVec,
+    fc1: GpuVisionLin,
+    fc1_b: DeviceVec,
+    fc2: GpuVisionLin,
+    fc2_b: DeviceVec,
+}
+
+#[derive(Debug)]
+struct GpuVisionTower {
+    pre_ln: DeviceVec,
+    layers: Vec<GpuViTLayer>,
+    mm1: GpuVisionLin,
+    mm2: GpuVisionLin,
+}
+
 /// Loaded Inkling-2 Vision Tower + 2×2 Spatial Merger MLP.
 #[derive(Debug)]
 pub struct Inkling2Vision {
@@ -224,6 +304,7 @@ pub struct Inkling2Vision {
     layers: Vec<ViTLayer>,
     mm1_w: Weight,
     mm2_w: Weight,
+    gpu_tower: OnceLock<Option<GpuVisionTower>>,
 }
 
 impl Inkling2Vision {
@@ -368,6 +449,7 @@ impl Inkling2Vision {
             layers,
             mm1_w,
             mm2_w,
+            gpu_tower: OnceLock::new(),
         })
     }
 
@@ -508,6 +590,7 @@ impl Inkling2Vision {
             layers,
             mm1_w,
             mm2_w,
+            gpu_tower: OnceLock::new(),
         })
     }
 
@@ -576,7 +659,16 @@ impl Inkling2Vision {
             }
         }
 
-        // 3. Pre-LN over [CLS, patches...].
+        // 3. Pre-LN + 23 ViT encoder layers + 2x2 merger MLP:
+        //    execute the entire tower in ONE `DeviceChain` submission on GPU when available
+        //    (eliminating 100+ CPU-GPU round trips and CPU O(N²) ViT attention).
+        if std::env::var_os("OAIY_NO_CHAIN").is_none() {
+            if let Some(out) = self.encode_gpu(&x, &coords, n_seq, n_patches, n_merged) {
+                return Ok(out);
+            }
+        }
+
+        // CPU/fallback path: Pre-LN over [CLS, patches...].
         x = layer_norm_rows(&x, &self.pre_ln_w, &self.pre_ln_b, d, self.cfg.layer_norm_eps);
 
         // 4. Precompute 2D axial pairwise RoPE (cos, sin) tables: width first, then height.
@@ -648,6 +740,142 @@ impl Inkling2Vision {
             self.cfg.proj_hidden_dim,
             usize::MAX,
         ))
+    }
+
+    fn build_gpu_tower(&self, chain: &dyn DeviceChain) -> Option<GpuVisionTower> {
+        let up = |v: &[f32]| -> DeviceVec {
+            let dv = chain.vec(v.len());
+            chain.upload(&dv, v);
+            dv
+        };
+        let up_ln = |w: &[f32], b: &[f32]| -> DeviceVec {
+            let mut mods = Vec::with_capacity(w.len() + b.len());
+            mods.extend(w.iter().map(|&v| v - 1.0));
+            mods.extend_from_slice(b);
+            up(&mods)
+        };
+        let pre_ln = up_ln(&self.pre_ln_w, &self.pre_ln_b);
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            layers.push(GpuViTLayer {
+                ln1: up_ln(&l.ln1_w, &l.ln1_b),
+                ln2: up_ln(&l.ln2_w, &l.ln2_b),
+                ls1: up(&l.ls1),
+                ls2: up(&l.ls2),
+                q: GpuVisionLin::from_weight(chain, &l.q_w)?,
+                q_b: up(&l.q_b),
+                k: GpuVisionLin::from_weight(chain, &l.k_w)?,
+                k_b: up(&l.k_b),
+                v: GpuVisionLin::from_weight(chain, &l.v_w)?,
+                v_b: up(&l.v_b),
+                o: GpuVisionLin::from_weight(chain, &l.o_w)?,
+                o_b: up(&l.o_b),
+                fc1: GpuVisionLin::from_weight(chain, &l.fc1_w)?,
+                fc1_b: up(&l.fc1_b),
+                fc2: GpuVisionLin::from_weight(chain, &l.fc2_w)?,
+                fc2_b: up(&l.fc2_b),
+            });
+        }
+        let mm1 = GpuVisionLin::from_weight(chain, &self.mm1_w)?;
+        let mm2 = GpuVisionLin::from_weight(chain, &self.mm2_w)?;
+        Some(GpuVisionTower { pre_ln, layers, mm1, mm2 })
+    }
+
+    fn encode_gpu(
+        &self,
+        x_host: &[f32],
+        coords: &[(usize, usize)],
+        n_seq: usize,
+        n_patches: usize,
+        n_merged: usize,
+    ) -> Option<Vec<f32>> {
+        if n_seq == 0 || n_patches == 0 || n_merged == 0 {
+            return None;
+        }
+        let chain = self.backend.chain()?;
+        let tower = self.gpu_tower.get_or_init(|| self.build_gpu_tower(chain)).as_ref()?;
+
+        let d = self.cfg.hidden_size;
+        let n_heads = self.cfg.num_heads;
+        let head_dim = self.cfg.head_dim;
+        let ff_dim = self.cfg.ff_dim;
+        let eps = self.cfg.layer_norm_eps;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Build interleaved `[sin, cos]` table matching `ChainRecorder::rope_rows(..., neox=false)`.
+        let (cos_tbl, sin_tbl) = build_axial_rope(coords, head_dim, self.cfg.rope_theta);
+        let mut rope_host = Vec::with_capacity(n_seq * head_dim);
+        for (&s, &c) in sin_tbl.iter().zip(&cos_tbl) {
+            rope_host.push(s);
+            rope_host.push(c);
+        }
+
+        let normed = chain.vec(n_seq * d);
+        let x_buf = chain.vec(n_seq * d);
+        let q = chain.vec(n_seq * d);
+        let k = chain.vec(n_seq * d);
+        let v = chain.vec(n_seq * d);
+        let kv = chain.vec(n_seq * 2 * d);
+        let att_len = chain.attention_rows_full_out_len(n_seq, n_heads, head_dim, n_seq);
+        let att = chain.vec(att_len);
+        let att_view = DeviceVec { len: n_seq * d, inner: Arc::clone(&att.inner) };
+        let proj = chain.vec(n_seq * d);
+        let mlp_h = chain.vec(n_seq * ff_dim);
+        let mlp_act = chain.vec(n_seq * ff_dim);
+        let rope_tbl = chain.vec(rope_host.len());
+        let merged = chain.vec(n_patches * d);
+        let mm_h = chain.vec(n_merged * self.cfg.proj_hidden_dim);
+        let mm_act = chain.vec(n_merged * self.cfg.proj_hidden_dim);
+        let out = chain.vec(n_merged * self.cfg.text_hidden_size);
+
+        chain.upload(&normed, x_host);
+        chain.upload(&rope_tbl, &rope_host);
+
+        let mut rec = chain.begin();
+        rec.keep_groups(false);
+
+        // Pre-LN: `normed` -> `x_buf`.
+        rec.norm_mod_rows(&normed, &x_buf, n_seq, d, &tower.pre_ln, 0, Some(d), RowNorm::Layer, eps);
+
+        // 23 ViT encoder layers.
+        for (layer, gl) in self.layers.iter().zip(&tower.layers) {
+            rec.norm_mod_rows(&x_buf, &normed, n_seq, d, &gl.ln1, 0, Some(d), RowNorm::Layer, eps);
+
+            gl.q.record(&mut *rec, &layer.q_w, &normed, &q, n_seq);
+            rec.add_bias_rows(&q, &gl.q_b, n_seq, d);
+            gl.k.record(&mut *rec, &layer.k_w, &normed, &k, n_seq);
+            rec.add_bias_rows(&k, &gl.k_b, n_seq, d);
+            gl.v.record(&mut *rec, &layer.v_w, &normed, &v, n_seq);
+            rec.add_bias_rows(&v, &gl.v_b, n_seq, d);
+
+            rec.rope_rows(&q, n_seq, n_heads, head_dim, &rope_tbl, false);
+            rec.rope_rows(&k, n_seq, n_heads, head_dim, &rope_tbl, false);
+
+            rec.store_rows(&k, &kv, n_seq, d, 0, 2 * d, 0);
+            rec.store_rows(&v, &kv, n_seq, d, 0, 2 * d, d);
+            rec.attention_rows_full(&q, &kv, &att, n_seq, n_heads, n_heads, head_dim, n_seq, scale);
+
+            gl.o.record(&mut *rec, &layer.o_w, &att_view, &proj, n_seq);
+            rec.add_bias_rows(&proj, &gl.o_b, n_seq, d);
+            rec.add_gated_rows(&x_buf, &proj, n_seq, d, &gl.ls1, 0, false);
+
+            rec.norm_mod_rows(&x_buf, &normed, n_seq, d, &gl.ln2, 0, Some(d), RowNorm::Layer, eps);
+            gl.fc1.record(&mut *rec, &layer.fc1_w, &normed, &mlp_h, n_seq);
+            rec.add_bias_rows(&mlp_h, &gl.fc1_b, n_seq, ff_dim);
+            rec.gelu_erf(&mlp_h, &mlp_act, n_seq * ff_dim);
+            gl.fc2.record(&mut *rec, &layer.fc2_w, &mlp_act, &proj, n_seq);
+            rec.add_bias_rows(&proj, &gl.fc2_b, n_seq, d);
+            rec.add_gated_rows(&x_buf, &proj, n_seq, d, &gl.ls2, 0, false);
+        }
+
+        // Drop CLS token + 2x2 spatial merger MLP (`4096 -> 4096 -> text_hidden`).
+        rec.copy(&x_buf, d, &merged, 0, n_patches * d);
+        tower.mm1.record(&mut *rec, &self.mm1_w, &merged, &mm_h, n_merged);
+        rec.gelu_erf(&mm_h, &mm_act, n_merged * self.cfg.proj_hidden_dim);
+        tower.mm2.record(&mut *rec, &self.mm2_w, &mm_act, &out, n_merged);
+        rec.read(&out);
+
+        rec.finish().into_iter().next()
     }
 }
 

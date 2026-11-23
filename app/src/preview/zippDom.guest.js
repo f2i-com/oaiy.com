@@ -94,7 +94,17 @@ function __encode(v) {
   if (v === window) return { $win: 1 };
   if (v.__zdomId !== undefined) return { $h: v.__zdomId };
   if (ArrayBuffer.isView && ArrayBuffer.isView(v)) return { $ta: v.constructor.name, d: Array.from(v) };
-  if (v instanceof ArrayBuffer) return { $ta: 'ArrayBuffer', d: Array.from(new Uint8Array(v)) };
+  if (v instanceof ArrayBuffer) {
+    var bytes = new Uint8Array(v);
+    if (bytes.byteLength > 1024) {
+      var bin = '';
+      for (var bi = 0; bi < bytes.length; bi += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(bi, bi + 0x8000));
+      }
+      return { $ab: btoa(bin) };
+    }
+    return { $ta: 'ArrayBuffer', d: Array.from(bytes) };
+  }
   if (v instanceof Date) return { $date: v.getTime() };
   if (Array.isArray(v)) return v.map(__encode);
   var out = {};
@@ -102,15 +112,68 @@ function __encode(v) {
   return out;
 }
 
+var __threeMods = Object.create(null);
+function __threeCtor(key, name, chain) {
+  var F = function () {};
+  if (name) {
+    try {
+      Object.defineProperty(F, 'name', { value: name });
+    } catch (_e) {}
+  }
+  F.prototype = __cls(name || 'Object', chain || ['Object']).prototype;
+  var statics = {};
+  return new Proxy(F, {
+    construct: function (_t, args) {
+      var encoded = [];
+      for (var i = 0; i < args.length; i++) encoded.push(__encode(args[i]));
+      return __host('threeNew', key, encoded);
+    },
+    apply: function (_t, _thisArg, args) {
+      var encoded = [];
+      for (var i = 0; i < args.length; i++) encoded.push(__encode(args[i]));
+      return __host('threeCall', key, encoded);
+    },
+    get: function (t, prop) {
+      if (prop === 'prototype') return t.prototype;
+      if (prop === 'name') return t.name;
+      if (typeof prop === 'symbol') return t[prop];
+      if (Object.prototype.hasOwnProperty.call(statics, prop)) return statics[prop];
+      var v = __host('threeStaticGet', key, prop);
+      if (v && v.$m === 1) {
+        statics[prop] = function () {
+          var encoded = [];
+          for (var i = 0; i < arguments.length; i++) encoded.push(__encode(arguments[i]));
+          return __host('threeStaticCall', key, prop, encoded);
+        };
+        return statics[prop];
+      }
+      return v;
+    },
+  });
+}
+function __zdom_import(spec) {
+  if (__threeMods[spec]) return __threeMods[spec];
+  var mod = __host('threeMod', spec);
+  __threeMods[spec] = mod;
+  return mod;
+}
+
 function __decode(v) {
   if (v === null || typeof v !== 'object') return v;
   if (Array.isArray(v)) return v.map(__decode);
+  if (v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
   if (v.$h !== undefined) return __wrap(v.$h, v.c);
   if (v.$u) return undefined;
   if (v.$win) return window;
   if (v.$num !== undefined) return Number(v.$num);
   if (v.$f !== undefined) return __fns.get(v.$f);
   if (v.$date !== undefined) return new Date(v.$date);
+  if (v.$ab !== undefined) {
+    var rawBin = atob(v.$ab);
+    var abBytes = new Uint8Array(rawBin.length);
+    for (var ai = 0; ai < rawBin.length; ai++) abBytes[ai] = rawBin.charCodeAt(ai);
+    return abBytes.buffer;
+  }
   if (v.$ta !== undefined) {
     if (v.$ta === 'ArrayBuffer') return new Uint8Array(v.d).buffer;
     var T = globalThis[v.$ta] || Uint8Array;
@@ -186,8 +249,8 @@ function __wrap(id, chain) {
         special[k].set(v);
         return true;
       }
-      // The page's own data on a node stays here, as itself.
-      if (v !== null && typeof v === 'object' && v.__zdomId === undefined && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
+      // The page's own data on a DOM node stays here, as itself; non-Node host objects (e.g. Three.js userData/uniforms) forward to the host.
+      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && v.__zdomId === undefined && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
         extra[k] = v;
         return true;
       }
@@ -415,6 +478,12 @@ var frames = window;
     Object.defineProperty(C, 'name', { value: name });
     globalThis[name] = C;
   });
+  globalThis.URL.createObjectURL = function (blob) {
+    return __host('objectUrl', __encode(blob));
+  };
+  globalThis.URL.revokeObjectURL = function (url) {
+    __host('revokeObjectUrl', String(url));
+  };
   var chains = {
     EventTarget: [], Node: ['EventTarget'], Element: ['Node', 'EventTarget'], HTMLElement: ['Element', 'Node', 'EventTarget'], SVGElement: ['Element', 'Node', 'EventTarget'],
     Document: ['Node', 'EventTarget'], CharacterData: ['Node', 'EventTarget'],
@@ -788,6 +857,7 @@ var __exports = {
   queueMicrotask: queueMicrotask,
   fetch: fetch,
   XMLHttpRequest: XMLHttpRequest,
+  __zdom_import: __zdom_import,
 };
 for (var __k in __exports) {
   try {

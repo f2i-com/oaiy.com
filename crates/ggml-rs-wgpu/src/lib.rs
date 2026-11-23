@@ -193,6 +193,9 @@ struct Gpu {
     /// Variant of [`Self::wide`] where binding 7 is read-only (for wide shaders that only write binding 6),
     /// eliminating false Write-After-Write Vulkan barriers on the shared `dummy_rw` buffer across independent dispatches.
     wide_ro7: std::sync::OnceLock<(wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
+    /// Variant of [`Self::wide`] where bindings 5, 6 and 7 are read-write (for 3-output fused kernels such as
+    /// `ADD_RMSNORM_Q8_LANES` that update residual `x`, normalized F32 `out`, and packed Q8_0 `q` in one pass).
+    wide_rw3: std::sync::OnceLock<(wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     chain_groups_wide: Mutex<HashMap<chain::WideKey, wgpu::BindGroup>>,
     /// Small buffers for a kernel's bindings it does not use: one read, one written.
     dummy: std::sync::OnceLock<wgpu::Buffer>,
@@ -569,7 +572,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), wide_ro7: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), programs: Mutex::new(HashMap::new()), q8_kept: Mutex::new(HashMap::new()), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()), stream_slots: Mutex::new(stream::Slots::default()) }),
+            gpu: Arc::new(Gpu { device, coop_tile, queue_raw: queue, lost, watch, feed: Arc::new(Feed::default()), in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(0)), layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), exl3: Mutex::new([None, None]), named: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), pool: Mutex::new(Vec::new()), staging: Mutex::new(Vec::new()), chain_groups: Mutex::new(HashMap::new()), wide: std::sync::OnceLock::new(), wide_ro7: std::sync::OnceLock::new(), wide_rw3: std::sync::OnceLock::new(), chain_groups_wide: Mutex::new(HashMap::new()), dummy: std::sync::OnceLock::new(), dummy_rw: std::sync::OnceLock::new(), limits, staged: AtomicU64::new(0), few: std::sync::OnceLock::new(), moe_steps: Mutex::new(Vec::new()), coop_units: std::sync::OnceLock::new(), int8_rows: std::sync::OnceLock::new(), decode_int8: Mutex::new(HashMap::new()), dense_arena: Mutex::new(None), programs: Mutex::new(HashMap::new()), q8_kept: Mutex::new(HashMap::new()), subgroups32: !subgroups.is_empty(), coop_split: Mutex::new(HashMap::new()), host_staging: std::sync::OnceLock::new(), host_pieces: Mutex::new(HostPieces::default()), stream_slots: Mutex::new(stream::Slots::default()) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             left: Arc::new(AtomicU64::new(0)),

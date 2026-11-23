@@ -10,9 +10,10 @@ import { javascript } from '@codemirror/lang-javascript';
 import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
 import { python } from '@codemirror/lang-python';
+import { openSearchPanel } from '@codemirror/search';
 import { Compartment, EditorState, type Extension } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
-import type { Vfs, VfsChange } from '../vfs/vfs';
+import { normalizePath, type Vfs, type VfsChange } from '../vfs/vfs';
 import { clear, h } from './dom';
 import { editorLook } from './editorTheme';
 import { fileIcon, icon } from './icons';
@@ -24,17 +25,67 @@ const MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navi
 const MOD = MAC ? '⌘' : 'Ctrl';
 const ALT = MAC ? '⌥' : 'Alt';
 
+const WRAP_KEY = 'oaiy.editor.wrap';
+
+function rememberedWrap(): boolean {
+  try {
+    return localStorage.getItem(WRAP_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+function fileExtension(path: string): string {
+  const base = path.slice(path.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+}
+
 function languageFor(path: string): Extension[] {
-  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
+  const ext = fileExtension(path);
   switch (ext) {
     case 'js': case 'mjs': case 'cjs': case 'jsx': return [javascript({ jsx: true })];
-    case 'ts': case 'tsx': case 'mts': return [javascript({ typescript: true, jsx: ext === 'tsx' })];
+    case 'ts': case 'tsx': case 'mts': case 'logic': return [javascript({ typescript: true, jsx: ext === 'tsx' })];
     case 'py': return [python()];
-    case 'json': return [json()];
+    case 'json': case 'jsonc': case 'webmanifest': return [json()];
     case 'md': case 'markdown': return [markdown()];
-    case 'html': case 'htm': case 'svg': case 'xml': return [html()];
+    case 'html': case 'htm': case 'svg': case 'xml': case 'ui': case 'vue': return [html()];
     case 'css': case 'scss': return [css()];
     default: return [];
+  }
+}
+
+function languageLabel(path: string): string {
+  const base = path.slice(path.lastIndexOf('/') + 1);
+  const ext = fileExtension(path);
+  if (!ext) {
+    const low = base.toLowerCase();
+    if (low === 'dockerfile') return 'Dockerfile';
+    if (low === 'makefile') return 'Makefile';
+    return 'Plain text';
+  }
+  switch (ext) {
+    case 'ui': return 'SoftN UI';
+    case 'logic': return 'SoftN Logic';
+    case 'ts': case 'mts': return 'TypeScript';
+    case 'tsx': return 'TSX';
+    case 'js': case 'mjs': case 'cjs': return 'JavaScript';
+    case 'jsx': return 'JSX';
+    case 'py': return 'Python';
+    case 'json': case 'jsonc': case 'webmanifest': return 'JSON';
+    case 'md': case 'markdown': return 'Markdown';
+    case 'html': case 'htm': return 'HTML';
+    case 'vue': return 'Vue';
+    case 'svg': return 'SVG';
+    case 'xml': return 'XML';
+    case 'css': return 'CSS';
+    case 'scss': return 'SCSS';
+    case 'sql': return 'SQL';
+    case 'rs': return 'Rust';
+    case 'sh': case 'bash': return 'Shell';
+    case 'yml': case 'yaml': return 'YAML';
+    case 'toml': return 'TOML';
+    default: return ext.toUpperCase();
   }
 }
 
@@ -61,11 +112,20 @@ export class EditorPane {
   /** A dot while there is typing not saved yet. */
   private readonly dirtyDot = h('span.editor-dirty', { role: 'img', 'aria-label': 'unsaved changes', title: 'Not saved yet', hidden: true });
   private readonly saveState = h('span.editor-state', { 'aria-live': 'polite' });
+  private readonly findButton = h('button.icon.editor-tool.editor-find', { type: 'button', title: `Find in file (${MOD} F)`, 'aria-label': 'Find in file', hidden: true, onclick: () => { if (this.view) { this.view.focus(); openSearchPanel(this.view); } } }, icon('search')) as HTMLButtonElement;
+  private readonly wrapButton = h('button.icon.editor-tool.editor-wrap', { type: 'button', title: 'Toggle word wrap', 'aria-label': 'Toggle word wrap', 'aria-pressed': 'true', hidden: true, onclick: () => this.toggleWrap() }, icon('wrap')) as HTMLButtonElement;
+  private readonly copyPathButton = h('button.icon.editor-tool.editor-copy-path', { type: 'button', title: 'Copy file path', 'aria-label': 'Copy file path', hidden: true, onclick: () => this.copyPath() }, icon('copy')) as HTMLButtonElement;
   private readonly closeButton = h('button.icon.editor-close', { type: 'button', title: 'Close this file', 'aria-label': 'Close this file', onclick: () => this.closeByHand() }, icon('x')) as HTMLButtonElement;
-  private readonly title = h('div.editor-head', this.fileGlyph, this.pathLabel, this.dirtyDot, this.saveState, this.closeButton);
+  private readonly headTools = h('span.editor-head-tools', this.findButton, this.wrapButton, this.copyPathButton, this.closeButton);
+  private readonly title = h('div.editor-head', this.fileGlyph, this.pathLabel, this.dirtyDot, this.saveState, this.headTools);
   /** The person closed the file (the tree lets go of it). */
   onClose: () => void = () => {};
   private readonly body = h('div.editor-body');
+  private readonly statusPos = h('span.editor-status-pos');
+  private readonly statusLang = h('span.editor-status-lang');
+  private readonly statusSize = h('span.editor-status-size');
+  private readonly statusBar = h('div.editor-status', { hidden: true }, this.statusPos, this.statusLang, this.statusSize);
+  private copyTimer: ReturnType<typeof setTimeout> | null = null;
   private view: EditorView | null = null;
   private path: string | null = null;
   private dirty = false;
@@ -78,8 +138,10 @@ export class EditorPane {
   /** The image, audio or video file on show, and its element. */
   private mediaPath: string | null = null;
   private media: Media | null = null;
-  /** The editor's colours, which follow the page's light or dark. */
+  /** The editor's colours, word wrap, language, and accessible name. */
   private readonly look = new Compartment();
+  private readonly wrap = new Compartment();
+  private lineWrap = rememberedWrap();
   /** The open file's language, and the name it is read out by: both of its path, which a rename changes. */
   private readonly language = new Compartment();
   private readonly name = new Compartment();
@@ -98,9 +160,58 @@ export class EditorPane {
 
   constructor(private vfs: Vfs) {
     this.conflictBar.hidden = true;
-    this.element.append(this.title, this.conflictBar, this.body);
+    this.syncWrapButton();
+    this.element.append(this.title, this.conflictBar, this.body, this.statusBar);
     this.showEmpty();
     onTheme((t) => this.view?.dispatch({ effects: this.look.reconfigure(editorLook(t)) }));
+  }
+
+  private syncWrapButton(): void {
+    this.wrapButton.classList.toggle('active', this.lineWrap);
+    this.wrapButton.setAttribute('aria-pressed', String(this.lineWrap));
+    this.wrapButton.title = this.lineWrap ? 'Word wrap: ON (click to disable)' : 'Word wrap: OFF (click to enable)';
+  }
+
+  private toggleWrap(): void {
+    this.lineWrap = !this.lineWrap;
+    try {
+      localStorage.setItem(WRAP_KEY, this.lineWrap ? '1' : '0');
+    } catch {
+      /* ignore storage errors */
+    }
+    this.syncWrapButton();
+    this.view?.dispatch({ effects: this.wrap.reconfigure(this.lineWrap ? EditorView.lineWrapping : []) });
+  }
+
+  private copyPath(): void {
+    const p = this.path ?? this.mediaPath;
+    if (!p) return;
+    void navigator.clipboard?.writeText(p).then(() => {
+      this.copyPathButton.replaceChildren(icon('check'));
+      this.copyPathButton.classList.add('copied');
+      this.copyPathButton.title = 'Copied path';
+      if (this.copyTimer) clearTimeout(this.copyTimer);
+      this.copyTimer = setTimeout(() => {
+        this.copyPathButton.replaceChildren(icon('copy'));
+        this.copyPathButton.classList.remove('copied');
+        this.copyPathButton.title = 'Copy file path';
+      }, 1500);
+    }).catch(() => {});
+  }
+
+  private updateStatusBar(): void {
+    if (!this.view || !this.path) {
+      this.statusBar.hidden = true;
+      return;
+    }
+    const sel = this.view.state.selection.main;
+    const line = this.view.state.doc.lineAt(sel.head);
+    const col = sel.head - line.from + 1;
+    this.statusPos.textContent = `Ln ${line.number}, Col ${col}`;
+    this.statusLang.textContent = languageLabel(this.path);
+    const bytes = this.known?.byteLength ?? this.view.state.doc.length;
+    this.statusSize.textContent = `${this.view.state.doc.lines.toLocaleString()} lines · ${formatBytes(bytes)}`;
+    this.statusBar.hidden = false;
   }
 
   get openPath(): string | null {
@@ -137,7 +248,12 @@ export class EditorPane {
   private header(path: string | null, state: SaveState = 'clean', note = ''): void {
     clear(this.pathLabel);
     clear(this.fileGlyph);
+    const isCode = !!path && state !== 'binary' && state !== 'media';
+    this.findButton.hidden = !isCode;
+    this.wrapButton.hidden = !isCode;
+    this.copyPathButton.hidden = !path;
     this.closeButton.hidden = !path;
+    if (!isCode) this.statusBar.hidden = true;
     this.title.classList.toggle('empty', !path);
     if (!path) {
       this.pathLabel.textContent = 'No file open';
@@ -219,7 +335,9 @@ export class EditorPane {
     this.body.append(h('div.media-view', bar, media.element));
   }
 
-  open(path: string, options: { source?: boolean } = {}): void {
+  open(rawPath: string, options: { source?: boolean } = {}): void {
+    const key = normalizePath(rawPath);
+    const path = `/${key}`;
     this.flush();
     this.keepMine();
     this.conflict = false;
@@ -258,10 +376,11 @@ export class EditorPane {
       extensions: [
         basicSetup,
         this.look.of(editorLook(theme())),
-        EditorView.lineWrapping,
+        this.wrap.of(this.lineWrap ? EditorView.lineWrapping : []),
         this.language.of(languageFor(path)),
         this.name.of(nameFor(path)),
         EditorView.updateListener.of((update) => {
+          if (update.selectionSet || update.docChanged) this.updateStatusBar();
           if (!update.docChanged || this.applying) return;
           this.dirty = true;
           if (!this.conflict) this.setState('saving');
@@ -273,6 +392,7 @@ export class EditorPane {
     this.view?.destroy();
     clear(this.body);
     this.view = new EditorView({ state, parent: this.body });
+    this.updateStatusBar();
   }
 
   /** Save pending keystrokes to the project now. */

@@ -18,6 +18,118 @@ const UPDATE = '*** Update File: ';
 
 const WHITE_SPACE = /\p{White_Space}/u;
 
+/** The times in a row a part that opens more brackets than it closes may come in what a tool writes ([`runawayNesting`]). */
+const NESTED_RUN = 32;
+
+function opensMore(text: string): boolean {
+  let depth = 0;
+  for (const c of text) depth += c === '(' || c === '[' || c === '{' ? 1 : c === ')' || c === ']' || c === '}' ? -1 : 0;
+  return depth > 0;
+}
+
+/**
+ * A part of `text` that nests a call or an index inside itself again and again (`dirs.indexOf(dirs.indexOf(…`).
+ */
+export function runawayNesting(text: string): { unit: string; times: number; line: number } | null {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 40 || c === 91 || c === 123) depth++;
+    else if (c === 41 || c === 93 || c === 125) depth--;
+  }
+  if (depth < NESTED_RUN) return null;
+  for (const m of text.matchAll(new RegExp(`([^\\n]{1,32}?)\\1{${NESTED_RUN - 1},}`, 'g'))) {
+    const unit = m[1]!;
+    if (opensMore(unit)) return { unit, times: m[0].length / unit.length, line: text.slice(0, m.index).split('\n').length };
+  }
+  return null;
+}
+
+/** Refuses what a write or patch would put in a file where it nests a call in itself without end ([`runawayNesting`]). */
+export function refuseRunaway(text: string): void {
+  const run = runawayNesting(text);
+  if (run) {
+    throw new Error(`nothing was written: what you wrote repeats ${JSON.stringify(run.unit)} ${run.times} times in a row on its line ${run.line}, a call or an index written inside itself again and again, which nothing after it can close (a reply that ran away). Write that part another way: in steps, with a variable or a loop. Write a large file in parts (write_file with the first part, then append_file for each next part).`);
+  }
+}
+
+function lineBigrams(line: string): Set<string> {
+  const t = line.trim().toLowerCase();
+  const set = new Set<string>();
+  if (t.length === 1) {
+    set.add(t);
+    return set;
+  }
+  for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
+  return set;
+}
+
+function bigramDice(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let shared = 0;
+  for (const x of a) if (b.has(x)) shared++;
+  return (2 * shared) / (a.size + b.size);
+}
+
+/**
+ * Find the closest matching multi-line block in `lines` for `pattern` using bigram Dice similarity
+ * across all non-empty pattern lines. Returns numbered verbatim lines from the file, or '' when no
+ * plausible match exists.
+ */
+export function nearestBlockHint(lines: readonly string[], pattern: readonly string[], maxDisplayLines = 8): string {
+  const nonEmpty = pattern
+    .map((l, idx) => ({ idx, trimmed: l.trim(), grams: lineBigrams(l) }))
+    .filter((p) => p.trimmed.length > 0);
+  if (!nonEmpty.length || !lines.length) return '';
+
+  const lineGrams = lines.map(lineBigrams);
+  const winLen = Math.max(1, Math.min(pattern.length, lines.length));
+  const maxStart = Math.max(0, lines.length - winLen);
+
+  let bestStart = -1;
+  let bestScore = 0;
+
+  if (nonEmpty.length === 1) {
+    const target = nonEmpty[0]!.grams;
+    for (let i = 0; i < lines.length; i++) {
+      const s = bigramDice(lineGrams[i]!, target);
+      if (s > bestScore) {
+        bestScore = s;
+        bestStart = i;
+      }
+    }
+  } else {
+    const sample = nonEmpty.slice(0, 8);
+    for (let start = 0; start <= maxStart; start++) {
+      let sum = 0;
+      for (const p of sample) {
+        const targetIdx = Math.min(lines.length - 1, start + Math.min(p.idx, winLen - 1));
+        let localBest = bigramDice(lineGrams[targetIdx]!, p.grams);
+        if (localBest < 0.9 && targetIdx > start) {
+          localBest = Math.max(localBest, bigramDice(lineGrams[targetIdx - 1]!, p.grams));
+        }
+        if (localBest < 0.9 && targetIdx + 1 < start + winLen) {
+          localBest = Math.max(localBest, bigramDice(lineGrams[targetIdx + 1]!, p.grams));
+        }
+        sum += localBest;
+      }
+      const avg = sum / sample.length;
+      if (avg > bestScore) {
+        bestScore = avg;
+        bestStart = start;
+      }
+    }
+  }
+
+  if (bestStart < 0 || bestScore < 0.3) return '';
+  const from = Math.max(0, bestStart - 1);
+  const to = Math.min(lines.length, bestStart + Math.min(winLen + 1, maxDisplayLines));
+  return lines
+    .slice(from, to)
+    .map((l, i) => `${from + i + 1}\t${l.replace(/\r$/, '')}`)
+    .join('\n');
+}
+
 export interface PatchHunk {
   lineNumber: number;
   context?: string;
@@ -78,6 +190,7 @@ function seekSequence(lines: readonly string[], pattern: readonly string[], star
   if (pattern.length === 0) return start;
   if (pattern.length > lines.length) return undefined;
   const last = lines.length - pattern.length;
+  if (eof && last < start) return undefined;
   const first = eof ? last : start;
   for (const normalize of MATCH_PASSES) {
     const expected = pattern.map(normalize);
@@ -239,8 +352,14 @@ export function applyHunks(before: string, hunks: readonly PatchHunk[]): ApplyHu
       lineIndex = found + 1;
     }
     if (hunk.oldLines.length === 0) {
-      const start = original[original.length - 1] === '' ? original.length - 1 : original.length;
+      const start =
+        hunk.context !== undefined
+          ? lineIndex
+          : original[original.length - 1] === ''
+            ? original.length - 1
+            : original.length;
       replacements.push({ start, oldLength: 0, newLines: hunk.newLines });
+      lineIndex = start;
       continue;
     }
 
@@ -263,6 +382,21 @@ export function applyHunks(before: string, hunks: readonly PatchHunk[]): ApplyHu
   }
 
   replacements.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < replacements.length; i++) {
+    const prev = replacements[i - 1]!;
+    const curr = replacements[i]!;
+    if (curr.start < prev.start + prev.oldLength) {
+      return {
+        ok: false,
+        failure: {
+          hunkLineNumber: hunks[Math.min(i, hunks.length - 1)]?.lineNumber ?? 1,
+          stage: 'oldLines',
+          searchStart: prev.start + prev.oldLength,
+          pattern: [...(hunks[Math.min(i, hunks.length - 1)]?.oldLines ?? [])],
+        },
+      };
+    }
+  }
   let lines = original;
   for (let i = replacements.length - 1; i >= 0; i--) {
     const r = replacements[i]!;
@@ -301,12 +435,57 @@ export function applyPatchToVfs(
   // Stage all mutations against a virtual overlay so repeated ops in the same patch compose
   // cleanly and any failure leaves the real VFS completely untouched.
   const overlay = new Map<string, string | null>(); // null => deleted
+  const createdDirs = new Set<string>();
   const pending: Array<() => void> = [];
   const results: AppliedPatchFile[] = [];
 
+  const noteParents = (key: string): void => {
+    const parts = key.split('/');
+    let ancestor = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      ancestor = ancestor ? `${ancestor}/${parts[i]}` : parts[i]!;
+      createdDirs.add(ancestor);
+    }
+  };
+
+  const hasFileAt = (key: string): boolean => {
+    if (overlay.has(key)) return overlay.get(key) !== null;
+    return vfs.stat(`/${key}`)?.type === 'file';
+  };
+
+  const hasDirAt = (key: string): boolean => {
+    if (createdDirs.has(key)) return true;
+    const prefix = `${key}/`;
+    for (const [k, v] of overlay.entries()) {
+      if (v !== null && k.startsWith(prefix)) return true;
+    }
+    const st = vfs.stat(`/${key}`);
+    if (st?.type !== 'dir') return false;
+    // A directory still exists if any non-deleted VFS file resides under it or it is already a dir in VFS.
+    return true;
+  };
+
+  const assertWritablePath = (key: string, verb: string): void => {
+    if (hasDirAt(key)) {
+      throw new Error(`Cannot ${verb} /${key}: path is a directory`);
+    }
+    const parts = key.split('/');
+    let ancestor = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      ancestor = ancestor ? `${ancestor}/${parts[i]}` : parts[i]!;
+      if (hasFileAt(ancestor)) {
+        throw new Error(`Cannot ${verb} /${key}: parent /${ancestor} is a file`);
+      }
+    }
+  };
+
   const readCurrent = (key: string): string | null => {
     if (overlay.has(key)) return overlay.get(key) ?? null;
-    if (!vfs.exists(`/${key}`)) return null;
+    const st = vfs.stat(`/${key}`);
+    if (!st) return null;
+    if (st.type === 'dir') {
+      throw new Error(`Cannot patch /${key}: path is a directory`);
+    }
     return vfs.readText(`/${key}`);
   };
 
@@ -315,14 +494,18 @@ export function applyPatchToVfs(
     if (!key) throw new Error(`Invalid file path at patch line ${op.lineNumber}`);
 
     if (op.kind === 'add') {
+      assertWritablePath(key, 'add');
       if (readCurrent(key) !== null) {
         throw new Error(`Cannot add /${key}: file already exists (use Update File instead)`);
       }
+      refuseRunaway(op.content);
       overlay.set(key, op.content);
+      noteParents(key);
       const addedLines = op.content ? op.content.replace(/\n$/, '').split('\n').length : 0;
       pending.push(() => {
         vfs.writeFile(`/${key}`, op.content, { parents: true });
         reads.set(key, vfs.version(`/${key}`));
+        reads.delete(`${key}#partial`);
       });
       results.push({ kind: 'add', path: key, addedLines, removedLines: 0 });
     } else if (op.kind === 'delete') {
@@ -360,11 +543,21 @@ export function applyPatchToVfs(
       if (!applied.ok) {
         const f = applied.failure;
         const snippet = f.pattern.slice(0, 3).join('\n');
+        const origLines = normalized.split('\n');
+        if (origLines[origLines.length - 1] === '') origLines.pop();
+        const earlier = f.searchStart > 0 ? seekSequence(origLines, f.pattern, 0, false) : undefined;
+        const orderHint =
+          earlier !== undefined && earlier < f.searchStart
+            ? `\nNote: those lines appear earlier at line ${earlier + 1} (before line ${f.searchStart + 1}); put hunks in top-to-bottom file order.`
+            : '';
+        const near = orderHint ? '' : nearestBlockHint(origLines, f.pattern);
+        const nearHint = near ? `\nClosest lines in /${key}:\n${near}` : '';
         throw new Error(
-          `Patch hunk at line ${f.hunkLineNumber} failed to match ${f.stage === 'context' ? 'context header' : 'target lines'} in /${key}:\n${snippet}`,
+          `Patch hunk at line ${f.hunkLineNumber} failed to match ${f.stage === 'context' ? 'context header' : 'target lines'} in /${key} (searched from line ${f.searchStart + 1}):\n${snippet}${orderHint}${nearHint}`,
         );
       }
       const nextText = hadCrlf ? applied.after.replace(/\n/g, '\r\n') : applied.after;
+      refuseRunaway(nextText);
       let addedLines = 0;
       let removedLines = 0;
       for (const h of op.hunks) {
@@ -382,19 +575,25 @@ export function applyPatchToVfs(
         addedLines += h.newLines.length - shared;
         removedLines += h.oldLines.length - shared;
       }
-      const destKey = op.moveTo ? normalizePath(op.moveTo) : key;
+      const destKey = op.moveTo !== undefined ? normalizePath(op.moveTo) : key;
+      if (!destKey) {
+        throw new Error(`Invalid Move to path at patch line ${op.lineNumber}`);
+      }
       if (destKey !== key) {
+        assertWritablePath(destKey, `move /${key} to`);
         if (readCurrent(destKey) !== null) {
           throw new Error(`Cannot move /${key} to /${destKey}: destination already exists`);
         }
         overlay.set(key, null);
         overlay.set(destKey, nextText);
+        noteParents(destKey);
         pending.push(() => {
           vfs.writeFile(`/${destKey}`, nextText, { parents: true });
           vfs.remove(`/${key}`, true);
           reads.delete(key);
           reads.delete(`${key}#partial`);
           reads.set(destKey, vfs.version(`/${destKey}`));
+          reads.delete(`${destKey}#partial`);
         });
         results.push({ kind: 'update', path: key, moveTo: destKey, addedLines, removedLines });
       } else {
@@ -402,6 +601,7 @@ export function applyPatchToVfs(
         pending.push(() => {
           vfs.writeFile(`/${key}`, nextText);
           reads.set(key, vfs.version(`/${key}`));
+          reads.delete(`${key}#partial`);
         });
         results.push({ kind: 'update', path: key, addedLines, removedLines });
       }

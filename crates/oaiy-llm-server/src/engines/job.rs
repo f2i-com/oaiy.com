@@ -162,21 +162,49 @@ pub fn penalizes(s: &Sampling) -> bool {
 /// once a token), presence (once a token) and frequency (each time). The engines apply them to the reply's prose
 /// alone: not its thinking, never inside a tool call, where code rightly repeats.
 pub fn penalize_reply(logits: &mut [f32], history: &std::collections::VecDeque<u32>, s: &Sampling) {
-    if !penalizes(s) {
+    if !penalizes(s) || history.is_empty() {
         return;
     }
-    let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-    for &id in history {
-        *counts.entry(id).or_insert(0.0) += 1.0;
-    }
-    for (id, count) in counts {
+    // Sort a small copy of recent history (typically <= 256 tokens) instead of allocating a HashMap per token.
+    let mut ids: Vec<u32> = history.iter().copied().collect();
+    ids.sort_unstable();
+    let mut i = 0;
+    while i < ids.len() {
+        let id = ids[i];
+        let mut j = i + 1;
+        while j < ids.len() && ids[j] == id {
+            j += 1;
+        }
+        let count = (j - i) as f32;
         if let Some(value) = logits.get_mut(id as usize) {
             if s.repeat_penalty > 1.0 {
                 *value = if *value < 0.0 { *value * s.repeat_penalty } else { *value / s.repeat_penalty };
             }
             *value -= s.presence_penalty + s.frequency_penalty * count;
         }
+        i = j;
     }
+}
+
+/// Maintain a binary min-heap of `(logit, token_id)` by sifting down from `pos`.
+#[inline]
+fn sift_down_min(heap: &mut [(f32, u32)], mut pos: usize) {
+    let len = heap.len();
+    let item = heap[pos];
+    loop {
+        let left = pos * 2 + 1;
+        if left >= len {
+            break;
+        }
+        let right = left + 1;
+        let smallest = if right < len && heap[right].0 < heap[left].0 { right } else { left };
+        if item.0 <= heap[smallest].0 {
+            break;
+        }
+        heap[pos] = heap[smallest];
+        pos = smallest;
+    }
+    heap[pos] = item;
 }
 
 /// Pick the next token: greedy at temperature 0, else temperature, top-k
@@ -185,20 +213,41 @@ pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
     let greedy = || {
         logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32
     };
-    if s.temperature <= 0.0 || logits.is_empty() {
+    let inv_t = if s.temperature > 0.0 { 1.0 / s.temperature } else { f32::INFINITY };
+    if !s.temperature.is_finite() || s.temperature <= 0.0 || !inv_t.is_finite() || logits.is_empty() {
         return greedy();
     }
     let k = if s.top_k > 0 { s.top_k.min(CANDIDATES) } else { CANDIDATES }.min(logits.len());
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    let desc = |a: &u32, b: &u32| logits[*b as usize].partial_cmp(&logits[*a as usize]).unwrap_or(std::cmp::Ordering::Equal);
-    if k < idx.len() {
-        idx.select_nth_unstable_by(k - 1, desc);
-        idx.truncate(k);
+    // Streaming top-k selection with a tiny L1-resident min-heap (<= 256 entries = 2 KB)
+    // instead of allocating a 1 MB `0..vocab` index vector and running `select_nth` per token.
+    let mut heap: Vec<(f32, u32)> = Vec::with_capacity(k);
+    for (i, &v) in logits[..k].iter().enumerate() {
+        heap.push((if v.is_nan() { f32::NEG_INFINITY } else { v }, i as u32));
     }
-    idx.sort_unstable_by(desc);
-    let top = logits[idx[0] as usize];
-    let mut probs: Vec<f64> = idx.iter().map(|&i| (((logits[i as usize] - top) / s.temperature) as f64).exp()).collect();
+    for pos in (0..(k / 2)).rev() {
+        sift_down_min(&mut heap, pos);
+    }
+    let mut min_v = heap[0].0;
+    for (offset, &v) in logits[k..].iter().enumerate() {
+        if v > min_v {
+            heap[0] = (v, (k + offset) as u32);
+            sift_down_min(&mut heap, 0);
+            min_v = heap[0].0;
+        }
+    }
+    heap.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    let top = heap[0].0;
+    let mut probs: Vec<f64> = if top.is_finite() {
+        heap.iter().map(|&(v, _)| (((v - top) * inv_t) as f64).exp()).collect()
+    } else if top.is_infinite() && top.is_sign_positive() {
+        heap.iter().map(|&(v, _)| if v == f32::INFINITY { 1.0 } else { 0.0 }).collect()
+    } else {
+        return greedy();
+    };
     let total: f64 = probs.iter().sum();
+    if !(total > 0.0 && total.is_finite()) {
+        return greedy();
+    }
     let mut keep = probs.len();
     if s.top_p < 1.0 {
         let mut acc = 0.0;
@@ -216,10 +265,10 @@ pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
     for (i, p) in probs.iter().enumerate() {
         r -= p;
         if r <= 0.0 {
-            return idx[i];
+            return heap[i].1;
         }
     }
-    idx[keep - 1]
+    heap[keep - 1].1
 }
 
 
@@ -242,5 +291,17 @@ mod penalty_tests {
         let mut logits = original.clone();
         penalize_reply(&mut logits, &history, &Sampling { presence_penalty: 0.5, frequency_penalty: 0.25, ..base });
         assert_eq!(logits, vec![2.0 - 0.5 - 0.5, -2.0 - 0.5 - 0.25, 1.5]);
+    }
+
+    #[test]
+    fn sample_handles_non_finite_logits_and_subnormal_temperature() {
+        let base = Sampling { temperature: 0.8, top_p: 0.9, top_k: 4, seed: 42, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
+        let mut rng = 42u64;
+        assert_eq!(sample(&[f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY], &base, &mut rng), 0);
+        assert_eq!(sample(&[0.0, f32::INFINITY, 1.0], &base, &mut rng), 1);
+        let tiny_t = Sampling { temperature: 1e-40, ..base.clone() };
+        assert_eq!(sample(&[1.0, 5.0, 2.0], &tiny_t, &mut rng), 1);
+        let nan_t = Sampling { temperature: f32::NAN, ..base };
+        assert_eq!(sample(&[1.0, 5.0, 2.0], &nan_t, &mut rng), 1);
     }
 }

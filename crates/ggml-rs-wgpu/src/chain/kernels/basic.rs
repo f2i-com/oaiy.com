@@ -187,6 +187,83 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     .replace("GROUPS_N", &lanes.div_ceil(16).to_string())
 }
 
+/// Subgroup-reduced [`rmsnorm_narrow4`] for `lanes <= 32` (`head_dim <= 128`, 32-lane subgroup GPUs):
+/// uses `subgroupShuffleXor` / `subgroupAdd` with ZERO `workgroupBarrier()`s and ZERO workgroup shared memory.
+pub(in crate::chain) fn rmsnorm_narrow4_sg(lanes: usize) -> String {
+    assert!(matches!(lanes, 8 | 16 | 32), "subgroup narrow norm takes 8, 16 or 32 lanes, got {lanes}");
+    let reduce = match lanes {
+        8 => "    sq += subgroupShuffleXor(sq, 1u);\n    sq += subgroupShuffleXor(sq, 2u);\n    sq += subgroupShuffleXor(sq, 4u);",
+        16 => "    sq += subgroupShuffleXor(sq, 1u);\n    sq += subgroupShuffleXor(sq, 2u);\n    sq += subgroupShuffleXor(sq, 4u);\n    sq += subgroupShuffleXor(sq, 8u);",
+        32 => "    sq = subgroupAdd(sq);",
+        _ => unreachable!(),
+    };
+    r#"@group(0) @binding(0) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> y4: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> p: array<vec4<u32>, 2>;
+const L: u32 = LANES_Nu;
+const RPW: u32 = ROWS_Nu;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n4 = p[0].x / 4u;
+    let r = li / L;
+    let i = li % L;
+    let row = (wg.x + wg.y * 65535u) * RPW + r;
+    let live = row < p[0].w && i < n4;
+    let at = row * n4;
+    var wrows = p[0].z;
+    if (wrows == 0u) { wrows = 1u; }
+    let wat = (row % wrows) * n4;
+    var s = vec4<f32>(0.0);
+    if (live) {
+        let v = x4[at + i];
+        s += v * v;
+    }
+    var sq = s.x + s.y + s.z + s.w;
+REDUCE_BODY
+    let inv = 1.0 / sqrt(sq / f32(p[0].x) + bitcast<f32>(p[0].y));
+    if (live) {
+        y4[at + i] = x4[at + i] * inv * w4[wat + i];
+    }
+}
+"#
+    .replace("LANES_N", &lanes.to_string())
+    .replace("ROWS_N", &(256 / lanes).to_string())
+    .replace("REDUCE_BODY", reduce)
+}
+
+/// [`ADD_RMSNORM_ROWS4`] for 32-lane subgroup devices: reduces across each warp via `subgroupAdd` and
+/// combines the 8 warps with a single `workgroupBarrier()` (down from 3 barriers).
+pub(in crate::chain) const ADD_RMSNORM_ROWS4_SG: &str = r#"
+@group(0) @binding(0) var<storage, read> yv: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> x4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> out: array<vec4<f32>>;
+@group(0) @binding(8) var<uniform> p: array<vec4<u32>, 2>;
+var<workgroup> wpart: array<f32, 8>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let n4 = p[0].x / 4u;
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p[0].z) { return; }
+    let at = row * n4;
+    var s = vec4<f32>(0.0);
+    for (var i = li; i < n4; i += 256u) {
+        let v = x4[at + i] + yv[at + i];
+        x4[at + i] = v;
+        s += v * v;
+    }
+    let ws = subgroupAdd(s.x + s.y + s.z + s.w);
+    if (lane == 0u) { wpart[sgi] = ws; }
+    workgroupBarrier();
+    let total = ((wpart[0] + wpart[1]) + (wpart[2] + wpart[3])) + ((wpart[4] + wpart[5]) + (wpart[6] + wpart[7]));
+    let inv = 1.0 / sqrt(total / f32(p[0].x) + bitcast<f32>(p[0].y));
+    for (var i = li; i < n4; i += 256u) { out[at + i] = x4[at + i] * inv * w4[i]; }
+}
+"#;
+
 /// `x += y`, then each row of `x` RMS-normed into `out` with `w` (`[n]`, one for every row), rows a multiple of 4
 /// long: a residual's add and the next norm in one dispatch. `p[0]`: n, the bits of eps.
 pub(in crate::chain) const ADD_RMSNORM_ROWS4: &str = r#"

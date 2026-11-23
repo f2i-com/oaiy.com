@@ -426,6 +426,12 @@ pub(in crate::chain) static ATTENTION_ROWS_JOIN: std::sync::LazyLock<String> = s
     let s = wg.y;
 "));
 
+/// Subgroup-reduced [`ATTENTION_ROWS_JOIN`] (2 barriers for `m` and `l` instead of 17).
+pub(in crate::chain) static ATTENTION_ROWS_JOIN_SG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| JOIN_RUNS_SG.replace("ROWS
+", "    let rows = p[1].w;
+    let s = wg.y;
+"));
+
 /// Positions a workgroup of [`ATTENTION_PART`] takes.
 pub(in crate::chain) const SPLIT: usize = 256;
 
@@ -592,6 +598,75 @@ pub(in crate::chain) static ATTENTION_JOIN: std::sync::LazyLock<String> = std::s
 ", "    let rows = 1u;
     let s = 0u;
 "));
+
+/// Subgroup-reduced [`ATTENTION_JOIN`] (2 barriers for `m` and `l` instead of 17).
+pub(in crate::chain) static ATTENTION_JOIN_SG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| JOIN_RUNS_SG.replace("ROWS
+", "    let rows = 1u;
+    let s = 0u;
+"));
+
+const JOIN_RUNS_SG: &str = r#"
+var<workgroup> wmax: array<f32, 8>;
+var<workgroup> wsum: array<f32, 8>;
+var<workgroup> sums: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_id) sgi: u32) {
+    let n_h = p[0].x;
+    let hd = p[0].z;
+    let runs = p[1].y;
+ROWS
+    let h = wg.x;
+    let first = (s * n_h + h) * runs;
+    let ml = rows * n_h * hd + rows * n_h * runs * hd + first * 2u;
+    var m = -3.4e38;
+    for (var r = li; r < runs; r += 256u) {
+        if (y[ml + r * 2u + 1u] > 0.0) { m = max(m, y[ml + r * 2u]); }
+    }
+    let wm = subgroupMax(m);
+    if (lane == 0u) { wmax[sgi] = wm; }
+    workgroupBarrier();
+    m = max(max(max(wmax[0], wmax[1]), max(wmax[2], wmax[3])), max(max(wmax[4], wmax[5]), max(wmax[6], wmax[7])));
+    var l = 0.0;
+    for (var r = li; r < runs; r += 256u) {
+        let lr = y[ml + r * 2u + 1u];
+        if (lr > 0.0) { l += exp(y[ml + r * 2u] - m) * lr; }
+    }
+    let wl = subgroupAdd(l);
+    if (lane == 0u) { wsum[sgi] = wl; }
+    workgroupBarrier();
+    l = ((wsum[0] + wsum[1]) + (wsum[2] + wsum[3])) + ((wsum[4] + wsum[5]) + (wsum[6] + wsum[7]));
+    let cols = (hd + 3u) / 4u;
+    let span = min(cols, 256u);
+    let slices = 256u / span;
+    let sl = li / span;
+    for (var c0 = 0u; c0 < cols; c0 += span) {
+        let c = c0 + li % span;
+        var acc = vec4<f32>(0.0);
+        if (sl < slices && c < cols) {
+            for (var r = sl; r < runs; r += slices) {
+                let lr = y[ml + r * 2u + 1u];
+                if (lr > 0.0) {
+                    let at = rows * n_h * hd + (first + r) * hd + c * 4u;
+                    acc += exp(y[ml + r * 2u] - m) * vec4<f32>(y[at], y[at + 1u], y[at + 2u], y[at + 3u]);
+                }
+            }
+        }
+        sums[li] = acc;
+        workgroupBarrier();
+        if (sl == 0u && c < cols) {
+            for (var o = 1u; o < slices; o++) { acc += sums[o * span + c - c0]; }
+            let v = acc / l;
+            let at = (s * n_h + h) * hd + c * 4u;
+            y[at] = v.x;
+            if (c * 4u + 1u < hd) { y[at + 1u] = v.y; }
+            if (c * 4u + 2u < hd) { y[at + 2u] = v.z; }
+            if (c * 4u + 3u < hd) { y[at + 3u] = v.w; }
+        }
+        workgroupBarrier();
+    }
+}
+"#;
 
 /// The runs of a head's parts put together (its query's, `s` of `rows`): each run's values rescaled from its largest
 /// to the head's, over the sum of the rescaled sums; a run with nothing (`l` 0) adds nothing. The largest and the sum

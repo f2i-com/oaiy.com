@@ -65,6 +65,9 @@ impl ChainRecorder for Recorder<'_> {
     fn rmsnorm_rows(&mut self, x: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         assert!(rows > 0 && x.len % rows == 0 && w.len >= x.len / rows && out.len >= x.len, "chain: rmsnorm of {rows} rows of {}", x.len);
         let n = x.len / rows;
+        if rows == 1 && n >= 512 && self.rmsnorm_q8(x, w, out, eps) {
+            return;
+        }
         // rows a multiple of 4 long (a model's width, a head's): vec4 loads
         let (pipeline, groups) = self.rmsnorm_pipeline(n, rows, false);
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), 0, rows as u32], groups);
@@ -89,14 +92,32 @@ impl ChainRecorder for Recorder<'_> {
 
     fn add_rmsnorm_rows(&mut self, x: &DeviceVec, y: &DeviceVec, w: &DeviceVec, out: &DeviceVec, rows: usize, eps: f32) {
         let n = x.len / rows.max(1);
-        if rows == 0 || n % 4 != 0 || n * rows != x.len || y.len < x.len || w.len < n || out.len < x.len || Arc::ptr_eq(&x.inner, &out.inner) {
+        if rows == 0
+            || n % 4 != 0
+            || n * rows != x.len
+            || y.len < x.len
+            || w.len < n
+            || out.len < x.len
+            || Arc::ptr_eq(&x.inner, &out.inner)
+            || Arc::ptr_eq(&y.inner, &x.inner)
+            || Arc::ptr_eq(&y.inner, &out.inner)
+            || Arc::ptr_eq(&w.inner, &x.inner)
+            || Arc::ptr_eq(&w.inner, &out.inner)
+        {
             self.add(x, y);
             self.rmsnorm_rows(x, w, out, rows, eps);
             return;
         }
+        if rows == 1 && n >= 512 && self.add_rmsnorm_q8(x, y, w, out, eps) {
+            return;
+        }
         let d = self.gpu().dummy().clone();
         let r = rows as u32;
-        self.dispatch_wide("chain-add-rmsnorm-rows4", ADD_RMSNORM_ROWS4, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits(), r], (r.min(65535), r.div_ceil(65535), 1));
+        if self.gpu().subgroups32() {
+            self.dispatch_wide("chain-add-rmsnorm-rows4-sg", ADD_RMSNORM_ROWS4_SG, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits(), r], (r.min(65535), r.div_ceil(65535), 1));
+        } else {
+            self.dispatch_wide("chain-add-rmsnorm-rows4", ADD_RMSNORM_ROWS4, [buffer(y), buffer(w), &d, &d, &d, &d, buffer(x), buffer(out)], &[n as u32, eps.to_bits(), r], (r.min(65535), r.div_ceil(65535), 1));
+        }
     }
 
     fn add(&mut self, acc: &DeviceVec, y: &DeviceVec) {
@@ -107,6 +128,9 @@ impl ChainRecorder for Recorder<'_> {
     fn silu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
         let ff = out.len / rows;
         assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: SwiGLU of {rows} rows");
+        if rows == 1 && self.act_mul_split_q8(fused, out, false) {
+            return;
+        }
         let pipeline = self.named("chain-silu-mul-split", SILU_MUL_SPLIT);
         self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], grid((out.len as u32).div_ceil(256)));
     }
@@ -114,6 +138,9 @@ impl ChainRecorder for Recorder<'_> {
     fn gelu_mul_split_rows(&mut self, fused: &DeviceVec, out: &DeviceVec, rows: usize) {
         let ff = out.len / rows;
         assert!(rows > 0 && out.len == rows * ff && fused.len >= 2 * out.len, "chain: GeGLU of {rows} rows");
+        if rows == 1 && self.act_mul_split_q8(fused, out, true) {
+            return;
+        }
         let pipeline = self.named("chain-gelu-mul-split", GELU_MUL_SPLIT);
         self.dispatch_kept(&pipeline, buffer(fused), buffer(fused), buffer(out), &[ff as u32, rows as u32], grid((out.len as u32).div_ceil(256)));
     }
@@ -169,7 +196,15 @@ impl ChainRecorder for Recorder<'_> {
         let n = x.len / (rows * streams).max(1);
         assert!(rows > 0 && streams > 0 && n * rows * streams == x.len && w.len >= streams * n && out.len >= x.len, "chain: a norm of {rows} rows of {streams} streams");
         // (streams a multiple of 4 long: vec4 loads, as a row's norm)
-        let pipeline = if n % 4 == 0 { self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string()) } else { self.named("chain-rmsnorm-rows", RMSNORM_ROWS) };
+        let pipeline = if n % 4 == 0 {
+            if self.gpu().subgroups32() {
+                self.gpu().named_pipeline("chain-rmsnorm-rows4-sg", || RMSNORM_ROWS4_SG.to_string())
+            } else {
+                self.gpu().named_pipeline("chain-rmsnorm-rows4", || RMSNORM_ROWS4.to_string())
+            }
+        } else {
+            self.named("chain-rmsnorm-rows", RMSNORM_ROWS)
+        };
         let r = (rows * streams) as u32;
         self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(out), &[n as u32, eps.to_bits(), streams as u32, r], (r.min(65535), r.div_ceil(65535), 1));
     }
@@ -804,6 +839,9 @@ impl ChainRecorder for Recorder<'_> {
 
     fn silu_mul(&mut self, gate: &DeviceVec, up: &DeviceVec, out: &DeviceVec, len: usize) {
         assert!(gate.len >= len && up.len >= len && out.len >= len, "chain: a SwiGLU of {len}");
+        if self.silu_mul_q8(gate, up, out, len) {
+            return;
+        }
         let pipeline = self.named("chain-silu-mul", SILU_MUL);
         self.dispatch_kept(&pipeline, buffer(gate), buffer(up), buffer(out), &[len as u32], grid((len as u32).div_ceil(256)));
     }
@@ -884,7 +922,15 @@ impl ChainRecorder for Recorder<'_> {
     fn matmul_f32_rows(&mut self, w: &DeviceVec, n: usize, k: usize, x: &DeviceVec, y: &DeviceVec, rows: usize) {
         assert!(w.len >= n * k && x.len >= rows * k && y.len >= rows * n && n <= 65535 && rows.div_ceil(64) <= 65535, "chain: an f32 matmul [{n}, {k}] of {rows} rows");
         if rows == 1 {
-            let pipeline = if k % 4 == 0 { self.gpu().named_pipeline("chain-matvec-f32-4", || MATVEC_F32_4.to_string()) } else { self.named("chain-matmul-f32", MATMUL_F32) };
+            let pipeline = if k % 4 == 0 {
+                if self.gpu().subgroups32() {
+                    self.gpu().named_pipeline("chain-matvec-f32-4-sg", || MATVEC_F32_4_SG.to_string())
+                } else {
+                    self.gpu().named_pipeline("chain-matvec-f32-4", || MATVEC_F32_4.to_string())
+                }
+            } else {
+                self.named("chain-matmul-f32", MATMUL_F32)
+            };
             self.dispatch_kept(&pipeline, buffer(w), buffer(x), buffer(y), &[n as u32, k as u32], (n as u32, 1, 1));
             return;
         }
@@ -928,7 +974,7 @@ impl ChainRecorder for Recorder<'_> {
         // layer for 512), then the state; a step's and a check's as they were
         if rows >= 16 && rows <= 65535 {
             let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
-            self.dispatch_wide("chain-ssm-conv-rows", SSM_CONV_ROWS, [q, buffer(weight), buffer(state), &d, &d, &d, &drw, buffer(out)], &words, (groups, rows as u32, 1));
+            self.dispatch_wide("chain-ssm-conv-rows", SSM_CONV_ROWS, [q, buffer(weight), buffer(state), &d, &d, &d, buffer(out), &drw], &words, (groups, rows as u32, 1));
             self.dispatch_wide("chain-ssm-conv-state", SSM_CONV_STATE, [q, &d, &d, &d, &d, &d, buffer(state), &drw], &words, (groups, 1, 1));
             return;
         }
@@ -943,7 +989,7 @@ impl ChainRecorder for Recorder<'_> {
         // a prompt's a thread a (channel, token), then the state; a step's and a few rows' a thread a channel
         if rows >= 16 && rows <= 65535 {
             let (d, drw) = (self.gpu().dummy().clone(), self.gpu().dummy_rw().clone());
-            self.dispatch_wide("chain-short-conv-rows", SHORT_CONV_ROWS, [x, buffer(weight), buffer(state), &d, &d, &d, &drw, buffer(out)], &words, (groups, rows as u32, 1));
+            self.dispatch_wide("chain-short-conv-rows", SHORT_CONV_ROWS, [x, buffer(weight), buffer(state), &d, &d, &d, buffer(out), &drw], &words, (groups, rows as u32, 1));
             self.dispatch_wide("chain-short-conv-state", SHORT_CONV_STATE, [x, &d, &d, &d, &d, &d, buffer(state), &drw], &words, (groups, 1, 1));
             return;
         }
@@ -1119,7 +1165,7 @@ impl ChainRecorder for Recorder<'_> {
             let names = if lanes { &WIDE_LANES } else { &WIDE };
             let part = self.gpu().named_pipeline(names[per_kv][at], || attention_part_group_wide_halved(per_kv, head_dim, lanes));
             self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
-            let join = self.named("chain-attention-join", &ATTENTION_JOIN);
+            let join = if self.gpu().subgroups32() { self.named("chain-attention-join-sg", &ATTENTION_JOIN_SG) } else { self.named("chain-attention-join", &ATTENTION_JOIN) };
             self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
             return;
         };
@@ -1130,7 +1176,7 @@ impl ChainRecorder for Recorder<'_> {
             self.gpu().named_pipeline(NAMES[g], || attention_part_group_halved(g))
         };
         self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, ((n_h / g) as u32, runs as u32, 1));
-        let join = self.named("chain-attention-join", &ATTENTION_JOIN);
+        let join = if self.gpu().subgroups32() { self.named("chain-attention-join-sg", &ATTENTION_JOIN_SG) } else { self.named("chain-attention-join", &ATTENTION_JOIN) };
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
     }
 

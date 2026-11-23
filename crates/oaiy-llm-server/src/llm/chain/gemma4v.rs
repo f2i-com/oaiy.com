@@ -134,10 +134,23 @@ impl Block {
 pub(crate) struct Tower {
     patch: Lin,
     blocks: Vec<Block>,
-    /// Each 3 x 3 patches' mean times `sqrt(d)`: `[d, 9 d]` (f32), nine rows of `d` side by side into one.
+    /// Each 3 x 3 patches' mean times `sqrt(d)` (and times `v.std_scale` when standardized): `[d, 9 d]` (f32),
+    /// nine rows of `d` side by side into one.
     pool: DeviceVec,
+    /// Optional `-v.std_bias * v.std_scale` (f32, `[d]`) added right after `pool`, completing
+    /// `(pooled - std_bias) * std_scale` in full F32 precision with zero extra multiply pass.
+    std_offset: Option<DeviceVec>,
     ones: DeviceVec,
     proj: Lin,
+}
+
+/// Fold Gemma 4's post-pool standardization `(pooled - std_bias) * std_scale` into per-channel
+/// pool multiplier `s * std_scale[o]` and post-pool bias `-std_bias[o] * std_scale[o]` (computed in f64).
+pub(crate) fn standardize_pool(base_scale: f32, std_bias: &[f32], std_scale: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(std_bias.len(), std_scale.len());
+    let pool_scale: Vec<f32> = std_scale.iter().map(|&sc| (base_scale as f64 * sc as f64) as f32).collect();
+    let offset: Vec<f32> = std_bias.iter().zip(std_scale).map(|(&b, &sc)| (-(b as f64) * sc as f64) as f32).collect();
+    (pool_scale, offset)
 }
 
 impl Tower {
@@ -155,10 +168,19 @@ impl Tower {
         let blocks = mm.blocks.iter().map(|b| Block::of(chain, b)).collect::<Option<Vec<_>>>()?;
         let k = POOL * POOL;
         let s = (d as f32).sqrt() / k as f32;
+        let (pool_scales, std_offset) = match (&mm.std_bias, &mm.std_scale) {
+            (Some(bias), Some(scale)) => {
+                let (ps, off) = standardize_pool(s, &host(bias), &host(scale));
+                (ps, Some(vector(chain, &off)))
+            }
+            (None, None) => (vec![s; d], None),
+            _ => return None,
+        };
         let mut pool = vec![0f32; d * k * d];
         for o in 0..d {
+            let so = pool_scales[o];
             for j in 0..k {
-                pool[o * k * d + j * d + o] = s;
+                pool[o * k * d + j * d + o] = so;
             }
         }
         let c = &mm.projector.clamps;
@@ -166,6 +188,7 @@ impl Tower {
             patch,
             blocks,
             pool: vector(chain, &pool),
+            std_offset,
             ones: vector(chain, &vec![1.0; d]),
             proj: Lin::of(chain, &[&mm.projector.input_projection], range(c.output.0, c.output.1))?,
         })
@@ -298,12 +321,36 @@ pub(crate) fn forward(mm: &Gemma4VMmProj, image: &Tensor) -> Option<Tensor> {
     let mut rec = chain.begin();
     rec.keep_groups(false);
     let r = rec.as_mut();
-    // each block's nine patches' mean (times sqrt(d)), an RMS norm without a weight, the projection
+    // each block's nine patches' mean (times sqrt(d), and standardized via `(pooled - std_bias) * std_scale`
+    // folded into `tower.pool` + `tower.std_offset` on Gemma 4 26B-A4B / 31B), an RMS norm without a weight, the projection
     r.matmul_f32_rows(&tower.pool, d, POOL * POOL * d, &x, &pooled, n / 9);
+    if let Some(offset) = &tower.std_offset {
+        r.add_bias_rows(&pooled, offset, n / 9, d);
+    }
     r.rmsnorm_rows(&pooled, &tower.ones, &pn, n / 9, eps);
     tower.proj.run(r, &pn, &out, n / 9);
     r.read(&out);
     let values = rec.finish().pop()?;
     Some(Tensor::from_vec(values, vec![n / 9, tower.proj.n]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::standardize_pool;
+
+    #[test]
+    fn standardize_pool_matches_f32_affine_transform_without_precision_loss() {
+        let base_s = (1152.0f32).sqrt() / 9.0;
+        let bias = [-53760.0f32, 0.0, 36352.0, 12.5];
+        let scale = [0.0013f32, 1.0, 0.0025, 2.0];
+        let (pool_scales, offsets) = standardize_pool(base_s, &bias, &scale);
+        let patch_sum = [265.0f32, -4.0, 9640.0, 6.0];
+        for i in 0..patch_sum.len() {
+            let got = patch_sum[i] * pool_scales[i] + offsets[i];
+            let pooled = patch_sum[i] * base_s;
+            let want = (pooled - bias[i]) * scale[i];
+            assert!((got - want).abs() <= 1e-4, "channel {i}: got {got} != want {want}");
+        }
+    }
 }
 

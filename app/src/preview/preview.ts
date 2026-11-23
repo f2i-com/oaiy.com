@@ -30,7 +30,7 @@ import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { onTheme, theme } from '../ui/theme';
-import { appFiles, appLabel, findApps, isSoftnApp, isWebApp, logicSyntax } from '../softn/softn';
+import { appFiles, appLabel, findApps, isSoftnApp, isWebApp, logicSyntax, softnAppOf } from '../softn/softn';
 import { findPages, pageFiles, pageLabel } from './page';
 import { findModels, modelFiles, modelLabel } from './model';
 import { KEPT_STATUS, KEPT_TITLE, LiveFrame, engineMismatch, fitNote, frameSays, isLoadSyntaxError, plainProblem, updateSaid } from './liveFrame';
@@ -266,6 +266,7 @@ export class Preview {
   /** Shows the preview over the whole screen (or OAIY's whole window, where the screen cannot be had), and back. */
   private readonly fullLabel = h('span.label', 'Full screen');
   private readonly fullButton = h('button.preview-full', { title: 'Show the app or page over the whole screen (Esc to leave)', 'aria-label': 'Full screen', onclick: () => this.setFull(!this.full) }, icon('expand'), this.fullLabel);
+  private readonly shotButton = h('button.preview-shot', { type: 'button', title: 'Save a PNG screenshot of the preview into /shots/', 'aria-label': 'Save screenshot', onclick: () => void this.saveToolbarShot() }, icon('camera'), h('span.label', 'Shot')) as HTMLButtonElement;
 
   /** Whether the preview fills the screen ([`Preview::setFull`]). */
   get full(): boolean {
@@ -297,8 +298,12 @@ export class Preview {
   constructor(private vfs: Vfs, private readonly projectId: () => string) {
     // (Reload starts the app or page over in a new frame, also where a change would have been taken in place)
     const reload = h('button.preview-reload', { title: 'Start it again from the beginning', 'aria-label': 'Reload', onclick: () => this.render(true) }, icon('refresh'), h('span.label', 'Reload'));
-    // The app is told OAIY's own theme when it opens (not the system's, which can differ): a change of theme opens it again.
+    // The app and 3D model viewer follow OAIY's own theme (not the system's, which can differ).
     onTheme(() => {
+      if (this.target?.kind === 'model' && this.frame) {
+        this.frame.contentWindow?.postMessage({ __oaiyAgent: true, type: 'modelview:theme', theme: theme() }, '*');
+        return;
+      }
       if (this.target?.kind !== 'app' || !this.frame) return;
       this.link?.close();
       this.link = null;
@@ -352,12 +357,39 @@ export class Preview {
     window.addEventListener('message', (event) => this.fromBridge(event));
     new ResizeObserver(() => this.layout()).observe(this.frameHost);
     this.frameHost.append(this.stage, this.linkBar.element);
-    // (the status after the size picker, then Reload and Full screen at the right; on a narrow pane the two are their icons)
-    this.element.append(h('div.pane-title', h('span.preview-kicker', 'Preview'), this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload, this.fullButton), this.banner, this.frameHost);
+    this.status.addEventListener('click', () => {
+      if (this.problems.some((p) => p.level === 'error')) this.banner.hidden = false;
+    });
+    this.status.addEventListener('keydown', (e: KeyboardEvent) => {
+      if ((e.key === 'Enter' || e.key === ' ') && this.problems.some((p) => p.level === 'error')) {
+        e.preventDefault();
+        this.banner.hidden = false;
+      }
+    });
+    // (the status after the size picker, then Shot, Reload and Full screen at the right; on a narrow pane they are their icons)
+    this.element.append(h('div.pane-title', h('span.preview-kicker', 'Preview'), this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, this.shotButton, reload, this.fullButton), this.banner, this.frameHost);
     this.picker.hidden = true;
     this.sizeCustom.hidden = true;
     this.sizeNote.hidden = true;
+    this.shotButton.hidden = true;
     this.showMessage('Open a web page (an .html file), a 3D model (a .glb file) or a SoftN app (/softn new) to see it here.');
+  }
+
+  private async saveToolbarShot(): Promise<void> {
+    if (!this.target || !this.frame || this.busy) return;
+    this.shotButton.disabled = true;
+    try {
+      const shot = await this.screenshot(this.target);
+      const stem = (this.target.kind === 'app' ? this.target.root || 'app' : this.target.path.split('/').pop()?.replace(/\.[^.]+$/, '') || 'preview').replace(/[^A-Za-z0-9._-]+/g, '-');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const dest = `shots/${stem}-${stamp}.png`;
+      this.vfs.writeFile(`/${dest}`, shot.png, { parents: true });
+      this.setStatus(`saved /${dest}`, 'ok', `${shot.width}×${shot.height} PNG saved in project`);
+    } catch (error) {
+      this.setStatus('shot failed', 'error', error instanceof Error ? error.message : String(error));
+    } finally {
+      this.shotButton.disabled = false;
+    }
   }
 
   /** The app folder shown ('' when it is the project root, or when a page is shown). */
@@ -384,6 +416,15 @@ export class Preview {
     if (pages.length) this.picker.append(h('optgroup', { label: 'Web pages' }, ...pages.map((path) => option({ kind: 'page', path }, `/${path}`))));
     if (models.length) this.picker.append(h('optgroup', { label: '3D models' }, ...models.map((path) => option({ kind: 'model', path }, `/${path}`))));
     this.picker.hidden = apps.length + pages.length + models.length < 2;
+    const isModel = this.target?.kind === 'model';
+    this.sizePicker.hidden = isModel;
+    if (isModel) {
+      this.sizeCustom.hidden = true;
+      this.sizeNote.hidden = true;
+    } else {
+      this.sizeCustom.hidden = this.sizePicker.value !== 'custom';
+    }
+    this.shotButton.hidden = !this.target;
     return apps;
   }
 
@@ -427,9 +468,40 @@ export class Preview {
     if (visible && this.stale) this.render();
   }
 
+  private webAppId(root: string): string {
+    return `oaiy-agent-${this.projectId()}-${root ? `sub:${root}` : '__root__'}`;
+  }
+
+  private clearSqliteStorageFor(root: string): void {
+    const webStorageKey = `web:${this.webAppId(root)}`;
+    const saved = this.storage.get(webStorageKey);
+    if (!saved) return;
+    const next: Record<string, string> = {};
+    for (const [k, v] of Object.entries(saved)) {
+      if (!k.includes('sqlite:')) next[k] = v;
+    }
+    this.storage.set(webStorageKey, next);
+  }
+
   /** The project changed: re-render after edits settle (the agent writes in bursts). */
   changed(path: string | null): void {
     if (path === null || /(^|\/)manifest\.json$/i.test(path) || /\.(html?|glb|gltf)$/i.test(path)) this.refreshApps();
+    if (path !== null) {
+      const key = path.replace(/^\/+/, '');
+      // Clear cached persisted SQLite blobs for whichever app owns a changed DB/seed/manifest file,
+      // even when a different app/page is currently shown in the preview.
+      const ownerRoot = softnAppOf(this.vfs, key);
+      if (ownerRoot !== null) {
+        const ownerRel = ownerRoot ? key.slice(ownerRoot.length + 1) : key;
+        if (
+          ownerRel === 'manifest.json' ||
+          /\.(?:sql|db|sqlite|sqlite3)$/i.test(ownerRel) ||
+          /(?:^|\/)(?:db|database|migrations)\/[^/]+\.json$/i.test(ownerRel)
+        ) {
+          this.clearSqliteStorageFor(ownerRoot);
+        }
+      }
+    }
     const target = this.target;
     if (path !== null && target) {
       const key = path.replace(/^\/+/, '');
@@ -437,19 +509,6 @@ export class Preview {
         if (target.root && !key.startsWith(`${target.root}/`)) return;
         const rel = target.root ? key.slice(target.root.length + 1) : key;
         if (!/(^|\/)(manifest\.json|permission\.json|\.htaccess|Cargo\.toml)$|\.(ui|html?|logic|js|mjs|cjs|jsx|ts|tsx|mts|vue|py|php|phtml|rs|sql|db|sqlite|sqlite3|xdb|css|json|svg)$|(^|\/)(assets|backend|server|db|database|migrations)\//i.test(rel)) return;
-        // When the author/agent edits a database schema, seed, or .db file, clear cached persisted
-        // SQLite blobs for this app so the updated schema/seed/image takes effect on next render.
-        if (/\.(?:sql|db|sqlite|sqlite3)$/i.test(rel) || /(?:^|\/)(?:db|database|migrations)\/[^/]+\.json$/i.test(rel)) {
-          const webStorageKey = `web:oaiy-agent-${this.projectId()}-${target.root || 'root'}`;
-          const saved = this.storage.get(webStorageKey);
-          if (saved) {
-            const next: Record<string, string> = {};
-            for (const [k, v] of Object.entries(saved)) {
-              if (!k.includes('sqlite:')) next[k] = v;
-            }
-            this.storage.set(webStorageKey, next);
-          }
-        }
       } else if (target.kind === 'model') {
         // A .glb is all there is to it; a .gltf also reads its folder.
         const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
@@ -548,6 +607,16 @@ export class Preview {
     this.status.textContent = text;
     this.status.dataset.kind = kind;
     this.status.title = title;
+    const clickable = kind === 'error' && this.problems.some((p) => p.level === 'error');
+    this.status.classList.toggle('clickable', clickable);
+    if (clickable) {
+      this.status.setAttribute('role', 'button');
+      this.status.tabIndex = 0;
+      if (!title.includes('Click to show')) this.status.title = title ? `${title} — click to show errors` : 'Click to show errors';
+    } else {
+      this.status.removeAttribute('role');
+      this.status.removeAttribute('tabindex');
+    }
   }
 
   /**
@@ -559,7 +628,7 @@ export class Preview {
   }
 
   private fromBridge(event: MessageEvent): void {
-    const data = event.data as { __oaiyAgent?: boolean; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string };
+    const data = event.data as { __oaiyAgent?: boolean; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string; filename?: unknown; mime?: unknown; bytes?: unknown; userInitiated?: unknown };
     if (!this.frame || event.source !== this.frame.contentWindow || data?.__oaiyAgent !== true) return;
     if (data.type === 'bot:bridge') {
       this.bridgeReady = true;
@@ -597,6 +666,31 @@ export class Preview {
       this.storage.set(storageKey(this.target), data.store as Record<string, string>);
     } else if (data.type === 'bot:dialog' && typeof data.message === 'string') {
       this.setStatus(`${data.kind ?? 'alert'}: ${data.message.slice(0, 120)}`, 'ok');
+    } else if (data.type === 'bot:download' && data.bytes instanceof Uint8Array && data.bytes.byteLength <= 64 * 1024 * 1024) {
+      const rawName = typeof data.filename === 'string' ? data.filename : 'export.bin';
+      const safeName = rawName.replace(/[\\/]+/g, '_').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '') || 'export.bin';
+      const dest = `exports/${safeName}`;
+      try {
+        this.vfs.writeFile(`/${dest}`, data.bytes, { parents: true });
+        this.refreshApps();
+        const kb = Math.max(1, Math.round(data.bytes.byteLength / 1024));
+        this.setStatus(`saved /${dest} (${kb} KB)`, 'ok');
+        // Only trigger a host browser download for safe export extensions after a real user gesture in the preview.
+        const SAFE_EXPORT_EXT = /\.(glb|gltf|png|jpe?g|webp|svg|json|txt|csv|obj|stl|ply|wav|mp3|webm|mp4)$/i;
+        if (data.userInitiated === true && !this.requests.size && typeof document !== 'undefined' && SAFE_EXPORT_EXT.test(safeName)) {
+          const mime = typeof data.mime === 'string' && data.mime ? data.mime : 'application/octet-stream';
+          const copy = new Uint8Array(data.bytes.byteLength);
+          copy.set(data.bytes);
+          const url = URL.createObjectURL(new Blob([copy.buffer], { type: mime }));
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = safeName;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      } catch (error) {
+        this.setStatus(`export failed: ${error instanceof Error ? error.message : String(error)}`, 'error');
+      }
     }
   }
 
@@ -976,7 +1070,7 @@ export class Preview {
       // Copies, so the project's own bytes stay put when they are handed over.
       const sent: Record<string, Uint8Array> = {};
       for (const [name, data] of Object.entries(files)) sent[name] = data.slice();
-      frame.contentWindow!.postMessage({ type: 'modelview:init', path, files: sent }, '*', [channel.port2, ...Object.values(sent).map((d) => d.buffer as ArrayBuffer)]);
+      frame.contentWindow!.postMessage({ type: 'modelview:init', path, files: sent, theme: theme() }, '*', [channel.port2, ...Object.values(sent).map((d) => d.buffer as ArrayBuffer)]);
     };
     window.addEventListener('message', onMessage);
     setTimeout(() => {
@@ -1068,7 +1162,7 @@ export class Preview {
     const syntax = logicSyntax(this.vfs, root).catch(() => []);
     const { client, assets } = this.appSource(root);
     const web = isWebApp(this.vfs, root);
-    const appId = `oaiy-agent-${this.projectId()}-${root || 'root'}`;
+    const appId = this.webAppId(root);
     const webStorageKey = `web:${appId}`;
     let bytes: ArrayBuffer | undefined;
     try {

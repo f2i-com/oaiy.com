@@ -61,11 +61,22 @@ const SIDES = [
 
 const status = document.getElementById('status');
 const hint = document.getElementById('hint');
+const statsEl = document.getElementById('stats');
+const hudEl = document.getElementById('hud');
+const btnReset = document.getElementById('btn-reset');
+const btnWire = document.getElementById('btn-wire');
+const btnGrid = document.getElementById('btn-grid');
+const btnStage = document.getElementById('btn-stage');
 const say = (text, error = false) => {
   status.textContent = text;
   status.hidden = !text;
   status.classList.toggle('error', error);
 };
+
+let stageDark = false;
+let wireframeOn = false;
+let gridOn = true;
+const originalWireframes = new WeakMap();
 
 const renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -77,7 +88,9 @@ renderer.toneMapping = typeof NeutralToneMapping === 'number' ? NeutralToneMappi
 document.body.prepend(renderer.domElement);
 
 const scene = new Scene();
-scene.background = backdrop();
+const lightBackdrop = backdrop(false);
+const darkBackdrop = backdrop(true);
+scene.background = lightBackdrop;
 // Soft studio light: a lit room reflected in the model, a sky-and-ground fill, and one key light.
 const pmrem = new PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -92,21 +105,83 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.addEventListener('change', () => draw());
 controls.addEventListener('start', () => (hint.hidden = true));
 
-/** A light, vertical wash of grey: neutral behind any colour, and light enough for dark models. */
-function backdrop() {
+/** Neutral vertical studio backdrop (light or dark) with near-zero chroma so colours stay true. */
+function backdrop(dark) {
   const canvas = document.createElement('canvas');
   canvas.width = 2;
   canvas.height = 256;
   const ctx = canvas.getContext('2d');
   const gradient = ctx.createLinearGradient(0, 0, 0, 256);
-  gradient.addColorStop(0, '#f1f2f4');
-  gradient.addColorStop(1, '#c6cad1');
+  if (dark) {
+    gradient.addColorStop(0, '#1f232b');
+    gradient.addColorStop(1, '#111419');
+  } else {
+    gradient.addColorStop(0, '#f1f2f4');
+    gradient.addColorStop(1, '#c6cad1');
+  }
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, 2, 256);
   const texture = new CanvasTexture(canvas);
   texture.colorSpace = SRGBColorSpace;
   return texture;
 }
+
+function applyStage(dark) {
+  stageDark = Boolean(dark);
+  document.documentElement.dataset.stage = stageDark ? 'dark' : 'light';
+  scene.background = stageDark ? darkBackdrop : lightBackdrop;
+  if (btnStage) {
+    btnStage.setAttribute('aria-pressed', String(stageDark));
+    btnStage.textContent = stageDark ? 'Light' : 'Dark';
+  }
+  if (shown?.grid) {
+    const oldGrid = shown.grid;
+    const { centre, radius, box } = shown;
+    const extent = Math.max(box.max.x - box.min.x, box.max.z - box.min.z, radius);
+    const nextGrid = new GridHelper(extent * 2.5, 10, stageDark ? 0x4b5568 : 0x9aa0aa, stageDark ? 0x2d3544 : 0xb4b9c1);
+    nextGrid.position.set(centre.x, box.min.y, centre.z);
+    nextGrid.material.transparent = true;
+    nextGrid.material.opacity = stageDark ? 0.5 : 0.55;
+    nextGrid.visible = gridOn;
+    scene.remove(oldGrid);
+    scene.add(nextGrid);
+    shown.grid = nextGrid;
+  }
+  draw();
+}
+
+function applyWireframe(on) {
+  wireframeOn = Boolean(on);
+  if (btnWire) btnWire.setAttribute('aria-pressed', String(wireframeOn));
+  if (!shown?.root) return;
+  shown.root.traverse((node) => {
+    if (!node.isMesh || !node.material) return;
+    for (const mat of Array.isArray(node.material) ? node.material : [node.material]) {
+      if (!mat || !('wireframe' in mat)) continue;
+      if (!originalWireframes.has(mat)) originalWireframes.set(mat, Boolean(mat.wireframe));
+      mat.wireframe = wireframeOn ? true : originalWireframes.get(mat);
+    }
+  });
+  draw();
+}
+
+btnReset?.addEventListener('click', () => {
+  if (!shown) return;
+  aim(camera, 35, 20, window.innerWidth / window.innerHeight);
+  controls.target.copy(shown.centre);
+  controls.update();
+  draw();
+});
+btnWire?.addEventListener('click', () => applyWireframe(!wireframeOn));
+btnGrid?.addEventListener('click', () => {
+  gridOn = !gridOn;
+  btnGrid.setAttribute('aria-pressed', String(gridOn));
+  if (shown?.grid) {
+    shown.grid.visible = gridOn;
+    draw();
+  }
+});
+btnStage?.addEventListener('click', () => applyStage(!stageDark));
 
 /** What is shown: the model, where it sits and how far to stand back from it. */
 let shown = null;
@@ -256,7 +331,14 @@ function measure(root, gltf, path, bytes) {
     `Materials: ${materials.size} (${[...new Set(kinds)].join('; ') || 'none'})`,
     `Animations: ${gltf.animations.length ? gltf.animations.map((a) => a.name || 'unnamed').join(', ') : 'none'}`,
   ];
-  return { text: lines.join('\n'), centre, radius: box.getBoundingSphere(new Sphere()).radius || 0.5, box };
+  const shortNum = (v) => (v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 10_000 ? `${(v / 1000).toFixed(1)}k` : n(v));
+  return {
+    text: lines.join('\n'),
+    pill: `${shortNum(triangles)} tris · ${n(meshes)} ${meshes === 1 ? 'mesh' : 'meshes'}`,
+    centre,
+    radius: box.getBoundingSphere(new Sphere()).radius || 0.5,
+    box,
+  };
 }
 
 /** Shows the model, fitted to the view from a three-quarter angle, over a faint floor grid. */
@@ -264,14 +346,21 @@ function show(root, facts) {
   if (shown) scene.remove(shown.root, shown.grid);
   const { centre, radius, box } = facts;
   const extent = Math.max(box.max.x - box.min.x, box.max.z - box.min.z, radius);
-  const grid = new GridHelper(extent * 2.5, 10, 0x9aa0aa, 0xb4b9c1);
+  const grid = new GridHelper(extent * 2.5, 10, stageDark ? 0x4b5568 : 0x9aa0aa, stageDark ? 0x2d3544 : 0xb4b9c1);
   grid.position.set(centre.x, box.min.y, centre.z);
   grid.material.transparent = true;
-  grid.material.opacity = 0.55;
+  grid.material.opacity = stageDark ? 0.5 : 0.55;
+  grid.visible = gridOn;
   scene.add(root, grid);
   key.position.set(centre.x + radius * 3, centre.y + radius * 5, centre.z + radius * 4);
   key.target.position.copy(centre);
   shown = { root, grid, centre, radius, box, text: facts.text };
+  if (wireframeOn) applyWireframe(true);
+  if (statsEl) {
+    statsEl.textContent = facts.pill;
+    statsEl.hidden = false;
+  }
+  if (hudEl) hudEl.hidden = false;
   aim(camera, 35, 20, window.innerWidth / window.innerHeight);
   controls.target.copy(centre);
   controls.minDistance = radius * 0.2;
@@ -383,7 +472,12 @@ window.addEventListener('message', async (event) => {
   if (event.source !== parentWindow || !data) return;
   if (data.type === 'modelview:init') {
     port = event.ports[0] || null;
+    if (data.theme === 'dark' || data.theme === 'light') applyStage(data.theme === 'dark');
     start(data);
+    return;
+  }
+  if (data.type === 'modelview:theme' && (data.theme === 'dark' || data.theme === 'light')) {
+    applyStage(data.theme === 'dark');
     return;
   }
   if (data.__oaiyAgent !== true || typeof data.id !== 'number') return;

@@ -67,7 +67,7 @@ export function repairDanglingToolCalls(
         ...next.results,
         ...missing.map((call) => makeRepairResult(call, cause, startedCallIds?.has(call.id) ?? false)),
       ];
-      out.push({ role: 'tool', results: patchedResults });
+      out.push({ ...next, results: patchedResults });
       i++; // consumed next
     } else {
       mutated = true;

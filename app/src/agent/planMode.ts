@@ -20,6 +20,12 @@ export const PLAN_MODE_RESTRICTED_TOOLS = new Set([
   'code_run',
   'sandbox_shell',
   'sqlite_execute',
+  'delegate',
+  'softn_import',
+  'softn_interact',
+  'page_interact',
+  'video_frames',
+  'create_voice',
   'generate_image',
   'generate_video',
   'generate_speech',
@@ -31,6 +37,23 @@ export const PLAN_MODE_RESTRICTED_TOOLS = new Set([
   'media_compose',
   'video_split',
 ]);
+
+/** Call-aware Plan Mode restriction check (also blocks mutating options and session tools). */
+export function isToolBlockedInPlanMode(
+  name: string,
+  input?: Record<string, unknown>,
+  sessionToolNames?: ReadonlySet<string>,
+): boolean {
+  if (PLAN_MODE_RESTRICTED_TOOLS.has(name)) return true;
+  if (sessionToolNames?.has(name)) return true;
+  if (name === 'softn_examples' && typeof input?.install_to === 'string' && input.install_to.trim().length > 0) {
+    return true;
+  }
+  if (name === 'preview_screenshot' && typeof input?.save_to === 'string' && input.save_to.trim().length > 0) {
+    return true;
+  }
+  return false;
+}
 
 export const EXIT_PLAN_MODE_SPEC: ToolSpec = {
   name: EXIT_PLAN_MODE_TOOL,
@@ -71,6 +94,41 @@ export const PLAN_MODE_ENTER_NOTE =
 
 export const PLAN_MODE_EXIT_NOTE =
   '[OAIY Plan Mode: INACTIVE]\nPlan Mode is now off. You may proceed with file edits and implementation tools.';
+
+/** Reconstruct Plan Mode state after loading saved conversation turns. */
+export function planModeAfter(
+  turns: readonly {
+    role: string;
+    text?: string;
+    automatic?: boolean;
+    summary?: boolean;
+    results?: ReadonlyArray<{ name: string; isError: boolean; content: string }>;
+  }[],
+): {
+  active: boolean;
+  entered: boolean;
+} {
+  let active = false;
+  let entered = false;
+  for (const t of turns) {
+    if (t.role === 'user' && t.automatic === true && !t.summary && typeof t.text === 'string') {
+      if (t.text.startsWith('[OAIY Plan Mode: ACTIVE]')) {
+        active = true;
+        entered = true;
+      } else if (t.text.startsWith('[OAIY Plan Mode: INACTIVE]')) {
+        active = false;
+      }
+    } else if (t.role === 'tool' && Array.isArray(t.results)) {
+      for (const r of t.results) {
+        if (r.name === EXIT_PLAN_MODE_TOOL && !r.isError && r.content.includes('Plan Mode is now OFF')) {
+          active = false;
+          entered = true;
+        }
+      }
+    }
+  }
+  return { active, entered };
+}
 
 export function planModeBlockedMessage(toolName: string): string {
   return (

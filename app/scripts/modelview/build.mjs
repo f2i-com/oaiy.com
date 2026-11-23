@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..', '..');
 const SOURCE = join(here, 'viewer.js');
+const THREE_HOST_SOURCE = join(here, 'three-host-entry.js');
 const THREE = join(root, 'node_modules', 'three', 'package.json');
 
 /** Writes `out` (public/modelview/model-viewer.js) unless it is newer than what it is built from. */
@@ -37,6 +38,28 @@ export async function buildViewer(out = join(root, 'public', 'modelview', 'model
   return true;
 }
 
+/** Writes `out` (public/webpage/three-host.js) unless it is newer than what it is built from. */
+export async function buildThreeHost(out = join(root, 'public', 'webpage', 'three-host.js')) {
+  const stamp = `/* three-host ${JSON.parse(readFileSync(THREE, 'utf8')).version} */\n`;
+  if (existsSync(out) && statSync(out).mtimeMs >= statSync(THREE_HOST_SOURCE).mtimeMs && readFileSync(out, 'utf8').startsWith(stamp)) return false;
+  const { build } = await import('rolldown');
+  const result = await build({
+    input: THREE_HOST_SOURCE,
+    cwd: root,
+    logLevel: 'warn',
+    write: false,
+    output: { format: 'iife', minify: true, codeSplitting: false },
+  });
+  const chunk = result.output.find((o) => o.type === 'chunk');
+  if (!chunk) throw new Error('the webpage Three.js host runtime did not build');
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, stamp + chunk.code);
+  return true;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  buildViewer().then((built) => console.log(built ? 'built public/modelview/model-viewer.js' : 'public/modelview/model-viewer.js is up to date'));
+  Promise.all([buildViewer(), buildThreeHost()]).then(([builtViewer, builtThree]) => {
+    console.log(builtViewer ? 'built public/modelview/model-viewer.js' : 'public/modelview/model-viewer.js is up to date');
+    console.log(builtThree ? 'built public/webpage/three-host.js' : 'public/webpage/three-host.js is up to date');
+  });
 }

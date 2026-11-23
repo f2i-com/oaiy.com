@@ -478,6 +478,78 @@ fn configured(cfg: &Json, group: &str, id: &str) -> bool {
     }
 }
 
+/// Whether `cfg` already configures catalog entry `e` under its exact id OR (for LLMs registered with a
+/// quantization suffix like `gemma-4-31b-it-q4-k-m`) with a `model_path` matching `e.add[0]`'s filename.
+fn configured_entry(cfg: &Json, e: &Json) -> bool {
+    let id = str_or(e, "id", "");
+    let group = str_or(e, "group", "");
+    if configured(cfg, group, id) {
+        return true;
+    }
+    if group == "llm" {
+        let first_name = strings(e.get("add"))
+            .into_iter()
+            .next()
+            .and_then(|rel| Path::new(&rel).file_name().map(|s| s.to_string_lossy().to_ascii_lowercase()));
+        if let Some(want) = first_name {
+            return cfg
+                .get("llm")
+                .and_then(|l| l.get("models"))
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .any(|m| {
+                    let p = str_or(m, "model_path", "");
+                    !p.is_empty()
+                        && Path::new(p)
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&want))
+                });
+        }
+    }
+    false
+}
+
+/// The gated repository URL where a gated catalog model's licence is accepted: prefers a part explicitly
+/// marked `"gated": true` (e.g. DINOv3 for Pixal3D and TRELLIS.2), falling back to the first repo part.
+fn licence_url_of(e: &Json) -> Option<String> {
+    if !e.get("gated").and_then(Json::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let parts = e.get("parts").and_then(Json::as_array)?;
+    let repo = parts
+        .iter()
+        .find(|p| p.get("gated").and_then(Json::as_bool).unwrap_or(false) && !str_or(p, "repo", "").is_empty())
+        .or_else(|| parts.iter().find(|p| !str_or(p, "repo", "").is_empty()))
+        .map(|p| str_or(p, "repo", ""))?;
+    Some(format!("https://huggingface.co/{repo}"))
+}
+
+/// Compact capability tags derived from a catalog entry before `parts`/`add` are stripped for the UI.
+fn capability_tags(e: &Json) -> Vec<Json> {
+    let id = str_or(e, "id", "");
+    let group = str_or(e, "group", "");
+    let mut tags = Vec::new();
+    if e.get("agent_tools").and_then(Json::as_bool).unwrap_or(false) {
+        tags.push(Json::str("tools"));
+    }
+    if group == "llm" && id != "gemma-3-4b" {
+        let adds = strings(e.get("add"));
+        let has_vision = adds.iter().any(|a| a.to_ascii_lowercase().contains("mmproj"))
+            || id == "inkling-2-mini-safetensors";
+        if has_vision {
+            tags.push(Json::str("vision"));
+        }
+    }
+    if id.contains("3d-coder") {
+        tags.push(Json::str("3d-code"));
+    }
+    if group == "model3d" {
+        tags.push(Json::str("glb"));
+    }
+    tags
+}
+
 /// Whether the files a finished part's marker lists (relative to `dir`) are all still there. A file deleted since (to
 /// make room, by a virus scanner, by a sync tool) made a model read as downloaded that could not be used, added again
 /// or discarded, with nothing in OAIY to repair it: such a part reads as partly downloaded, which Resume completes by
@@ -1191,13 +1263,15 @@ impl Downloads {
                     Json::Obj(f) => f.clone(),
                     _ => Vec::new(),
                 };
-                // (a gated model's page, where its licence is accepted: its first part's repository)
-                let licence = e.get("gated").and_then(Json::as_bool).unwrap_or(false).then(|| {
-                    e.get("parts").and_then(Json::as_array).and_then(|p| p.iter().map(|p| str_or(p, "repo", "")).find(|r| !r.is_empty())).map(|r| format!("https://huggingface.co/{r}"))
-                }).flatten();
+                // (a gated model's page, where its licence is accepted: prefers a part marked `"gated": true`)
+                let licence = licence_url_of(e);
+                let tags = capability_tags(e);
                 o.retain(|(k, _)| k != "parts" && k != "add");
                 if let Some(url) = licence {
                     o.push(("licence_url".into(), Json::str(url)));
+                }
+                if !tags.is_empty() {
+                    o.push(("tags".into(), Json::Arr(tags)));
                 }
                 let d = list.iter().find(|d| d.id == id);
                 // (with no download of it listed, where it is: where downloads go, else a folder they went to before)
@@ -1221,9 +1295,9 @@ impl Downloads {
                 if where_ != dir {
                     o.push(("at".into(), Json::str(where_.to_string_lossy())));
                 }
-                // (a model of that name in the settings already, added from wherever its files are: said, so its card
+                // (a model of that name or filename in the settings already, added from wherever its files are: said, so its card
                 // does not only offer to download it)
-                o.push(("configured".into(), Json::Bool(!have && configured(&cfg, str_or(e, "group", ""), id))));
+                o.push(("configured".into(), Json::Bool(!have && configured_entry(&cfg, e))));
                 o.push(("download".into(), d.map_or(Json::Null, Download::to_json)));
                 Json::Obj(o)
             })
@@ -2089,7 +2163,7 @@ fn needed_part_missing(section: &str, m: &Json) -> bool {
         "image" | "video" => !registry::missing_fields(section, m).is_empty(),
         "speech" => empty("design") && empty("base") && empty("breeze"),
         "music" | "sound" => empty("path"),
-        "model3d" => ["path", "dino", "naf"].iter().any(|k| empty(k)),
+        "model3d" => empty("path") || empty("dino") || (registry::model3d_needs_naf(m) && empty("naf")),
         _ => false,
     }
 }
@@ -2119,12 +2193,26 @@ mod tests {
     /// A model already in the settings under the catalog's name, added from wherever its files are, is said to be so.
     #[test]
     fn a_model_in_the_settings_by_the_catalogs_name_is_said_to_be_there() {
-        let cfg = Json::parse(br#"{"llm":{"models":[{"name":"qwen3.5-9b"}]},"media":{"image":{"models":{"qwen-image-2.1-turbo":{}}}}}"#).unwrap();
+        let cfg = Json::parse(br#"{"llm":{"models":[{"name":"qwen3.5-9b"},{"name":"gemma-4-31b-it-q4-k-m","model_path":"C:/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"}]},"media":{"image":{"models":{"qwen-image-2.1-turbo":{}}}}}"#).unwrap();
         assert!(configured(&cfg, "llm", "qwen3.5-9b"));
         assert!(configured(&cfg, "image", "qwen-image-2.1-turbo"));
         assert!(!configured(&cfg, "image", "flux-3-image-klein"));
         assert!(!configured(&cfg, "video", "qwen-image-2.1-turbo"), "another kind's model of that name is not it");
         assert!(!configured(&cfg, "llm", ""));
+        let gemma31 = entry("gemma-4-31b").expect("gemma-4-31b in catalog");
+        assert!(configured_entry(&cfg, gemma31), "GGUF registered with quant suffix matches via filename");
+        let gemma26 = entry("gemma-4-26b-a4b").expect("gemma-4-26b-a4b in catalog");
+        assert!(!configured_entry(&cfg, gemma26));
+    }
+
+    #[test]
+    fn licence_url_prefers_explicitly_gated_part() {
+        let pixal = entry("pixal3d").expect("pixal3d in catalog");
+        let trellis = entry("trellis2-4b").expect("trellis2-4b in catalog");
+        let flux3 = entry("flux-3-image-klein").expect("flux-3-image-klein in catalog");
+        assert_eq!(licence_url_of(pixal).as_deref(), Some("https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
+        assert_eq!(licence_url_of(trellis).as_deref(), Some("https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"));
+        assert_eq!(licence_url_of(flux3).as_deref(), Some("https://huggingface.co/black-forest-labs/flux-3-image-klein"));
     }
 
     #[test]

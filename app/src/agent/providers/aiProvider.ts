@@ -433,27 +433,31 @@ async function providerRequest<T>(
     });
 
     if (!resp.ok) {
-      const text = (await resp.text()).slice(0, 500);
+      // Read up to 16 KB so structured JSON error payloads (`error.message`, `error.code`, sign-in notices)
+      // are never truncated mid-object before parsing, while keeping fallback display snippets compact.
+      const raw = (await resp.text()).slice(0, 16_384);
+      const text = raw.slice(0, 500);
       controller.signal.throwIfAborted();
       if (resp.status === 429) {
         const retryAfterMs = parseRetryAfter(resp.headers.get('retry-after'));
+        const detail = providerMessage(raw);
         throw new AIProviderError(
           'rate-limited',
-          `The provider is rate-limiting requests${retryAfterMs !== undefined ? `; it asked for a wait of ${Math.ceil(retryAfterMs / 1000)} s` : ''}. ${text}`.trim(),
-          { status: 429, retryAfterMs },
+          `The provider is rate-limiting requests${retryAfterMs !== undefined ? `; it asked for a wait of ${Math.ceil(retryAfterMs / 1000)} s` : ''}. ${detail ?? text}`.trim(),
+          { status: 429, retryAfterMs, detail: detail ?? text, code: providerCode(raw) },
         );
       }
-      const detail = providerMessage(text);
+      const detail = providerMessage(raw);
       // OAIY's ChatGPT connector, signed out: where to sign in, said plainly (nothing else is tried instead).
-      if (signInNeeded(text)) throw new AIProviderError('http', CHATGPT_SIGN_IN, { status: resp.status, detail: detail ?? text });
-      const code = providerCode(text);
+      if (signInNeeded(raw)) throw new AIProviderError('http', CHATGPT_SIGN_IN, { status: resp.status, detail: detail ?? text });
+      const code = providerCode(raw);
       const said = describeConnectionError(kindForStatus(resp.status), { ...errorContext(provider, url), detail }, resp.status);
       // An overload that passes, said with a status: waited for and asked again as a rate limit is (and as the same
       // overload said inside a stream is). Anthropic's 529 overloaded_error; OAIY's engine busy with other pictures (503
       // `busy`); a 503 that says it is overloaded, or when to come back. Not a 503 that will not pass by waiting (OAIY's
       // model worker stopped: `unavailable`).
       const retryAfterMs = parseRetryAfter(resp.headers.get('retry-after'));
-      const overloaded = resp.status === 529 || (resp.status === 503 && code !== 'unavailable' && (code === 'busy' || retryAfterMs !== undefined || /overloaded/i.test(text)));
+      const overloaded = resp.status === 529 || (resp.status === 503 && code !== 'unavailable' && (code === 'busy' || retryAfterMs !== undefined || /overloaded/i.test(raw)));
       if (overloaded) throw new AIProviderError('rate-limited', said, { status: resp.status, retryAfterMs, detail: detail ?? text, code });
       throw new AIProviderError('http', said, { status: resp.status, detail: detail ?? text, code });
     }

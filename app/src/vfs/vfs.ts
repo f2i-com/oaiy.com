@@ -91,6 +91,12 @@ export class Vfs {
   private listeners = new Set<(change: VfsChange) => void>();
   /** Every write gets the next number, so a version is never reused. */
   private clock = 0;
+  /** Monotonic mutation counter bumped on every VFS change (for O(1) cache invalidation). */
+  private _revision = 0;
+
+  get revision(): number {
+    return this._revision;
+  }
 
   onChange(listener: (change: VfsChange) => void): () => void {
     this.listeners.add(listener);
@@ -98,6 +104,7 @@ export class Vfs {
   }
 
   private emit(change: VfsChange): void {
+    this._revision++;
     for (const listener of this.listeners) listener(change);
   }
 

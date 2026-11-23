@@ -411,6 +411,34 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
     </Fragment>
   );
 
+  const showFlowRuntimeNote = Boolean(runtime && !runtime.ready);
+  const showNoProviderNote = provs !== null && provs.length === 0 && !codexConnected;
+  const showNoPluginsNote = plug !== null && plug.length === 0;
+  const showUntrustedNotes = untrusted.length > 0;
+  const showNoRunningPluginNote = plug !== null && plug.length > 0 && runningPlug === 0 && untrusted.length < plug.length;
+  const showNoRunningServiceNote = svc !== null && svc.length > 0 && runningSvc === 0;
+  const showNoReadyProviderNote = provs !== null && provs.length > 0 && readyProv === 0;
+  const showAllClearNote = Boolean(
+    runtime?.ready &&
+      provs !== null &&
+      plug !== null &&
+      svc !== null &&
+      readyProv > 0 &&
+      crashedPlug.length === 0 &&
+      needRepair.length === 0 &&
+      untrusted.length === 0 &&
+      (plug.length === 0 || runningPlug > 0),
+  );
+  const hasNextSteps =
+    showFlowRuntimeNote ||
+    showNoProviderNote ||
+    showNoPluginsNote ||
+    showUntrustedNotes ||
+    showNoRunningPluginNote ||
+    showNoRunningServiceNote ||
+    showNoReadyProviderNote ||
+    showAllClearNote;
+
   return (
     <div className={notAnswering ? 'panel is-stale' : 'panel'}>
       {[
@@ -611,23 +639,25 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
       // Anything actionable, rather than making the user hunt for it. While the
       // setup guide is open it covers this same ground, so only one shows.
-      !guideShown && (svc !== null || plug !== null || provs !== null) && (
+      // Omit the section entirely when none of its notes apply (e.g., when a
+      // dedicated top-level repair/crash banner already covers the state).
+      !guideShown && hasNextSteps && (
         <section className="service-section" key="next-steps">
           <div className="section-title-row">
             <h3 className="section-title">Next steps</h3>
           </div>
-          {runtime && !runtime.ready && (
+          {showFlowRuntimeNote && (
             <div className="datadir-note datadir-row">
               <span>
                 <TriangleAlert size={13} /> Flows cannot run on this computer —{' '}
-                {runtime.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
+                {runtime?.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
               </span>
               {/* When the only thing missing is Node, fixing it is one click —
                   don't make the user go and install a runtime by hand. */}
               {installNode}
             </div>
           )}
-          {provs !== null && provs.length === 0 && !codexConnected && (
+          {showNoProviderNote && (
             <div className="datadir-note datadir-row">
               <span>No AI provider configured — flows have no chat model to call.</span>
               <button className="btn-tiny" onClick={() => onNavigate('providers')}>
@@ -635,7 +665,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </button>
             </div>
           )}
-          {plug !== null && plug.length === 0 && (
+          {showNoPluginsNote && (
             <div className="datadir-note datadir-row">
               <span>No plugins installed — connectors and device events come from plugins.</span>
               <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
@@ -653,7 +683,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </button>
             </div>
           ))}
-          {plug !== null && plug.length > 0 && runningPlug === 0 && untrusted.length < plug.length && (
+          {showNoRunningPluginNote && (
             <div className="datadir-note datadir-row">
               <span>No plugin is running — their connectors are unavailable to flows.</span>
               <button className="btn-tiny" onClick={() => onNavigate('plugins')}>
@@ -661,7 +691,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </button>
             </div>
           )}
-          {svc !== null && svc.length > 0 && runningSvc === 0 && (
+          {showNoRunningServiceNote && (
             <div className="datadir-note datadir-row">
               <span>No local service is running — local models are offline.</span>
               <button className="btn-tiny" onClick={() => onNavigate('services')}>
@@ -669,33 +699,23 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </button>
             </div>
           )}
-          {provs !== null &&
-            provs.length > 0 &&
-            readyProv === 0 && (
-              <div className="datadir-note datadir-row">
-                <span>Every AI provider is disabled or missing a key.</span>
-                <button className="btn-tiny" onClick={() => onNavigate('providers')}>
-                  <Sparkles size={13} /> Fix providers
-                </button>
-              </div>
-            )}
+          {showNoReadyProviderNote && (
+            <div className="datadir-note datadir-row">
+              <span>Every AI provider is disabled or missing a key.</span>
+              <button className="btn-tiny" onClick={() => onNavigate('providers')}>
+                <Sparkles size={13} /> Fix providers
+              </button>
+            </div>
+          )}
           {/* The all-clear, so the screen is never ambiguous about being fine. */}
-          {runtime?.ready &&
-            provs !== null &&
-            plug !== null &&
-            svc !== null &&
-            readyProv > 0 &&
-            crashedPlug.length === 0 &&
-            needRepair.length === 0 &&
-            untrusted.length === 0 &&
-            (plug.length === 0 || runningPlug > 0) && (
-              <div className="datadir-note datadir-row">
-                <span>
-                  <CircleDot size={13} /> Ready — {readyProv} provider{readyProv === 1 ? '' : 's'} and{' '}
-                  {runningPlug} plugin{runningPlug === 1 ? '' : 's'} available to your flows.
-                </span>
-              </div>
-            )}
+          {showAllClearNote && (
+            <div className="datadir-note datadir-row">
+              <span>
+                <CircleDot size={13} /> Ready — {readyProv} provider{readyProv === 1 ? '' : 's'} and{' '}
+                {runningPlug} plugin{runningPlug === 1 ? '' : 's'} available to your flows.
+              </span>
+            </div>
+          )}
         </section>
       ),
 

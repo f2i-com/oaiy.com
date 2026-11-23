@@ -31,6 +31,106 @@
   const BUDGET = 400_000_000;
   const post = (message, transfer) => parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*', transfer || []);
   const nativeConsole = { log: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console) };
+  const threeHost = window.__oaiyAgentThree || null;
+  const objectBlobs = new Map();
+  const MAX_OBJECT_BLOBS = 64;
+  const handleObjects = new WeakSet();
+  const threeCallables = new Map();
+  const BLOCKED_STATIC_PROPS = new Set(['__proto__', 'constructor', 'prototype', 'call', 'apply', 'bind', 'arguments', 'caller']);
+  let lastUserGestureAt = 0;
+  const markUserGesture = (event) => {
+    if (event && event.isTrusted) lastUserGestureAt = Date.now();
+  };
+  window.addEventListener('pointerdown', markUserGesture, true);
+  window.addEventListener('click', markUserGesture, true);
+  window.addEventListener('keydown', markUserGesture, true);
+
+  // --- bundled offline Three.js module resolver ----------------------------------
+
+  const resolveThreeModule = (rawSpec, importMap) => {
+    if (!threeHost || !rawSpec) return null;
+    let spec = String(rawSpec).trim();
+    if (importMap && typeof importMap === 'object') {
+      if (typeof importMap[spec] === 'string') spec = importMap[spec];
+      else {
+        for (const [k, v] of Object.entries(importMap)) {
+          if (typeof v === 'string' && k.endsWith('/') && spec.startsWith(k)) {
+            spec = v + spec.slice(k.length);
+            break;
+          }
+        }
+      }
+    }
+    if (spec === 'three' || /(?:^|\/)three(?:\.module|\.core)?(?:\.min)?\.m?js(?:[?#]|$)/i.test(spec) || /\/three(?:@[^/]+)?\/?$/i.test(spec)) {
+      return 'three';
+    }
+    const clean = spec.replace(/[?#].*$/, '');
+    const addons = [
+      [/OrbitControls\.m?js$/i, 'three/addons/controls/OrbitControls.js'],
+      [/GLTFExporter\.m?js$/i, 'three/addons/exporters/GLTFExporter.js'],
+      [/GLTFLoader\.m?js$/i, 'three/addons/loaders/GLTFLoader.js'],
+      [/RoomEnvironment\.m?js$/i, 'three/addons/environments/RoomEnvironment.js'],
+      [/RoundedBoxGeometry\.m?js$/i, 'three/addons/geometries/RoundedBoxGeometry.js'],
+      [/BufferGeometryUtils\.m?js$/i, 'three/addons/utils/BufferGeometryUtils.js'],
+      [/EffectComposer\.m?js$/i, 'three/addons/postprocessing/EffectComposer.js'],
+      [/RenderPass\.m?js$/i, 'three/addons/postprocessing/RenderPass.js'],
+      [/UnrealBloomPass\.m?js$/i, 'three/addons/postprocessing/UnrealBloomPass.js'],
+      [/OutputPass\.m?js$/i, 'three/addons/postprocessing/OutputPass.js'],
+    ];
+    for (const [re, canonical] of addons) {
+      if (re.test(clean)) return canonical;
+    }
+    return null;
+  };
+
+  /** Rewrite ES module imports for bundled Three.js modules into `__zdom_import(...)` calls inside Zipp. */
+  const rewriteThreeModule = (code, importMap) => {
+    let rewritten = false;
+    let modIdx = 0;
+    const importRe = /^([ \t]*)import\s+([^;]*?)\s+from\s+['"]([^'"]+)['"]\s*;?/gm;
+    const out = code.replace(importRe, (full, indent, clause, rawSpec) => {
+      const canonical = resolveThreeModule(rawSpec, importMap);
+      if (!canonical) return full;
+      rewritten = true;
+      const specLit = JSON.stringify(canonical);
+      const trimmed = clause.trim();
+      const nsMatch = /^\*\s+as\s+([A-Za-z_$][\w$]*)$/.exec(trimmed);
+      if (nsMatch) return `${indent}const ${nsMatch[1]} = __zdom_import(${specLit});`;
+      const namedOnly = /^\{([\s\S]*)\}$/.exec(trimmed);
+      if (namedOnly) {
+        const bindings = namedOnly[1].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
+        return `${indent}const {${bindings}} = __zdom_import(${specLit});`;
+      }
+      const defAndNamed = /^([A-Za-z_$][\w$]*)\s*,\s*\{([\s\S]*)\}$/.exec(trimmed);
+      if (defAndNamed) {
+        const tmp = `__threeMod_${++modIdx}`;
+        const bindings = defAndNamed[2].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
+        return `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defAndNamed[1]} = ${tmp}.default || ${tmp}; const {${bindings}} = ${tmp};`;
+      }
+      const defOnly = /^([A-Za-z_$][\w$]*)$/.exec(trimmed);
+      if (defOnly) {
+        const tmp = `__threeMod_${++modIdx}`;
+        return `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defOnly[1]} = ${tmp}.default || ${tmp};`;
+      }
+      return full;
+    });
+    return { code: out, rewritten };
+  };
+
+  const emitBlobDownload = (anchor, directTrusted = false) => {
+    if (!(anchor instanceof HTMLAnchorElement)) return false;
+    const download = anchor.getAttribute('download');
+    const href = anchor.getAttribute('href') || anchor.href || '';
+    if (download === null || !href.startsWith('blob:')) return false;
+    const blob = objectBlobs.get(href);
+    if (!blob) return false;
+    const filename = download.trim() || 'export.bin';
+    const userInitiated = Boolean(directTrusted) || (Date.now() - lastUserGestureAt < 5000);
+    blob.arrayBuffer().then((buf) => {
+      post({ type: 'bot:download', filename, mime: blob.type || 'application/octet-stream', bytes: new Uint8Array(buf), userInitiated }, [buf]);
+    }).catch(() => {});
+    return true;
+  };
 
   let port = null;
   let engine = null;
@@ -142,13 +242,27 @@
     if (!types) listening.set(el, (types = new Set()));
     types.add(type);
   };
-  const adopt = (root, base, scripts) => {
+  const adopt = (root, base, scripts, importMap) => {
     const handlers = [];
     const elements = root.nodeType === 1 ? [root, ...root.querySelectorAll('*')] : [...root.querySelectorAll('*')];
     for (const el of elements) {
       const tag = el.localName;
       if (tag === 'script') {
         const type = (el.getAttribute('type') || '').trim();
+        if (/^importmap$/i.test(type)) {
+          if (importMap) {
+            try {
+              const parsed = JSON.parse(el.textContent || '{}');
+              if (parsed && parsed.imports && typeof parsed.imports === 'object') {
+                Object.assign(importMap, parsed.imports);
+              }
+            } catch {
+              /* ignore malformed importmap */
+            }
+          }
+          el.remove();
+          continue;
+        }
         if (JS_TYPES.test(type)) {
           if (scripts) {
             const src = el.getAttribute('src');
@@ -225,7 +339,15 @@
     if (depth > 6) return null;
     if (Array.isArray(v) || isCollection(v)) return Array.from(v, (x) => toGuest(x, depth + 1));
     if (ArrayBuffer.isView(v) && !(v instanceof DataView)) return { $ta: v.constructor.name, d: Array.from(v) };
-    if (v instanceof ArrayBuffer) return { $ta: 'ArrayBuffer', d: Array.from(new Uint8Array(v)) };
+    if (v instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(v);
+      if (bytes.byteLength > 1024) {
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        return { $ab: btoa(bin) };
+      }
+      return { $ta: 'ArrayBuffer', d: Array.from(bytes) };
+    }
     if (v instanceof Date) return { $date: v.getTime() };
     if (v instanceof Promise) {
       const id = nextPromise++;
@@ -236,6 +358,7 @@
       );
       return { $p: id };
     }
+    if (handleObjects.has(v)) return { $h: handle(v), c: chainOf(v) };
     const proto = Object.getPrototypeOf(v);
     if (proto === Object.prototype || proto === null) {
       const out = {};
@@ -271,6 +394,12 @@
     if (v.$f !== undefined) return guestFn(v.$f);
     if (v.$num !== undefined) return Number(v.$num);
     if (v.$date !== undefined) return new Date(v.$date);
+    if (v.$ab !== undefined) {
+      const bin = atob(v.$ab);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    }
     if (v.$ta !== undefined) return v.$ta === 'ArrayBuffer' ? new Uint8Array(v.d).buffer : new (TYPED[v.$ta] || Uint8Array)(v.d);
     const out = {};
     for (const k of Object.keys(v)) out[k] = fromGuest(v[k]);
@@ -430,6 +559,22 @@
       if (isBlockedProp(obj, prop)) return undefined;
       const val = obj[prop];
       if (isForbiddenHostVal(val)) return undefined;
+      if (val && typeof val === 'object' && prop === 'uniforms' && obj && obj.isMaterial) {
+        handleObjects.add(val);
+        for (const k of Object.keys(val)) {
+          if (val[k] && typeof val[k] === 'object') handleObjects.add(val[k]);
+        }
+      } else if (
+        val &&
+        typeof val === 'object' &&
+        prop === 'userData' &&
+        obj &&
+        (obj.isObject3D || obj.isMaterial || obj.isBufferGeometry || obj.isTexture)
+      ) {
+        handleObjects.add(val);
+      } else if (val && typeof val === 'object' && handleObjects.has(obj)) {
+        handleObjects.add(val);
+      }
       return val;
     },
     set(id, prop, value) {
@@ -483,6 +628,7 @@
         for (const node of [...obj.childNodes, ...(parent ? parent.childNodes : [])]) if (!before.has(node)) harvest(node);
         return undefined;
       }
+      if (method === 'click' && emitBlobDownload(obj)) return undefined;
       const result = obj[method](...list);
       if (HTML_METHODS.has(method) && result instanceof Node) harvest(result);
       if (INSERTS.has(method)) for (const arg of list) if (arg instanceof HTMLScriptElement) setTimeout(() => runInserted(arg));
@@ -594,6 +740,86 @@
       const path = resolve(String(url), dirOf(pagePath));
       return path !== null && path in files ? new Blob([files[path]], { type: mimeOf(path) }) : new Blob([]);
     },
+    objectUrl(blob) {
+      const b = fromGuest(blob);
+      if (!(b instanceof Blob)) throw new TypeError('URL.createObjectURL requires a Blob');
+      const url = URL.createObjectURL(b);
+      if (objectBlobs.size >= MAX_OBJECT_BLOBS) {
+        const oldest = objectBlobs.keys().next().value;
+        if (oldest !== undefined) {
+          objectBlobs.delete(oldest);
+          URL.revokeObjectURL(oldest);
+        }
+      }
+      objectBlobs.set(url, b);
+      return url;
+    },
+    revokeObjectUrl(url) {
+      const u = String(url);
+      objectBlobs.delete(u);
+      URL.revokeObjectURL(u);
+      return undefined;
+    },
+    threeMod(spec) {
+      const mod = threeHost?.modules?.[String(spec)];
+      if (!mod) throw new TypeError(`Bundled Three.js module "${spec}" is not available`);
+      const out = {};
+      for (const k of Object.keys(mod)) {
+        const val = mod[k];
+        if (typeof val === 'function') {
+          const key = `${spec}:${k}`;
+          threeCallables.set(key, val);
+          out[k] = { $tc: key, n: val.name || k, ch: val.prototype ? chainOf(val.prototype) : ['Object'] };
+        } else if (val && typeof val === 'object') {
+          handleObjects.add(val);
+          out[k] = { $h: handle(val), c: chainOf(val) };
+        } else {
+          out[k] = toGuest(val);
+        }
+      }
+      return out;
+    },
+    threeNew(key, args) {
+      const C = threeCallables.get(String(key));
+      if (typeof C !== 'function') throw new TypeError(`Unknown Three.js constructor ${key}`);
+      const list = (args || []).map(fromGuest);
+      if (key === 'three:WebGLRenderer') {
+        const opts = list[0] && typeof list[0] === 'object' ? { ...list[0] } : {};
+        if (opts.preserveDrawingBuffer === undefined) opts.preserveDrawingBuffer = true;
+        list[0] = opts;
+      }
+      return new C(...list);
+    },
+    threeCall(key, args) {
+      const fn = threeCallables.get(String(key));
+      if (typeof fn !== 'function') throw new TypeError(`Unknown Three.js function ${key}`);
+      return fn(...(args || []).map(fromGuest));
+    },
+    threeStaticGet(key, prop) {
+      const C = threeCallables.get(String(key));
+      if (!C || typeof prop !== 'string' || BLOCKED_STATIC_PROPS.has(prop) || isBlockedProp(C, prop)) return undefined;
+      let hasSafe = false;
+      for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = Object.getPrototypeOf(cur)) {
+        if (Object.prototype.hasOwnProperty.call(cur, prop)) { hasSafe = true; break; }
+      }
+      if (!hasSafe) return undefined;
+      const val = C[prop];
+      if (isForbiddenHostVal(val)) return undefined;
+      if (val && typeof val === 'object') handleObjects.add(val);
+      return val;
+    },
+    threeStaticCall(key, prop, args) {
+      const C = threeCallables.get(String(key));
+      let hasSafe = false;
+      if (C && typeof prop === 'string' && !BLOCKED_STATIC_PROPS.has(prop) && !isBlockedProp(C, prop)) {
+        for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = Object.getPrototypeOf(cur)) {
+          if (Object.prototype.hasOwnProperty.call(cur, prop)) { hasSafe = true; break; }
+        }
+      }
+      if (!hasSafe || typeof C[prop] !== 'function') throw new TypeError(`${key}.${prop} is not a function`);
+      const res = C[prop](...(args || []).map(fromGuest));
+      return isForbiddenHostVal(res) ? undefined : res;
+    },
   };
 
   const answer = (key) => {
@@ -611,7 +837,7 @@
     let reply;
     try {
       const result = fn(a, b, c);
-      reply = { ok: op === 'window' || op === 'flush' ? result : toGuest(result) };
+      reply = { ok: op === 'window' || op === 'flush' || op === 'threeMod' ? result : toGuest(result) };
     } catch (error) {
       reply = { err: `${error && error.name ? error.name : 'Error'}: ${error && error.message !== undefined ? error.message : error}` };
     } finally {
@@ -632,6 +858,10 @@
     if (event.defaultPrevented || event.button !== 0) return;
     const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
     if (!link) return;
+    if (emitBlobDownload(link, event.isTrusted)) {
+      event.preventDefault();
+      return;
+    }
     const href = link.getAttribute('href') || '';
     if (href.startsWith('#') || href === '') return;
     event.preventDefault();
@@ -662,7 +892,8 @@
     const base = dirOf(pagePath);
     const parsed = new DOMParser().parseFromString(html, 'text/html');
     const scripts = [];
-    const handlers = adopt(parsed.documentElement, base, scripts);
+    const importMap = Object.create(null);
+    const handlers = adopt(parsed.documentElement, base, scripts, importMap);
     // The engine is ready before the page's CSP forbids loading code.
     let glue = null;
     if (scripts.length || handlers.length) {
@@ -704,6 +935,16 @@
       let name = `inline script ${script.line}`;
       if (script.src) {
         name = script.src;
+        const bundledThree = resolveThreeModule(script.src, importMap);
+        if (bundledThree) {
+          const bindCode =
+            bundledThree === 'three'
+              ? 'globalThis.THREE = Object.assign({}, __zdom_import("three"));'
+              : `globalThis.THREE = globalThis.THREE || Object.assign({}, __zdom_import("three")); Object.assign(globalThis.THREE, __zdom_import(${JSON.stringify(bundledThree)}));`;
+          const failed = enter(() => engine.callFunction('__zdom_run', [bindCode, name]));
+          if (typeof failed === 'string') note('error', failed);
+          continue;
+        }
         if (external(script.src)) {
           note('warn', `Not loaded: the script ${script.src}. The preview is offline, so only the project's own scripts run; put a copy in the project and link to it.`);
           continue;
@@ -721,8 +962,15 @@
         continue;
       }
       if (script.module && /^\s*(import|export)\b/m.test(code)) {
-        note('error', `${name}: ES module import/export is not supported in the preview. Use classic scripts (several <script src> in order) that share globals.`);
-        continue;
+        const transformed = rewriteThreeModule(code, importMap);
+        if (transformed.rewritten && !/^\s*(import|export)\b/m.test(transformed.code)) {
+          code = /\bawait\b/.test(transformed.code)
+            ? `(async function () {\n${transformed.code}\n})().catch(function(__e){ console.error('Uncaught ' + (__e && __e.stack ? __e.stack : String(__e))); });`
+            : `(function () {\n${transformed.code}\n})();`;
+        } else {
+          note('error', `${name}: ES module import/export is not supported in the preview (except bundled Three.js imports from 'three' and 'three/addons/...'). Use classic scripts (several <script src> in order) that share globals.`);
+          continue;
+        }
       }
       const failed = enter(() => engine.callFunction('__zdom_run', [code, name]));
       if (typeof failed === 'string') note('error', failed);

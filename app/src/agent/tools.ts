@@ -22,11 +22,13 @@ import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, t
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
 import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, removeBackground, upscaleImage, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
-import { maybeSpillOutput } from './spill';
-import { applyPatchToVfs } from './patch';
+import { maybeSpillOutput, safeTextSlice } from './spill';
+import { applyPatchToVfs, nearestBlockHint, refuseRunaway, runawayNesting } from './patch';
 import { ASK_USER_SPEC, ASK_USER_TOOL } from './askUser';
 import { EXIT_PLAN_MODE_TOOL } from './planMode';
 import { withToolTimeout } from './repair';
+
+export { runawayNesting };
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -174,6 +176,14 @@ export interface PreviewHost {
   readonly target: PreviewTarget | null;
 }
 
+export interface ReadSpanRecord {
+  version: number;
+  callId: string;
+  consecutiveStubs: number;
+  summary: string;
+  bodyChars: number;
+}
+
 export interface ToolContext {
   vfs: Vfs;
   /** Unwrapped project VFS for internal harness bookkeeping (spill storage under `/.oaiy/spill/`). */
@@ -181,6 +191,10 @@ export interface ToolContext {
   gate: NetGate;
   /** Versions of the files read in this conversation: path -> version when read. */
   reads: Map<string, number>;
+  /** Previously read file spans for unchanged-file deduplication (`path\0span` -> record). */
+  readSpans?: Map<string, ReadSpanRecord>;
+  /** Returns whether a previous tool result `callId` is still verbatim (unpruned) in the active context window. */
+  isToolResultActive?: (callId: string) => boolean;
   /** The emulated shell's state, kept between calls. */
   shell: { cwd: string; env: Record<string, string> };
   /** The live preview of SoftN apps and web pages, when the page has one. */
@@ -528,6 +542,7 @@ export const TOOLS: ToolSpec[] = [
         limit: int,
         char_start: { ...int, description: 'Read raw characters from this offset (0-based) instead of lines' },
         char_count: { ...int, description: `How many characters with char_start (default and max ${READ_CHARS})` },
+        force: { type: 'boolean', description: 'Re-read in full even if the file has not changed since you read it earlier' },
       },
     },
   },
@@ -743,8 +758,21 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'grep',
-    description: 'Search file contents with a JavaScript regular expression. Returns path:line: text matches.',
-    parameters: { type: 'object', required: ['pattern'], properties: { pattern: str, path: str, glob: { ...str, description: 'Only files whose name or path matches, e.g. *.ts' }, ignore_case: { type: 'boolean' }, max_results: int } },
+    description: 'Search file contents with a JavaScript regular expression (or literal string when literal: true). Returns matches grouped by file, or matching paths only when files_only: true.',
+    parameters: {
+      type: 'object',
+      required: ['pattern'],
+      properties: {
+        pattern: str,
+        path: str,
+        glob: { ...str, description: 'Only files whose name or path matches, e.g. *.ts' },
+        ignore_case: { type: 'boolean' },
+        literal: { type: 'boolean', description: 'Match pattern as plain literal text instead of regex' },
+        context: { ...int, minimum: 0, maximum: 5, description: 'Lines of surrounding context to include (0-5)' },
+        files_only: { type: 'boolean', description: 'Return only matching file paths' },
+        max_results: int,
+      },
+    },
   },
   {
     name: 'glob',
@@ -1013,48 +1041,6 @@ export function moduleHint(stderr: string, source: string, tool: 'code_run' | 's
   return `${name} is the project's /${path}. Code given to code_run as text runs at the project's root, and changing sys.path does not change where imports are found here: ${byPath ? `import it by its path, ${byPath}. Or ` : ''}write the test as a file beside it (${beside}, which imports ${name} by name) and run that file with code_run's file.`;
 }
 
-/** The times in a row a part that opens more brackets than it closes may come in what a tool writes ([`runawayNesting`]). */
-const NESTED_RUN = 32;
-
-/** Whether text opens more brackets (`(`, `[`, `{`) than it closes. */
-function opensMore(text: string): boolean {
-  let depth = 0;
-  for (const c of text) depth += c === '(' || c === '[' || c === '{' ? 1 : c === ')' || c === ']' || c === '}' ? -1 : 0;
-  return depth > 0;
-}
-
-/**
- * A part of `text` that nests a call or an index inside itself again and again (`dirs.indexOf(dirs.indexOf(…`): what
- * repeats (1 to 32 characters on one line, opening more brackets than it closes), how many times in a row
- * ([`NESTED_RUN`] and more), and the line of `text` it starts on; or null. A reply that ran away writes one (Nanbeige 4.3
- * 33B with its thinking off wrote `dirs.indexOf(` 513 times into a file, which was saved; then wrote the whole file again
- * into the same run). No code means one, and nothing after it can close it, where data that repeats (a list's item, a
- * map's cells) closes what it opens. (OAIY's own engine stops such a reply itself; this is for the others.) Looked for
- * only where the text opens that many more brackets than it closes.
- */
-export function runawayNesting(text: string): { unit: string; times: number; line: number } | null {
-  let depth = 0;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c === 40 || c === 91 || c === 123) depth++;
-    else if (c === 41 || c === 93 || c === 125) depth--;
-  }
-  if (depth < NESTED_RUN) return null;
-  for (const m of text.matchAll(new RegExp(`([^\\n]{1,32}?)\\1{${NESTED_RUN - 1},}`, 'g'))) {
-    const unit = m[1];
-    if (opensMore(unit)) return { unit, times: m[0].length / unit.length, line: text.slice(0, m.index).split('\n').length };
-  }
-  return null;
-}
-
-/** Refuses what a write would put in a file where it nests a call in itself without end ([`runawayNesting`]). */
-function refuseRunaway(text: string): void {
-  const run = runawayNesting(text);
-  if (run) {
-    throw new Error(`nothing was written: what you wrote repeats ${JSON.stringify(run.unit)} ${run.times} times in a row on its line ${run.line}, a call or an index written inside itself again and again, which nothing after it can close (a reply that ran away). Write that part another way: in steps, with a variable or a loop. Write a large file in parts (write_file with the first part, then append_file for each next part).`);
-  }
-}
-
 function cut(text: string, max = OUTPUT_CHARS): string {
   if (text.length <= max) return text;
   const head = text.slice(0, Math.floor(max * 0.7));
@@ -1114,35 +1100,89 @@ function timeoutOf(input: Record<string, unknown>): number {
   return Math.min(Math.max(Math.round(secs), 1), MAX_TIMEOUT_S) * 1000;
 }
 
-/** A few lines of the file that most resemble `needle`, for a failed edit. */
-function nearestLines(text: string, needle: string): string {
-  const first = needle.split('\n').find((l) => l.trim()) ?? needle;
-  const grams = (s: string) => {
-    const t = s.trim().toLowerCase();
-    const set = new Set<string>();
-    for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
-    return set;
-  };
-  const target = grams(first);
-  const lines = text.split('\n');
-  let best = -1;
-  let score = 0;
-  lines.forEach((line, i) => {
-    const g = grams(line);
-    let shared = 0;
-    for (const x of g) if (target.has(x)) shared++;
-    const s = (2 * shared) / (g.size + target.size || 1);
-    if (s > score) {
-      score = s;
-      best = i;
+/** Describe leading whitespace concisely (e.g. `2 spaces`, `1 tab`, `0 spaces`). */
+function describeIndent(line: string): string {
+  const m = /^[ \t]*/.exec(line);
+  const ws = m ? m[0] : '';
+  if (!ws) return 'no leading indent';
+  const tabs = (ws.match(/\t/g) ?? []).length;
+  const spaces = ws.length - tabs;
+  if (tabs && spaces) return `${tabs} tab${tabs === 1 ? '' : 's'} + ${spaces} space${spaces === 1 ? '' : 's'}`;
+  if (tabs) return `${tabs} tab${tabs === 1 ? '' : 's'}`;
+  return `${spaces} space${spaces === 1 ? '' : 's'}`;
+}
+
+/**
+ * Diagnose why `old_string` was not found in `text`:
+ *   Stage A: exact match ignoring leading/trailing horizontal whitespace -> report exact line range,
+ *            indentation mismatch, and verbatim numbered lines.
+ *   Stage B: multi-line bigram sliding-window match across all non-empty needle lines.
+ */
+function diagnoseEditMismatch(text: string, needle: string): string {
+  const fileLines = text.split('\n').map((l) => l.replace(/\r$/, ''));
+  const needleLines = needle.split('\n').map((l) => l.replace(/\r$/, ''));
+
+  // Stage A: indentation / horizontal-whitespace-only mismatch
+  const normNeedle = needleLines.map((l) => l.trim());
+  if (normNeedle.some((l) => l.length > 0) && normNeedle.length <= fileLines.length) {
+    const normFile = fileLines.map((l) => l.trim());
+    for (let start = 0; start <= normFile.length - normNeedle.length; start++) {
+      let ok = true;
+      for (let j = 0; j < normNeedle.length; j++) {
+        if (normFile[start + j] !== normNeedle[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      // Find first line with an indentation or trailing-whitespace difference.
+      let diffNote = 'different whitespace';
+      for (let j = 0; j < needleLines.length; j++) {
+        const expected = needleLines[j]!;
+        const actual = fileLines[start + j]!;
+        if (expected === actual) continue;
+        const expLead = /^[ \t]*/.exec(expected)?.[0] ?? '';
+        const actLead = /^[ \t]*/.exec(actual)?.[0] ?? '';
+        if (expLead !== actLead) {
+          diffNote = `different indentation (expected ${describeIndent(expected)}, file has ${describeIndent(actual)})`;
+        } else {
+          diffNote = 'different trailing whitespace';
+        }
+        break;
+      }
+      const from = start + 1;
+      const to = start + needleLines.length;
+      const span = from === to ? `line ${from}` : `lines ${from}-${to}`;
+      const shown = fileLines
+        .slice(start, Math.min(fileLines.length, start + Math.min(needleLines.length + 1, 10)))
+        .map((l, i) => `${start + i + 1}\t${l}`)
+        .join('\n');
+      return `. Found matching text at ${span} with ${diffNote}. Verbatim lines:\n${shown}`;
     }
-  });
-  if (best < 0 || score < 0.3) return '';
-  const from = Math.max(0, best - 2);
-  return lines
-    .slice(from, best + 3)
-    .map((l, i) => `${from + i + 1}\t${l}`)
-    .join('\n');
+  }
+
+  // Stage B: multi-line fuzzy window across all non-empty needle lines
+  const near = nearestBlockHint(fileLines, needleLines, 8);
+  return near ? `. The closest lines are:\n${near}` : '';
+}
+
+/** 1-based line numbers where `needle` starts inside `text` (up to `limit` positions). */
+function occurrenceLines(text: string, needle: string, limit = 10): number[] {
+  const lines: number[] = [];
+  let pos = 0;
+  let lineNo = 1;
+  let scanned = 0;
+  while (lines.length < limit) {
+    const idx = text.indexOf(needle, pos);
+    if (idx < 0) break;
+    for (let i = scanned; i < idx; i++) {
+      if (text.charCodeAt(i) === 10) lineNo++;
+    }
+    scanned = idx;
+    lines.push(lineNo);
+    pos = idx + Math.max(1, needle.length);
+  }
+  return lines;
 }
 
 function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
@@ -1193,23 +1233,47 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const key = normalizePath(need(input, 'path'));
       if (imageMimeFor(key) && !/\.svg$/i.test(key)) throw new Error(`/${key} is an image: look at it with view_image`);
       const text = vfs.readText(`/${key}`);
+      const currentVersion = vfs.version(`/${key}`);
+      const force = input.force === true;
       // Editing needs a read; replacing needs the whole file read. What the agent knows of the file as it is now, whole
       // (it wrote or read all of it, and it has not changed since), a read of part of it takes nothing from: Nanbeige 4.3
       // 33B wrote a file whole, read ten lines of it, and was refused when it wrote the file again.
-      const knownWhole = ctx.reads.get(key) === vfs.version(`/${key}`) && !ctx.reads.has(`${key}#partial`);
+      const knownWhole = ctx.reads.get(key) === currentVersion && !ctx.reads.has(`${key}#partial`);
       const readAs = (whole: boolean) => {
-        ctx.reads.set(key, vfs.version(`/${key}`));
+        ctx.reads.set(key, currentVersion);
         if (whole) ctx.reads.delete(`${key}#partial`);
         else if (!knownWhole) ctx.reads.set(`${key}#partial`, 1);
+      };
+      const maybeDedup = (spanKey: string): string | null => {
+        if (force || !ctx.readSpans) return null;
+        const prev = ctx.readSpans.get(spanKey);
+        if (!prev || prev.version !== currentVersion || prev.bodyChars < 1_200) return null;
+        if (ctx.isToolResultActive && !ctx.isToolResultActive(prev.callId)) return null;
+        if (prev.consecutiveStubs >= 1) return null;
+        prev.consecutiveStubs++;
+        return `[/${key} (${prev.summary}) is unchanged since you read it earlier in this conversation. Reuse that content above, or call read_file with force: true to re-read it in full.]`;
+      };
+      const recordSpan = (spanKey: string, summary: string, bodyChars: number) => {
+        ctx.readSpans?.set(spanKey, {
+          version: currentVersion,
+          callId: call.id,
+          consecutiveStubs: 0,
+          summary,
+          bodyChars,
+        });
       };
       if (typeof input.char_start === 'number') {
         const start = Math.max(0, Math.floor(input.char_start));
         const count = Math.min(Math.max(1, typeof input.char_count === 'number' ? Math.floor(input.char_count) : READ_CHARS), READ_CHARS);
+        const spanKey = `${key}\0char:${start}:${count}`;
         const slice = text.slice(start, start + count);
-        const lineNo = text.slice(0, start).split('\n').length;
-        // A part of the file: enough to edit it, not to replace it (the whole of it, read so, is read).
         readAs(start === 0 && slice.length === text.length);
-        return `[characters ${start}-${start + slice.length} of ${text.length}, starting on line ${lineNo}]\n${slice}${start + slice.length < text.length ? `\n[continue with char_start ${start + slice.length}]` : ''}`;
+        const stub = maybeDedup(spanKey);
+        if (stub) return stub;
+        const lineNo = text.slice(0, start).split('\n').length;
+        const result = `[characters ${start}-${start + slice.length} of ${text.length}, starting on line ${lineNo}]\n${slice}${start + slice.length < text.length ? `\n[continue with char_start ${start + slice.length}]` : ''}`;
+        recordSpan(spanKey, `chars ${start}-${start + slice.length} of ${text.length}`, result.length);
+        return result;
       }
       const lines = text.split('\n');
       const offset = typeof input.offset === 'number' ? Math.max(1, Math.floor(input.offset)) : 1;
@@ -1219,25 +1283,33 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (offset > lines.length) {
         // (the last line with text: a file that ends with a line break has an empty one after it)
         const at = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 2 : lines.length - 1;
-        const long = lines[at].length > LINE_CHARS ? `${at + 1 === lines.length ? ',' : `; line ${at + 1} is`} ${lines[at].length} characters long: read it with char_start` : '';
+        const lastRaw = lines[at]!.replace(/\r$/, '');
+        const long = lastRaw.length > LINE_CHARS ? `${at + 1 === lines.length ? ',' : `; line ${at + 1} is`} ${lastRaw.length} characters long: read it with char_start` : '';
         return `[/${key} has ${lines.length} line${lines.length === 1 ? '' : 's'}, so there is nothing from line ${offset} on. Its last line is ${lines.length}${long}.]`;
       }
+      const spanKey = `${key}\0line:${offset}:${limit}`;
       const slice = lines.slice(offset - 1, offset - 1 + limit);
       let charAt = 0;
-      for (let i = 0; i < offset - 1; i++) charAt += lines[i].length + 1;
+      for (let i = 0; i < offset - 1; i++) charAt += lines[i]!.length + 1;
       let linesCut = false;
       let body = slice
-        .map((l, i) => {
+        .map((rawLine, i) => {
           const at = charAt;
-          charAt += l.length + 1;
+          charAt += rawLine.length + 1;
+          const l = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
           if (l.length > LINE_CHARS) linesCut = true;
-          return l.length > LINE_CHARS ? `${offset + i}\t${l.slice(0, LINE_CHARS)} [line continues: ${l.length - LINE_CHARS} more characters; char_start ${at + LINE_CHARS}]` : `${offset + i}\t${l}`;
+          return l.length > LINE_CHARS ? `${offset + i}\t${safeTextSlice(l, LINE_CHARS, false)} [line continues: ${l.length - LINE_CHARS} more characters; char_start ${at + LINE_CHARS}]` : `${offset + i}\t${l}`;
         })
         .join('\n');
-      if (body.length > READ_CHARS) body = `${body.slice(0, READ_CHARS)}\n[cut at ${READ_CHARS} characters]`;
-      readAs(offset === 1 && slice.length === lines.length && body.length <= READ_CHARS && !linesCut);
+      const bodyTooLong = body.length > READ_CHARS;
+      if (bodyTooLong) body = `${safeTextSlice(body, READ_CHARS, false)}\n[cut at ${READ_CHARS} characters]`;
+      readAs(offset === 1 && slice.length === lines.length && !bodyTooLong && !linesCut);
+      const stub = maybeDedup(spanKey);
+      if (stub) return stub;
       const more = offset - 1 + slice.length < lines.length ? `\n[lines ${offset}-${offset - 1 + slice.length} of ${lines.length}; continue with offset ${offset + slice.length}]` : '';
-      return body + more;
+      const result = body + more;
+      recordSpan(spanKey, `lines ${offset}-${offset - 1 + slice.length} of ${lines.length}`, result.length);
+      return result;
     }
     case 'file_info': {
       const key = normalizePath(need(input, 'path'));
@@ -1356,6 +1428,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       refuseRunaway(newString);
       const text = vfs.readText(`/${key}`);
       if (!oldString) throw new Error('old_string is empty');
+      if (oldString === newString) throw new Error('old_string and new_string are identical (no-op edit)');
       let oldText = oldString;
       let newText = newString;
       let count = text.split(oldText).length - 1;
@@ -1366,10 +1439,14 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         count = text.split(oldText).length - 1;
       }
       if (count === 0) {
-        const near = nearestLines(text, oldString);
-        throw new Error(`old_string was not found in /${key}${near ? `. The closest lines are:\n${near}` : ''}`);
+        const diag = diagnoseEditMismatch(text, oldString);
+        throw new Error(`old_string was not found in /${key}${diag}`);
       }
-      if (count > 1 && input.replace_all !== true) throw new Error(`old_string matches ${count} places in /${key}; add surrounding lines to make it unique, or set replace_all`);
+      if (count > 1 && input.replace_all !== true) {
+        const atLines = occurrenceLines(text, oldText, 10);
+        const lineHint = atLines.length ? ` (lines ${atLines.join(', ')}${count > atLines.length ? ', …' : ''})` : '';
+        throw new Error(`old_string matches ${count} places in /${key}${lineHint}; add surrounding lines to make it unique, or set replace_all`);
+      }
       const next = input.replace_all === true ? text.split(oldText).join(newText) : text.replace(oldText, () => newText);
       vfs.writeFile(`/${key}`, next);
       ctx.reads.set(key, vfs.version(`/${key}`));
@@ -1387,15 +1464,51 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       return `deleted /${key}`;
     }
     case 'grep': {
+      const pattern = need(input, 'pattern');
+      if (!pattern) throw new Error('pattern must not be empty');
       const host = new SandboxHost(vfs, ctx.gate, 'grep', 10_000);
       host.signal = ctx.signal;
+      const filesOnly = input.files_only === true;
+      const context = typeof input.context === 'number' && Number.isFinite(input.context) ? Math.min(Math.max(Math.floor(input.context), 0), 5) : 0;
       const found = JSON.parse(
         await host.call('fs.grep', [
-          JSON.stringify({ pattern: need(input, 'pattern'), path: typeof input.path === 'string' ? input.path : '/', glob: input.glob ?? null, ignore_case: input.ignore_case === true, max_results: typeof input.max_results === 'number' ? Math.min(Math.max(1, input.max_results), 1000) : 200 }),
+          JSON.stringify({
+            pattern,
+            path: typeof input.path === 'string' ? input.path : '/',
+            glob: input.glob ?? null,
+            ignore_case: input.ignore_case === true,
+            literal: input.literal === true,
+            context,
+            files_only: filesOnly,
+            max_results: typeof input.max_results === 'number' ? Math.min(Math.max(1, input.max_results), 1000) : 200,
+          }),
         ]),
-      ) as { matches: Array<{ path: string; line: number; text: string }>; truncated: boolean };
+      ) as { matches: Array<{ path: string; line: number; text: string; isContext?: boolean }>; files?: string[]; truncated: boolean };
+      if (filesOnly) {
+        const matchedFiles = found.files ?? [];
+        if (!matchedFiles.length) return 'no matches';
+        return cut(matchedFiles.join('\n') + (found.truncated ? '\n[more files not shown]' : ''));
+      }
       if (!found.matches.length) return 'no matches';
-      return cut(found.matches.map((m) => `${m.path}:${m.line}: ${m.text.length > 300 ? `${m.text.slice(0, 300)}…` : m.text}`).join('\n') + (found.truncated ? '\n[more matches not shown]' : ''));
+      // Group matches by file to avoid repeating the full path on every line.
+      const outLines: string[] = [];
+      let currentPath = '';
+      let prevLine = -1;
+      for (const m of found.matches) {
+        if (m.path !== currentPath) {
+          if (currentPath) outLines.push('');
+          outLines.push(m.path);
+          currentPath = m.path;
+          prevLine = -1;
+        } else if (context > 0 && prevLine >= 0 && m.line > prevLine + 1) {
+          outLines.push('  --');
+        }
+        const sep = m.isContext ? '-' : ':';
+        const snippet = m.text.length > 300 ? `${m.text.slice(0, 300)}…` : m.text;
+        outLines.push(`  ${m.line}${sep} ${snippet}`);
+        prevLine = m.line;
+      }
+      return cut(outLines.join('\n') + (found.truncated ? '\n[more matches not shown]' : ''));
     }
     case 'glob': {
       const pattern = need(input, 'pattern').replace(/^\.?\//, '');
@@ -1564,11 +1677,16 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const target = resolveApp(vfs, input.app);
       const root = target.ok ? target.root : typeof input.app === 'string' && input.app.trim() ? normalizePath(input.app) : '';
       const sql = typeof input.sql === 'string' ? input.sql : '';
+      const manifestKey = root ? `${root}/manifest.json` : 'manifest.json';
+      const hadManifestRead = ctx.reads.has(manifestKey) || ctx.reads.has(`${manifestKey}#partial`);
       const res = await executeSqlite(vfs, root, sql, {
         database: typeof input.database === 'string' ? input.database : undefined,
         params: Array.isArray(input.params) ? input.params : undefined,
         registerInManifest: input.register_in_manifest !== false,
       });
+      if (hadManifestRead && vfs.exists(`/${manifestKey}`)) {
+        ctx.reads.set(manifestKey, vfs.version(`/${manifestKey}`));
+      }
       return JSON.stringify(res, null, 2);
     }
     case 'page_check': {
@@ -2078,9 +2196,11 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const host = new SandboxHost(vfs, ctx.gate, 'web_fetch', 60_000);
       host.signal = ctx.signal;
       const response = JSON.parse(await host.call('net.fetch', [JSON.stringify({ url: need(input, 'url') })])) as { status: number; url: string; headers: Record<string, string>; body: string; truncated: boolean };
-      const max = typeof input.max_chars === 'number' ? Math.min(Math.max(1000, input.max_chars), 100_000) : 20_000;
       let body = response.body;
       if (/html/i.test(response.headers['content-type'] ?? '')) body = htmlToText(body);
+      // When the caller explicitly requested `max_chars`, honor that inline cap; otherwise preserve up to OUTPUT_CHARS
+      // so `maybeSpillOutput` writes the full text verbatim to `/.oaiy/spill/` with head+tail preview & read_file hint.
+      const max = typeof input.max_chars === 'number' ? Math.min(Math.max(1000, input.max_chars), OUTPUT_CHARS) : OUTPUT_CHARS;
       return `HTTP ${response.status} ${response.url}\n\n${cut(body, max)}`;
     }
     default:
@@ -2192,13 +2312,29 @@ function reportChanges(report: Record<string, unknown>, changes: { written: Set<
   if (deleted.length) report.files_deleted = deleted;
 }
 
+const DEFAULT_TOOL_TIMEOUT_MS: Record<string, number> = {
+  web_fetch: 120_000,
+  preview_screenshot: 45_000,
+  softn_check: 45_000,
+  softn_inspect: 45_000,
+  softn_interact: 45_000,
+  page_check: 45_000,
+  page_inspect: 45_000,
+  page_interact: 45_000,
+  sqlite_schema: 45_000,
+  sqlite_query: 45_000,
+  sqlite_execute: 45_000,
+};
+
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
   const out: ToolOut = { images: [], files: [], check: null, review: [] };
   const explicitTimeoutMs =
     typeof call.input.timeout_ms === 'number' && Number.isFinite(call.input.timeout_ms) && call.input.timeout_ms > 0
       ? Math.min(call.input.timeout_ms, MAX_TIMEOUT_S * 1000)
-      : undefined;
+      : typeof call.input.timeout_secs === 'number' && Number.isFinite(call.input.timeout_secs) && call.input.timeout_secs > 0
+        ? Math.min(call.input.timeout_secs * 1000 + 5_000, (MAX_TIMEOUT_S + 5) * 1000)
+        : DEFAULT_TOOL_TIMEOUT_MS[call.name];
   try {
     const rawContent = explicitTimeoutMs
       ? await withToolTimeout(call.name, explicitTimeoutMs, ctx.signal, (scopedSignal) =>

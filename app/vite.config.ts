@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { copyBridge, installBridge } from './scripts/softn-bridge/install.mjs';
-import { buildViewer } from './scripts/modelview/build.mjs';
+import { buildThreeHost, buildViewer } from './scripts/modelview/build.mjs';
 
 /** Code the Agent shares with the flow editor and the providers origin: `@oaiy/shared/...` (plain TypeScript). */
 const sharedDir = fileURLToPath(new URL('../shared', import.meta.url));
@@ -30,6 +30,7 @@ const softnHeaders = {
     installBridge('public/softn');
     copyBridge('public/webpage');
     await buildViewer();
+    await buildThreeHost();
   },
   configureServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
     server.middlewares.use(softnMiddleware);

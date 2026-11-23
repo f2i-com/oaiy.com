@@ -189,7 +189,7 @@ impl Recorder<'_> {
             let part = if head_dim % 4 == 0 && head_dim <= 512 { self.gpu().named_pipeline("chain-attention-part4", || ATTENTION_PART4.to_string()) } else { self.named("chain-attention-part", ATTENTION_PART) };
             self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, runs as u32, 1));
         }
-        let join = self.named("chain-attention-join", &ATTENTION_JOIN);
+        let join = if self.gpu().subgroups32() { self.named("chain-attention-join-sg", &ATTENTION_JOIN_SG) } else { self.named("chain-attention-join", &ATTENTION_JOIN) };
         self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, 1, 1));
     }
 
@@ -224,7 +224,7 @@ impl Recorder<'_> {
             let part = self.gpu().named_pipeline(RUNS[g][usize::from(head_dim == 128)], || attention_coop_runs(head_dim, g));
             let params = self.uniform(&[n_h as u32, n_kv as u32, head_dim as u32, past as u32, 0, runs as u32, scale.to_bits(), rows as u32]);
             self.dispatch(&part, buffer(kv), buffer(q), buffer(out), &params, (n_kv as u32, runs as u32, 1));
-            let join = self.named("chain-attention-rows-join", &ATTENTION_ROWS_JOIN);
+            let join = if self.gpu().subgroups32() { self.named("chain-attention-rows-join-sg", &ATTENTION_ROWS_JOIN_SG) } else { self.named("chain-attention-rows-join", &ATTENTION_ROWS_JOIN) };
             self.dispatch(&join, buffer(kv), buffer(q), buffer(out), &params, (n_h as u32, rows as u32, 1));
             self.weigh(4.0 * rows as f64 * kv_len as f64 * (n_h * head_dim) as f64);
             return;

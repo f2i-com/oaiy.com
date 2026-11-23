@@ -402,6 +402,106 @@ await check('a SoftN app shows a 3D model from its assets in a Scene3D, and its 
   expect(faces.red > 1000 && faces.cyan > 1000, `the model's faces are not in the screenshot (red ${faces.red}, cyan ${faces.cyan} pixels)`);
 });
 
+await check('a standalone Three.js ES-module page (Qwen3.5-4B-GLB-3D-Coder style) renders live WebGL in Zipp and exports a valid .glb to /exports/', async () => {
+  await write({
+    'three3d/index.html': `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>3D Coder Scene</title>
+<style>body{margin:0;overflow:hidden;background:#101420}#export{position:fixed;top:12px;left:12px;z-index:2;padding:8px 14px}</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<button id="export">Export GLB</button>
+<p id="status" style="position:fixed;bottom:12px;left:12px;color:#fff"></p>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101420);
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(2.2, 1.8, 3.0);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+const light = new THREE.DirectionalLight(0xffffff, 2.5);
+light.position.set(3, 5, 4);
+scene.add(light);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+const model = new THREE.Group();
+const box = new THREE.Mesh(
+  new THREE.BoxGeometry(1.4, 1.4, 1.4),
+  new THREE.MeshStandardMaterial({ color: 0xef4444, roughness: 0.4, metalness: 0.1 }),
+);
+model.add(box);
+box.userData.part = 'cube';
+let escapeBlocked = false;
+try {
+  const fn = THREE.Scene.constructor;
+  escapeBlocked = typeof fn !== 'function';
+} catch {
+  escapeBlocked = true;
+}
+scene.add(model);
+controls.update();
+renderer.render(scene, camera);
+document.getElementById('status').textContent = 'rendered ' + (box instanceof THREE.Mesh ? 'mesh' : 'other') + ' ud:' + box.userData.part + ' safe:' + escapeBlocked;
+
+document.getElementById('export').addEventListener('click', () => {
+  const exporter = new GLTFExporter();
+  exporter.parse(
+    model,
+    (result) => {
+      const blob = new Blob([result], { type: 'model/gltf-binary' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'coder-box.glb';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      document.getElementById('status').textContent = 'exported ' + result.byteLength + ' bytes';
+    },
+    (err) => {
+      document.getElementById('status').textContent = 'export error: ' + err;
+    },
+    { binary: true },
+  );
+});
+</script>
+</body>
+</html>`,
+  });
+  const checked = await tool('page_check', { path: 'three3d/index.html' });
+  expect(!checked.isError, checked.content);
+  const shown = await tool('page_inspect', {});
+  expect(shown.content.includes('rendered mesh ud:cube safe:true'), shown.content);
+
+  // Screenshot must show rendered red WebGL cube pixels (not a blank canvas)
+  const shot = await tool('preview_screenshot', { path: 'three3d/index.html', save_to: 'shots/three3d.png' });
+  expect(!shot.isError && shot.images === 1, JSON.stringify(shot));
+  const colors = await redAndCyan('shots/three3d.png');
+  expect(colors.red > 3000, `expected red WebGL pixels in Three.js screenshot, got ${colors.red}`);
+
+  // Clicking Export GLB must export a valid binary glTF (.glb) saved into /exports/coder-box.glb
+  const exported = await tool('page_interact', { actions: [{ click: 'Export GLB' }, { wait: 400 }] });
+  expect(!exported.isError && /exported \d+ bytes/.test(exported.content), exported.content);
+  const glbBytes = await page.evaluate(() => Array.from(window.harness.read('exports/coder-box.glb')));
+  expect(glbBytes.length > 100 && glbBytes[0] === 0x67 && glbBytes[1] === 0x6c && glbBytes[2] === 0x54 && glbBytes[3] === 0x46, `invalid GLB header: ${glbBytes.slice(0, 8).join(',')}`);
+});
+
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

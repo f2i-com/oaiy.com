@@ -515,8 +515,8 @@ impl QuantMoe {
             let groups = ((2 * bs * blocks) as u32).div_ceil(256);
             let jd = buf(&st.jobs_d);
             rec.dispatch_wide("moe-many-clear", MANY_CLEAR, [&d, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, (groups.min(65535), groups.div_ceil(65535), 1));
-            rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
-            rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &drw, &buf(&od)], &words, (1, 1, 1));
+            rec.dispatch_wide("moe-many-count", MANY_COUNT, [&jd, &d, &d, &d, &d, &d, &buf(&od), &drw], &words, ((pairs as u32).div_ceil(256), 1, 1));
+            rec.dispatch_wide("moe-many-scan", MANY_SCAN, [&d, &d, &d, &d, &d, &d, &buf(&od), &drw], &words, (1, 1, 1));
             rec.dispatch_wide("moe-many-scatter", MANY_SCATTER, [&jd, &d, &d, &d, &d, &d, &buf(&og), &buf(&od)], &words, ((pairs as u32).div_ceil(256), 1, 1));
             let tail = (few > 0).then(|| [Order::At(&og, tail_g / few, 2 * self.routed, few), Order::At(&od, tail_d / few, self.routed, few)]);
             self.run(rec, &st, x, out, rows, Order::Blocks(&og, 2 * blocks, bs), Order::Blocks(&od, blocks, bs), tail, into);

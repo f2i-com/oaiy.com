@@ -27,6 +27,7 @@ export interface SlashCommandItem {
 
 export const SLASH_COMMANDS: readonly SlashCommandItem[] = [
   { command: '/plan', usage: '/plan [on|off]', description: 'Toggle collaborative Plan Mode before editing files' },
+  { command: '/undo', usage: '/undo [list]', description: 'Revert files changed by the latest agent turn' },
   { command: '/compact', usage: '/compact', description: 'Prune older tool outputs & summarize earlier turns' },
   { command: '/softn', usage: '/softn [new|check|preview|apps]', description: 'Create, check, preview, or manage SoftN apps' },
   { command: '/internet', usage: '/internet [on|off|allowlist|status]', description: 'Inspect or configure the sandbox network gate' },
@@ -34,13 +35,17 @@ export const SLASH_COMMANDS: readonly SlashCommandItem[] = [
   { command: '/help', usage: '/help', description: 'Show available slash commands' },
 ];
 
+export const SESSION_SLASH_COMMANDS: readonly SlashCommandItem[] = SLASH_COMMANDS.filter(
+  (c) => c.command === '/clear' || c.command === '/help',
+);
+
 /**
  * Extract an active `@path` or `@"path with spaces` token immediately before
  * `cursorCol`. Ignores `@` inside an email or identifier.
  */
 export function activeAtToken(text: string, cursorCol: number): ActiveAtToken | undefined {
   const beforeCursor = text.slice(0, cursorCol);
-  const quoted = /(?:^|\s)(@"([^"\r\n]*))$/u.exec(beforeCursor);
+  const quoted = /(?:^|[\s([{])(@"([^"\r\n]*))$/u.exec(beforeCursor);
   if (quoted?.[1] !== undefined && quoted[2] !== undefined) {
     return {
       prefix: quoted[1],
@@ -50,7 +55,7 @@ export function activeAtToken(text: string, cursorCol: number): ActiveAtToken | 
       end: cursorCol,
     };
   }
-  const plain = /(?:^|\s)(@([^\s@]*))$/u.exec(beforeCursor);
+  const plain = /(?:^|[\s([{])(@([^\s@]*))$/u.exec(beforeCursor);
   if (plain?.[1] === undefined || plain[2] === undefined) return undefined;
   return {
     prefix: plain[1],
@@ -78,10 +83,12 @@ export function formatFileMention(candidate: FileReferenceCandidate, preserveQuo
 /** Extract unique VFS file paths explicitly mentioned via `@path` or `@"path"` in a prompt. */
 export function extractFileMentions(text: string): string[] {
   const seen = new Set<string>();
-  const re = /(?:^|\s)@(?:"([^"\r\n]+)"|([^\s@,;:!?()[\]{}]+))/gu;
+  const re = /(?:^|[\s([{])@(?:"([^"\r\n]+)"|([^\s@,;:!?()[\]{}]+))/gu;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const raw = (m[1] ?? m[2] ?? '').replace(/^\.?\//, '').replace(/\/+$/, '');
+    const isQuoted = m[1] !== undefined;
+    let raw = (m[1] ?? m[2] ?? '').replace(/^\.?\//, '').replace(/\/+$/, '');
+    if (!isQuoted) raw = raw.replace(/[.']+$/g, '');
     if (raw) seen.add(raw);
   }
   return [...seen];
@@ -151,9 +158,16 @@ export function attachComposerAutocomplete(
   input: HTMLTextAreaElement,
   anchor: HTMLElement,
   getVfs: () => Vfs | null,
+  getCommands: () => readonly SlashCommandItem[] = () => SLASH_COMMANDS,
 ): ComposerAutocomplete {
-  const popup = h('div', { class: 'mention-popup', hidden: true, role: 'listbox' });
+  const popupId = `mention-popup-${Math.random().toString(36).slice(2, 8)}`;
+  const popup = h('div', { id: popupId, class: 'mention-popup', hidden: true, role: 'listbox', 'aria-label': 'Suggestions' });
+  // Prevent scrollbar clicks or header mousedown inside the popup from blurring the textarea and closing it.
+  popup.addEventListener('mousedown', (e) => e.preventDefault());
   anchor.append(popup);
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-controls', popupId);
+  input.setAttribute('aria-expanded', 'false');
 
   type Mode =
     | { kind: 'none' }
@@ -162,11 +176,28 @@ export function attachComposerAutocomplete(
 
   let mode: Mode = { kind: 'none' };
   let activeIndex = 0;
+  let optionRows: HTMLButtonElement[] = [];
+
+  const syncActive = () => {
+    optionRows.forEach((row, i) => {
+      const on = i === activeIndex;
+      row.classList.toggle('active', on);
+      row.setAttribute('aria-selected', on ? 'true' : 'false');
+      if (on) {
+        input.setAttribute('aria-activedescendant', row.id);
+        row.scrollIntoView({ block: 'nearest' });
+      }
+    });
+    if (!optionRows.length) input.removeAttribute('aria-activedescendant');
+  };
 
   const close = () => {
     mode = { kind: 'none' };
     activeIndex = 0;
+    optionRows = [];
     popup.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
     clear(popup);
   };
 
@@ -198,17 +229,33 @@ export function attachComposerAutocomplete(
 
   const render = () => {
     clear(popup);
+    optionRows = [];
     if (mode.kind === 'none') {
       popup.hidden = true;
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
       return;
     }
-    const items = mode.kind === 'file' ? mode.items : mode.items;
+    const items = mode.items;
     if (!items.length) {
+      if (mode.kind === 'file' && mode.token.query.length > 0) {
+        popup.hidden = false;
+        input.setAttribute('aria-expanded', 'true');
+        input.removeAttribute('aria-activedescendant');
+        popup.append(
+          h('div', { class: 'mention-head' }, 'Files in project'),
+          h('div', { class: 'mention-empty' }, `No files matching “${mode.token.query}”`),
+        );
+        return;
+      }
       popup.hidden = true;
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
       return;
     }
     if (activeIndex >= items.length) activeIndex = 0;
     popup.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
 
     if (mode.kind === 'file') {
       popup.append(h('div', { class: 'mention-head' }, 'Files in project'));
@@ -216,17 +263,26 @@ export function attachComposerAutocomplete(
         const row = h(
           'button',
           {
+            id: `${popupId}-opt-${i}`,
             type: 'button',
             class: `mention-item${i === activeIndex ? ' active' : ''}`,
             role: 'option',
+            'aria-selected': i === activeIndex ? 'true' : 'false',
           },
           h('span', { class: `mention-kind ${item.kind}` }, item.kind === 'directory' ? 'DIR' : 'FILE'),
           h('span', { class: 'mention-path' }, item.kind === 'directory' ? `${item.path}/` : item.path),
-        );
+        ) as HTMLButtonElement;
         row.onmousedown = (e) => {
           e.preventDefault();
           applySelection(i);
         };
+        row.onmouseenter = () => {
+          if (activeIndex !== i) {
+            activeIndex = i;
+            syncActive();
+          }
+        };
+        optionRows.push(row);
         popup.append(row);
       });
     } else {
@@ -235,20 +291,31 @@ export function attachComposerAutocomplete(
         const row = h(
           'button',
           {
+            id: `${popupId}-opt-${i}`,
             type: 'button',
             class: `mention-item${i === activeIndex ? ' active' : ''}`,
             role: 'option',
+            'aria-selected': i === activeIndex ? 'true' : 'false',
           },
           h('span', { class: 'mention-cmd' }, item.usage),
           h('span', { class: 'mention-desc' }, item.description),
-        );
+        ) as HTMLButtonElement;
         row.onmousedown = (e) => {
           e.preventDefault();
           applySelection(i);
         };
+        row.onmouseenter = () => {
+          if (activeIndex !== i) {
+            activeIndex = i;
+            syncActive();
+          }
+        };
+        optionRows.push(row);
         popup.append(row);
       });
     }
+    popup.append(h('div', { class: 'mention-foot', 'aria-hidden': 'true' }, '↑↓ navigate · Enter / Tab select · Esc close'));
+    syncActive();
   };
 
   const refresh = () => {
@@ -257,8 +324,11 @@ export function attachComposerAutocomplete(
     // 1. Slash command autocomplete at start of prompt (single line, no spaces yet).
     if (val.startsWith('/') && !/\s/.test(val.slice(0, cursor)) && !val.includes('\n')) {
       const q = val.slice(0, cursor).toLowerCase();
-      const matched = SLASH_COMMANDS.filter((c) => c.command.startsWith(q));
-      if (matched.length) {
+      const commands = getCommands();
+      const matched = commands.filter((c) => c.command.startsWith(q));
+      // When the user has already typed a complete unambiguous command (e.g. `/clear`), hide
+      // the popup so pressing Enter submits immediately on the first keypress.
+      if (matched.length && !(matched.length === 1 && matched[0]!.command === q)) {
         mode = { kind: 'slash', items: matched };
         activeIndex = 0;
         render();
@@ -271,7 +341,7 @@ export function attachComposerAutocomplete(
       const vfs = getVfs();
       if (vfs) {
         const items = searchMentionCandidates(vfs, tok.query, 8);
-        if (items.length) {
+        if (items.length || tok.query.length > 0) {
           mode = { kind: 'file', token: tok, items };
           activeIndex = 0;
           render();
@@ -283,29 +353,38 @@ export function attachComposerAutocomplete(
   };
 
   const handleKeyDown = (e: KeyboardEvent): boolean => {
+    if (e.isComposing || e.keyCode === 229) return false;
     if (mode.kind === 'none') return false;
     const len = mode.items.length;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+      return true;
+    }
     if (!len) return false;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       activeIndex = (activeIndex + 1) % len;
-      render();
+      syncActive();
       return true;
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault();
       activeIndex = (activeIndex - 1 + len) % len;
-      render();
+      syncActive();
       return true;
     }
     if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      if (
+        e.key === 'Enter' &&
+        mode.kind === 'slash' &&
+        input.value.trim().toLowerCase() === mode.items[activeIndex]?.command
+      ) {
+        close();
+        return false;
+      }
       e.preventDefault();
       applySelection(activeIndex);
-      return true;
-    }
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      close();
       return true;
     }
     return false;

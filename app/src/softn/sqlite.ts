@@ -190,9 +190,16 @@ function dbFileMatches(a: string, b: string): boolean {
   const normA = normalizePath(a).toLowerCase();
   const normB = normalizePath(b).toLowerCase();
   if (normA === normB) return true;
+  if (normA.includes('/') && normB.includes('/')) return false;
   const baseA = normA.replace(/^.*\//, '');
   const baseB = normB.replace(/^.*\//, '');
   return baseA === baseB;
+}
+
+function looksLikeFilePath(spec: string, extRe: RegExp): boolean {
+  const trimmed = spec.trim();
+  if (!trimmed || trimmed.includes('\n')) return false;
+  return extRe.test(trimmed) || trimmed.includes('/');
 }
 
 /** List declared and discovered SQLite databases, schemas, and seeds in an app folder. */
@@ -334,14 +341,19 @@ async function openHydratedConnection(
       const appliedSql = new Set<string>();
       const runSeedSql = (spec: string) => {
         const cleanPath = normalizePath(spec);
-        if (!looksLikeSqlStatement(spec) && vfs.exists(inApp(root, cleanPath))) {
-          if (appliedSql.has(cleanPath)) return;
-          appliedSql.add(cleanPath);
-          const sqlText = vfs.readText(inApp(root, cleanPath));
-          if (sqlText.trim()) conn.execute_json(sqlText, null);
-        } else if (spec.trim()) {
-          conn.execute_json(spec, null);
+        if (!looksLikeSqlStatement(spec)) {
+          if (cleanPath && vfs.exists(inApp(root, cleanPath))) {
+            if (appliedSql.has(cleanPath)) return;
+            appliedSql.add(cleanPath);
+            const sqlText = vfs.readText(inApp(root, cleanPath));
+            if (sqlText.trim()) conn.execute_json(sqlText, null);
+            return;
+          }
+          if (looksLikeFilePath(spec, /\.sql$/i)) {
+            throw new Error(`seedSql file "${spec}" not found in app`);
+          }
         }
+        if (spec.trim()) conn.execute_json(spec, null);
       };
 
       if (decl?.seedSql) {
@@ -353,7 +365,14 @@ async function openHydratedConnection(
       if (decl?.seedJson !== undefined) {
         if (typeof decl.seedJson === 'string') {
           const cleanPath = normalizePath(decl.seedJson);
-          const payload = vfs.exists(inApp(root, cleanPath)) ? vfs.readText(inApp(root, cleanPath)) : decl.seedJson;
+          let payload: string;
+          if (cleanPath && vfs.exists(inApp(root, cleanPath))) {
+            payload = vfs.readText(inApp(root, cleanPath));
+          } else if (!/^\s*[\[{]/.test(decl.seedJson) && looksLikeFilePath(decl.seedJson, /\.json$/i)) {
+            throw new Error(`seedJson file "${decl.seedJson}" not found in app`);
+          } else {
+            payload = decl.seedJson;
+          }
           if (payload.trim()) conn.seed_json(payload);
         } else {
           conn.seed_json(JSON.stringify(decl.seedJson));
@@ -588,7 +607,6 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
     return findings;
   }
 
-  const checkedFiles = new Set<string>();
   const targets = declared.length
     ? declared
     : databases.map((d) => ({
@@ -598,6 +616,40 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
         seedJson: d.seedJson && d.seedJson !== '(inline JSON)' ? d.seedJson : undefined,
         persist: d.persist,
       }));
+
+  const applySeeds = (targetConn: XdbWasmConnection, cfg: { seedSql?: string; seedJson?: string | Record<string, unknown> }) => {
+    if (cfg.seedSql) {
+      const clean = normalizePath(cfg.seedSql);
+      if (!looksLikeSqlStatement(cfg.seedSql)) {
+        if (clean && vfs.exists(inApp(root, clean))) {
+          const sqlText = vfs.readText(inApp(root, clean));
+          if (sqlText.trim()) targetConn.execute_json(sqlText, null);
+        } else if (looksLikeFilePath(cfg.seedSql, /\.sql$/i)) {
+          throw new Error(`seedSql file "${cfg.seedSql}" not found in app`);
+        } else if (cfg.seedSql.trim()) {
+          targetConn.execute_json(cfg.seedSql, null);
+        }
+      } else if (cfg.seedSql.trim()) {
+        targetConn.execute_json(cfg.seedSql, null);
+      }
+    }
+    if (cfg.seedJson !== undefined) {
+      if (typeof cfg.seedJson === 'string') {
+        const clean = normalizePath(cfg.seedJson);
+        let payload: string;
+        if (clean && vfs.exists(inApp(root, clean))) {
+          payload = vfs.readText(inApp(root, clean));
+        } else if (!/^\s*[\[{]/.test(cfg.seedJson) && looksLikeFilePath(cfg.seedJson, /\.json$/i)) {
+          throw new Error(`seedJson file "${cfg.seedJson}" not found in app`);
+        } else {
+          payload = cfg.seedJson;
+        }
+        if (payload.trim()) targetConn.seed_json(payload);
+      } else {
+        targetConn.seed_json(JSON.stringify(cfg.seedJson));
+      }
+    }
+  };
 
   for (const cfg of targets) {
     const file = cfg.file || `${cfg.name}.db`;
@@ -616,25 +668,7 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
     try {
       conn = new bindings.WasmConnection(initialBytes, null, null, 4096, MAX_STEPS, MAX_MEMORY_BYTES, MAX_PAGE_READS);
       if (!initialBytes) {
-        if (cfg.seedSql) {
-          const clean = normalizePath(cfg.seedSql);
-          if (!looksLikeSqlStatement(cfg.seedSql) && vfs.exists(inApp(root, clean))) {
-            checkedFiles.add(clean);
-            const sqlText = vfs.readText(inApp(root, clean));
-            if (sqlText.trim()) conn.execute_json(sqlText, null);
-          } else if (cfg.seedSql.trim()) {
-            conn.execute_json(cfg.seedSql, null);
-          }
-        }
-        if (cfg.seedJson !== undefined) {
-          if (typeof cfg.seedJson === 'string') {
-            const clean = normalizePath(cfg.seedJson);
-            const payload = vfs.exists(inApp(root, clean)) ? vfs.readText(inApp(root, clean)) : cfg.seedJson;
-            if (payload.trim()) conn.seed_json(payload);
-          } else {
-            conn.seed_json(JSON.stringify(cfg.seedJson));
-          }
-        }
+        applySeeds(conn, cfg);
       }
       // Verify schema is readable
       conn.execute_json('SELECT name FROM sqlite_master LIMIT 1', null);
@@ -650,6 +684,28 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
       });
     } finally {
       if (conn) closeConn(conn);
+    }
+
+    // Even when a persisted `.db` file already exists, dry-run declared seeds on a fresh in-memory
+    // DB so broken edits to `seedSql` / `seedJson` are never silently ignored.
+    if (initialBytes && (cfg.seedSql || cfg.seedJson !== undefined)) {
+      let seedConn: XdbWasmConnection | null = null;
+      try {
+        seedConn = new bindings.WasmConnection(null, null, null, 4096, MAX_STEPS, MAX_MEMORY_BYTES, MAX_PAGE_READS);
+        applySeeds(seedConn, cfg);
+      } catch (error) {
+        const sourceFile =
+          typeof cfg.seedSql === 'string' && !looksLikeSqlStatement(cfg.seedSql) && vfs.exists(inApp(root, normalizePath(cfg.seedSql)))
+            ? normalizePath(cfg.seedSql)
+            : 'manifest.json';
+        findings.push({
+          level: 'error',
+          file: sourceFile,
+          message: `XDB SQLite seed check failed for database "${cfg.name}": ${error instanceof Error ? error.message : String(error)}`,
+        });
+      } finally {
+        if (seedConn) closeConn(seedConn);
+      }
     }
   }
 

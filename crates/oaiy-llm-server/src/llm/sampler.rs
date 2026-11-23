@@ -157,6 +157,8 @@ pub struct Sampler {
     /// Persists across samples so the filter adapts to the prior token's
     /// observed surprisal.
     mirostat_mu: Option<f32>,
+    /// Reusable candidate buffer to avoid multi-MB per-token heap allocations.
+    scratch: Vec<(usize, f32)>,
 }
 
 impl Sampler {
@@ -168,6 +170,7 @@ impl Sampler {
             params,
             history: VecDeque::with_capacity(cap),
             mirostat_mu,
+            scratch: Vec::new(),
         }
     }
 
@@ -244,8 +247,9 @@ impl Sampler {
         };
         let l: &[f32] = logits_owned.as_deref().unwrap_or(l_src);
 
-        // Greedy fast path.
-        if self.params.temperature <= 0.0 {
+        // Greedy fast path (also handles non-finite or subnormal temperature where `1.0 / T` overflows).
+        let inv_t = if self.params.temperature > 0.0 { 1.0 / self.params.temperature } else { f32::INFINITY };
+        if !self.params.temperature.is_finite() || self.params.temperature <= 0.0 || !inv_t.is_finite() {
             let mut best_i = 0usize;
             let mut best_v = f32::NEG_INFINITY;
             for (i, &v) in l.iter().enumerate() {
@@ -255,43 +259,40 @@ impl Sampler {
             return best_i as u32;
         }
 
-        // Apply temperature, exp, then optionally restrict to top-k, top-p, min-p.
-        let inv_t = 1.0 / self.params.temperature;
-        let mut scored: Vec<(usize, f32)> = (0..n).map(|i| (i, l[i] * inv_t)).collect();
-
-        // Subtract max before exp for numerical stability.
-        let mut m = f32::NEG_INFINITY;
-        for &(_, v) in &scored { if v > m { m = v; } }
-        for s in &mut scored { s.1 = (s.1 - m).exp(); }
-
-        // Mirostat v2 short-circuits the top-k / top-p / min-p chain.
+        // Mirostat v2 needs the full normalized distribution for exact surprisal.
         if let Some(cfg) = self.params.mirostat {
-            // Snapshot μ — avoid holding a mutable borrow on self while we
-            // also call self.next_f32(). We write the new μ back at the end.
-            let mut mu = self.mirostat_mu.unwrap_or(2.0 * cfg.tau);
-
-            // Normalise to probabilities for surprisal computation.
-            let total: f32 = scored.iter().map(|s| s.1).sum();
-            if total > 0.0 {
-                for s in &mut scored { s.1 /= total; }
+            let mut scored = std::mem::take(&mut self.scratch);
+            scored.clear();
+            scored.reserve(n);
+            let mut m = f32::NEG_INFINITY;
+            for (i, &v) in l.iter().enumerate() {
+                let sv = v * inv_t;
+                if sv > m { m = sv; }
+                scored.push((i, sv));
             }
-
-            // Filter to tokens with surprisal ≤ μ, i.e. p ≥ 2^-μ.
+            let mut total = 0.0f32;
+            for s in &mut scored {
+                let e = (s.1 - m).exp();
+                s.1 = e;
+                total += e;
+            }
+            let mut mu = self.mirostat_mu.unwrap_or(2.0 * cfg.tau);
+            if total > 0.0 {
+                let inv_total = 1.0 / total;
+                for s in &mut scored { s.1 *= inv_total; }
+            }
             let p_threshold = (-mu).exp2();
             let mut filtered: Vec<(usize, f32)> = scored.iter()
                 .copied()
                 .filter(|s| s.1 >= p_threshold)
                 .collect();
-            // Always keep the argmax — protects against pathological μ where
-            // the threshold filters everything out.
             if filtered.is_empty() {
                 let argmax = scored.iter()
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .copied().unwrap_or((0, 1.0));
                 filtered.push(argmax);
             }
-
-            // Sample from filtered distribution.
+            self.scratch = scored;
             let f_total: f32 = filtered.iter().map(|s| s.1).sum();
             let r = self.next_f32() * f_total;
             let mut acc = 0.0f32;
@@ -301,37 +302,106 @@ impl Sampler {
                 acc += w;
                 if acc >= r { chosen = i; chosen_p = w; break; }
             }
-
-            // Update μ from observed surprisal of the chosen token.
-            // s = -log2(p). Then μ ← μ - η · (s - τ).
             let surprisal = -chosen_p.max(1e-30).log2();
             mu -= cfg.eta * (surprisal - cfg.tau);
             self.mirostat_mu = Some(mu);
-
             self.observe(chosen as u32);
             return chosen as u32;
         }
 
-        // top-k cut (sort by descending prob).
-        if let Some(k) = self.params.top_k {
-            if k < scored.len() {
-                scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                scored.truncate(k);
+        // Fast non-mirostat path: filter candidates on raw logits BEFORE calling `exp()` or sorting,
+        // reusing `self.scratch` so large vocabularies (152K–248K) avoid multi-MB allocations and
+        // hundreds of thousands of wasted `exp()` / `O(V log V)` sort operations per token.
+        let mut scored = std::mem::take(&mut self.scratch);
+        scored.clear();
+        let mut sorted_desc = false;
+
+        if let Some(k) = self.params.top_k.filter(|&k| k > 0 && k < n) {
+            // Bounded min-heap over raw logits (monotone with exp((v - m) * inv_t)).
+            scored.reserve(k);
+            for (i, &v) in l[..k].iter().enumerate() {
+                scored.push((i, if v.is_nan() { f32::NEG_INFINITY } else { v }));
+            }
+            let sift = |h: &mut [(usize, f32)], mut pos: usize| {
+                let len = h.len();
+                let item = h[pos];
+                loop {
+                    let left = pos * 2 + 1;
+                    if left >= len { break; }
+                    let right = left + 1;
+                    let smallest = if right < len && h[right].1 < h[left].1 { right } else { left };
+                    if item.1 <= h[smallest].1 { break; }
+                    h[pos] = h[smallest];
+                    pos = smallest;
+                }
+                h[pos] = item;
+            };
+            for pos in (0..(k / 2)).rev() { sift(&mut scored, pos); }
+            let mut min_v = scored[0].1;
+            for (offset, &v) in l[k..].iter().enumerate() {
+                if v > min_v {
+                    scored[0] = (k + offset, v);
+                    sift(&mut scored, 0);
+                    min_v = scored[0].1;
+                }
+            }
+            scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            sorted_desc = true;
+            let max_l = scored[0].1;
+            if max_l.is_finite() {
+                for s in &mut scored {
+                    s.1 = ((s.1 - max_l) * inv_t).exp();
+                }
+            } else if max_l.is_infinite() && max_l.is_sign_positive() {
+                for s in &mut scored {
+                    s.1 = if s.1 == f32::INFINITY { 1.0 } else { 0.0 };
+                }
+            } else {
+                scored.clear();
+                if n > 0 { scored.push((0, 1.0)); }
+            }
+        } else {
+            // Single pass to find max logit, then keep only logits whose exp contributes above f32 floor
+            // (`exp(-24.0) ~= 3.8e-11`, negligible even summed across 250K tokens).
+            let mut max_l = f32::NEG_INFINITY;
+            for &v in l {
+                if v > max_l { max_l = v; }
+            }
+            if max_l.is_finite() {
+                let cutoff_l = max_l - 24.0 * self.params.temperature;
+                for (i, &v) in l.iter().enumerate() {
+                    if v >= cutoff_l {
+                        scored.push((i, ((v - max_l) * inv_t).exp()));
+                    }
+                }
+            } else if max_l.is_infinite() && max_l.is_sign_positive() {
+                for (i, &v) in l.iter().enumerate() {
+                    if v == f32::INFINITY {
+                        scored.push((i, 1.0));
+                    }
+                }
+            }
+            if scored.is_empty() && n > 0 {
+                scored.push((0, 1.0));
             }
         }
 
-        // top-p cut: sort, take prefix until cumulative prob >= p.
+        // top-p cut: sort (if not already sorted descending), take prefix until cumulative prob >= p.
         if let Some(p) = self.params.top_p {
-            scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let total: f32 = scored.iter().map(|s| s.1).sum();
-            let mut cum = 0.0f32;
-            let mut keep = 0usize;
-            for s in &scored {
-                cum += s.1 / total;
-                keep += 1;
-                if cum >= p { break; }
+            if !sorted_desc {
+                scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             }
-            scored.truncate(keep);
+            let total: f32 = scored.iter().map(|s| s.1).sum();
+            if total > 0.0 && total.is_finite() {
+                let mut cum = 0.0f32;
+                let mut keep = 0usize;
+                for s in &scored {
+                    cum += s.1 / total;
+                    keep += 1;
+                    if cum >= p { break; }
+                }
+                scored.truncate(keep.max(1));
+            }
         }
 
         // min-p cut: keep tokens with prob >= min_p × max_prob.
@@ -342,6 +412,7 @@ impl Sampler {
             // Pathological case: if min_p ≥ 1 and ties exist we may still have ≥1; if
             // somehow we ended up empty, fall back to argmax.
             if scored.is_empty() {
+                self.scratch = scored;
                 let mut best_i = 0usize;
                 let mut best_v = f32::NEG_INFINITY;
                 for (i, &v) in l.iter().enumerate() {
@@ -364,6 +435,7 @@ impl Sampler {
             }
             out
         };
+        self.scratch = scored;
         self.observe(chosen as u32);
         chosen as u32
     }
@@ -530,5 +602,39 @@ mod tests {
         let mu_after = s.mirostat_mu.unwrap();
         assert!(mu_after < mu_initial,
             "μ should shrink when observed surprisal > τ; before={mu_initial}, after={mu_after}");
+    }
+
+    #[test]
+    fn sampler_handles_non_finite_logits_and_subnormal_temperature() {
+        let mut s = Sampler::new(SampleParams {
+            temperature: 0.8,
+            top_k: Some(3),
+            top_p: Some(0.9),
+            min_p: Some(0.05),
+            ..SampleParams::greedy()
+        });
+        let all_neg_inf = Tensor::from_vec(vec![f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY, f32::NEG_INFINITY], vec![4]);
+        assert_eq!(s.sample(&all_neg_inf), 0);
+        let pos_inf = Tensor::from_vec(vec![1.0, f32::INFINITY, 2.0, -3.0], vec![4]);
+        assert_eq!(s.sample(&pos_inf), 1);
+
+        let mut no_topk = Sampler::new(SampleParams {
+            temperature: 0.8,
+            top_k: None,
+            top_p: Some(0.9),
+            min_p: None,
+            ..SampleParams::greedy()
+        });
+        assert_eq!(no_topk.sample(&all_neg_inf), 0);
+        assert_eq!(no_topk.sample(&pos_inf), 1);
+
+        let mut tiny_t = Sampler::new(SampleParams {
+            temperature: 1e-40,
+            top_k: Some(3),
+            top_p: Some(0.9),
+            ..SampleParams::greedy()
+        });
+        let normal = Tensor::from_vec(vec![1.0, 5.0, 2.0, 0.0], vec![4]);
+        assert_eq!(tiny_t.sample(&normal), 1);
     }
 }

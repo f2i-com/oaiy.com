@@ -325,7 +325,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           modelCache.set(cacheKey(p), found);
           if (editing !== p) return;
           fillModels(found);
-          note.textContent = found.length ? `${found.length} model${found.length === 1 ? '' : 's'} available.` : 'The server listed no models; type one under Other.';
+          say(note, found.length ? `${found.length} model${found.length === 1 ? '' : 's'} available.` : 'The server listed no models; type one under Other.');
         } catch (error) {
           if (editing === p && !quiet) say(note, (error as Error).message, true);
           else if (editing === p) say(note, `Could not list models yet: ${(error as Error).message}`, true);
@@ -549,9 +549,9 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           context.agentElsewhere
             ? `The Agent runs on ${context.agentElsewhere}. Which AI it runs on is chosen in one place: OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar). The providers below are the Agent's own; it uses them when Settings → Agent says OAIY's engine.`
             : "Which AI the Agent runs on is chosen in one place: OAIY's Settings → Agent (Settings is at the foot of OAIY's sidebar). The providers below are the Agent's own; it uses them when Settings → Agent says OAIY's engine.",
-          // (OAIY's Settings page takes this page's place in the window: this dialog closes, asking first if something
-          // here was changed)
-          ...(context.openOaiySettings ? [' ', h('button.link', { type: 'button', onclick: () => { context.openOaiySettings?.(); void leave(); } }, "Open OAIY's Settings")] : []),
+          // (OAIY's Settings page takes this page's place in the window: ask first if something here was changed,
+          // and navigate only once the person confirmed leaving)
+          ...(context.openOaiySettings ? [' ', h('button.link', { type: 'button', onclick: async () => { if (await leave()) context.openOaiySettings?.(); } }, "Open OAIY's Settings")] : []),
         )]
       : context.agentElsewhere
         ? [h('p.agent-elsewhere', `The Agent runs on ${context.agentElsewhere}, as chosen in OAIY's Settings → Agent: change it there. The providers below are this page's own; the Agent uses them when it runs on OAIY's engine.`)]
@@ -609,9 +609,10 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     );
     // (closed without saving, Escape or Cancel: asked first where something was changed, a key just typed among it)
     let startedAs = '';
-    const leave = async (): Promise<void> => {
-      if (JSON.stringify({ providers, activeId, agent, media }) !== startedAs && !(await confirmAction({ title: 'Close without saving?', message: 'The changes made here are not saved.', ok: 'Close without saving', danger: true }))) return;
+    const leave = async (): Promise<boolean> => {
+      if (JSON.stringify({ providers, activeId, agent, media }) !== startedAs && !(await confirmAction({ title: 'Close without saving?', message: 'The changes made here are not saved.', ok: 'Close without saving', danger: true }))) return false;
       close(null);
+      return true;
     };
     document.body.append(dialog);
     renderList();

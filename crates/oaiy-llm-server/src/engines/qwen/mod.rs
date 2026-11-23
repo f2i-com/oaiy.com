@@ -438,32 +438,80 @@ fn call_excerpt(raw: &str) -> String {
 /// Stream prose and reasoning as tokens arrive. Native tool XML stays buffered
 /// until the existing strict parser validates the complete call. A token may
 /// end halfway through a UTF-8 character or the opening tool tag.
+///
+/// Tracks byte offsets into the append-only `decoded` buffer so every token step
+/// is O(1) amortized instead of copying and re-scanning the entire reply on each token.
 #[derive(Default)]
-struct NativeStream { sent: String, tool_sent: String, calls: Calls }
+struct NativeStream {
+    sent_len: usize,
+    tool_sent_len: usize,
+    tool_open_at: Option<usize>,
+    call_start_at: Option<usize>,
+    dsml_checked: usize,
+    calls: Calls,
+}
 
 impl NativeStream {
     fn tool_preview(&mut self, decoded: &str) -> Result<Option<(String, bool)>, String> {
-        let Some(at) = decoded.find(self.calls.open().0) else { return Ok(None) };
+        let tag = self.calls.open().0;
+        let at = match self.tool_open_at {
+            Some(pos) => pos,
+            None => {
+                let mut from = self.sent_len.saturating_sub(tag.len());
+                while from > 0 && !decoded.is_char_boundary(from) { from -= 1; }
+                let Some(rel) = decoded[from..].find(tag) else { return Ok(None) };
+                let pos = from + rel;
+                self.tool_open_at = Some(pos);
+                pos
+            }
+        };
         let draft = decoded[at..].trim_end_matches('\u{fffd}');
-        let delta = draft.strip_prefix(&self.tool_sent).ok_or("Qwen tool preview changed after streaming")?;
+        if draft.len() < self.tool_sent_len {
+            return Err("Qwen tool preview changed after streaming".into());
+        }
+        let delta = &draft[self.tool_sent_len..];
         if delta.is_empty() { return Ok(None); }
-        let update = (delta.to_owned(), self.tool_sent.is_empty());
-        self.tool_sent = draft.to_owned();
+        let update = (delta.to_owned(), self.tool_sent_len == 0);
+        self.tool_sent_len = draft.len();
         Ok(Some(update))
     }
 
     fn push(&mut self, decoded: &str, tools: &[Json], complete: bool) -> Result<String, String> {
-        let text = if complete { self.calls.normalize(decoded, tools)? } else {
-            if decoded.contains(DSML) { return Err("unexpected DSML in Qwen output".into()); }
-            let (tag, start) = self.calls.open();
-            let end = decoded.find(start).unwrap_or_else(|| {
+        if complete {
+            let text = self.calls.normalize(decoded, tools)?;
+            let sent = decoded.get(..self.sent_len).ok_or("Qwen decoded text changed after streaming")?;
+            let delta = text.strip_prefix(sent).ok_or("Qwen decoded text changed after streaming")?.to_owned();
+            self.sent_len = text.len();
+            return Ok(delta);
+        }
+        let mut dsml_from = self.dsml_checked.saturating_sub(DSML.len());
+        while dsml_from > 0 && !decoded.is_char_boundary(dsml_from) { dsml_from -= 1; }
+        if decoded[dsml_from..].contains(DSML) {
+            return Err("unexpected DSML in Qwen output".into());
+        }
+        self.dsml_checked = decoded.len();
+
+        let (tag, start) = self.calls.open();
+        let end = if let Some(at) = self.call_start_at {
+            at
+        } else {
+            let mut from = self.sent_len.saturating_sub(start.len());
+            while from > 0 && !decoded.is_char_boundary(from) { from -= 1; }
+            if let Some(rel) = decoded[from..].find(start) {
+                let at = from + rel;
+                self.call_start_at = Some(at);
+                at
+            } else {
                 let held = (1..tag.len()).rev().find(|&n| decoded.ends_with(&tag[..n])).unwrap_or(0);
-                decoded.len()-held
-            });
-            decoded[..end].trim_end_matches('\u{fffd}').to_owned()
+                decoded.len() - held
+            }
         };
-        let delta = text.strip_prefix(&self.sent).ok_or("Qwen decoded text changed after streaming")?.to_owned();
-        self.sent = text;
+        let ready = decoded[..end].trim_end_matches('\u{fffd}');
+        if ready.len() < self.sent_len {
+            return Err("Qwen decoded text changed after streaming".into());
+        }
+        let delta = ready[self.sent_len..].to_owned();
+        self.sent_len = ready.len();
         Ok(delta)
     }
 }
@@ -1447,11 +1495,15 @@ impl QwenEngine {
         let mut closing: std::collections::VecDeque<u32> = Default::default();
         let mut closed = false;
         let mut generated = Vec::new(); let mut think_used = 0usize;
+        let mut decoded = String::with_capacity(4096);
+        let mut utf8_pending: Vec<u8> = Vec::with_capacity(8);
         let mut stream = NativeStream { calls: self.calls, ..Default::default() };
         // The reply's prose (past its thought, outside its tool calls, where code rightly repeats): its recent tokens,
         // for its repeat, presence and frequency penalties (`crate::engines::job::penalize_reply`).
         let (mut in_call, mut prose) = (false, std::collections::VecDeque::<u32>::new());
+        let open_tag = self.calls.open().0;
         let close = match self.calls { Calls::Qwen => "</tool_call>", Calls::Lfm2 => crate::engines::lfm2::CALL_END };
+        let call_overlap = open_tag.len().max(close.len());
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
         // (OAIY_CHAIN_PROFILE: the prompt's kernels said here, the reply's alone after)
         #[cfg(feature = "webgpu")]
@@ -1584,8 +1636,19 @@ impl QwenEngine {
                 in_thought = false;
             }
             let clock = std::time::Instant::now();
-            let decoded = tok.decode(&generated);
-            in_call = decoded.rfind(self.calls.open().0).is_some_and(|at| decoded.rfind(close).is_none_or(|end| end < at));
+            let prev_len = decoded.len();
+            tok.decode_token_incremental(next, &mut utf8_pending, &mut decoded);
+            if decoded.len() > prev_len {
+                let mut scan = prev_len.saturating_sub(call_overlap);
+                while scan > 0 && !decoded.is_char_boundary(scan) { scan -= 1; }
+                let tail = &decoded[scan..];
+                match (tail.rfind(open_tag), tail.rfind(close)) {
+                    (Some(o), Some(c)) => in_call = o > c,
+                    (Some(_), None) => in_call = true,
+                    (None, Some(_)) => in_call = false,
+                    (None, None) => {}
+                }
+            }
             let delta = stream.push(&decoded, &job.tools, false)?;
             if !delta.is_empty() { let _ = job.events.send(Event::Text(delta)); }
             if let Some((text,start)) = stream.tool_preview(&decoded)? {
@@ -1682,15 +1745,16 @@ impl QwenEngine {
             let each: Vec<String> = by_fifty.iter().scan(0f64, |before, &t| { let d = t - *before; *before = t; Some(format!("{d:.3}")) }).collect();
             eprintln!("  Qwen decode: the model's seconds by fifties of tokens: {}", each.join(" "));
         }
-        let raw = tok.decode(&generated);
+        tokenizer::Tokenizer::flush_incremental(&mut utf8_pending, &mut decoded);
+        let raw = &decoded;
         // The client is told what the model wrote, so a rejected call can be read
         // and fixed; the server log never holds it. Skip final tool-contract check when
         // cancelled early (client closed or stop string hit), but still send Done & settle checkpoints.
         let text = if cancelled {
             String::new()
         } else {
-            stream.push(&raw, &job.tools, true)
-                .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?
+            stream.push(raw, &job.tools, true)
+                .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(raw)))?
         };
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s){}", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64(), if drafts_checked > 0 { format!("; {drafts_taken} of {drafts_checked} drafts taken ({checks} checks of {rows_checked} rows {t_check:.2}s, drafting {t_draft:.2}s, undoing {t_undo:.2}s)") } else { String::new() }); }
         #[cfg(feature = "webgpu")]

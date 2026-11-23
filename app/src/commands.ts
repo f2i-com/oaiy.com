@@ -102,6 +102,8 @@ export function helpText(inOaiy: boolean): string {
       prune older tool outputs and summarize earlier turns to free context room
   /plan [on|off]
       toggle collaborative Plan Mode (inspect & design a plan for review before editing files)
+  /undo [list]
+      revert the files changed in the latest agent turn (or list recent turn checkpoints)
   /clear
       start a new conversation (the project's files stay)
   /help

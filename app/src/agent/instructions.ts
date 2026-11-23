@@ -94,6 +94,16 @@ export class WorkspaceInstructions {
     this.baselineLoaded = false;
   }
 
+  /** Record existing root instructions when resuming a saved session without re-injecting them. */
+  seedBaseline(vfs: Vfs): void {
+    if (this.baselineLoaded) return;
+    this.baselineLoaded = true;
+    for (const candidate of INSTRUCTION_CANDIDATES) {
+      const item = readCandidate(vfs, candidate, this.maxSourceBytes);
+      if (item) this.seen.set(item.path, item.digest);
+    }
+  }
+
   /** Load root-level workspace instructions once (for the start of a conversation). */
   loadBaseline(vfs: Vfs): string | null {
     if (this.baselineLoaded) return null;
@@ -142,17 +152,22 @@ export class WorkspaceInstructions {
       }
     }
 
-    // 2. Discover nested instruction files in directories touched this step.
-    const dirsToScan = new Set<string>();
+    // 2. Discover newly created root instructions or nested instruction files in directories touched this step.
+    const dirsToScan = new Set<string>(['']);
     for (const rawPath of touchedPaths) {
+      const clean = normalizePath(rawPath);
       for (const dir of ancestorDirs(rawPath)) {
-        if (dir) dirsToScan.add(dir);
+        dirsToScan.add(dir);
+      }
+      if (clean && vfs.stat(`/${clean}`)?.type === 'dir') {
+        dirsToScan.add(clean);
       }
     }
     let budget = this.maxBytes;
     for (const dir of dirsToScan) {
-      for (const name of ['AGENTS.md', 'OAIY.md', 'CLAUDE.md', 'AGENTS.local.md']) {
-        const path = `${dir}/${name}`;
+      const candidates = dir === '' ? INSTRUCTION_CANDIDATES : (['AGENTS.md', 'OAIY.md', 'CLAUDE.md', 'AGENTS.local.md'] as const);
+      for (const name of candidates) {
+        const path = dir ? `${dir}/${name}` : name;
         if (this.seen.has(path)) continue;
         const item = readCandidate(vfs, path, this.maxSourceBytes);
         if (!item) continue;

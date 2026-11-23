@@ -21,7 +21,12 @@ impl Recorder<'_> {
         let r = 32;
         let size = |s: &str| s.replace("DK_VALUE", &dk.to_string());
         let rows = d.rows as u32;
-        self.dispatch_wide(names[0], &size(DELTA_NET_PREP), [buffer(conv), &dd, buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), &dd, buffer(&qk), &drw], words, (d.k_heads as u32, rows, 1));
+        let sg128 = dk == 128 && self.gpu().subgroups32();
+        if sg128 {
+            self.dispatch_wide("chain-delta-net-prep-sg-128", DELTA_NET_PREP_SG_128, [buffer(conv), &dd, buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), &dd, buffer(&qk), &drw], words, (d.k_heads as u32, rows, 1));
+        } else {
+            self.dispatch_wide(names[0], &size(DELTA_NET_PREP), [buffer(conv), &dd, buffer(beta_alpha), buffer(ssm_a), buffer(dt_bias), &dd, buffer(&qk), &drw], words, (d.k_heads as u32, rows, 1));
+        }
         // (a step's one token where subgroups are 32 lanes and the heads 128 wide: a subgroup a row, [`DELTA_NET_STEP`];
         // not where the recording's rows are alike, a check's rows a step's bit for bit, the scan's order of sums
         // theirs; OAIY_DELTA_NET_STEP=0: the scan)
@@ -34,7 +39,11 @@ impl Recorder<'_> {
             let groups = (d.v_heads * dk / r) as u32;
             self.dispatch_wide(names[1], &delta_net_scan(dk, r), [buffer(&qk), buffer(conv), buffer(&qk), &dd, &dd, &dd, buffer(state), buffer(out)], words, (groups, 1, 1));
         }
-        self.dispatch_wide(names[2], &size(DELTA_NET_NORM), [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), &drw, buffer(out)], words, (d.v_heads as u32, rows, 1));
+        if sg128 {
+            self.dispatch_wide("chain-delta-net-norm-sg-128", DELTA_NET_NORM_SG_128, [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), buffer(out), &drw], words, (d.v_heads as u32, rows, 1));
+        } else {
+            self.dispatch_wide(names[2], &size(DELTA_NET_NORM), [&dd, buffer(z), &dd, &dd, &dd, buffer(norm), buffer(out), &drw], words, (d.v_heads as u32, rows, 1));
+        }
         // (the scan was the scratch's last reader: the next layer's delta net takes it again. Each of Flash-Next's
         // 36 such layers held its own to the recording's end, 16 MB at 512 rows: half of what a chunk took)
         self.done_with(&qk);

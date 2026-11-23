@@ -332,6 +332,29 @@ fn project(seen: &Seen, naf: Option<(&naf::Naf, usize)>, coords: &[[i32; 3]], gr
     Tensor::cat(&[&lr, &hr], 1)
 }
 
+/// Resolve a checkpoint named in `pipeline.json` (`args.models.<key>`): first relative to `model_dir`,
+/// then falling back to `model_dir/ckpts/<file_name>` (e.g. TRELLIS.2-4B's external
+/// `"microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"` stored in `ckpts/`).
+fn resolve_model(model_dir: &Path, pipeline: &Json, key: &str) -> Result<PathBuf> {
+    let rel = pipeline
+        .get("args")
+        .and_then(|a| a.get("models"))
+        .and_then(|m| m.get(key))
+        .and_then(Json::as_str)
+        .ok_or_else(|| candle_core::Error::Msg(format!("pipeline.json: no {key}")))?;
+    let direct = model_dir.join(rel);
+    if direct.with_extension("json").is_file() || direct.with_extension("safetensors").is_file() {
+        return Ok(direct);
+    }
+    if let Some(name) = Path::new(rel).file_name() {
+        let local = model_dir.join("ckpts").join(name);
+        if local.with_extension("json").is_file() || local.with_extension("safetensors").is_file() {
+            return Ok(local);
+        }
+    }
+    Ok(direct)
+}
+
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
@@ -341,10 +364,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     }
     let dev = device(r.device)?;
     let pipeline = Json::parse(&std::fs::read(r.model_dir.join("pipeline.json"))?).map_err(candle_core::Error::wrap)?;
-    let model = |key: &str| -> Result<PathBuf> {
-        let rel = pipeline.get("args").and_then(|a| a.get("models")).and_then(|m| m.get(key)).and_then(Json::as_str).ok_or_else(|| candle_core::Error::Msg(format!("pipeline.json: no {key}")))?;
-        Ok(r.model_dir.join(rel))
-    };
+    let model = |key: &str| -> Result<PathBuf> { resolve_model(&r.model_dir, &pipeline, key) };
+    let uses_proj = dit::Config::read(&model("sparse_structure_flow_model")?.with_extension("json"))?.has_proj;
     let ss_sampling = Sampling::read(&pipeline, "sparse_structure_sampler", r.steps);
     let shape_sampling = Sampling::read(&pipeline, "shape_slat_sampler", r.steps);
     let tex_sampling = Sampling::read(&pipeline, "tex_slat_sampler", r.steps);
@@ -373,19 +394,24 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     dump(r, "global512", &seen512.global)?;
     dump(r, "patches512", &seen512.patches)?;
     dump(r, "patches1024", &seen1024.patches)?;
-    let naf = naf::Naf::load(&r.naf, &dev)?;
+    let naf = if uses_proj { Some(naf::Naf::load(&r.naf, &dev)?) } else { None };
+    let cond512 = if uses_proj { seen512.global.clone() } else { Tensor::cat(&[&seen512.global, &seen512.patches], 0)? };
+    let cond1024 = if uses_proj { seen1024.global.clone() } else { Tensor::cat(&[&seen1024.global, &seen1024.patches], 0)? };
+    let (tok512, tok1024) = (cond512.dim(0)?, cond1024.dim(0)?);
 
     // 2. The coarse structure.
     let ss_res = 16usize;
     let dense = Level::dense(ss_res, &dev)?;
-    let proj_ss = project(&seen512, None, &dense.coords, ss_res, &cam, &dev)?;
-    dump(r, "proj_ss", &proj_ss)?;
+    let proj_ss = if uses_proj { Some(project(&seen512, None, &dense.coords, ss_res, &cam, &dev)?) } else { None };
+    if let Some(p) = &proj_ss {
+        dump(r, "proj_ss", p)?;
+    }
     let coords32 = {
         let flow = dit::Dit::load(&model("sparse_structure_flow_model")?, &dev)?;
         let c_in = flow.config().in_channels;
         let rope = dit::rope_tables(&dense.coords, 128, &dev)?;
-        let pos = flow.context(Some(&seen512.global), Some(&proj_ss), 5, &dev)?;
-        let neg = flow.context(None, None, seen512.global.dim(0)?, &dev)?;
+        let pos = flow.context(Some(&cond512), proj_ss.as_ref(), tok512, &dev)?;
+        let neg = flow.context(None, None, tok512, &dev)?;
         // The noise as the reference draws it, [C, 16³], as tokens [16³, C].
         let n = ss_res * ss_res * ss_res;
         let x = Tensor::from_vec(start_noise(r, "ss", 1, c_in * n)?, (c_in, n), &dev)?.t()?.contiguous()?;
@@ -415,13 +441,15 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
 
     // 3. The shape at 512, the finer voxels it proposes, and the shape there.
     let lr_level = Level::new(coords32.clone(), 32, &dev)?;
-    let proj_lr = project(&seen512, Some((&naf, 512)), &coords32, 32, &cam, &dev)?;
-    dump(r, "proj_shape512", &proj_lr)?;
+    let proj_lr = if let Some(naf) = &naf { Some(project(&seen512, Some((naf, 512)), &coords32, 32, &cam, &dev)?) } else { None };
+    if let Some(p) = &proj_lr {
+        dump(r, "proj_shape512", p)?;
+    }
     let lr_slat = {
         let flow = dit::Dit::load(&model("shape_slat_flow_model_512")?, &dev)?;
         let rope = dit::rope_tables(&coords32, 128, &dev)?;
-        let pos = flow.context(Some(&seen512.global), Some(&proj_lr), 5, &dev)?;
-        let neg = flow.context(None, None, 5, &dev)?;
+        let pos = flow.context(Some(&cond512), proj_lr.as_ref(), tok512, &dev)?;
+        let neg = flow.context(None, None, tok512, &dev)?;
         let c = flow.config().in_channels;
         let x = Tensor::from_vec(start_noise(r, "shape_lr", 2, coords32.len() * c)?, (coords32.len(), c), &dev)?;
         let z = sample(x, &shape_sampling, false, |x, t, cnd| flow.forward(x, t, &rope, if cnd { &pos } else { &neg }), |i, n| report(event("making_shape", i, n * 2)))?;
@@ -447,13 +475,15 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let hr_coords = given_coords(r, "coords_hr")?.unwrap_or(hr_coords);
     let grid = hr_res / 16;
     dump_coords(r, "coords_hr", &hr_coords)?;
-    let proj_hr = project(&seen1024, Some((&naf, 512)), &hr_coords, grid, &cam, &dev)?;
-    dump(r, "proj_shape_hr", &proj_hr)?;
+    let proj_hr = if let Some(naf) = &naf { Some(project(&seen1024, Some((naf, 512)), &hr_coords, grid, &cam, &dev)?) } else { None };
+    if let Some(p) = &proj_hr {
+        dump(r, "proj_shape_hr", p)?;
+    }
     let rope_hr = dit::rope_tables(&hr_coords, 128, &dev)?;
     let shape = {
         let flow = dit::Dit::load(&model("shape_slat_flow_model_1024")?, &dev)?;
-        let pos = flow.context(Some(&seen1024.global), Some(&proj_hr), 5, &dev)?;
-        let neg = flow.context(None, None, 5, &dev)?;
+        let pos = flow.context(Some(&cond1024), proj_hr.as_ref(), tok1024, &dev)?;
+        let neg = flow.context(None, None, tok1024, &dev)?;
         let c = flow.config().in_channels;
         let x = Tensor::from_vec(start_noise(r, "shape_hr", 3, hr_coords.len() * c)?, (hr_coords.len(), c), &dev)?;
         let z = sample(x, &shape_sampling, false, |x, t, cnd| flow.forward(x, t, &rope_hr, if cnd { &pos } else { &neg }), |i, n| report(event("making_shape", n + i, n * 2)))?;
@@ -463,12 +493,14 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     drop(proj_hr);
 
     // 4. The texture on the same voxels.
-    let proj_tex = project(&seen1024, Some((&naf, 1024)), &hr_coords, grid, &cam, &dev)?;
-    dump(r, "proj_tex", &proj_tex)?;
+    let proj_tex = if let Some(naf) = &naf { Some(project(&seen1024, Some((naf, 1024)), &hr_coords, grid, &cam, &dev)?) } else { None };
+    if let Some(p) = &proj_tex {
+        dump(r, "proj_tex", p)?;
+    }
     let tex = {
         let flow = dit::Dit::load(&model("tex_slat_flow_model_1024")?, &dev)?;
-        let pos = flow.context(Some(&seen1024.global), Some(&proj_tex), 5, &dev)?;
-        let neg = flow.context(None, None, 5, &dev)?;
+        let pos = flow.context(Some(&cond1024), proj_tex.as_ref(), tok1024, &dev)?;
+        let neg = flow.context(None, None, tok1024, &dev)?;
         let shape_n = normalize(&shape, &shape_norm)?;
         let c = flow.config().in_channels - shape_n.dim(1)?;
         let x = Tensor::from_vec(start_noise(r, "tex", 4, hr_coords.len() * c)?, (hr_coords.len(), c), &dev)?;
@@ -477,10 +509,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         denormalize(&z, &tex_norm)?
     };
     dump(r, "tex_hr", &tex)?;
-    drop(proj_tex);
-    drop(naf);
-    drop(seen512);
-    drop(seen1024);
+    drop((proj_tex, naf, cond512, cond1024, seen512, seen1024));
 
     // 5. Decoding, the mesh and its colours.
     report(event("decoding", 0, 2));
@@ -631,10 +660,8 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let stages = Stages::default();
     let cpu = Device::Cpu;
     let pipeline = Json::parse(&std::fs::read(r.model_dir.join("pipeline.json"))?).map_err(candle_core::Error::wrap)?;
-    let model = |key: &str| -> Result<PathBuf> {
-        let rel = pipeline.get("args").and_then(|a| a.get("models")).and_then(|m| m.get(key)).and_then(Json::as_str).ok_or_else(|| candle_core::Error::Msg(format!("pipeline.json: no {key}")))?;
-        Ok(r.model_dir.join(rel))
-    };
+    let model = |key: &str| -> Result<PathBuf> { resolve_model(&r.model_dir, &pipeline, key) };
+    let uses_proj = dit::Config::read(&model("sparse_structure_flow_model")?.with_extension("json"))?.has_proj;
     let ss_sampling = Sampling::read(&pipeline, "sparse_structure_sampler", r.steps);
     let shape_sampling = Sampling::read(&pipeline, "shape_slat_sampler", r.steps);
     let tex_sampling = Sampling::read(&pipeline, "tex_slat_sampler", r.steps);
@@ -664,18 +691,21 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("encoding_image", 1, 2));
     let seen1024 = stages.time("features", || see(&dino, &prepared.image, 1024, &cpu))?;
     drop(dino);
-    let naf = naf::Naf::load(&r.naf, &cpu)?;
-    let (global512, global1024) = (values(&seen512.global)?, values(&seen1024.global)?);
-    let tokens = seen512.global.dim(0)?;
+    let naf = if uses_proj { Some(naf::Naf::load(&r.naf, &cpu)?) } else { None };
+    let cond512_t = if uses_proj { seen512.global.clone() } else { Tensor::cat(&[&seen512.global, &seen512.patches], 0)? };
+    let cond1024_t = if uses_proj { seen1024.global.clone() } else { Tensor::cat(&[&seen1024.global, &seen1024.patches], 0)? };
+    let (tok512, tok1024) = (cond512_t.dim(0)?, cond1024_t.dim(0)?);
+    let (cond512, cond1024) = (values(&cond512_t)?, values(&cond1024_t)?);
+    drop((cond512_t, cond1024_t));
     let gpu = ggml_rs_wgpu::WgpuBackend::nth(r.device, None).map_err(|e| candle_core::Error::Msg(format!("3D on WebGPU: {e}")))?;
     // one flow model's run: its conditioning, its starting noise, the sampler; the velocity on the device
-    let run = |path: &Path, coords: &[[i32; 3]], proj: &[f32], global: &[f32], x: Vec<f32>, extra: Option<&[f32]>, s: &Sampling, unbiased: bool, report: &mut dyn FnMut(usize, usize)| -> Result<Vec<f32>> {
+    let run = |path: &Path, coords: &[[i32; 3]], proj: Option<&[f32]>, cond: &[f32], cond_tokens: usize, x: Vec<f32>, extra: Option<&[f32]>, s: &Sampling, unbiased: bool, report: &mut dyn FnMut(usize, usize)| -> Result<Vec<f32>> {
         let flow = WgpuDit3::load(path, &gpu)?;
         let n = coords.len();
-        let pos = flow.context(&gpu, Some(global), Some(proj), tokens);
-        let neg = flow.context(&gpu, None, None, tokens);
+        let pos = flow.context(&gpu, Some(cond), proj, cond_tokens);
+        let neg = flow.context(&gpu, None, None, cond_tokens);
         let rope = crate::model3d::webgpu::upload_values(&gpu, &table(coords, 128));
-        let w = flow.scratch(&gpu, n);
+        let w = flow.scratch_with_kv(&gpu, n, cond_tokens);
         let cin = flow.config().in_channels;
         let (xd, out) = (ggml_rs::DeviceChain::vec(&gpu, n * cin), ggml_rs::DeviceChain::vec(&gpu, n * flow.config().out_channels));
         sample_values(x, s, unbiased, |x, t, conditional| {
@@ -700,14 +730,18 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // 2. The coarse structure.
     let ss_res = 16usize;
     let dense = Level::dense(ss_res, &cpu)?;
-    let proj_ss = stages.time("projections", || values(&project(&seen512, None, &dense.coords, ss_res, &cam, &cpu)?))?;
+    let proj_ss = if uses_proj {
+        Some(stages.time("projections", || values(&project(&seen512, None, &dense.coords, ss_res, &cam, &cpu)?))?)
+    } else {
+        None
+    };
     let coords32 = {
         let n = ss_res * ss_res * ss_res;
         let c_in = dit::Config::read(&model("sparse_structure_flow_model")?.with_extension("json"))?.in_channels;
         // the noise as the reference draws it, [C, 16³], as tokens [16³, C]
         let planes = start_noise(r, "ss", 1, c_in * n)?;
         let x: Vec<f32> = (0..n * c_in).map(|i| planes[(i % c_in) * n + i / c_in]).collect();
-        let z = stages.time("structure", || run(&model("sparse_structure_flow_model")?, &dense.coords, &proj_ss, &global512, x, None, &ss_sampling, true, &mut |i, n| report(event("making_structure", i, n))))?;
+        let z = stages.time("structure", || run(&model("sparse_structure_flow_model")?, &dense.coords, proj_ss.as_deref(), &cond512, tok512, x, None, &ss_sampling, true, &mut |i, n| report(event("making_structure", i, n))))?;
         dump(r, "ss_latent", &host(&z, n)?)?;
         let (logits, res) = stages.time("decoding", || WgpuStructureDecoder::load(&model("sparse_structure_decoder")?, &gpu)?.forward(&gpu, &z))?;
         // occupied at 64³, max-pooled to 32³ (any occupied child)
@@ -728,16 +762,22 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     dump_coords(r, "coords32", &coords32)?;
 
     // 3. The shape at 512, the finer voxels it proposes, and the shape there.
-    let proj_lr = stages.time("projections", || values(&project(&seen512, Some((&naf, 512)), &coords32, 32, &cam, &cpu)?))?;
+    let proj_lr = if let Some(naf) = &naf {
+        Some(stages.time("projections", || values(&project(&seen512, Some((naf, 512)), &coords32, 32, &cam, &cpu)?))?)
+    } else {
+        None
+    };
     let shape_flow = model("shape_slat_flow_model_512")?;
     let c = dit::Config::read(&shape_flow.with_extension("json"))?.in_channels;
     let x = start_noise(r, "shape_lr", 2, coords32.len() * c)?;
-    let lr = stages.time("shape", || run(&shape_flow, &coords32, &proj_lr, &global512, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", i, n * 2))))?;
+    let lr = stages.time("shape", || run(&shape_flow, &coords32, proj_lr.as_deref(), &cond512, tok512, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", i, n * 2))))?;
     let lr_slat = denorm(&lr, &shape_norm);
     dump(r, "shape512", &host(&lr_slat, coords32.len())?)?;
     drop(proj_lr);
-    let shape_decoder = WgpuSparseDecoder::load(&model("shape_slat_decoder")?, &gpu)?;
-    let fine = stages.time("decoding", || shape_decoder.upsample(&gpu, WgpuLevel::new(&gpu, coords32.clone(), 32), &lr_slat, 4))?;
+    let fine = {
+        let shape_decoder = WgpuSparseDecoder::load(&model("shape_slat_decoder")?, &gpu)?;
+        stages.time("decoding", || shape_decoder.upsample(&gpu, WgpuLevel::new(&gpu, coords32.clone(), 32), &lr_slat, 4))?
+    };
     // quantized to the high-resolution latent grid, fewer tokens if there are too many
     let mut hr_res = r.resolution;
     let hr_coords = loop {
@@ -754,29 +794,39 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let hr_coords = given_coords(r, "coords_hr")?.unwrap_or(hr_coords);
     let grid = hr_res / 16;
     dump_coords(r, "coords_hr", &hr_coords)?;
-    let proj_hr = stages.time("projections", || values(&project(&seen1024, Some((&naf, 512)), &hr_coords, grid, &cam, &cpu)?))?;
+    let proj_hr = if let Some(naf) = &naf {
+        Some(stages.time("projections", || values(&project(&seen1024, Some((naf, 512)), &hr_coords, grid, &cam, &cpu)?))?)
+    } else {
+        None
+    };
     let shape_flow = model("shape_slat_flow_model_1024")?;
     let x = start_noise(r, "shape_hr", 3, hr_coords.len() * c)?;
-    let z = stages.time("shape", || run(&shape_flow, &hr_coords, &proj_hr, &global1024, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", n + i, n * 2))))?;
+    let z = stages.time("shape", || run(&shape_flow, &hr_coords, proj_hr.as_deref(), &cond1024, tok1024, x, None, &shape_sampling, false, &mut |i, n| report(event("making_shape", n + i, n * 2))))?;
     let shape = denorm(&z, &shape_norm);
     dump(r, "shape_hr", &host(&shape, hr_coords.len())?)?;
     drop(proj_hr);
 
     // 4. The texture on the same voxels.
-    let proj_tex = stages.time("projections", || values(&project(&seen1024, Some((&naf, 1024)), &hr_coords, grid, &cam, &cpu)?))?;
+    let proj_tex = if let Some(naf) = &naf {
+        Some(stages.time("projections", || values(&project(&seen1024, Some((naf, 1024)), &hr_coords, grid, &cam, &cpu)?))?)
+    } else {
+        None
+    };
     let tex_flow = model("tex_slat_flow_model_1024")?;
     let shape_n = renorm(&shape, &shape_norm);
     let c_tex = dit::Config::read(&tex_flow.with_extension("json"))?.in_channels - shape_n.len() / hr_coords.len();
     let x = start_noise(r, "tex", 4, hr_coords.len() * c_tex)?;
-    let z = stages.time("texture", || run(&tex_flow, &hr_coords, &proj_tex, &global1024, x, Some(&shape_n), &tex_sampling, false, &mut |i, n| report(event("making_texture", i, n))))?;
+    let z = stages.time("texture", || run(&tex_flow, &hr_coords, proj_tex.as_deref(), &cond1024, tok1024, x, Some(&shape_n), &tex_sampling, false, &mut |i, n| report(event("making_texture", i, n))))?;
     let tex = denorm(&z, &tex_norm);
     dump(r, "tex_hr", &host(&tex, hr_coords.len())?)?;
-    drop((proj_tex, naf, seen512, seen1024));
+    drop((proj_tex, naf, cond512, cond1024, seen512, seen1024));
 
     // 5. Decoding, the mesh and its colours.
     report(event("decoding", 0, 2));
-    let decoded = stages.time("decoding", || shape_decoder.forward(&gpu, WgpuLevel::new(&gpu, hr_coords.clone(), grid), &shape, None))?;
-    drop(shape_decoder);
+    let decoded = stages.time("decoding", || {
+        let shape_decoder = WgpuSparseDecoder::load(&model("shape_slat_decoder")?, &gpu)?;
+        shape_decoder.forward(&gpu, WgpuLevel::new(&gpu, hr_coords.clone(), grid), &shape, None)
+    })?;
     let res = decoded.level.res;
     report(event("decoding", 1, 2));
     let attrs = stages.time("decoding", || WgpuSparseDecoder::load(&model("tex_slat_decoder")?, &gpu)?.forward(&gpu, WgpuLevel::new(&gpu, hr_coords.clone(), grid), &tex, Some(&decoded.subdivisions)))?;

@@ -35,13 +35,28 @@ export interface DeliverableFile {
 }
 
 export interface FileSnapshotEntry {
+  version: number;
   size: number;
-  hash: number;
-  binary: boolean;
-  text: string | null;
+  /** Immutable VFS byte reference at snapshot time (zero-copy; VFS replaces Uint8Array on every write). */
+  bytes: Uint8Array;
 }
 
 export type VfsSnapshot = Map<string, FileSnapshotEntry>;
+
+export interface CheckpointEntry {
+  /** Project-relative path without leading slash. */
+  path: string;
+  kind: ChangeKind;
+  /** Original pre-turn bytes, or `null` when the file did not exist before the turn (was created). */
+  beforeBytes: Uint8Array | null;
+}
+
+export interface TurnCheckpoint {
+  id: string;
+  at: number;
+  label: string;
+  files: CheckpointEntry[];
+}
 
 const MAX_DIFF_BYTES = 256 * 1024;
 const MAX_LCS_CELLS = 220_000;
@@ -51,14 +66,13 @@ const CONTEXT_LINES = 3;
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
 
-/** Fast non-cryptographic 32-bit FNV-1a hash for change detection. */
-function hashBytes(bytes: Uint8Array): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < bytes.length; i++) {
-    h ^= bytes[i];
-    h = Math.imul(h, 0x01000193);
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
   }
-  return h >>> 0;
+  return true;
 }
 
 function isLikelyBinary(bytes: Uint8Array): boolean {
@@ -69,6 +83,17 @@ function isLikelyBinary(bytes: Uint8Array): boolean {
   return false;
 }
 
+function decodeSnapshotText(bytes: Uint8Array): { binary: boolean; text: string | null } {
+  const binary = isLikelyBinary(bytes);
+  if (binary) return { binary: true, text: null };
+  if (bytes.byteLength > MAX_DIFF_BYTES) return { binary: false, text: null };
+  try {
+    return { binary: false, text: textDecoder.decode(bytes) };
+  } catch {
+    return { binary: true, text: null };
+  }
+}
+
 function shouldSkipPath(relPath: string): boolean {
   const parts = relPath.split('/');
   for (let i = 0; i < parts.length - 1; i++) {
@@ -77,7 +102,7 @@ function shouldSkipPath(relPath: string): boolean {
   return parts[0] === '.oaiy' || parts[0] === '.git';
 }
 
-/** Snapshot all non-ignored files currently in `vfs`. */
+/** Zero-copy snapshot of all non-ignored files currently in `vfs`. */
 export function snapshotVfs(vfs: Vfs): VfsSnapshot {
   const snap: VfsSnapshot = new Map();
   const walked = vfs.walk('/', { limit: 10_000 });
@@ -86,20 +111,10 @@ export function snapshotVfs(vfs: Vfs): VfsSnapshot {
     if (shouldSkipPath(entry.path)) continue;
     try {
       const bytes = vfs.readBytes(`/${entry.path}`);
-      const binary = isLikelyBinary(bytes);
-      let text: string | null = null;
-      if (!binary && bytes.byteLength <= MAX_DIFF_BYTES) {
-        try {
-          text = textDecoder.decode(bytes);
-        } catch {
-          text = null;
-        }
-      }
       snap.set(entry.path, {
+        version: vfs.version(`/${entry.path}`),
         size: bytes.byteLength,
-        hash: hashBytes(bytes),
-        binary: binary || (text === null && bytes.byteLength <= MAX_DIFF_BYTES),
-        text,
+        bytes,
       });
     } catch {
       /* file vanished concurrently */
@@ -269,6 +284,8 @@ function buildHunks(ops: RawOp[]): { hunks: DiffHunk[]; truncated: boolean } {
 
 /**
  * Compute net file deliverables and unified diff hunks between `before` and `after` snapshots.
+ * Unchanged files are skipped in O(1) via VFS version comparison; UTF-8 decoding and LCS diff
+ * only run on files whose contents actually changed.
  */
 export function diffSnapshots(before: VfsSnapshot, after: VfsSnapshot): DeliverableFile[] {
   const paths = new Set<string>([...before.keys(), ...after.keys()]);
@@ -280,33 +297,38 @@ export function diffSnapshots(before: VfsSnapshot, after: VfsSnapshot): Delivera
 
     if (!prev && next) {
       // Created
-      if (next.binary || next.text === null) {
-        files.push({ path, kind: 'created', binary: next.binary, sizeBytes: next.size, added: 0, deleted: 0, hunks: [] });
+      const decoded = decodeSnapshotText(next.bytes);
+      if (decoded.binary || decoded.text === null) {
+        files.push({ path, kind: 'created', binary: decoded.binary, sizeBytes: next.size, added: 0, deleted: 0, hunks: [] });
         continue;
       }
-      const newLines = splitLines(next.text);
+      const newLines = splitLines(decoded.text);
       const { ops, added, deleted } = computeLineOps([], newLines);
       const { hunks, truncated } = buildHunks(ops);
       files.push({ path, kind: 'created', binary: false, sizeBytes: next.size, added, deleted, hunks, ...(truncated ? { truncatedDiff: true } : {}) });
     } else if (prev && !next) {
       // Deleted
-      if (prev.binary || prev.text === null) {
-        files.push({ path, kind: 'deleted', binary: prev.binary, sizeBytes: prev.size, added: 0, deleted: 0, hunks: [] });
+      const decoded = decodeSnapshotText(prev.bytes);
+      if (decoded.binary || decoded.text === null) {
+        files.push({ path, kind: 'deleted', binary: decoded.binary, sizeBytes: prev.size, added: 0, deleted: 0, hunks: [] });
         continue;
       }
-      const oldLines = splitLines(prev.text);
+      const oldLines = splitLines(decoded.text);
       const { ops, added, deleted } = computeLineOps(oldLines, []);
       const { hunks, truncated } = buildHunks(ops);
       files.push({ path, kind: 'deleted', binary: false, sizeBytes: 0, added, deleted, hunks, ...(truncated ? { truncatedDiff: true } : {}) });
     } else if (prev && next) {
-      // Unchanged (including write-then-revert no-ops!)
-      if (prev.size === next.size && prev.hash === next.hash && prev.text === next.text) continue;
-      if (prev.binary || next.binary || prev.text === null || next.text === null) {
-        files.push({ path, kind: 'modified', binary: prev.binary || next.binary, sizeBytes: next.size, added: 0, deleted: 0, hunks: [] });
+      // Fast O(1) unchanged check via VFS version, plus exact byte equality for write-then-revert no-ops.
+      if (prev.version === next.version) continue;
+      if (prev.size === next.size && bytesEqual(prev.bytes, next.bytes)) continue;
+      const oldDec = decodeSnapshotText(prev.bytes);
+      const newDec = decodeSnapshotText(next.bytes);
+      if (oldDec.binary || newDec.binary || oldDec.text === null || newDec.text === null) {
+        files.push({ path, kind: 'modified', binary: oldDec.binary || newDec.binary, sizeBytes: next.size, added: 0, deleted: 0, hunks: [] });
         continue;
       }
-      const oldLines = splitLines(prev.text);
-      const newLines = splitLines(next.text);
+      const oldLines = splitLines(oldDec.text);
+      const newLines = splitLines(newDec.text);
       const { ops, added, deleted } = computeLineOps(oldLines, newLines);
       if (added === 0 && deleted === 0) continue;
       const { hunks, truncated } = buildHunks(ops);
@@ -315,4 +337,62 @@ export function diffSnapshots(before: VfsSnapshot, after: VfsSnapshot): Delivera
   }
 
   return files;
+}
+
+/**
+ * Capture a compact turn-level undo checkpoint storing only the pre-turn bytes of net-changed files
+ * (or `null` for files created during the turn). Returns `null` if no files changed.
+ */
+export function createCheckpoint(
+  id: string,
+  label: string,
+  before: VfsSnapshot,
+  after: VfsSnapshot,
+): TurnCheckpoint | null {
+  const paths = new Set<string>([...before.keys(), ...after.keys()]);
+  const files: CheckpointEntry[] = [];
+  for (const path of [...paths].sort()) {
+    const prev = before.get(path);
+    const next = after.get(path);
+    if (!prev && next) {
+      files.push({ path, kind: 'created', beforeBytes: null });
+    } else if (prev && !next) {
+      files.push({ path, kind: 'deleted', beforeBytes: prev.bytes });
+    } else if (prev && next) {
+      if (prev.version === next.version) continue;
+      if (prev.size === next.size && bytesEqual(prev.bytes, next.bytes)) continue;
+      files.push({ path, kind: 'modified', beforeBytes: prev.bytes });
+    }
+  }
+  if (!files.length) return null;
+  return { id, at: Date.now(), label, files };
+}
+
+/**
+ * Revert a turn checkpoint on `vfs`, restoring pre-turn file contents and removing files created
+ * during that turn. Updates/clears `reads` so subsequent agent edits see the restored versions.
+ */
+export function revertCheckpoint(
+  vfs: Vfs,
+  checkpoint: TurnCheckpoint,
+  reads?: Map<string, number>,
+): { restored: string[]; deleted: string[] } {
+  const restored: string[] = [];
+  const deleted: string[] = [];
+  for (const entry of checkpoint.files) {
+    if (entry.beforeBytes === null) {
+      if (vfs.exists(`/${entry.path}`)) {
+        vfs.remove(`/${entry.path}`, true);
+        deleted.push(entry.path);
+      }
+      reads?.delete(entry.path);
+      reads?.delete(`${entry.path}#partial`);
+    } else {
+      vfs.writeFile(`/${entry.path}`, entry.beforeBytes, { parents: true });
+      restored.push(entry.path);
+      reads?.delete(entry.path);
+      reads?.delete(`${entry.path}#partial`);
+    }
+  }
+  return { restored, deleted };
 }

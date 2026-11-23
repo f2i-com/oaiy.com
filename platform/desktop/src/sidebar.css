@@ -290,7 +290,7 @@
 @media (max-height: 760px) and (min-width: 701px) {
   .sidebar { padding-top: 16px; }
   .brand { padding-bottom: 12px; }
-  .brand > strong { font-size: 24px; }
+  .brand > strong { font-size: 19px; }
   .brand > span { margin-top: 4px; font-size: 11px; }
   .sidebar nav button, .sidebar .settings { min-height: 31px; }
   .sidebar nav button.active::before, .sidebar .settings.active::before { top: 7px; bottom: 7px; }
@@ -369,8 +369,9 @@
 .workspace-nav-dialog > .sidebar { height: 100%; padding: 22px 12px 12px; }
 .workspace-nav-dialog .nav-dismiss { position: absolute; top: 13px; right: 12px; z-index: 1; }
 .workspace-nav-dialog .sidebar nav button, .workspace-nav-dialog .sidebar .settings { min-height: 44px; }
-.workspace-nav-dialog .sidebar nav .nav-toggle { width: 40px; min-height: 40px; }
-.workspace-nav-dialog .sidebar nav .nav-child { min-height: 40px; }
+.workspace-nav-dialog .sidebar nav .nav-sub-head > .nav-parent { padding-right: 46px; }
+.workspace-nav-dialog .sidebar nav button.nav-toggle { width: 40px; height: 40px; min-height: 40px; }
+.workspace-nav-dialog .sidebar nav .nav-children > button.nav-child { min-height: 40px; }
 .workspace-nav-dialog .sidebar nav { padding-bottom: 16px; }
 @media (max-width: 1240px) {
   .nav-launch { display: inline-flex; flex: none; }

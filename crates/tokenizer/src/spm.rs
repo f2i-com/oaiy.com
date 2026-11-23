@@ -264,7 +264,9 @@ pub fn decode(tok: &Tokenizer, ids: &[u32]) -> String {
     out
 }
 
-fn parse_byte_fallback(s: &str) -> Option<u8> {
+pub(crate) fn parse_byte_fallback(s: &str) -> Option<u8> {
     let s = s.strip_prefix("<0x")?.strip_suffix('>')?;
     u8::from_str_radix(s, 16).ok()
 }
+
+pub(crate) const SPM_SPACE_STR: &str = "\u{2581}";

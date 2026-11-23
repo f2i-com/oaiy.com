@@ -67,6 +67,111 @@ function streamError(error: unknown): AIProviderError {
 
 const closedEarly = () => new AIProviderError('network', 'The connection closed before the reply was complete.');
 
+/** Strip commas immediately preceding `}` or `]` outside quoted JSON strings. */
+function stripTrailingJsonCommas(text: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ',') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (text[j] === '}' || text[j] === ']') continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Parse a tool call's JSON arguments with safe, deterministic recovery for common local-model quirks:
+ *   1. Markdown code fences wrapping a JSON object (```json ... ```)
+ *   2. Trailing commas before `}` or `]` outside strings
+ *   3. Single double-encoded JSON string (`"{\"path\":\"a.ts\"}"`)
+ *   4. Single spurious trailing `}` (`{"path":"a.ts"}}`)
+ * Truncated JSON and non-object values (arrays, primitives) are never fabricated and return a clear `parseError`.
+ */
+export function parseToolArgs(raw: string): { input: Record<string, unknown>; parseError?: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { input: {} };
+
+  const accept = (value: unknown, allowUnwrap: boolean): { input: Record<string, unknown>; parseError?: string } => {
+    if (isRecord(value)) return { input: value };
+    if (allowUnwrap && typeof value === 'string') {
+      const inner = value.trim();
+      if (inner.startsWith('{') && inner.endsWith('}')) {
+        try {
+          const unwrapped: unknown = JSON.parse(inner);
+          if (isRecord(unwrapped)) return { input: unwrapped };
+        } catch {
+          try {
+            const unwrapped: unknown = JSON.parse(stripTrailingJsonCommas(inner));
+            if (isRecord(unwrapped)) return { input: unwrapped };
+          } catch {
+            /* fall through to non-object error */
+          }
+        }
+      }
+    }
+    return { input: {}, parseError: 'arguments are not a JSON object' };
+  };
+
+  let firstError: unknown;
+  try {
+    return accept(JSON.parse(trimmed), true);
+  } catch (err) {
+    firstError = err;
+  }
+
+  // Strip optional markdown fence wrapper.
+  const fenced = /^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```$/i.exec(trimmed);
+  const candidate = (fenced ? fenced[1]! : trimmed).trim();
+
+  const tryRecover = (text: string): { input: Record<string, unknown>; parseError?: string } | null => {
+    try {
+      const res = accept(JSON.parse(text), true);
+      if (!res.parseError) return res;
+    } catch {
+      /* try next pass */
+    }
+    const noTrailing = stripTrailingJsonCommas(text);
+    if (noTrailing !== text) {
+      try {
+        const res = accept(JSON.parse(noTrailing), true);
+        if (!res.parseError) return res;
+      } catch {
+        /* try next pass */
+      }
+    }
+    return null;
+  };
+
+  const direct = tryRecover(candidate);
+  if (direct) return direct;
+
+  // Recover a single spurious trailing brace emitted by some local quantized models (e.g. `{"a":1}}`).
+  if (candidate.endsWith('}}')) {
+    const trimmedBrace = tryRecover(candidate.slice(0, -1));
+    if (trimmedBrace) return trimmedBrace;
+  }
+
+  const msg = firstError instanceof Error ? firstError.message : String(firstError);
+  return { input: {}, parseError: `arguments are not valid JSON (${msg})` };
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic Messages
 // ---------------------------------------------------------------------------
@@ -129,12 +234,10 @@ export class AnthropicStream {
         const block = this.blocks[index];
         if (block?.type === 'tool_use') {
           const raw = (this.json.get(index) ?? '').trim();
-          try {
-            const input: unknown = raw ? JSON.parse(raw) : {};
-            block.input = isRecord(input) ? input : {};
-          } catch (err) {
-            block.input = {};
-            this.parseErrors.set(String(block.id), `The arguments were not valid JSON (${err instanceof Error ? err.message : String(err)}). Send the call again with a JSON object.`);
+          const parsed = parseToolArgs(raw);
+          block.input = parsed.input;
+          if (parsed.parseError) {
+            this.parseErrors.set(String(block.id), `The ${parsed.parseError}. Send the call again with a JSON object.`);
           }
         }
         break;
@@ -252,9 +355,16 @@ export class OpenAIStream {
     const id = typeof raw.id === 'string' ? raw.id : '';
     const fn = isRecord(raw.function) ? raw.function : {};
     // Calls are told apart by `index`. A server that leaves it out sends each
-    // call whole, or continues the last one: a new id is a new call.
+    // call whole, or continues an existing call by id / the last one: look up by id first.
     let index = typeof raw.index === 'number' ? (this.moved.get(raw.index) ?? raw.index) : -1;
-    if (index < 0) index = id && !this.calls.some((c) => c.id === id) ? this.calls.length : Math.max(this.lastIndex, 0);
+    if (index < 0) {
+      if (id) {
+        const existing = this.calls.findIndex((c) => c?.id === id);
+        index = existing >= 0 ? existing : this.calls.length;
+      } else {
+        index = Math.max(this.lastIndex, 0);
+      }
+    }
     // A call's first fragment (its name, with an id of its own) at an index whose call already has a name and another
     // id: a server that sends each call whole at the same index. A new call, and the index's later fragments are its own
     // (the two were merged into one call, its arguments two objects run together, and neither ran).

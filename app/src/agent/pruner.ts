@@ -14,13 +14,14 @@ import type { ToolResult, Turn } from './protocol';
 import { codePointLength } from './spill';
 
 export const PRUNE_MARKER = '\n\n[... older tool output pruned to save context ...]\n\n';
+const PRESERVE_GUIDE_LINE = /^\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide (?:is now in your instructions|follows)[^\n]*/gm;
 
 export interface PruneConfig {
-  /** Minimum code-point length before a tool result is pruned (default 1,600). */
+  /** Minimum code-point length before a tool result is pruned (default 8,192). */
   thresholdChars?: number;
-  /** Code points retained at the beginning of a pruned result (default 600). */
+  /** Code points retained at the beginning of a pruned result (default 4,096). */
   headChars?: number;
-  /** Code points retained at the end of a pruned result (default 600 — preserves spill pointers). */
+  /** Code points retained at the end of a pruned result (default 1,024 — preserves spill pointers). */
   tailChars?: number;
   /** Number of most-recent turns protected from pruning (default 6). */
   protectRecentTurns?: number;
@@ -60,9 +61,12 @@ export function pruneToolText(text: string, config: PruneConfig = {}): string | 
 
   const head = points.slice(0, maxHead).join('');
   const tail = maxTail > 0 ? points.slice(points.length - maxTail).join('') : '';
-  const next = `${head}${PRUNE_MARKER}${tail}`;
+  const omitted = points.slice(maxHead, maxTail > 0 ? points.length - maxTail : points.length).join('');
+  const preservedGuides = [...omitted.matchAll(PRESERVE_GUIDE_LINE)].map((m) => m[0]);
+  const guideSuffix = preservedGuides.length ? `${preservedGuides.join('\n')}\n` : '';
+  const next = `${head}${PRUNE_MARKER}${guideSuffix}${tail}`;
   const after = codePointLength(next);
-  if (after >= total || after > threshold) return null;
+  if (after >= total || (after > threshold && !preservedGuides.length)) return null;
   return next;
 }
 

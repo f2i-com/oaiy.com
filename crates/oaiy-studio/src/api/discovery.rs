@@ -311,6 +311,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .into_iter()
         .map(|(name, m)| {
             let has = |k: &str| !str_or(&m, k, "").trim().is_empty();
+            let needs_naf = crate::models::registry::model3d_needs_naf(&m);
             let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == model3d_default)),
@@ -320,8 +321,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("input", Json::str(if has("matte") { "a picture of one object; its background is removed" } else { "a picture of one object on a plain or transparent background" })),
                 ("removes_background", Json::Bool(has("matte"))),
                 ("upscales", Json::Bool(has("upscaler"))),
-                ("ready", Json::Bool(has("path") && has("dino") && has("naf"))),
-                ("license", Json::str("MIT (Pixal3D); DINOv3 under Meta's DINOv3 License")),
+                ("ready", Json::Bool(has("path") && has("dino") && (!needs_naf || has("naf")))),
+                ("license", Json::str(if needs_naf { "MIT (Pixal3D); DINOv3 under Meta's DINOv3 License" } else { "MIT (TRELLIS.2); DINOv3 under Meta's DINOv3 License" })),
             ]);
             with_files(entry, missing_files(&studio.root, &m, &MODEL3D_FILES))
         })

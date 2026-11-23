@@ -86,6 +86,10 @@ const ICONS: Record<string, { shapes: Shape[]; fill?: boolean }> = {
   // A link taken apart: a computer unpaired.
   unlink: { shapes: [['path', 'M18.8 12.3l1.7-1.7a5 5 0 0 0-7.1-7.1l-1.7 1.7'], ['path', 'M5.2 11.7l-1.7 1.7a5 5 0 0 0 7.1 7.1l1.7-1.7'], ['line', 8, 2, 8, 5], ['line', 2, 8, 5, 8], ['line', 16, 19, 16, 22], ['line', 19, 16, 22, 16]] },
   ban: { shapes: [['circle', 12, 12, 10], ['line', 4.9, 4.9, 19.1, 19.1]] },
+  camera: { shapes: [['path', 'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z'], ['circle', 12, 13, 4]] },
+  plus: { shapes: [['line', 12, 5, 12, 19], ['line', 5, 12, 19, 12]] },
+  wrap: { shapes: [['line', 3, 6, 21, 6], ['path', 'M3 12h15a3 3 0 1 1 0 6h-4'], ['polyline', '16 16 14 18 16 20'], ['line', 3, 18, 10, 18]] },
+  undo: { shapes: [['path', 'M3 7v6h6'], ['path', 'M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13']] },
 };
 
 const NS = 'http://www.w3.org/2000/svg';

@@ -77,7 +77,9 @@ export async function runInSandbox(request: RunRequest, handler: HostHandler, op
   const started = performance.now();
   const available = sandboxAvailable();
   if (!available.ok) return { timedOut: false, failure: available.reason, elapsedMs: 0, hostCalls: 0 };
+  if (options.signal?.aborted) return { timedOut: false, failure: 'stopped', elapsedMs: 0, hostCalls: 0 };
   const module = await zippModule();
+  if (options.signal?.aborted) return { timedOut: false, failure: 'stopped', elapsedMs: 0, hostCalls: 0 };
   const sab = createChannelBuffer();
   const writer = new ReplyWriter(sab);
   const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module', name: 'zipp-sandbox' });
@@ -85,16 +87,18 @@ export async function runInSandbox(request: RunRequest, handler: HostHandler, op
 
   return new Promise<RunOutcome>((resolve) => {
     let settled = false;
+    const onAbort = () => finish({ timedOut: false, failure: 'stopped' });
     const finish = (outcome: Omit<RunOutcome, 'elapsedMs' | 'hostCalls'>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
       worker.terminate();
       resolve({ ...outcome, elapsedMs: Math.round(performance.now() - started), hostCalls });
     };
     const timer = setTimeout(() => finish({ timedOut: true }), options.timeoutMs);
-    if (options.signal?.aborted) queueMicrotask(() => finish({ timedOut: false, failure: 'stopped' }));
-    options.signal?.addEventListener('abort', () => finish({ timedOut: false, failure: 'stopped' }), { once: true });
+    if (options.signal?.aborted) queueMicrotask(onAbort);
+    else options.signal?.addEventListener('abort', onAbort, { once: true });
 
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const message = event.data;

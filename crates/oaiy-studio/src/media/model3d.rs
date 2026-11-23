@@ -42,9 +42,10 @@ pub fn model3d_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json, 
         }
         Ok(config::resolve(root, &p).to_string_lossy().into_owned())
     };
-    let path = folder("path", "Pixal3D folder")?;
+    let path = folder("path", "3D model folder")?;
     let dino = folder("dino", "DINOv3 ViT-L/16 folder")?;
-    let naf = folder("naf", "NAF weights (naf_release.pth)")?;
+    let needs_naf = crate::models::registry::model3d_needs_naf(model);
+    let naf = if needs_naf { Some(folder("naf", "NAF weights (naf_release.pth)")?) } else { None };
     let helper = |key: &str| -> Option<String> {
         let p = str_or(model, key, "").trim().to_string();
         (!p.is_empty()).then(|| config::resolve(root, &p).to_string_lossy().into_owned())
@@ -73,7 +74,6 @@ pub fn model3d_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json, 
         ("kind".into(), Json::str("model3d")),
         ("model_dir".into(), Json::str(&path)),
         ("dino_dir".into(), Json::str(&dino)),
-        ("naf".into(), Json::str(&naf)),
         ("image".into(), Json::str(&image)),
         ("resolution".into(), Json::Int(resolution)),
         ("faces".into(), Json::Int(faces)),
@@ -82,6 +82,9 @@ pub fn model3d_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json, 
         ("device".into(), Json::Int(int_or(cfg.get("media").unwrap_or(&Json::Null), "device", 0))),
         ("output_dir".into(), Json::str(output_dir.to_string_lossy())),
     ];
+    if let Some(naf) = &naf {
+        f.push(("naf".into(), Json::str(naf)));
+    }
     // The baked textures' size, or 0 for vertex colours only.
     let texture_size = number(body, &["texture_size"]).map(|v| v as i64).unwrap_or_else(|| int_or(model, "texture_size", 2048));
     if ![0, 512, 1024, 2048, 4096].contains(&texture_size) {

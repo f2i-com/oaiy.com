@@ -82,16 +82,20 @@ function countLines(text: string): number {
   return n;
 }
 
-function pruneOldSpills(vfs: Vfs): void {
+let spillSeq = 0;
+
+function pruneOldSpills(vfs: Vfs, keepPath?: string): void {
   try {
     if (!vfs.exists(SPILL_DIR)) return;
+    const keepName = keepPath?.startsWith(`${SPILL_DIR}/`) ? keepPath.slice(SPILL_DIR.length + 1) : undefined;
     const entries = vfs.list(SPILL_DIR).filter((e) => e.type === 'file');
     if (entries.length <= MAX_SPILL_FILES) return;
-    entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const removable = keepName ? entries.filter((e) => e.name !== keepName) : entries;
+    removable.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
     const excess = entries.length - MAX_SPILL_FILES;
-    for (let i = 0; i < excess; i++) {
+    for (let i = 0; i < excess && i < removable.length; i++) {
       try {
-        vfs.remove(`${SPILL_DIR}/${entries[i].name}`);
+        vfs.remove(`${SPILL_DIR}/${removable[i]!.name}`);
       } catch {
         /* ignore cleanup race */
       }
@@ -132,11 +136,15 @@ export function maybeSpillOutput(
 
   const safeId = sanitizeSegment(callId, String(Date.now()), 28);
   const safeTool = sanitizeSegment(toolName, 'tool', 28);
-  const spillPath = `${SPILL_DIR}/${safeId}-${safeTool}.txt`;
+  let spillPath = `${SPILL_DIR}/${safeId}-${safeTool}.txt`;
+  while (vfs.exists(spillPath)) {
+    spillSeq++;
+    spillPath = `${SPILL_DIR}/${safeId}-${spillSeq}-${safeTool}.txt`;
+  }
 
   try {
     vfs.writeFile(spillPath, content, { parents: true });
-    pruneOldSpills(vfs);
+    pruneOldSpills(vfs, spillPath);
   } catch {
     // Storage failure must never hide valid tool output.
     return { text: content, omittedBytes: 0, totalLines };
@@ -175,10 +183,14 @@ export function maybeSpillOutput(
   const totalBytes = encoder.encode(content).byteLength;
   const keptBytes = encoder.encode(head).byteLength + encoder.encode(tail).byteLength;
   const omittedBytes = Math.max(0, totalBytes - keptBytes);
+  const readHint =
+    totalLines <= 5 && totalBytes > 10_000
+      ? `read_file({"path": "${spillPath}", "char_start": 0, "char_count": 10000})`
+      : `read_file({"path": "${spillPath}", "offset": 1, "limit": 200})`;
   const notice =
     `[Full ${toolName} output (${totalLines.toLocaleString()} lines, ${totalBytes.toLocaleString()} bytes; ` +
     `${omittedBytes.toLocaleString()} bytes omitted above) saved verbatim to ${spillPath}. ` +
-    `Use read_file({"path": "${spillPath}", "offset": 1, "limit": 200}) or search_file({"path": "${spillPath}", "pattern": "..."}) to inspect specific parts.]`;
+    `Use ${readHint} or search_file({"path": "${spillPath}", "pattern": "..."}) to inspect specific parts.]`;
 
   const text = `${head}\n\n[...]\n\n${tail}\n\n${notice}`;
   return { text, spillPath, omittedBytes, totalLines };

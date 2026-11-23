@@ -453,7 +453,8 @@ impl Server {
         }
         let top_k = num("top_k")?.map_or(0, |v| v.max(0.0) as usize);
         let seed = num("seed")?.map_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64), |v| v as u64);
-        let max_tokens = num("max_completion_tokens")?.or(num("max_tokens")?).map_or(a.cfg.max_tokens, |v| v.max(1.0) as usize);
+        // `max_tokens <= 0` (e.g. `-1`, used by llama.cpp / Qwen3.5-4B-3D-Coder) means unlimited up to the context window.
+        let max_tokens = resolve_max_tokens(num("max_completion_tokens")?.or(num("max_tokens")?), a.cfg.max_tokens, a.cfg.max_seq);
         if body.get("n").and_then(Json::as_i64).is_some_and(|n| n != 1) {
             return Err(bad("n > 1 is not supported"));
         }
@@ -1685,6 +1686,28 @@ mod tests {
 }
 
 const TOOL_CONTRACT_CODE: &str = "tool_contract_error";
+
+fn resolve_max_tokens(requested: Option<f64>, default_max_tokens: usize, max_seq: usize) -> usize {
+    requested.map_or(default_max_tokens, |v| {
+        if !v.is_finite() || v <= 0.0 {
+            max_seq
+        } else {
+            (v.max(1.0) as usize).min(max_seq)
+        }
+    })
+}
+
+#[test]
+fn negative_or_zero_max_tokens_uses_context_window() {
+    assert_eq!(resolve_max_tokens(None, 4096, 65536), 4096);
+    assert_eq!(resolve_max_tokens(Some(-1.0), 4096, 65536), 65536);
+    assert_eq!(resolve_max_tokens(Some(0.0), 4096, 65536), 65536);
+    assert_eq!(resolve_max_tokens(Some(f64::NAN), 4096, 65536), 65536);
+    assert_eq!(resolve_max_tokens(Some(f64::INFINITY), 4096, 65536), 65536);
+    assert_eq!(resolve_max_tokens(Some(0.5), 4096, 65536), 1);
+    assert_eq!(resolve_max_tokens(Some(1234.0), 4096, 65536), 1234);
+    assert_eq!(resolve_max_tokens(Some(999_999.0), 4096, 65536), 65536);
+}
 
 fn observer_review_policy(body: &Json) -> Result<(), ApiError> {
     match body.get("oaiy_observer_review") {

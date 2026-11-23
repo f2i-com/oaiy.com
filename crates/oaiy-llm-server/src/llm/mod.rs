@@ -277,6 +277,7 @@ impl Model {
     pub fn forward_spliced(&self, tokens: &[u32], soft: &[(usize, &[f32])], kv: &mut KvCache) -> Option<Tensor> {
         match self {
             Self::Gemma4(m) => Some(m.forward_spliced(tokens, soft, kv)),
+            Self::Gemma4Moe(m) => Some(m.forward_spliced(tokens, soft, kv)),
             Self::Glm5Next(m) => Some(m.forward_spliced(tokens, soft, kv).unwrap_or_else(|e| panic!("{e}"))),
             Self::Inkling2(m) => Some(m.forward_spliced(tokens, soft, kv).unwrap_or_else(|e| panic!("Inkling-2 forward error: {e}"))),
             _ => None,

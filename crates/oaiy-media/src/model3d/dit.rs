@@ -22,6 +22,9 @@ pub struct Config {
     pub out_channels: usize,
     pub cond_channels: usize,
     pub proj_channels: usize,
+    /// True for Pixal3D (`image_attn_mode: "proj"` with per-voxel back-projected `proj_linear`);
+    /// false for standard TRELLIS.2-4B (full DINOv3 token cross-attention, no `proj_linear` / NAF).
+    pub has_proj: bool,
     pub mlp: usize,
     pub resolution: usize,
 }
@@ -31,9 +34,14 @@ impl Config {
         let j = Json::parse(&std::fs::read(path)?).map_err(candle_core::Error::wrap)?;
         let a = j.get("args").ok_or_else(|| candle_core::Error::Msg(format!("{}: no args", path.display())))?;
         let n = |k: &str| a.get(k).and_then(Json::as_i64).map(|v| v as usize).ok_or_else(|| candle_core::Error::Msg(format!("{}: no {k}", path.display())));
-        if a.get("pe_mode").and_then(Json::as_str) != Some("rope") || a.get("image_attn_mode").and_then(Json::as_str) != Some("proj") || a.get("share_mod").and_then(Json::as_bool) != Some(true) {
-            candle_core::bail!("{}: only RoPE, shared-modulation, projection-attention models are supported", path.display());
+        let attn_mode = a.get("image_attn_mode").and_then(Json::as_str);
+        if a.get("pe_mode").and_then(Json::as_str) != Some("rope")
+            || !matches!(attn_mode, None | Some("proj"))
+            || a.get("share_mod").and_then(Json::as_bool) != Some(true)
+        {
+            candle_core::bail!("{}: only RoPE, shared-modulation TRELLIS.2 / Pixal3D models are supported", path.display());
         }
+        let has_proj = attn_mode == Some("proj");
         let channels = n("model_channels")?;
         let ratio = a.get("mlp_ratio").and_then(Json::as_f64).unwrap_or(4.);
         let cond = n("cond_channels")?;
@@ -45,6 +53,7 @@ impl Config {
             out_channels: n("out_channels")?,
             cond_channels: cond,
             proj_channels: a.get("proj_in_channels").and_then(Json::as_i64).map(|v| v as usize).unwrap_or(cond),
+            has_proj,
             mlp: (channels as f64 * ratio) as usize,
             resolution: n("resolution")?,
         })
@@ -77,7 +86,7 @@ struct Block {
     cq_norm: Tensor,
     ck_norm: Tensor,
     cout: Lin,
-    proj: Lin,
+    proj: Option<Lin>,
     fc1: Lin,
     fc2: Lin,
 }
@@ -174,6 +183,7 @@ impl Dit {
         let blocks = (0..cfg.blocks)
             .map(|i| {
                 let p = format!("blocks.{i}");
+                let ca = if cfg.has_proj { format!("{p}.cross_attn.cross_attn_block") } else { format!("{p}.cross_attn") };
                 Ok(Block {
                     // A plain parameter, not a linear layer: it stays F32 in the reference.
                     modulation: store.tensor_f32(&format!("{p}.modulation"), dev)?,
@@ -183,12 +193,12 @@ impl Dit {
                     out: Lin::load(&mut store, &format!("{p}.self_attn.to_out"), bf, dev)?,
                     norm2_w: store.tensor_f32(&format!("{p}.norm2.weight"), dev)?,
                     norm2_b: store.tensor_f32(&format!("{p}.norm2.bias"), dev)?,
-                    cq: Lin::load(&mut store, &format!("{p}.cross_attn.cross_attn_block.to_q"), bf, dev)?,
-                    ckv: Lin::load(&mut store, &format!("{p}.cross_attn.cross_attn_block.to_kv"), bf, dev)?,
-                    cq_norm: store.tensor_f32(&format!("{p}.cross_attn.cross_attn_block.q_rms_norm.gamma"), dev)?,
-                    ck_norm: store.tensor_f32(&format!("{p}.cross_attn.cross_attn_block.k_rms_norm.gamma"), dev)?,
-                    cout: Lin::load(&mut store, &format!("{p}.cross_attn.cross_attn_block.to_out"), bf, dev)?,
-                    proj: Lin::load(&mut store, &format!("{p}.cross_attn.proj_linear"), bf, dev)?,
+                    cq: Lin::load(&mut store, &format!("{ca}.to_q"), bf, dev)?,
+                    ckv: Lin::load(&mut store, &format!("{ca}.to_kv"), bf, dev)?,
+                    cq_norm: store.tensor_f32(&format!("{ca}.q_rms_norm.gamma"), dev)?,
+                    ck_norm: store.tensor_f32(&format!("{ca}.k_rms_norm.gamma"), dev)?,
+                    cout: Lin::load(&mut store, &format!("{ca}.to_out"), bf, dev)?,
+                    proj: if cfg.has_proj { Some(Lin::load(&mut store, &format!("{p}.cross_attn.proj_linear"), bf, dev)?) } else { None },
                     fc1: Lin::load(&mut store, &format!("{p}.mlp.mlp.0"), bf, dev)?,
                     fc2: Lin::load(&mut store, &format!("{p}.mlp.mlp.2"), bf, dev)?,
                 })
@@ -272,10 +282,12 @@ impl Dit {
             let q = head_rms(&b.cq.forward(&hn)?.reshape((n, heads, d))?, &b.cq_norm)?;
             let a = attention(&q, ck, cv)?.reshape((n, c))?;
             let mut a = b.cout.forward(&a)?;
-            a = match &ctx.proj {
-                Some(p) => (a + b.proj.forward(p)?)?,
-                None => a.broadcast_add(&b.proj.b)?,
-            };
+            if let Some(proj) = &b.proj {
+                a = match &ctx.proj {
+                    Some(p) => (a + proj.forward(p)?)?,
+                    None => a.broadcast_add(&proj.b)?,
+                };
+            }
             h = (h + a)?;
             // MLP.
             let hn = layer_norm(&h, 1e-6)?.to_dtype(DType::BF16)?;
@@ -285,5 +297,37 @@ impl Dit {
         }
         let h = layer_norm(&h, 1e-5)?;
         self.output.forward(&h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_reads_both_pixal3d_and_trellis2() {
+        let dir = std::env::temp_dir().join(format!("oaiy-dit-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let trellis = dir.join("trellis2.json");
+        std::fs::write(
+            &trellis,
+            r#"{"name":"SparseStructureFlowModel","args":{"resolution":16,"in_channels":8,"out_channels":8,"model_channels":1536,"cond_channels":1024,"num_blocks":30,"num_heads":12,"mlp_ratio":5.3334,"pe_mode":"rope","share_mod":true}}"#,
+        )
+        .unwrap();
+        let tc = Config::read(&trellis).unwrap();
+        assert!(!tc.has_proj);
+        assert_eq!(tc.mlp, 8192);
+        assert_eq!(tc.blocks, 30);
+
+        let pixal = dir.join("pixal3d.json");
+        std::fs::write(
+            &pixal,
+            r#"{"name":"SparseStructureFlowModel","args":{"resolution":16,"in_channels":8,"out_channels":8,"model_channels":1536,"cond_channels":1024,"proj_in_channels":1024,"num_blocks":30,"num_heads":12,"mlp_ratio":5.3334,"pe_mode":"rope","image_attn_mode":"proj","share_mod":true}}"#,
+        )
+        .unwrap();
+        let pc = Config::read(&pixal).unwrap();
+        assert!(pc.has_proj);
+        assert_eq!(pc.proj_channels, 1024);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

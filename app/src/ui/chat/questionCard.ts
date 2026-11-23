@@ -31,6 +31,7 @@ export function mountQuestionCard(
 
     const body = h('div', { class: 'ask-card-body' });
     const inputs: HTMLInputElement[] = [];
+    let firstOptionBtn: HTMLButtonElement | null = null;
 
     for (const q of questions) {
       const sel = new Set<string>();
@@ -47,7 +48,7 @@ export function mountQuestionCard(
           const isRec = /\(recommended\)/i.test(opt.label);
           const btn = h(
             'button',
-            { type: 'button', class: `ask-opt${isRec ? ' recommended' : ''}` },
+            { type: 'button', class: `ask-opt${isRec ? ' recommended' : ''}`, 'aria-pressed': 'false' },
             h('span', { class: 'ask-opt-label' }, opt.label),
             ...(opt.description ? [h('span', { class: 'ask-opt-desc' }, opt.description)] : []),
           ) as HTMLButtonElement;
@@ -56,17 +57,24 @@ export function mountQuestionCard(
               if (sel.has(opt.label)) {
                 sel.delete(opt.label);
                 btn.classList.remove('selected');
+                btn.setAttribute('aria-pressed', 'false');
               } else {
                 sel.add(opt.label);
                 btn.classList.add('selected');
+                btn.setAttribute('aria-pressed', 'true');
               }
             } else {
               sel.clear();
-              for (const b of buttons) b.classList.remove('selected');
+              for (const b of buttons) {
+                b.classList.remove('selected');
+                b.setAttribute('aria-pressed', 'false');
+              }
               sel.add(opt.label);
               btn.classList.add('selected');
+              btn.setAttribute('aria-pressed', 'true');
             }
           };
+          if (!firstOptionBtn) firstOptionBtn = btn;
           buttons.push(btn);
           optsEl.append(btn);
         }
@@ -133,6 +141,7 @@ export function mountQuestionCard(
 
     const onAbort = () => finish(true);
     if (signal?.aborted) {
+      if (container.classList.contains('ask-wrap')) container.remove();
       finish(true);
       return;
     }
@@ -140,17 +149,19 @@ export function mountQuestionCard(
 
     submitBtn.onclick = () => finish(false);
     skipBtn.onclick = () => finish(true);
-    for (const inp of inputs) {
+    inputs.forEach((inp, idx) => {
       inp.onkeydown = (e) => {
+        if (e.isComposing || e.keyCode === 229) return;
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          finish(false);
+          if (idx < inputs.length - 1) inputs[idx + 1]?.focus();
+          else finish(false);
         }
       };
-    }
+    });
 
     container.append(card);
-    inputs[0]?.focus();
+    (firstOptionBtn ?? inputs[0])?.focus();
   });
 }
 
@@ -187,6 +198,11 @@ export function mountPlanReviewCard(
     const approveBtn = h('button', { type: 'button', class: 'ask-btn-primary' }, 'Approve & execute') as HTMLButtonElement;
     const footer = h('div', { class: 'plan-review-footer' }, feedback, h('div', { class: 'plan-review-actions' }, reviseBtn, approveBtn));
     card.append(footer);
+    feedback.oninput = () => {
+      const hasNote = feedback.value.trim().length > 0;
+      reviseBtn.textContent = hasNote ? 'Request revision' : 'Keep planning';
+      approveBtn.textContent = hasNote ? 'Approve with note' : 'Approve & execute';
+    };
 
     let done = false;
     const settle = (approved: boolean, note?: string) => {
@@ -207,6 +223,7 @@ export function mountPlanReviewCard(
 
     const onAbort = () => settle(false, 'Cancelled');
     if (signal?.aborted) {
+      if (container.classList.contains('plan-review-wrap')) container.remove();
       settle(false, 'Cancelled');
       return;
     }
@@ -215,6 +232,7 @@ export function mountPlanReviewCard(
     approveBtn.onclick = () => settle(true);
     reviseBtn.onclick = () => settle(false);
     feedback.onkeydown = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         settle(feedback.value.trim().length === 0);

@@ -45,6 +45,13 @@ const TOOLS: Record<string, [string, string]> = {
   softn_inspect: ['Inspected the app', 'app'],
   softn_interact: ['Used the app', 'app'],
   softn_import: ['Unpacked', 'package'],
+  sqlite_list_databases: ['Listed databases', 'table'],
+  sqlite_schema: ['Inspected SQLite schema', 'table'],
+  sqlite_query: ['Queried SQLite', 'table'],
+  sqlite_execute: ['Updated SQLite', 'table'],
+  find_tools: ['Looked up tools', 'search'],
+  use_tool: ['Ran tool', 'wrench'],
+  guide: ['Read guide', 'file-text'],
   page_check: ['Checked the page', 'globe'],
   page_inspect: ['Inspected the page', 'globe'],
   page_interact: ['Used the page', 'globe'],
@@ -204,7 +211,7 @@ const DOING: Record<string, string> = {
   Checked: 'Checking', Chose: 'Choosing', Confirmed: 'Confirming', Cut: 'Cutting', Deleted: 'Deleting', Denied: 'Denying',
   Edited: 'Editing', Ended: 'Ending', Enlarged: 'Enlarging', Fetched: 'Fetching', Finished: 'Finishing', Forgot: 'Forgetting',
   Found: 'Finding', Gave: 'Giving', Inspected: 'Inspecting', Installed: 'Installing', Let: 'Letting', Listed: 'Listing',
-  Looked: 'Looking', Made: 'Making', Marked: 'Marking', Paused: 'Pausing', Pinned: 'Pinning', Put: 'Putting', Ran: 'Running',
+  Looked: 'Looking', Made: 'Making', Marked: 'Marking', Patched: 'Patching', Paused: 'Pausing', Pinned: 'Pinning', Presented: 'Presenting', Put: 'Putting', Queried: 'Querying', Ran: 'Running',
   Read: 'Reading', Recorded: 'Recording', Remembered: 'Remembering', Removed: 'Removing', Requested: 'Requesting',
   Restarted: 'Restarting', Resumed: 'Resuming', Reviewed: 'Reviewing', Searched: 'Searching', Sent: 'Sending', Set: 'Setting',
   Showed: 'Showing', Signed: 'Signing', Split: 'Splitting', Started: 'Starting', Stopped: 'Stopping', Switched: 'Switching',
@@ -260,6 +267,17 @@ export function summarizeCall(call: ToolCall): string {
     case 'softn_docs': return s('search') ? `search: ${s('search')}` : s('topic') || s('section') || 'map';
     case 'softn_components': return Array.isArray(i.names) ? i.names.join(', ') : s('names');
     case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
+    case 'sqlite_list_databases': return s('app');
+    case 'sqlite_schema': return [s('database'), s('table'), s('app')].filter(Boolean).join(' · ');
+    case 'sqlite_query': case 'sqlite_execute': return [s('database'), s('sql').replace(/\s+/g, ' ').trim().slice(0, 72)].filter(Boolean).join(' · ');
+    case 'find_tools': return s('query') || 'all';
+    case 'use_tool': return s('name');
+    case 'guide': return s('topic');
+    case 'apply_patch': {
+      const files = [...s('patch').matchAll(/^\*\*\* (?:Add File|Update File|Delete File): (.+)$/gm)].map((m) => m[1]!.trim());
+      return files.length <= 2 ? files.join(', ') : `${files[0]} +${files.length - 1} more`;
+    }
+    case 'exit_plan_mode': return s('title');
     case 'lookup_business_data': return s('question');
     case 'request_appointment': return [s('service'), s('date'), s('time')].filter(Boolean).join(' · ');
     case 'remember': return s('name') || s('fact');

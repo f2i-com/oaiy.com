@@ -191,20 +191,24 @@ export class SandboxHost implements HostHandler {
     }
   }
 
-  private grep(req: { pattern: string; path?: string; ignore_case?: boolean; glob?: string | null; exclude_dir?: string | null; max_results?: number; files_only?: boolean }) {
+  private grep(req: { pattern: string; path?: string; ignore_case?: boolean; literal?: boolean; context?: number; glob?: string | null; exclude_dir?: string | null; max_results?: number; files_only?: boolean }) {
     let regex: RegExp;
     // The search runs on the page's thread: a long pattern or a huge line is where a regex can hang it.
+    if (!req.pattern) throw new SyntaxError('pattern must not be empty');
     if (req.pattern.length > 1000) throw new SyntaxError('the pattern is too long (at most 1000 characters)');
+    const source = req.literal ? req.pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : req.pattern;
     try {
-      regex = new RegExp(req.pattern, req.ignore_case ? 'i' : '');
+      regex = new RegExp(source, req.ignore_case ? 'i' : '');
     } catch (error) {
       throw new SyntaxError(`invalid regular expression: ${(error as Error).message}`);
     }
     const glob = req.glob ? globRegex(req.glob) : null;
     const max = Math.min(Math.max(req.max_results ?? 500, 1), 20_000);
+    const context = typeof req.context === 'number' && Number.isFinite(req.context) ? Math.min(Math.max(Math.floor(req.context), 0), 5) : 0;
     const walked = this.vfs.walk(req.path ?? '/');
-    const matches: Array<{ path: string; line: number; text: string }> = [];
+    const matches: Array<{ path: string; line: number; text: string; isContext?: boolean }> = [];
     const files: string[] = [];
+    let matchCount = 0;
     let scanned = 0;
     let truncated = walked.truncated;
     outer: for (const entry of walked.entries) {
@@ -219,17 +223,54 @@ export class SandboxHost implements HostHandler {
       }
       scanned++;
       const lines = text.split('\n');
-      for (let n = 0; n < lines.length; n++) {
-        if (!regex.test(lines[n])) continue;
-        if (req.files_only) {
+      if (req.files_only) {
+        for (let n = 0; n < lines.length; n++) {
+          if (!regex.test(lines[n])) continue;
           files.push(entry.path);
+          if (files.length >= max) {
+            truncated = true;
+            break outer;
+          }
           continue outer;
         }
-        matches.push({ path: entry.path, line: n + 1, text: lines[n].slice(0, 1000) });
-        if (matches.length >= max) {
-          truncated = true;
-          break outer;
+        continue;
+      }
+      if (context === 0) {
+        for (let n = 0; n < lines.length; n++) {
+          if (!regex.test(lines[n])) continue;
+          matches.push({ path: entry.path, line: n + 1, text: lines[n].replace(/\r$/, '').slice(0, 1000) });
+          matchCount++;
+          if (matchCount >= max) {
+            truncated = true;
+            break outer;
+          }
         }
+      } else {
+        const hitSet = new Set<number>();
+        const emitSet = new Set<number>();
+        for (let n = 0; n < lines.length; n++) {
+          if (!regex.test(lines[n])) continue;
+          hitSet.add(n);
+          const from = Math.max(0, n - context);
+          const to = Math.min(lines.length - 1, n + context);
+          for (let j = from; j <= to; j++) emitSet.add(j);
+          matchCount++;
+          if (matchCount >= max) {
+            truncated = true;
+            break;
+          }
+        }
+        if (emitSet.size) {
+          for (const idx of [...emitSet].sort((a, b) => a - b)) {
+            matches.push({
+              path: entry.path,
+              line: idx + 1,
+              text: lines[idx]!.replace(/\r$/, '').slice(0, 1000),
+              ...(hitSet.has(idx) ? {} : { isContext: true }),
+            });
+          }
+        }
+        if (truncated) break outer;
       }
     }
     return { matches, files, truncated, files_scanned: scanned };
@@ -259,7 +300,20 @@ export class SandboxHost implements HostHandler {
     // look at a redirect's new host before it goes there.
     const open = settings.mode === 'open' && settings.deny.length === 0;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(1000, Math.min(this.remainingMs(), 120_000)));
+    let timedOut = false;
+    const onUpstreamAbort = () => controller.abort(this.signal?.reason);
+    if (this.signal?.aborted) {
+      throw new TypeError('fetch failed: cancelled');
+    }
+    this.signal?.addEventListener('abort', onUpstreamAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1000, Math.min(this.remainingMs(), 120_000)));
+    const cleanup = () => {
+      clearTimeout(timer);
+      this.signal?.removeEventListener('abort', onUpstreamAbort);
+    };
     let response: Response;
     try {
       response = await fetch(url, {
@@ -274,23 +328,25 @@ export class SandboxHost implements HostHandler {
       if (response.redirected && response.url) {
         const final = new URL(response.url).hostname;
         if (isLocalHost(final) && !settings.allow.some((h) => hostKey(h) === hostKey(final))) {
-          clearTimeout(timer);
+          cleanup();
           void response.body?.cancel().catch(() => {});
           throw new TypeError(`fetch failed: ${host} redirected to \`${final}\`, which is on this machine or its local network; not followed`);
         }
         const after = this.gate.check(final, this.via);
         if (!after.ok) {
-          clearTimeout(timer);
+          cleanup();
           void response.body?.cancel().catch(() => {});
           throw new TypeError(`fetch failed: ${host} redirected to ${final}: ${after.reason}`);
         }
       }
     } catch (error) {
-      clearTimeout(timer);
+      cleanup();
       if (error instanceof TypeError && error.message.startsWith('fetch failed:')) throw error;
-      const why = controller.signal.aborted
-        ? 'timed out'
-        : `${(error as Error).message}. From a browser this usually means the site does not allow cross-origin requests (CORS)${open ? '' : ', or it redirected while the gate is restricted'}`;
+      const why = this.signal?.aborted
+        ? 'cancelled'
+        : timedOut || controller.signal.aborted
+          ? 'timed out'
+          : `${(error as Error).message}. From a browser this usually means the site does not allow cross-origin requests (CORS)${open ? '' : ', or it redirected while the gate is restricted'}`;
       throw new TypeError(`fetch failed: ${why}`);
     }
     const limit = req.save_to ? MAX_DOWNLOAD_BYTES : MAX_FETCH_BYTES;
@@ -298,22 +354,36 @@ export class SandboxHost implements HostHandler {
     const chunks: Uint8Array[] = [];
     let total = 0;
     let truncated = false;
-    if (reader) {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (total + value.byteLength > limit) {
-          chunks.push(value.subarray(0, limit - total));
-          total = limit;
-          truncated = true;
-          await reader.cancel();
-          break;
+    try {
+      if (reader) {
+        for (;;) {
+          if (this.signal?.aborted) {
+            await reader.cancel().catch(() => {});
+            throw new TypeError('fetch failed: cancelled');
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (total + value.byteLength > limit) {
+            chunks.push(value.subarray(0, limit - total));
+            total = limit;
+            truncated = true;
+            await reader.cancel();
+            break;
+          }
+          chunks.push(value);
+          total += value.byteLength;
         }
-        chunks.push(value);
-        total += value.byteLength;
       }
+    } catch (error) {
+      if (error instanceof TypeError && error.message.startsWith('fetch failed:')) throw error;
+      const why = this.signal?.aborted ? 'cancelled' : timedOut || controller.signal.aborted ? 'timed out' : (error as Error).message;
+      throw new TypeError(`fetch failed: ${why}`);
+    } finally {
+      cleanup();
     }
-    clearTimeout(timer);
+    if (this.signal?.aborted) {
+      throw new TypeError('fetch failed: cancelled');
+    }
     const bytes = new Uint8Array(total);
     let offset = 0;
     for (const c of chunks) {
