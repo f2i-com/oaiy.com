@@ -376,6 +376,52 @@ fn content_range_start(resp: &reqwest::Response) -> Option<u64> {
         .ok()
 }
 
+#[derive(Default)]
+struct TransferSlot {
+    /// Monotonic generation counter incremented on every start/pause/resume/cancel
+    /// transition so a stale task can never mutate progress or leak an AbortHandle.
+    generation: u64,
+    /// AbortHandle for the currently-running transfer of `generation`, if any.
+    abort: Option<AbortHandle>,
+    /// True once the task for `generation` has exited (guards against a task
+    /// finishing before `spawn_transfer` stores its `AbortHandle`).
+    exited: bool,
+}
+
+/// RAII cleanup guard for an in-flight download task. Declared before the open
+/// `.part` file so the file handle is dropped first on every exit path (normal,
+/// error, abort, or panic), then clears `TransferSlot::abort` and best-effort
+/// removes `.part` if the download was cancelled.
+struct TransferGuard {
+    id: String,
+    generation: u64,
+    part_path: PathBuf,
+    progress_map: Arc<Mutex<HashMap<String, DownloadProgress>>>,
+    transfers: Arc<Mutex<HashMap<String, TransferSlot>>>,
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        let is_cancelled = self
+            .progress_map
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&self.id).map(|p| p.status == DownloadStatus::Cancelled))
+            .unwrap_or(false);
+        if let Ok(mut t) = self.transfers.lock() {
+            if let Some(slot) = t.get_mut(&self.id) {
+                if slot.generation == self.generation {
+                    slot.abort = None;
+                    slot.exited = true;
+                }
+            }
+        }
+        if is_cancelled {
+            let _ = std::fs::remove_file(&self.part_path);
+        }
+    }
+}
+
 pub struct Downloads {
     /// Where downloaded files land: `${dataDir}/models/`. This is the
     /// "designated folder" the UI shows prominently.
@@ -393,9 +439,10 @@ pub struct Downloads {
     /// All downloads ever attempted in this session, keyed by id.
     /// Completed entries stay so the UI can surface "just finished".
     progress: Arc<Mutex<HashMap<String, DownloadProgress>>>,
-    /// AbortHandles for in-flight task cancellation (pause + cancel).
-    /// Kept separate from `progress` so the latter can stay serializable.
-    abort_handles: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Per-download generation + AbortHandle tracking for in-flight transfers.
+    /// Kept separate from `progress` so the latter stays serializable.
+    /// Lock order invariant: always acquire `progress` BEFORE `transfers`.
+    transfers: Arc<Mutex<HashMap<String, TransferSlot>>>,
     /// Optional HuggingFace access token, sent as `Authorization: Bearer`
     /// on huggingface.co requests so gated/private repos (Llama, some
     /// Gemma) download. Set from the persisted config at startup +
@@ -417,7 +464,7 @@ impl Downloads {
             models_dir,
             models_cache: Arc::new(Mutex::new(None)),
             progress: Arc::new(Mutex::new(HashMap::new())),
-            abort_handles: Arc::new(Mutex::new(HashMap::new())),
+            transfers: Arc::new(Mutex::new(HashMap::new())),
             hf_token: Arc::new(Mutex::new(None)),
         }
     }
@@ -763,7 +810,7 @@ impl Downloads {
         //
         // A poisoned lock is now fatal rather than silently ignored: proceeding
         // past a poisoned registry is exactly how the duplicate transfer happened.
-        {
+        let generation = {
             let mut g = self
                 .progress
                 .lock()
@@ -820,11 +867,22 @@ impl Downloads {
                 ));
             }
 
+            let mut t = self
+                .transfers
+                .lock()
+                .map_err(|_| "download transfer lock poisoned".to_string())?;
+            let slot = t.entry(id.clone()).or_default();
+            slot.generation = slot.generation.wrapping_add(1).max(1);
+            slot.abort = None;
+            slot.exited = false;
+            let gen = slot.generation;
             g.insert(id.clone(), progress);
-        }
+            gen
+        };
 
         self.spawn_transfer(
             id.clone(),
+            generation,
             normalised,
             dest,
             /* resume_from = */ 0,
@@ -837,39 +895,39 @@ impl Downloads {
     /// preserved; resume() picks up via HTTP Range. No-op if already
     /// paused/finished.
     pub fn pause(&self, id: &str) -> Result<(), String> {
-        let status = {
-            let g = self.progress.lock().map_err(|_| "lock poisoned")?;
-            g.get(id).map(|p| p.status).ok_or("unknown download")?
-        };
-        match status {
-            DownloadStatus::Active | DownloadStatus::Queued => {
-                self.abort_task(id);
-                self.update(id, |p| {
+        let abort_handle = {
+            let mut g = self.progress.lock().map_err(|_| "lock poisoned")?;
+            let p = g.get_mut(id).ok_or("unknown download")?;
+            match p.status {
+                DownloadStatus::Active | DownloadStatus::Queued => {
                     p.status = DownloadStatus::Paused;
                     // Clear speed/ETA so paused rows don't lie ("12 MiB/s")
                     // for the few seconds before the user sees the badge flip.
                     p.speed_bps = None;
                     p.eta_secs = None;
-                });
-                Ok(())
+                    let mut t = self.transfers.lock().map_err(|_| "lock poisoned")?;
+                    let slot = t.entry(id.to_string()).or_default();
+                    slot.generation = slot.generation.wrapping_add(1).max(1);
+                    slot.exited = false;
+                    slot.abort.take()
+                }
+                DownloadStatus::Paused => return Ok(()),
+                other => return Err(format!("can't pause download in state {other:?}")),
             }
-            DownloadStatus::Paused => Ok(()),
-            other => Err(format!("can't pause download in state {other:?}")),
+        };
+        if let Some(h) = abort_handle {
+            h.abort();
         }
+        Ok(())
     }
 
     /// Resume a paused download. Sends `Range: bytes=N-` from the current
     /// byte counter; if the server refuses, the .part is wiped and we
     /// restart from 0 (with a warning surfaced on `error`).
     pub fn resume(&self, id: &str) -> Result<(), String> {
-        // CLAIM the download atomically: check the state and flip it to Queued
-        // under ONE lock. This used to read the status, drop the lock, then check
-        // and spawn — so two concurrent resume() calls on the same paused row both
-        // saw Paused, both passed, and both spawned a transfer that reopens the
-        // same .part with .append(true). Interleaved appends corrupt the file and
-        // the byte counter. Transitioning inside the critical section means the
-        // second caller sees Queued and takes the error path instead.
-        let (url, dest) = {
+        // CLAIM the download atomically: check the state, flip it to Queued,
+        // and advance the per-download generation under ONE critical section.
+        let (url, dest, expected, generation) = {
             let mut g = self.progress.lock().map_err(|_| "lock poisoned")?;
             let p = g.get_mut(id).ok_or("unknown download")?;
             if !matches!(p.status, DownloadStatus::Paused | DownloadStatus::Failed) {
@@ -877,7 +935,17 @@ impl Downloads {
             }
             p.status = DownloadStatus::Queued;
             p.error = None;
-            (p.url.clone(), PathBuf::from(&p.dest_path))
+            let mut t = self.transfers.lock().map_err(|_| "lock poisoned")?;
+            let slot = t.entry(id.to_string()).or_default();
+            slot.generation = slot.generation.wrapping_add(1).max(1);
+            slot.abort = None;
+            slot.exited = false;
+            (
+                p.url.clone(),
+                PathBuf::from(&p.dest_path),
+                p.expected_sha256.clone(),
+                slot.generation,
+            )
         };
         // Resume from the ACTUAL bytes on disk, not the throttle-lagged counter.
         // Every chunk is write_all'd in order, but `bytes_downloaded` only advances
@@ -895,106 +963,101 @@ impl Downloads {
         let resume_from = std::fs::metadata(part_path_for(&dest))
             .map(|m| m.len())
             .unwrap_or(0);
-        // Status/error already set while claiming above; only the offset is left,
-        // and it needed file I/O so it's computed outside the lock.
-        self.update(id, |p| {
+        // Re-verify our generation under `progress` -> `transfers` before
+        // updating `bytes_downloaded` and spawning: a concurrent pause/cancel
+        // during the metadata stat above invalidates this resume attempt.
+        {
+            let mut g = self.progress.lock().map_err(|_| "lock poisoned")?;
+            let t = self.transfers.lock().map_err(|_| "lock poisoned")?;
+            if t.get(id).is_none_or(|s| s.generation != generation) {
+                return Ok(());
+            }
+            let Some(p) = g.get_mut(id) else {
+                return Ok(());
+            };
+            if p.status != DownloadStatus::Queued {
+                return Ok(());
+            }
             p.bytes_downloaded = resume_from;
-        });
-        // Carried across a resume: the digest is a property of the file, not of
-        // one transfer attempt.
-        let expected = self
-            .progress
-            .lock()
-            .ok()
-            .and_then(|g| g.get(id).and_then(|p| p.expected_sha256.clone()));
-        self.spawn_transfer(id.to_string(), url, dest, resume_from, expected);
+        }
+        self.spawn_transfer(id.to_string(), generation, url, dest, resume_from, expected);
         Ok(())
     }
 
     /// Cancel + delete the in-progress file. Use when the user clicks
     /// the trash icon next to an active or paused download.
     pub fn cancel(&self, id: &str) -> Result<(), String> {
-        let (status, part_path) = {
-            let g = self.progress.lock().map_err(|_| "lock poisoned")?;
-            let p = g.get(id).ok_or("unknown download")?;
-            (p.status, part_path_for(&PathBuf::from(&p.dest_path)))
-        };
-        // Guard on status the way pause()/resume() do. This used to run
-        // unconditionally, so losing the race with completion silently relabelled a
-        // SUCCESSFUL download: the abort found a dead handle, the .part had already
-        // been renamed to its final name so remove_file no-op'd, and the sole effect
-        // was rewriting a Completed row — digest and all — to say "cancelled" about a
-        // multi-GB model still sitting on disk under the confirm text "partial data
-        // will be discarded". The window is not tight: the panel's poll can't run
-        // while the native confirm() blocks the webview, so it lasts as long as the
-        // user hesitates. Worse, the UI fires "Download complete" only on an observed
-        // transition INTO completed, so the user was never told it had succeeded.
-        // An Err here is a benign 400 the panel refreshes past.
-        match status {
-            DownloadStatus::Queued
-            | DownloadStatus::Active
-            | DownloadStatus::Paused
-            | DownloadStatus::Failed => {
-                self.abort_task(id);
-                let _ = std::fs::remove_file(&part_path);
-                self.update(id, |p| {
+        // Atomically re-check status, transition to Cancelled, advance generation,
+        // and take the in-flight AbortHandle under ONE critical section so a
+        // racing completion can never be relabelled Cancelled, and a racing
+        // resume/spawn can never survive past this cancel.
+        let (abort_handle, part_path) = {
+            let mut g = self.progress.lock().map_err(|_| "lock poisoned")?;
+            let p = g.get_mut(id).ok_or("unknown download")?;
+            match p.status {
+                DownloadStatus::Queued
+                | DownloadStatus::Active
+                | DownloadStatus::Paused
+                | DownloadStatus::Failed => {
+                    let part_path = part_path_for(&PathBuf::from(&p.dest_path));
                     p.status = DownloadStatus::Cancelled;
                     p.finished_at = Some(Utc::now());
-                });
-                Ok(())
+                    p.speed_bps = None;
+                    p.eta_secs = None;
+                    let mut t = self.transfers.lock().map_err(|_| "lock poisoned")?;
+                    let slot = t.entry(id.to_string()).or_default();
+                    slot.generation = slot.generation.wrapping_add(1).max(1);
+                    slot.exited = false;
+                    (slot.abort.take(), part_path)
+                }
+                // Idempotent, like pause() on an already-paused row: a second click on
+                // the trash button shouldn't raise an error.
+                DownloadStatus::Cancelled => return Ok(()),
+                // Completed is deliberately NOT treated as "then delete the file": the
+                // finished model belongs to the user now, and discarding it on a click
+                // labelled "cancel the download" would be data loss. Removing an
+                // installed model is a separate, separately-confirmed action.
+                other => return Err(format!("can't cancel download in state {other:?}")),
             }
-            // Idempotent, like pause() on an already-paused row: a second click on
-            // the trash button shouldn't raise an error.
-            DownloadStatus::Cancelled => Ok(()),
-            // Completed is deliberately NOT treated as "then delete the file": the
-            // finished model belongs to the user now, and discarding it on a click
-            // labelled "cancel the download" would be data loss. Removing an
-            // installed model is a separate, separately-confirmed action.
-            other => Err(format!("can't cancel download in state {other:?}")),
+        };
+        if let Some(h) = abort_handle {
+            h.abort();
         }
+        let _ = std::fs::remove_file(&part_path);
+        Ok(())
     }
 
     // ---- internals ----
 
-    fn abort_task(&self, id: &str) {
-        if let Ok(mut g) = self.abort_handles.lock() {
-            if let Some(h) = g.remove(id) {
-                h.abort();
-            }
-        }
-    }
-
-    fn update<F: FnOnce(&mut DownloadProgress)>(&self, id: &str, f: F) {
-        if let Ok(mut g) = self.progress.lock() {
-            if let Some(p) = g.get_mut(id) {
-                f(p);
-            }
-        }
-    }
-
     fn spawn_transfer(
         &self,
         id: String,
+        generation: u64,
         url: String,
         dest: PathBuf,
         resume_from: u64,
         expected_sha256: Option<String>,
     ) {
+        // Fast check before spawning: skip if pause/cancel already superseded us.
+        if self
+            .transfers
+            .lock()
+            .ok()
+            .is_none_or(|t| t.get(&id).is_none_or(|s| s.generation != generation))
+        {
+            return;
+        }
         let progress_map = self.progress.clone();
-        // The abort_map clone is moved into the task so it can remove its
-        // own AbortHandle entry on completion — without this, finished
-        // downloads leak stale entries that the next pause() would try to
-        // abort harmlessly but the map would grow unbounded across long
-        // sessions.
-        let abort_map = self.abort_handles.clone();
+        let transfers = self.transfers.clone();
         let models_cache = self.models_cache.clone();
         let id_for_task = id.clone();
         let token = self.hf_token.lock().ok().and_then(|g| g.clone());
         let handle = tokio::spawn(async move {
             run_download(
                 progress_map,
-                abort_map,
+                transfers,
                 id_for_task,
+                generation,
                 url,
                 dest,
                 resume_from,
@@ -1004,16 +1067,31 @@ impl Downloads {
             )
             .await;
         });
-        if let Ok(mut g) = self.abort_handles.lock() {
-            g.insert(id, handle.abort_handle());
+        let abort_if_superseded = match self.transfers.lock() {
+            Ok(mut t) => match t.get_mut(&id) {
+                Some(slot) if slot.generation == generation && !slot.exited => {
+                    slot.abort = Some(handle.abort_handle());
+                    false
+                }
+                Some(slot) if slot.generation == generation => {
+                    // Task already finished and cleaned up before we stored its handle.
+                    false
+                }
+                _ => true,
+            },
+            Err(_) => true,
+        };
+        if abort_if_superseded {
+            handle.abort();
         }
     }
 }
 
 async fn run_download(
     progress_map: Arc<Mutex<HashMap<String, DownloadProgress>>>,
-    abort_map: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    transfers: Arc<Mutex<HashMap<String, TransferSlot>>>,
     id: String,
+    generation: u64,
     url: String,
     dest: PathBuf,
     resume_from: u64,
@@ -1021,15 +1099,46 @@ async fn run_download(
     expected_sha256: Option<String>,
     models_cache: Arc<Mutex<Option<(std::time::Instant, Vec<ModelFile>)>>>,
 ) {
-    let update = |f: Box<dyn FnOnce(&mut DownloadProgress)>| {
-        if let Ok(mut g) = progress_map.lock() {
-            if let Some(p) = g.get_mut(&id) {
-                f(p);
-            }
-        }
+    // Declared FIRST so every open file handle inside `run_download` is dropped
+    // BEFORE `TransferGuard::drop` clears `TransferSlot::abort` and cleans up
+    // `.part` on cancellation — covering every exit path (normal, error, abort, panic).
+    let part = part_path_for(&dest);
+    let _guard = TransferGuard {
+        id: id.clone(),
+        generation,
+        part_path: part.clone(),
+        progress_map: progress_map.clone(),
+        transfers: transfers.clone(),
     };
 
-    update(Box::new(|p| p.status = DownloadStatus::Active));
+    let is_current = || -> bool {
+        transfers
+            .lock()
+            .ok()
+            .and_then(|t| t.get(&id).map(|s| s.generation == generation))
+            .unwrap_or(false)
+    };
+    let update = |f: Box<dyn FnOnce(&mut DownloadProgress)>| -> bool {
+        if let Ok(mut g) = progress_map.lock() {
+            let current = transfers
+                .lock()
+                .ok()
+                .and_then(|t| t.get(&id).map(|s| s.generation == generation))
+                .unwrap_or(false);
+            if !current {
+                return false;
+            }
+            if let Some(p) = g.get_mut(&id) {
+                f(p);
+                return true;
+            }
+        }
+        false
+    };
+
+    if !update(Box::new(|p| p.status = DownloadStatus::Active)) {
+        return;
+    }
 
     // The name resolved again now, every address checked, and the client held to those: the check in start() and the
     // connection here each asked the resolver, and a name that answered a public address then and an internal one now
@@ -1236,7 +1345,6 @@ async fn run_download(
         }
     }
 
-    let part = part_path_for(&dest);
     if let Err(e) = tokio::fs::create_dir_all(part.parent().unwrap_or(Path::new("."))).await {
         update(Box::new(move |p| {
             p.status = DownloadStatus::Failed;
@@ -1453,11 +1561,12 @@ async fn run_download(
                 ));
                 p.finished_at = Some(Utc::now());
             }));
-            if let Ok(mut g) = abort_map.lock() {
-                g.remove(&id);
-            }
             return;
         }
+    }
+
+    if !is_current() {
+        return;
     }
 
     if let Err(e) = tokio::fs::rename(&part, &dest).await {
@@ -1491,13 +1600,6 @@ async fn run_download(
         p.speed_bps = None;
         p.eta_secs = None;
     }));
-
-    // Drop our AbortHandle from the map — the task's about to exit
-    // normally; future pause/cancel calls would no-op anyway, but a
-    // clean map saves memory across long sessions of many downloads.
-    if let Ok(mut g) = abort_map.lock() {
-        g.remove(&id);
-    }
 }
 
 /// Hash the first `len` bytes of a file, for seeding a resumed download.
@@ -1671,21 +1773,21 @@ fn guess_filename(url: &str) -> Result<String, String> {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push((h * 16 + l) as char);
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -2217,5 +2319,99 @@ mod tests {
         assert!(!is_hf_host("http://huggingface.co/x/resolve/main/m.gguf"));
         assert!(is_hf_host("https://huggingface.co/x/resolve/main/m.gguf"));
         assert!(is_hf_host("https://cdn-lfs.huggingface.co/x"));
+    }
+
+    #[test]
+    fn percent_decode_decodes_multibyte_utf8() {
+        assert_eq!(percent_decode("caf%C3%A9.gguf"), "café.gguf");
+        assert_eq!(percent_decode("%E6%A8%A1%E5%9E%8B-v1.gguf"), "模型-v1.gguf");
+        assert_eq!(percent_decode("literal%ZZ%2"), "literal%ZZ%2");
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+    }
+
+    #[tokio::test]
+    async fn generation_guard_prevents_stale_spawn_and_clears_abort_handle_on_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-dl-gen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = Downloads::new(dir.clone());
+
+        // Start a download and immediately cancel it: generation advances and
+        // AbortHandle is removed without the spawned task relabelling it Active.
+        let id = d
+            .start("https://1.1.1.1/Repo/cancel-race.gguf", None, None, None)
+            .unwrap();
+        let gen_before_cancel = d.transfers.lock().unwrap().get(&id).unwrap().generation;
+        d.cancel(&id).unwrap();
+        let gen_after_cancel = d.transfers.lock().unwrap().get(&id).unwrap().generation;
+        assert!(gen_after_cancel > gen_before_cancel);
+        assert!(d.transfers.lock().unwrap().get(&id).unwrap().abort.is_none());
+
+        // A stale generation passed to spawn_transfer must be ignored and must not
+        // overwrite Cancelled or store an AbortHandle.
+        d.spawn_transfer(
+            id.clone(),
+            gen_before_cancel,
+            "https://1.1.1.1/Repo/cancel-race.gguf".into(),
+            dir.join("cancel-race.gguf"),
+            0,
+            None,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(d.progress.lock().unwrap().get(&id).unwrap().status, DownloadStatus::Cancelled);
+        assert!(d.transfers.lock().unwrap().get(&id).unwrap().abort.is_none());
+
+        // An early-return failure inside run_download must clear AbortHandle via RAII Drop.
+        let err_id = "early-err".to_string();
+        d.progress.lock().unwrap().insert(
+            err_id.clone(),
+            DownloadProgress {
+                id: err_id.clone(),
+                url: "not-a-valid-url".into(),
+                filename: "err.gguf".into(),
+                subdir: None,
+                dest_path: dir.join("err.gguf").display().to_string(),
+                status: DownloadStatus::Queued,
+                bytes_downloaded: 0,
+                bytes_total: None,
+                started_at: Utc::now(),
+                finished_at: None,
+                error: None,
+                resumable: None,
+                speed_bps: None,
+                eta_secs: None,
+                sha256: None,
+                expected_sha256: None,
+                verified: None,
+            },
+        );
+        d.transfers.lock().unwrap().insert(
+            err_id.clone(),
+            TransferSlot { generation: 1, abort: None, exited: false },
+        );
+        d.spawn_transfer(
+            err_id.clone(),
+            1,
+            "not-a-valid-url".into(),
+            dir.join("err.gguf"),
+            0,
+            None,
+        );
+        for _ in 0..50 {
+            if d.progress.lock().unwrap().get(&err_id).unwrap().status == DownloadStatus::Failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(d.progress.lock().unwrap().get(&err_id).unwrap().status, DownloadStatus::Failed);
+        let slot = d.transfers.lock().unwrap();
+        let s = slot.get(&err_id).unwrap();
+        assert!(s.abort.is_none(), "AbortHandle must be cleared on early error return");
+        assert!(s.exited, "TransferGuard must mark exited on early error return");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

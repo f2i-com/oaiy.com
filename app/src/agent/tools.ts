@@ -166,10 +166,10 @@ export function planChanges(before: Plan | null, after: Plan): { done: number[];
 
 /** The live preview (SoftN apps and web pages), as the tools use it. */
 export interface PreviewHost {
-  check(target?: PreviewTarget): Promise<PreviewResult>;
-  inspect(target?: PreviewTarget): Promise<PageReport>;
-  act(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport>;
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView }): Promise<Shot & { problems: Problem[]; since?: number }>;
+  check(target?: PreviewTarget, signal?: AbortSignal): Promise<PreviewResult>;
+  inspect(target?: PreviewTarget, signal?: AbortSignal): Promise<PageReport>;
+  act(target: PreviewTarget | undefined, actions: PreviewAction[], signal?: AbortSignal): Promise<PageReport>;
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView; signal?: AbortSignal }): Promise<Shot & { problems: Problem[]; since?: number }>;
   setViewport(size: Viewport | null): ViewportInfo;
   viewport(): ViewportInfo;
   /** What it shows now. */
@@ -1642,7 +1642,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (!target.ok) throw new Error(target.reason);
       if (!ctx.preview) throw new Error('there is no live preview in this session');
       const app: PreviewTarget = { kind: 'app', root: target.root };
-      const report = call.name === 'softn_inspect' ? await ctx.preview.inspect(app) : await ctx.preview.act(app, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      const report = call.name === 'softn_inspect' ? await ctx.preview.inspect(app, ctx.signal) : await ctx.preview.act(app, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : [], ctx.signal);
       // (text that was meant as a button: in classic SoftN that is most often a handler on a component that takes none)
       if (report.error && !isWebApp(vfs, target.root) && /nothing takes a click there/.test(report.error)) report.error += ' In a SoftN app only some components take @click (Button, Box, Card, …); softn_check names a handler that is ignored.';
       return pageReport(`App: ${appLabel(target.root)}`, report);
@@ -1659,6 +1659,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const schema = await inspectSqliteSchema(vfs, root, {
         database: typeof input.database === 'string' ? input.database : undefined,
         table: typeof input.table === 'string' ? input.table : undefined,
+        signal: ctx.signal,
       });
       return JSON.stringify(schema, null, 2);
     }
@@ -1670,6 +1671,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         database: typeof input.database === 'string' ? input.database : undefined,
         params: Array.isArray(input.params) ? input.params : undefined,
         limit: typeof input.limit === 'number' ? input.limit : undefined,
+        signal: ctx.signal,
       });
       return JSON.stringify(res, null, 2);
     }
@@ -1683,6 +1685,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         database: typeof input.database === 'string' ? input.database : undefined,
         params: Array.isArray(input.params) ? input.params : undefined,
         registerInManifest: input.register_in_manifest !== false,
+        signal: ctx.signal,
       });
       if (hadManifestRead && vfs.exists(`/${manifestKey}`)) {
         ctx.reads.set(manifestKey, vfs.version(`/${manifestKey}`));
@@ -1692,7 +1695,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'page_check': {
       if (!ctx.preview) throw new Error('there is no live preview in this session');
       const page = pageTarget(ctx, input.path, false);
-      const result = await ctx.preview.check(page);
+      const result = await ctx.preview.check(page, ctx.signal);
       const lines = [`Page: /${page.path} (${viewportText(ctx.preview.viewport())})`];
       if (result.ok) lines.push('Render: the page loaded and its scripts ran without reported errors (the user sees it in the preview).');
       else lines.push(`Errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
@@ -1704,7 +1707,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'page_inspect': case 'page_interact': {
       if (!ctx.preview) throw new Error('there is no live preview in this session');
       const page = pageTarget(ctx, input.path, true);
-      const report = call.name === 'page_inspect' ? await ctx.preview.inspect(page) : await ctx.preview.act(page, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      const report = call.name === 'page_inspect' ? await ctx.preview.inspect(page, ctx.signal) : await ctx.preview.act(page, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : [], ctx.signal);
       return pageReport(`Page: /${page.path}`, report);
     }
     case 'preview_viewport': {
@@ -1751,10 +1754,10 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const [yaw, pitch] = [angle(input.yaw), angle(input.pitch)];
       const sideView = model && (yaw !== undefined || pitch !== undefined) ? { yaw: yaw ?? 0, pitch: Math.max(-90, Math.min(90, pitch ?? 0)) } : undefined;
       if (ctx.images === false) {
-        const report = await ctx.preview.inspect(target);
+        const report = await ctx.preview.inspect(target, ctx.signal);
         return `This model does not take images, so here is the page as text instead.\n${pageReport(target ? targetLabel(target) : 'The preview', report)}`;
       }
-      const shot = await ctx.preview.screenshot(target, { fullPage, view: sideView });
+      const shot = await ctx.preview.screenshot(target, { fullPage, view: sideView, signal: ctx.signal });
       const shown = ctx.preview.target ? targetLabel(ctx.preview.target) : 'the preview';
       const lines = model
         ? [`Screenshot of the 3D model ${shown}: ${shot.width}×${shot.height} px, ${sideView ? `from yaw ${sideView.yaw}°, pitch ${sideView.pitch}°` : 'from four sides (front, right, back, top; labelled)'}.`, ...(shot.about ? [shot.about] : [])]
@@ -2277,8 +2280,18 @@ function looksUpElements(vfs: Vfs, root: string): boolean {
 }
 
 export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
-  const dbFindings = isWebApp(ctx.vfs, root) ? await validateAppDatabases(ctx.vfs, root).catch(() => []) : [];
-  const findings = [...checkProject(ctx.vfs, root), ...dbFindings, ...(await logicSyntax(ctx.vfs, root).catch(() => [])), ...(await checkEvents(ctx.vfs, root).catch(() => []))];
+  const dbFindings = isWebApp(ctx.vfs, root)
+    ? await validateAppDatabases(ctx.vfs, root, ctx.signal).catch((err) => {
+        if (ctx.signal?.aborted) throw err;
+        return [];
+      })
+    : [];
+  const syntaxFindings = await logicSyntax(ctx.vfs, root, ctx.signal).catch((err) => {
+    if (ctx.signal?.aborted) throw err;
+    return [];
+  });
+  ctx.signal?.throwIfAborted();
+  const findings = [...checkProject(ctx.vfs, root), ...dbFindings, ...syntaxFindings, ...(await checkEvents(ctx.vfs, root).catch(() => []))];
   const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
   const problems: string[] = findings.filter((f) => f.level === 'error').map((f) => `${f.file}: ${f.message}`);
   if (problems.length) {
@@ -2286,7 +2299,7 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
   } else if (!ctx.preview) {
     lines.push('Render: no live preview in this session.');
   } else {
-    const result = await ctx.preview.check({ kind: 'app', root });
+    const result = await ctx.preview.check({ kind: 'app', root }, ctx.signal);
     problems.push(...result.errors);
     lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
     // (the frame kept the last version that started: what the page tools see is that one, not the files as they are now)
@@ -2314,16 +2327,16 @@ function reportChanges(report: Record<string, unknown>, changes: { written: Set<
 
 const DEFAULT_TOOL_TIMEOUT_MS: Record<string, number> = {
   web_fetch: 120_000,
-  preview_screenshot: 45_000,
-  softn_check: 45_000,
-  softn_inspect: 45_000,
-  softn_interact: 45_000,
-  page_check: 45_000,
-  page_inspect: 45_000,
-  page_interact: 45_000,
-  sqlite_schema: 45_000,
-  sqlite_query: 45_000,
-  sqlite_execute: 45_000,
+  preview_screenshot: 90_000,
+  softn_check: 90_000,
+  softn_inspect: 90_000,
+  softn_interact: 90_000,
+  page_check: 90_000,
+  page_inspect: 90_000,
+  page_interact: 90_000,
+  sqlite_schema: 90_000,
+  sqlite_query: 90_000,
+  sqlite_execute: 90_000,
 };
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {

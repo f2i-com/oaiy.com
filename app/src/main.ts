@@ -542,17 +542,22 @@ async function main(): Promise<void> {
         if (currentRun) chat.system('Stop the agent first before reverting a turn.', 'error');
         return false;
       }
-      const reverted = agent.undoCheckpoint(checkpointId);
-      if (!reverted) {
-        chat.system('That turn checkpoint is no longer available to revert.');
+      try {
+        const reverted = agent.undoCheckpoint(checkpointId);
+        if (!reverted) {
+          chat.system('That turn checkpoint is no longer available to revert.');
+          return false;
+        }
+        await project.flush();
+        const summaryBits: string[] = [];
+        if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
+        if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
+        chat.system(`Reverted turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
+        return true;
+      } catch (err) {
+        chat.system(`Could not revert turn: ${err instanceof Error ? err.message : String(err)}`, 'error');
         return false;
       }
-      await project.flush();
-      const summaryBits: string[] = [];
-      if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
-      if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
-      chat.system(`Reverted turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
-      return true;
     },
     getVfs: () => (viewing ? frontDesk?.vfs ?? null : project?.vfs ?? null),
     getSlashCommands: () => (viewing ? SESSION_SLASH_COMMANDS : SLASH_COMMANDS),
@@ -2109,16 +2114,20 @@ async function main(): Promise<void> {
             return;
           }
           const targetId = sub ? args[0] : undefined;
-          const reverted = agent.undoCheckpoint(targetId);
-          if (!reverted) {
-            chat.system(targetId ? `No checkpoint found with id "${targetId}". Run /undo list to see available checkpoints.` : 'Nothing to undo — no file-changing agent turns recorded in this session.');
-            return;
+          try {
+            const reverted = agent.undoCheckpoint(targetId);
+            if (!reverted) {
+              chat.system(targetId ? `No checkpoint found with id "${targetId}". Run /undo list to see available checkpoints.` : 'Nothing to undo — no file-changing agent turns recorded in this session.');
+              return;
+            }
+            await project.flush();
+            const summaryBits: string[] = [];
+            if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
+            if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
+            chat.system(`Undid turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
+          } catch (err) {
+            chat.system(`Could not undo turn: ${err instanceof Error ? err.message : String(err)}`, 'error');
           }
-          await project.flush();
-          const summaryBits: string[] = [];
-          if (reverted.restored.length) summaryBits.push(`restored ${reverted.restored.map((p) => `/${p}`).join(', ')}`);
-          if (reverted.deleted.length) summaryBits.push(`removed ${reverted.deleted.map((p) => `/${p}`).join(', ')}`);
-          chat.system(`Undid turn "${reverted.checkpoint.label}": ${summaryBits.join('; ') || 'no changes'}.`);
           return;
         }
         case 'help': case '?':

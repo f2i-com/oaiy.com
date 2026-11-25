@@ -868,7 +868,15 @@ async fn engines_status() -> axum::response::Response {
     let Some(ui) = ENGINES_UI.read().ok().and_then(|g| g.clone()) else {
         return Json(serde_json::json!({ "running": false })).into_response();
     };
-    let state = match reqwest::Client::new().get(format!("{ui}/api/state")).timeout(std::time::Duration::from_secs(5)).send().await {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    else {
+        return Json(serde_json::json!({ "running": false, "uiUrl": ui })).into_response();
+    };
+    let state = match client.get(format!("{ui}/api/state")).send().await {
         Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
         _ => None,
     };
@@ -877,7 +885,7 @@ async fn engines_status() -> axum::response::Response {
     };
     // (the model the gateway serves: the Mac's, or the card's while the eGPU serves one)
     let llm = crate::ai::routes::serving_llm(&state);
-    let system = match reqwest::Client::new().get(format!("{ui}/api/system")).timeout(std::time::Duration::from_secs(5)).send().await {
+    let system = match client.get(format!("{ui}/api/system")).send().await {
         Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     };

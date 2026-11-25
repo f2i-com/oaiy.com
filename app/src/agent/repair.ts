@@ -136,9 +136,9 @@ export async function withToolTimeout<T>(
   }, timeoutMs);
 
   try {
-    const value = await fn(controller.signal);
-    if (timedOut) throw new ToolTimeoutError(timeoutMs, toolName);
-    return value;
+    // Preserve a completed value if `fn` settled cleanly right as the cooperative timer elapsed;
+    // cooperative tools that honor `signal` reject on abort and convert to `ToolTimeoutError` below.
+    return await fn(controller.signal);
   } catch (err) {
     if (timedOut) throw new ToolTimeoutError(timeoutMs, toolName);
     throw err;

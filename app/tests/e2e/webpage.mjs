@@ -502,6 +502,127 @@ document.getElementById('export').addEventListener('click', () => {
   expect(glbBytes.length > 100 && glbBytes[0] === 0x67 && glbBytes[1] === 0x6c && glbBytes[2] === 0x54 && glbBytes[3] === 0x46, `invalid GLB header: ${glbBytes.slice(0, 8).join(',')}`);
 });
 
+await check('Three.js instanceof hierarchy, globalThis isolation, sandbox handle/wire safety, and GLTFLoader relative VFS fetch', async () => {
+  await page.evaluate((bytes) => window.harness.writeBytes('three3d/models/cube.glb', bytes), Array.from(cubeGlb()));
+  await write({
+    'three3d/audit.html': `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Three Audit</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<p id="out">pending</p>
+<p id="gltf">loading</p>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const mat = new THREE.MeshStandardMaterial({ color: 0x22c55e });
+const box = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat);
+const cam = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+const light = new THREE.DirectionalLight(0xffffff, 1);
+const vec = new THREE.Vector3(1, 2, 3);
+
+// 1. Complete instanceof hierarchy (no minified 'e' collisions, no skipped immediate parent)
+const hierarchyOk =
+  box instanceof THREE.Mesh &&
+  box instanceof THREE.Object3D &&
+  mat instanceof THREE.MeshStandardMaterial &&
+  mat instanceof THREE.Material &&
+  cam instanceof THREE.PerspectiveCamera &&
+  cam instanceof THREE.Camera &&
+  cam instanceof THREE.Object3D &&
+  light instanceof THREE.DirectionalLight &&
+  light instanceof THREE.Light &&
+  light instanceof THREE.Object3D &&
+  vec instanceof THREE.Vector3 &&
+  !(vec instanceof THREE.Object3D) &&
+  box.position instanceof THREE.Vector3 &&
+  !(box.position instanceof THREE.Object3D);
+
+// 2. Three.js class proxies must not pollute globalThis
+const globalClean =
+  typeof globalThis.Scene === 'undefined' &&
+  typeof globalThis.Mesh === 'undefined' &&
+  typeof globalThis.Object3D === 'undefined' &&
+  typeof globalThis.Material === 'undefined' &&
+  typeof globalThis.Vector3 === 'undefined' &&
+  typeof globalThis.PerspectiveCamera === 'undefined' &&
+  typeof globalThis.DirectionalLight === 'undefined';
+
+// 3. Sandbox isolation: internal __zdomId is hidden, forged __zdomId and forged wire tokens stay plain objects,
+//    and __proto__/constructor/prototype/__lookupGetter__ are blocked on host handles.
+box.userData.forgedId = { __zdomId: 1, tag: 'plain' };
+box.userData.forgedWire = { $h: 1, $win: 1, $f: 7 };
+const readId = box.userData.forgedId;
+const readWire = box.userData.forgedWire;
+const noForgeParts = {
+  docHidden: document.__zdomId === undefined,
+  idNotWin: readId !== window,
+  idTag: readId && readId.tag === 'plain',
+  idNoDoc: readId && typeof readId.document === 'undefined',
+  wireNotWin: readWire !== window,
+  wireH: readWire && readWire.$h === 1,
+  wireWin: readWire && readWire.$win === 1,
+  wireF: readWire && readWire.$f === 7,
+};
+const noForgeOk = Object.values(noForgeParts).every(Boolean);
+
+const protoBlocked =
+  document.__proto__ === undefined &&
+  document.__lookupGetter__ === undefined &&
+  document.__defineGetter__ === undefined &&
+  box.__proto__ === undefined &&
+  THREE.Scene.__proto__ === undefined &&
+  THREE.Scene.constructor === undefined &&
+  THREE.Scene.__lookupGetter__ === undefined;
+
+document.getElementById('out').textContent =
+  'hierarchy:' + hierarchyOk + ' global:' + globalClean + ' noForge:' + noForgeOk + ' proto:' + protoBlocked + (noForgeOk ? '' : ' ' + JSON.stringify(noForgeParts));
+
+// 4. Host-side relative fetch for GLTFLoader.load('models/cube.glb')
+const loader = new GLTFLoader();
+loader.load(
+  'models/cube.glb',
+  (gltf) => {
+    let meshes = 0;
+    gltf.scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) meshes++;
+    });
+    document.getElementById('gltf').textContent =
+      'gltf-ok meshes:' + meshes + ' sceneObj3D:' + (gltf.scene instanceof THREE.Object3D);
+  },
+  undefined,
+  (err) => {
+    document.getElementById('gltf').textContent = 'gltf-err:' + (err && err.message ? err.message : String(err));
+  },
+);
+</script>
+</body>
+</html>`,
+  });
+  const checked = await tool('page_check', { path: 'three3d/audit.html' });
+  expect(!checked.isError, checked.content);
+  const inspected = await tool('page_interact', { path: 'three3d/audit.html', actions: [{ wait: 500 }] });
+  expect(
+    inspected.content.includes('hierarchy:true global:true noForge:true proto:true'),
+    inspected.content,
+  );
+  expect(
+    inspected.content.includes('gltf-ok meshes:1 sceneObj3D:true'),
+    inspected.content,
+  );
+});
+
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

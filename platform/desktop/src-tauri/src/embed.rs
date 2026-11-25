@@ -307,6 +307,29 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>, page: Page, request: &Request<Vec<u
     serve_path(dist(app, page).as_deref(), page, request.uri().path())
 }
 
+const COMPILER_SANDBOX_WORKER_CSP: &str =
+    "default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'";
+
+fn is_compiler_sandbox_worker(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("/assets/") else {
+        return false;
+    };
+    !name.contains('/')
+        && !name.contains('\\')
+        && name.starts_with("compiler-sandbox-worker-")
+        && name.ends_with(".js")
+}
+
+/// Only the dashboard's own webview may show/hide embedded pages or change their theme.
+fn dashboard_only<R: Runtime>(webview: &tauri::Webview<R>) -> Result<(), String> {
+    if crate::update::gui::is_dashboard(webview.label()) {
+        Ok(())
+    } else {
+        log::warn!("refused an embedded-page command from the webview \"{}\"", webview.label());
+        Err("Only OAIY's own window can do that.".to_string())
+    }
+}
+
 /// The file at `uri_path` of an embedded page whose built files are in `root`, with the headers that make it
 /// cross-origin isolated: for its scheme ([`serve`]) and, on a Mac, the agent's port ([`serve_agent_over_http`]).
 fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u8>> {
@@ -339,6 +362,12 @@ fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u
     if path.starts_with("/softn/") {
         response = response.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
     }
+    // The Flows compiler sandbox worker runs untrusted package compiler code; mirror the
+    // restrictive worker CSP from platform/ui/vite.config.ts & public/_headers so dynamic
+    // cross-origin import() / fetch egress is blocked by the browser engine.
+    if page == Page::Flows && is_compiler_sandbox_worker(&path) {
+        response = response.header(header::CONTENT_SECURITY_POLICY, COMPILER_SANDBOX_WORKER_CSP);
+    }
     response.body(bytes).expect("a response")
 }
 
@@ -353,10 +382,17 @@ fn desktop_script(theme: &str, page: Page) -> String {
     let backup = if page == Page::Agent { format!(", backupToken: {:?}", crate::backup::agent::page_token()) } else { String::new() };
     let url = page.url();
     let own = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) + &url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let app = match page {
+        Page::Agent => Some(crate::auth::presets::App::Agent),
+        Page::Flows => Some(crate::auth::presets::App::Flows),
+        Page::Engines => None,
+    };
+    let token = app
+        .and_then(|a| crate::auth::desk_credential(a, &own))
+        .unwrap_or_else(|| crate::internal_token().to_string());
     format!(
         "if (location.protocol + '//' + location.host === {own:?}) window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?}{backup} }});",
         origin = format!("http://127.0.0.1:{}", crate::api_port()),
-        token = crate::internal_token(),
     )
 }
 
@@ -403,7 +439,8 @@ fn ground(mode: &str) -> Color {
 
 /// The dashboard's theme changed (or it has just started): the embedded pages follow.
 #[tauri::command]
-pub async fn set_theme<R: Runtime>(app: AppHandle<R>, mode: String) -> Result<(), String> {
+pub async fn set_theme<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview<R>, mode: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let mode = parse_theme(&mode).ok_or_else(|| format!("no theme called {mode}"))?;
     *THEME.lock().unwrap_or_else(|e| e.into_inner()) = Some(mode);
     if let Some(file) = theme_file(&app) {
@@ -553,14 +590,18 @@ fn own_at(mine: &Url, url: &Url) -> bool {
 /// loop, and on Windows never returns.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64, seen: Option<Seen>) -> Result<(), String> {
+pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64, seen: Option<Seen>) -> Result<(), String> {
+    dashboard_only(&webview)?;
     let page = Page::parse(&page).ok_or_else(|| format!("no embedded page called {page}"))?;
     let rect = [x.max(0.0), y.max(0.0), width.max(1.0), height.max(1.0)];
     let mine = ASKS.fetch_add(1, SeqCst) + 1;
-    WANTED.store(page.mark(), SeqCst);
-    kept(&PLACE)[page.slot()] = Some(rect);
     let opening = {
         let _one = placing();
+        if ASKS.load(SeqCst) != mine {
+            return Ok(());
+        }
+        WANTED.store(page.mark(), SeqCst);
+        kept(&PLACE)[page.slot()] = Some(rect);
         lay(&app, &window, page, rect)?
     };
     if opening {
@@ -1158,7 +1199,8 @@ fn engines_download<R: Runtime>(webview: tauri::Webview<R>, event: tauri::webvie
 
 /// Hide the embedded pages (the dashboard shows one of its own).
 #[tauri::command]
-pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>, webview: tauri::Webview<R>) -> Result<(), String> {
+    dashboard_only(&webview)?;
     // One placing at a time, a hiding too: between a showing's last look at what is asked and the keyboard it gives the
     // page, a hiding left the keyboard in a page out of sight; and one that stalled after it had forgotten which page
     // shows could hide a page asked for again meanwhile, which then read as shown and was never shown.
@@ -1166,14 +1208,22 @@ pub async fn hide_embedded<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
     ASKS.fetch_add(1, SeqCst);
     WANTED.store(0, SeqCst);
     SHOWN.store(0, SeqCst);
+    let mut first_err: Option<String> = None;
     for page in Page::ALL {
         if let Some(w) = app.get_webview(page.label()) {
-            w.hide().map_err(|e| e.to_string())?;
+            if let Err(e) = w.hide() {
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+            }
         }
     }
     // A page that had the keyboard keeps it hidden: back to the dashboard, to what was last used in it.
     keyboard_home(&app);
-    Ok(())
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// Tab's round through the window's webviews, and the keyboard's way home, on Windows.
@@ -1706,5 +1756,28 @@ mod tests {
     fn the_engines_page_has_no_files_of_ours() {
         let scratch = Scratch::new("engines");
         assert!(dist_candidates(None, Some(scratch.path("install")), &repo(&scratch), Page::Engines, false).is_empty());
+    }
+
+    #[test]
+    fn compiler_sandbox_worker_gets_restrictive_csp_on_flows() {
+        let scratch = Scratch::new("worker-csp");
+        let root = scratch.folder("flows");
+        scratch.file("flows/assets/compiler-sandbox-worker-abc123.js");
+        scratch.file("flows/assets/index-abc123.js");
+
+        let worker_resp = serve_path(Some(&root), Page::Flows, "/assets/compiler-sandbox-worker-abc123.js");
+        assert_eq!(worker_resp.status(), StatusCode::OK);
+        assert_eq!(
+            worker_resp.headers().get(header::CONTENT_SECURITY_POLICY).and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'")
+        );
+
+        let regular_resp = serve_path(Some(&root), Page::Flows, "/assets/index-abc123.js");
+        assert_eq!(regular_resp.status(), StatusCode::OK);
+        assert!(regular_resp.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+
+        let agent_resp = serve_path(Some(&root), Page::Agent, "/assets/compiler-sandbox-worker-abc123.js");
+        assert_eq!(agent_resp.status(), StatusCode::OK);
+        assert!(agent_resp.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
     }
 }

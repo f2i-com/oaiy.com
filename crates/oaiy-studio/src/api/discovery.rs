@@ -113,7 +113,7 @@ fn names(section: Option<&Json>) -> Vec<(String, Json)> {
 
 /// The files each kind of model names, by field (what `missing_files` checks).
 const LLM_FILES: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_FILES: [&str; 9] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae", "distill"];
+const IMAGE_FILES: [&str; 10] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "vision", "checkpoint", "tokenizer", "vae", "distill"];
 const VIDEO_FILES: [&str; 8] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae", "dev_transformer", "spatial_upscaler", "id_lora"];
 const SPEECH_FILES: [&str; 3] = ["design", "base", "breeze"];
 const MUSIC_FILES: [&str; 2] = ["path", "language_model"];
@@ -556,6 +556,8 @@ mod tests {
         crate::util::set(sound, "models", Json::parse(br#"{"here":{"path":"moss"},"gone":{"path":"Z:/nowhere/moss-soundeffect"}}"#).unwrap());
         let music = crate::models::registry::obj_mut(&mut cfg, &["media", "music"]).unwrap();
         crate::util::set(music, "models", Json::parse(br#"{"song":{"path":"moss","language_model":"song.gguf","loras":[{"path":"no-such.safetensors"}]}}"#).unwrap());
+        let image = crate::models::registry::obj_mut(&mut cfg, &["media", "image"]).unwrap();
+        crate::util::set(image, "models", Json::parse(br#"{"qi":{"base":"moss","transformer":"song.gguf","vision":"no-such-mmproj.gguf"}}"#).unwrap());
         let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);
         let model = |kind: &str, id: &str| {
             doc.get("models").and_then(|m| m.get(kind)).and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == id).cloned().unwrap()
@@ -566,6 +568,9 @@ mod tests {
         assert_eq!(model("sound", "gone").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("path"));
         // A LoRA counts: the model would not run without it.
         assert_eq!(model("music", "song").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("loras[0]"));
+        // A Qwen Image vision projector (mmproj) counts too.
+        assert_eq!(model("image", "qi").get("files_present"), Some(&Json::Bool(false)));
+        assert_eq!(model("image", "qi").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("vision"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

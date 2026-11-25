@@ -738,13 +738,14 @@ function estimateChars(turns: Turn[], charsPerToken = DEFAULT_CHARS_PER_TOKEN): 
   return turns.reduce((n, t) => n + turnChars(t, charsPerToken), 0);
 }
 
-/** Remove OAIY-injected project/workspace-instruction headers, hydrated @file blocks, and @file reference footers from a user turn's text. */
+/** Remove OAIY-injected project/workspace-instruction headers, hydrated @file blocks, @file reference footers, and auto-loaded local guides from a user turn's text. */
 export function stripInjectedUserContext(text: string): string {
   return text
     .replace(/^<project>[\s\S]*?<\/project>\n\n/, '')
     .replace(/^<workspace-instructions>[\s\S]*?<\/workspace-instructions>\n\n/, '')
     .replace(/\n\n<referenced-file path="[^"]*">[\s\S]*?<\/referenced-file>/g, '')
-    .replace(/\n\n\[Referenced project files: [^\]]*\]/g, '');
+    .replace(/\n\n\[Referenced project files: [^\]]*\]/g, '')
+    .replace(/\n\n\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide follows[\s\S]*$/, '');
 }
 
 /** A turn as plain text, for the summarizer: long tool output is cut, the gist is kept. */
@@ -752,7 +753,7 @@ function transcript(turn: Turn): string {
   const cutText = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)} […${text.length - max} more characters]` : text);
   if (turn.role === 'user') {
     if (turn.summary) return `Summary of what came before:\n${turn.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}`;
-    const text = stripInjectedUserContext(turn.text);
+    const text = turn.displayText ?? stripInjectedUserContext(turn.text);
     return `${turn.automatic ? 'OAIY' : 'User'}: ${cutText(text, 6000)}${turn.images?.length ? ` [${turn.images.length} image(s)]` : ''}`;
   }
   if (turn.role === 'assistant') {
@@ -1031,10 +1032,28 @@ export class Agent {
     if (!this.checkpoints.length) return null;
     const idx = id ? this.checkpoints.findIndex((c) => c.id === id) : this.checkpoints.length - 1;
     if (idx < 0) return null;
-    const [checkpoint] = this.checkpoints.splice(idx, 1);
-    const outcome = revertCheckpoint(this.options.vfs, checkpoint!, this.toolContext.reads);
+    const checkpoint = this.checkpoints[idx]!;
+    // Apply VFS revert first so a failure leaves the checkpoint intact for retry.
+    const outcome = revertCheckpoint(this.options.vfs, checkpoint, this.toolContext.reads);
+    this.checkpoints.splice(idx, 1);
+    // When reverting an earlier checkpoint out of order, strip overlapping paths from newer checkpoints
+    // so a subsequent `/undo` does not un-revert files already restored to an earlier state.
+    if (idx < this.checkpoints.length) {
+      const revertedPaths = checkpoint.files.map((f) => f.path);
+      const overlaps = (p: string) =>
+        revertedPaths.some((r) => p === r || p.startsWith(`${r}/`) || r.startsWith(`${p}/`));
+      for (let i = this.checkpoints.length - 1; i >= idx; i--) {
+        const newer = this.checkpoints[i]!;
+        const remaining = newer.files.filter((f) => !overlaps(f.path));
+        if (!remaining.length) {
+          this.checkpoints.splice(i, 1);
+        } else if (remaining.length !== newer.files.length) {
+          this.checkpoints[i] = { ...newer, files: remaining };
+        }
+      }
+    }
     this.toolContext.readSpans?.clear();
-    return { checkpoint: checkpoint!, ...outcome };
+    return { checkpoint, ...outcome };
   }
 
   get planMode(): boolean {
@@ -2270,7 +2289,7 @@ ${personInstructionsText(own)}` : ''}`;
    */
   private mechanicalSummary(old: Turn[], from: number): string {
     const asked = requestIndex(this.turns);
-    const requests = old.filter((t, i): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic && !t.summary && (asked < 0 || from + i < asked)).map((t) => `- ${stripInjectedUserContext(t.text).slice(0, 300)}`);
+    const requests = old.filter((t, i): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic && !t.summary && (asked < 0 || from + i < asked)).map((t) => `- ${(t.displayText ?? stripInjectedUserContext(t.text)).slice(0, 300)}`);
     const touched = new Set<string>();
     // (append_file and apply_patch among them: long documents and multi-file patches)
     for (const t of old) {
@@ -2758,10 +2777,17 @@ ${personInstructionsText(own)}` : ''}`;
   private requestWords(bare = false, includeLater = true): string {
     const at = requestIndex(this.turns);
     if (at < 0) return '';
-    const own = (t: Turn) => (t.role === 'user' ? stripInjectedUserContext(t.text) : '');
-    const first = bare ? own(this.turns[at]).replace(/\n\n\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide follows[\s\S]*$/, '') : own(this.turns[at]);
+    const firstTurn = this.turns[at]!;
+    const own = (t: Turn) => (t.role === 'user' ? (t.displayText ?? stripInjectedUserContext(t.text)) : '');
+    const first =
+      bare && firstTurn.role === 'user' && firstTurn.displayText === undefined
+        ? own(firstTurn).replace(/\n\n\[(?:OAIY|bot\.computer)\] The (?:app|web|video|media|document) guide follows[\s\S]*$/, '')
+        : own(firstTurn);
     if (!includeLater) return first.trim();
-    const later = this.turns.slice(at + 1).filter((t) => t.role === 'user' && !t.automatic && t.text.startsWith(DURING_PREFIX)).map((t) => own(t).replace(/^\[[^\]]*\]\n\n/, ''));
+    const later = this.turns
+      .slice(at + 1)
+      .filter((t) => t.role === 'user' && !t.automatic && t.text.startsWith(DURING_PREFIX))
+      .map((t) => (t.role === 'user' && t.displayText !== undefined ? t.displayText : own(t).replace(/^\[[^\]]*\]\n\n/, '')));
     return [first, ...later.map((t) => `Then, while you worked: ${t}`)].join('\n\n').trim();
   }
 
@@ -2796,7 +2822,7 @@ ${personInstructionsText(own)}` : ''}`;
     for (const m of this.inbox.splice(0)) {
       const note = m.note ?? DURING_NOTE;
       const text = `${planned && note !== HEARD_BY_TASK && note !== HEARD_BY_REVIEWER ? note.replace(/\]$/, ' If it changes what is wanted, change the plan to match (update_plan) before you carry on.]') : note}\n\n${m.text}`;
-      this.turns.push({ role: 'user', text, ...(m.images.length ? { images: m.images } : {}), ...(m.attachments.length ? { attachments: m.attachments } : {}) });
+      this.turns.push({ role: 'user', text, displayText: m.text, ...(m.images.length ? { images: m.images } : {}), ...(m.attachments.length ? { attachments: m.attachments } : {}) });
     }
     emit({ type: 'status', message: 'The agent has your message.' });
     return true;
@@ -2960,7 +2986,7 @@ ${personInstructionsText(own)}` : ''}`;
         // (where the tools are found, the request's guides come with it: the instructions stay the same)
         const names = new Set(this.usable.map((t) => t.name));
         const given = this.discovering && guides.length ? `\n\n${guides.map((g) => this.guideGivenText(g, names)).join('\n\n')}` : '';
-        this.turns.push({ role: 'user', text: `${text}${given}`, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
+        this.turns.push({ role: 'user', text: `${text}${given}`, displayText: prompt, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
         const carry = this.carryOver();
         if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
       }
@@ -3020,7 +3046,7 @@ ${personInstructionsText(own)}` : ''}`;
         const afterSnapshot = snapshotVfs(this.options.vfs);
         const files = diffSnapshots(beforeSnapshot, afterSnapshot);
         if (files.length) {
-          const cpLabel = stripInjectedUserContext(prompt).trim().replace(/\s+/g, ' ').slice(0, 80) || 'Agent turn';
+          const cpLabel = prompt.trim().replace(/\s+/g, ' ').slice(0, 80) || 'Agent turn';
           const cp = createCheckpoint(`cp-${++this.checkpointSeq}`, cpLabel, beforeSnapshot, afterSnapshot);
           if (cp) {
             this.checkpoints.push(cp);
@@ -3339,7 +3365,7 @@ ${personInstructionsText(own)}` : ''}`;
             const c = ran[i]!;
             const res = results[i];
             const rem = repeatGuard.observe(c, res ? { isError: res.isError, errorText: res.isError ? res.content : undefined } : undefined);
-            if (rem) lastReminder = rem;
+            if (rem && (!lastReminder?.hardStop || rem.hardStop)) lastReminder = rem;
           }
         }
         if (same >= SAME_STEP_NOTE && results.length) {

@@ -159,6 +159,35 @@ export class RepeatToolGuard {
     this.recent.push({ key, name: call.name, canonical });
     if (this.recent.length > RECENT_RING_LIMIT) this.recent.shift();
 
+    // Track repeated identical failing calls (across consecutive or intervening read-only calls) BEFORE consecutive threshold checks
+    // so error streaks stay accurate and a hard-stopping error repeat isn't masked by a non-stopping consecutive reminder.
+    let errorReminder: RepeatReminder | null = null;
+    if (outcome?.isError) {
+      const errKey = `${key}\0${normalizeErrorSig(outcome.errorText ?? '')}`;
+      const errCount = (this.errorStreaks.get(errKey) ?? 0) + 1;
+      this.errorStreaks.set(errKey, errCount);
+      if (errCount === 3 || errCount >= 5) {
+        errorReminder = {
+          tier: 'detailed',
+          kind: 'error-repeat',
+          hardStop: errCount >= 5,
+          count: errCount,
+          toolName: call.name,
+          message:
+            `[OAIY] Repeated failing tool call detected across steps:\n` +
+            `- tool: ${call.name}\n` +
+            `- failed_repeats: ${errCount}\n` +
+            `- arguments: ${previewArguments(canonical, this.previewChars)}\n` +
+            `The same call keeps failing with the same error. Stop repeating it and change your approach or arguments based on the error message.`,
+        };
+      }
+    } else if (outcome && !outcome.isError && !READ_ONLY_OBSERVE_TOOLS.has(call.name)) {
+      // A non-read-only tool succeeded — clear prior error streaks so fresh work starts clean.
+      this.errorStreaks.clear();
+    }
+
+    if (errorReminder?.hardStop) return errorReminder;
+
     // 1. Exact consecutive identical calls (`A, A, A, ...`).
     if (this.thresholdSet.has(this.count)) {
       if (this.count === this.thresholds[0]) {
@@ -179,30 +208,8 @@ export class RepeatToolGuard {
       };
     }
 
-    // 2. Repeated identical failing call across intervening read-only inspection calls (e.g. edit_file fail -> read_file -> edit_file fail).
-    if (outcome?.isError) {
-      const errKey = `${key}\0${normalizeErrorSig(outcome.errorText ?? '')}`;
-      const errCount = (this.errorStreaks.get(errKey) ?? 0) + 1;
-      this.errorStreaks.set(errKey, errCount);
-      if (errCount === 3 || errCount >= 5) {
-        return {
-          tier: 'detailed',
-          kind: 'error-repeat',
-          hardStop: errCount >= 5,
-          count: errCount,
-          toolName: call.name,
-          message:
-            `[OAIY] Repeated failing tool call detected across steps:\n` +
-            `- tool: ${call.name}\n` +
-            `- failed_repeats: ${errCount}\n` +
-            `- arguments: ${previewArguments(canonical, this.previewChars)}\n` +
-            `The same call keeps failing with the same error. Stop repeating it and change your approach or arguments based on the error message.`,
-        };
-      }
-    } else if (outcome && !outcome.isError && !READ_ONLY_OBSERVE_TOOLS.has(call.name)) {
-      // A non-read-only tool succeeded — clear prior error streaks so fresh work starts clean.
-      this.errorStreaks.clear();
-    }
+    // 2. Repeated identical failing call across intervening read-only inspection calls (non-stopping tier).
+    if (errorReminder) return errorReminder;
 
     // 3. Oscillating Period-2 (`ABABAB`) and Period-3 (`ABCABCABC`) tool call cycles.
     for (const period of [2, 3] as const) {

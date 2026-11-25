@@ -101,9 +101,47 @@ window.addEventListener('message', (ev: MessageEvent) => {
   // code via new Function) or `props` into THIS node's UI. The host always targets `parent`, so
   // legitimate messages have ev.source === window.parent. Mirrors the host-side ev.source check.
   if (ev.source !== window.parent) return;
-  const msg = ev.data as { __oaiybox?: string; code?: string; nodeId?: string; data?: unknown; selected?: boolean };
+  const msg = ev.data as {
+    __oaiybox?: string;
+    code?: string;
+    nodeId?: string;
+    data?: unknown;
+    selected?: boolean;
+    theme?: {
+      colorScheme?: unknown;
+      textPrimary?: unknown;
+      textSecondary?: unknown;
+      borderPrimary?: unknown;
+      bgTertiary?: unknown;
+      accentPrimary?: unknown;
+    };
+  };
   if (!msg || typeof msg !== 'object' || typeof msg.__oaiybox !== 'string') return;
-  if (msg.__oaiybox === 'init') {
+  if (msg.__oaiybox === 'theme' && msg.theme && typeof msg.theme === 'object') {
+    const t = msg.theme;
+    const rootStyle = document.documentElement.style;
+    if (t.colorScheme === 'light' || t.colorScheme === 'dark') {
+      rootStyle.setProperty('--oaiy-color-scheme', t.colorScheme);
+      rootStyle.colorScheme = t.colorScheme;
+    }
+    if (typeof t.textPrimary === 'string') {
+      rootStyle.setProperty('--oaiy-text', t.textPrimary);
+      document.body.style.color = t.textPrimary;
+    }
+    if (typeof t.textSecondary === 'string') {
+      rootStyle.setProperty('--oaiy-text-secondary', t.textSecondary);
+    }
+    if (typeof t.borderPrimary === 'string') {
+      rootStyle.setProperty('--oaiy-border', t.borderPrimary);
+      document.body.style.borderColor = t.borderPrimary;
+    }
+    if (typeof t.bgTertiary === 'string') {
+      rootStyle.setProperty('--oaiy-bg-tertiary', t.bgTertiary);
+    }
+    if (typeof t.accentPrimary === 'string') {
+      rootStyle.setProperty('--oaiy-accent', t.accentPrimary);
+    }
+  } else if (msg.__oaiybox === 'init') {
     nodeId = String(msg.nodeId ?? '');
     try {
       Component = loadComponent(String(msg.code ?? ''), nodeId);

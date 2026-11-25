@@ -600,13 +600,37 @@ impl Part for ServicesPart {
     }
 }
 
+struct CodexPart {
+    codex: Option<crate::ai::codex::CodexHandle>,
+}
+
+impl Part for CodexPart {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        if let Some(codex) = &self.codex {
+            codex.stop();
+        }
+        Ok(())
+    }
+
+    fn start(&self) -> Result<(), String> {
+        // Started lazily on demand by CodexAgent::session().
+        Ok(())
+    }
+}
+
 fn parts_for(app: &AppHandle, remember_for_relaunch: bool) -> Vec<Box<dyn Part>> {
     let registry = app.try_state::<RegistryHandle>().map(|r| r.inner().clone());
+    let codex = app.try_state::<crate::ai::codex::CodexHandle>().map(|c| c.inner().clone());
     vec![
         Box::new(EnginesPart { app: app.clone(), started_here: Mutex::new(false), for_update: remember_for_relaunch, stopped: Mutex::new(None) }),
         Box::new(ScriptHostPart),
         Box::new(PluginsPart { host: app.try_state::<Arc<PluginHost>>().map(|h| h.inner().clone()), was_running: Mutex::new(Vec::new()) }),
         Box::new(ServicesPart { registry, was_running: Mutex::new(Vec::new()), remember_for_relaunch }),
+        Box::new(CodexPart { codex }),
     ]
 }
 

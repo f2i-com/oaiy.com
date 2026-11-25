@@ -588,12 +588,14 @@ export function applyPatchToVfs(
         overlay.set(destKey, nextText);
         noteParents(destKey);
         pending.push(() => {
+          const wasPartial = reads.has(`${key}#partial`);
           vfs.writeFile(`/${destKey}`, nextText, { parents: true });
           vfs.remove(`/${key}`, true);
           reads.delete(key);
           reads.delete(`${key}#partial`);
           reads.set(destKey, vfs.version(`/${destKey}`));
-          reads.delete(`${destKey}#partial`);
+          if (wasPartial) reads.set(`${destKey}#partial`, 1);
+          else reads.delete(`${destKey}#partial`);
         });
         results.push({ kind: 'update', path: key, moveTo: destKey, addedLines, removedLines });
       } else {
@@ -601,7 +603,6 @@ export function applyPatchToVfs(
         pending.push(() => {
           vfs.writeFile(`/${key}`, nextText);
           reads.set(key, vfs.version(`/${key}`));
-          reads.delete(`${key}#partial`);
         });
         results.push({ kind: 'update', path: key, addedLines, removedLines });
       }

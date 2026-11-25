@@ -517,7 +517,7 @@ fn a_steps_norm_with_its_int8_rows_is_the_norm_then_their_own_pass() {
         DeviceChain::upload(&b, &nwd, &nw);
         let mut rec = Recorder::new(&b);
         rec.rmsnorm(&x, &nwd, &out, 1e-5);
-        assert!(rec.q8.iter().any(|(xb, m, kk, _)| xb == buffer(&out) && *m == 1 && *kk == k), "{k}: the norm's int8 rows kept for its matmuls");
+        assert!(rec.q8.iter().any(|(xb, m, kk, _, _)| xb == buffer(&out) && *m == 1 && *kk == k), "{k}: the norm's int8 rows kept for its matmuls");
         assert!(rec.matmul_rows_q8(&w8, &out, &y, 1));
         // (the same rows quantized again from the norm's output by their own pass)
         rec.q8.clear();
@@ -1058,4 +1058,45 @@ fn a_prompts_exl3_tables_are_not_written_over_by_scratch_let_go_of() {
         let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
         assert_eq!(bits(run(true)), bits(run(false)), "{rows} rows");
     }
+}
+
+/// Regression test for Bug 10: `q8_buf` must never pin pooled scratch buffers in `Gpu::q8_kept`,
+/// `wrote()` must only recycle `is_scratch` entries into `spare` (even if `keep_groups` toggles),
+/// and `Gpu::let_go()` must clear `Gpu::q8_kept`.
+#[test]
+fn q8_kept_never_pins_scratch_or_recycles_persistent_and_clears_on_let_go() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    b.gpu.let_go();
+    let kept_len = || b.gpu.q8_kept.lock().unwrap_or_else(|p| p.into_inner()).len();
+    assert_eq!(kept_len(), 0);
+
+    let persistent = b.vec(256);
+    let mut rec = Recorder::new(&b);
+    assert!(rec.keeps());
+
+    // 1. Pooled scratch source must NEVER enter `Gpu::q8_kept` even when `rec.keeps()` is true.
+    let scratch_src = rec.scratch(256);
+    let (xq_scratch, is_scratch) = rec.q8_buf(buffer(&scratch_src), 1, 256, 72);
+    assert!(is_scratch, "pooled scratch source must allocate q8 from scratch, not q8_kept");
+    assert_eq!(kept_len(), 0, "pooled scratch source must not be pinned in Gpu::q8_kept");
+    rec.q8.push((buffer(&scratch_src).clone(), 1, 256, xq_scratch, is_scratch));
+
+    // 2. Persistent source uses `Gpu::q8_kept` (`is_scratch == false`).
+    let (xq_kept, is_scratch_kept) = rec.q8_buf(buffer(&persistent), 1, 256, 72);
+    assert!(!is_scratch_kept, "persistent source under keep_groups(true) should use q8_kept");
+    assert_eq!(kept_len(), 1);
+    rec.q8.push((buffer(&persistent).clone(), 1, 256, xq_kept, is_scratch_kept));
+
+    // 3. Toggling `keep_groups(false)` mid-recording must NOT cause `wrote()` to recycle `xq_kept`
+    //    into `rec.spare`, while `wrote()` on `scratch_src` MUST recycle `xq_scratch`.
+    rec.keep_groups(false);
+    let spare_before = rec.spare.len();
+    rec.wrote(buffer(&persistent));
+    assert_eq!(rec.spare.len(), spare_before, "persistent q8_kept buffer must never be recycled into spare");
+    rec.wrote(buffer(&scratch_src));
+    assert_eq!(rec.spare.len(), spare_before + 1, "scratch q8 buffer should be recycled into spare");
+
+    // 4. `Gpu::let_go()` must clear `Gpu::q8_kept`.
+    b.gpu.let_go();
+    assert_eq!(kept_len(), 0, "Gpu::let_go() must clear q8_kept to avoid VRAM leak");
 }

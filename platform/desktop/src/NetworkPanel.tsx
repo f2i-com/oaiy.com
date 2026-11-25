@@ -137,9 +137,6 @@ export default function NetworkPanel({ onNavigate }: { onNavigate?: (view: 'flow
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
   useVisiblePoll(() => void refresh(), 3000);
 
   const change = async (next: Parameters<typeof network.setSettings>[0]) => {
@@ -626,6 +623,7 @@ function FindWorkers({
   const [outcome, setOutcomeNow] = useState<PairingOutcome | null>(storedOutcome);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [answering, setAnswering] = useState(false);
   const timer = useRef<number | undefined>(undefined);
   const mounted = useRef(false);
   useEffect(() => {
@@ -652,7 +650,7 @@ function FindWorkers({
 
   // While a pairing waits for the worker's approval, ask every two seconds.
   useEffect(() => {
-    if (!pairing || approvedThere) return;
+    if (!pairing || approvedThere || answering) return;
     let stopped = false;
     // (a blip on the way, the worker's Wi-Fi or a slow answer, is asked again: the request still stands on the worker,
     // and the code shown here is what its person compares. A few in a row end it; a request the worker no longer has
@@ -696,33 +694,42 @@ function FindWorkers({
       stopped = true;
       window.clearTimeout(timer.current);
     };
-  }, [pairing, approvedThere, onPaired]);
+  }, [pairing, approvedThere, answering, onPaired]);
 
   /**
    * This side's answer once the worker approved: the codes matched (paired), or they did not (nothing is). A `false`
    * before then withdraws the request, so the worker no longer shows it.
    */
   const answer = async (accept: boolean) => {
-    if (!pairing) return;
+    if (!pairing || answering) return;
+    const current = pairing;
     const waiting = !approvedThere;
+    setAnswering(true);
     setError(null);
-    setPairing(null);
-    setApprovedThere(false);
-    rememberAsked(pairing.pairingId, accept && lends && bothWays);
+    rememberAsked(current.pairingId, accept && lends && bothWays);
     try {
-      const r = await network.confirmPairing(pairing.pairingId, accept, accept && lends && bothWays);
+      const r = await network.confirmPairing(current.pairingId, accept, accept && lends && bothWays);
+      setPairing(null);
+      setApprovedThere(false);
       if (r.status === 'approved') setAddress('');
       setOutcome(
         r.status === 'approved'
-          ? paired(pairing.pairingId, r.node?.name ?? pairing.worker.name, r)
+          ? paired(current.pairingId, r.node?.name ?? current.worker.name, r)
           : waiting
             ? null
             : { text: 'Not paired: the codes did not match.', paired: false },
       );
       onPaired();
     } catch (e) {
-      // (stopping a request that has already expired needs no word)
-      if (!waiting) setError(e instanceof Error ? e.message : String(e));
+      if (waiting) {
+        // (stopping a request that has already expired needs no word)
+        setPairing(null);
+        setApprovedThere(false);
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setAnswering(false);
     }
   };
 
@@ -803,7 +810,7 @@ function FindWorkers({
           </div>
           {approvedThere && lends && (
             <label className="network-both-ways">
-              <input type="checkbox" checked={bothWays} onChange={(e) => setBothWays(e.target.checked)} />
+              <input type="checkbox" checked={bothWays} disabled={answering} onChange={(e) => setBothWays(e.target.checked)} />
               <span>
                 Also let {pairing.worker.name} use this computer <small>(one pairing, both ways)</small>
               </span>
@@ -812,15 +819,15 @@ function FindWorkers({
           <div className="pairing-actions">
             {approvedThere ? (
               <>
-                <button className="btn btn-primary" onClick={() => void answer(true)}>
+                <button className="btn btn-primary" disabled={answering} onClick={() => void answer(true)}>
                   <Check size={14} aria-hidden /> Yes, pair
                 </button>
-                <button className="btn btn-ghost" onClick={() => void answer(false)}>
+                <button className="btn btn-ghost" disabled={answering} onClick={() => void answer(false)}>
                   <X size={14} aria-hidden /> No
                 </button>
               </>
             ) : (
-              <button className="btn btn-ghost" onClick={() => void answer(false)}>
+              <button className="btn btn-ghost" disabled={answering} onClick={() => void answer(false)}>
                 Stop waiting
               </button>
             )}

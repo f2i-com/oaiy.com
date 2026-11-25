@@ -324,7 +324,8 @@ pub fn upgrade_backend(v: &mut Json) -> bool {
 /// Read the file (creating it with defaults when it does not exist yet).
 pub fn load(path: &Path) -> Result<Json, String> {
     if !path.exists() {
-        let v = default_json();
+        let mut v = default_json();
+        upgrade_origins(&mut v);
         save(path, &v)?;
         return Ok(v);
     }
@@ -1216,6 +1217,22 @@ mod tests {
         assert_eq!(origins, [&["oaiy://localhost", "https://oaiy.com", "http://oaiyagent.localhost", "oaiyagent://localhost"][..], linux].concat());
         assert_eq!(v.get("gateway").unwrap().get("origins_version").and_then(Json::as_i64), Some(6));
         assert!(!upgrade_origins(&mut v), "once only");
+    }
+
+    #[test]
+    fn fresh_load_writes_current_origins_version_and_platform_origins() {
+        let dir = Scratch::new("fresh-origins");
+        let path = dir.0.join(FILE_NAME);
+        let loaded = load(&path).unwrap();
+        let on_disk = Json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        for doc in [&loaded, &on_disk] {
+            let gw = doc.get("gateway").unwrap();
+            assert_eq!(gw.get("origins_version").and_then(Json::as_i64), Some(6));
+            let origins: Vec<&str> = gw.get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
+            assert_eq!(origins, [&COMPANION_ORIGINS[..], agent_http()].concat());
+        }
+        let mut again = on_disk;
+        assert!(!upgrade_origins(&mut again), "fresh file is already at current origins_version");
     }
 
     #[test]

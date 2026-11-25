@@ -1183,6 +1183,20 @@ impl Guard {
         };
         let no_route = matched.is_none();
 
+        // An in-process subrequest (such as MCP's Desk calling the local router on behalf of an
+        // already-authenticated caller) carries the caller's verified Principal as a request
+        // extension; honor it ONLY when there is no socket peer (`Peer::InProcess`) and it is a
+        // non-legacy principal. Step 10 still enforces the target route's scopes, flow-run limits,
+        // and dangerous/elevation checks against that principal.
+        let forwarded_principal = if peer == Peer::InProcess {
+            req.extensions()
+                .get::<Principal>()
+                .filter(|p| p.kind != PrincipalKind::Legacy)
+                .cloned()
+        } else {
+            None
+        };
+
         // Setup-only mode (design 4.7.1): an install with a web login and no owner answers an UNAUTHENTICATED caller
         // only the short list of routes that say whether there is a login and make one, and 401 `setup_required` to
         // everything else, however public the model would have that route be (the bridge's pairing and capabilities
@@ -1192,7 +1206,7 @@ impl Guard {
         // the protected routes), and a credential that is not valid is what it is anywhere (`401 token_invalid`, a
         // `429`), not `setup_required`.
         #[cfg(feature = "web")]
-        if class == Class::Public && !no_route && self.in_setup_only() {
+        if class == Class::Public && !no_route && self.in_setup_only() && forwarded_principal.is_none() {
             if let Some(m) = &matched {
                 if !setup_only_open(&method, m) {
                     if !headers.contains_key(header::AUTHORIZATION) {
@@ -1216,6 +1230,8 @@ impl Guard {
         // 7-9. the credential, if there is one
         let principal = if class == Class::Public {
             None
+        } else if let Some(p) = forwarded_principal {
+            Some(p)
         } else {
             self.authenticate(
                 &headers,

@@ -154,12 +154,16 @@ export function renderDeliverablesCard(
         title: 'Revert the file changes made in this turn (/undo)',
         onclick: async () => {
           btn.disabled = true;
-          const ok = await onRevert(cpId);
-          if (ok) {
-            btn.classList.add('reverted');
-            btn.replaceChildren(icon('check'), h('span', 'Reverted'));
-            btn.title = 'Turn changes reverted';
-          } else {
+          try {
+            const ok = await onRevert(cpId);
+            if (ok) {
+              btn.classList.add('reverted');
+              btn.replaceChildren(icon('check'), h('span', 'Reverted'));
+              btn.title = 'Turn changes reverted';
+            } else {
+              btn.disabled = false;
+            }
+          } catch {
             btn.disabled = false;
           }
         },

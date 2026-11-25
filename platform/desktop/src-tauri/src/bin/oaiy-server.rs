@@ -440,6 +440,7 @@ async fn server_main() {
         let registry = registry.clone();
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
+                .no_proxy()
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
             {

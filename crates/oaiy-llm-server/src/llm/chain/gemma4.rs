@@ -258,7 +258,7 @@ struct Bufs {
     xn: DeviceVec,
     proj: DeviceVec,
     proj_n: DeviceVec,
-    heads: BTreeMap<usize, [DeviceVec; 6]>,
+    heads: BTreeMap<(usize, usize), [DeviceVec; 6]>,
     ffn: BTreeMap<usize, (DeviceVec, DeviceVec, Option<(DeviceVec, DeviceVec)>)>,
     logits: DeviceVec,
     last: DeviceVec,
@@ -276,13 +276,14 @@ impl Bufs {
         let mut ffn = BTreeMap::new();
         for l in &st.layers {
             let hd = l.hd;
-            // k's and v's vectors as wide as the most KV heads a layer of this head width keeps
-            let n_kv = st.layers.iter().filter(|o| o.hd == hd).map(|o| o.n_kv).max().unwrap_or(l.n_kv);
-            heads.entry(hd).or_insert_with(|| [t * n_h * hd, t * n_kv * hd, t * n_kv * hd, t * n_h * hd, t * n_kv * hd, t * n_kv * hd].map(|len| v(len)));
-            ffn.entry(l.ff).or_insert_with(|| {
-                let split = matches!(l.ffn, Ffn::Split(..)).then(|| (v(t * l.ff), v(t * l.ff)));
-                (v(t * 2 * l.ff), v(t * l.ff), split)
-            });
+            let n_kv = st.layers[l.src].n_kv;
+            heads
+                .entry((hd, n_kv))
+                .or_insert_with(|| [t * n_h * hd, t * n_kv * hd, t * n_kv * hd, t * n_h * hd, t * n_kv * hd, t * n_kv * hd].map(|len| v(len)));
+            let entry = ffn.entry(l.ff).or_insert_with(|| (v(t * 2 * l.ff), v(t * l.ff), None));
+            if matches!(l.ffn, Ffn::Split(..)) && entry.2.is_none() {
+                entry.2 = Some((v(t * l.ff), v(t * l.ff)));
+            }
         }
         let ple = st.ple_proj.is_some().then(|| (v(t * cfg.n_layers * pld), v(t * cfg.n_layers * pld), v(t * pld), v(t * 2 * pld), v(t * pld), v(t * pld)));
         Bufs {
@@ -418,7 +419,7 @@ impl Gemma4Chain {
             let n_kv = st.layers[layer.src].n_kv;
             let (kvd, row) = (n_kv * hd, 2 * n_kv * hd);
             let table = &tables[layer.rope];
-            let [q, k, vv, qn, kn, vn] = &heads[&hd];
+            let [q, k, vv, qn, kn, vn] = &heads[&(hd, n_kv)];
             r.rmsnorm_rows(&xs, &layer.attn_norm, &xn, t, cfg.rms_eps);
             layer.q.rows(&b.attn_q, r, &xn, q, t, one);
             r.rmsnorm_rows(q, &layer.q_norm, qn, t * n_h, cfg.rms_eps);

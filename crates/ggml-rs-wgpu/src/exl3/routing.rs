@@ -16,7 +16,7 @@ pub(crate) const WSUM_ROWS: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let h = p[0].x;
     let kk = p[0].y;
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= h * p[0].z) { return; }
     let r = i / h;
     let c = i % h;
@@ -46,7 +46,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let h = p[0].x;
     let kk = p[0].y;
     let streams = p[0].w;
-    let i = id.x;
+    let i = id.x + id.y * 16776960u;
     if (i >= h * p[0].z) { return; }
     let r = i / h;
     let c = i % h;
@@ -87,11 +87,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let r = wg.x;
     let lr = r * (n + 1u);
     let quads = (n + 3u) / 4u;
-    // past the last logit, -inf (beats none)
+    // past the last logit, -inf (beats none); map NaNs to -inf so ranking is a total order
     if (t < quads) {
         var v = vec4<f32>(bitcast<f32>(0xff800000u));
         for (var c = 0u; c < 4u; c++) {
-            if (4u * t + c < n) { v[c] = logits[lr + 4u * t + c]; }
+            if (4u * t + c < n) {
+                let raw = logits[lr + 4u * t + c];
+                v[c] = select(bitcast<f32>(0xff800000u), raw, (bitcast<u32>(raw) & 0x7fffffffu) <= 0x7f800000u);
+            }
         }
         l4[t] = v;
     }
@@ -101,7 +104,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     var above = 0u;
     if (live) {
         // how many beat logit `i` (a higher logit, or as high at a lower index), among this thread's quads
-        let v = logits[lr + i];
+        let raw = logits[lr + i];
+        let v = select(bitcast<f32>(0xff800000u), raw, (bitcast<u32>(raw) & 0x7fffffffu) <= 0x7f800000u);
         for (var q = t % 4u; q < quads; q += 4u) {
             let u = l4[q];
             let j = 4u * q;
@@ -317,7 +321,8 @@ fn main(@builtin(local_invocation_index) li: u32) {
     let n = p[0].x;
     let k = p[0].y;
     if (li < n) {
-        pk[li] = 1.0 / (1.0 + exp(-logits[li])) + bias[li];
+        let raw = 1.0 / (1.0 + exp(-logits[li])) + bias[li];
+        pk[li] = select(bitcast<f32>(0xff800000u), raw, (bitcast<u32>(raw) & 0x7fffffffu) <= 0x7f800000u);
     }
     workgroupBarrier();
     if (li < n) {
@@ -358,8 +363,10 @@ fn main(@builtin(local_invocation_index) li: u32) {
     let scale = bitcast<f32>(p[0].z);
     if (li < n) {
         let s = 1.0 / (1.0 + exp(-logits[li]));
-        sig[li] = s;
-        pk[li] = s + bias[li];
+        let s_ok = select(0.0, s, (bitcast<u32>(s) & 0x7fffffffu) <= 0x7f800000u);
+        let raw = s_ok + bias[li];
+        sig[li] = s_ok;
+        pk[li] = select(bitcast<f32>(0xff800000u), raw, (bitcast<u32>(raw) & 0x7fffffffu) <= 0x7f800000u);
     }
     workgroupBarrier();
     if (li < n) {

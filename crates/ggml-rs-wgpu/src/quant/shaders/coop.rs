@@ -810,10 +810,10 @@ const COOP_F16_REGS: &str = r#"    var wr0 = vec4<f16>();
     var wr3 = vec4<f16>();"#;
 const COOP_F16_LOAD: &str = r#"let wk = b * 32u + lh * 16u;
         let wo = rl * (kx / 4u) + wk / 4u;
-        wr0 = select(vec4<f16>(), w4[wo], wk < kx);
-        wr1 = select(vec4<f16>(), w4[wo + 1u], wk + 4u < kx);
-        wr2 = select(vec4<f16>(), w4[wo + 2u], wk + 8u < kx);
-        wr3 = select(vec4<f16>(), w4[wo + 3u], wk + 12u < kx);"#;
+        if (wk < kx) { wr0 = w4[wo]; } else { wr0 = vec4<f16>(); }
+        if (wk + 4u < kx) { wr1 = w4[wo + 1u]; } else { wr1 = vec4<f16>(); }
+        if (wk + 8u < kx) { wr2 = w4[wo + 2u]; } else { wr2 = vec4<f16>(); }
+        if (wk + 12u < kx) { wr3 = w4[wo + 3u]; } else { wr3 = vec4<f16>(); }"#;
 const COOP_F16_STEP: &str = r#"let at4 = buf + lr * S4 + lh * 4u;
         if (rr < p.rows) {
             wt[at4] = wr0;
@@ -1292,10 +1292,10 @@ fn split_source(binding: &str, helpers: &str, prelude: &str, regs: &str, load: &
 const COOP_SPLIT_F16_REGS: &str = "    var waSET = vec4<f16>();\n    var wbSET = vec4<f16>();\n    var wcSET = vec4<f16>();\n    var wdSET = vec4<f16>();\n";
 const COOP_SPLIT_F16_LOAD: &str = r#"            let wk = b * 32u + lh * 16u;
             let wo = rl * (kx / 4u) + wk / 4u;
-            waSET = select(vec4<f16>(), w4[wo], wk < kx);
-            wbSET = select(vec4<f16>(), w4[wo + 1u], wk + 4u < kx);
-            wcSET = select(vec4<f16>(), w4[wo + 2u], wk + 8u < kx);
-            wdSET = select(vec4<f16>(), w4[wo + 3u], wk + 12u < kx);
+            if (wk < kx) { waSET = w4[wo]; } else { waSET = vec4<f16>(); }
+            if (wk + 4u < kx) { wbSET = w4[wo + 1u]; } else { wbSET = vec4<f16>(); }
+            if (wk + 8u < kx) { wcSET = w4[wo + 2u]; } else { wcSET = vec4<f16>(); }
+            if (wk + 12u < kx) { wdSET = w4[wo + 3u]; } else { wdSET = vec4<f16>(); }
 "#;
 const COOP_SPLIT_F16_DECODE: &str = r#"            wt[at4] = waSET;
             wt[at4 + 1u] = wbSET;

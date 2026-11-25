@@ -658,7 +658,8 @@ impl QuantMoe {
         // (no shared expert: its place weighted 0, the sums reading the routed experts' outputs there, which hold
         // numbers, where the shared one's vector holds whatever its last user left)
         let sd = if self.shared.is_some() { buf(&st.sd) } else { buf(&st.out_d) };
-        let groups = (((rows * h) as u32).div_ceil(256), 1, 1);
+        let g = ((rows * h) as u32).div_ceil(256);
+        let groups = (g.min(65535), g.div_ceil(65535).max(1), 1);
         match into {
             Some((xs, post, streams)) => {
                 assert!(xs.len >= rows * streams * h && post.len >= rows * streams, "moe: {rows} rows' {streams} streams");

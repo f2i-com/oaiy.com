@@ -417,7 +417,7 @@ pub struct Inkling2Translator {
     tool_buf: String,
     pending_calls: Vec<String>,
     closed_thinking: bool,
-    pending_bytes: Vec<u32>,
+    pending_bytes: Vec<u8>,
 }
 
 impl Inkling2Translator {
@@ -447,14 +447,14 @@ impl Inkling2Translator {
         let mut out = Vec::new();
 
         if Some(tok_id) == self.ids.end_sampling {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             self.flush_segment_close(&mut out);
             self.flush_tool_calls(&mut out);
             return (out, true);
         }
 
         if Some(tok_id) == self.ids.msg_model {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             self.flush_segment_close(&mut out);
             self.seg = Segment::Header;
             self.header_buf.clear();
@@ -462,7 +462,7 @@ impl Inkling2Translator {
         }
 
         if Some(tok_id) == self.ids.content_thinking {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             self.flush_tool_calls(&mut out);
             self.seg = Segment::Thinking;
             self.closed_thinking = false;
@@ -471,7 +471,7 @@ impl Inkling2Translator {
         }
 
         if Some(tok_id) == self.ids.content_text {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             self.flush_tool_calls(&mut out);
             if !self.closed_thinking {
                 out.push("</think>".into());
@@ -482,7 +482,7 @@ impl Inkling2Translator {
         }
 
         if Some(tok_id) == self.ids.content_invoke_tool {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             if !self.closed_thinking {
                 out.push("</think>".into());
                 self.closed_thinking = true;
@@ -493,37 +493,37 @@ impl Inkling2Translator {
         }
 
         if Some(tok_id) == self.ids.end_message {
-            self.flush_pending_utf8(tok, &mut out);
+            self.flush_pending_utf8(&mut out);
             self.flush_segment_close(&mut out);
             self.seg = Segment::Idle;
             return (out, false);
         }
 
-        // Normal token inside the active segment (buffer incomplete UTF-8 across multi-byte tokens).
-        self.pending_bytes.push(tok_id);
-        let decoded = tok.decode(&self.pending_bytes);
-        if !decoded.contains('\u{FFFD}') {
-            self.pending_bytes.clear();
+        // Normal token inside the active segment (incrementally decode UTF-8 in O(1) amortized time
+        // so invalid UTF-8 bytes emit U+FFFD and never stall streaming).
+        let mut decoded = String::new();
+        tok.decode_token_incremental(tok_id, &mut self.pending_bytes, &mut decoded);
+        if !decoded.is_empty() {
             self.push_decoded(&decoded, &mut out);
         }
         (out, false)
     }
 
     /// Flush any remaining buffered text or tool calls at end of generation (e.g., `max_tokens`).
-    pub fn finish(&mut self, tok: &Tokenizer) -> Vec<String> {
+    pub fn finish(&mut self, _tok: &Tokenizer) -> Vec<String> {
         let mut out = Vec::new();
-        self.flush_pending_utf8(tok, &mut out);
+        self.flush_pending_utf8(&mut out);
         self.flush_segment_close(&mut out);
         self.flush_tool_calls(&mut out);
         out
     }
 
-    fn flush_pending_utf8(&mut self, tok: &Tokenizer, out: &mut Vec<String>) {
+    fn flush_pending_utf8(&mut self, out: &mut Vec<String>) {
         if self.pending_bytes.is_empty() {
             return;
         }
-        let s = tok.decode(&self.pending_bytes).replace('\u{FFFD}', "");
-        self.pending_bytes.clear();
+        let mut s = String::new();
+        Tokenizer::flush_incremental(&mut self.pending_bytes, &mut s);
         if !s.is_empty() {
             self.push_decoded(&s, out);
         }
@@ -1053,7 +1053,11 @@ impl Inkling2Engine {
             .zip(&keyed)
             .take_while(|(a, b)| a == b)
             .count();
-        let swa_slack = self.model.swa_checkpoint_slack();
+        let swa = self.model.cfg.sliding_window;
+        let swa_valid_from = self.model.swa_valid_from();
+        // Prune live checkpoints whose SWA rows were already overwritten or dropped during SWA grow/resync.
+        self.checkpoints
+            .retain(|(_, ckpt, _)| ckpt.pos.saturating_sub(swa) >= swa_valid_from);
         let live_exact = if common == self.covered.len() && common < keyed.len() {
             common
         } else {
@@ -1067,7 +1071,7 @@ impl Inkling2Engine {
                 saved.len() > live_exact
                     && saved.len() <= common
                     && saved.len() < keyed.len()
-                    && self.covered.len().saturating_sub(ckpt.pos) <= swa_slack
+                    && ckpt.pos.saturating_sub(swa) >= swa_valid_from
                     && keyed.starts_with(saved)
             })
             .max_by_key(|(_, (saved, _, _))| saved.len())
@@ -1736,5 +1740,53 @@ mod tests {
         assert_eq!(base_boundary(&prompt, ids), Some(80));
         let stops = checkpoint_positions(&prompt, ids);
         assert_eq!(stops, vec![80, 84, 87, prompt.len() - 1]);
+    }
+
+    #[test]
+    fn translator_recovers_from_invalid_utf8_and_streams_split_multibyte_chars() {
+        let tok = test_tokenizer();
+        let ids = SpecialIds::from_tokenizer(&tok);
+        let mut tr = Inkling2Translator::new(ids);
+
+        // Open text segment.
+        let _ = tr.push(ids.msg_model.unwrap(), &tok);
+        let _ = tr.push(ids.content_text.unwrap(), &tok);
+
+        // Token 0xFF is an invalid UTF-8 lead byte in the byte-level BPE alphabet (256-entry table).
+        let (bad_chunks, stop) = tr.push(0xFFu32, &tok);
+        assert!(!stop);
+        assert_eq!(bad_chunks.join(""), "\u{FFFD}");
+
+        // Subsequent valid ASCII tokens must stream immediately (no freeze).
+        let mut streamed = String::new();
+        for b in b"ok" {
+            let (chunks, stop) = tr.push(u32::from(*b), &tok);
+            assert!(!stop);
+            for c in chunks {
+                streamed.push_str(&c);
+            }
+        }
+        assert_eq!(streamed, "ok");
+
+        // Split 4-byte emoji ("🚀" = F0 9F 9A 80) across individual byte tokens.
+        let emoji = "🚀".as_bytes();
+        let mut emoji_out = String::new();
+        for (idx, &b) in emoji.iter().enumerate() {
+            let (chunks, stop) = tr.push(u32::from(b), &tok);
+            assert!(!stop);
+            for c in chunks {
+                emoji_out.push_str(&c);
+            }
+            if idx < 3 {
+                assert!(emoji_out.is_empty(), "incomplete UTF-8 must be buffered until complete");
+            }
+        }
+        assert_eq!(emoji_out, "🚀");
+
+        // Trailing incomplete sequence flushed on finish().
+        let (c1, _) = tr.push(0xF0u32, &tok);
+        assert!(c1.is_empty());
+        let tail = tr.finish(&tok);
+        assert_eq!(tail.join(""), "\u{FFFD}");
     }
 }

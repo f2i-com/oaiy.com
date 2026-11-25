@@ -279,6 +279,9 @@ impl SparseDecoder {
     }
 
     fn run(&self, level: Arc<Level>, latent: &Tensor, guide: Option<&[Subdivision]>, stop_at: usize, mut report: impl FnMut(usize, usize)) -> Result<Decoded> {
+        if level.is_empty() {
+            candle_core::bail!("3d: no voxels to decode");
+        }
         let dev = latent.device().clone();
         let mut level = level;
         let mut h = self.from_latent.forward(&latent.to_dtype(DType::F32)?)?.to_dtype(DType::F16)?;
@@ -298,6 +301,9 @@ impl SparseDecoder {
                 (None, Some(g)) => Subdivision { parent: g[i].parent.clone(), child: g[i].child.clone() },
                 (None, None) => candle_core::bail!("a decoder that does not choose its children needs a guide"),
             };
+            if sub.parent.is_empty() {
+                candle_core::bail!("3d: no voxels survived subdivision (is the object in view, on a plain background?)");
+            }
             let x = h.clone();
             let hh = up.norm1.forward(&h)?.silu()?;
             let hh = up.conv1.forward(&level, &hh)?;

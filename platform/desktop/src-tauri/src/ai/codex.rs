@@ -267,6 +267,11 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     }
     cmd.env("CODEX_HOME", codex_home);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn().map_err(|e| CodexError::Unavailable(cannot_run(&e)))?;
     // On Windows this child is `cmd /c codex`, so killing the tracked pid
@@ -457,14 +462,24 @@ impl Session {
         let closed = lock(&self.routes).closed;
         !closed && lock(&self.child).as_mut().map_or(true, |c| c.try_wait().ok().flatten().is_none())
     }
+
+    /// Kill the child process tree (e.g. `cmd /c codex` + node/codex grandchildren) and reap it.
+    /// Takes the child out of the slot so repeated calls (e.g. `stop()` then `Drop`) never touch
+    /// a recycled PID.
+    fn terminate(&self) {
+        if let Some(mut child) = lock(&self.child).take() {
+            if child.try_wait().ok().flatten().is_none() {
+                crate::services::registry::kill_process_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(child) = lock(&self.child).as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.terminate();
     }
 }
 
@@ -730,6 +745,15 @@ pub struct CodexStatus {
 }
 
 impl CodexAgent {
+    /// Terminate any live Codex app-server child and its descendants immediately
+    /// (called on app exit and before installing an update).
+    pub fn stop(&self) {
+        let live = lock(&self.session).take();
+        if let Some(session) = live {
+            session.terminate();
+        }
+    }
+
     /// Run `f` against a live, initialized session, starting one if needed.
     ///
     /// The session is shared: `f` runs beside any other caller's, holding no

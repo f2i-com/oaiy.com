@@ -527,16 +527,89 @@ fn system32_exe(rel: &str) -> String {
     rel.to_string()
 }
 
-/// Normalize a path string for managed-root containment checks: drop trailing
-/// separators, and on Windows fold `/`→`\` and lowercase (so a `${dataDir}/x`
-/// expansion mixing separators still compares equal to its backslash root).
-fn norm_path_key(s: &str) -> String {
+/// Normalize a path for managed-root containment checks: rebuild from lexical
+/// components (collapsing repeated separators), drop trailing separators, and
+/// on Windows fold `/`→`\` and lowercase.
+fn norm_path_key(p: &Path) -> String {
+    let mut normalized = PathBuf::new();
+    for comp in p.components() {
+        normalized.push(comp.as_os_str());
+    }
+    let s = normalized.display().to_string();
     let s = s.trim_end_matches(['/', '\\']);
     if cfg!(windows) {
         s.replace('/', "\\").to_lowercase()
     } else {
         s.to_string()
     }
+}
+
+/// Strictly normalize a template-supplied path before any containment or
+/// filesystem check: reject UNC/network/device paths, reject any `.` or `..`
+/// segment (including non-leading `.` that `Path::components()` would silently
+/// elide), and collapse repeated separators via `Path::components()`.
+fn lexical_normalize_strict(raw: &str) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    if raw.is_empty() || raw.starts_with("\\\\") || raw.starts_with("//") {
+        return None;
+    }
+    if raw.split(['/', '\\']).any(|seg| seg == "." || seg == "..") {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            Component::CurDir | Component::ParentDir => return None,
+            Component::Prefix(pre) => match pre.kind() {
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) | Prefix::DeviceNS(_) => return None,
+                _ => normalized.push(pre.as_os_str()),
+            },
+            Component::RootDir | Component::Normal(_) => normalized.push(comp.as_os_str()),
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+/// Resolve symlinks and junctions on the deepest existing ancestor of `p`,
+/// preserving any non-existent trailing segments (for globs or not-yet-created
+/// paths). When `strict_existing` is true, an existing entry that cannot be
+/// canonicalized (e.g. a dangling symlink or broken junction) is rejected.
+fn canonicalize_deepest_existing(p: &Path, strict_existing: bool) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for comp in p.components() {
+        normalized.push(comp.as_os_str());
+    }
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+    let mut cur = normalized.clone();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut out = canon;
+            for seg in tail.into_iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        if strict_existing && std::fs::symlink_metadata(&cur).is_ok() {
+            return None;
+        }
+        match cur.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !cur.pop() {
+                    return Some(normalized);
+                }
+            }
+            None => return Some(normalized),
+        }
+    }
+}
+
+fn canonical_path_key(p: &Path) -> String {
+    let resolved = canonicalize_deepest_existing(p, false).unwrap_or_else(|| p.to_path_buf());
+    norm_path_key(&resolved)
 }
 
 /// The result of last reading one template file, plus enough of its metadata
@@ -1232,45 +1305,77 @@ impl Registry {
     /// contains bin/scripts/venvs/services — or any model dir). The uninstall
     /// guard so a template's declared paths can't reach outside what OAIY owns.
     fn path_within_managed_root(&self, p: &Path) -> bool {
-        let target = norm_path_key(&p.display().to_string());
+        use std::path::{Component, Prefix};
+        if p.components().any(|c| match c {
+            Component::CurDir | Component::ParentDir => true,
+            Component::Prefix(pre) => matches!(
+                pre.kind(),
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) | Prefix::DeviceNS(_)
+            ),
+            _ => false,
+        }) {
+            return false;
+        }
+        let target = canonical_path_key(p);
         if target.is_empty() {
             return false;
         }
         std::iter::once(&self.data_dir)
             .chain(self.model_dirs.iter())
             .any(|root| {
-                let r = norm_path_key(&root.display().to_string());
+                let r = canonical_path_key(root);
                 !r.is_empty()
                     && (target == r
                         || target.starts_with(&format!("{r}{}", std::path::MAIN_SEPARATOR)))
             })
     }
 
+    /// Strictly normalize and canonicalize a template-supplied path, ensuring it
+    /// is non-UNC, has no `.`/`..` segments, defeats symlinks/junctions via
+    /// deepest-existing ancestor canonicalization, and stays within a managed root.
+    fn normalize_managed_path(&self, raw: &str) -> Option<PathBuf> {
+        let lex = lexical_normalize_strict(raw)?;
+        let canon = canonicalize_deepest_existing(&lex, true)?;
+        self.path_within_managed_root(&canon).then_some(canon)
+    }
+
     /// True when `p` is EXACTLY one of the managed roots (data dir or a model
     /// dir). Used to refuse a glob sitting directly in a root, which would
     /// enumerate the whole root.
     fn is_managed_root(&self, p: &Path) -> bool {
-        let t = norm_path_key(&p.display().to_string());
+        let t = canonical_path_key(p);
         !t.is_empty()
             && std::iter::once(&self.data_dir)
                 .chain(self.model_dirs.iter())
-                .any(|r| norm_path_key(&r.display().to_string()) == t)
+                .any(|r| canonical_path_key(r) == t)
     }
 
     /// True when `p` is EXACTLY a managed root OR a SHARED structural dir under the data dir
-    /// (`bin`/`venvs`/`services`/`templates`/`scripts`). Uninstall must refuse these: removing
-    /// one would wipe EVERY service's files (all venvs, all binaries, all templates), not just
-    /// this service's. Paths strictly UNDER them (e.g. `${dataDir}/venvs/<id>`,
-    /// `${binDir}/my-server-*.exe`) are fine — this is an equality check, so they pass through.
+    /// (`bin`/`venvs`/`services`/`templates`/`scripts`/`auth`/`plugins`/`flows`/`voices`/`python`/`node`).
+    /// Uninstall must refuse these: removing one would wipe EVERY service's files or OAIY's own
+    /// credentials/plugins/flows/runtimes, not just this service's. Paths strictly UNDER them
+    /// (e.g. `${dataDir}/venvs/<id>`) are fine — this is an equality check, so they pass through.
     fn is_protected_uninstall_root(&self, p: &Path) -> bool {
         if self.is_managed_root(p) {
             return true;
         }
-        let t = norm_path_key(&p.display().to_string());
+        let t = canonical_path_key(p);
         !t.is_empty()
-            && ["bin", "venvs", "services", "templates", "scripts"]
-                .iter()
-                .any(|sub| norm_path_key(&self.data_dir.join(sub).display().to_string()) == t)
+            && [
+                "bin",
+                "venvs",
+                "services",
+                "templates",
+                "scripts",
+                "auth",
+                "plugins",
+                "flows",
+                "voices",
+                "python",
+                "node",
+            ]
+            .iter()
+            .any(|sub| canonical_path_key(&self.data_dir.join(sub)) == t)
     }
 
     /// Remove the files/dirs a service's `uninstall` spec declares, so the user
@@ -1307,32 +1412,32 @@ impl Registry {
         let mut paths = Vec::new();
         for raw in &spec.paths {
             let resolved = os_fix_path(substitute(raw, &ctx));
-            if resolved.split(['/', '\\']).any(|c| c == "..") {
-                log::warn!("uninstall {id}: skipping path with '..': {resolved}");
+            let Some(canonical) = self.normalize_managed_path(&resolved) else {
+                log::warn!("uninstall {id}: skipping invalid or out-of-root path: {resolved}");
                 continue;
-            }
-            if !self.path_within_managed_root(Path::new(&resolved)) {
-                log::warn!("uninstall {id}: skipping out-of-root path: {resolved}");
-                continue;
-            }
+            };
             // Refuse a path that IS a managed root or a shared structural dir (${dataDir},
-            // ${modelsDir}, ${binDir}, ${dataDir}/venvs, …). remove_dir_all on one of these
-            // would nuke every OTHER service's files + the model library — a hostile or buggy
-            // template's "Uninstall <ServiceX>" must only touch ServiceX's own subtree.
-            if self.is_protected_uninstall_root(Path::new(&resolved)) {
+            // ${modelsDir}, ${binDir}, ${dataDir}/venvs, ${dataDir}/auth, …). remove_dir_all
+            // on one of these would nuke every OTHER service's files / OAIY's own data — a
+            // hostile or buggy template's "Uninstall <ServiceX>" must only touch ServiceX's subtree.
+            if self.is_protected_uninstall_root(&canonical) {
                 log::warn!("uninstall {id}: refusing managed-root/structural path: {resolved}");
                 continue;
             }
-            // Refuse a glob sitting DIRECTLY in a managed root (e.g. `${modelsDir}/*`
-            // or `${modelsDir}/Q*`) — it could enumerate the user's whole library.
-            let pb = Path::new(&resolved);
-            if pb.file_name().and_then(|n| n.to_str()).is_some_and(|f| f.contains('*'))
-                && pb.parent().is_some_and(|par| self.is_managed_root(par))
+            // Refuse a glob sitting DIRECTLY in a managed root or protected structural dir
+            // (e.g. `${modelsDir}/*`, `${dataDir}/bin/*.*`, `${dataDir}/auth/*`).
+            if canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|f| f.contains('*'))
+                && canonical
+                    .parent()
+                    .is_some_and(|par| self.is_protected_uninstall_root(par))
             {
-                log::warn!("uninstall {id}: refusing root-level glob: {resolved}");
+                log::warn!("uninstall {id}: refusing protected-root glob: {resolved}");
                 continue;
             }
-            paths.push(resolved);
+            paths.push(canonical.display().to_string());
         }
         self.uninstalling.insert(id.to_string());
         Ok(paths)
@@ -1386,12 +1491,22 @@ impl Registry {
         bare_program_in(raw, own, &self.data_dir.join("bin"), later_program_dirs(exe_dir()))
     }
 
-    /// The resolved path of a service's install-completion marker, if it declares one.
-    fn install_marker_path(&self, template: &ServiceTemplate, port: u16) -> Option<String> {
-        template
-            .installed_marker
-            .as_ref()
-            .map(|m| os_fix_path(substitute(m, &self.ctx(port))))
+    /// Validate and canonicalize an `installedMarker` string against managed roots.
+    /// Rejects UNC/network paths, `.`/`..` segments, symlink/junction escapes,
+    /// paths outside a managed root, and managed/protected root directories themselves.
+    fn resolve_install_marker(&self, raw_marker: &str, port: u16) -> Option<PathBuf> {
+        let resolved = os_fix_path(substitute(raw_marker, &self.ctx(port)));
+        let canon = self.normalize_managed_path(&resolved)?;
+        if self.is_protected_uninstall_root(&canon) {
+            return None;
+        }
+        Some(canon)
+    }
+
+    /// The resolved, validated path of a service's install-completion marker, if it declares a valid one.
+    fn install_marker_path(&self, template: &ServiceTemplate, port: u16) -> Option<PathBuf> {
+        let raw = template.installed_marker.as_deref()?;
+        self.resolve_install_marker(raw, port)
     }
 
     /// Whether the service is installed. When the template declares an `installedMarker` — a
@@ -1400,8 +1515,10 @@ impl Registry {
     /// reap_exited) is the source of truth, so a partial/failed install correctly reads as
     /// not-installed (Start hidden, Install shown). Otherwise fall back to "run exe exists".
     fn run_installed(&self, template: &ServiceTemplate, port: u16) -> bool {
-        if let Some(marker) = self.install_marker_path(template, port) {
-            return Path::new(&marker).exists();
+        if template.installed_marker.is_some() {
+            return self
+                .install_marker_path(template, port)
+                .is_some_and(|marker| marker.exists());
         }
         self.run_command_exists(&template.run.command, port)
     }
@@ -1427,12 +1544,12 @@ impl Registry {
             let Some(marker) = self.install_marker_path(&svc.template, svc.port) else {
                 continue;
             };
-            if Path::new(&marker).exists()
+            if marker.exists()
                 || !self.run_command_exists(&svc.template.run.command, svc.port)
             {
                 continue;
             }
-            if let Some(parent) = Path::new(&marker).parent() {
+            if let Some(parent) = marker.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(&marker, "installed by oaiy\n");
@@ -1685,31 +1802,36 @@ impl Registry {
     /// the classic wedge is a dead-but-not-reaped child keeping the port, where
     /// a plain Start just loses the bind race and looks broken for no reason.
     pub fn repair(&mut self, id: &str) -> Result<(), String> {
-        {
+        if self.uninstalling.contains(id) {
+            return Err("it is being uninstalled: wait for that to finish".into());
+        }
+        let (old_runner, old_installer) = {
             let svc = self
                 .services
                 .get_mut(id)
                 .ok_or_else(|| format!("unknown service {id:?}"))?;
-            // Same liveness guard `start` uses, and for the same reason:
-            // Repair runs precisely when a child has already died, so its pid
-            // is the one most likely to have been recycled — and this is a
-            // `taskkill /T /F`, which would take an unrelated process AND ITS
-            // WHOLE TREE with it. check_exited() reports None only while the
-            // process is still ours.
-            if let Some(runner) = &svc.runner {
-                if runner.check_exited().is_none() {
-                    kill_process_tree(runner.pid);
-                }
-            }
-            if let Some(installer) = &svc.installer {
-                if installer.check_exited().is_none() {
-                    kill_process_tree(installer.pid);
-                }
-            }
-            svc.runner = None;
+            let old_runner = svc.runner.take();
+            let old_installer = svc.installer.take();
             svc.restart_attempts = 0;
             svc.restart_at = None;
             svc.set_status(ServiceStatus::Stopped, None);
+            (old_runner, old_installer)
+        };
+        // Same liveness + bounded reap discipline as start() / install_streaming():
+        // kill_tree_and_reap verifies check_exited().is_none() before killing by pid
+        // (preventing recycled-PID collateral damage), waits up to RESPAWN_REAP_GRACE
+        // so the port is actually released before start() binds it, and tracks any
+        // stubborn process in `self.exiting`.
+        if let Some(old) = old_runner {
+            self.exiting
+                .note(kill_tree_and_reap(&old, RESPAWN_REAP_GRACE, id));
+        }
+        if let Some(old) = old_installer {
+            self.exiting.note(kill_tree_and_reap(
+                &old,
+                RESPAWN_REAP_GRACE,
+                &format!("{id} install"),
+            ));
         }
         self.start(id)
     }
@@ -2256,12 +2378,15 @@ impl Registry {
         // run_installed() flips it to installed=true. A partial/failed install (non-zero exit →
         // no marker) correctly stays not-installed even though its venv interpreter exists.
         for (port, marker) in mark_installed {
-            let resolved = os_fix_path(substitute(&marker, &self.ctx(port)));
-            if let Some(parent) = Path::new(&resolved).parent() {
+            let Some(resolved) = self.resolve_install_marker(&marker, port) else {
+                log::warn!("refusing to write invalid or out-of-root install marker: {marker}");
+                continue;
+            };
+            if let Some(parent) = resolved.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Err(e) = std::fs::write(&resolved, "installed by oaiy\n") {
-                log::warn!("could not write install marker {resolved}: {e}");
+                log::warn!("could not write install marker {}: {e}", resolved.display());
             }
         }
         // A service meant to be warm before it is needed starts with OAIY from now on.
@@ -2553,6 +2678,16 @@ impl Registry {
     pub fn add_template(&mut self, template: ServiceTemplate) -> Result<(), String> {
         if !valid_service_id(&template.id) {
             return Err("service id must be lowercase letters/digits/dash/underscore (1–64 chars)".into());
+        }
+        if let Some(marker) = template.installed_marker.as_deref() {
+            if self
+                .resolve_install_marker(marker, template.default_port)
+                .is_none()
+            {
+                return Err(format!(
+                    "invalid installedMarker {marker:?}: must stay inside a managed directory without '.', '..', or UNC/network prefixes"
+                ));
+            }
         }
         if let Some(existing) = self.services.get(&template.id) {
             // (its process alive whatever its status says, an Errored service still loading: replaced under it, the
@@ -4472,5 +4607,141 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         }
         // The digest is of the normalized body.
         assert_eq!(template_digest("a\r\nb\n"), template_digest("a\nb"));
+    }
+
+    #[test]
+    fn uninstall_guard_blocks_dot_double_sep_protected_dirs_and_protected_globs() {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-uninstall-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let models = dir.join("models");
+        std::fs::create_dir_all(dir.join("templates")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        std::fs::create_dir_all(dir.join("venvs/evil-svc")).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+
+        let mut reg = Registry::empty(dir.clone(), models.clone());
+        let tpl: ServiceTemplate = serde_json::from_str(
+            r#"{
+                "id": "evil-svc",
+                "name": "Evil",
+                "description": "",
+                "category": "test",
+                "defaultPort": 19991,
+                "run": { "command": "evil.exe", "args": [] },
+                "uninstall": {
+                    "paths": [
+                        "${dataDir}/.",
+                        "${dataDir}//bin",
+                        "${dataDir}/auth",
+                        "${dataDir}/plugins",
+                        "${dataDir}/flows",
+                        "${dataDir}/voices",
+                        "${dataDir}/python",
+                        "${dataDir}/node",
+                        "${dataDir}/bin/*.*",
+                        "${dataDir}/auth/*",
+                        "${dataDir}/../outside",
+                        "\\\\attacker\\share\\evil",
+                        "${dataDir}/venvs/evil-svc"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        reg.add_template(tpl).unwrap();
+
+        let paths = reg.begin_uninstall("evil-svc").expect("begin_uninstall");
+        assert_eq!(
+            paths.len(),
+            1,
+            "only the legitimate per-service venv path may pass; got {paths:?}"
+        );
+        assert!(
+            canonical_path_key(Path::new(&paths[0]))
+                == canonical_path_key(&dir.join("venvs/evil-svc")),
+            "expected venvs/evil-svc, got {:?}",
+            paths[0]
+        );
+        // Also verify repair refuses while uninstalling.
+        let repair_err = reg
+            .repair("evil-svc")
+            .expect_err("repair must fail while uninstall is in flight");
+        assert!(repair_err.contains("being uninstalled"), "got {repair_err}");
+
+        reg.finish_uninstall("evil-svc", 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_marker_rejects_unc_traversal_and_outside_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-marker-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("templates")).unwrap();
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let mut reg = Registry::empty(dir.clone(), models);
+        let outside = std::env::temp_dir()
+            .join("oaiy-outside-marker.txt")
+            .display()
+            .to_string();
+
+        let bad_markers = [
+            r"\\attacker\share\marker".to_string(),
+            "//attacker/share/marker".to_string(),
+            "${dataDir}/../escape-marker".to_string(),
+            "${dataDir}/./venvs/svc/.marker".to_string(),
+            "${dataDir}/auth".to_string(),
+            outside,
+        ];
+        for (i, marker) in bad_markers.iter().enumerate() {
+            let tpl: ServiceTemplate = serde_json::from_value(serde_json::json!({
+                "id": format!("bad-marker-{i}"),
+                "name": "Bad",
+                "description": "",
+                "category": "test",
+                "defaultPort": 19992,
+                "installedMarker": marker,
+                "run": { "command": "bad.exe", "args": [] }
+            }))
+            .unwrap();
+            assert!(
+                reg.install_marker_path(&tpl, 19992).is_none(),
+                "install_marker_path must reject {marker:?}"
+            );
+            assert!(
+                !reg.run_installed(&tpl, 19992),
+                "run_installed must return false for rejected marker {marker:?}"
+            );
+            assert!(
+                reg.add_template(tpl).is_err(),
+                "add_template must reject invalid installedMarker {marker:?}"
+            );
+        }
+
+        // Valid managed marker succeeds.
+        let good: ServiceTemplate = serde_json::from_value(serde_json::json!({
+            "id": "good-marker",
+            "name": "Good",
+            "description": "",
+            "category": "test",
+            "defaultPort": 19993,
+            "installedMarker": "${dataDir}/venvs/good-marker/.oaiy-installed",
+            "run": { "command": "good.exe", "args": [] }
+        }))
+        .unwrap();
+        assert!(reg.install_marker_path(&good, 19993).is_some());
+        reg.add_template(good).expect("valid marker template accepted");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

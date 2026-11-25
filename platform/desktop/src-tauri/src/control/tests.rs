@@ -1502,3 +1502,207 @@ fn the_link_status_tool_says_why_a_stored_link_is_not_in_use() {
     let fine = tools::link_summary(&json!({"linked": true, "linkError": null}), Err("no sync".into()));
     assert_eq!((fine["problem"].clone(), fine["linkError"].clone()), (Value::Null, Value::Null));
 }
+
+#[tokio::test]
+async fn mcp_enforces_control_project_and_forwards_principal_in_scoped_mode() {
+    use crate::auth::clock::SystemClock;
+    use crate::auth::guard::{Guard, GuardConfig};
+    use crate::auth::mode::AccessMode;
+    use crate::auth::presets::{App, Preset};
+    use crate::auth::scopes::ScopeSet;
+    use crate::auth::store::{AuthStore, MintSpec};
+    use crate::auth::token::Kind;
+
+    let sb = Sandbox::new("scoped-mcp");
+    let control = Control::with_navigator(&sb.0, None);
+    let clock: Arc<dyn crate::auth::clock::Clock> = Arc::new(SystemClock);
+    let store = Arc::new(AuthStore::memory(clock.clone()));
+    let (cfg, _) = GuardConfig::from_env(&|_| None, false, true, 17972);
+    let guard = Arc::new(Guard::new(AccessMode::Scoped, cfg, store.clone(), None, None, clock));
+
+    let flows = Arc::new(crate::bridge::FlowStore::new(sb.0.join("flows")));
+    let bridge_routes = Router::new()
+        .route(
+            "/api/bridge/flows",
+            get({
+                let flows = flows.clone();
+                move || {
+                    let flows = flows.clone();
+                    async move {
+                        let list: Vec<Value> = flows
+                            .listed()
+                            .into_iter()
+                            .map(|f| json!({ "id": f.id, "name": f.name }))
+                            .collect();
+                        Json(json!({ "flows": list }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/bridge/flows/:id",
+            axum::routing::put({
+                let flows = flows.clone();
+                move |axum::extract::Path(id): axum::extract::Path<String>, Json(body): Json<Value>| {
+                    let flows = flows.clone();
+                    async move {
+                        let _ = flows.put(&id, &body.to_string());
+                        Json(json!({ "id": id }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/plugins/install",
+            axum::routing::post(|| async move { Json(json!({ "ok": true })) }),
+        );
+
+    let g = guard.clone();
+    let app = bridge_routes
+        .merge(super::router(control.clone()))
+        .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let g = g.clone();
+            async move { g.handle(req, next).await }
+        }));
+    control.set_router(app.clone());
+
+    let loopback_send = |headers: &[(&str, &str)], body: String| {
+        let app = app.clone();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        async move {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/mcp")
+                .header("Host", "127.0.0.1:17972")
+                .header("content-type", "application/json")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50000,
+                ))));
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let response = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+
+    // 1. A caller with only `control.read` (and `flows.read`) cannot list or invoke mutating tools.
+    let read_only = store
+        .mint(MintSpec::new(
+            Kind::Pat,
+            "reader",
+            ScopeSet::of(&["control.read", "flows.read"]),
+            60_000,
+        ))
+        .unwrap();
+    let read_auth = format!("Bearer {}", read_only.token);
+    let (status, list_body) = loopback_send(
+        &[("Authorization", &read_auth), ("X-OAIY-Session", "project")],
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list_body}");
+    let listed: Vec<String> = list_body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(listed.contains(&"flows_list".to_string()));
+    assert!(!listed.contains(&"flow_create".to_string()), "change tools hidden without control.project");
+
+    let (_, denied_call) = loopback_send(
+        &[("Authorization", &read_auth), ("X-OAIY-Session", "project")],
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "flow_create",
+                "arguments": { "id": "blocked", "flow": { "name": "Blocked", "nodes": [], "edges": [] } }
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(is_error(&denied_call["result"]), "{denied_call}");
+    assert!(
+        text(&denied_call["result"]).contains("control.project"),
+        "{denied_call}"
+    );
+
+    // Reading flows works through Desk in scoped mode without failing 401 on internal_token().
+    let (_, read_call) = loopback_send(
+        &[("Authorization", &read_auth), ("X-OAIY-Session", "project")],
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "flows_list", "arguments": {} }
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(!is_error(&read_call["result"]), "flows_list should succeed in scoped mode: {read_call}");
+
+    // 2. An Agent desk credential has `control.project` + `flows.write` (can create flows),
+    //    but lacks `plugins.install` (cannot escalate via plugin_install).
+    let mut agent_spec = MintSpec::new(
+        Kind::Dsk,
+        "agent webview",
+        Preset::Agent.scopes(),
+        60_000,
+    );
+    agent_spec.preset = Some(Preset::Agent);
+    agent_spec.app = Some(App::Agent);
+    agent_spec.origins = vec!["http://oaiy.localhost".into()];
+    let agent = store.mint(agent_spec).unwrap();
+    let agent_auth = format!("Bearer {}", agent.token);
+
+    let (_, save_call) = loopback_send(
+        &[
+            ("Authorization", &agent_auth),
+            ("Origin", "http://oaiy.localhost"),
+            ("X-OAIY-Session", "project"),
+        ],
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "flow_create",
+                "arguments": { "id": "scoped-ok", "flow": { "name": "Scoped OK", "nodes": [], "edges": [] } }
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(!is_error(&save_call["result"]), "Agent should create flow in scoped mode: {save_call}");
+
+    // Trying to invoke plugin_install must fail with 403 insufficient_scope on the underlying route.
+    let (_, escalate_call) = loopback_send(
+        &[
+            ("Authorization", &agent_auth),
+            ("Origin", "http://oaiy.localhost"),
+            ("X-OAIY-Session", "project"),
+        ],
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "plugin_install",
+                "arguments": { "source": "https://example.com/evil" }
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(is_error(&escalate_call["result"]), "Agent must not escalate to plugins.install: {escalate_call}");
+}

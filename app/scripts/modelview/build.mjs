@@ -40,15 +40,16 @@ export async function buildViewer(out = join(root, 'public', 'modelview', 'model
 
 /** Writes `out` (public/webpage/three-host.js) unless it is newer than what it is built from. */
 export async function buildThreeHost(out = join(root, 'public', 'webpage', 'three-host.js')) {
-  const stamp = `/* three-host ${JSON.parse(readFileSync(THREE, 'utf8')).version} */\n`;
-  if (existsSync(out) && statSync(out).mtimeMs >= statSync(THREE_HOST_SOURCE).mtimeMs && readFileSync(out, 'utf8').startsWith(stamp)) return false;
+  const stamp = `/* three-host ${JSON.parse(readFileSync(THREE, 'utf8')).version} keepNames */\n`;
+  const srcMtime = Math.max(statSync(THREE_HOST_SOURCE).mtimeMs, statSync(fileURLToPath(import.meta.url)).mtimeMs);
+  if (existsSync(out) && statSync(out).mtimeMs >= srcMtime && readFileSync(out, 'utf8').startsWith(stamp)) return false;
   const { build } = await import('rolldown');
   const result = await build({
     input: THREE_HOST_SOURCE,
     cwd: root,
     logLevel: 'warn',
     write: false,
-    output: { format: 'iife', minify: true, codeSplitting: false },
+    output: { format: 'iife', minify: true, keepNames: true, codeSplitting: false },
   });
   const chunk = result.output.find((o) => o.type === 'chunk');
   if (!chunk) throw new Error('the webpage Three.js host runtime did not build');

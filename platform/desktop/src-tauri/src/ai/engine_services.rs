@@ -477,7 +477,12 @@ async fn forward_to(gateway: &str, discovery: &Value, path: String, req: Request
         Err(e) => return ai_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", e.to_string()),
     };
     // No overall timeout: a picture or a song is answered when it is made.
-    let client = match reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5)).build() {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     };

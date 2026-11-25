@@ -806,8 +806,10 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 /* On paper a field is white inside its line, as the dashboard's are: the tinted fill read as a field switched off.
    (`background-color`, never the shorthand: a select keeps its one arrow.) */
 :root[data-theme=light] input:not([type=checkbox]):not([type=radio]):not([type=range]), :root[data-theme=light] select, :root[data-theme=light] textarea { background-color: #fff; }
+:root[data-theme=light] .composer2 textarea { background-color: transparent; }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme=dark]) input:not([type=checkbox]):not([type=radio]):not([type=range]), :root:not([data-theme=dark]) select, :root:not([data-theme=dark]) textarea { background-color: #fff; }
+  :root:not([data-theme=dark]) .composer2 textarea { background-color: transparent; }
 }
 
 /* ---------- in OAIY's window: the sections are one quiet row at the top ----------
@@ -1769,9 +1771,15 @@ $("#nav-shade").onclick = () => unfoldSections(false);
 matchMedia("(max-width: 699px)").addEventListener("change", () => unfoldSections(false));
 // The bar's height where the sections are along the bottom (its one row, also while More has it unfolded), else 0.
 const dockHeight = () => document.documentElement.classList.contains("dock") ? parseFloat(getComputedStyle(sections).minHeight) || 0 : 0;
+const cssEsc = s => typeof CSS !== "undefined" && CSS.escape ? CSS.escape(String(s)) : String(s).replace(/[^\w-]/g, c => "\\" + c.codePointAt(0).toString(16) + " ");
+const viewPage = v => {
+  if (!v) return null;
+  const el = document.getElementById("v-" + v);
+  return el && el.matches("section.view") ? el : null;
+};
 // A long page's blocks, as a row under its title that stays in reach while the page scrolls.
 function renderJump(view) {
-  const page = $("#v-" + view);
+  const page = viewPage(view);
   if (!page?.hasAttribute("data-jump")) return;
   const heads = $$(".block h2", page).filter(h => !h.closest("[hidden]"));
   let row = $(".jump", page);
@@ -1787,21 +1795,24 @@ function renderJump(view) {
 // In OAIY's window two of this page's sections go by another name (the labels are in the markup, `only-in-oaiy`):
 // their tooltips follow.
 if (document.documentElement.classList.contains("in-oaiy")) {
-  for (const [view, name] of [["overview", "Status"], ["settings", "Engine settings"]]) { const b = $(`.sections button[data-view="${view}"]`); if (b) b.title = name; }
+  for (const [view, name] of [["overview", "Status"], ["settings", "Engine settings"]]) { const b = $(`.sections button[data-view="${cssEsc(view)}"]`); if (b) b.title = name; }
 }
 function show(target) {
   const [view, sub] = String(target || "").split(":");
-  if (!view || !$("#v-" + view)) return;
+  const page = viewPage(view);
+  if (!page) return;
   if (view === "get" && sub) dlGroup = sub;
-  const moved = !$("#v-" + view)?.classList.contains("on");
+  const moved = !page.classList.contains("on");
+  const escView = cssEsc(view);
   $$(".sections button[data-view]").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
-  sections.classList.toggle("in-more", !!$(`.sections button[data-more][data-view="${view}"]`));
+  const moreBtn = $(`.sections button[data-more][data-view="${escView}"]`);
+  sections.classList.toggle("in-more", !!moreBtn);
   // Where the open section is one that More holds, the row names it in More's place (in OAIY's window, the CSS of
   // `.in-oaiy.dock .sections.in-more`): "More" in bold did not say where the person was.
-  { const held = $(`.sections button[data-more][data-view="${view}"] .label`), word = $("#sections-more .label");
+  { const held = moreBtn ? $(".label", moreBtn) : null, word = $("#sections-more .label");
     if (word) { if (held) word.dataset.here = held.innerText.trim() || held.textContent.trim(); else delete word.dataset.here; } }
   unfoldSections(false);
-  $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
+  $$("section.view").forEach(s => s.classList.toggle("on", s === page));
   renderJump(view);
   // Another section starts at its top, not where the last one was scrolled to.
   if (moved && !(view === "models" && sub)) scrollTo(0, 0);
@@ -1809,9 +1820,9 @@ function show(target) {
   if (location.hash.split(":")[0] !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
   requestAnimationFrame(() => {
-    pathEnds($("#v-" + view));
+    pathEnds(page);
     if (view === "models" && sub) {
-      const dest = $("#m-" + sub) || (sub === "llm" ? $("#m-llm") : null);
+      const dest = document.getElementById("m-" + sub) || (sub === "llm" ? $("#m-llm") : null);
       dest?.closest(".block")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }
   });
@@ -1969,8 +1980,8 @@ $("#add-browse").onclick = () => pick({title: "Choose a model file or folder"}, 
 function field(label, section, name, key, value, opts = {}) {
   const id = `f-${section}-${name}-${key}`.replace(/[^\w-]/g, "_");
   return `<label class="f"><span>${esc(label)}${opts.missing ? ' <span class="tag bad">needed</span>' : ""}</span><div class="pathfield">
-    <input type="text" id="${id}" value="${esc(value || "")}" data-mfield="${esc(section)}|${esc(name)}|${esc(key)}" placeholder="${esc(opts.placeholder || "")}">
-    <button class="btn" type="button" data-mpick="${esc(section)}|${esc(name)}|${esc(key)}" ${opts.dir ? 'data-dir="1"' : ""}>Browse</button></div></label>`;
+    <input type="text" id="${id}" value="${esc(value || "")}" data-mfield data-section="${esc(section)}" data-model="${esc(name)}" data-key="${esc(key)}" placeholder="${esc(opts.placeholder || "")}">
+    <button class="btn" type="button" data-mpick data-section="${esc(section)}" data-model="${esc(name)}" data-key="${esc(key)}" ${opts.dir ? 'data-dir="1"' : ""}>Browse</button></div></label>`;
 }
 /* A model's LoRAs, each a path and a strength: a Qwen Image model's (files,
    applied with the turbo adapter), or a language model's (PEFT folders,
@@ -1980,12 +1991,12 @@ function loraList(section, name, list, label = "LoRAs (optional; each with a str
   const rows = (list || []).map((l, i) => {
     const path = typeof l === "string" ? l : (l.path || ""), strength = typeof l === "string" ? 1 : (l.strength ?? 1);
     return `<div class="pathfield">
-      <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a .gguf)" : "LoRA .safetensors"}">
-      <input type="number" step="0.05" min="-4" max="4" value="${esc(String(strength))}" data-lora="${section}|${esc(name)}|${i}|strength" title="Strength (1 = as trained)" style="width:6em;flex:none">
-      <button class="btn quiet warn" type="button" data-lora-remove="${section}|${esc(name)}|${i}">Remove</button></div>`;
+      <input type="text" value="${esc(path)}" data-lora data-section="${esc(section)}" data-model="${esc(name)}" data-index="${i}" data-key="path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a .gguf)" : "LoRA .safetensors"}">
+      <input type="number" step="0.05" min="-4" max="4" value="${esc(String(strength))}" data-lora data-section="${esc(section)}" data-model="${esc(name)}" data-index="${i}" data-key="strength" title="Strength (1 = as trained)" style="width:6em;flex:none">
+      <button class="btn quiet warn" type="button" data-lora-remove data-section="${esc(section)}" data-model="${esc(name)}" data-index="${i}">Remove</button></div>`;
   }).join("");
   return `<div class="f"><span class="small muted">${esc(label)}</span>${rows}
-    <div><button class="btn" type="button" data-lora-add="${section}|${esc(name)}"${dir ? ' data-dir="1"' : ""}>Add LoRA…</button></div></div>`;
+    <div><button class="btn" type="button" data-lora-add data-section="${esc(section)}" data-model="${esc(name)}"${dir ? ' data-dir="1"' : ""}>Add LoRA…</button></div></div>`;
 }
 function modelLoras(section, name) {
   const m = modelObj(section, name);
@@ -2020,7 +2031,7 @@ function renderFaceAge() {
   const set = parts.some(([k]) => (f[k] || "").trim());
   $("#m-faceage").innerHTML = set ? `<div class="item"><div class="item-head"><strong>Age check</strong>
       ${miss.length ? `<span class="tag bad">Needs its ${miss.map(k => k === "model" ? "age model" : "face finder").join(" and ")}</span>` : ""}
-      <span class="item-acts"><label class="check"><input type="checkbox" data-menable="faceage|check" ${f.enabled !== false ? "checked" : ""}> Enabled</label>
+      <span class="item-acts"><label class="check"><input type="checkbox" data-menable data-section="faceage" data-model="check" ${f.enabled !== false ? "checked" : ""}> Enabled</label>
       <button class="btn quiet warn" type="button" data-faceage-remove>Remove</button></span></div>
       <div class="cols" style="gap:12px">${parts.map(([key, label]) => field(label, "faceage", "check", key, f[key], {missing: miss.includes(key)})).join("")}</div></div>`
     : '<div class="empty">No age check. Get models has it, under Age check.</div>';
@@ -2088,13 +2099,13 @@ function renderModels() {
     <div class="item-head"><strong>${esc(m.name)}</strong>
       ${isDefaultLlm(m) ? defaultLlmTag() : ""}
       ${whereLlm(m)}
-      <span class="item-acts">${isDefaultLlm(m) ? "" : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
-      <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
-      <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></span></div>
+      <span class="item-acts">${isDefaultLlm(m) ? "" : `<button class="btn quiet" data-default data-section="llm" data-model="${esc(m.name)}">Make default</button>`}
+      <label class="check"><input type="checkbox" data-menable data-section="llm" data-model="${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
+      <button class="btn quiet warn" data-remove data-section="llm" data-model="${esc(m.name)}">Remove</button></span></div>
     <details class="item-more" data-item="llm|${esc(m.name)}" ${openItem("llm", m.name, !(m.path || "").trim()) ? "open" : ""}>${itemSummary(m.path)}
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
-    ${m.egpu && egpuOn() ? "" : `<div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>`}
+    ${m.egpu && egpuOn() ? "" : `<div class="f"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu data-model="${esc(m.name)}" data-index="${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> ${gpuLabel(g)}</label>`).join("")}</div></div>`}
     <label class="check" title="For a model file that has a multi-token-prediction layer: the layer drafts the next few tokens and the model checks them in one run. Experimental: a third to three fifths faster on predictable text (lists, facts, code), a little faster on stories and about even at higher temperatures, with the same replies as without it, holding 0.3 to 1 GB more on the GPU."><input type="checkbox" data-mtp="${esc(m.name)}" ${m.mtp ? "checked" : ""}> Draft tokens with its MTP layer (experimental)</label>
     ${egpuTick(m)}
     </details>
@@ -2125,6 +2136,7 @@ function renderModels() {
       : field("Base folder (diffusers)", "image", name, "base", m.base, {dir: true, missing: miss.includes("base")}) + field("Transformer (.gguf)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
         + field("Transformer (.safetensors)", "image", name, "safetensors_transformer", m.safetensors_transformer) + field("Turbo adapter (optional)", "image", name, "adapter", m.adapter)
         + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder)
+        + field("Vision projector (.gguf, optional)", "image", name, "vision", m.vision)
         + loraList("image", name, m.loras);
     return mediaItem("image", name, m, moss ? ((m.distill || "").trim() ? `MOSS-Image, ${m.steps || 8} passes` : "MOSS-Image") : flux3 ? "FLUX 3 Image Klein" : klein ? "FLUX.2 Klein 4B" : sdxl ? "SDXL" : "Qwen Image", miss, fields);
   }).join("") : '<div class="empty">No image model yet. Get one under Get models, or add a checkpoint, a .gguf or .safetensors file, or a diffusers folder above: Check says what it is.</div>';
@@ -2179,7 +2191,7 @@ function renderModels() {
     const fields = ["transformer", "vae", "text_encoder", "tokenizer", "audio_vae"]
       .filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
       .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("")
-      + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield="video|${esc(name)}|negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
+      + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield data-section="video" data-model="${esc(name)}" data-key="negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
     return mediaItem("video", name, m, familyName(m.family || name), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Get one under Get models, or add a video model\'s .safetensors file above.</div>';
 
@@ -2187,12 +2199,12 @@ function renderModels() {
   renderFaceAge();
   watchOpenItems();
   pathEnds($("#v-models"));
-  $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
-  $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
+  $$("[data-mfield]").forEach(el => el.oninput = () => { const {section: s, model: n, key: k} = el.dataset; modelObj(s, n)[k] = el.value; touch(); });
+  $$("[data-mpick]").forEach(b => b.onclick = () => { const {section: s, model: n, key: k} = b.dataset;
     pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const own = s === "llm" || s === "picture" || s === "faceage"; const miss = own ? [] : missingOf(s, modelObj(s, n)); if (!own && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
   $$("[data-mgpu]").forEach(el => el.onchange = () => {
-    const [name] = el.dataset.mgpu.split("|"), m = modelObj("llm", name);
-    const picked = $$("[data-mgpu]").filter(i => i.checked && i.dataset.mgpu.split("|")[0] === name).map(i => +i.dataset.mgpu.split("|")[1]);
+    const name = el.dataset.model, m = modelObj("llm", name);
+    const picked = $$("[data-mgpu]").filter(i => i.checked && i.dataset.model === name).map(i => +i.dataset.index);
     if (picked.length) m.devices = picked; else delete m.devices;
     touch(); shareNote();
   });
@@ -2211,12 +2223,12 @@ function renderModels() {
     touch();
   });
   $$("[data-lorastrength]").forEach(el => el.oninput = () => { const m = modelObj("llm", el.dataset.lorastrength); const v = Number(el.value); m.lora_strength = el.value === "" || isNaN(v) ? 1 : v; touch(); });
-  $$("[data-lora]").forEach(el => el.oninput = () => { const [s, n, i, k] = el.dataset.lora.split("|"); const l = modelLoras(s, n)[+i];
+  $$("[data-lora]").forEach(el => el.oninput = () => { const {section: s, model: n, index: i, key: k} = el.dataset; const l = modelLoras(s, n)[+i];
     l[k] = k === "strength" ? (el.value === "" || isNaN(Number(el.value)) ? 1 : Number(el.value)) : el.value; touch(); });
-  $$("[data-lora-remove]").forEach(b => b.onclick = () => { const [s, n, i] = b.dataset.loraRemove.split("|"); modelLoras(s, n).splice(+i, 1); renderModels(); touch(); });
-  $$("[data-lora-add]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.loraAdd.split("|");
+  $$("[data-lora-remove]").forEach(b => b.onclick = () => { const {section: s, model: n, index: i} = b.dataset; modelLoras(s, n).splice(+i, 1); renderModels(); touch(); });
+  $$("[data-lora-add]").forEach(b => b.onclick = () => { const {section: s, model: n} = b.dataset;
     pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json, or a .gguf LoRA)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
-  $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
+  $$("[data-menable]").forEach(el => el.onchange = () => { const {section: s, model: n} = el.dataset; modelObj(s, n).enabled = el.checked; touch(); });
   $$("[data-pin]").forEach(el => el.onchange = async () => {
     const model = el.dataset.pin, pin = el.checked;
     try {
@@ -2225,8 +2237,8 @@ function renderModels() {
       await loadConfig(); refresh();
     } catch (e) { el.checked = !pin; toast(e.message, true); }
   });
-  $$("[data-default]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.default.split("|"); if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
-  $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");
+  $$("[data-default]").forEach(b => b.onclick = () => { const {section: s, model: n} = b.dataset; if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
+  $$("[data-remove]").forEach(b => b.onclick = async () => { const {section, model: name} = b.dataset;
     if (!await ask({title: `Remove ${name}?`, text: "It leaves the model list; the files stay on disk.", buttons: [{label: "Cancel", value: null}, {label: "Remove", value: "ok", kind: "warn"}]})) return;
     try { await api("/api/models/remove", {method: "POST", body: {section, name}}); await loadConfig(); toast("Removed " + name); } catch (e) { toast(e.message, true); } });
   filterModels();
@@ -2325,10 +2337,10 @@ function mediaItem(section, name, m, arch, miss, fields) {
     ${isDefault ? '<span class="tag good">Default</span>' : ""}
     ${miss.length ? `<span class="tag bad">Needs ${miss.map(k => esc(partName(k))).join(", ")}</span>` : lastResidency(name)}
     ${section === "image" ? `<span data-pin-tag="${esc(name)}">${pinTag(name)}</span>` : ""}
-    <span class="item-acts">${isDefault ? "" : `<button class="btn quiet" data-default="${section}|${esc(name)}">Make default</button>`}
+    <span class="item-acts">${isDefault ? "" : `<button class="btn quiet" data-default data-section="${esc(section)}" data-model="${esc(name)}">Make default</button>`}
     ${pinnable || pinned ? `<label class="check" title="Kept loaded in the picture worker on its GPU, whatever the keep time: the next picture takes seconds. Other jobs that need that GPU wait, or are refused, until it is let go."><input type="checkbox" data-pin="${esc(name)}" ${pinned ? "checked" : ""}> Keep loaded</label>` : ""}
-    <label class="check" ${miss.length ? 'title="It can be switched on once it has the files it needs"' : ""}><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
-    <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></span></div>
+    <label class="check" ${miss.length ? 'title="It can be switched on once it has the files it needs"' : ""}><input type="checkbox" data-menable data-section="${esc(section)}" data-model="${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
+    <button class="btn quiet warn" data-remove data-section="${esc(section)}" data-model="${esc(name)}">Remove</button></span></div>
     <details class="item-more" data-item="${section}|${esc(name)}" ${openItem(section, name, miss.length > 0) ? "open" : ""}>${itemSummary(mainFile(section, m))}
     <div class="cols" style="gap:12px">${fields}</div></details></div>`;
 }
@@ -3190,9 +3202,12 @@ function renderSoundtrack() {
 }
 $("#vid-soundtrack").onchange = renderSoundtrack;
 $("#vid-voice").onchange = renderSoundtrack;
-// Sound is offered for models that have their audio VAE.
+// Sound is offered for models that have their audio VAE (and for a paired computer's model, whose audio VAE is that
+// computer's to know: offered, and that computer says where it has none).
 function soundCapable() {
-  const name = $("#vid-model").value || cfg?.media?.video?.default_model;
+  const c = chosen("#vid-model");
+  if (c.node) return true;
+  const name = c.model || cfg?.media?.video?.default_model;
   const m = cfg?.media?.video?.models?.[name];
   return !!(m && m.audio_vae);
 }
@@ -3692,7 +3707,7 @@ const DL_CAP_LABEL = { tools: "Tools", vision: "Vision", "3d-code": "3D Code", g
 function hostHardware() {
   const known = !!sys;
   const unified = macMemory();
-  const gpus = (sys?.gpus || []).map(g => g.memory_total_mb ? g.memory_total_mb / 1024 : 0).filter(v => v > 0);
+  const gpus = (sys?.gpus || []).filter(g => !g.unified).map(g => g.memory_total_mb ? g.memory_total_mb / 1024 : 0).filter(v => v > 0);
   const egpuMb = state?.egpu?.available && state.egpu.enabled ? (state.egpu.usage?.memory_total_mb || state.egpu.memory_total_mb || 0) : 0;
   const egpuGb = egpuMb ? egpuMb / 1024 : 0;
   if (egpuGb > 0) gpus.push(egpuGb);
@@ -3707,16 +3722,17 @@ function modelFit(m, hw) {
   if (!hw.known) return { fits: true, cls: "", label: "", title: "" };
   const ramShort = m.ram_gb && hw.ramGb && hw.ramGb + 2 < m.ram_gb;
   if (ramShort) return { fits: false, cls: "dl-fit-no", label: `Needs ${m.ram_gb} GB RAM`, title: `Needs about ${m.ram_gb} GB system memory (detected ${Math.round(hw.ramGb)} GB)` };
+  const fitsEgpu = hw.egpuGb > 0 && hw.egpuGb + 0.5 >= m.vram_gb;
   // Apple Silicon unified memory (when not using a larger discrete eGPU): ~72% of total unified memory is available for weights.
-  if (hw.unified && hw.ramGb > 0 && hw.egpuGb < m.vram_gb) {
+  if (hw.unified && hw.ramGb > 0 && !fitsEgpu) {
     const usableGb = hw.ramGb * 0.72;
     if (usableGb >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "Fits unified memory", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory)` };
     if (hw.ramGb * 0.85 >= m.vram_gb) return { fits: true, cls: "dl-fit-tight", label: "Tight fit", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory)` };
     return { fits: false, cls: "dl-fit-no", label: "Streams from SSD", title: `Needs ~${m.vram_gb} GB memory (${Math.round(hw.ramGb)} GB unified memory) — streams layers from SSD` };
   }
   if (!hw.maxGpuGb) return { fits: false, cls: "dl-fit-no", label: "CPU only", title: `Needs ~${m.vram_gb} GB VRAM — no GPU detected, runs on CPU` };
-  if (hw.maxGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: hw.egpuGb >= m.vram_gb ? "Fits eGPU" : "Fits your GPU", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB)` };
-  if (hw.gpuCount > 1 && hw.totalGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "Fits across GPUs", title: `Needs ~${m.vram_gb} GB VRAM across ${hw.gpuCount} GPUs (${Math.round(hw.totalGpuGb)} GB total)` };
+  if (hw.maxGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: fitsEgpu ? "Fits eGPU" : "Fits your GPU", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB)` };
+  if (m.group === "llm" && hw.gpuCount > 1 && hw.totalGpuGb + 0.5 >= m.vram_gb) return { fits: true, cls: "dl-fit-ok", label: "Fits across GPUs", title: `Needs ~${m.vram_gb} GB VRAM across ${hw.gpuCount} GPUs (${Math.round(hw.totalGpuGb)} GB total)` };
   if (hw.maxGpuGb + 2 >= m.vram_gb) return { fits: true, cls: "dl-fit-tight", label: "Tight fit", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB)` };
   return { fits: false, cls: "dl-fit-no", label: "Split / CPU", title: `Needs ~${m.vram_gb} GB VRAM (largest GPU: ${Math.round(hw.maxGpuGb)} GB) — runs split or streamed` };
 }
@@ -4042,7 +4058,7 @@ document.addEventListener("keydown", e => {
 // (a button that goes to another section, there from the start or drawn later, as an empty list's is)
 document.addEventListener("click", e => { const b = e.target.closest("[data-goto]"); if (b) show(b.dataset.goto); });
 $("#dl-dir").oninput = () => { dlDirEdited = true; $("#dl-dir-save").hidden = false; forgetPlans(); renderDownloads(); };
-$("#dl-browse").onclick = () => pick({dir: true, title: "Choose the folder to save models in", start: $("#dl-dir").value}, p => { $("#dl-dir").value = p; dlDirEdited = true; $("#dl-dir-save").hidden = false; });
+$("#dl-browse").onclick = () => pick({dir: true, title: "Choose the folder to save models in", start: $("#dl-dir").value}, p => { $("#dl-dir").value = p; dlDirEdited = true; $("#dl-dir-save").hidden = false; forgetPlans(); renderDownloads(); });
 $("#dl-dir-save").onclick = async () => {
   try { dl = await api("/api/downloads/settings", {method: "POST", body: {dir: $("#dl-dir").value.trim()}}); forgetPlans(); dlDirEdited = false; $("#dl-dir-save").hidden = true; toast("New downloads go to " + dl.dir); await loadConfig(); renderDownloads(); }
   catch (e) { toast(e.message, true); }
@@ -4076,10 +4092,10 @@ async function refresh() {
 async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); macWords(); if (dl && $("#v-get").classList.contains("on")) renderDownloads(); } catch {} }
 (async () => {
   await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware(); loadVoices();
-  try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); } catch {}
-  { const [hv, ht] = location.hash.slice(1).split(":"); if (hv === "play" && ht) $(`#v-play .ptabs button[data-tab=${ht}]`)?.click(); }
-  { let v = location.hash.slice(1).split(":")[0]; try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }
-  window.addEventListener("hashchange", () => { const [v, t] = location.hash.slice(1).split(":"); if ($("#v-" + v)) show(v); if (v === "play" && t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); });
+  try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab="${cssEsc(t)}"]`)?.click(); } catch {}
+  { const [hv, ht] = location.hash.slice(1).split(":"); if (hv === "play" && ht) $(`#v-play .ptabs button[data-tab="${cssEsc(ht)}"]`)?.click(); }
+  { let v = location.hash.slice(1).split(":")[0]; try { v ||= localStorage.getItem("studio-view"); } catch {} if (viewPage(v)) show(v); }
+  window.addEventListener("hashchange", () => { const [v, t] = location.hash.slice(1).split(":"); if (viewPage(v)) show(v); if (v === "play" && t) $(`#v-play .ptabs button[data-tab="${cssEsc(t)}"]`)?.click(); });
   setInterval(refresh, 1500);
   setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 2000);
   setInterval(() => { if ($("#v-logs").classList.contains("on")) pollLogs(false); }, 1500);

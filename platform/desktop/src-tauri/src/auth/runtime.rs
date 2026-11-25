@@ -206,6 +206,8 @@ fn run_credential_of(guard: Option<Arc<Guard>>, ttl: Duration) -> Result<RunCred
 
 /// The most a `run` credential may live (`store::check_grant`).
 const RUN_TTL_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+/// The most a `desk` credential may live (`store::check_grant`).
+const DESK_TTL_MAX_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
 /// Whether this process has said its guard will be an enforcing one ([`will_enforce`]).
 static WILL_ENFORCE: AtomicBool = AtomicBool::new(false);
@@ -231,6 +233,44 @@ fn guard_in_time(expected: bool, wait: Duration, installed: &dyn Fn() -> Option<
 pub fn run_credential(ttl: Duration) -> Result<RunCredential, MintFailure> {
     let installed = || installed_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
     run_credential_of(guard_in_time(WILL_ENFORCE.load(Ordering::Relaxed), Duration::from_secs(30), &installed), ttl)
+}
+
+/// Mint an in-memory `desk` credential for an embedded desktop webview (`app`, bound to `origin`)
+/// when the running guard is enforcing (`scoped` or `shadow`). Returns `None` in `legacy` mode
+/// (or when no enforcing guard is installed), so callers fall back to `crate::internal_token()`.
+pub fn desk_credential(app: super::presets::App, origin: &str) -> Option<String> {
+    let installed = || installed_slot().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    desk_credential_of(
+        guard_in_time(WILL_ENFORCE.load(Ordering::Relaxed), Duration::from_secs(30), &installed),
+        app,
+        origin,
+    )
+}
+
+fn desk_credential_of(
+    guard: Option<Arc<Guard>>,
+    app: super::presets::App,
+    origin: &str,
+) -> Option<String> {
+    let guard = guard.filter(|g| g.mode().is_enforcing())?;
+    let preset = app.desk_ceiling();
+    let label = format!("desktop {} webview", app.name());
+    let mut spec = MintSpec::new(
+        Kind::Dsk,
+        &label,
+        preset.scopes(),
+        DESK_TTL_MAX_MS,
+    );
+    spec.preset = Some(preset);
+    spec.app = Some(app);
+    spec.origins = vec![origin.to_string()];
+    match guard.store().mint(spec) {
+        Ok(minted) => Some(minted.token),
+        Err(e) => {
+            log::warn!("auth: failed to mint desk credential for {} ({origin}): {e:?}", app.name());
+            None
+        }
+    }
 }
 
 /// What shutdown does to a guard: write the credential store, the throttle and the audit counts that are
@@ -757,5 +797,54 @@ mod tests {
             &no_env
         )
         .is_err());
+    }
+
+    #[test]
+    fn desk_credential_mints_bound_dsk_in_enforcing_modes_and_none_in_legacy() {
+        use super::super::presets::App;
+        use super::super::principal::PrincipalKind;
+
+        let legacy_dir = TempDir::new("runtime-desk-legacy");
+        let legacy_guard = build_guard(
+            &AccessSettings::legacy(),
+            &legacy_dir.0,
+            17972,
+            false,
+            true,
+            None,
+            &no_env,
+        )
+        .unwrap();
+        assert!(desk_credential_of(Some(legacy_guard), App::Agent, "http://oaiy.localhost").is_none());
+        assert!(desk_credential_of(None, App::Flows, "http://oaiyflows.localhost").is_none());
+
+        for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+            let dir = TempDir::new("runtime-desk-enforcing");
+            let guard = build_guard(
+                &AccessSettings::new(mode),
+                &dir.0,
+                17972,
+                false,
+                true,
+                None,
+                &no_env,
+            )
+            .unwrap();
+            for (app, origin) in [
+                (App::Agent, "http://oaiy.localhost"),
+                (App::Flows, "http://oaiyflows.localhost"),
+            ] {
+                let token = desk_credential_of(Some(guard.clone()), app, origin)
+                    .expect("desk credential minted in enforcing mode");
+                assert!(token.starts_with("oaiydsk_"), "{mode:?} {app:?}: {token}");
+                let who = guard.store().authenticate(&token, None).unwrap();
+                assert_eq!(who.kind, PrincipalKind::Desk);
+                assert_eq!(who.app, Some(app));
+                assert_eq!(who.scopes, app.desk_ceiling().scopes());
+                assert_eq!(who.origins, vec![origin.to_string()]);
+                assert!(!who.persisted);
+            }
+            audit::uninstall();
+        }
     }
 }

@@ -2263,3 +2263,62 @@ fn experts_in_slots_are_each_the_definitions() {
     close(&got[0], &slot_reference(&records.0[5], &layout, &x, 1, 0.0), "the copied slot");
     close(&got[1], &slot_reference(&records.0[5], &layout, &x, 1, 0.0), "the slot beside it, as it was");
 }
+
+/// Regression test for Bug 12: NaN router logits must map to -inf before ranking in `ROUTE_RANK`,
+/// `ROUTE_SIGMOID_RANK_STEP`, and `ROUTE_SIGMOID_STEP_FUSED` so NaNs never collide on rank 0 or
+/// outrank finite experts.
+#[test]
+fn routing_kernels_sanitize_nan_logits_without_rank0_collision() {
+    use ggml_rs::ChainRecorder;
+    let Some(b) = backend() else { return };
+    let (routed, top_k) = (16usize, 4usize);
+    let mut logits_host = vec![-5.0f32; routed + 1];
+    logits_host[0] = f32::NAN;
+    logits_host[2] = f32::from_bits(0xffc0_0001); // negative NaN
+    logits_host[5] = 4.0;
+    logits_host[9] = 2.0;
+    logits_host[11] = 6.0;
+    logits_host[14] = 1.0;
+    logits_host[routed] = 0.0;
+    let bias_host = vec![0.0f32; routed];
+
+    let logits = b.vec(logits_host.len());
+    let bias = b.vec(bias_host.len());
+    let jd = b.vec(2 * top_k);
+    let jobs_gu = b.vec(4 * top_k);
+    let w = b.vec(top_k + 1);
+    DeviceChain::upload(&b, &logits, &logits_host);
+    DeviceChain::upload(&b, &bias, &bias_host);
+
+    let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().unwrap().clone();
+    let d = b.gpu.dummy().clone();
+    let drw = b.gpu.dummy_rw().clone();
+
+    // 1. ROUTE_RANK
+    let mut rec = crate::chain::Recorder::new(&b);
+    rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [&buf(&logits), &d, &d, &d, &d, &d, &buf(&jd), &drw], &[routed as u32, top_k as u32], (1, 1, 1));
+    rec.read(&jd);
+    let got_rank: Vec<u32> = Box::new(rec).finish().pop().unwrap().into_iter().map(f32::to_bits).collect();
+    let picked_rank: Vec<u32> = (0..top_k).map(|r| got_rank[2 * r]).collect();
+    assert_eq!(picked_rank, vec![11, 5, 9, 14], "ROUTE_RANK must pick finite top-4 without NaN collision");
+
+    // 2. ROUTE_SIGMOID_RANK_STEP
+    let mut rec = crate::chain::Recorder::new(&b);
+    rec.dispatch_wide("moe-route-sigmoid-rank-step", ROUTE_SIGMOID_RANK_STEP, [&buf(&logits), &buf(&bias), &d, &d, &d, &d, &buf(&jd), &drw], &[routed as u32, top_k as u32], (1, 1, 1));
+    rec.read(&jd);
+    let got_sig: Vec<u32> = Box::new(rec).finish().pop().unwrap().into_iter().map(f32::to_bits).collect();
+    let picked_sig: Vec<u32> = (0..top_k).map(|r| got_sig[2 * r]).collect();
+    assert_eq!(picked_sig, vec![11, 5, 9, 14], "ROUTE_SIGMOID_RANK_STEP must pick finite top-4 without NaN collision");
+
+    // 3. ROUTE_SIGMOID_STEP_FUSED
+    let mut rec = crate::chain::Recorder::new(&b);
+    rec.dispatch_wide("moe-route-sigmoid-step-fused", ROUTE_SIGMOID_STEP_FUSED, [&buf(&logits), &buf(&bias), &d, &d, &d, &d, &buf(&jobs_gu), &buf(&w)], &[routed as u32, top_k as u32, 1.0f32.to_bits()], (1, 1, 1));
+    rec.read(&jobs_gu);
+    rec.read(&w);
+    let mut res = Box::new(rec).finish();
+    let got_w = res.pop().unwrap();
+    let got_gu: Vec<u32> = res.pop().unwrap().into_iter().map(f32::to_bits).collect();
+    let picked_fused: Vec<u32> = (0..top_k).map(|r| got_gu[4 * r] / 2).collect();
+    assert_eq!(picked_fused, vec![11, 5, 9, 14], "ROUTE_SIGMOID_STEP_FUSED must pick finite top-4 without NaN collision");
+    assert!(got_w[..top_k].iter().all(|v| v.is_finite() && *v > 0.0), "weights must be finite positive: {got_w:?}");
+}

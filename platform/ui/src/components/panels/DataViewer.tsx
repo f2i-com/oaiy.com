@@ -15,6 +15,7 @@ import { getFlowDatabaseManager, type FlowDatabaseInfo } from '../../services/da
 import { CopyLink } from '../ui/CopyButton';
 import SectionPage, { Card, EmptyState } from '../chrome/SectionPage';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
+import { isReadOnlySql } from '../../lib/sqlReadOnly';
 
 type ExportFormat = 'json' | 'csv';
 
@@ -38,6 +39,7 @@ interface DataViewerProps {
 export default function DataViewer({ activeFlowId, packageId, flowName }: DataViewerProps) {
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
+  const [viewingRawResult, setViewingRawResult] = useState(false);
   const [data, setData] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -106,6 +108,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     const myReq = ++requestIdRef.current;
     setLoading(true);
     setError(null);
+    setViewingRawResult(false);
     setSelectedCollection(name);
     setSelectedRows(new Set());
     try {
@@ -140,15 +143,16 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     // responses can't overwrite this flow's view.
     requestIdRef.current++;
     // Reset state when flow changes
+    setViewingRawResult(false);
     setSelectedCollection(null);
     setData([]);
     setSelectedRows(new Set());
     loadCollections();
   }, [activeFlowId, packageId, loadCollections]);
 
-  // Auto-select workflow_data if it exists
+  // Auto-select workflow_data if it exists (unless user is viewing raw SQL results)
   useEffect(() => {
-    if (collections.length > 0 && !selectedCollection) {
+    if (collections.length > 0 && !selectedCollection && !viewingRawResult) {
       const workflowData = collections.find(c => c.name === 'workflow_data');
       if (workflowData) {
         loadCollection('workflow_data');
@@ -156,7 +160,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
         loadCollection(collections[0].name);
       }
     }
-  }, [collections, selectedCollection, loadCollection]);
+  }, [collections, selectedCollection, viewingRawResult, loadCollection]);
 
   // Clear success message after 3 seconds
   useEffect(() => {
@@ -182,29 +186,6 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
       try { window.localStorage.setItem('oaiy.dataviewer.developerMode', String(next)); } catch { /* ignore */ }
       return next;
     });
-  }, []);
-
-  /**
-   * Classify an arbitrary SQL string as read-only or destructive.
-   * The check is intentionally conservative: anything that isn't clearly
-   * a `SELECT`/`WITH ... SELECT`/`PRAGMA`/`EXPLAIN` is treated as
-   * destructive so the user gets a confirmation prompt.
-   */
-  const isReadOnlySql = useCallback((sql: string): boolean => {
-    // Strip leading whitespace + line/block comments before classifying.
-    const stripped = sql
-      .replace(/--[^\n]*/g, '')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .trim()
-      .toLowerCase();
-    if (!stripped) return false;
-    return (
-      stripped.startsWith('select ') ||
-      stripped.startsWith('select(') ||
-      stripped.startsWith('with ') ||
-      stripped.startsWith('pragma ') ||
-      stripped.startsWith('explain ')
-    );
   }, []);
 
   // Execute raw SQL
@@ -249,8 +230,16 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
       if (myReq !== requestIdRef.current) return;
 
       if (result.rows.length > 0) {
+        setViewingRawResult(true);
         setData(result.rows);
         setSelectedCollection(null);
+        setSelectedRows(new Set());
+      } else if (readOnly) {
+        setViewingRawResult(true);
+        setData([]);
+        setSelectedCollection(null);
+        setSelectedRows(new Set());
+        setSuccessMessage('0 rows returned');
       }
       if (result.rowsAffected > 0) {
         setSuccessMessage(`${result.rowsAffected} rows affected`);
@@ -265,7 +254,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     } finally {
       if (myReq === requestIdRef.current) setLoading(false);
     }
-  }, [rawSql, activeFlowId, packageId, selectedFlowDb, loadCollections, developerMode, isReadOnlySql, confirm]);
+  }, [rawSql, activeFlowId, packageId, selectedFlowDb, loadCollections, developerMode, confirm]);
 
   // Export data
   const exportData = useCallback(async (format: ExportFormat) => {
@@ -391,6 +380,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
         }
         setData([]);
         setCollections(prev => prev.filter(c => c.name !== selectedCollection));
+        setViewingRawResult(false);
         setSelectedCollection(null);
         setSuccessMessage('All records cleared');
       } catch (err) {
@@ -552,7 +542,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
 
         <Card
           className="oaiy-data-main"
-          title={selectedCollection || 'No collection chosen'}
+          title={selectedCollection || (viewingRawResult ? 'SQL query result' : 'No collection chosen')}
           count={data.length > 0 ? `${data.length} record${data.length === 1 ? '' : 's'}` : undefined}
           flush
           actions={

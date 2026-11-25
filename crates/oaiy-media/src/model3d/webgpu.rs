@@ -708,6 +708,9 @@ impl WgpuSparseDecoder {
         use crate::model3d::sparse::Subdivision;
         let mut level = level;
         let mut n = level.len();
+        if n == 0 {
+            return Err(err("no voxels to decode"));
+        }
         let mut c = self.channels[0];
         let x = upload(gpu, latent);
         let mut h = gpu.vec(n * c);
@@ -777,10 +780,14 @@ impl WgpuSparseDecoder {
                 (None, Some(g)) => Subdivision { parent: g[i].parent.clone(), child: g[i].child.clone() },
                 (None, None) => return Err(err("a decoder that does not choose its children needs a guide")),
             };
+            let coords = sub.coords_of(&level.coords);
+            if coords.is_empty() {
+                return Err(err("no voxels survived subdivision (is the object in view, on a plain background?)"));
+            }
             let r = rec.as_mut();
             let (t, hh) = (gpu.vec(n * c), gpu.vec(n * c));
             norm_silu(r, &h, &up.norm1, &t, &hh, n, c, 1e-6);
-            let next = WgpuLevel::new(gpu, sub.coords_of(&level.coords), level.res * 2);
+            let next = WgpuLevel::new(gpu, coords, level.res * 2);
             let m = next.len();
             let (o, skip) = (up.out, up.channels / 8);
             // the first conv's outputs (8 children's channels a voxel) a range of parents at a time, under a binding's

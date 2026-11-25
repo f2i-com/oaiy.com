@@ -128,33 +128,7 @@ async function httpRequest(
       };
     }
 
-    // Fallback to Tauri HTTP if available
-    if (ctx.tauri) {
-      const result = await ctx.tauri.invoke<{
-        status: number;
-        headers: Record<string, string>;
-        body: string;
-        url: string;
-      }>('http_request', {
-        request: {
-          url,
-          method,
-          headers,
-          body: body || null,
-          follow_redirects: true,
-          max_redirects: 10,
-          allow_private_networks: true,
-        }
-      });
-
-      return {
-        status: result.status,
-        headers: result.headers,
-        body: result.body,
-      };
-    }
-
-    // Final fallback to fetch
+    // Final fallback to policy-enforced ctx.fetch (never bypass via raw http_request)
     const fetchOptions: RequestInit = {
       method,
       headers,

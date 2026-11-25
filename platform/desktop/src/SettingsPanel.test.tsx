@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   backupInspect: vi.fn(),
   backupUndo: vi.fn(),
   appConfigGet: vi.fn(),
+  migrationPlan: vi.fn(),
   migrationStatus: vi.fn(),
   restart: vi.fn(),
 }));
@@ -50,7 +51,7 @@ vi.mock('./api', async (importOriginal) => {
       get: (...a: unknown[]) => h.appConfigGet(...a),
       logPath: () => Promise.resolve(null),
       getHfTokenStatus: () => Promise.resolve(false),
-      migrationPlan: () => Promise.reject(new Error('none')),
+      migrationPlan: (...a: unknown[]) => h.migrationPlan(...a),
       migrationStatus: (...a: unknown[]) => h.migrationStatus(...a),
       restart: (...a: unknown[]) => h.restart(...a),
     },
@@ -136,6 +137,7 @@ const button = (label: string) => Array.from(host.querySelectorAll('button')).fi
 beforeEach(() => {
   vi.clearAllMocks();
   invalidate();
+  h.migrationPlan.mockRejectedValue(new Error('none'));
   h.migrationStatus.mockResolvedValue({ running: false, mode: '', filesTotal: 0, filesDone: 0, bytesTotal: 0, bytesDone: 0, current: '', done: false, error: null });
   h.restart.mockResolvedValue(undefined);
   h.appConfigGet.mockResolvedValue({
@@ -337,5 +339,64 @@ describe('restarting for a new data folder', () => {
     expect(h.restart).toHaveBeenCalled();
     expect(text()).toContain('Restarting has to wait. A phone call is live.');
     confirm.mockRestore();
+  });
+
+  it('shows the Copy/Move migration card when resetting back to the default folder (configuredDir is null)', async () => {
+    h.appConfigGet.mockResolvedValue({
+      ...pending,
+      activeDir: 'D:/oaiy',
+      defaultDir: 'C:/data',
+      configuredDir: null,
+      isCustom: false,
+      restartRequired: true,
+    });
+    h.migrationPlan.mockResolvedValue({
+      oldDir: 'D:/oaiy',
+      newDir: 'C:/data',
+      fileCount: 4,
+      totalBytes: 1024,
+      subdirs: ['models', 'flows'],
+      canMigrate: true,
+    });
+    await mount('storage');
+    await settle();
+    expect(h.migrationPlan).toHaveBeenCalled();
+    expect(text()).toContain('Bring your data to the new folder?');
+    expect(button('Copy over')).toBeTruthy();
+    expect(button('Move over')).toBeTruthy();
+  });
+
+  it('does not clobber a running or completed migration when migrationPlan resolves after migrationStatus', async () => {
+    let resolvePlan!: (v: unknown) => void;
+    h.appConfigGet.mockResolvedValue(pending);
+    h.migrationPlan.mockReturnValue(new Promise((r) => (resolvePlan = r)));
+    h.migrationStatus.mockResolvedValue({
+      running: true,
+      mode: 'copy',
+      filesTotal: 10,
+      filesDone: 4,
+      bytesTotal: 1000,
+      bytesDone: 400,
+      current: 'models/a.gguf',
+      done: false,
+      error: null,
+    });
+    await mount('storage');
+    await settle();
+    expect(button('Restart now')?.disabled).toBe(true);
+    // Now migrationPlan resolves later — must NOT clear the active migration state!
+    await act(async () => {
+      resolvePlan({
+        oldDir: 'C:/data',
+        newDir: 'D:/oaiy',
+        fileCount: 10,
+        totalBytes: 1000,
+        subdirs: ['models'],
+        canMigrate: true,
+      });
+    });
+    await settle();
+    expect(button('Restart now')?.disabled).toBe(true);
+    expect(text()).toContain('Copying your data to the new folder');
   });
 });

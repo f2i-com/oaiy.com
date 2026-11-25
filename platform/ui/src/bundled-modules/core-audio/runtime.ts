@@ -441,7 +441,13 @@ async function runTtsExternal(
     const renderedHeaders = parseHeaders(opts.externalHeaders, vars);
     const renderedBody = method === 'GET' ? undefined : renderTemplate(bodyTemplate, vars, { jsonEscape: true });
 
-    ctx.log('info', `[TTS:external] ${method} ${renderedUrl} (template ${bodyTemplate.length} chars → ${(renderedBody || '').length})`);
+    // Log the uninterpolated URL template (with userinfo/sensitive query params stripped)
+    // so interpolated {{apiKey}} secrets are never written to logs.
+    const safeLogUrl = url
+        .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/\s"'?#@]+@/gi, '$1')
+        .replace(/([?&][^=&#\s]*?(?:key|token|secret|password|auth|credential)[^=&#\s]*=)([^&#\s]*)/gi, (whole, prefix: string, val: string) =>
+            val.includes('{{') ? whole : `${prefix}[redacted]`);
+    ctx.log('info', `[TTS:external] ${method} ${safeLogUrl} (template ${bodyTemplate.length} chars → ${(renderedBody || '').length})`);
 
     const response = await ctx.fetch(renderedUrl, {
         method,

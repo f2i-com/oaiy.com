@@ -141,18 +141,34 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'Filesystem.readChunkContent': 'filesystem:read',
   'Filesystem.writeFile': 'filesystem',
   'Filesystem.copyFile': 'filesystem',
+  'FileSystem.listFolder': 'filesystem:read',
+  'FileSystem.readFile': 'filesystem:read',
+  'FileSystem.calculateFileChunks': 'filesystem:read',
+  'FileSystem.readChunkContent': 'filesystem:read',
+  'FileSystem.writeFile': 'filesystem',
+  'FileSystem.copyFile': 'filesystem',
   // Spawning OS processes is far more dangerous than reading/writing
   // files; it gets its own permission so granting `filesystem` no
   // longer implies the right to execute arbitrary commands. Round 5
   // reviewer #4.
   'Filesystem.runCommand': 'process:execute',
+  'FileSystem.runCommand': 'process:execute',
   // === Browser automation =================================================
   'Browser.create': 'browser',
   'Browser.createSession': 'browser',
+  'Browser.createSessionV2': 'browser',
   'Browser.navigate': 'browser',
+  'Browser.goto': 'browser',
   'Browser.evaluate': 'browser',
+  'Browser.evaluateJson': 'browser',
   'Browser.screenshot': 'browser',
   'Browser.getHtml': 'browser',
+  'Browser.getText': 'browser',
+  'Browser.getTitle': 'browser',
+  'Browser.getUrl': 'browser',
+  'Browser.waitForSelector': 'browser',
+  'Browser.getCookies': 'browser',
+  'Browser.setCookies': 'browser',
   'Browser.action': 'browser',
   'Browser.close': 'browser',
   'Browser.closeSession': 'browser',
@@ -161,6 +177,25 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'Browser.control': 'browser',
   'Browser.ensureServiceReadyByPort': 'service:start',
   'Browser.httpRequest': 'browser',
+  'Browser.extractEmails': 'browser',
+  'Browser.extractPhones': 'browser',
+  'Browser.extractLinks': 'browser',
+  'Browser.extractImages': 'browser',
+  'Browser.extractColors': 'browser',
+  'Browser.extractLogoCandidate': 'browser',
+  'Browser.extractMetaTags': 'browser',
+  'Browser.extractJsonLd': 'browser',
+  'Browser.extractWebsiteData': 'browser',
+  // === Service module (custom + contract HTTP services) ===================
+  'Service.call': 'network',
+  'Service.callContract': 'network',
+  // === 3D Model module ====================================================
+  'Model3D.make': 'network',
+  'Model3D.generate': 'network',
+  // === Ask the Agent (dispatches tasks to OAIY Desktop's tool-using agent) =
+  // Hands a prompt to the desktop agent (which can read files and run tools),
+  // so require the high-risk `process:execute` permission rather than `network`.
+  'AgentTask.ask': 'process:execute',
   // === Diffusion module (image+video generation) ==========================
   'Diffusion.getStatus': 'diffusion',
   'Diffusion.getDevices': 'diffusion',
@@ -192,6 +227,9 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'AI.request': 'network',
   // === Audio — cloud APIs + filesystem ====================================
   'Audio.textToSpeech': 'network',
+  'Audio.textToSpeechV2': 'network',
+  'Audio.serviceAudio': 'network',
+  'Audio.serviceTranscribe': 'network',
   'Audio.generateMusic': 'network',
   'Audio.speechToText': 'network',
   'Audio.saveAudio': 'filesystem',
@@ -202,6 +240,10 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'Audio.resolveServiceUrl': 'service:start',
   // === Image — generation + filesystem ====================================
   'Image.generate': 'network',
+  'Image.generateService': 'network',
+  'Image.generateServiceInfo': 'network',
+  'Image.serviceImage': 'network',
+  'Image.serviceImageInfo': 'network',
   'Image.resize': 'filesystem:read',
   'Image.save': 'filesystem',
   // === Video — services + heavy filesystem ================================
@@ -211,6 +253,7 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'Video.extractLastFrame': 'filesystem:read',
   'Video.extractBatch': 'filesystem:read',
   'Video.generate': 'network',
+  'Video.generateService': 'network',
   'Video.generateVideoWan2GP': 'network',
   'Video.generateAvatar': 'network',
   'Video.save': 'filesystem',
@@ -221,6 +264,23 @@ const REQUIRED_PERMISSIONS_BY_KIND: Readonly<Record<string, string>> = {
   'Video.videoPip': 'filesystem',
   'Video.videoCaptions': 'filesystem',
   'Video.downloadVideo': 'network',
+  'VideoFrames.getInfo': 'filesystem:read',
+  'VideoFrames.extract': 'filesystem:read',
+  'VideoFrames.extractAtTimestamps': 'filesystem:read',
+  'VideoFrames.extractLastFrame': 'filesystem:read',
+  'VideoFrames.extractBatch': 'filesystem:read',
+  'VideoFrames.generate': 'network',
+  'VideoFrames.generateService': 'network',
+  'VideoFrames.generateVideoWan2GP': 'network',
+  'VideoFrames.generateAvatar': 'network',
+  'VideoFrames.save': 'filesystem',
+  'VideoFrames.saveVideo': 'filesystem',
+  'VideoFrames.extendVideos': 'filesystem',
+  'VideoFrames.appendVideos': 'filesystem',
+  'VideoFrames.mixAudio': 'filesystem',
+  'VideoFrames.videoPip': 'filesystem',
+  'VideoFrames.videoCaptions': 'filesystem',
+  'VideoFrames.downloadVideo': 'network',
   // === Database — local SQLite =============================================
   'Database.execute': 'filesystem',
   // === Input — read-only file access via OS picker =========================
@@ -251,15 +311,19 @@ const NO_PERMISSION_REQUIRED_KINDS: ReadonlySet<string> = new Set([
   'Agent.get',
   'Agent.set',
   'Agent.memory',
-  // FlowControl — control-flow primitives, no I/O.
+  // FlowControl / Subflow — control-flow primitives, no I/O.
   'FlowControl.execute',
   'FlowControl.executeMacro',
   'FlowControl.checkAborted',
+  'Subflow.execute',
+  'Subflow.executeMacro',
+  'Subflow.checkAborted',
   // Input — UI file pickers gate themselves on user interaction.
   'Input.pickFile',
   'Input.pickFolder',
   // Filesystem path lookups that don't open any file.
   'Filesystem.getDownloadsPath',
+  'FileSystem.getDownloadsPath',
 ]);
 
 function safeStringify(v: unknown): string {
@@ -1139,6 +1203,49 @@ export class OAIYRuntime {
           log?.({ source: 'Runtime', message, type: 'error' });
           return Promise.reject(new Error(message));
         }
+        // Never allow raw `http_request` calls to bypass local-network permission /
+        // SSRF checks by passing `allow_private_networks: true` straight to the
+        // native command. Route every `http_request` through `performHttpRequest`
+        // so `isLocalNetworkUrl` / `localNetworkWhitelist` / `onLocalNetworkPermission`
+        // are always enforced.
+        if (cmd === 'http_request') {
+          const raw = (args ?? {}) as Record<string, unknown>;
+          const req =
+            raw.request && typeof raw.request === 'object' && !Array.isArray(raw.request)
+              ? (raw.request as Record<string, unknown>)
+              : raw;
+          const url =
+            typeof req.url === 'string'
+              ? req.url
+              : typeof req.uri === 'string'
+                ? req.uri
+                : '';
+          if (!url) {
+            return Promise.reject(new Error('http_request: missing url'));
+          }
+          const method =
+            typeof req.method === 'string' && req.method ? req.method.toUpperCase() : 'GET';
+          const headers: Record<string, string> = {};
+          if (req.headers && typeof req.headers === 'object' && !Array.isArray(req.headers)) {
+            for (const [k, v] of Object.entries(req.headers as Record<string, unknown>)) {
+              headers[k] = String(v);
+            }
+          }
+          const body =
+            typeof req.body === 'string'
+              ? req.body
+              : req.body !== undefined && req.body !== null
+                ? JSON.stringify(req.body)
+                : undefined;
+          const bodyBase64 = typeof req.body_base64 === 'string' ? req.body_base64 : undefined;
+          const signal = req.signal instanceof AbortSignal ? req.signal : undefined;
+          return this.performHttpRequest(url, method, headers, body, { bodyBase64, signal }).then(
+            (res) => ({
+              ...res,
+              ok: res.status >= 200 && res.status < 300,
+            }),
+          ) as Promise<T>;
+        }
         return inner(cmd, args) as Promise<T>;
       },
     };
@@ -1313,7 +1420,8 @@ export class OAIYRuntime {
       ok: status >= 200 && status < 300,
       statusText: '',
       headers: respHeaders,
-      url,
+      url: result.url || url,
+      bodyIsBase64: isBinary,
       redirected: false,
       type: 'basic',
       body: null,
@@ -1363,7 +1471,7 @@ export class OAIYRuntime {
     body?: string,
     // (a body of bytes, as base64; and the caller's signal, which stops the request when the run is stopped)
     extra: { bodyBase64?: string; signal?: AbortSignal } = {}
-  ): Promise<{ status: number; headers: Record<string, string>; body: string; bodyIsBase64?: boolean }> {
+  ): Promise<{ status: number; headers: Record<string, string>; body: string; url?: string; bodyIsBase64?: boolean }> {
     const isLocalNetwork = this.isLocalNetworkUrl(url);
 
     if (isLocalNetwork && !this.isUrlWhitelisted(url)) {
@@ -1413,6 +1521,7 @@ export class OAIYRuntime {
         status: result.status,
         headers: result.headers,
         body: result.body,
+        url: result.url || url,
         bodyIsBase64: result.bodyIsBase64,
       };
     }
@@ -1463,6 +1572,7 @@ export class OAIYRuntime {
       status: response.status,
       headers: responseHeaders,
       body: responseBody,
+      url: response.url || url,
     };
   }
 

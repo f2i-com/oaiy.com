@@ -1075,34 +1075,36 @@ export default function OAIYBuilder({
         target.isContentEditable ||
         target.closest('.monaco-editor'); // Monaco editor
 
-      if (isEditing) {
+      if (isEditing || !active) {
         return;
       }
 
+      const key = event.key.toLowerCase();
+
       // Undo / Redo: ⌘Z, ⇧⌘Z (Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y elsewhere). A text field's own undo is its own (above).
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+      if ((event.ctrlKey || event.metaKey) && key === 'z') {
         event.preventDefault();
         if (event.shiftKey) redo();
         else undo();
         return;
       }
-      if (event.ctrlKey && !event.metaKey && event.key === 'y') {
+      if (event.ctrlKey && !event.metaKey && key === 'y') {
         event.preventDefault();
         redo();
         return;
       }
 
-      // Copy, paste and select all are the canvas's on the canvas alone (the builder itself counts: it has the focus
-      // after a click on an empty part of the canvas): text selected in the Log or the Properties panel copies as
-      // text, as anywhere else.
+      // Copy, paste, select all, group and delete are the canvas's on the canvas alone (the builder itself counts:
+      // it has the focus after a click on an empty part of the canvas): text selected in the Log or the Properties
+      // panel keeps its own behaviour.
       const onCanvas = isCanvasTarget(target, event.currentTarget);
       const textSelected = (window.getSelection()?.toString() ?? '').length > 0;
-      if ((event.ctrlKey || event.metaKey) && ['c', 'v', 'a'].includes(event.key) && (!onCanvas || textSelected)) {
+      if ((event.ctrlKey || event.metaKey) && ['c', 'v', 'a'].includes(key) && (!onCanvas || textSelected)) {
         return;
       }
 
       // Copy: Ctrl+C / Cmd+C
-      if ((event.ctrlKey || event.metaKey) && event.key === 'c') {
+      if ((event.ctrlKey || event.metaKey) && key === 'c') {
         event.preventDefault();
         if (!copySelected() && nodes.some((n) => n.selected)) {
           onShowToast?.('Not copied: this browser’s storage is full or unavailable', 'error');
@@ -1111,7 +1113,7 @@ export default function OAIYBuilder({
       }
 
       // Paste: Ctrl+V / Cmd+V
-      if ((event.ctrlKey || event.metaKey) && event.key === 'v') {
+      if ((event.ctrlKey || event.metaKey) && key === 'v') {
         event.preventDefault();
         // Get mouse position relative to the flow canvas for paste location
         // If we don't have a good position, paste with default offset
@@ -1120,25 +1122,29 @@ export default function OAIYBuilder({
       }
 
       // Select All: Ctrl+A / Cmd+A
-      if ((event.ctrlKey || event.metaKey) && event.key === 'a') {
+      if ((event.ctrlKey || event.metaKey) && key === 'a') {
         event.preventDefault();
         setNodes((nds) => nds.map((n) => ({ ...n, selected: true })));
         setEdges((eds) => eds.map((e) => ({ ...e, selected: true })));
         return;
       }
 
-      // Group: Ctrl+G / Cmd+G
-      if ((event.ctrlKey || event.metaKey) && event.key === 'g') {
+      // Group: Ctrl+G / Cmd+G (canvas only)
+      if ((event.ctrlKey || event.metaKey) && key === 'g') {
+        if (!onCanvas) return;
         event.preventDefault();
         handleGroupSelected();
         return;
       }
 
+      // Delete / Backspace (canvas only; React Flow's own deleteKeyCode is disabled so Backspace isn't double-handled)
       if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (!onCanvas) return;
+        event.preventDefault();
         deleteSelected();
       }
     },
-    [deleteSelected, copySelected, pasteClipboard, setNodes, setEdges, handleGroupSelected, nodes, onShowToast, undo, redo]
+    [active, deleteSelected, copySelected, pasteClipboard, setNodes, setEdges, handleGroupSelected, nodes, onShowToast, undo, redo]
   );
 
   // Handle ComfyUI workflow dialog confirmation
@@ -1302,9 +1308,10 @@ export default function OAIYBuilder({
           onPaneContextMenu={handlePaneContextMenu}
           onConnectStart={handleConnectStart}
           onConnectEnd={handleConnectEnd}
-          // Backspace deletes the selection only while the canvas is the page
-          // showing: React Flow listens on the whole document.
-          deleteKeyCode={active ? 'Backspace' : null}
+          // Both Delete and Backspace are handled by OAIYBuilder's onKeyDown (gated on
+          // `active && onCanvas`, cascading group children and cleaning edge state), so
+          // disable React Flow's own Backspace listener to prevent double-handling.
+          deleteKeyCode={null}
           // Navigation: scroll wheel zooms, left/middle/right-drag to pan
           panOnScroll={false}
           panOnDrag

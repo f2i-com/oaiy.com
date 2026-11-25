@@ -213,12 +213,18 @@ impl Sampler {
     pub fn sample_biased(&mut self, logits: &Tensor, bias: &[(u32, f32)]) -> u32 {
         debug_assert_eq!(logits.rank(), 1);
         let n = logits.numel();
+        if n == 0 {
+            return 0;
+        }
         let l_src = logits.data();
 
         // Whether we need an owned copy of the logits to mutate. We need one
-        // if either logit_bias or repetition penalty applies.
-        let need_owned = !bias.is_empty()
-            || matches!(self.params.repeat_penalty, Some(p) if p != 1.0 && !self.history.is_empty());
+        // if either logit_bias or a valid repetition penalty applies.
+        let valid_repeat = matches!(
+            self.params.repeat_penalty,
+            Some(p) if p > 0.0 && p.is_finite() && p != 1.0 && !self.history.is_empty()
+        );
+        let need_owned = !bias.is_empty() || valid_repeat;
 
         let logits_owned: Option<Vec<f32>> = if need_owned {
             let mut v: Vec<f32> = l_src.to_vec();
@@ -231,9 +237,13 @@ impl Sampler {
 
             // Repetition penalty: positive logit → divide, negative → multiply
             // (matches llama.cpp semantics — true soft suppression regardless of sign).
+            // Deduplicate history so each unique recent token is penalized once (not p^count).
             if let Some(p) = self.params.repeat_penalty {
-                if p != 1.0 && !self.history.is_empty() {
-                    for &tok in &self.history {
+                if p > 0.0 && p.is_finite() && p != 1.0 && !self.history.is_empty() {
+                    let mut seen: Vec<u32> = self.history.iter().copied().collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    for tok in seen {
                         let i = tok as usize;
                         if i < v.len() {
                             v[i] = if v[i] > 0.0 { v[i] / p } else { v[i] * p };
@@ -266,44 +276,70 @@ impl Sampler {
             scored.reserve(n);
             let mut m = f32::NEG_INFINITY;
             for (i, &v) in l.iter().enumerate() {
-                let sv = v * inv_t;
+                let sv = if v.is_finite() { v * inv_t } else if v.is_infinite() && v.is_sign_positive() { f32::INFINITY } else { f32::NEG_INFINITY };
                 if sv > m { m = sv; }
                 scored.push((i, sv));
             }
             let mut total = 0.0f32;
-            for s in &mut scored {
-                let e = (s.1 - m).exp();
-                s.1 = e;
-                total += e;
+            if m.is_finite() {
+                for s in &mut scored {
+                    let e = if s.1.is_finite() { (s.1 - m).exp() } else { 0.0 };
+                    s.1 = e;
+                    total += e;
+                }
+            } else if m.is_infinite() && m.is_sign_positive() {
+                for s in &mut scored {
+                    let e = if s.1 == f32::INFINITY { 1.0 } else { 0.0 };
+                    s.1 = e;
+                    total += e;
+                }
+            } else {
+                for s in &mut scored {
+                    s.1 = 0.0;
+                }
             }
             let mut mu = self.mirostat_mu.unwrap_or(2.0 * cfg.tau);
-            if total > 0.0 {
+            if !mu.is_finite() {
+                mu = if cfg.tau.is_finite() { 2.0 * cfg.tau } else { 10.0 };
+            }
+            mu = mu.clamp(-100.0, 100.0);
+            if total > 0.0 && total.is_finite() {
                 let inv_total = 1.0 / total;
                 for s in &mut scored { s.1 *= inv_total; }
+            } else {
+                for s in &mut scored { s.1 = 0.0; }
+                scored[0].1 = 1.0;
             }
             let p_threshold = (-mu).exp2();
             let mut filtered: Vec<(usize, f32)> = scored.iter()
                 .copied()
-                .filter(|s| s.1 >= p_threshold)
+                .filter(|s| s.1 > 0.0 && s.1 >= p_threshold)
                 .collect();
             if filtered.is_empty() {
                 let argmax = scored.iter()
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .copied().unwrap_or((0, 1.0));
+                    .filter(|s| s.1 > 0.0)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .copied()
+                    .unwrap_or((0, 1.0));
                 filtered.push(argmax);
             }
             self.scratch = scored;
             let f_total: f32 = filtered.iter().map(|s| s.1).sum();
             let r = self.next_f32() * f_total;
             let mut acc = 0.0f32;
-            let mut chosen = filtered.last().unwrap().0;
-            let mut chosen_p = filtered.last().unwrap().1;
+            let mut chosen = filtered[0].0;
+            let mut chosen_p = filtered[0].1;
             for &(i, w) in &filtered {
+                if w <= 0.0 { continue; }
+                chosen = i;
+                chosen_p = w;
                 acc += w;
-                if acc >= r { chosen = i; chosen_p = w; break; }
+                if acc > r { break; }
             }
             let surprisal = -chosen_p.max(1e-30).log2();
-            mu -= cfg.eta * (surprisal - cfg.tau);
+            if cfg.eta.is_finite() && cfg.tau.is_finite() {
+                mu = (mu - cfg.eta * (surprisal - cfg.tau)).clamp(-100.0, 100.0);
+            }
             self.mirostat_mu = Some(mu);
             self.observe(chosen as u32);
             return chosen as u32;
@@ -423,15 +459,17 @@ impl Sampler {
             }
         }
 
-        // Sample.
+        // Sample (skip zero-weight candidates and use `acc > r` so `r == 0.0` never selects a zero-weight token).
         let total: f32 = scored.iter().map(|s| s.1).sum();
         let r = self.next_f32() * total;
         let mut acc = 0.0f32;
         let chosen = {
-            let mut out = scored.last().unwrap().0;
+            let mut out = scored.first().map_or(0, |s| s.0);
             for &(i, w) in &scored {
+                if w <= 0.0 { continue; }
+                out = i;
                 acc += w;
-                if acc >= r { out = i; break; }
+                if acc > r { break; }
             }
             out
         };
@@ -636,5 +674,117 @@ mod tests {
         });
         let normal = Tensor::from_vec(vec![1.0, 5.0, 2.0, 0.0], vec![4]);
         assert_eq!(tiny_t.sample(&normal), 1);
+    }
+
+    #[test]
+    fn repeat_penalty_deduplicates_history_and_validates_penalty() {
+        // Token 1 appears 3 times in history with logit 10.0, token 2 has logit 4.0, penalty = 2.0.
+        // Penalized once: 10.0 / 2.0 = 5.0 > 4.0 (token 1 still wins).
+        // If erroneously applied 3 times (p^3): 10.0 / 8.0 = 1.25 < 4.0 (wrongly loses to token 2).
+        let logits = Tensor::from_vec(vec![0.0, 10.0, 4.0, 0.0], vec![4]);
+        let mut s = Sampler::new(SampleParams {
+            temperature: 0.0,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repeat_penalty: Some(2.0),
+            repeat_last_n: 8,
+            mirostat: None,
+            seed: 0,
+        });
+        s.observe(1);
+        s.observe(1);
+        s.observe(1);
+        assert_eq!(s.sample(&logits), 1);
+
+        // Non-positive / non-finite repeat penalties are ignored rather than corrupting logits.
+        for bad_p in [0.0, -2.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut sb = Sampler::new(SampleParams {
+                temperature: 0.0,
+                repeat_penalty: Some(bad_p),
+                repeat_last_n: 4,
+                ..SampleParams::greedy()
+            });
+            sb.observe(1);
+            assert_eq!(sb.sample(&logits), 1, "bad penalty {bad_p:?} must not corrupt greedy argmax");
+        }
+    }
+
+    #[test]
+    fn empty_logits_returns_zero_without_panicking() {
+        let empty = Tensor::from_vec(Vec::new(), vec![0]);
+        let mut greedy = Sampler::new(SampleParams::greedy());
+        assert_eq!(greedy.sample(&empty), 0);
+        let mut standard = Sampler::new(SampleParams::default());
+        assert_eq!(standard.sample(&empty), 0);
+        let mut miro = Sampler::new(SampleParams::mirostat(5.0));
+        assert_eq!(miro.sample(&empty), 0);
+    }
+
+    #[test]
+    fn mirostat_handles_nan_all_neg_inf_pos_inf_and_mu_clamping() {
+        let mut s = Sampler::new(SampleParams::mirostat(5.0));
+        // NaN mixed with finite logits must never poison mu or pick NaN.
+        let with_nan = Tensor::from_vec(vec![f32::NAN, 10.0, f32::NEG_INFINITY, f32::NAN], vec![4]);
+        for _ in 0..20 {
+            assert_eq!(s.sample(&with_nan), 1);
+            assert!(s.mirostat_mu.unwrap().is_finite());
+        }
+
+        // All -inf / NaN falls back cleanly to token 0 with finite mu.
+        let all_bad = Tensor::from_vec(vec![f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY], vec![3]);
+        assert_eq!(s.sample(&all_bad), 0);
+        assert!(s.mirostat_mu.unwrap().is_finite());
+
+        // +inf selects the +inf token without NaN.
+        let pos_inf = Tensor::from_vec(vec![1.0, 2.0, f32::INFINITY, 3.0], vec![4]);
+        assert_eq!(s.sample(&pos_inf), 2);
+        assert!(s.mirostat_mu.unwrap().is_finite());
+
+        // Extreme mu must clamp so (-mu).exp2() never underflows to 0.0 and admits zero-weight banned tokens.
+        s.mirostat_mu = Some(1000.0);
+        let sharp_with_banned = Tensor::from_vec(vec![f32::NEG_INFINITY, 10.0, f32::NEG_INFINITY], vec![3]);
+        for _ in 0..50 {
+            assert_eq!(s.sample(&sharp_with_banned), 1);
+            let mu = s.mirostat_mu.unwrap();
+            assert!(mu.is_finite() && (-100.0..=100.0).contains(&mu), "mu out of clamp: {mu}");
+        }
+    }
+
+    #[test]
+    fn zero_weight_candidates_are_never_selected_even_when_r_is_zero() {
+        // Construct logits where token 0 and token 2 have weight 0.0 (banned via -inf), only token 1 has weight 1.0.
+        // Force Sampler's PRNG so `next_f32()` produces 0.0 (or test across many seeds including exact 0.0 draw).
+        let logits = Tensor::from_vec(vec![f32::NEG_INFINITY, 10.0, f32::NEG_INFINITY], vec![3]);
+        let mut s = Sampler::new(SampleParams {
+            temperature: 1.0,
+            top_k: Some(3),
+            top_p: None,
+            min_p: None,
+            repeat_penalty: None,
+            repeat_last_n: 0,
+            mirostat: None,
+            seed: 0,
+        });
+        // Find a state whose `next_f32() == 0.0`? Even simpler: directly verify standard & mirostat
+        // never pick index 0 or 2 across 1000 draws AND with a state producing r == 0.0.
+        for _ in 0..1000 {
+            assert_eq!(s.sample(&logits), 1);
+        }
+        // Also test Mirostat v2 when index 0 is -inf and mu is clamped high:
+        let mut m = Sampler::new(SampleParams::mirostat(50.0));
+        m.mirostat_mu = Some(100.0);
+        for _ in 0..1000 {
+            assert_eq!(m.sample(&logits), 1);
+        }
+        // Directly verify exact r == 0.0 via a non-sorted candidate list where token 0 has weight 0.0:
+        // With `state` chosen so `next_u64() >> 40 == 0` -> `next_f32() == 0.0`.
+        // Invert SplitMix64 for z = 0: z = 0 maps to 0 through all xorshift/mul steps!
+        // Since next_u64 does `state = state.wrapping_add(0x9E3779B97F4A7C15); z = state; ...`,
+        // setting `s.state = 0u64.wrapping_sub(0x9E3779B97F4A7C15)` makes `next_f32() == 0.0` exact!
+        s.state = 0u64.wrapping_sub(0x9E3779B97F4A7C15);
+        assert_eq!(s.sample(&logits), 1, "r == 0.0 must never pick a zero-weight candidate");
+        m.state = 0u64.wrapping_sub(0x9E3779B97F4A7C15);
+        assert_eq!(m.sample(&logits), 1, "mirostat r == 0.0 must never pick a zero-weight candidate");
     }
 }

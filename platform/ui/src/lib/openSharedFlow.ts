@@ -22,6 +22,8 @@ import {
 } from './backendDispatcher';
 import { decryptEnvelope } from './flowCrypto';
 
+import { stripUnsafeImportedSettings } from '../utils/ProjectIO';
+
 // SECURITY: shared-link passwords are held in memory for this session only —
 // never persisted to localStorage. Plaintext-at-rest under a public, guessable
 // key would let any later same-origin XSS read every saved flow password, so we
@@ -34,30 +36,14 @@ const sessionFlowPasswords = new Map<string, string>();
 // silently override where the RECIPIENT's AI/HTTP traffic goes, or to disable their
 // local-network protections — otherwise a malicious link redirects the victim's model
 // calls (prompts + API keys) to an attacker, or turns off their SSRF guard. We strip
-// these keys on import so the flow runs against the recipient's own environment; the
-// flow's nodes fall back to the recipient's endpoints/defaults. Non-routing defaults
+// these keys on import (using the shared UNSAFE_IMPORTED_SETTING_KEYS list in
+// ProjectIO) so the flow runs against the recipient's own environment; the flow's
+// nodes fall back to the recipient's endpoints/defaults. Non-routing defaults
 // (provider/model names, theme, etc.) are harmless and kept.
-const UNSAFE_IMPORTED_SETTING_KEYS = [
-  'defaultAIEndpoint',
-  'ollamaEndpoint',
-  'lmstudioEndpoint',
-  'defaultImageEndpoint',
-  'defaultVideoEndpoint',
-  'allowAllLocalNetwork',
-  'localNetworkWhitelist',
-] as const;
-
 function sanitizeUntrustedFlowSettings(flow: FlowSnapshot): FlowSnapshot {
   const settings = (flow as { settings?: unknown }).settings;
   if (!settings || typeof settings !== 'object') return flow;
-  const cleaned: Record<string, unknown> = { ...(settings as Record<string, unknown>) };
-  const stripped: string[] = [];
-  for (const k of UNSAFE_IMPORTED_SETTING_KEYS) {
-    if (k in cleaned) {
-      delete cleaned[k];
-      stripped.push(k);
-    }
-  }
+  const { cleaned, stripped } = stripUnsafeImportedSettings(settings as Record<string, unknown>);
   if (stripped.length === 0) return flow;
   console.warn(
     `[openSharedFlow] dropped endpoint/network overrides from a shared flow's settings ` +

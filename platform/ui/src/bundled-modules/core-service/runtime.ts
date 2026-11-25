@@ -106,24 +106,52 @@ interface HttpResult {
   statusText?: string;
 }
 
+function sanitizeUrlForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    for (const key of Array.from(u.searchParams.keys())) {
+      if (/(key|token|secret|password|auth|credential)/i.test(key)) {
+        u.searchParams.set(key, '[redacted]');
+      }
+    }
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/([?&][^=&#\s]*?(?:key|token|secret|password|auth|credential)[^=&#\s]*=)[^&#\s]*/gi, '$1[redacted]');
+  }
+}
+
 async function httpCall(
   url: string,
   method: string,
   headers: Record<string, string>,
   body: string | undefined,
+  nodeId?: string,
 ): Promise<HttpResult> {
-  // Prefer the shared HTTP proxy — desktop reaches it via Tauri reqwest
-  // (dodges CORS); the web shim routes it to `fetch` directly. Same
-  // result shape, same call site.
-  const invoke = ctx?.tauri?.invoke as
-    | (<T>(cmd: string, args?: unknown) => Promise<T>)
-    | undefined;
-  if (invoke) {
-    return await invoke<HttpResult>('http_request', { url, method, headers, body });
-  }
-  const resp = await fetch(url, { method, headers, body });
+  // Always route through the runtime's policy-enforced fetch (`ctx.secureFetch`) so
+  // `isLocalNetworkUrl` / `localNetworkWhitelist` / `onLocalNetworkPermission` are
+  // enforced consistently (and desktop still proxies through native `http_request`
+  // after policy approval).
+  const fetcher = ctx?.secureFetch ?? ctx?.fetch;
+  const resp = fetcher
+    ? await fetcher(url, {
+        method,
+        headers,
+        body,
+        signal: ctx?.abortSignal,
+        ...(nodeId ? { nodeId } : {}),
+        purpose: 'Service HTTP call',
+      })
+    : await fetch(url, { method, headers, body, signal: ctx?.abortSignal });
   const text = await resp.text();
-  return { status: resp.status, ok: resp.ok, body: text };
+  const respHeaders: Record<string, string> = {};
+  if (resp.headers && typeof resp.headers.forEach === 'function') {
+    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+  }
+  return { status: resp.status, ok: resp.ok, headers: respHeaders, body: text, statusText: resp.statusText };
 }
 
 async function call(
@@ -167,8 +195,10 @@ async function call(
         headers = parsed as Record<string, string>;
       }
     } catch (e) {
+      const rawErr = e instanceof Error ? e.message : String(e);
+      const safeErr = apiKey ? rawErr.split(apiKey).join('[redacted]') : rawErr;
       throw new Error(
-        `[Service] Headers template did not render to valid JSON: ${(e as Error).message}\nRendered: ${rendered.slice(0, 200)}`,
+        `[Service] Headers template did not render to valid JSON: ${safeErr}\nTemplate: ${rawHeaders.slice(0, 200)}`,
       );
     }
   }
@@ -231,8 +261,8 @@ async function call(
     }
   }
 
-  ctx?.log?.('info', `[Service] ${upMethod} ${endpoint} (node ${nodeId})`);
-  const res = await httpCall(endpoint, upMethod, headers, body);
+  ctx?.log?.('info', `[Service] ${upMethod} ${sanitizeUrlForLog(endpoint)} (node ${nodeId})`);
+  const res = await httpCall(endpoint, upMethod, headers, body, nodeId);
   const ok = res.ok ?? (res.status >= 200 && res.status < 300);
   if (!ok) {
     throw new Error(`[Service] HTTP ${res.status}: ${(res.body || '').slice(0, 400)}`);

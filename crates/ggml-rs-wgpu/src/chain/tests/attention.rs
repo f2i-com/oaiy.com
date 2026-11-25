@@ -1089,3 +1089,50 @@ fn a_wide_heads_full_attention_is_the_hosts() {
         assert!(cos > least && worst <= most * top, "{n_h} heads {hd} wide, {rows} over {kv_len}: cosine {cos}, worst {worst} of {top}");
     }
 }
+
+/// Regression test for Bugs 3 & 4: grouped-lanes attention with sliding window (`runs` bounded by
+/// `window.min(kv_len)` and `lanes_of` skipping `start >= end` runs without OOB) matches CPU.
+#[test]
+fn grouped_lanes_attention_with_sliding_window_matches_cpu() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    if !attention_group_wide_for(7, 128, b.gpu.limits.max_compute_workgroup_storage_size) {
+        return;
+    }
+    let cpu = ggml_rs::CpuBackend::new();
+    let (n_h, n_kv, hd) = (7usize, 1usize, 128usize);
+    let (qd, kvd) = (n_h * hd, n_kv * hd);
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut next = rng(313);
+    // Test window smaller than `past + rows` across 1-run and multi-run windows, including where
+    // early rows have fewer live runs than `runs` (`start >= end`).
+    for (past, rows, window) in [(600usize, 4usize, Some(128usize)), (600, 4, Some(300)), (250, 10, Some(300))] {
+        let kv_len = past + rows;
+        let q: Vec<f32> = (0..rows * qd).map(|_| next() * 0.5).collect();
+        let ks: Vec<f32> = (0..kv_len * kvd).map(|_| next() * 0.5).collect();
+        let vs: Vec<f32> = (0..kv_len * kvd).map(|_| next() * 0.5).collect();
+        let want = ggml_rs::Backend::attention(
+            &cpu,
+            &ggml_rs::Tensor::from_vec(q.clone(), vec![rows, n_h, hd]),
+            &ggml_rs::Tensor::from_vec(ks.clone(), vec![kv_len, n_kv, hd]),
+            &ggml_rs::Tensor::from_vec(vs.clone(), vec![kv_len, n_kv, hd]),
+            kv_len,
+            scale,
+            past,
+            window,
+        );
+        let mut interleaved = Vec::with_capacity(kv_len * 2 * kvd);
+        for t in 0..kv_len {
+            interleaved.extend_from_slice(&ks[t * kvd..(t + 1) * kvd]);
+            interleaved.extend_from_slice(&vs[t * kvd..(t + 1) * kvd]);
+        }
+        let (qv, cache) = (b.vec(q.len()), b.vec(interleaved.len()));
+        DeviceChain::upload(&b, &qv, &q);
+        DeviceChain::upload(&b, &cache, &interleaved);
+        let out = b.vec(b.attention_rows_out_len(rows, n_h, hd, kv_len));
+        let mut rec = Recorder::new(&b);
+        rec.attention_rows_group_wide(&qv, &cache, false, &out, rows, n_h, n_kv, hd, past, window, scale);
+        rec.read_range(&out, 0, rows * qd);
+        let got = Box::new(rec).finish().pop().unwrap();
+        close(&got, want.data(), &format!("grouped lanes swa past={past} rows={rows} window={window:?}"));
+    }
+}

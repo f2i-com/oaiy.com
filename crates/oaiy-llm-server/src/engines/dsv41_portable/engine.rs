@@ -738,15 +738,11 @@ impl Engine {
                 return Some(Finish::Stop);
             }
             n.set(n.get() + 1);
-            // Whole UTF-8 characters only: a token can be part of one.
+            // Whole UTF-8 characters only: a token can be part of one. Truly invalid byte
+            // sequences emit U+FFFD and drain immediately so streaming never stalls.
             pending.extend_from_slice(tok.token_bytes(next));
-            let valid = match std::str::from_utf8(&pending) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if valid > 0 {
-                let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                pending.drain(..valid);
+            let text = drain_utf8(&mut pending);
+            if !text.is_empty() {
                 parser.push(&text);
                 if job.events.send(Event::Text(text)).is_err() {
                     return Some(Finish::Stop); // nobody is listening
@@ -839,7 +835,10 @@ impl Engine {
             eprintln!("  drafts: {taken} of {drafted} taken in {passes} passes ({:.2} tokens a pass); {}", (passes + taken) as f64 / passes as f64, self.timing.line());
         }
         if !pending.is_empty() {
-            let _ = job.events.send(Event::Text(String::from_utf8_lossy(&pending).into_owned()));
+            let text = String::from_utf8_lossy(&pending).into_owned();
+            pending.clear();
+            parser.push(&text);
+            let _ = job.events.send(Event::Text(text));
         }
         if self.log {
             let decode_s = decode.elapsed().as_secs_f64();
@@ -852,6 +851,40 @@ impl Engine {
         let _ = job.events.send(Event::Done { finish, completion_tokens: n.get() });
         Ok(())
     }
+}
+
+/// Drain all complete UTF-8 characters and truly-invalid byte sequences (replaced with U+FFFD)
+/// from `pending`, leaving only an incomplete trailing multi-byte UTF-8 sequence (if any).
+fn drain_utf8(pending: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    while !pending.is_empty() {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    out.push_str(std::str::from_utf8(&pending[..valid]).expect("valid utf8 prefix"));
+                }
+                match e.error_len() {
+                    Some(bad_len) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..valid + bad_len);
+                    }
+                    None => {
+                        if valid > 0 {
+                            pending.drain(..valid);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Whether the state an incognito request left (`held`: its session, None where it named none) may serve a request
@@ -926,5 +959,28 @@ mod tests {
         assert_eq!(reusable(&kept, &second), 20000);
         // (the last prompt's checkpoint, a conversation of its own, serves none of it)
         assert_eq!(reusable(&first[..first.len() - 1], &second), 0);
+    }
+
+    #[test]
+    fn drain_utf8_emits_replacement_on_invalid_bytes_and_preserves_incomplete_tail() {
+        let mut pending = Vec::new();
+        // Valid prefix + invalid byte + valid suffix + incomplete 4-byte emoji prefix.
+        pending.extend_from_slice(b"hi");
+        pending.push(0xFF);
+        pending.extend_from_slice(b"ok");
+        let emoji = "🚀".as_bytes();
+        pending.extend_from_slice(&emoji[..2]);
+        assert_eq!(drain_utf8(&mut pending), "hi\u{FFFD}ok");
+        assert_eq!(pending, &emoji[..2]);
+
+        // Completing the emoji drains cleanly.
+        pending.extend_from_slice(&emoji[2..]);
+        assert_eq!(drain_utf8(&mut pending), "🚀");
+        assert!(pending.is_empty());
+
+        // Leading invalid byte drains immediately instead of freezing forever.
+        pending.push(0x80);
+        assert_eq!(drain_utf8(&mut pending), "\u{FFFD}");
+        assert!(pending.is_empty());
     }
 }

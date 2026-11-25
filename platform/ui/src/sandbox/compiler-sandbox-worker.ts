@@ -44,7 +44,7 @@ const hostPost = self.postMessage.bind(self);
 // absent in a Worker.)
 (function () {
   const egress = [
-    'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'BroadcastChannel',
+    'fetch', 'XMLHttpRequest', 'WebSocket', 'WebTransport', 'EventSource', 'BroadcastChannel',
     'importScripts', 'Request', 'Response', 'Headers', 'Worker', 'SharedWorker',
     // `caches` (CacheStorage) is a secure-context Worker global whose Cache.add()/addAll()
     // perform a REAL network fetch of the given URL — an egress beacon. `postMessage`/`indexedDB`
@@ -67,6 +67,20 @@ const hostPost = self.postMessage.bind(self);
       }
     }
     t = Object.getPrototypeOf(t) as object | null;
+  }
+
+  // Neutralize `navigator.storage` (OPFS / StorageManager — same-origin persistent storage
+  // reachable in a Worker) across the WorkerNavigator prototype chain.
+  if (typeof self.navigator === 'object' && self.navigator !== null) {
+    let nav: object | null = self.navigator as object;
+    while (nav && nav !== Object.prototype) {
+      try {
+        Object.defineProperty(nav, 'storage', { value: undefined, configurable: false, writable: false });
+      } catch {
+        /* non-configurable already */
+      }
+      nav = Object.getPrototypeOf(nav) as object | null;
+    }
   }
 })();
 

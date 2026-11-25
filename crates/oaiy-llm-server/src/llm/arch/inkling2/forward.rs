@@ -85,6 +85,10 @@ pub(crate) struct GpuDecodeState {
     /// enabling instant KV prefix reuse across multi-turn chats & agent loops even when
     /// generated thinking blocks are stripped from the next turn's prompt.
     pub(crate) ckpt_pos: Option<usize>,
+    /// Earliest absolute token position whose SWA KV rows are guaranteed intact across all SWA
+    /// GPU ring buffers. Monotonically advances on forward progress (never decreases on rewind)
+    /// and resets to `state.pos.saturating_sub(swa)` on `sync_host_to_gpu` / ring growth.
+    pub(crate) swa_valid_from: usize,
     pub(crate) ckpt_slots: Vec<(DeviceVec, DeviceVec, DeviceVec)>,
     pub(crate) step_params: DeviceVec,
     pub(crate) attn_split: DeviceVec,
@@ -166,6 +170,7 @@ impl GpuScratch {
             ds.host_dirty = false;
             ds.recipe = None;
             ds.ckpt_pos = None;
+            ds.swa_valid_from = 0;
         }
     }
 
@@ -869,7 +874,7 @@ impl Inkling2Model {
         let Some(ds) = scratch_guard.as_mut().and_then(|s| s.decode_state.as_mut()) else {
             return false;
         };
-        if !ds.synced {
+        if !ds.synced || pos.saturating_sub(self.cfg.sliding_window) < ds.swa_valid_from {
             return false;
         }
         if ds.ckpt_slots.len() != ds.slots.len() {
@@ -908,7 +913,6 @@ impl Inkling2Model {
         if target_pos == 0 || target_pos > st.pos {
             return false;
         }
-        let decoded = st.pos - target_pos;
         let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
         let Some(ds) = scratch_guard.as_mut().and_then(|s| s.decode_state.as_mut()) else {
             return false;
@@ -917,11 +921,7 @@ impl Inkling2Model {
             return false;
         }
         let swa = self.cfg.sliding_window;
-        if ds
-            .slots
-            .iter()
-            .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
-        {
+        if !swa_checkpoint_valid(target_pos, swa, ds.swa_valid_from) {
             return false;
         }
         let mut rec = chain.begin();
@@ -951,6 +951,26 @@ impl Inkling2Model {
                 .unwrap_or(usize::MAX);
         }
         self.cfg.sliding_window
+    }
+
+    /// Earliest absolute token position whose SWA KV rows are still intact in live state.
+    pub fn swa_valid_from(&self) -> usize {
+        let scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ds) = scratch_guard
+            .as_ref()
+            .and_then(|s| s.decode_state.as_ref())
+            .filter(|ds| ds.synced)
+        {
+            return ds.swa_valid_from;
+        }
+        drop(scratch_guard);
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.slots
+            .iter()
+            .filter(|s| s.is_swa)
+            .map(|s| s.base_pos)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Exact serialized byte size of a full [`Inkling2StateSnapshot`] at `pos` tokens, computed
@@ -987,6 +1007,9 @@ impl Inkling2Model {
                 .and_then(|s| s.decode_state.as_ref())
                 .filter(|ds| ds.synced),
         ) {
+            if !swa_checkpoint_valid(st.pos, self.cfg.sliding_window, ds.swa_valid_from) {
+                return None;
+            }
             let past = self.cfg.conv_kernel.saturating_sub(1);
             let hidden = self.cfg.hidden;
             if past == 0 {
@@ -1032,7 +1055,6 @@ impl Inkling2Model {
         if target_pos == 0 || target_pos > st.pos || ckpt.slots.len() != st.slots.len() {
             return false;
         }
-        let decoded = st.pos - target_pos;
         let swa = self.cfg.sliding_window;
         let mut scratch_guard = self.gpu_scratch.lock().unwrap_or_else(|p| p.into_inner());
         if let (Some(chain), Some(ds)) = (
@@ -1045,11 +1067,7 @@ impl Inkling2Model {
             if ds.slots.len() != ckpt.slots.len() {
                 return false;
             }
-            if ds
-                .slots
-                .iter()
-                .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
-            {
+            if !swa_checkpoint_valid(target_pos, swa, ds.swa_valid_from) {
                 return false;
             }
             for (g_slot, c_slot) in ds.slots.iter().zip(&ckpt.slots) {
@@ -1122,7 +1140,6 @@ impl Inkling2Model {
         if target_pos == 0 || target_pos > st.pos || ckpt.slots.len() != st.slots.len() {
             return None;
         }
-        let decoded = st.pos - target_pos;
         let swa = self.cfg.sliding_window;
         let past = self.cfg.conv_kernel.saturating_sub(1);
         let hidden = self.cfg.hidden;
@@ -1137,11 +1154,7 @@ impl Inkling2Model {
             if ds.slots.len() != ckpt.slots.len() {
                 return None;
             }
-            if ds
-                .slots
-                .iter()
-                .any(|s| s.is_swa && decoded > s.kv_cap.saturating_sub(swa))
-            {
+            if !swa_checkpoint_valid(target_pos, swa, ds.swa_valid_from) {
                 return None;
             }
             return Some(self.read_gpu_snapshot(chain, ds, target_pos, Some(ckpt), swa, past, hidden));
@@ -1454,6 +1467,8 @@ impl Inkling2Model {
             ds.synced = false;
             ds.host_dirty = false;
             ds.recipe = None;
+            ds.ckpt_pos = None;
+            ds.swa_valid_from = 0;
         }
 
         // `blocks` stores block residuals ALREADY normalized with unweighted RMSNorm (eps = 1e-6),
@@ -1637,6 +1652,7 @@ impl Inkling2Model {
             recipe: None,
             slots,
             ckpt_pos: None,
+            swa_valid_from: 0,
             ckpt_slots: Vec::new(),
             step_params: chain.vec(4),
             attn_split: chain.vec(max_heads * 16 * 132),
@@ -1661,6 +1677,7 @@ impl Inkling2Model {
 
     fn sync_host_to_gpu(&self, chain: &dyn DeviceChain, state: &Inkling2State, ds: &mut GpuDecodeState) {
         let swa = self.cfg.sliding_window;
+        let mut swa_valid_from = 0usize;
         for (il, g_slot) in ds.slots.iter_mut().enumerate() {
             let h_slot = &state.slots[il];
             let kv_dim = g_slot.kv_dim;
@@ -1682,6 +1699,9 @@ impl Inkling2Model {
                 0
             }
             .max(h_slot.base_pos);
+            if g_slot.is_swa {
+                swa_valid_from = swa_valid_from.max(k_first);
+            }
             let k_end = state.pos.min(h_slot.base_pos + h_slot.stored_rows);
             if k_first < k_end {
                 let count = k_end - k_first;
@@ -1703,6 +1723,7 @@ impl Inkling2Model {
         ds.synced = true;
         ds.host_dirty = false;
         ds.recipe = None;
+        ds.swa_valid_from = swa_valid_from;
     }
 
     fn sync_gpu_to_host(&self, chain: &dyn DeviceChain, state: &mut Inkling2State, ds: &GpuDecodeState) {
@@ -2287,6 +2308,9 @@ impl Inkling2Model {
         state.pos += 1;
         if let Some(ds_mut) = scratch.decode_state.as_mut() {
             ds_mut.host_dirty = true;
+            if let Some(min_swa_cap) = ds_mut.slots.iter().filter(|s| s.is_swa).map(|s| s.kv_cap).min() {
+                ds_mut.swa_valid_from = swa_advance_valid_from(ds_mut.swa_valid_from, state.pos, min_swa_cap);
+            }
             if let Some(r) = captured_recipe {
                 ds_mut.recipe = Some(r);
             }
@@ -2691,6 +2715,7 @@ impl Inkling2Model {
             }
             ds.synced = false;
             ds.recipe = None;
+            ds.ckpt_pos = None;
         }
 
         if !ds.synced {
@@ -2842,6 +2867,9 @@ impl Inkling2Model {
         if let Some(ds_mut) = scratch.decode_state.as_mut() {
             ds_mut.synced = true;
             ds_mut.host_dirty = true;
+            if let Some(min_swa_cap) = ds_mut.slots.iter().filter(|s| s.is_swa).map(|s| s.kv_cap).min() {
+                ds_mut.swa_valid_from = swa_advance_valid_from(ds_mut.swa_valid_from, state.pos, min_swa_cap);
+            }
         }
         if let Some(t0) = t_step_start {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -3475,5 +3503,55 @@ impl Inkling2Model {
             out[i] += ffn_conv[i];
         }
         Ok(out)
+    }
+}
+
+/// Advance the monotonic SWA validity floor after forward progress to `new_pos` on ring buffers
+/// whose smallest SWA capacity is `min_swa_cap`. Never decreases across rewinds.
+#[inline]
+pub(crate) fn swa_advance_valid_from(swa_valid_from: usize, new_pos: usize, min_swa_cap: usize) -> usize {
+    swa_valid_from.max(new_pos.saturating_sub(min_swa_cap))
+}
+
+/// Whether all SWA rows needed at `target_pos` (`[target_pos.saturating_sub(swa) .. target_pos)`)
+/// remain intact given the monotonic validity floor `swa_valid_from`.
+#[inline]
+pub(crate) fn swa_checkpoint_valid(target_pos: usize, swa: usize, swa_valid_from: usize) -> bool {
+    target_pos.saturating_sub(swa) >= swa_valid_from
+}
+
+#[cfg(test)]
+mod swa_watermark_tests {
+    use super::*;
+
+    #[test]
+    fn monotonic_swa_valid_from_rejects_overwritten_checkpoint_after_rewind() {
+        let swa = 512usize;
+        let min_swa_cap = 2560usize;
+        let mut valid_from = 0usize;
+
+        // Turn 1 advances to pos = 3000 -> ring overwrote rows 0..440.
+        valid_from = swa_advance_valid_from(valid_from, 3000, min_swa_cap);
+        assert_eq!(valid_from, 440);
+
+        // Checkpoint at pos = 1000 needs rows 488..1000 -> still valid (488 >= 440).
+        assert!(swa_checkpoint_valid(1000, swa, valid_from));
+
+        // Rewind to pos = 1000: `valid_from` MUST NOT decrease!
+        // Advance slightly on turn 2 to pos = 1050 (below cap, so max keeps 440).
+        valid_from = swa_advance_valid_from(valid_from, 1050, min_swa_cap);
+        assert_eq!(valid_from, 440);
+
+        // Earlier checkpoint at pos = 800 needs rows 288..800, but 288..440 were already
+        // overwritten on turn 1 -> MUST be rejected even though 1050 - 800 = 250 <= cap - swa.
+        assert!(!swa_checkpoint_valid(800, swa, valid_from));
+
+        // After SWA grow / sync_host_to_gpu at pos = 1050, only [538..1050) were re-uploaded.
+        valid_from = 1050usize.saturating_sub(swa);
+        assert_eq!(valid_from, 538);
+        // Checkpoint at pos = 1000 needs rows 488..1000, but 488..538 were never uploaded -> rejected.
+        assert!(!swa_checkpoint_valid(1000, swa, valid_from));
+        // Current pos = 1050 needs rows 538..1050 -> valid.
+        assert!(swa_checkpoint_valid(1050, swa, valid_from));
     }
 }

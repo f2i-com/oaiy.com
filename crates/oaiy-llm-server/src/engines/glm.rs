@@ -586,7 +586,7 @@ impl GlmEngine {
         let _ = job.events.send(Event::Prefilled { cached: start });
 
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
-        let (mut pending, mut n) = (Vec::new(), 0usize);
+        let (mut utf8_pending, mut n) = (Vec::<u8>::new(), 0usize);
         let opened = self.think_start.is_some() && prompt.last().copied() == self.think_start;
         let mut budget = ThinkBudget::new(opened, self.think_end, job.think_budget).closing(&job.think_closing).opens_with(self.think_start);
         let max_seq = self.model.config().context_length.min(self.kv.max_len);
@@ -614,16 +614,12 @@ impl GlmEngine {
             }
             n += 1;
 
-            // Decode the run so far and send only what is new: a single token can be
-            // half a UTF-8 sequence, and this tokenizer hands back strings rather
-            // than bytes, so the delta of the decoded run is what is safe to emit.
-            pending.push(next);
-            let text = self.tok.decode(&pending);
-            if !text.contains('\u{FFFD}') {
-                pending.clear();
-                if job.events.send(Event::Text(text)).is_err() {
-                    break Finish::Stop; // nobody is listening
-                }
+            // Incrementally decode UTF-8 in O(1) amortized time, holding incomplete trailing
+            // multi-byte sequences in `utf8_pending` while emitting U+FFFD for truly invalid bytes.
+            let mut text = String::new();
+            self.tok.decode_token_incremental(next, &mut utf8_pending, &mut text);
+            if !text.is_empty() && job.events.send(Event::Text(text)).is_err() {
+                break Finish::Stop; // nobody is listening
             }
 
             if n >= job.max_tokens || pos + 1 >= max_seq {
@@ -636,10 +632,10 @@ impl GlmEngine {
             self.covered.push(next);
             pos += 1;
         };
-        if !pending.is_empty() {
-            let _ = job
-                .events
-                .send(Event::Text(self.tok.decode(&pending).replace('\u{FFFD}', "")));
+        let mut tail = String::new();
+        tokenizer::Tokenizer::flush_incremental(&mut utf8_pending, &mut tail);
+        if !tail.is_empty() {
+            let _ = job.events.send(Event::Text(tail));
         }
         let decode_s = decode.elapsed().as_secs_f64();
         #[cfg(feature = "webgpu")]

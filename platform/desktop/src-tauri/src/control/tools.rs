@@ -12,6 +12,7 @@ use tower::ServiceExt as _;
 
 use super::engines::GROUPS;
 use super::{audit, Control, Session, SWITCHED_OFF};
+use crate::auth::principal::{ControlLevel, Principal, PrincipalKind};
 use crate::bridge::pairing::PairingAccess;
 
 // ---------------------------------------------------------------------------
@@ -397,17 +398,42 @@ pub(crate) const NOT_FOR_A_PAIRED_PAGE: [&str; 15] = [
     "setup_finish",
 ];
 
-/// Whether `session` is offered `tool`, asking with a paired page's grant (`paired`) or as this computer's own.
-pub(crate) fn offered(tool: &ToolDef, session: Session, paired: Option<PairingAccess>) -> bool {
+/// Whether `session` is offered `tool`, asking with a paired page's grant (`paired`),
+/// an authenticated principal (`principal`, enforcing `control.read` / `control.project`),
+/// or as this computer's own.
+pub(crate) fn offered(
+    tool: &ToolDef,
+    session: Session,
+    paired: Option<PairingAccess>,
+    principal: Option<&Principal>,
+) -> bool {
     if paired.is_some() && NOT_FOR_A_PAIRED_PAGE.contains(&tool.name) {
         return false;
     }
-    if tool.changes() { session.may_change() } else { session.may_read() }
+    if tool.changes() {
+        if principal.is_some_and(|p| p.control_level() != ControlLevel::Project) {
+            return false;
+        }
+        session.may_change()
+    } else {
+        if principal.is_some_and(|p| p.control_level() == ControlLevel::None) {
+            return false;
+        }
+        session.may_read()
+    }
 }
 
 /// The tools `session` is offered, as `tools/list` shows them.
-pub(crate) fn list(session: Session, paired: Option<PairingAccess>) -> Vec<Value> {
-    defs().iter().filter(|d| offered(d, session, paired)).map(ToolDef::listing).collect()
+pub(crate) fn list(
+    session: Session,
+    paired: Option<PairingAccess>,
+    principal: Option<&Principal>,
+) -> Vec<Value> {
+    defs()
+        .iter()
+        .filter(|d| offered(d, session, paired, principal))
+        .map(ToolDef::listing)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +535,14 @@ pub(crate) fn validate(tool: &ToolDef, args: &Map<String, Value>) -> Result<(), 
 /// `paired`: the caller asked with a paired page's token (the Agent in a browser tab), not as this computer's own
 /// (its window, or a program holding its credential): it is offered less, and what the tool changes is held to that
 /// page's grant ([`Desk::paired`]).
-pub(crate) async fn call(control: &Control, session: Session, paired: Option<PairingAccess>, name: &str, args: Map<String, Value>) -> Value {
+pub(crate) async fn call(
+    control: &Control,
+    session: Session,
+    paired: Option<PairingAccess>,
+    principal: Option<&Principal>,
+    name: &str,
+    args: Map<String, Value>,
+) -> Value {
     let Some(tool) = find(name) else {
         return error_result(&format!("There is no tool called {name:?}: tools/list names the tools there are."));
     };
@@ -520,14 +553,20 @@ pub(crate) async fn call(control: &Control, session: Session, paired: Option<Pai
             control.audit().append(tool.name, &args_value, &who, ok, summary);
         }
     };
-    if !offered(tool, session, paired) {
-        let why = match session {
-            _ if paired.is_some() && NOT_FOR_A_PAIRED_PAGE.contains(&tool.name) => {
-                format!("{} is not for a page paired with OAIY (the Agent in a browser tab): the person does it in OAIY's own window.", tool.name)
+    if !offered(tool, session, paired, principal) {
+        let why = if tool.changes() && principal.is_some_and(|p| p.control_level() != ControlLevel::Project) {
+            format!("{} changes OAIY, which requires the control.project scope.", tool.name)
+        } else if !tool.changes() && principal.is_some_and(|p| p.control_level() == ControlLevel::None) {
+            format!("{} requires the control.read scope.", tool.name)
+        } else {
+            match session {
+                _ if paired.is_some() && NOT_FOR_A_PAIRED_PAGE.contains(&tool.name) => {
+                    format!("{} is not for a page paired with OAIY (the Agent in a browser tab): the person does it in OAIY's own window.", tool.name)
+                }
+                Session::Runner => format!("{} changes OAIY, and a runner session may only read it: change OAIY from a project or setup conversation.", tool.name),
+                Session::Other => "OAIY's control tools are not offered to this session: the X-OAIY-Session header names project, setup, runner, call, sms or task.".to_string(),
+                s => format!("OAIY's control tools are not offered in {} sessions.", s.name()),
             }
-            Session::Runner => format!("{} changes OAIY, and a runner session may only read it: change OAIY from a project or setup conversation.", tool.name),
-            Session::Other => "OAIY's control tools are not offered to this session: the X-OAIY-Session header names project, setup, runner, call, sms or task.".to_string(),
-            s => format!("OAIY's control tools are not offered in {} sessions.", s.name()),
         };
         log(false, &why);
         return error_result(&why);
@@ -545,7 +584,7 @@ pub(crate) async fn call(control: &Control, session: Session, paired: Option<Pai
         log(false, why);
         return error_result(why);
     };
-    let desk = Desk { router, paired };
+    let desk = Desk { router, paired, principal: principal.cloned() };
     let outcome = run(&desk, control, tool.name, &Args(&args)).await;
     match outcome {
         Ok(d) => {
@@ -993,6 +1032,10 @@ pub(crate) struct Desk {
     /// The tools act for a page paired with OAIY, with this grant: each request says so
     /// ([`crate::http::PairedGrant`]), and the gate holds what it changes to what that page could change itself.
     pub paired: Option<PairingAccess>,
+    /// The caller's verified principal (in `scoped`/`shadow` mode), forwarded on in-process
+    /// subrequests so `Guard::admit` authorizes target routes against the caller's scopes
+    /// instead of failing 401 on `internal_token()`.
+    pub principal: Option<Principal>,
 }
 
 pub(crate) struct Reply {
@@ -1003,10 +1046,12 @@ pub(crate) struct Reply {
 
 impl Desk {
     pub async fn send(&self, method: Method, path: &str, body: Option<String>, wait: Duration) -> Result<Reply, String> {
-        let mut request = Request::builder()
-            .method(method.clone())
-            .uri(path)
-            .header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
+        let mut request = Request::builder().method(method.clone()).uri(path);
+        if let Some(p) = self.principal.as_ref().filter(|p| p.kind != PrincipalKind::Legacy) {
+            request = request.extension(p.clone());
+        } else {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
+        }
         if let Some(access) = self.paired {
             request = request.extension(crate::http::PairedGrant(access));
         }
@@ -1050,7 +1095,12 @@ impl Desk {
 
     /// A file's bytes (a picture the engines made), as they are.
     async fn bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        let mut request = Request::builder().method(Method::GET).uri(path).header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
+        let mut request = Request::builder().method(Method::GET).uri(path);
+        if let Some(p) = self.principal.as_ref().filter(|p| p.kind != PrincipalKind::Legacy) {
+            request = request.extension(p.clone());
+        } else {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
+        }
         if let Some(access) = self.paired {
             request = request.extension(crate::http::PairedGrant(access));
         }
@@ -2249,9 +2299,11 @@ async fn flow_run(d: &Desk, id: &str, node: Option<&str>, key: Option<&str>, inp
         return Err(format!("There is no flow {id:?}: flows_list shows them."));
     }
     let run = uuid::Uuid::new_v4().simple().to_string();
-    // (the Agent's own runs are the person's, run unconfined; one for a page paired with OAIY is that page's, confined as
-    // any app's run is: bridge::worker::outside_input)
-    let caller = if d.paired.is_some() { json!({ "product": PAIRED_AGENT_PRODUCT, "label": "the Agent in a paired page" }) } else { json!({ "product": crate::bridge::worker::AGENT_PRODUCT, "label": "the Agent" }) };
+    // (the Agent's own runs are the person's, run unconfined; one for a page paired with OAIY or an external PAT is
+    // that caller's, confined as any app's run is: bridge::worker::outside_input)
+    let confined_caller = d.paired.is_some()
+        || d.principal.as_ref().is_some_and(|p| p.kind == PrincipalKind::Pat);
+    let caller = if confined_caller { json!({ "product": PAIRED_AGENT_PRODUCT, "label": "the Agent in a paired page" }) } else { json!({ "product": crate::bridge::worker::AGENT_PRODUCT, "label": "the Agent" }) };
     let mut body = json!({
         "protocol": crate::http::BRIDGE_PROTOCOL,
         "caller": caller,
@@ -2518,7 +2570,7 @@ mod flow_run_tests {
         let offline = json!({ "error": { "code": "node_offline", "message": "Rig did not answer: could not connect to its address" }, "runId": null, "key": "x" });
         let done = json!({ "runId": "r1", "status": "succeeded", "output": { "output": { "text": "done" } } });
         let (router, asked) = runs_route(vec![(StatusCode::SERVICE_UNAVAILABLE, offline), (StatusCode::OK, done)]);
-        let d = Desk { router, paired: None };
+        let d = Desk { router, paired: None, principal: None };
         let answer = flow_run_on(&d, "logo", "w1", None, None, true, 5).await.unwrap();
         assert_eq!(answer.data["runId"], "r1", "{}", answer.data);
         let keys = asked.lock().unwrap().clone();
@@ -2528,26 +2580,26 @@ mod flow_run_tests {
         // not finished when it answered (wait false, or its time up): the key the tool made up is given, to follow it
         let running = json!({ "runId": "r3", "status": "running" });
         let (router, asked) = runs_route(vec![(StatusCode::ACCEPTED, running)]);
-        let answer = flow_run_on(&Desk { router, paired: None }, "logo", "w1", None, None, false, 5).await.unwrap();
+        let answer = flow_run_on(&Desk { router, paired: None, principal: None }, "logo", "w1", None, None, false, 5).await.unwrap();
         let key = asked.lock().unwrap()[0].as_str().unwrap().to_string();
         assert_eq!((answer.data["runId"].as_str(), answer.data["key"].as_str(), answer.data["node"].as_str()), (Some("r3"), Some(key.as_str()), Some("w1")));
         assert!(answer.summary.contains(&format!("key \"{key}\" to follow it")), "{}", answer.summary);
         // lost track of after it started: the error says the key to follow it with, and that key is the one given
         let lost = json!({ "error": { "code": "node_offline", "message": "Rig did not answer; run r2 may still be running there" }, "runId": "r2", "key": "k-9" });
         let (router, asked) = runs_route(vec![(StatusCode::SERVICE_UNAVAILABLE, lost)]);
-        let d = Desk { router, paired: None };
+        let d = Desk { router, paired: None, principal: None };
         let e = flow_run_on(&d, "logo", "w1", Some("k-9"), None, true, 5).await.err().unwrap();
         assert!(e.contains("run r2 may still be running there") && e.contains("key \"k-9\""), "{e}");
         assert_eq!(asked.lock().unwrap().clone(), vec![json!("k-9")], "a run started there is not asked for again");
         // refused there as asked (no run, no key): said as it is
         let refused = json!({ "error": { "code": "flow_not_shared", "message": "Rig shares no flow logo" } });
         let (router, _) = runs_route(vec![(StatusCode::NOT_FOUND, refused)]);
-        let e = flow_run_on(&Desk { router, paired: None }, "logo", "w1", None, None, true, 5).await.err().unwrap();
+        let e = flow_run_on(&Desk { router, paired: None, principal: None }, "logo", "w1", None, None, true, 5).await.err().unwrap();
         assert_eq!(e, "Rig shares no flow logo");
         // a key of another flow's run there: refused as asked, said as it is
         let reused = json!({ "error": { "code": "key_in_use", "message": "the key k-9 is a run of another flow on Rig (logo): ask with another key, or with none" } });
         let (router, _) = runs_route(vec![(StatusCode::CONFLICT, reused)]);
-        let e = flow_run_on(&Desk { router, paired: None }, "poster", "w1", Some("k-9"), None, true, 5).await.err().unwrap();
+        let e = flow_run_on(&Desk { router, paired: None, principal: None }, "poster", "w1", Some("k-9"), None, true, 5).await.err().unwrap();
         assert!(e.starts_with("the key k-9 is a run of another flow"), "{e}");
     }
 }

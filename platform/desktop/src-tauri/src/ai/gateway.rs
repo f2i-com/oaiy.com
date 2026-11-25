@@ -110,7 +110,7 @@ fn client_for(provider: &AiProvider, streaming: bool, direct: bool, target: &egr
     if provider.id == super::routes::ENGINE_PROVIDER_ID {
         egress::engine_client(streaming, target)
     } else {
-        egress::provider_client(streaming, direct, target)
+        egress::provider_client(streaming, direct || provider.allow_local, target)
     }
     .map_err(GatewayError::Upstream)
 }
@@ -227,7 +227,7 @@ pub async fn models(provider: &AiProvider) -> Result<Value, GatewayError> {
     let target = egress::target(&provider.base_url, "/v1/models", provider.allow_local)
         .await
         .map_err(GatewayError::BadRequest)?;
-    let client = egress::client(false, &target).map_err(GatewayError::Upstream)?;
+    let client = client_for(provider, false, provider.allow_local, &target)?;
     let rb = apply_auth(client.get(target.url.clone()), provider, key.as_deref());
     let resp = rb
         .send()
@@ -272,7 +272,7 @@ async fn anthropic_probe(provider: &AiProvider) -> Result<(), GatewayError> {
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "ping" }],
     });
-    let client = egress::client(false, &target).map_err(GatewayError::Upstream)?;
+    let client = client_for(provider, false, provider.allow_local, &target)?;
     let rb = apply_auth(with_json_body(client.post(target.url.clone()), &body)?, provider, key.as_deref());
     let resp = rb
         .send()

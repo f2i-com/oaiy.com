@@ -50,6 +50,7 @@ import { inOaiyWindow } from '../lib/oaiyWindow';
 import { desktopSaveState, shared as sharedWithDesktop, subscribeDesktopFlowUnsaved, subscribeDesktopSaveState, type DesktopSaveState } from '../hooks/useDesktopFlows';
 import { savedLabelOf } from '../lib/savedLabel';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
+import { PermissionRequestQueue } from '../lib/permissionQueue';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
 import { oaiyDesktop } from '../lib/oaiyAgentTools';
@@ -278,25 +279,35 @@ export default function OAIYApp() {
   // Macro runner modal state
   const [macroRunnerFlow, setMacroRunnerFlow] = useState<Flow | null>(null);
 
-  // Local network permission dialog state
+  // Local network permission dialog state (FIFO queue so concurrent requests never drop earlier resolvers)
   const [permissionRequest, setPermissionRequest] = useState<LocalNetworkPermissionRequest | null>(null);
-  const permissionResolverRef = useRef<((response: LocalNetworkPermissionResponse) => void) | null>(null);
+  const permissionQueueRef = useRef<PermissionRequestQueue | null>(null);
+  if (!permissionQueueRef.current) {
+    permissionQueueRef.current = new PermissionRequestQueue();
+  }
+
+  // Drain any pending permission requests as denied on unmount so no promises hang forever.
+  useEffect(() => {
+    const queue = permissionQueueRef.current;
+    return () => {
+      queue?.drainDeny();
+    };
+  }, []);
 
   // Handle local network permission requests
   const handleLocalNetworkPermission = useCallback((request: LocalNetworkPermissionRequest): Promise<LocalNetworkPermissionResponse> => {
-    return new Promise((resolve) => {
-      permissionResolverRef.current = resolve;
+    const queue = permissionQueueRef.current!;
+    const { promise, becameActive } = queue.enqueue(request);
+    if (becameActive) {
       setPermissionRequest(request);
-    });
+    }
+    return promise;
   }, []);
 
   // Handle permission dialog response
   const handlePermissionResponse = useCallback((allowed: boolean, remember: boolean) => {
-    if (permissionResolverRef.current) {
-      permissionResolverRef.current({ allowed, remember });
-      permissionResolverRef.current = null;
-    }
-    setPermissionRequest(null);
+    const next = permissionQueueRef.current!.respond(allowed, remember);
+    setPermissionRequest(next);
   }, []);
 
   // Handle flow name editing
@@ -630,13 +641,18 @@ export default function OAIYApp() {
   // a service_call's apiKeyConstant / headers / bodyTemplate would leak as
   // plaintext to anyone with the view URL. sanitizeProjectForExport runs each
   // flow's graph through the same secret-stripping the export uses.
-  const flowSnapshotForShare: FlowSnapshot = useMemo(
-    () => ({
-      flows: sanitizeProjectForExport(project).flows,
-      settings: project.settings as unknown as Record<string, unknown>,
-    }),
-    [project],
-  );
+  const flowSnapshotForShare: FlowSnapshot = useMemo(() => {
+    const sanitized = sanitizeProjectForExport(project);
+    const safeSettings: Record<string, unknown> = sanitized.settings
+      ? { ...(sanitized.settings as unknown as Record<string, unknown>) }
+      : {};
+    delete safeSettings.localNetworkWhitelist;
+    delete safeSettings.allowAllLocalNetwork;
+    return {
+      flows: sanitized.flows,
+      settings: safeSettings,
+    };
+  }, [project]);
 
   // Keyboard shortcuts
   useEffect(() => {

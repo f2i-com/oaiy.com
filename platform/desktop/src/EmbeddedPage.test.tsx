@@ -125,4 +125,28 @@ describe('the box a page in its own webview is laid over', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10); });
     expect(h.invoke).toHaveBeenLastCalledWith('show_embedded', expect.objectContaining({ page: 'agent', x: 222, y: 124 }));
   });
+
+  it('clears a previous page error when switching to another embedded page', async () => {
+    h.invoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === 'show_embedded' && (args as { page: string }).page === 'flows') {
+        return Promise.reject(new Error('flows failed to open'));
+      }
+      if (command === 'show_embedded' && (args as { page: string }).page === 'agent') {
+        return new Promise<void>(() => {});
+      }
+      return Promise.resolve();
+    });
+    try {
+      act(() => root.render(<EmbeddedPage page="flows" />));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      expect(host.textContent).toContain('flows failed to open');
+      // Switching to agent must clear the stale flows error immediately, even before agent resolves.
+      act(() => root.render(<EmbeddedPage page="agent" />));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      expect(host.textContent).not.toContain('flows failed to open');
+      expect(host.textContent).toContain('Opening the Agent');
+    } finally {
+      h.invoke.mockImplementation(() => Promise.resolve());
+    }
+  });
 });

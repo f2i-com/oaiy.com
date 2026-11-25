@@ -84,6 +84,10 @@ export default function PluginsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [logsFor, setLogsFor] = useState<string | null>(null);
+  const loadPluginLogs = useCallback(
+    async () => (logsFor ? (await plugins.logs(logsFor, 300)).lines : []),
+    [logsFor],
+  );
   /** Path to a plugin folder or .tar.gz to install. */
   const [installSource, setInstallSource] = useState('');
   const [installing, setInstalling] = useState(false);
@@ -410,7 +414,7 @@ export default function PluginsPanel() {
         <LogsViewer
           title={`${nameOf(list.find((p) => p.id === logsFor)) ?? logsFor} — logs`}
           onClose={() => setLogsFor(null)}
-          load={async () => (await plugins.logs(logsFor, 300)).lines}
+          load={loadPluginLogs}
         />
       )}
     </div>

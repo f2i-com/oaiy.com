@@ -300,7 +300,7 @@ impl KpoolCache {
     /// `len` they are zeros nobody has read yet -- keeping them would make a
     /// snapshot several times bigger for nothing.
     pub fn rows_upto(&self, len: usize) -> Vec<Vec<f32>> {
-        let keep = len.min(self.max_len) * self.d_idx;
+        let keep = len.min(self.max_len) * HEADS_PER_CELL * self.d_idx;
         self.layers
             .iter()
             .map(|l| l.get(..keep.min(l.len())).unwrap_or(l).to_vec())
@@ -678,6 +678,53 @@ mod tests {
 
         kc.reset();
         assert_eq!(kc.key(1, 5).unwrap(), &[0.0; 4][..]);
+    }
+
+    #[test]
+    fn rows_upto_and_restore_preserve_all_heads_across_full_len() {
+        let d = 4;
+        let len = 8;
+        let mut kc = KpoolCache::new(2, 16, d).unwrap();
+        for layer in 0..2 {
+            for cell in 0..len {
+                let base = (layer * 100 + cell * 10) as f32;
+                let key = [base + 1.0, base + 2.0, base + 3.0, base + 4.0];
+                let gate = [-(base + 1.0), -(base + 2.0), -(base + 3.0), -(base + 4.0)];
+                kc.store(layer, cell, &key, &gate).unwrap();
+            }
+            for pool in 0..(len / KPOOL) {
+                let pbase = (layer * 1000 + pool * 50) as f32;
+                let pooled = [pbase + 0.5, pbase + 1.5, pbase + 2.5, pbase + 3.5];
+                kc.set_pooled(layer, pool, KPOOL, &pooled).unwrap();
+            }
+            // Write past `len` to verify snapshot truncates past `len` and restore zeroes slack.
+            kc.store(layer, len, &[99.0; 4], &[-99.0; 4]).unwrap();
+        }
+
+        let snap = kc.rows_upto(len);
+        assert_eq!(snap.len(), 2);
+        for rows in &snap {
+            assert_eq!(rows.len(), len * HEADS_PER_CELL * d);
+        }
+
+        let mut restored = KpoolCache::new(2, 16, d).unwrap();
+        restored.store(0, len, &[77.0; 4], &[77.0; 4]).unwrap();
+        restored.restore_rows(&snap).unwrap();
+
+        for layer in 0..2 {
+            for cell in 0..len {
+                assert_eq!(restored.key(layer, cell).unwrap(), kc.key(layer, cell).unwrap());
+                assert_eq!(restored.gate(layer, cell).unwrap(), kc.gate(layer, cell).unwrap());
+            }
+            for pool in 0..(len / KPOOL) {
+                assert_eq!(
+                    restored.pooled(layer, pool, KPOOL).unwrap(),
+                    kc.pooled(layer, pool, KPOOL).unwrap()
+                );
+            }
+            assert_eq!(restored.key(layer, len).unwrap(), &[0.0; 4][..]);
+            assert_eq!(restored.gate(layer, len).unwrap(), &[0.0; 4][..]);
+        }
     }
 
     #[test]

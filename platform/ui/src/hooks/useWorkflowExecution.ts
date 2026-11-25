@@ -244,10 +244,11 @@ export function useWorkflowExecution({
       // Job completed, update nodes with final results
       if (job.status === 'completed' && job.result !== undefined) {
         const result = job.result;
+        const resultObj: Record<string, unknown> =
+          result && typeof result === 'object' ? (result as Record<string, unknown>) : {};
         let outputValue: string | string[] = '';
 
         if (result && typeof result === 'object') {
-          const resultObj = result as Record<string, unknown>;
           if (resultObj.__output__ !== undefined) {
             outputValue = resultObj.__output__ as string | string[];
           } else {
@@ -256,8 +257,6 @@ export function useWorkflowExecution({
         } else if (result !== null && result !== undefined) {
           outputValue = String(result);
         }
-
-        const resultObj = result as Record<string, unknown>;
 
         setNodes((nds) => {
           const currentEdges = edges;

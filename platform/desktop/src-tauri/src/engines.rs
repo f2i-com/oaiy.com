@@ -371,7 +371,12 @@ fn ask_engines(ui: &str, timeout: std::time::Duration, connect: std::time::Durat
         Ok(false) => return (Ok((0, 0)), true),
         Err(why) => return (Err(why), false),
     }
-    let client = match reqwest::blocking::Client::builder().timeout(timeout).build() {
+    let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+    {
         Ok(client) => client,
         Err(e) => return (Err(format!("the question could not be asked ({e})")), false),
     };

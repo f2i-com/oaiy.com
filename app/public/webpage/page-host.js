@@ -36,7 +36,35 @@
   const MAX_OBJECT_BLOBS = 64;
   const handleObjects = new WeakSet();
   const threeCallables = new Map();
+  const ctorNames = new WeakMap();
+  const threeCtors = new WeakSet();
+  if (threeHost && threeHost.modules) {
+    const registerThreeModule = (mod) => {
+      if (!mod || typeof mod !== 'object') return;
+      for (const k of Object.keys(mod)) {
+        if (k === 'default') continue;
+        const val = mod[k];
+        if (typeof val === 'function') {
+          if (!ctorNames.has(val)) ctorNames.set(val, k);
+          threeCtors.add(val);
+          if (val.prototype) {
+            for (let p = val.prototype; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+              if (typeof p.constructor === 'function') threeCtors.add(p.constructor);
+            }
+          }
+        }
+      }
+    };
+    if (Object.prototype.hasOwnProperty.call(threeHost.modules, 'three')) registerThreeModule(threeHost.modules.three);
+    for (const spec of Object.keys(threeHost.modules)) {
+      if (spec !== 'three') registerThreeModule(threeHost.modules[spec]);
+    }
+  }
   const BLOCKED_STATIC_PROPS = new Set(['__proto__', 'constructor', 'prototype', 'call', 'apply', 'bind', 'arguments', 'caller']);
+  const BLOCKED_PROTO_PROPS = new Set([
+    '__proto__', 'constructor', 'prototype',
+    '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
+  ]);
   let lastUserGestureAt = 0;
   const markUserGesture = (event) => {
     if (event && event.isTrusted) lastUserGestureAt = Date.now();
@@ -147,6 +175,7 @@
     png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', ico: 'image/x-icon', bmp: 'image/bmp',
     woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
     mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', mp4: 'video/mp4', webm: 'video/webm', pdf: 'application/pdf', wasm: 'application/wasm',
+    glb: 'model/gltf-binary', gltf: 'model/gltf+json', bin: 'application/octet-stream', hdr: 'application/octet-stream', exr: 'image/x-exr', obj: 'text/plain', mtl: 'text/plain', stl: 'model/stl',
   };
   const mimeOf = (path) => MIME[(path.split('.').pop() || '').toLowerCase()] || 'application/octet-stream';
   const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
@@ -169,6 +198,81 @@
     }
     return parts.join('/');
   };
+
+  // Resolve host-side relative fetches (e.g. Three.js GLTFLoader.load('models/ship.glb')) against
+  // the project's VFS while delegating blob:/data: URLs to the native browser fetch.
+  const nativeFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+  const NativeRequest = typeof window.Request === 'function' ? window.Request : null;
+  const rawRequestUrls = new WeakMap();
+  if (NativeRequest) {
+    const WrappedRequest = function Request(input, init) {
+      const req = new NativeRequest(input, init);
+      if (typeof input === 'string') rawRequestUrls.set(req, input);
+      else if (input instanceof URL) rawRequestUrls.set(req, input.href);
+      return req;
+    };
+    WrappedRequest.prototype = NativeRequest.prototype;
+    Object.setPrototypeOf(WrappedRequest, NativeRequest);
+    window.Request = WrappedRequest;
+  }
+  const frameHref = (() => {
+    try {
+      return new URL(window.location.href);
+    } catch {
+      return null;
+    }
+  })();
+  const frameDirPath = frameHref ? frameHref.pathname.slice(0, frameHref.pathname.lastIndexOf('/') + 1) : '';
+  if (nativeFetch) {
+    window.fetch = (input, init) => {
+      const rawUrl =
+        typeof input === 'string'
+          ? input
+          : NativeRequest && input instanceof NativeRequest
+            ? (rawRequestUrls.get(input) ?? input.url)
+            : input instanceof URL
+              ? input.href
+              : input && typeof input === 'object' && 'url' in input
+                ? String(input.url)
+                : String(input);
+      if (/^(?:blob|data):/i.test(rawUrl)) return nativeFetch(input, init);
+      let vfsRef = null;
+      if (!external(rawUrl)) {
+        vfsRef = rawUrl;
+      } else if (frameHref) {
+        try {
+          const parsed = new URL(rawUrl);
+          if (parsed.origin === frameHref.origin) {
+            vfsRef = parsed.pathname.startsWith(frameDirPath)
+              ? parsed.pathname.slice(frameDirPath.length)
+              : parsed.pathname;
+          }
+        } catch {
+          /* ignore unparseable URL */
+        }
+      }
+      if (vfsRef !== null) {
+        const path = resolve(vfsRef, dirOf(pagePath));
+        if (path !== null && Object.prototype.hasOwnProperty.call(files, path)) {
+          return Promise.resolve(
+            new Response(files[path], {
+              status: 200,
+              statusText: 'OK',
+              headers: { 'content-type': mimeOf(path) },
+            }),
+          );
+        }
+        return Promise.resolve(
+          new Response('', {
+            status: 404,
+            statusText: 'Not Found',
+            headers: { 'content-type': 'text/plain' },
+          }),
+        );
+      }
+      return nativeFetch(input, init);
+    };
+  }
   const decoder = new TextDecoder();
   const textOf = (path) => (typeof files[path] === 'string' ? files[path] : decoder.decode(files[path]));
   const blobs = new Map();
@@ -317,14 +421,31 @@
     }
     return id;
   };
+  const hasOwn = (obj, prop) => Object.prototype.hasOwnProperty.call(obj, prop);
+  const ctorNameOf = (ctor) => {
+    if (typeof ctor !== 'function') return '';
+    return ctorNames.get(ctor) || (threeHost && threeHost.ctorNames && threeHost.ctorNames.get(ctor)) || ctor.name || '';
+  };
   const chainOf = (value) => {
     const chain = [];
-    for (let p = Object.getPrototypeOf(value); p && chain.length < 8; p = Object.getPrototypeOf(p)) {
-      const name = p.constructor && p.constructor.name;
+    for (let p = Object.getPrototypeOf(value); p && p !== Object.prototype && chain.length < 12; p = Object.getPrototypeOf(p)) {
+      const name = ctorNameOf(p.constructor);
       if (!name || name === 'Object') break;
       chain.push(name);
     }
     return chain.length ? chain : ['Object'];
+  };
+  const isThreeValue = (value) => {
+    if (!value || typeof value !== 'object') return false;
+    for (let p = Object.getPrototypeOf(value); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+      if (typeof p.constructor === 'function' && threeCtors.has(p.constructor)) return true;
+    }
+    return false;
+  };
+  const wrapHandle = (v) => {
+    const out = { $h: handle(v), c: chainOf(v) };
+    if (isThreeValue(v)) out.ng = 1;
+    return out;
   };
   const isCollection = (v) => v instanceof NodeList || v instanceof HTMLCollection || (typeof StyleSheetList !== 'undefined' && v instanceof StyleSheetList) || (typeof FileList !== 'undefined' && v instanceof FileList) || (typeof DOMRectList !== 'undefined' && v instanceof DOMRectList) || (typeof CSSRuleList !== 'undefined' && v instanceof CSSRuleList) || (typeof TouchList !== 'undefined' && v instanceof TouchList);
   const promises = new Map();
@@ -358,14 +479,17 @@
       );
       return { $p: id };
     }
-    if (handleObjects.has(v)) return { $h: handle(v), c: chainOf(v) };
+    if (handleObjects.has(v)) return wrapHandle(v);
     const proto = Object.getPrototypeOf(v);
     if (proto === Object.prototype || proto === null) {
       const out = {};
-      for (const k of Object.keys(v)) out[k] = toGuest(v[k], depth + 1);
-      return out;
+      for (const k of Object.keys(v)) {
+        if (k === '__proto__') continue;
+        out[k] = toGuest(v[k], depth + 1);
+      }
+      return { $o: out };
     }
-    return { $h: handle(v), c: chainOf(v) };
+    return wrapHandle(v);
   };
   const guestFns = new Map();
   const guestFnIds = new WeakMap();
@@ -385,24 +509,39 @@
   const fromGuest = (v) => {
     if (v === null || typeof v !== 'object') return v;
     if (Array.isArray(v)) return v.map(fromGuest);
-    if (v.$h !== undefined) {
+    if (hasOwn(v, '$o') && v.$o && typeof v.$o === 'object' && !Array.isArray(v.$o)) {
+      const out = {};
+      for (const k of Object.keys(v.$o)) {
+        if (k === '__proto__') continue;
+        out[k] = fromGuest(v.$o[k]);
+      }
+      return out;
+    }
+    if (hasOwn(v, '$h')) {
       if (!objects.has(v.$h)) throw new Error('that object is gone (an event is only usable while its listener runs)');
       return objects.get(v.$h);
     }
-    if (v.$u) return undefined;
-    if (v.$win) return window;
-    if (v.$f !== undefined) return guestFn(v.$f);
-    if (v.$num !== undefined) return Number(v.$num);
-    if (v.$date !== undefined) return new Date(v.$date);
-    if (v.$ab !== undefined) {
+    if (hasOwn(v, '$u') && v.$u) return undefined;
+    if (hasOwn(v, '$win') && v.$win) return window;
+    if (hasOwn(v, '$f')) return guestFn(v.$f);
+    if (hasOwn(v, '$num')) return Number(v.$num);
+    if (hasOwn(v, '$date')) return new Date(v.$date);
+    if (hasOwn(v, '$ab')) {
       const bin = atob(v.$ab);
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       return bytes.buffer;
     }
-    if (v.$ta !== undefined) return v.$ta === 'ArrayBuffer' ? new Uint8Array(v.d).buffer : new (TYPED[v.$ta] || Uint8Array)(v.d);
+    if (hasOwn(v, '$ta')) {
+      return v.$ta === 'ArrayBuffer'
+        ? new Uint8Array(v.d).buffer
+        : new ((hasOwn(TYPED, v.$ta) && TYPED[v.$ta]) || Uint8Array)(v.d);
+    }
     const out = {};
-    for (const k of Object.keys(v)) out[k] = fromGuest(v[k]);
+    for (const k of Object.keys(v)) {
+      if (k === '__proto__') continue;
+      out[k] = fromGuest(v[k]);
+    }
     return out;
   };
 
@@ -546,14 +685,31 @@
   ]);
   const isBlockedProp = (obj, prop) => {
     const p = String(prop);
+    if (BLOCKED_PROTO_PROPS.has(p)) return true;
     if (p.startsWith('__oaiyAgent') || p.startsWith('__zdom')) return true;
     return obj === window && BLOCKED_WIN_PROPS.has(p);
   };
+  const isHostPrototype = (obj) => {
+    if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+    if (
+      obj === Object.prototype ||
+      obj === Function.prototype ||
+      obj === Array.prototype ||
+      obj === EventTarget.prototype ||
+      obj === Node.prototype ||
+      obj === Element.prototype ||
+      obj === HTMLElement.prototype ||
+      obj === Window.prototype ||
+      obj === Document.prototype
+    ) return true;
+    const desc = Object.getOwnPropertyDescriptor(obj, 'constructor');
+    return Boolean(desc && typeof desc.value === 'function' && desc.value.prototype === obj);
+  };
   const isForbiddenHostVal = (val) => val === parentWindow || (window.top && window.top !== window && val === window.top);
 
-  const OPS = {
+  const OPS = Object.assign(Object.create(null), {
     window: () => ({ $h: handle(window), c: ['Window'] }),
-    document: () => toGuest(document),
+    document: () => document,
     get(id, prop) {
       const obj = target(id);
       if (isBlockedProp(obj, prop)) return undefined;
@@ -579,7 +735,7 @@
     },
     set(id, prop, value) {
       const obj = target(id);
-      if (isBlockedProp(obj, prop)) return undefined;
+      if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return undefined;
       let v = fromGuest(value);
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
@@ -601,7 +757,7 @@
     },
     del(id, prop) {
       const obj = target(id);
-      if (isBlockedProp(obj, prop)) return;
+      if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return;
       delete obj[prop];
     },
     call(id, method, args) {
@@ -636,6 +792,7 @@
       return result;
     },
     new(name, args) {
+      if (isBlockedProp(window, name)) throw new TypeError(`${name} is not allowed`);
       const C = window[name];
       if (typeof C !== 'function') throw new TypeError(`${name} is not available in the preview`);
       return new C(...(args || []).map(fromGuest));
@@ -648,7 +805,7 @@
       // A plain record of the browser's (a DOMRect, say): its readable properties.
       const keys = new Set(Object.keys(obj));
       for (let p = Object.getPrototypeOf(obj); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
-        for (const [k, d] of Object.entries(Object.getOwnPropertyDescriptors(p))) if (d.get && k !== 'constructor') keys.add(k);
+        for (const [k, d] of Object.entries(Object.getOwnPropertyDescriptors(p))) if (d.get && !BLOCKED_PROTO_PROPS.has(k)) keys.add(k);
       }
       return [...keys];
     },
@@ -761,23 +918,26 @@
       return undefined;
     },
     threeMod(spec) {
-      const mod = threeHost?.modules?.[String(spec)];
+      const name = String(spec);
+      const mod = threeHost && threeHost.modules && hasOwn(threeHost.modules, name) ? threeHost.modules[name] : null;
       if (!mod) throw new TypeError(`Bundled Three.js module "${spec}" is not available`);
       const out = {};
       for (const k of Object.keys(mod)) {
         const val = mod[k];
         if (typeof val === 'function') {
-          const key = `${spec}:${k}`;
+          const key = `${name}:${k}`;
           threeCallables.set(key, val);
-          out[k] = { $tc: key, n: val.name || k, ch: val.prototype ? chainOf(val.prototype) : ['Object'] };
+          const canonical = ctorNameOf(val) || k;
+          const parentChain = val.prototype ? chainOf(val.prototype).filter((n) => n !== 'Object') : [];
+          out[k] = { $tc: key, n: canonical, ch: [canonical, ...parentChain] };
         } else if (val && typeof val === 'object') {
           handleObjects.add(val);
-          out[k] = { $h: handle(val), c: chainOf(val) };
+          out[k] = { $h: handle(val), c: chainOf(val), ng: 1 };
         } else {
           out[k] = toGuest(val);
         }
       }
-      return out;
+      return { $o: out };
     },
     threeNew(key, args) {
       const C = threeCallables.get(String(key));
@@ -820,7 +980,7 @@
       const res = C[prop](...(args || []).map(fromGuest));
       return isForbiddenHostVal(res) ? undefined : res;
     },
-  };
+  });
 
   const answer = (key) => {
     if (typeof key !== 'string' || !key.startsWith(MAGIC)) return null;
@@ -831,7 +991,7 @@
       return { err: 'TypeError: malformed call' };
     }
     const [op, a, b, c] = request;
-    const fn = OPS[op];
+    const fn = typeof op === 'string' && hasOwn(OPS, op) ? OPS[op] : undefined;
     if (!fn) return { err: `TypeError: unknown operation ${op}` };
     depth++;
     let reply;

@@ -1104,7 +1104,7 @@ export default function App() {
           )}
           {/* A page in a webview of its own: the desktop lays it over this box (and takes it away while a call rings,
               whose dialog it would cover). */}
-          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing || menuOpen} />}
+          {embedded && <EmbeddedPage key={view} page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing || menuOpen} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset. `revisit`
               suppresses the entrance animation the second time you open a panel,

@@ -182,8 +182,9 @@ pub(crate) struct Recorder<'a> {
     /// such projection's in turn.
     low_rank: [Option<DeviceVec>; 3],
     /// Inputs of several rows quantized to int8 for the int8 kernels so far (the vector, its rows and width, the int8
-    /// rows): each quantized once for the matmuls that read it, until something writes it.
-    q8: Vec<(wgpu::Buffer, usize, usize, DeviceVec)>,
+    /// rows, and whether the int8 rows came from `self.scratch()` rather than persistent `Gpu::q8_kept`): each
+    /// quantized once for the matmuls that read it, until something writes it.
+    q8: Vec<(wgpu::Buffer, usize, usize, DeviceVec, bool)>,
     /// Inputs of a prompt's rows as f16 for the tensor cores so far, as `q8`.
     x16: Vec<(wgpu::Buffer, usize, usize, DeviceVec)>,
     /// The f16 queries and cache rows of the tensor cores' attention: each attention's converted into them as it runs.
@@ -502,19 +503,31 @@ impl Recorder<'_> {
         buf
     }
 
+    /// Allocate a Q8_0 activation buffer for `(src_buf, rows, width)` of `len` f32 words, returning
+    /// `(buffer_vec, is_scratch)`. Uses persistent `Gpu::q8_kept` only when `self.keep` is true and
+    /// `src_buf` is NOT a pooled scratch buffer (so pooled scratch buffers are never pinned in
+    /// `Gpu::q8_kept`).
+    pub(super) fn q8_buf(&mut self, src_buf: &wgpu::Buffer, rows: usize, width: usize, len: usize) -> (DeviceVec, bool) {
+        let is_pooled = self.pooled.iter().any(|(_, b)| b == src_buf) || self.spare.iter().any(|(_, b)| b == src_buf);
+        if self.keep && !is_pooled {
+            (DeviceVec { len, inner: Arc::new(self.gpu().q8_kept(src_buf, rows, width, (len * 4) as u64)) }, false)
+        } else {
+            (self.scratch(len), true)
+        }
+    }
+
     /// A dispatch whose bind group is the same every step (its buffers and parameters): made once and kept.
     /// `b` written by what was just recorded: its int8 rows (if quantized) are stale.
     fn wrote(&mut self, b: &wgpu::Buffer) {
         let spare = &mut self.spare;
-        // When `self.keep` is true, `q8` entries are persistent `Gpu::q8_kept` buffers (not pooled
-        // scratch) and must NEVER be recycled into `self.spare`, or later `scratch()` calls alias them.
+        // Recycle into `self.spare` ONLY when that specific `q8` entry was allocated from `self.scratch()`
+        // (`is_scratch == true`), NEVER persistent `Gpu::q8_kept` buffers (even if `self.keep` changed).
         if !self.q8.is_empty() {
-            let recycle_q8 = !self.keep;
-            self.q8.retain(|(x, _, _, v)| {
+            self.q8.retain(|(x, _, _, v, is_scratch)| {
                 if x != b {
                     return true;
                 }
-                if recycle_q8 {
+                if *is_scratch {
                     spare.push((buffer(v).size(), buffer(v).clone()));
                 }
                 false

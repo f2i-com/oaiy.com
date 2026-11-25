@@ -347,21 +347,56 @@ async fn create_run(
     State(st): State<BridgeState>,
     headers: axum::http::HeaderMap,
     own_window: Option<axum::Extension<crate::http::OwnWindow>>,
+    principal: Option<axum::Extension<crate::auth::principal::Principal>>,
+    req_info: Option<axum::Extension<crate::auth::guard::RequestInfo>>,
     Json(body): Json<RunRequestBody>,
 ) -> axum::response::Response {
     if let Err(rej) = validate(&body) {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", rej.message());
     }
+    let principal = principal.map(|axum::Extension(p)| p);
+    let in_process = req_info
+        .as_ref()
+        .is_some_and(|axum::Extension(i)| i.peer == crate::auth::guard::Peer::InProcess);
+    let is_agent_caller = from_this_process(&headers)
+        || principal.as_ref().is_some_and(|p| {
+            (matches!(
+                p.kind,
+                crate::auth::principal::PrincipalKind::Desk
+                    | crate::auth::principal::PrincipalKind::Session
+            ) && p.app == Some(crate::auth::presets::App::Agent))
+                || (in_process
+                    && !matches!(
+                        p.kind,
+                        crate::auth::principal::PrincipalKind::Pat
+                            | crate::auth::principal::PrincipalKind::Legacy
+                    ))
+        });
     // The Agent's runs are the person's and run unconfined (worker::outside_input): the name is the Agent's alone.
-    if body.caller.product == super::worker::AGENT_PRODUCT && !from_this_process(&headers) {
+    if body.caller.product == super::worker::AGENT_PRODUCT && !is_agent_caller {
         return bridge_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             format!("caller.product {:?} is this desktop's own Agent; name your app or service instead", super::worker::AGENT_PRODUCT),
         );
     }
+    let is_desktop_caller = own_window.is_some()
+        || from_this_process(&headers)
+        || principal.as_ref().is_some_and(|p| {
+            (matches!(
+                p.kind,
+                crate::auth::principal::PrincipalKind::Desk
+                    | crate::auth::principal::PrincipalKind::Session
+            ) && p.app == Some(crate::auth::presets::App::Dash))
+                || (in_process
+                    && !matches!(
+                        p.kind,
+                        crate::auth::principal::PrincipalKind::Pat
+                            | crate::auth::principal::PrincipalKind::Legacy
+                    ))
+        });
     // So are the desktop's own window's (Run history's Run again): the name is the window's alone.
-    if body.caller.product == super::worker::DESKTOP_PRODUCT && own_window.is_none() && !from_this_process(&headers) {
+    if body.caller.product == super::worker::DESKTOP_PRODUCT && !is_desktop_caller {
         return bridge_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -3249,6 +3284,102 @@ done
             assert_eq!(runs[0]["caller"], json!({ "product": "formlogic", "label": "Acme reception" }));
             let (_, body) = read(queued_runs(State(st.clone()), axum::extract::Query(query("all", 1, None, Some("n"), Some("other")))).await).await;
             assert!(body["runs"][0].get("caller").is_none(), "a run asked with no label has none");
+        }
+
+        #[tokio::test]
+        async fn create_run_scoped_principals_authorize_desktop_and_agent_without_allowing_spoofing() {
+            use crate::auth::guard::{Peer, RequestInfo};
+            use crate::auth::host::Channel;
+            use crate::auth::presets::App;
+            use crate::auth::principal::{Principal, PrincipalKind};
+            use crate::auth::scopes::ScopeSet;
+
+            let (_sb, st) = release_state("scoped-caller-product", Publishers::default());
+            st.flows.put("greeting", r#"{"name":"Greeting","nodes":[],"edges":[]}"#).unwrap();
+            let orig_id = reserve(&st, "orig-1", "greeting", None, json!({ "a": 1 }));
+
+            let make_principal = |kind: PrincipalKind, app: Option<App>| Principal {
+                id: "p1".into(),
+                kind,
+                label: "test".into(),
+                scopes: ScopeSet::all(),
+                origins: Vec::new(),
+                app,
+                elevated: false,
+                chain: Vec::new(),
+                persisted: false,
+                expires_ms: None,
+                preset: None,
+                legacy_import: false,
+            };
+            let socket_info = RequestInfo {
+                peer: Peer::Socket(std::net::SocketAddr::from(([127, 0, 0, 1], 55555))),
+                client_ip: "127.0.0.1".into(),
+                client_key: "127.0.0.1".into(),
+                via_trusted_proxy: false,
+                proto: "http",
+                host: "127.0.0.1:17972".into(),
+                host_class: None,
+                channel: Channel::Insecure,
+            };
+            let in_proc_info = RequestInfo {
+                peer: Peer::InProcess,
+                ..socket_info.clone()
+            };
+
+            let agent_body = |key: &str| -> RunRequestBody {
+                serde_json::from_value(json!({
+                    "protocol": crate::http::BRIDGE_PROTOCOL,
+                    "caller": { "product": crate::bridge::worker::AGENT_PRODUCT },
+                    "flowId": "greeting",
+                    "mode": "async",
+                    "correlationId": format!("c-{key}"),
+                    "idempotencyKey": key,
+                }))
+                .unwrap()
+            };
+            let desk_body = |key: &str| -> RunRequestBody {
+                serde_json::from_value(json!({
+                    "protocol": crate::http::BRIDGE_PROTOCOL,
+                    "caller": { "product": crate::bridge::worker::DESKTOP_PRODUCT },
+                    "flowId": "greeting",
+                    "again": orig_id,
+                    "mode": "async",
+                    "correlationId": format!("c-{key}"),
+                    "idempotencyKey": key,
+                }))
+                .unwrap()
+            };
+
+            // 1. PAT (even in-process) CANNOT spoof oaiy-agent or oaiy-desktop.
+            let pat = make_principal(PrincipalKind::Pat, None);
+            let (s, _) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(pat.clone())), Some(axum::Extension(in_proc_info.clone())), Json(agent_body("k1"))).await).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let (s, _) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(pat)), Some(axum::Extension(in_proc_info.clone())), Json(desk_body("k2"))).await).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+
+            // 2. Flows webview desk principal CANNOT spoof oaiy-agent or oaiy-desktop over socket.
+            let flows_desk = make_principal(PrincipalKind::Desk, Some(App::Flows));
+            let (s, _) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(flows_desk.clone())), Some(axum::Extension(socket_info.clone())), Json(agent_body("k3"))).await).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let (s, _) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(flows_desk)), Some(axum::Extension(socket_info.clone())), Json(desk_body("k4"))).await).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+
+            // 3. Agent webview desk principal CAN use oaiy-agent, CANNOT spoof oaiy-desktop over socket.
+            let agent_desk = make_principal(PrincipalKind::Desk, Some(App::Agent));
+            let (s, _) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(agent_desk.clone())), Some(axum::Extension(socket_info.clone())), Json(desk_body("k5"))).await).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+            let (s, b) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(agent_desk)), Some(axum::Extension(socket_info.clone())), Json(agent_body("k6"))).await).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+
+            // 4. Dashboard desk principal CAN use oaiy-desktop over socket (Run again in scoped mode).
+            let dash_desk = make_principal(PrincipalKind::Desk, Some(App::Dash));
+            let (s, b) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(dash_desk.clone())), Some(axum::Extension(socket_info)), Json(desk_body("k7"))).await).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+
+            // 5. In-process Desk call from dashboard principal CAN use oaiy-agent.
+            let (s, b) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(dash_desk)), Some(axum::Extension(in_proc_info)), Json(agent_body("k8"))).await).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
         }
     }
 }

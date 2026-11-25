@@ -28,25 +28,38 @@ export default function MoreMenu({ label, items }: { label: string; items: MoreI
   const [place, setPlace] = useState<{ top: number; left: number } | null>(null);
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
+  const focused = useRef(false);
 
   const close = (refocus = false) => {
     setOpen(false);
     setPlace(null);
+    focused.current = false;
     if (refocus) button.current?.focus();
   };
 
   // Under the button, its right edge on the button's (kept inside the window, a little off its edges, where the
   // button is near the left one); above the button where it would run off the foot of the window.
   useLayoutEffect(() => {
-    if (!open || !button.current || !menu.current) return;
+    if (!open) {
+      focused.current = false;
+      return;
+    }
+    if (!button.current || !menu.current) return;
     const b = button.current.getBoundingClientRect();
     const m = menu.current.getBoundingClientRect();
     const below = b.bottom + 4;
     const top = below + m.height > window.innerHeight - 8 && b.top - 4 - m.height >= 8 ? b.top - 4 - m.height : below;
     const left = Math.max(8, Math.min(b.right - m.width, window.innerWidth - m.width - 8));
     setPlace({ top, left });
-    menu.current.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
   }, [open]);
+
+  // Focus the first enabled item only once `place` is set and `visibility: hidden` has been removed
+  // (browsers ignore `.focus()` on elements with `visibility: hidden`), guarded so it runs once per open.
+  useLayoutEffect(() => {
+    if (!open || !place || focused.current) return;
+    focused.current = true;
+    menu.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
+  }, [open, place]);
 
   useEffect(() => {
     if (!open) return;

@@ -35,6 +35,24 @@ const MAX_ENDPOINT_LENGTH = 2048;
  * (no `process`), the credential the page holds for its desktop, for that
  * desktop's engine routes only (contractRuntime's `desktopCredential`).
  */
+/**
+ * Explicit AI/gateway pathname allowlist for attaching `OAIY_SERVER_TOKEN` in
+ * Node/CLI mode. Mirrors `contractRuntime`'s `desktopCredential` allowlist so
+ * the desktop's admin token is never sent to arbitrary server endpoints
+ * (settings, services, secrets, pairing, etc.).
+ */
+const ALLOWED_LOCAL_AI_PATHS = [
+  /^\/api\/ai\/v1\//,
+  /^\/api\/ai\/providers\/[A-Za-z0-9._-]{1,64}\/v1\//,
+  /^\/api\/ai\/engine\//,
+  /^\/api\/network\/nodes\/[A-Za-z0-9]{1,64}\/v1\/chat\/completions$/,
+];
+
+function isAllowedLocalAiPath(pathname: string): boolean {
+  if (/%2e|%2f|%5c|\\/i.test(pathname)) return false;
+  return ALLOWED_LOCAL_AI_PATHS.some((re) => re.test(pathname));
+}
+
 function localServerBearer(endpoint: string): string | null {
   // In a page: the desktop's own credential for its own engine routes, as the Service nodes send it. A page whose
   // origin the desktop does not trust (a tab connected to it, a server that trusts tokens alone) was answered 403.
@@ -43,18 +61,22 @@ function localServerBearer(endpoint: string): string | null {
   const base = process.env.OAIY_SERVER_URL;
   if (!token || !base) return null;
   try {
-    return new URL(endpoint).origin === new URL(base).origin ? token : null;
+    const u = new URL(endpoint);
+    if (u.origin !== new URL(base).origin) return null;
+    return isAllowedLocalAiPath(u.pathname) ? token : null;
   } catch {
     return null;
   }
 }
 
-/** Whether `endpoint` is the OAIY this run belongs to, not a provider. */
+/** Whether `endpoint` is an AI route on the OAIY this run belongs to, not a provider. */
 function isOwnServer(endpoint: string): boolean {
   if (localServerBearer(endpoint)) return true;
   const base = typeof process === 'undefined' || !process.env ? undefined : process.env.OAIY_SERVER_URL;
   try {
-    return !!base && new URL(endpoint).origin === new URL(base).origin;
+    if (!base) return false;
+    const u = new URL(endpoint);
+    return u.origin === new URL(base).origin && isAllowedLocalAiPath(u.pathname);
   } catch {
     return false;
   }
@@ -362,14 +384,15 @@ function getUserFriendlyError(error: string, context: string, endpoint?: string)
 /**
  * Resolve API key from constant name or direct value
  */
-function resolveApiKey(apiKeyConstant: string): string {
+function resolveApiKey(apiKeyConstant: string, allowDirectLiteral: boolean = false): string {
   if (!apiKeyConstant) return '';
 
   // Check if this looks like a direct API key (not a constant name)
-  // Common prefixes: sk- (OpenAI), anthropic- (Anthropic), gsk_ (Groq), etc.
+  // Common prefixes: sk- (OpenAI), anthropic- (Anthropic), gsk_ (Groq), AIza (Google), etc.
   if (apiKeyConstant.startsWith('sk-') ||
       apiKeyConstant.startsWith('anthropic-') ||
       apiKeyConstant.startsWith('gsk_') ||
+      apiKeyConstant.startsWith('AIza') ||
       apiKeyConstant.length > 40) {
     // Likely a direct API key, return as-is
     return apiKeyConstant;
@@ -382,7 +405,13 @@ function resolveApiKey(apiKeyConstant: string): string {
   }
   // Try module settings
   const settingKey = ctx.getModuleSetting(apiKeyConstant);
-  if (typeof settingKey === 'string') return settingKey;
+  if (typeof settingKey === 'string' && settingKey) return settingKey;
+  // When called from APIs that accept a literal key directly (e.g. AI.vision),
+  // preserve non-constant-shaped literal keys instead of dropping them, while
+  // still refusing to send an unresolved ENV_VAR_NAME as a bearer token.
+  if (allowDirectLiteral && !/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(apiKeyConstant)) {
+    return apiKeyConstant;
+  }
   // Return empty if not found
   return '';
 }
@@ -695,7 +724,8 @@ async function chat(
   videoFrames: number = 8,
   customBodyTemplate: string = '',
   customResponsePath: string = '',
-  customHeaders: string = ''
+  customHeaders: string = '',
+  allowDirectApiKey: boolean = false
 ): Promise<string> {
   // Check for abort before starting
   if (ctx.abortSignal?.aborted) {
@@ -907,25 +937,26 @@ async function chat(
       ctx.log('error', `[AI] oaiy-local chat failed: ${msg}`);
       ctx.onNodeStatus?.(nodeId, 'error');
       throw err;
-    }
-    // Note: NO eager unload here anymore. Earlier versions called
-    // `plugin:oaiy-llm|llm_unload_model` after every chat to free VRAM
-    // for downstream diffusion, but that forced a full ~12-15 s cold
-    // reload on the *next* LLM call (and on every chain re-run, even
-    // when the GGUF is already on the OS disk cache). The replacement
-    // is cross-plugin eviction: `plugin-diffusion`'s
-    // `ensureLoadedWithQuant` calls `plugin:oaiy-llm|llm_unload_all`
-    // right before it loads its own heavy weights, so VRAM stays safe
-    // for the chain workflow without making pure-LLM workflows pay a
-    // cold reload on every call.
-    // The user can still manually evict via `Diffusion.unloadModel` or
-    // the Models settings tab if they want to free VRAM explicitly.
-    // Set `OAIY_LLM_EAGER_UNLOAD=1` to restore the legacy behaviour.
-    const eagerEnv = (
-      (globalThis as Record<string, unknown>).process as { env?: Record<string, string> } | undefined
-    )?.env?.OAIY_LLM_EAGER_UNLOAD;
-    if (eagerEnv === '1') {
-      await tryEagerLlmUnload(model);
+    } finally {
+      // Note: NO eager unload by default. Earlier versions called
+      // `plugin:oaiy-llm|llm_unload_model` after every chat to free VRAM
+      // for downstream diffusion, but that forced a full ~12-15 s cold
+      // reload on the *next* LLM call (and on every chain re-run, even
+      // when the GGUF is already on the OS disk cache). The replacement
+      // is cross-plugin eviction: `plugin-diffusion`'s
+      // `ensureLoadedWithQuant` calls `plugin:oaiy-llm|llm_unload_all`
+      // right before it loads its own heavy weights, so VRAM stays safe
+      // for the chain workflow without making pure-LLM workflows pay a
+      // cold reload on every call.
+      // The user can still manually evict via `Diffusion.unloadModel` or
+      // the Models settings tab if they want to free VRAM explicitly.
+      // Set `OAIY_LLM_EAGER_UNLOAD=1` to restore the legacy behaviour.
+      const eagerEnv = (
+        (globalThis as Record<string, unknown>).process as { env?: Record<string, string> } | undefined
+      )?.env?.OAIY_LLM_EAGER_UNLOAD;
+      if (eagerEnv === '1') {
+        await tryEagerLlmUnload(model);
+      }
     }
   }
 
@@ -1182,7 +1213,7 @@ async function chat(
   }
 
   // Resolve API key
-  const apiKey = resolveApiKey(apiKeyConstant);
+  const apiKey = resolveApiKey(apiKeyConstant, allowDirectApiKey);
 
   if (!endpoint) {
     ctx.onNodeStatus?.(nodeId, 'error');
@@ -1281,7 +1312,9 @@ async function chat(
         try {
           headers = JSON.parse(renderTemplate(customHeaders, tplVars, false)) as Record<string, string>;
         } catch (e) {
-          ctx.log('warn', `[AI] Custom Headers JSON invalid; using defaults: ${e}`);
+          const rawErr = e instanceof Error ? e.message : String(e);
+          const safeErr = apiKey ? rawErr.split(apiKey).join('[redacted]') : rawErr;
+          ctx.log('warn', `[AI] Custom Headers JSON invalid; using defaults: ${safeErr}`);
         }
       }
       if (apiKey && !('Authorization' in headers) && !('authorization' in headers)) {
@@ -1291,7 +1324,9 @@ async function chat(
       try {
         body = JSON.parse(renderedBody) as Record<string, unknown>;
       } catch (e) {
-        throw new Error(`[AI] Custom body template did not render to valid JSON: ${e instanceof Error ? e.message : String(e)}. Rendered: ${renderedBody.slice(0, 300)}`);
+        const rawErr = e instanceof Error ? e.message : String(e);
+        const safeErr = apiKey ? rawErr.split(apiKey).join('[redacted]') : rawErr;
+        throw new Error(`[AI] Custom body template did not render to valid JSON: ${safeErr}. Template: ${customBodyTemplate.slice(0, 300)}`);
       }
     } else if (isAnthropic) {
       // Anthropic Messages API format. The system prompt is a field of its own, not a turn: every system turn goes
@@ -1404,6 +1439,23 @@ async function chat(
     // Retry loop for 503 (service still loading) with progress logging
     const maxRetries = 60; // Up to ~5 minutes of retrying
     const retryDelayMs = 5000;
+    const sleepWithAbort = (ms: number, signal?: AbortSignal): Promise<void> =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+
     let response: Response | undefined;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (ctx.abortSignal?.aborted) {
@@ -1413,6 +1465,7 @@ async function chat(
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: ctx.abortSignal,
         nodeId,
         purpose: 'AI/LLM chat request',
       });
@@ -1422,7 +1475,11 @@ async function chat(
       const errorText = await response.text();
       ctx.log('info', `[AI] Service loading: ${errorText.substring(0, 200)} (retrying in ${retryDelayMs / 1000}s...)`);
       ctx.onNodeStatus?.(nodeId, 'running');
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      await sleepWithAbort(retryDelayMs, ctx.abortSignal);
+      if (ctx.abortSignal?.aborted) {
+        ctx.log('info', '[AI] Aborted by user during retry wait');
+        return '__ABORT__';
+      }
     }
 
     if (!response || !response.ok) {
@@ -1575,7 +1632,7 @@ async function vision(
     finalInput,
     endpoint,
     model,
-    '', // apiKeyConstant not used, apiKey passed directly
+    apiKey || '', // Supports constant name or direct literal API key
     false, // streaming
     maxTokens,
     0.7, // temperature
@@ -1588,7 +1645,13 @@ async function vision(
     maxImageDimension,
     maxImageSizeKB,
     false, // enableThinking
-    mmprojPath
+    mmprojPath,
+    null, // videoInput already extracted above
+    8, // videoFrames
+    '', // customBodyTemplate
+    '', // customResponsePath
+    '', // customHeaders
+    true // allowDirectApiKey
   );
 }
 

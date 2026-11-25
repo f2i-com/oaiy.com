@@ -456,7 +456,7 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 /// file's (one as large, but not it, is fetched again).
 fn in_place(studio_root: &Path, f: &Planned) -> bool {
     match f.size {
-        Some(s) => size_of(&f.dest) == s && !f.sha256.as_deref().is_some_and(|want| library::known(studio_root, &f.dest).is_some_and(|h| h != want)),
+        Some(s) => f.dest.is_file() && size_of(&f.dest) == s && !f.sha256.as_deref().is_some_and(|want| library::known(studio_root, &f.dest).is_some_and(|h| h != want)),
         None => f.dest.is_file(),
     }
 }
@@ -479,7 +479,7 @@ fn configured(cfg: &Json, group: &str, id: &str) -> bool {
 }
 
 /// Whether `cfg` already configures catalog entry `e` under its exact id OR (for LLMs registered with a
-/// quantization suffix like `gemma-4-31b-it-q4-k-m`) with a `model_path` matching `e.add[0]`'s filename.
+/// quantization suffix like `gemma-4-31b-it-q4-k-m`) with a `path` matching `e.add[0]`'s filename.
 fn configured_entry(cfg: &Json, e: &Json) -> bool {
     let id = str_or(e, "id", "");
     let group = str_or(e, "group", "");
@@ -499,7 +499,7 @@ fn configured_entry(cfg: &Json, e: &Json) -> bool {
                 .unwrap_or(&[])
                 .iter()
                 .any(|m| {
-                    let p = str_or(m, "model_path", "");
+                    let p = str_or(m, "path", "");
                     !p.is_empty()
                         && Path::new(p)
                             .file_name()
@@ -1702,13 +1702,16 @@ impl Downloads {
             }
             loop {
                 // A partial file that is whole already needs only its name.
-                if !f.size.is_some_and(|s| size_of(&part) == s) {
+                if !f.size.is_some_and(|s| part.is_file() && size_of(&part) == s) {
                     let want = self.curl(&cfg, id, f, &part, done, gated)?;
                     if want != Want::Run {
                         return Ok(want);
                     }
                 }
                 if let Some(s) = f.size {
+                    if !part.is_file() {
+                        return Err(format!("{shown}: partial file missing after download; resume the download to try again"));
+                    }
                     let got = size_of(&part);
                     if got > s {
                         // (so the next try begins it again, rather than be refused at its end as this one was)
@@ -2193,7 +2196,7 @@ mod tests {
     /// A model already in the settings under the catalog's name, added from wherever its files are, is said to be so.
     #[test]
     fn a_model_in_the_settings_by_the_catalogs_name_is_said_to_be_there() {
-        let cfg = Json::parse(br#"{"llm":{"models":[{"name":"qwen3.5-9b"},{"name":"gemma-4-31b-it-q4-k-m","model_path":"C:/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"}]},"media":{"image":{"models":{"qwen-image-2.1-turbo":{}}}}}"#).unwrap();
+        let cfg = Json::parse(br#"{"llm":{"models":[{"name":"qwen3.5-9b"},{"name":"gemma-4-31b-it-q4-k-m","path":"C:/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"}]},"media":{"image":{"models":{"qwen-image-2.1-turbo":{}}}}}"#).unwrap();
         assert!(configured(&cfg, "llm", "qwen3.5-9b"));
         assert!(configured(&cfg, "image", "qwen-image-2.1-turbo"));
         assert!(!configured(&cfg, "image", "flux-3-image-klein"));
@@ -2203,6 +2206,19 @@ mod tests {
         assert!(configured_entry(&cfg, gemma31), "GGUF registered with quant suffix matches via filename");
         let gemma26 = entry("gemma-4-26b-a4b").expect("gemma-4-26b-a4b in catalog");
         assert!(!configured_entry(&cfg, gemma26));
+    }
+
+    #[test]
+    fn zero_byte_catalog_file_is_not_in_place_until_it_exists() {
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-dl-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("empty.txt");
+        let f = Planned { url: String::new(), dest: dest.clone(), size: Some(0), hub: false, sha256: None };
+        assert!(!in_place(&dir, &f), "missing file must not match size 0");
+        std::fs::write(&dest, b"").unwrap();
+        assert!(in_place(&dir, &f), "existing 0-byte file is in place");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

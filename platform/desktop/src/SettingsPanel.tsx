@@ -259,10 +259,12 @@ export function StorageSettings() {
     refresh();
   }, [refresh]);
 
-  // When a folder change is pending, ask what could be brought over. The
-  // offer resets (un-skips) whenever the pending target changes.
+  // When a folder change is pending (including "Reset to default", where
+  // configuredDir is null while restartRequired is true), ask what could be
+  // brought over. Do not reset `mig` here so an active or completed migration
+  // restored on mount is never clobbered.
   useEffect(() => {
-    if (!cfg?.restartRequired || !cfg.configuredDir) {
+    if (!cfg?.restartRequired) {
       setPlan(null);
       return;
     }
@@ -273,7 +275,6 @@ export function StorageSettings() {
         if (!cancelled) {
           setPlan(p);
           setSkipped(false);
-          setMig(null);
         }
       })
       .catch(() => {
@@ -282,7 +283,7 @@ export function StorageSettings() {
     return () => {
       cancelled = true;
     };
-  }, [cfg?.restartRequired, cfg?.configuredDir]);
+  }, [cfg?.restartRequired, cfg?.configuredDir, cfg?.defaultDir]);
 
   // Stop polling on unmount.
   useEffect(() => {
@@ -381,15 +382,20 @@ export function StorageSettings() {
     [watchMigration],
   );
 
-  // A copy or move still running from before Settings was opened: shown and followed, not offered again.
+  // A copy or move still running (or already completed for this session) from
+  // before Settings was opened: shown and followed, not offered again.
   useEffect(() => {
     let gone = false;
     appConfig
       .migrationStatus()
       .then((s) => {
-        if (gone || !s.running) return;
-        setMig(s);
-        watchMigration(s.mode);
+        if (gone) return;
+        if (s.running) {
+          setMig(s);
+          watchMigration(s.mode);
+        } else if (s.done && !s.error) {
+          setMig(s);
+        }
       })
       .catch(() => {});
     return () => {
@@ -410,6 +416,7 @@ export function StorageSettings() {
       try {
         await appConfig.setDataDir(path);
         setManualPath('');
+        if (!migInFlightRef.current) setMig(null);
         await refresh();
         toast.push({
           kind: 'success',

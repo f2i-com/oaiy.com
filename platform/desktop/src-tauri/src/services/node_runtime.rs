@@ -368,7 +368,7 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
         uuid::Uuid::new_v4()
     ));
     let mut hasher = Sha256::new();
-    {
+    let download_res: Result<(), String> = (|| {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -400,6 +400,11 @@ fn install_node_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
                 );
             }
         }
+        Ok(())
+    })();
+    if let Err(e) = download_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
 
     let actual_sha = super::python::hex_lower(&hasher.finalize());

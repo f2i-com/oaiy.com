@@ -285,17 +285,30 @@ export function isSoftnProject(vfs: Vfs): boolean {
 }
 
 /**
- * The app whose page the project file at `path` is (no leading slash), or null: an app's `index.html` is a page of the
- * app, shown as the app, not a web page of the project. The innermost app holding the file is its app, and a file it
- * keeps out of itself (assets/, builder/, the project's uploads/) is no page of it.
+ * The innermost SoftN app folder that owns the project file at `path` (no leading slash), or null.
+ * Unlike [`softnAppOf`], this matches any file belonging to the app (such as `manifest.json`, `.sql`,
+ * `.db`, `db/*.json`, scripts, or assets), while still excluding `builder/` and the root `uploads/`.
  */
-export function softnAppOf(vfs: Vfs, path: string, apps = findApps(vfs)): string | null {
+export function softnOwnerApp(vfs: Vfs, path: string, apps = findApps(vfs)): string | null {
   const file = path.replace(/^\/+/, '');
   const root = apps.filter((r) => r === '' || file.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
   if (root === undefined) return null;
   const rel = root ? file.slice(root.length + 1) : file;
   const first = rel.split('/')[0];
   if (first === 'builder' || (root === '' && first === 'uploads')) return null;
+  return root;
+}
+
+/**
+ * The app whose page the project file at `path` is (no leading slash), or null: an app's `index.html` is a page of the
+ * app, shown as the app, not a web page of the project. The innermost app holding the file is its app, and a file it
+ * keeps out of itself (assets/, builder/, the project's uploads/) is no page of it.
+ */
+export function softnAppOf(vfs: Vfs, path: string, apps = findApps(vfs)): string | null {
+  const root = softnOwnerApp(vfs, path, apps);
+  if (root === null) return null;
+  const file = path.replace(/^\/+/, '');
+  const rel = root ? file.slice(root.length + 1) : file;
   return isAppPagePath(rel) ? root : null;
 }
 
@@ -738,10 +751,13 @@ JSON.stringify(out)`;
 }
 
 /** Compile-check the app's logic on the Zipp sandbox (no network, no writes). */
-export function logicSyntax(vfs: Vfs, root = ''): Promise<Finding[]> {
+export function logicSyntax(vfs: Vfs, root = '', signal?: AbortSignal): Promise<Finding[]> {
   return checkLogicSyntax(vfs, root, async (source) => {
+    if (signal?.aborted) throw signal.reason ?? new Error('aborted');
     const host = new SandboxHost(vfs, new NetGate({ mode: 'blocked' }), 'softn_check', 15_000);
-    const outcome = await runInSandbox({ lang: 'js', source, limits: { maxSteps: 500_000_000 } }, host, { timeoutMs: 15_000 });
+    host.signal = signal;
+    const outcome = await runInSandbox({ lang: 'js', source, limits: { maxSteps: 500_000_000 } }, host, { timeoutMs: 15_000, signal });
+    if (signal?.aborted) throw signal.reason ?? new Error('aborted');
     return outcome.result?.value;
   });
 }

@@ -237,18 +237,39 @@ pub fn moe_forward_with_logits(
 // exact same routing math (equivalence with the resident path by construction).
 pub(crate) fn top_k_softmax(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
     let k = k.min(logits.len());
-    // Index + value pairs.
-    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    // Index + value pairs; map NaN to -inf so it never panics or beats finite logits.
+    let mut pairs: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i, if v.is_nan() { f32::NEG_INFINITY } else { v }))
+        .collect();
+    let cmp = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
     // Partial sort to get the top-K (largest values first).
-    pairs.select_nth_unstable_by(k.saturating_sub(1), |a, b| b.1.partial_cmp(&a.1).unwrap());
+    pairs.select_nth_unstable_by(k - 1, cmp);
     pairs.truncate(k);
-    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    pairs.sort_by(cmp);
 
     // Softmax over the top-K logits.
     let max_l = pairs[0].1;
-    let exps: Vec<f32> = pairs.iter().map(|(_, l)| (l - max_l).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+    let weights: Vec<f32> = if max_l.is_finite() {
+        let exps: Vec<f32> = pairs.iter().map(|(_, l)| (l - max_l).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        if sum > 0.0 && sum.is_finite() {
+            exps.into_iter().map(|e| e / sum).collect()
+        } else {
+            vec![1.0 / k as f32; k]
+        }
+    } else if max_l.is_infinite() && max_l.is_sign_positive() {
+        let exps: Vec<f32> = pairs.iter().map(|(_, l)| if *l == f32::INFINITY { 1.0 } else { 0.0 }).collect();
+        let sum: f32 = exps.iter().sum();
+        exps.into_iter().map(|e| e / sum).collect()
+    } else {
+        vec![1.0 / k as f32; k]
+    };
     let indices: Vec<usize> = pairs.iter().map(|(i, _)| *i).collect();
     (indices, weights)
 }
@@ -269,6 +290,24 @@ mod tests {
         assert!((w[1] - 0.119).abs() < 0.005, "expert 3 weight: got {}, want ~0.119", w[1]);
         let sum: f32 = w.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "weights sum to ~1.0; got {sum}");
+    }
+
+    #[test]
+    fn top_k_softmax_handles_nan_and_non_finite_logits() {
+        // NaNs must never panic or outrank finite logits.
+        let (idx, w) = top_k_softmax(&[f32::NAN, 1.0, f32::NAN, 3.0, -5.0], 2);
+        assert_eq!(idx, vec![3, 1]);
+        assert!(w.iter().all(|x| x.is_finite() && *x > 0.0));
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+
+        // All-NaN produces finite normalized weights without panicking.
+        let (idx_all, w_all) = top_k_softmax(&[f32::NAN, f32::NAN, f32::NAN], 2);
+        assert_eq!(idx_all, vec![0, 1]);
+        assert!(w_all.iter().all(|x| x.is_finite() && (*x - 0.5).abs() < 1e-5));
+
+        // Empty / k == 0 returns empty without panicking.
+        assert_eq!(top_k_softmax(&[], 2), (vec![], vec![]));
+        assert_eq!(top_k_softmax(&[1.0, 2.0], 0), (vec![], vec![]));
     }
 
     #[test]

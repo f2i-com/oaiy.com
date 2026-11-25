@@ -666,7 +666,7 @@ pub(in crate::chain) fn attention_coop_full(hd: usize) -> String {
 pub(in crate::chain) fn attention_coop_masked(hd: usize) -> String {
     attention_coop(hd)
         .replace("@group(0) @binding(2) var<storage, read_write> y: array<f32>;", "@group(0) @binding(2) var<storage, read> mask: array<u32>;\n@group(0) @binding(6) var<storage, read_write> y: array<f32>;")
-        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}")
+        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    if (row >= p.rows) { return false; }\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}")
         .replace("if (kp <= qpos && kp < p.kv_len) {", "if (kp <= qpos && kp < p.kv_len && kept(q0 + tr, qpos, kp)) {")
 }
 
@@ -677,7 +677,7 @@ pub(in crate::chain) fn attention_coop_masked(hd: usize) -> String {
 pub(in crate::chain) fn attention_coop_one_masked(hd: usize) -> String {
     let mut src = attention_coop_one(hd, false)
         .replace("@group(0) @binding(2) var<storage, read_write> y: array<f32>;", "@group(0) @binding(2) var<storage, read> mask: array<u32>;\n@group(0) @binding(6) var<storage, read_write> y: array<f32>;")
-        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}");
+        .replace("@group(0) @binding(3) var<uniform> p: Params;", "@group(0) @binding(8) var<uniform> p: Params;\n\n// whether query `row` (at `qpos`) attends to position `kp`: its tail block's, or a block it kept\nfn kept(row: u32, qpos: u32, kp: u32) -> bool {\n    if (row >= p.rows) { return false; }\n    let b = kp / p._pad0;\n    if (b >= (qpos + 1u) / p._pad0) { return true; }\n    return ((mask[row * p._pad1 + b / 32u] >> (b % 32u)) & 1u) == 1u;\n}");
     assert!(src.contains("fn kept(") && src.contains("binding(6) var<storage, read_write> y"), "the mask's bindings");
     for j in 0..8 {
         let seen = format!("(k{j} <= vec4<u32>(qpos)) & (k{j} < vec4<u32>(p.kv_len))");

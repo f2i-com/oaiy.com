@@ -244,9 +244,7 @@ impl<'a> SplitRun<'a> {
         let pos = self.past0 + at;
         let hv = self.chain.vec(t * s.d);
         self.chain.upload(&hv, hidden);
-        if t > 1 {
-            self.chained.mtp_prompt(self.m, self.st, spec, self.chain, rec, &self.emb[at * s.d..(at + t) * s.d], &hv, t, pos, self.owner);
-        }
+        self.chained.mtp_prompt(self.m, self.st, spec, self.chain, rec, &self.emb[at * s.d..(at + t) * s.d], &hv, t, pos, self.owner);
         rec.copy(&hv, (t - 1) * s.d, &spec.hid, 0, s.d);
         *spec.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (pos + t - 1, 1);
     }

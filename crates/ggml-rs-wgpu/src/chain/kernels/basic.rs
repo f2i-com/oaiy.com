@@ -398,9 +398,12 @@ var<workgroup> found: array<u32, 2>;
 var<workgroup> bv: array<f32, 256>;
 var<workgroup> bi: array<u32, 256>;
 
-// larger float, larger key
+// larger float, larger key; NaN maps to 0u (below -inf) so it never beats finite logits
 fn key(v: f32) -> u32 {
     let b = bitcast<u32>(v);
+    if ((b & 0x7fffffffu) > 0x7f800000u) {
+        return 0u;
+    }
     return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
 }
 
@@ -480,14 +483,15 @@ fn main(@builtin(local_invocation_index) t: u32) {
     var best = -3.4e38;
     var bidx = 0xffffffffu;
     for (var i = lo; i < hi; i++) {
-        let v = x[start + i];
-        let kk = key(v);
+        let raw = x[start + i];
+        let kk = key(raw);
         var candidate = kk > prefix;
         if (kk == prefix) {
             candidate = taken < need;
             taken++;
         }
         if (candidate) {
+            let v = select(raw, bitcast<f32>(0xff800000u), kk == 0u);
             var s = v;
             if (!greedy) {
                 let h = pcg(seed ^ pcg(draw ^ pcg(at ^ pcg(i))));

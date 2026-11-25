@@ -101,6 +101,8 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+const utf8Encoder = new TextEncoder();
+
 /** What the header says about the open file's saving. */
 type SaveState = 'clean' | 'saving' | 'saved' | 'conflict' | 'error' | 'binary' | 'media';
 
@@ -129,6 +131,7 @@ export class EditorPane {
   private view: EditorView | null = null;
   private path: string | null = null;
   private dirty = false;
+  private dirtyBytes: number | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private savedTimer: ReturnType<typeof setTimeout> | null = null;
   private applying = false;
@@ -209,7 +212,9 @@ export class EditorPane {
     const col = sel.head - line.from + 1;
     this.statusPos.textContent = `Ln ${line.number}, Col ${col}`;
     this.statusLang.textContent = languageLabel(this.path);
-    const bytes = this.known?.byteLength ?? this.view.state.doc.length;
+    const bytes = this.dirty
+      ? (this.dirtyBytes ?? utf8Encoder.encode(this.view.state.doc.toString()).byteLength)
+      : (this.known?.byteLength ?? utf8Encoder.encode(this.view.state.doc.toString()).byteLength);
     this.statusSize.textContent = `${this.view.state.doc.lines.toLocaleString()} lines · ${formatBytes(bytes)}`;
     this.statusBar.hidden = false;
   }
@@ -242,6 +247,7 @@ export class EditorPane {
       /* the project cannot take it: nothing more to do as the file is left */
     }
     this.dirty = false;
+    this.dirtyBytes = null;
   }
 
   /** The header for a file (or none): its icon, its path as a breadcrumb, and how its saving stands. */
@@ -342,6 +348,10 @@ export class EditorPane {
     this.keepMine();
     this.conflict = false;
     this.conflictBar.hidden = true;
+    if (this.vfs.stat(path)?.type !== 'file') {
+      this.close();
+      return;
+    }
     if (mediaKind(path) && !options.source) {
       this.showMedia(path);
       return;
@@ -359,6 +369,8 @@ export class EditorPane {
     }
     if (doc === null) {
       this.path = null;
+      this.dirty = false;
+      this.dirtyBytes = null;
       this.view?.destroy();
       this.view = null;
       clear(this.body);
@@ -369,6 +381,7 @@ export class EditorPane {
     }
     this.path = path;
     this.dirty = false;
+    this.dirtyBytes = null;
     this.known = this.vfs.readBytes(path);
     this.header(path);
     const state = EditorState.create({
@@ -380,12 +393,14 @@ export class EditorPane {
         this.language.of(languageFor(path)),
         this.name.of(nameFor(path)),
         EditorView.updateListener.of((update) => {
+          if (update.docChanged && !this.applying) {
+            this.dirty = true;
+            this.dirtyBytes = utf8Encoder.encode(update.state.doc.toString()).byteLength;
+            if (!this.conflict) this.setState('saving');
+            if (this.saveTimer) clearTimeout(this.saveTimer);
+            this.saveTimer = setTimeout(() => this.flush(), 400);
+          }
           if (update.selectionSet || update.docChanged) this.updateStatusBar();
-          if (!update.docChanged || this.applying) return;
-          this.dirty = true;
-          if (!this.conflict) this.setState('saving');
-          if (this.saveTimer) clearTimeout(this.saveTimer);
-          this.saveTimer = setTimeout(() => this.flush(), 400);
         }),
       ],
     });
@@ -405,8 +420,10 @@ export class EditorPane {
     try {
       this.vfs.writeFile(this.path, this.view.state.doc.toString(), { parents: true });
       this.dirty = false;
+      this.dirtyBytes = null;
       this.known = this.vfs.readBytes(this.path);
       this.setState('saved');
+      this.updateStatusBar();
     } catch (error) {
       this.setState('error', (error as Error).message);
     }
@@ -438,22 +455,38 @@ export class EditorPane {
       }
     }
     if (this.mediaPath && (path === null || `/${path}` === this.mediaPath)) {
-      if (this.vfs.exists(this.mediaPath)) this.showMedia(this.mediaPath);
+      if (this.vfs.stat(this.mediaPath)?.type === 'file') this.showMedia(this.mediaPath);
       else this.close();
       return;
     }
     if (!this.path || (path !== null && `/${path}` !== this.path)) return;
-    if (!this.vfs.exists(this.path)) {
+    if (this.vfs.stat(this.path)?.type !== 'file') {
       this.close();
       return;
     }
     if (!this.view) return;
-    const text = this.vfs.readText(this.path);
+    let text: string | null = null;
+    if (this.vfs.isText(this.path)) {
+      try {
+        text = this.vfs.readText(this.path);
+      } catch {
+        text = null;
+      }
+    }
+    if (text === null) {
+      if (this.dirty) {
+        this.showConflict();
+      } else {
+        this.open(this.path);
+      }
+      return;
+    }
     if (text === this.view.state.doc.toString()) return;
     if (this.dirty) {
       this.showConflict();
       return;
     }
+    this.dirtyBytes = null;
     this.known = this.vfs.readBytes(this.path);
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
@@ -539,12 +572,29 @@ export class EditorPane {
       return;
     }
     this.dirty = false;
+    this.dirtyBytes = null;
     this.setState('clean');
-    const text = this.vfs.exists(this.path) ? this.vfs.readText(this.path) : '';
-    this.known = this.vfs.exists(this.path) ? this.vfs.readBytes(this.path) : null;
+    if (this.vfs.stat(this.path)?.type !== 'file') {
+      this.close();
+      return;
+    }
+    let text: string | null = null;
+    if (this.vfs.isText(this.path)) {
+      try {
+        text = this.vfs.readText(this.path);
+      } catch {
+        text = null;
+      }
+    }
+    if (text === null) {
+      this.open(this.path);
+      return;
+    }
+    this.known = this.vfs.readBytes(this.path);
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
     this.applying = false;
+    this.updateStatusBar();
   }
 
   /** Closed with its button: what was typed is saved first, and nothing is open after. */
@@ -563,6 +613,7 @@ export class EditorPane {
     this.view = null;
     this.path = null;
     this.dirty = false;
+    this.dirtyBytes = null;
     this.known = null;
     this.showEmpty();
   }

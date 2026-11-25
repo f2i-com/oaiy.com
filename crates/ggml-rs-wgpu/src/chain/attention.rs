@@ -199,7 +199,7 @@ impl Recorder<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_rows_group_wide(&mut self, q: &DeviceVec, kv: &DeviceVec, halves: bool, out: &DeviceVec, rows: usize, n_h: usize, n_kv: usize, head_dim: usize, past: usize, window: Option<usize>, scale: f32) {
         let kv_len = past + rows;
-        let runs = kv_len.div_ceil(SPLIT).max(1);
+        let runs = window.filter(|&w| w > 0).map_or(kv_len, |w| w.min(kv_len)).div_ceil(SPLIT).max(1);
         let g = n_h / n_kv.max(1);
         let kv_values = if halves { kv.len * 2 } else { kv.len };
         assert!(

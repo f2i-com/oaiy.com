@@ -103,11 +103,11 @@ impl Recorder<'_> {
     pub(crate) fn x_q8(&mut self, x: &DeviceVec, m: usize, k: usize) -> (DeviceVec, usize) {
         let (len, xs_at) = crate::quant::shaders::q8_len(m, k);
         let xb = buffer(x).clone();
-        if let Some((.., xq)) = self.q8.iter().find(|(b, rows, width, _)| *b == xb && *rows == m && *width == k) {
+        if let Some((_, _, _, xq, _)) = self.q8.iter().find(|(b, rows, width, _, _)| *b == xb && *rows == m && *width == k) {
             return (xq.clone(), xs_at);
         }
         // (a kept recording's own buffer for them, the same every run, so the recording is replayed; else scratch)
-        let xq = if self.keeps() { DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&xb, m, k, (len * 4) as u64)) } } else { self.scratch(len) };
+        let (xq, is_scratch) = self.q8_buf(&xb, m, k, len);
         let blocks = (m * k / 32) as u32;
         // (a device whose subgroups are 32 lanes: 8 lanes a block, [`crate::quant::shaders::QUANT_Q8_LANES`])
         let (quant, groups) = if self.gpu().subgroups32() {
@@ -117,7 +117,7 @@ impl Recorder<'_> {
         };
         let d = self.gpu().dummy().clone();
         self.dispatch_kept(&quant, &d, buffer(x), buffer(&xq), &[k as u32, m as u32, xs_at as u32], (groups.min(65535), groups.div_ceil(65535), 1));
-        self.q8.push((xb, m, k, xq.clone()));
+        self.q8.push((xb, m, k, xq.clone(), is_scratch));
         (xq, xs_at)
     }
 
@@ -143,10 +143,10 @@ impl Recorder<'_> {
         let (len, xs_at) = crate::quant::shaders::q8_len(1, k);
         let ob = buffer(out).clone();
         // (a kept recording's own buffer for them, the same every run, so the recording is replayed; else scratch)
-        let xq = if self.keeps() { DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, k, (len * 4) as u64)) } } else { self.scratch(len) };
+        let (xq, is_scratch) = self.q8_buf(&ob, 1, k, len);
         let d = self.gpu().dummy().clone();
         self.dispatch_wide("chain-rmsnorm-q8", crate::quant::shaders::NORM_Q8_LANES, [buffer(x), buffer(w), &d, &d, &d, &d, buffer(out), buffer(&xq)], &[k as u32, eps.to_bits(), xs_at as u32], ((k as u32 / 32).div_ceil(32), 1, 1));
-        self.q8.push((ob, 1, k, xq));
+        self.q8.push((ob, 1, k, xq, is_scratch));
         true
     }
 
@@ -170,11 +170,7 @@ impl Recorder<'_> {
         }
         let (len, xs_at) = crate::quant::shaders::q8_len(1, k);
         let ob = buffer(out).clone();
-        let xq = if self.keeps() {
-            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, k, (len * 4) as u64)) }
-        } else {
-            self.scratch(len)
-        };
+        let (xq, is_scratch) = self.q8_buf(&ob, 1, k, len);
         let d = self.gpu().dummy().clone();
         self.dispatch_wide(
             "chain-add-rmsnorm-q8",
@@ -183,7 +179,7 @@ impl Recorder<'_> {
             &[k as u32, eps.to_bits(), xs_at as u32],
             (1, 1, 1),
         );
-        self.q8.push((ob, 1, k, xq));
+        self.q8.push((ob, 1, k, xq, is_scratch));
         true
     }
 
@@ -203,11 +199,7 @@ impl Recorder<'_> {
         }
         let (len, xs_at) = crate::quant::shaders::q8_len(1, ff);
         let ob = buffer(out).clone();
-        let xq = if self.keeps() {
-            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, ff, (len * 4) as u64)) }
-        } else {
-            self.scratch(len)
-        };
+        let (xq, is_scratch) = self.q8_buf(&ob, 1, ff, len);
         let d = self.gpu().dummy().clone();
         let (name, src) = if gelu {
             ("chain-gelu-mul-split-q8", crate::quant::shaders::GELU_MUL_SPLIT_Q8_LANES)
@@ -215,7 +207,7 @@ impl Recorder<'_> {
             ("chain-silu-mul-split-q8", crate::quant::shaders::SILU_MUL_SPLIT_Q8_LANES)
         };
         self.dispatch_wide(name, src, [buffer(fused), &d, &d, &d, &d, &d, buffer(out), buffer(&xq)], &[ff as u32, xs_at as u32], ((ff as u32 / 32).div_ceil(32), 1, 1));
-        self.q8.push((ob, 1, ff, xq));
+        self.q8.push((ob, 1, ff, xq, is_scratch));
         true
     }
 
@@ -239,13 +231,7 @@ impl Recorder<'_> {
         }
         let (qlen, xs_at) = crate::quant::shaders::q8_len(1, len);
         let ob = buffer(out).clone();
-        // Never pin a pooled scratch buffer in `Gpu::q8_kept` (which is keyed by buffer identity).
-        let is_pooled = self.pooled.iter().any(|(_, b)| b == &ob) || self.spare.iter().any(|(_, b)| b == &ob);
-        let xq = if self.keeps() && !is_pooled {
-            DeviceVec { len: qlen, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, len, (qlen * 4) as u64)) }
-        } else {
-            self.scratch(qlen)
-        };
+        let (xq, is_scratch) = self.q8_buf(&ob, 1, len, qlen);
         let d = self.gpu().dummy().clone();
         self.dispatch_wide(
             "chain-silu-mul-q8",
@@ -254,7 +240,7 @@ impl Recorder<'_> {
             &[len as u32, xs_at as u32],
             ((len as u32 / 32).div_ceil(32), 1, 1),
         );
-        self.q8.push((ob, 1, len, xq));
+        self.q8.push((ob, 1, len, xq, is_scratch));
         true
     }
 
@@ -281,11 +267,7 @@ impl Recorder<'_> {
         }
         let (len, xs_at) = crate::quant::shaders::q8_len(n_streams, k);
         let ob = buffer(out).clone();
-        let xq = if self.keeps() {
-            DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, n_streams, k, (len * 4) as u64)) }
-        } else {
-            self.scratch(len)
-        };
+        let (xq, is_scratch) = self.q8_buf(&ob, n_streams, k, len);
         let d = self.gpu().dummy().clone();
         self.dispatch_wide(
             "chain-rmsnorm-q8-multi",
@@ -294,7 +276,7 @@ impl Recorder<'_> {
             &[k as u32, eps.to_bits(), xs_at as u32, u32::from(separate_w)],
             ((k as u32 / 32).div_ceil(32), n_streams as u32, 1),
         );
-        self.q8.push((ob, n_streams, k, xq));
+        self.q8.push((ob, n_streams, k, xq, is_scratch));
         true
     }
 

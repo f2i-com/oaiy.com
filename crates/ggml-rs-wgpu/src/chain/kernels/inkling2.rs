@@ -216,7 +216,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
     var sq = 0.0;
     for (var i = li; i < hidden; i += 256u) {
-        let v = select(cur[src_off + i], msg[src_off + i], is_msg);
+        var v = 0.0;
+        if (is_msg) { v = msg[src_off + i]; } else { v = cur[src_off + i]; }
         sq += v * v;
     }
     part[li] = sq;
@@ -227,7 +228,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let inv = inverseSqrt(part[0] / f32(hidden) + 1e-6);
     for (var i = li; i < hidden; i += 256u) {
-        let v = select(cur[src_off + i], msg[src_off + i], is_msg);
+        var v = 0.0;
+        if (is_msg) { v = msg[src_off + i]; } else { v = cur[src_off + i]; }
         out[dst_off + i] = v * inv;
     }
 }
@@ -1800,7 +1802,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         let start = seq - past;
         for (var j = 0u; j < past; j++) {
             let sr = (start + j) * stride + ch;
-            hist[h_base + j * c + ch] = select(x0[sr], x1[sr], s == 1u);
+            if (s == 1u) {
+                hist[h_base + j * c + ch] = x1[sr];
+            } else {
+                hist[h_base + j * c + ch] = x0[sr];
+            }
         }
     } else {
         let keep = past - seq;
@@ -1809,7 +1815,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
         for (var j = 0u; j < seq; j++) {
             let sr = j * stride + ch;
-            hist[h_base + (keep + j) * c + ch] = select(x0[sr], x1[sr], s == 1u);
+            if (s == 1u) {
+                hist[h_base + (keep + j) * c + ch] = x1[sr];
+            } else {
+                hist[h_base + (keep + j) * c + ch] = x0[sr];
+            }
         }
     }
 }

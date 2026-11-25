@@ -86,7 +86,7 @@ export interface TurnPlace {
 }
 
 export type Turn =
-  | ({ role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by OAIY (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean; /** A fresh start (a new phone call): the model reads from here on, what came before kept for the chat and for searching. */ fresh?: boolean; /** Guides read with this request (it plainly asked for that kind of work). */ guides?: string[] } & TurnPlace)
+  | ({ role: 'user'; text: string; /** The user's original message before OAIY-injected project/file/guide wrappers, for UI replay & summaries. */ displayText?: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by OAIY (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean; /** A fresh start (a new phone call): the model reads from here on, what came before kept for the chat and for searching. */ fresh?: boolean; /** Guides read with this request (it plainly asked for that kind of work). */ guides?: string[] } & TurnPlace)
   | ({ role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[]; /** What the model thought first: shown in the chat, never sent back. */ thinking?: string } & TurnPlace)
   | ({ role: 'tool'; results: ToolResult[] } & TurnPlace);
 
@@ -245,8 +245,8 @@ function openAIMessages(system: string, turns: Turn[], includeReasoning = false)
       if (turn.calls.length) {
         message.tool_calls = turn.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.input) } }));
         // DeepSeek Reasoner requires `reasoning_content` on assistant tool-call turns within the active user turn.
-        if (includeReasoning && i > lastUserIdx && turn.thinking) {
-          message.reasoning_content = turn.thinking;
+        if (includeReasoning && i > lastUserIdx) {
+          message.reasoning_content = turn.thinking ?? '';
         }
       }
       out.push(message);
@@ -265,18 +265,32 @@ function openAIMessages(system: string, turns: Turn[], includeReasoning = false)
   return out;
 }
 
-function decodeAnthropic(data: Record<string, unknown>, parseErrors?: Map<string, string>): Reply {
-  const content = Array.isArray(data.content) ? data.content : [];
+export function decodeAnthropic(data: Record<string, unknown>, parseErrors?: Map<string, string>): Reply {
+  const rawContent = Array.isArray(data.content) ? data.content : [];
+  const content: unknown[] = [];
   let text = '';
   let thinking = '';
   const calls: ToolCall[] = [];
-  for (const block of content) {
-    if (!isRecord(block)) continue;
-    if (block.type === 'text' && typeof block.text === 'string') text += block.text;
-    else if (block.type === 'thinking' && typeof block.thinking === 'string') thinking += block.thinking;
-    else if (block.type === 'tool_use') {
-      const id = typeof block.id === 'string' && block.id ? block.id : `call_${Date.now().toString(36)}_${++fallbackCallSeq}_${calls.length}`;
-      calls.push({ id, name: String(block.name ?? ''), input: isRecord(block.input) ? block.input : {}, parseError: parseErrors?.get(id) });
+  for (const block of rawContent) {
+    if (!isRecord(block)) {
+      content.push(block);
+      continue;
+    }
+    if (block.type === 'text' && typeof block.text === 'string') {
+      text += block.text;
+      content.push(block);
+    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+      thinking += block.thinking;
+      content.push(block);
+    } else if (block.type === 'tool_use') {
+      const rawId = typeof block.id === 'string' ? block.id.trim() : '';
+      const id = rawId || `call_${Date.now().toString(36)}_${++fallbackCallSeq}_${calls.length}`;
+      const input = isRecord(block.input) ? block.input : {};
+      const parseError = parseErrors?.get(id) ?? (typeof block.id === 'string' && block.id !== id ? parseErrors?.get(block.id) : undefined);
+      calls.push({ id, name: String(block.name ?? ''), input, parseError });
+      content.push(block.id === id && block.input === input ? block : { ...block, id, input });
+    } else {
+      content.push(block);
     }
   }
   const usage = isRecord(data.usage) ? data.usage : {};

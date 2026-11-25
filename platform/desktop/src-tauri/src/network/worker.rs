@@ -942,7 +942,14 @@ async fn service(State(net): State<Network>, Extension(caller): Extension<Caller
     };
     // (one client for every request: its connections to the service kept for the next line of a call)
     static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
-    let Some(client) = CLIENT.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build().ok()).clone() else {
+    let Some(client) = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .ok()
+    }).clone() else {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", "no HTTP client");
     };
     let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
@@ -1077,7 +1084,12 @@ async fn pins(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "engines_unavailable", said_here(&net, "this computer's engines are not running"));
     };
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     };
@@ -1101,7 +1113,11 @@ async fn pins(State(net): State<Network>, Extension(caller): Extension<Caller>, 
 /// The engines' resources (`GET /api/resources` of the Studio), what a primary shows: GPUs, models, the queue.
 async fn local_resources(net: &Network) -> Value {
     let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else { return Value::Null };
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(4)).build();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(4))
+        .build();
     let Ok(client) = client else { return Value::Null };
     let Ok(r) = client.get(format!("{}/api/resources", ui.trim_end_matches('/'))).send().await else { return Value::Null };
     let Ok(v) = r.json::<Value>().await else { return Value::Null };
@@ -1181,7 +1197,12 @@ async fn chat(State(net): State<Network>, Extension(caller): Extension<Caller>, 
     if let Some(o) = request.as_object_mut() {
         o.remove("model");
     }
-    let client = match reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build() {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     };

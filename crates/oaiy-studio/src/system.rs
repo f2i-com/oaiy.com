@@ -383,7 +383,7 @@ fn ram_mb() -> Option<(u64, u64)> {
 }
 
 /// Model-ish files the picker shows (folders are always shown).
-const SHOWN: [&str; 6] = ["gguf", "safetensors", "json", "exe", "", "mp4"];
+const SHOWN: [&str; 7] = ["gguf", "safetensors", "json", "onnx", "exe", "", "mp4"];
 
 /// A directory listing for the file picker: folders first, then files that could
 /// be models (or tokenizers, or ffmpeg). No path means the roots: drive letters
@@ -410,12 +410,14 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
             dirs.push((name.to_ascii_lowercase(), entry_json(&p, &name, true, 0)));
         } else {
             let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            let shown = SHOWN.contains(&ext.as_str()) && (ext != "exe" || name.to_ascii_lowercase().contains("ffmpeg")) && (!ext.is_empty() || name.contains("ffmpeg"));
+            let lower = name.to_ascii_lowercase();
+            let tool = lower.contains("ffmpeg") || lower.starts_with("oaiy-");
+            let shown = SHOWN.contains(&ext.as_str()) && (ext != "exe" || tool) && (!ext.is_empty() || tool);
             // A Python to run tinygrad with (`python3`, `python3.12`, `python.exe`: the eGPU's setting on a Mac).
-            let python = name.to_ascii_lowercase().starts_with("python") && !name.to_ascii_lowercase().ends_with(".py");
+            let python = lower.starts_with("python") && !lower.ends_with(".py");
             // NAF's and Real-ESRGAN's weights, the PyTorch files a model needs.
             if shown || python || crate::models::detect::readable_pth(&name) {
-                files.push((name.to_ascii_lowercase(), entry_json(&p, &name, false, meta.len())));
+                files.push((lower, entry_json(&p, &name, false, meta.len())));
             }
         }
     }
@@ -646,12 +648,12 @@ mod tests {
         // any of its names, but not a Python file)
         std::fs::create_dir_all(d.join(".venv")).unwrap();
         std::fs::create_dir_all(d.join(".git")).unwrap();
-        for f in ["a.gguf", "notes.txt", "b.safetensors", "naf_release.pth", "other.pth", "python3", "python3.12", "python_notes.py", "tool"] {
+        for f in ["a.gguf", "notes.txt", "b.safetensors", "yunet.onnx", "naf_release.pth", "other.pth", "python3", "python3.12", "python_notes.py", "oaiy-llm-server", "oaiy-media.exe", "oaiy-notes.txt", "random.exe", "ffmpeg", "ffmpeg.exe", "tool"] {
             std::fs::write(d.join(f), b"x").unwrap();
         }
         let listing = browse(Some(d.to_str().unwrap())).unwrap();
         let names: Vec<_> = listing.get("entries").unwrap().as_array().unwrap().iter().map(|e| e.get("name").unwrap().as_str().unwrap().to_string()).collect();
-        assert_eq!(names, [".venv", "sub", "a.gguf", "b.safetensors", "naf_release.pth", "python3", "python3.12"]);
+        assert_eq!(names, [".venv", "sub", "a.gguf", "b.safetensors", "ffmpeg", "ffmpeg.exe", "naf_release.pth", "oaiy-llm-server", "oaiy-media.exe", "python3", "python3.12", "yunet.onnx"]);
         assert!(browse(Some(d.join("missing").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(d).unwrap();
         assert!(!browse(None).unwrap().get("entries").unwrap().as_array().unwrap().is_empty());

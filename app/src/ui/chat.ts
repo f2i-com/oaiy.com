@@ -1611,8 +1611,10 @@ export class ChatPane {
           'aria-label': 'Edit and resend message',
           onclick: (e: Event) => {
             e.stopPropagation();
+            this.suggestionDraft = null;
             this.input.value = text;
             this.grow();
+            this.updateSend();
             this.input.focus();
             this.input.setSelectionRange(text.length, text.length);
             this.autocomplete?.refresh();
@@ -2614,7 +2616,7 @@ export class ChatPane {
     if (turn.role === 'user') {
       // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
       const during = /^\[The user sent this while you[^\]]*\]\n\n/.exec(turn.text);
-      const text = stripInjectedUserContext(during ? turn.text.slice(during[0].length) : turn.text);
+      const text = turn.displayText ?? stripInjectedUserContext(during ? turn.text.slice(during[0].length) : turn.text);
       const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
       // Chats saved before attachments were kept on the turn: read them from the note.
       const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];

@@ -30,7 +30,7 @@ import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { onTheme, theme } from '../ui/theme';
-import { appFiles, appLabel, findApps, isSoftnApp, isWebApp, logicSyntax, softnAppOf } from '../softn/softn';
+import { appFiles, appLabel, findApps, isSoftnApp, isWebApp, logicSyntax, softnOwnerApp } from '../softn/softn';
 import { findPages, pageFiles, pageLabel } from './page';
 import { findModels, modelFiles, modelLabel } from './model';
 import { KEPT_STATUS, KEPT_TITLE, LiveFrame, engineMismatch, fitNote, frameSays, isLoadSyntaxError, plainProblem, updateSaid } from './liveFrame';
@@ -205,6 +205,47 @@ const manifestPath = (root: string): string => `/${root ? `${root}/` : ''}manife
 
 type BridgeReply = Omit<PageReport, 'problems'> & { shot?: Omit<Shot, 'png'> & { png: ArrayBuffer } };
 
+function abortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  return new Error(typeof reason === 'string' && reason ? reason : 'aborted');
+}
+
+function waitMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export class Preview {
   readonly element = h('section.preview');
   private readonly status = h('span.preview-status', '');
@@ -232,6 +273,7 @@ export class Preview {
   private stale = true;
   private visible = false;
   private generation = 0;
+  private settledGeneration = 0;
   private current: PreviewResult = { ok: false, errors: [], at: 0 };
   private waiters: Array<(r: PreviewResult) => void> = [];
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -490,7 +532,7 @@ export class Preview {
       const key = path.replace(/^\/+/, '');
       // Clear cached persisted SQLite blobs for whichever app owns a changed DB/seed/manifest file,
       // even when a different app/page is currently shown in the preview.
-      const ownerRoot = softnAppOf(this.vfs, key);
+      const ownerRoot = softnOwnerApp(this.vfs, key);
       if (ownerRoot !== null) {
         const ownerRel = ownerRoot ? key.slice(ownerRoot.length + 1) : key;
         if (
@@ -515,7 +557,11 @@ export class Preview {
         if (key !== target.path && !(/\.gltf$/i.test(target.path) && (!folder || key.startsWith(folder)))) return;
       } else {
         const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
-        if ((folder && !key.startsWith(folder)) || key.split('/').some((s) => s.startsWith('.'))) return;
+        if (
+          (folder && !key.startsWith(folder)) ||
+          (!folder && /^(?:shots|exports|uploads)(?:\/|$)/.test(key)) ||
+          key.split('/').some((s) => s.startsWith('.'))
+        ) return;
       }
     }
     this.stale = true;
@@ -737,20 +783,34 @@ export class Preview {
     this.setStatus(this.kept ? KEPT_STATUS : 'error', 'error', this.kept ? KEPT_TITLE : errors.length > 1 ? `${errors.length} errors: the banner below says the latest` : 'The banner below says what is wrong');
   }
 
-  private request(message: Record<string, unknown>, timeoutMs = 20_000): Promise<BridgeReply> {
+  private request(message: Record<string, unknown>, timeoutMs = 20_000, signal?: AbortSignal): Promise<BridgeReply> {
+    if (signal?.aborted) return Promise.reject(abortError(signal));
     const frame = this.frame?.contentWindow;
     if (!frame) return Promise.resolve({ ok: false, page: '', error: 'the preview is not showing anything' });
     const id = this.nextRequest++;
-    return new Promise((resolve) => {
-      const finish = (result: BridgeReply) => {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const cleanup = () => {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         this.requests.delete(id);
-        resolve(result);
         if (!this.requests.size && this.pendingPage) {
           const page = this.pendingPage;
           this.pendingPage = null;
           setTimeout(() => this.setPage(page));
         }
+      };
+      const finish = (result: BridgeReply) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(result);
+      };
+      const onAbort = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(abortError(signal));
       };
       const timer = setTimeout(() => {
         finish({
@@ -762,59 +822,62 @@ export class Preview {
         });
       }, timeoutMs);
       this.requests.set(id, finish);
+      signal?.addEventListener('abort', onAbort, { once: true });
       frame.postMessage({ __oaiyAgent: true, id, ...message }, '*');
     });
   }
 
   /** A request to the frame, asked again once if the frame was re-rendered under it. */
-  private async requestAgain(message: Record<string, unknown>, timeoutMs?: number): Promise<BridgeReply> {
-    const first = await this.request(message, timeoutMs);
+  private async requestAgain(message: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<BridgeReply> {
+    const first = await this.request(message, timeoutMs, signal);
     if (first.error !== RELOADED) return first;
-    await this.ready();
-    return this.request(message, timeoutMs);
+    await this.ready(undefined, signal);
+    return this.request(message, timeoutMs, signal);
   }
 
   // --- what the agent asks -------------------------------------------------------------
 
   /** Render `target` unless it is already live and current. */
-  private async ready(target?: PreviewTarget): Promise<PreviewResult> {
-    if ((target && !sameTarget(target, this.target)) || this.stale || !this.frame || this.current.at === 0) return this.checkNow(target);
+  private async ready(target?: PreviewTarget, signal?: AbortSignal): Promise<PreviewResult> {
+    if (signal?.aborted) throw abortError(signal);
+    if ((target && !sameTarget(target, this.target)) || this.stale || !this.frame || this.current.at === 0) return this.checkNow(target, signal);
     return this.current;
   }
 
   /** Describe what the app or page shows, as text. */
-  inspect(target?: PreviewTarget): Promise<PageReport> {
-    return this.exclusive(() => this.inspectNow(target));
+  inspect(target?: PreviewTarget, signal?: AbortSignal): Promise<PageReport> {
+    return this.exclusive(() => this.inspectNow(target, signal), signal);
   }
 
-  private async inspectNow(target?: PreviewTarget): Promise<PageReport> {
-    const rendered = await this.ready(target);
+  private async inspectNow(target?: PreviewTarget, signal?: AbortSignal): Promise<PageReport> {
+    const rendered = await this.ready(target, signal);
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
-    const result = await this.requestAgain({ type: 'bot:inspect' });
+    const result = await this.requestAgain({ type: 'bot:inspect' }, undefined, signal);
     return { ...result, problems: [...this.problems], since };
   }
 
   /** Click, fill, choose and press keys in the app or page, then describe it. */
-  act(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport> {
-    return this.exclusive(() => this.actNow(target, actions));
+  act(target: PreviewTarget | undefined, actions: PreviewAction[], signal?: AbortSignal): Promise<PageReport> {
+    return this.exclusive(() => this.actNow(target, actions, signal), signal);
   }
 
-  private async actNow(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport> {
-    const rendered = await this.ready(target);
+  private async actNow(target: PreviewTarget | undefined, actions: PreviewAction[], signal?: AbortSignal): Promise<PageReport> {
+    const rendered = await this.ready(target, signal);
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
-    const result = await this.request({ type: 'bot:act', actions }, 60_000);
+    const result = await this.request({ type: 'bot:act', actions }, 60_000, signal);
     if (result.error === RELOADED) return { ok: false, page: '', error: 'the page was re-rendered while the actions ran (its files changed); run them again', problems: [] };
     // Errors a click causes can arrive a moment after it.
-    await new Promise((r) => setTimeout(r, 200));
+    await waitMs(200, signal);
     return { ...result, problems: [...this.problems], since };
   }
 
   /** A PNG of what the app or page shows: the viewport, or the whole page; a 3D model from four sides, or from `view`. */
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[]; since: number }> {
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView; signal?: AbortSignal } = {}): Promise<Shot & { problems: Problem[]; since: number }> {
+    const { signal } = options;
     return this.exclusive(async () => {
-      const rendered = await this.ready(target);
+      const rendered = await this.ready(target, signal);
       if (!this.frame) throw new Error(rendered.errors.join('; ') || 'nothing is rendered');
       // A model that could not be read has nothing to draw: why is the answer.
       if (this.target?.kind === 'model' && !rendered.ok) throw new Error(rendered.errors.join('; ') || 'the model could not be shown');
@@ -822,15 +885,16 @@ export class Preview {
       if (box.width < 1 || box.height < 1) throw new Error('the preview is not on screen (on a narrow screen, open the Preview tab), so it cannot be drawn');
       // A size just chosen: the page lays itself out again first.
       const wait = this.resizedAt + 500 - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (wait > 0) await waitMs(wait, signal);
       const since = Date.now();
-      const result = await this.requestAgain({ type: 'bot:screenshot', fullPage: options.fullPage === true, view: options.view }, 60_000);
+      const result = await this.requestAgain({ type: 'bot:screenshot', fullPage: options.fullPage === true, view: options.view }, 60_000, signal);
       if (!result.ok || !result.shot) throw new Error(result.error || 'the preview could not take a screenshot');
       return { ...result.shot, png: new Uint8Array(result.shot.png), problems: [...this.problems], since };
-    });
+    }, signal);
   }
 
   private settle(result: Omit<PreviewResult, 'at'>): void {
+    this.settledGeneration = Math.max(this.settledGeneration, this.generation);
     this.current = { ...result, at: this.current.at };
     for (const w of this.waiters.splice(0)) w(this.current);
   }
@@ -840,25 +904,46 @@ export class Preview {
    * parallel would otherwise switch the preview to their own app under each other.
    */
   private lock: Promise<unknown> = Promise.resolve();
-  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  private exclusive<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(abortError(signal));
     this.busy++;
-    const run = this.lock.then(fn, fn).finally(() => this.busy--);
+    const step = () => {
+      if (signal?.aborted) throw abortError(signal);
+      return fn();
+    };
+    const run = this.lock.then(step, step).finally(() => this.busy--);
     this.lock = run.catch(() => {});
-    return run;
+    return raceAbort(run, signal);
   }
 
   /** Render now and wait for the outcome (for the agent's softn_check and page_check). */
-  check(target?: PreviewTarget): Promise<PreviewResult> {
-    return this.exclusive(() => this.checkNow(target));
+  check(target?: PreviewTarget, signal?: AbortSignal): Promise<PreviewResult> {
+    return this.exclusive(() => this.checkNow(target, signal), signal);
   }
 
-  private async checkNow(target?: PreviewTarget): Promise<PreviewResult> {
+  private async checkNow(target?: PreviewTarget, signal?: AbortSignal): Promise<PreviewResult> {
+    if (signal?.aborted) throw abortError(signal);
     if (target && !sameTarget(target, this.target)) {
       this.target = target;
       this.refreshApps();
     }
-    if (this.target?.kind === 'app' && !(await softnRuntimeAvailable())) return { ok: false, errors: ['the SoftN preview runtime is not installed (npm run fetch:softn); only the file checks ran'], at: Date.now() };
-    const done = new Promise<PreviewResult>((resolve) => this.waiters.push(resolve));
+    if (this.target?.kind === 'app' && !(await raceAbort(softnRuntimeAvailable(), signal))) {
+      return { ok: false, errors: ['the SoftN preview runtime is not installed (npm run fetch:softn); only the file checks ran'], at: Date.now() };
+    }
+    if (signal?.aborted) throw abortError(signal);
+    const done = new Promise<PreviewResult>((resolve, reject) => {
+      const onAbort = () => {
+        const idx = this.waiters.indexOf(onSettle);
+        if (idx >= 0) this.waiters.splice(idx, 1);
+        reject(abortError(signal));
+      };
+      const onSettle = (result: PreviewResult) => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(result);
+      };
+      this.waiters.push(onSettle);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
     this.render();
     return done;
   }
@@ -1076,7 +1161,7 @@ export class Preview {
     setTimeout(() => {
       // (taken off whatever came of it: a render that replaced this frame before it was ready left it listening)
       window.removeEventListener('message', onMessage);
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
+      if (generation !== this.generation || this.settledGeneration >= generation) return;
       this.setStatus('the model did not load', 'error');
       this.settle({ ok: false, errors: ['the 3D model preview did not finish loading within 30 s'] });
     }, 30_000);
@@ -1136,7 +1221,7 @@ export class Preview {
     window.addEventListener('message', onMessage);
     setTimeout(() => {
       window.removeEventListener('message', onMessage);
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
+      if (generation !== this.generation || this.settledGeneration >= generation) return;
       this.setStatus('the page did not load', 'error');
       this.settle({ ok: false, errors: ['the page preview did not finish loading within 20 s'] });
     }, 20_000);
@@ -1199,6 +1284,7 @@ export class Preview {
     const onMessage = (event: MessageEvent) => {
       if (event.source !== frame.contentWindow || event.data?.type !== 'formlogic:ready') return;
       window.removeEventListener('message', onMessage);
+      clearTimeout(readyTimer);
       // The app's localStorage as it was left, for the bridge's stand-in (the frame has no origin, and the browser's own
       // store refused every write: a snake game saving its best score failed at every step), before the app is sent.
       if (!web) frame.contentWindow?.postMessage({ __oaiyAgent: true, type: 'bot:storage-init', store: this.storage.get(storageKey({ kind: 'app', root })) ?? {} }, '*');
@@ -1304,9 +1390,9 @@ export class Preview {
           }, SETTLE_MS);
     };
     window.addEventListener('message', onMessage);
-    setTimeout(() => {
+    const readyTimer = setTimeout(() => {
       window.removeEventListener('message', onMessage);
-      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
+      if (generation !== this.generation || this.settledGeneration >= generation) return;
       this.setStatus('the preview runtime did not start', 'error');
       this.settle({ ok: false, errors: ['the SoftN preview runtime did not start within 20 s'] });
     }, 20_000);

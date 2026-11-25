@@ -27,12 +27,25 @@ try {
   try { globalThis.__zippHostCall = undefined; } catch (_e2) {}
 }
 var __wrappers = new Map();
+var __wrapperIds = new WeakMap();
+var __METHOD_TOKEN = {};
+var __TYPED = {
+  Int8Array: typeof Int8Array !== 'undefined' ? Int8Array : null,
+  Uint8Array: typeof Uint8Array !== 'undefined' ? Uint8Array : null,
+  Uint8ClampedArray: typeof Uint8ClampedArray !== 'undefined' ? Uint8ClampedArray : null,
+  Int16Array: typeof Int16Array !== 'undefined' ? Int16Array : null,
+  Uint16Array: typeof Uint16Array !== 'undefined' ? Uint16Array : null,
+  Int32Array: typeof Int32Array !== 'undefined' ? Int32Array : null,
+  Uint32Array: typeof Uint32Array !== 'undefined' ? Uint32Array : null,
+  Float32Array: typeof Float32Array !== 'undefined' ? Float32Array : null,
+  Float64Array: typeof Float64Array !== 'undefined' ? Float64Array : null,
+};
 var __expando = new Map();
 var __fnIds = new Map();
 var __fns = new Map();
 var __promises = new Map();
 var __nextFn = 1;
-var __classes = {};
+var __classes = Object.create(null);
 
 function __host(op, a, b, c) {
   var reply = JSON.parse(__channel('ls.getItem', __MAGIC + JSON.stringify([op, a, b, c])));
@@ -55,10 +68,10 @@ function __flush() {
   for (var i = 0; i < list.length; i++) __zdom_cb(list[i][0], list[i][1], list[i][2]);
 }
 
-function __cls(name, chain) {
+function __cls(name, chain, exposeGlobal) {
   if (__classes[name]) return __classes[name];
   var parentName = chain && chain.length > 1 ? chain[1] : null;
-  var parent = parentName ? __cls(parentName, chain.slice(1)) : null;
+  var parent = parentName ? __cls(parentName, chain.slice(1), exposeGlobal) : null;
   var C = function () {
     throw new TypeError('Illegal constructor');
   };
@@ -66,7 +79,7 @@ function __cls(name, chain) {
   C.prototype.constructor = C;
   Object.defineProperty(C, 'name', { value: name });
   __classes[name] = C;
-  if (typeof globalThis[name] === 'undefined') globalThis[name] = C;
+  if (exposeGlobal !== false && typeof globalThis[name] === 'undefined') globalThis[name] = C;
   return C;
 }
 
@@ -92,7 +105,8 @@ function __encode(v) {
   }
   if (typeof v === 'symbol') return String(v);
   if (v === window) return { $win: 1 };
-  if (v.__zdomId !== undefined) return { $h: v.__zdomId };
+  var wid = __wrapperIds.get(v);
+  if (wid !== undefined) return { $h: wid };
   if (ArrayBuffer.isView && ArrayBuffer.isView(v)) return { $ta: v.constructor.name, d: Array.from(v) };
   if (v instanceof ArrayBuffer) {
     var bytes = new Uint8Array(v);
@@ -108,8 +122,11 @@ function __encode(v) {
   if (v instanceof Date) return { $date: v.getTime() };
   if (Array.isArray(v)) return v.map(__encode);
   var out = {};
-  for (var k in v) out[k] = __encode(v[k]);
-  return out;
+  for (var k in v) {
+    if (k === '__proto__') continue;
+    out[k] = __encode(v[k]);
+  }
+  return { $o: out };
 }
 
 var __threeMods = Object.create(null);
@@ -120,7 +137,7 @@ function __threeCtor(key, name, chain) {
       Object.defineProperty(F, 'name', { value: name });
     } catch (_e) {}
   }
-  F.prototype = __cls(name || 'Object', chain || ['Object']).prototype;
+  F.prototype = __cls(name || 'Object', chain || ['Object'], false).prototype;
   var statics = {};
   return new Proxy(F, {
     construct: function (_t, args) {
@@ -139,7 +156,7 @@ function __threeCtor(key, name, chain) {
       if (typeof prop === 'symbol') return t[prop];
       if (Object.prototype.hasOwnProperty.call(statics, prop)) return statics[prop];
       var v = __host('threeStaticGet', key, prop);
-      if (v && v.$m === 1) {
+      if (v === __METHOD_TOKEN) {
         statics[prop] = function () {
           var encoded = [];
           for (var i = 0; i < arguments.length; i++) encoded.push(__encode(arguments[i]));
@@ -161,8 +178,19 @@ function __zdom_import(spec) {
 function __decode(v) {
   if (v === null || typeof v !== 'object') return v;
   if (Array.isArray(v)) return v.map(__decode);
+  if (Object.prototype.hasOwnProperty.call(v, '$o') && v.$o && typeof v.$o === 'object' && !Array.isArray(v.$o)) {
+    var plain = {};
+    var okeys = Object.keys(v.$o);
+    for (var oi = 0; oi < okeys.length; oi++) {
+      var ok = okeys[oi];
+      if (ok === '__proto__') continue;
+      plain[ok] = __decode(v.$o[ok]);
+    }
+    return plain;
+  }
+  if (v.$m === 1) return __METHOD_TOKEN;
   if (v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
-  if (v.$h !== undefined) return __wrap(v.$h, v.c);
+  if (v.$h !== undefined) return __wrap(v.$h, v.c, v.ng === 1);
   if (v.$u) return undefined;
   if (v.$win) return window;
   if (v.$num !== undefined) return Number(v.$num);
@@ -176,7 +204,7 @@ function __decode(v) {
   }
   if (v.$ta !== undefined) {
     if (v.$ta === 'ArrayBuffer') return new Uint8Array(v.d).buffer;
-    var T = globalThis[v.$ta] || Uint8Array;
+    var T = (Object.prototype.hasOwnProperty.call(__TYPED, v.$ta) && __TYPED[v.$ta]) || Uint8Array;
     return new T(v.d);
   }
   if (v.$p !== undefined) {
@@ -186,7 +214,10 @@ function __decode(v) {
     });
   }
   var out = {};
-  for (var k in v) out[k] = __decode(v[k]);
+  for (var k in v) {
+    if (k === '__proto__') continue;
+    out[k] = __decode(v[k]);
+  }
   return out;
 }
 
@@ -201,11 +232,11 @@ var __special = {
   },
 };
 
-function __wrap(id, chain) {
+function __wrap(id, chain, noGlobal) {
   var existing = __wrappers.get(id);
   if (existing) return existing;
   chain = chain || ['Object'];
-  var C = __cls(chain[0], chain);
+  var C = __cls(chain[0], chain, noGlobal ? false : true);
   var target = Object.create(C.prototype);
   var methods = {};
   var extra = {};
@@ -217,7 +248,6 @@ function __wrap(id, chain) {
   }
   var proxy = new Proxy(target, {
     get: function (t, k) {
-      if (k === '__zdomId') return id;
       if (typeof k === 'symbol') {
         if (k === Symbol.iterator) {
           return function () {
@@ -233,7 +263,7 @@ function __wrap(id, chain) {
       if (special[k]) return special[k].get ? special[k].get() : special[k].value;
       if (methods[k]) return methods[k];
       var value = __host('get', id, k);
-      if (value && value.$m === 1) {
+      if (value === __METHOD_TOKEN) {
         methods[k] = function () {
           var args = [];
           for (var i = 0; i < arguments.length; i++) args.push(__encode(arguments[i]));
@@ -250,7 +280,7 @@ function __wrap(id, chain) {
         return true;
       }
       // The page's own data on a DOM node stays here, as itself; non-Node host objects (e.g. Three.js userData/uniforms) forward to the host.
-      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && v.__zdomId === undefined && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
+      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && !__wrapperIds.has(v) && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
         extra[k] = v;
         return true;
       }
@@ -285,6 +315,7 @@ function __wrap(id, chain) {
     },
   });
   __wrappers.set(id, proxy);
+  __wrapperIds.set(proxy, id);
   return proxy;
 }
 
@@ -302,7 +333,7 @@ function __zdom_cb(fnId, thisValue, args) {
 
 /** A promise the page's code left behind (an async handler's, say): its failure is reported, as a browser reports an unhandled rejection. */
 function __watch(value, where) {
-  if (value && typeof value === 'object' && typeof value.then === 'function' && value.__zdomId === undefined) {
+  if (value && typeof value === 'object' && typeof value.then === 'function' && !__wrapperIds.has(value)) {
     value.then(null, function (error) {
       __report(error, where);
     });
@@ -356,7 +387,7 @@ function __zdom_run(source, name) {
 function __format(v) {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
-  if (v && v.__zdomId !== undefined) {
+  if (v && typeof v === 'object' && __wrapperIds.has(v)) {
     try {
       return '<' + String(v.tagName || v.nodeName || 'object').toLowerCase() + (v.id ? '#' + v.id : '') + '>';
     } catch (e) {

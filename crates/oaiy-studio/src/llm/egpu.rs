@@ -1062,7 +1062,7 @@ impl Egpu {
     fn watch(self: Arc<Self>, generation: u64) {
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let (addr, key, ready) = {
+            let (addr, key, ready, paused) = {
                 let mut g = self.lock();
                 if g.generation != generation {
                     return;
@@ -1079,9 +1079,9 @@ impl Egpu {
                     self.changed.notify_all();
                     return;
                 }
-                (g.addr.clone(), g.key.clone(), g.state == State::Ready)
+                (g.addr.clone(), g.key.clone(), g.state == State::Ready, g.paused)
             };
-            if ready {
+            if ready || paused {
                 continue;
             }
             let auth = format!("Bearer {key}");
@@ -1093,7 +1093,7 @@ impl Egpu {
                 .is_some_and(|v| v.get("data").and_then(Json::as_array).is_some());
             if listed {
                 let mut g = self.lock();
-                if g.generation == generation && g.state == State::Starting {
+                if g.generation == generation && g.state == State::Starting && !g.paused {
                     g.state = State::Ready;
                     g.ready_after = g.started.map(|s| s.elapsed().as_secs_f64());
                     g.said = None;
@@ -2294,5 +2294,33 @@ mod tests {
         child.wait().unwrap();
         std::thread::sleep(Duration::from_secs(1));
         assert_eq!(launched.engines_left(), 0, "the engine outlived its launcher");
+    }
+
+    #[test]
+    fn watch_skips_http_probe_while_paused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let egpu = Arc::new(Egpu::new());
+        let gen = {
+            let mut g = egpu.lock();
+            g.generation = 1;
+            g.state = State::Starting;
+            g.paused = true;
+            g.addr = addr;
+            g.key = "secret-bearer-token".into();
+            g.generation
+        };
+        let watcher = {
+            let egpu = Arc::clone(&egpu);
+            std::thread::spawn(move || egpu.watch(gen))
+        };
+        // Wait past at least one 500 ms watch tick while paused: zero probes must arrive.
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "watch probed an unbound/paused port");
+        assert_eq!(egpu.state(), State::Starting);
+        // Stop watcher cleanly.
+        egpu.lock().generation += 1;
+        watcher.join().unwrap();
     }
 }

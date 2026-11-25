@@ -159,8 +159,8 @@ fn meshing_passes() -> Result<()> {
         baked.textures.base_color_png.len() / 1024,
         baked.textures.metallic_roughness_png.len() / 1024
     );
-    std::fs::write(dump.join("model.glb"), super::glb::write(&baked.mesh, Some(&baked.textures)))?;
+    std::fs::write(dump.join("model.glb"), super::glb::write(&baked.mesh, Some(&baked.textures))?)?;
     m.color_from_voxels(&voxels);
-    std::fs::write(dump.join("colours.glb"), super::glb::write(&m, None))?;
+    std::fs::write(dump.join("colours.glb"), super::glb::write(&m, None)?)?;
     Ok(())
 }

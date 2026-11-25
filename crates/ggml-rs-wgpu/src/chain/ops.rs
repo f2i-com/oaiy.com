@@ -1508,16 +1508,11 @@ impl ChainRecorder for Recorder<'_> {
             let ob = buffer(out).clone();
             let xq_opt = if write_q8 {
                 let (len, _) = crate::quant::shaders::q8_len(1, q_dim);
-                let xq = if self.keeps() {
-                    DeviceVec { len, inner: std::sync::Arc::new(self.gpu().q8_kept(&ob, 1, q_dim, (len * 4) as u64)) }
-                } else {
-                    self.scratch(len)
-                };
-                Some(xq)
+                Some(self.q8_buf(&ob, 1, q_dim, len))
             } else {
                 None
             };
-            let q8_buf = xq_opt.as_ref().map(buffer).unwrap_or(&drw);
+            let q8_buf = xq_opt.as_ref().map(|(v, _)| buffer(v)).unwrap_or(&drw);
             let h_word = (n_heads as u32) | if write_q8 { 0x8000_0000u32 } else { 0 };
 
             static NO_SPLITK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1558,8 +1553,8 @@ impl ChainRecorder for Recorder<'_> {
                     (n_heads as u32, 1, 1),
                 );
             }
-            if let Some(xq) = xq_opt {
-                self.q8.push((ob, 1, q_dim, xq));
+            if let Some((xq, is_scratch)) = xq_opt {
+                self.q8.push((ob, 1, q_dim, xq, is_scratch));
             }
         } else {
             let clips = (half::f16::from_f32(qk_clip).to_bits() as u32) | ((half::f16::from_f32(rel_clip).to_bits() as u32) << 16);

@@ -150,7 +150,12 @@ pub fn machine(system: &Value) -> Value {
 /// What this computer's engines' control page answers at `path` (`Null` where they do not answer).
 pub(crate) async fn engines_get(net: &super::Network, path: &str) -> Value {
     let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else { return Value::Null };
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(4)).build() else { return Value::Null };
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(4))
+        .build()
+    else { return Value::Null };
     let Ok(r) = client.get(format!("{}{path}", ui.trim_end_matches('/'))).send().await else { return Value::Null };
     r.json::<Value>().await.unwrap_or(Value::Null)
 }
@@ -159,7 +164,12 @@ pub(crate) async fn engines_get(net: &super::Network, path: &str) -> Value {
 /// do not answer).
 pub(crate) async fn engines_post(net: &super::Network, path: &str, body: &Value, wait: Duration) -> Value {
     let Some(ui) = crate::ai::engine_services::local_engines_ui(&net.inner().ai) else { return Value::Null };
-    let Ok(client) = reqwest::Client::builder().timeout(wait).build() else { return Value::Null };
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(wait)
+        .build()
+    else { return Value::Null };
     let Ok(r) = client.post(format!("{}{path}", ui.trim_end_matches('/'))).json(body).send().await else { return Value::Null };
     r.json::<Value>().await.unwrap_or(Value::Null)
 }

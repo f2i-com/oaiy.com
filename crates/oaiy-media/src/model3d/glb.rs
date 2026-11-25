@@ -32,7 +32,10 @@ fn linear(v: f32) -> f32 {
 
 /// The mesh as a GLB. Its material is single-sided: the remeshed surface is closed
 /// and faces out (and where it is open, it has both sides), as TRELLIS.2's export.
-pub fn write(mesh: &Mesh, textures: Option<&Textures>) -> Vec<u8> {
+pub fn write(mesh: &Mesh, textures: Option<&Textures>) -> candle_core::Result<Vec<u8>> {
+    if mesh.positions.is_empty() || mesh.triangles.is_empty() {
+        candle_core::bail!("glb: cannot write an empty mesh ({} vertices, {} triangles)", mesh.positions.len(), mesh.triangles.len());
+    }
     let normals = match textures {
         Some(t) => t.normals.clone(),
         None => mesh.normals(),
@@ -58,6 +61,9 @@ pub fn write(mesh: &Mesh, textures: Option<&Textures>) -> Vec<u8> {
     let mut hi = [f32::NEG_INFINITY; 3];
     for p in &mesh.positions {
         for k in 0..3 {
+            if !p[k].is_finite() {
+                candle_core::bail!("glb: mesh has non-finite vertex position");
+            }
             lo[k] = lo[k].min(p[k]);
             hi[k] = hi[k].max(p[k]);
         }
@@ -162,5 +168,48 @@ pub fn write(mesh: &Mesh, textures: Option<&Textures>) -> Vec<u8> {
     out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
     out.extend_from_slice(b"BIN\0");
     out.extend_from_slice(&bin);
-    out
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_rejects_empty_and_non_finite_meshes() {
+        let empty = Mesh { positions: Vec::new(), triangles: Vec::new(), colors: None, metal_rough: None };
+        assert!(write(&empty, None).is_err(), "empty mesh must return error rather than invalid GLB");
+
+        let no_tris = Mesh { positions: vec![[0., 0., 0.]], triangles: Vec::new(), colors: None, metal_rough: None };
+        assert!(write(&no_tris, None).is_err(), "mesh with no triangles must return error");
+
+        let nan_mesh = Mesh {
+            positions: vec![[f32::NAN, 0., 0.], [1., 0., 0.], [0., 1., 0.]],
+            triangles: vec![[0, 1, 2]],
+            colors: None,
+            metal_rough: None,
+        };
+        assert!(write(&nan_mesh, None).is_err(), "non-finite positions must return error");
+    }
+
+    #[test]
+    fn write_emits_valid_glb_bounds_for_non_empty_mesh() {
+        let mesh = Mesh {
+            positions: vec![[-1.0, 0.5, 2.0], [3.0, -0.5, 0.0], [0.0, 2.0, -1.0]],
+            triangles: vec![[0, 1, 2]],
+            colors: None,
+            metal_rough: None,
+        };
+        let bytes = write(&mesh, None).unwrap();
+        assert_eq!(&bytes[0..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[16..20], b"JSON");
+        let doc = Json::parse(&bytes[20..20 + json_len]).unwrap();
+        let pos = &doc.get("accessors").unwrap().as_array().unwrap()[0];
+        let min: Vec<f64> = pos.get("min").unwrap().as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let max: Vec<f64> = pos.get("max").unwrap().as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert_eq!(min, vec![-1.0, -0.5, -1.0]);
+        assert_eq!(max, vec![3.0, 2.0, 2.0]);
+    }
 }

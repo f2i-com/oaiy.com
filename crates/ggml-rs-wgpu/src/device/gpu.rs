@@ -560,6 +560,7 @@ impl Gpu {
     pub(crate) fn let_go(&self) {
         self.chain_groups.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.chain_groups_wide.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.q8_kept.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.pool.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.staging.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }

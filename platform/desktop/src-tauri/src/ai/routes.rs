@@ -215,9 +215,12 @@ async fn engine_discovery_snapshot(st: &AiState, bounded: bool) -> Result<(Strin
 
 async fn engine_discovery_snapshot_at(ui: Option<String>, bounded: bool) -> Result<(String, Value, Value), String> {
     let ui = ui.ok_or("OAIY's engines are not running")?;
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4));
-    if bounded { builder = builder.no_proxy().redirect(reqwest::redirect::Policy::none()); }
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|e| e.to_string())?;
     let state = engine_json(&client, format!("{}/api/state", ui.trim_end_matches('/')), bounded).await?;
     let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
     let discovery = engine_json(&client, format!("{gateway}/v1/discovery"), bounded).await?;

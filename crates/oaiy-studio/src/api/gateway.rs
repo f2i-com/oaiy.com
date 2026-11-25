@@ -1110,15 +1110,38 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path, call
         return Err(fail(409, format!("a voice named {name} already exists; delete it first, or send replace: true")));
     }
     let cfg = studio.config();
-    let (request, model, label) = crate::media::speech::voice_request(&cfg, &studio.root, &media::day_dir(&studio.output_root(), "voices"), &body).map_err(|e| fail(400, e))?;
-    let job = studio.media.submit(Kind::Speech, request, model, format!("voice: {label}"), 1, 0.0, keep_jobs(&cfg), None);
-    let done = wait_for_caller(studio, &job.id, SPEECH_WAIT, caller).ok_or_else(|| fail(500, "the job disappeared"))?;
+    let private = incognito || !keep;
+    let scratch = scratch_for(studio, req, Some(&body)).or_else(|| {
+        private.then(|| studio.output_root().join(".incognito").join(crate::util::random_id("")))
+    });
+    let out = scratch.clone().unwrap_or_else(|| studio.output_root());
+    let (request, model, label) = crate::media::speech::voice_request(&cfg, &studio.root, &media::day_dir(&out, "voices"), &body).map_err(|e| {
+        if let Some(s) = &scratch {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        fail(400, e)
+    })?;
+    let job = studio.media.submit(Kind::Speech, request, model, format!("voice: {label}"), 1, 0.0, keep_jobs(&cfg), scratch);
+    let done = match wait_for_caller(studio, &job.id, SPEECH_WAIT, caller) {
+        Some(done) => done,
+        None => {
+            if private {
+                studio.media.remove(&job.id);
+            }
+            return Err(fail(500, "the job disappeared"));
+        }
+    };
     if done.status != "completed" {
+        if private {
+            studio.media.remove(&done.id);
+        }
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("voice job {}", done.status))));
     }
     let path = |k: &str| done.result.get(k).and_then(Json::as_str).map(std::path::PathBuf::from).ok_or_else(|| fail(500, format!("the voice job returned no {k}")));
     if !keep {
-        let handed = crate::media::speech::hand_back(&label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e));
+        let handed = path("voice_file")
+            .and_then(|vf| path("path").map(|p| (vf, p)))
+            .and_then(|(vf, p)| crate::media::speech::hand_back(&label, &vf, &p).map_err(|e| fail(500, e)));
         studio.media.remove(&done.id);
         return handed.and_then(ok);
     }
@@ -2713,5 +2736,66 @@ open(log, "a").write("ended\n")
         assert_eq!(v.get("status").and_then(Json::as_str), Some("failed"));
         assert_eq!(v.get("error").unwrap().get("code").and_then(Json::as_str), Some("cancelled"));
         assert_eq!(content_type(std::path::Path::new("a/model.glb")), "model/gltf-binary");
+    }
+
+    #[test]
+    fn create_voice_incognito_and_unkept_use_scratch_and_clean_up_on_failure() {
+        let dir = std::env::temp_dir().join(format!("oaiy-studio-voice-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("breeze")).unwrap();
+        let mut cfg = crate::config::default_json();
+        let speech = crate::models::registry::obj_mut(&mut cfg, &["media", "speech"]).unwrap();
+        crate::util::set(speech, "models", Json::parse(br#"{"breeze":{"breeze":"breeze"}}"#).unwrap());
+        let studio = Arc::new(Studio::for_test(&dir, cfg));
+
+        for (label, extra_hdr, body) in [
+            ("incognito", Some(("X-OAIY-Incognito", "1")), r#"{"name":"Ghost","description":"soft whisper"}"#),
+            ("keep_false", None, r#"{"name":"Temp","description":"warm baritone","keep":false}"#),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let served = Arc::clone(&studio);
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = oaiy_engine::http::serve(stream, |req, w| {
+                    handle(&served, req, w, Matched { target: "voices".into(), spec: "openai".into(), rest: String::new() }, true)
+                });
+            });
+            let body_bytes = body.as_bytes().to_vec();
+            let client = std::thread::spawn(move || {
+                let mut hdrs = vec![("Content-Type", "application/json")];
+                if let Some(h) = extra_hdr {
+                    hdrs.push(h);
+                }
+                fetch(&addr, "POST", "/v1/audio/voices", &hdrs, &body_bytes, Duration::from_secs(30)).unwrap().status
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let id = loop {
+                if let Some(id) = studio.media.private_activity().as_array().and_then(|a| a.first()).and_then(|j| j.get("id")).and_then(Json::as_str).map(String::from) {
+                    break id;
+                }
+                assert!(std::time::Instant::now() < deadline, "{label}: expected incognito voice job in private_activity");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+
+            let job = studio.media.get(&id).expect("job present while queued");
+            assert!(job.incognito, "{label}: job must be marked incognito");
+            assert!(studio.media.list().is_empty(), "{label}: private voice job must not appear in list()");
+            let scratch = job.scratch.clone().expect("scratch dir assigned");
+            let out_dir = str_or(&job.request, "output_dir", "");
+            assert!(std::path::Path::new(out_dir).starts_with(&scratch), "{label}: output_dir {out_dir} must live inside scratch {}", scratch.display());
+            std::fs::create_dir_all(&scratch).unwrap();
+            std::fs::write(scratch.join("leftover.wav"), b"RIFF").unwrap();
+
+            assert!(studio.media.cancel(&id));
+            let status = client.join().unwrap();
+            let _ = server.join();
+            assert_eq!(status, 500, "{label}: cancelled job returns 500");
+            assert!(studio.media.get(&id).is_none(), "{label}: job removed after failure");
+            assert!(!scratch.exists(), "{label}: scratch dir deleted after failure");
+            assert!(!dir.join("outputs").join("voices").exists(), "{label}: no files in outputs/voices");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -83,7 +83,15 @@ pub struct MigrationProgress {
 pub type MigrationHandle = Arc<Mutex<MigrationProgress>>;
 
 fn norm(s: &str) -> String {
-    s.trim_end_matches(['/', '\\']).to_lowercase()
+    let trimmed = s.trim_end_matches(['/', '\\']);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        trimmed.to_lowercase()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        trimmed.to_string()
+    }
 }
 
 /// Walk `root` recursively, invoking `f(file_path, size_bytes)` per file.
@@ -181,8 +189,12 @@ pub fn run(old: PathBuf, new: PathBuf, mode: Mode, progress: MigrationHandle) {
                     // Copied beside its name, then renamed into place: a copy cut short (the disk full, the app
                     // quit) is never taken for the file by a later run, which skips what exists.
                     let part = part_path(&dst);
-                    std::fs::copy(&src, &part)?;
-                    std::fs::rename(&part, &dst)?;
+                    if let Err(e) = std::fs::copy(&src, &part)
+                        .and_then(|_| std::fs::rename(&part, &dst))
+                    {
+                        let _ = std::fs::remove_file(&part);
+                        return Err(e);
+                    }
                 }
                 if mode == Mode::Move {
                     // Delete the source ONLY when this run created the

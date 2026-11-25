@@ -20,18 +20,34 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
-const modules = Object.freeze({
-  three: THREE,
-  'three/addons/controls/OrbitControls.js': Object.freeze({ OrbitControls, default: OrbitControls }),
-  'three/addons/exporters/GLTFExporter.js': Object.freeze({ GLTFExporter, default: GLTFExporter }),
-  'three/addons/loaders/GLTFLoader.js': Object.freeze({ GLTFLoader, default: GLTFLoader }),
-  'three/addons/environments/RoomEnvironment.js': Object.freeze({ RoomEnvironment, default: RoomEnvironment }),
-  'three/addons/geometries/RoundedBoxGeometry.js': Object.freeze({ RoundedBoxGeometry, default: RoundedBoxGeometry }),
-  'three/addons/utils/BufferGeometryUtils.js': BufferGeometryUtils,
-  'three/addons/postprocessing/EffectComposer.js': Object.freeze({ EffectComposer, default: EffectComposer }),
-  'three/addons/postprocessing/RenderPass.js': Object.freeze({ RenderPass, default: RenderPass }),
-  'three/addons/postprocessing/UnrealBloomPass.js': Object.freeze({ UnrealBloomPass, default: UnrealBloomPass }),
-  'three/addons/postprocessing/OutputPass.js': Object.freeze({ OutputPass, default: OutputPass }),
-});
+const modules = Object.freeze(
+  Object.assign(Object.create(null), {
+    three: THREE,
+    'three/addons/controls/OrbitControls.js': Object.freeze({ OrbitControls, default: OrbitControls }),
+    'three/addons/exporters/GLTFExporter.js': Object.freeze({ GLTFExporter, default: GLTFExporter }),
+    'three/addons/loaders/GLTFLoader.js': Object.freeze({ GLTFLoader, default: GLTFLoader }),
+    'three/addons/environments/RoomEnvironment.js': Object.freeze({ RoomEnvironment, default: RoomEnvironment }),
+    'three/addons/geometries/RoundedBoxGeometry.js': Object.freeze({ RoundedBoxGeometry, default: RoundedBoxGeometry }),
+    'three/addons/utils/BufferGeometryUtils.js': BufferGeometryUtils,
+    'three/addons/postprocessing/EffectComposer.js': Object.freeze({ EffectComposer, default: EffectComposer }),
+    'three/addons/postprocessing/RenderPass.js': Object.freeze({ RenderPass, default: RenderPass }),
+    'three/addons/postprocessing/UnrealBloomPass.js': Object.freeze({ UnrealBloomPass, default: UnrealBloomPass }),
+    'three/addons/postprocessing/OutputPass.js': Object.freeze({ OutputPass, default: OutputPass }),
+  }),
+);
 
-window.__oaiyAgentThree = Object.freeze({ THREE, modules });
+// Map every exported constructor to its canonical export name (immune to bundler minification).
+const ctorNames = new WeakMap();
+const registerCtorNames = (mod) => {
+  for (const key of Object.keys(mod)) {
+    if (key === 'default') continue;
+    const val = mod[key];
+    if (typeof val === 'function' && !ctorNames.has(val)) ctorNames.set(val, key);
+  }
+};
+registerCtorNames(THREE);
+for (const spec of Object.keys(modules)) {
+  if (spec !== 'three') registerCtorNames(modules[spec]);
+}
+
+window.__oaiyAgentThree = Object.freeze({ THREE, modules, ctorNames });

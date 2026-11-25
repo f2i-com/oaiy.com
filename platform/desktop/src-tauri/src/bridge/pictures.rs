@@ -276,12 +276,17 @@ pub fn inline_local(mut inputs: Value) -> Value {
 pub fn upload_local(bytes: &[u8], mime: &str) -> Result<String, String> {
     let base = format!("http://127.0.0.1:{}", crate::api_port());
     let credential = crate::auth::run_credential(LOCAL_CALL).map_err(|e| e.to_string())?;
-    let response = reqwest::blocking::Client::new()
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("the engines could not be reached ({e})"))?;
+    let response = client
         .post(format!("{base}{}", FILES_PATH.trim_end_matches('/')))
         .bearer_auth(credential.bearer())
         .header(reqwest::header::CONTENT_TYPE, mime)
         .body(bytes.to_vec())
-        .timeout(Duration::from_secs(60))
         .send()
         .map_err(|e| format!("the engines could not be reached ({e})"))?;
     let status = response.status();
@@ -305,10 +310,15 @@ pub fn fetch_local(reference: &str) -> Result<Vec<u8>, String> {
         return Err("it is a picture at another address than this desktop's".into());
     }
     let credential = crate::auth::run_credential(LOCAL_CALL).map_err(|e| e.to_string())?;
-    let response = reqwest::blocking::Client::new()
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("it could not be read ({e})"))?;
+    let response = client
         .get(format!("http://127.0.0.1:{}{path}", crate::api_port()))
         .bearer_auth(credential.bearer())
-        .timeout(Duration::from_secs(30))
         .send()
         .map_err(|e| format!("it could not be read ({e})"))?;
     if !response.status().is_success() {

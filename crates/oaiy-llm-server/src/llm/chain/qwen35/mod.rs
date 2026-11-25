@@ -2050,9 +2050,16 @@ impl Qwen35Chain {
         }
         if let Some(sp) = &st.spec {
             let rows = if checking { t } else { 1 };
-            // (the layer's cache first: a chunk's carries on from the hidden state the run before kept)
-            if !checking && t > 1 {
+            // (the layer's cache first: a chunk's carries on from the hidden state the run before kept,
+            // including a trailing 1-token chunk on `N * chunk_size + 1` prompts)
+            if !checking {
+                if t == 1 {
+                    rec.keep_groups(false);
+                }
                 self.mtp_prompt(m, st, sp, chain, &mut *rec, emb, &w.xn, t, past, kv.id);
+                if t == 1 {
+                    rec.keep_groups(true);
+                }
             }
             rec.copy(&w.xn, (t - rows) * s.d, &sp.hid, 0, rows * s.d);
             *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner()) = (past + t - rows, rows);

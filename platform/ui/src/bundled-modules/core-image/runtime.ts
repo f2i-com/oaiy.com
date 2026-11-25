@@ -541,19 +541,23 @@ async function generateComfyUI(
   }
 
   // Apply image input overrides - upload images to ComfyUI's input folder
-  // Use imageInputConfigs if available (new format), otherwise fall back to imageInputNodeIds (legacy)
-  // Filter out bypassed nodes
-  const effectiveNodeIds = (imageInputConfigs?.map(c => c.nodeId) || imageInputNodeIds || [])
-    .filter(nodeId => !nodesToBypass.has(nodeId));
+  // Use imageInputConfigs if available (new format), otherwise fall back to imageInputNodeIds (legacy).
+  // Pair each node with its corresponding imageInput and config BEFORE filtering out
+  // bypassed nodes so bypassing an earlier slot never shifts later inputs onto the wrong node.
+  const rawImageNodeIds = imageInputConfigs?.map(c => c.nodeId) || imageInputNodeIds || [];
+  const effectiveImageEntries = rawImageNodeIds
+    .map((nodeId, idx) => ({
+      nodeId,
+      imageInput: imageInputs?.[idx],
+      config: imageInputConfigs?.[idx],
+      originalIndex: idx,
+    }))
+    .filter(entry => !nodesToBypass.has(entry.nodeId));
 
-  ctx.log('info', `[ImageGen] Processing ${effectiveNodeIds.length} image inputs, imageInputs=${JSON.stringify(imageInputs)?.substring(0, 200)}`);
+  ctx.log('info', `[ImageGen] Processing ${effectiveImageEntries.length} image inputs, imageInputs=${JSON.stringify(imageInputs)?.substring(0, 200)}`);
 
-  if (imageInputs && effectiveNodeIds.length > 0) {
-    for (let i = 0; i < effectiveNodeIds.length; i++) {
-      const nodeId = effectiveNodeIds[i];
-      const imageInput = imageInputs[i];
-      const config = imageInputConfigs?.[i];
-
+  if (imageInputs && effectiveImageEntries.length > 0) {
+    for (const { nodeId, imageInput, config, originalIndex: i } of effectiveImageEntries) {
       ctx.log('info', `[ImageGen] Image ${i}: nodeId=${nodeId}, input=${JSON.stringify(imageInput)?.substring(0, 100)}, config=${JSON.stringify(config)}`);
 
       if (!nodeId || !workflow[nodeId]) {

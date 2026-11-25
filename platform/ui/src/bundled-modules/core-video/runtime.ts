@@ -978,13 +978,17 @@ async function generate(
   }
 
   // Handle Image Inputs
-  // Filter out bypassed nodes
-  const effectiveNodeIds = (comfyImageInputConfigs?.map(c => c.nodeId) || comfyImageInputNodeIds || [])
-    .filter(nodeId => !nodesToBypass.has(nodeId));
-  if (imageInputs && effectiveNodeIds.length > 0) {
-    for (let i = 0; i < effectiveNodeIds.length; i++) {
-      const id = effectiveNodeIds[i];
-      const input = imageInputs[i];
+  // Pair each node with its corresponding imageInput BEFORE filtering out bypassed nodes
+  // so bypassing an earlier slot never shifts later inputs onto the wrong node.
+  const rawImageNodeIds = comfyImageInputConfigs?.map(c => c.nodeId) || comfyImageInputNodeIds || [];
+  const effectiveImageEntries = rawImageNodeIds
+    .map((id, idx) => ({
+      id,
+      input: imageInputs?.[idx],
+    }))
+    .filter(entry => !nodesToBypass.has(entry.id));
+  if (imageInputs && effectiveImageEntries.length > 0) {
+    for (const { id, input } of effectiveImageEntries) {
 
       if (!id || !workflow[id]) continue;
       if (input === undefined || input === null || input === '') continue; // Skip if no input, use default

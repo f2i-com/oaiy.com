@@ -8,7 +8,7 @@
  *   - Exact line-level `+added` / `-deleted` counts.
  *   - Compact 3-line-context unified diff hunks for interactive UI inspection.
  */
-import { IGNORED_DIRS, type Vfs } from '../vfs/vfs';
+import { IGNORED_DIRS, parentOf, type Vfs } from '../vfs/vfs';
 
 export type ChangeKind = 'created' | 'modified' | 'deleted';
 
@@ -379,20 +379,61 @@ export function revertCheckpoint(
 ): { restored: string[]; deleted: string[] } {
   const restored: string[] = [];
   const deleted: string[] = [];
-  for (const entry of checkpoint.files) {
-    if (entry.beforeBytes === null) {
-      if (vfs.exists(`/${entry.path}`)) {
-        vfs.remove(`/${entry.path}`, true);
-        deleted.push(entry.path);
+  const clearReadsFor = (path: string, subtree = false) => {
+    if (!reads) return;
+    reads.delete(path);
+    reads.delete(`${path}#partial`);
+    if (subtree) {
+      const prefix = `${path}/`;
+      for (const k of [...reads.keys()]) {
+        if (k.startsWith(prefix)) reads.delete(k);
       }
-      reads?.delete(entry.path);
-      reads?.delete(`${entry.path}#partial`);
-    } else {
-      vfs.writeFile(`/${entry.path}`, entry.beforeBytes, { parents: true });
-      restored.push(entry.path);
-      reads?.delete(entry.path);
-      reads?.delete(`${entry.path}#partial`);
     }
+  };
+  const pruneEmptyParents = (path: string) => {
+    let dir = parentOf(path);
+    while (dir) {
+      const st = vfs.stat(`/${dir}`);
+      if (st?.type !== 'dir') break;
+      if (vfs.list(`/${dir}`).length > 0) break;
+      vfs.remove(`/${dir}`, false);
+      dir = parentOf(dir);
+    }
+  };
+
+  // Phase 1: remove files created during the turn first, and clean up newly empty parent directories
+  // so restoring a pre-turn file that was replaced by a directory (or vice versa) does not hit EISDIR/ENOTDIR.
+  for (const entry of checkpoint.files) {
+    if (entry.beforeBytes !== null) continue;
+    const st = vfs.stat(`/${entry.path}`);
+    if (st) {
+      vfs.remove(`/${entry.path}`, true);
+      deleted.push(entry.path);
+      pruneEmptyParents(entry.path);
+    }
+    clearReadsFor(entry.path, st?.type === 'dir');
   }
+
+  // Phase 2: restore pre-turn file contents, clearing any conflicting directory at the target path
+  // or conflicting file along its ancestor chain first.
+  for (const entry of checkpoint.files) {
+    if (entry.beforeBytes === null) continue;
+    if (vfs.stat(`/${entry.path}`)?.type === 'dir') {
+      vfs.remove(`/${entry.path}`, true);
+      clearReadsFor(entry.path, true);
+    }
+    let anc = parentOf(entry.path);
+    while (anc) {
+      if (vfs.stat(`/${anc}`)?.type === 'file') {
+        vfs.remove(`/${anc}`, true);
+        clearReadsFor(anc);
+      }
+      anc = parentOf(anc);
+    }
+    vfs.writeFile(`/${entry.path}`, entry.beforeBytes, { parents: true });
+    restored.push(entry.path);
+    clearReadsFor(entry.path);
+  }
+
   return { restored, deleted };
 }

@@ -218,6 +218,45 @@ export const sanitizeNodeData = (
 };
 
 /**
+ * Settings keys that an untrusted imported project, settings file, or shared
+ * flow must NEVER override silently: redirecting default endpoints would route
+ * the user's prompts + API keys to an attacker's host, and overriding
+ * `allowAllLocalNetwork` / `localNetworkWhitelist` would disable SSRF /
+ * local-network protections.
+ */
+export const UNSAFE_IMPORTED_SETTING_KEYS = [
+  'defaultAIEndpoint',
+  'ollamaEndpoint',
+  'lmstudioEndpoint',
+  'defaultImageEndpoint',
+  'defaultVideoEndpoint',
+  'allowAllLocalNetwork',
+  'localNetworkWhitelist',
+] as const;
+
+/**
+ * Return a shallow copy of an imported settings object with endpoint/network
+ * override keys removed. Also returns the list of stripped key names so callers
+ * can log a warning when overrides were dropped.
+ */
+export function stripUnsafeImportedSettings<T extends Record<string, unknown>>(
+  settings: T | undefined | null,
+): { cleaned: Partial<T>; stripped: string[] } {
+  if (!settings || typeof settings !== 'object') {
+    return { cleaned: {}, stripped: [] };
+  }
+  const cleaned: Record<string, unknown> = { ...settings };
+  const stripped: string[] = [];
+  for (const k of UNSAFE_IMPORTED_SETTING_KEYS) {
+    if (k in cleaned) {
+      delete cleaned[k];
+      stripped.push(k);
+    }
+  }
+  return { cleaned: cleaned as Partial<T>, stripped };
+}
+
+/**
  * Get a node definition's field names: the ones its schema calls secret, and the rest
  */
 const getSchemaFields = (nodeType: string): { secret: Set<string>; plain: Set<string> } => {
@@ -230,6 +269,22 @@ const getSchemaFields = (nodeType: string): { secret: Set<string>; plain: Set<st
     }
   }
   return fields;
+};
+
+/**
+ * Sanitize a single node's data using its schema (when `nodeType` is known) plus
+ * heuristic secret detection. Shared by both project export and single-workflow export.
+ */
+export const sanitizeNodeDataForType = (
+  data: Record<string, unknown>,
+  nodeType?: string,
+  knownSecrets: Set<string> = new Set(),
+): Record<string, unknown> => {
+  if (nodeType) {
+    const schema = getSchemaFields(nodeType);
+    return sanitizeNodeData(data, knownSecrets, schema.secret, schema.plain);
+  }
+  return sanitizeNodeData(data, knownSecrets);
 };
 
 /**
@@ -353,7 +408,7 @@ function sanitizeServiceForExport(
  * rule for names is kept for their header maps, and everything else is judged by what it holds: a key in a URL went out
  * with the file.
  */
-const sanitizeProjectRecord = <T extends object>(record: T, knownSecrets: Set<string>): T => {
+export const sanitizeProjectRecord = <T extends object>(record: T, knownSecrets: Set<string>): T => {
   const result: Record<string, unknown> = {};
   for (const [field, value] of Object.entries(record)) {
     if (typeof value === 'string') {
@@ -587,10 +642,13 @@ export const parseImportedProject = (content: string): ExportedProject => {
         (c) => !defaultConstants.find((d) => d.key === c.key)
       )
     ),
-    // Merge settings
+    // Merge settings — strip untrusted endpoint/local-network override keys so an
+    // imported project cannot silently redirect AI traffic or disable SSRF guards.
     settings: {
       ...defaultSettings,
-      ...imported.settings,
+      ...stripUnsafeImportedSettings(
+        imported.settings as unknown as Record<string, unknown> | undefined,
+      ).cleaned,
     },
   };
 };

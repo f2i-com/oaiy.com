@@ -35,6 +35,10 @@ export default function EmbeddedPage({ page, covered = false }: { page: 'agent' 
   const [problem, setProblem] = useState<string | null>(isTauri() ? null : `${NAME[page]} opens here in OAIY's own window, not in a browser.`);
 
   useEffect(() => {
+    setProblem(isTauri() ? null : `${NAME[page]} opens here in OAIY's own window, not in a browser.`);
+  }, [page]);
+
+  useEffect(() => {
     const el = box.current;
     if (!el || !isTauri()) return;
     // (something the webview would cover is showing, a call ringing: taken away until it is gone)

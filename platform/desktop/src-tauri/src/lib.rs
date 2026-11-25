@@ -368,7 +368,8 @@ fn open_path(webview: tauri::Webview, path: String) -> Result<(), String> {
 /// OS handler. Guarded to http/https so the UI can't ask us to launch arbitrary
 /// schemes. Invoked from the header's oaiy.com link.
 #[tauri::command]
-fn open_url(url: String) -> Result<(), String> {
+fn open_url(webview: tauri::Webview, url: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("only http(s) URLs are allowed".into());
     }
@@ -752,8 +753,20 @@ pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle)
     let configured_dir = read_data_dir_override(app);
     let effective = configured_dir.clone().unwrap_or_else(|| default_dir.clone());
     // Normalise trailing separators for the comparison so e.g.
-    // "D:\OAIY" and "D:\OAIY\" don't read as a pending change.
-    let norm = |s: &str| s.trim_end_matches(['/', '\\']).to_lowercase();
+    // "D:\OAIY" and "D:\OAIY\" don't read as a pending change. Only fold case on
+    // case-insensitive filesystems (Windows/macOS) so a Linux case-only folder
+    // rename still registers as a pending change.
+    let norm = |s: &str| {
+        let trimmed = s.trim_end_matches(['/', '\\']);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            trimmed.to_lowercase()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            trimmed.to_string()
+        }
+    };
 
     // Models dir: default is <pending data dir>/models, so the "pending"
     // readout reflects where models will live after a restart that also
@@ -792,8 +805,13 @@ impl http::ConfigProvider for TauriConfigProvider {
 
 /// Tauri command: current data-dir configuration for the Settings panel.
 #[tauri::command]
-fn get_config(app: tauri::AppHandle, registry: tauri::State<RegistryHandle>) -> DesktopConfig {
-    config_snapshot(&app, &registry)
+fn get_config(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    registry: tauri::State<RegistryHandle>,
+) -> Result<DesktopConfig, String> {
+    dashboard_only(&webview)?;
+    Ok(config_snapshot(&app, &registry))
 }
 
 /// Reject a user-supplied directory that isn't a plain local absolute path BEFORE we touch it.
@@ -888,11 +906,15 @@ fn apply_and_list_extra_dirs(registry: &RegistryHandle, dirs: Vec<String>) -> Ve
 /// the primary models dir). Read live from the registry so it reflects any
 /// add/remove done this session without a restart.
 #[tauri::command]
-fn list_model_dirs(registry: tauri::State<RegistryHandle>) -> Vec<String> {
-    registry
+fn list_model_dirs(
+    webview: tauri::Webview,
+    registry: tauri::State<RegistryHandle>,
+) -> Result<Vec<String>, String> {
+    dashboard_only(&webview)?;
+    Ok(registry
         .lock()
         .map(|r| r.extra_model_dirs())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Tauri command: register an additional (read-only) model folder. Validates
@@ -957,14 +979,9 @@ struct GpuInfo {
     name: String,
 }
 
-/// Tauri command: the CUDA GPUs present (index + name), via nvidia-smi. Empty on a box
-/// without an NVIDIA GPU / nvidia-smi — the GPU picker then hides itself.
-/// `async` so Tauri runs it OFF the main thread: this spawns `nvidia-smi`,
-/// which costs ~60ms on a healthy machine and much more on a busy one. Every
-/// service card mounts a GPU picker, so on the plain `#[tauri::command]` form
-/// that stall landed on the UI thread exactly as the Services panel rendered.
-#[tauri::command(async)]
-fn list_gpus() -> Vec<GpuInfo> {
+/// Probe the CUDA GPUs present (index + name) via nvidia-smi. Empty on a box
+/// without an NVIDIA GPU / nvidia-smi.
+fn probe_gpus() -> Vec<GpuInfo> {
     // Hard deadline. `nvidia-smi` is a third-party binary talking to a kernel
     // driver, and it does not always come back: a busy GPU, a half-installed
     // driver, or a hung one leaves it blocked indefinitely. This used to run
@@ -1027,6 +1044,18 @@ fn list_gpus() -> Vec<GpuInfo> {
             Some(GpuInfo { index, name })
         })
         .collect()
+}
+
+/// Tauri command: the CUDA GPUs present (index + name), via nvidia-smi. Empty on a box
+/// without an NVIDIA GPU / nvidia-smi — the GPU picker then hides itself.
+/// `async` so Tauri runs it OFF the main thread: this spawns `nvidia-smi`,
+/// which costs ~60ms on a healthy machine and much more on a busy one. Every
+/// service card mounts a GPU picker, so on the plain `#[tauri::command]` form
+/// that stall landed on the UI thread exactly as the Services panel rendered.
+#[tauri::command(async)]
+fn list_gpus(webview: tauri::Webview) -> Result<Vec<GpuInfo>, String> {
+    dashboard_only(&webview)?;
+    Ok(probe_gpus())
 }
 
 /// Tauri command: pin a service to a GPU index (CUDA_VISIBLE_DEVICES), or clear with a null
@@ -1122,6 +1151,8 @@ async fn tell_and_quit(app: &tauri::AppHandle, title: &str, body: String) {
 /// port is trivially squatted, so identity is asserted rather than assumed.
 async fn port_holder_is_oaiy(port: u16) -> bool {
     let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
     else {
@@ -1144,15 +1175,17 @@ async fn port_holder_is_oaiy(port: u16) -> bool {
 /// barely better than no log, and this file is the first thing to ask for when
 /// something goes wrong on a machine we cannot reach.
 #[tauri::command]
-fn log_path() -> Option<String> {
-    crate::applog::LOGGER.path().map(|p| p.display().to_string())
+fn log_path(webview: tauri::Webview) -> Result<Option<String>, String> {
+    dashboard_only(&webview)?;
+    Ok(crate::applog::LOGGER.path().map(|p| p.display().to_string()))
 }
 
 /// Tauri command: open a native folder picker, returning the chosen path
 /// (or None if cancelled). Non-blocking via a oneshot so we never stall
 /// the UI thread.
 #[tauri::command]
-async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn pick_folder(webview: tauri::Webview, app: tauri::AppHandle) -> Result<Option<String>, String> {
+    dashboard_only(&webview)?;
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |f| {
@@ -1288,12 +1321,17 @@ fn pending_data_dir(app: &tauri::AppHandle) -> PathBuf {
 
 /// Tauri command: what a data-folder migration would move (old → pending).
 #[tauri::command]
-fn migration_plan(app: tauri::AppHandle, registry: tauri::State<RegistryHandle>) -> MigratePlan {
+fn migration_plan(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    registry: tauri::State<RegistryHandle>,
+) -> Result<MigratePlan, String> {
+    dashboard_only(&webview)?;
     let old = match registry.lock().ok().map(|r| r.data_dir().to_path_buf()) {
         Some(o) => o,
-        None => return MigratePlan::default(),
+        None => return Ok(MigratePlan::default()),
     };
-    migrate::plan(&old, &pending_data_dir(&app))
+    Ok(migrate::plan(&old, &pending_data_dir(&app)))
 }
 
 /// Tauri command: start copying/moving the user's data to the pending
@@ -1336,15 +1374,23 @@ fn start_migration(
 
 /// Tauri command: current migration progress (polled by the UI).
 #[tauri::command]
-fn migration_status(migration: tauri::State<MigrationHandle>) -> MigrationProgress {
-    migration.lock().map(|g| g.clone()).unwrap_or_default()
+fn migration_status(
+    webview: tauri::Webview,
+    migration: tauri::State<MigrationHandle>,
+) -> Result<MigrationProgress, String> {
+    dashboard_only(&webview)?;
+    Ok(migration.lock().map(|g| g.clone()).unwrap_or_default())
 }
 
 /// Tauri command: whether a HuggingFace token is currently set. We never
 /// hand the token itself back to the UI — only its presence.
 #[tauri::command]
-fn get_hf_token_status(downloads: tauri::State<DownloadsHandle>) -> bool {
-    downloads.has_token()
+fn get_hf_token_status(
+    webview: tauri::Webview,
+    downloads: tauri::State<DownloadsHandle>,
+) -> Result<bool, String> {
+    dashboard_only(&webview)?;
+    Ok(downloads.has_token())
 }
 
 /// Tauri command: set (or clear, with an empty string) the HuggingFace
@@ -1467,6 +1513,15 @@ pub fn run() {
     };
     builder
         .invoke_handler(move |invoke| {
+            if !crate::update::gui::is_dashboard(invoke.message.webview_ref().label()) {
+                log::warn!(
+                    "refused IPC command \"{}\" from non-dashboard webview \"{}\"",
+                    invoke.message.command(),
+                    invoke.message.webview_ref().label()
+                );
+                invoke.resolver.reject("Only OAIY's own window can do that.");
+                return true;
+            }
             if isolated && !crate::isolated_policy::ipc_allowed(invoke.message.command()) {
                 invoke.resolver.reject(crate::isolated_policy::REFUSAL);
                 true
@@ -1669,7 +1724,7 @@ pub fn run() {
                 let registry_for_gpus = registry.clone();
                 let app_for_gpus = app.handle().clone();
                 std::thread::spawn(move || {
-                    let available = list_gpus();
+                    let available = probe_gpus();
                     // Only prune when enumeration actually SUCCEEDED, so a
                     // transient nvidia-smi failure cannot wipe valid pins.
                     if available.is_empty() {
@@ -1838,6 +1893,8 @@ pub fn run() {
                 // The ChatGPT connector: its OAuth lives in a CODEX_HOME under
                 // the data dir, owned by the codex child, not by us.
                 let ai_codex_for_http = crate::ai::codex::new_handle(&data_dir_for_bridge);
+                // Managed so app exit / update teardown stops any live codex session.
+                app_for_http.manage(ai_codex_for_http.clone());
                 // Companion trust and its relay. Built here, before serve(),
                 // because the plugin host answers `companion.admission` from
                 // the SAME identity store the routes administer — two stores
@@ -1974,6 +2031,7 @@ pub fn run() {
             let registry_for_health = registry.clone();
             tauri::async_runtime::spawn(async move {
                 let client = match reqwest::Client::builder()
+                    .no_proxy()
                     .timeout(std::time::Duration::from_secs(3))
                     .build()
                 {

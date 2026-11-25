@@ -40,9 +40,47 @@ const RUNTIME = sandboxRuntime.replace(/<\/script/gi, '<\\/script');
 const SRCDOC =
   `<!doctype html><html><head><meta charset="utf-8">` +
   `<meta http-equiv="Content-Security-Policy" content="${CSP}">` +
-  `<style>html,body,#root{margin:0;padding:0}body{font-family:system-ui,-apple-system,sans-serif;` +
-  `font-size:13px;color:#e5e7eb;background:transparent}</style></head>` +
+  `<style>html{color-scheme:var(--oaiy-color-scheme,dark)}html,body,#root{margin:0;padding:0}` +
+  `body{font-family:system-ui,-apple-system,sans-serif;font-size:13px;` +
+  `color:var(--oaiy-text,rgb(244 247 255));border-color:var(--oaiy-border,rgb(32 42 60));background:transparent}</style></head>` +
   `<body><div id="root"></div><script>${RUNTIME}</script></body></html>`;
+
+interface SandboxThemeTokens {
+  colorScheme: 'light' | 'dark';
+  textPrimary: string;
+  textSecondary: string;
+  borderPrimary: string;
+  bgTertiary: string;
+  accentPrimary: string;
+}
+
+function readHostThemeTokens(): SandboxThemeTokens {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return {
+      colorScheme: 'dark',
+      textPrimary: 'rgb(244 247 255)',
+      textSecondary: 'rgb(152 166 189)',
+      borderPrimary: 'rgb(32 42 60)',
+      bgTertiary: 'rgb(19 28 45)',
+      accentPrimary: 'rgb(113 103 255)',
+    };
+  }
+  const root = document.documentElement;
+  const isLight = root.classList.contains('light');
+  const cs = getComputedStyle(root);
+  const rgbToken = (name: string, fallback: string): string => {
+    const raw = cs.getPropertyValue(name).trim();
+    return raw ? `rgb(${raw})` : fallback;
+  };
+  return {
+    colorScheme: isLight ? 'light' : 'dark',
+    textPrimary: rgbToken('--color-text-primary', isLight ? 'rgb(23 23 23)' : 'rgb(244 247 255)'),
+    textSecondary: rgbToken('--color-text-secondary', isLight ? 'rgb(104 100 94)' : 'rgb(152 166 189)'),
+    borderPrimary: rgbToken('--color-border-primary', isLight ? 'rgb(214 209 200)' : 'rgb(32 42 60)'),
+    bgTertiary: rgbToken('--color-bg-tertiary', isLight ? 'rgb(246 243 237)' : 'rgb(19 28 45)'),
+    accentPrimary: rgbToken('--accent-primary', isLight ? 'rgb(36 87 230)' : 'rgb(113 103 255)'),
+  };
+}
 
 interface Props extends CustomNodeUIProps {
   /** Compiled UI bundle for this node — UNTRUSTED package code, runs only in the iframe. */
@@ -83,6 +121,7 @@ export const SandboxedCustomNodeUI: React.FC<Props> = ({
       if (!m || typeof m.__oaiybox !== 'string') return;
       if (m.__oaiybox === 'boot') {
         readyRef.current = true;
+        postToFrame({ __oaiybox: 'theme', theme: readHostThemeTokens() });
         postToFrame({ __oaiybox: 'init', code, nodeId: nodeTypeId });
         postToFrame({ __oaiybox: 'props', data: dataRef.current, selected: selectedRef.current });
       } else if (m.__oaiybox === 'dataChange') {
@@ -94,6 +133,23 @@ export const SandboxedCustomNodeUI: React.FC<Props> = ({
     window.addEventListener('message', onMsg);
     return () => window.removeEventListener('message', onMsg);
   }, [code, nodeTypeId, postToFrame]);
+
+  // Keep the sandbox iframe's text/border colors in sync whenever the host theme changes
+  // (e.g. toggling dark Prism Lab ↔ light Paper Circuit or changing accent color).
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
+    const syncTheme = () => {
+      if (readyRef.current) {
+        postToFrame({ __oaiybox: 'theme', theme: readHostThemeTokens() });
+      }
+    };
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'style'],
+    });
+    return () => observer.disconnect();
+  }, [postToFrame]);
 
   // Push prop changes to the frame once it's booted.
   useEffect(() => {

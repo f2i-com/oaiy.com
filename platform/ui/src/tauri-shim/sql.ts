@@ -78,9 +78,109 @@ function dbNameFromConn(conn: string): string {
   return flat || 'oaiy_data.db';
 }
 
-/** plugin-sql positional `$1` → SQLite indexed `?1`. Leaves `$.jsonPath` alone. */
-function normalizeSql(sql: string): string {
-  return sql.replace(/\$(\d+)/g, '?$1');
+/**
+ * plugin-sql positional `$1` → SQLite indexed `?1`.
+ * Skips single-quoted strings, double/backtick/bracket-quoted identifiers,
+ * and `--` / `/* *\/` comments so literals like `'Price: $100'` are never corrupted.
+ * Leaves `$.jsonPath` alone.
+ */
+export function normalizeSql(sql: string): string {
+  let out = '';
+  let i = 0;
+  const len = sql.length;
+  while (i < len) {
+    const ch = sql[i];
+    // Single-quoted string literal ('...' with '' escape)
+    if (ch === "'") {
+      const start = i++;
+      while (i < len) {
+        if (sql[i] === "'") {
+          i++;
+          if (i < len && sql[i] === "'") {
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Double-quoted identifier ("..." with "" escape)
+    if (ch === '"') {
+      const start = i++;
+      while (i < len) {
+        if (sql[i] === '"') {
+          i++;
+          if (i < len && sql[i] === '"') {
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Backtick-quoted identifier (`...` with `` escape)
+    if (ch === '`') {
+      const start = i++;
+      while (i < len) {
+        if (sql[i] === '`') {
+          i++;
+          if (i < len && sql[i] === '`') {
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Bracket-quoted identifier ([...])
+    if (ch === '[') {
+      const start = i++;
+      while (i < len && sql[i] !== ']') i++;
+      if (i < len) i++;
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Line comment (-- ... \n)
+    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      const start = i;
+      i += 2;
+      while (i < len && sql[i] !== '\n') i++;
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Block comment (/* ... */)
+    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
+      const start = i;
+      i += 2;
+      while (i + 1 < len && !(sql[i] === '*' && sql[i + 1] === '/')) i++;
+      i = i + 1 < len ? i + 2 : len;
+      out += sql.slice(start, i);
+      continue;
+    }
+    // Positional placeholder $1, $2, ...
+    if (ch === '$' && i + 1 < len && sql[i + 1] >= '0' && sql[i + 1] <= '9') {
+      const prev = i > 0 ? sql[i - 1] : '';
+      if (!/[A-Za-z0-9_]/.test(prev)) {
+        let j = i + 1;
+        while (j < len && sql[j] >= '0' && sql[j] <= '9') j++;
+        out += '?' + sql.slice(i + 1, j);
+        i = j;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 export interface QueryResult {

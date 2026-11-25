@@ -18,6 +18,11 @@ import type { ProjectConstant, ProjectSettings } from 'oaiy-core';
 import { useServices } from '../../hooks/useServices';
 import { AppearanceTab, SecurityTab, ServicesTab } from './settings';
 import { uiLogger as logger } from '../../utils/logger';
+import {
+  looksLikeSecret,
+  sanitizeProjectRecord,
+  stripUnsafeImportedSettings,
+} from '../../utils/ProjectIO';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import SectionPage, { Card, SubNav, type SubNavItem } from '../chrome/SectionPage';
 import {
@@ -102,10 +107,19 @@ export default function SettingsPanel({
     if (onExportSettings) {
       onExportSettings();
     } else {
-      // Default export behavior
+      // Default export behavior — sanitize settings and blank any secret or secret-looking constants.
+      const knownSecrets = new Set<string>();
+      for (const c of constants) {
+        if (c.value && (c.isSecret || c.category === 'api_key' || looksLikeSecret(c.value))) {
+          knownSecrets.add(c.value);
+        }
+      }
       const exportData = {
-        settings,
-        constants: constants.map(c => ({ ...c, value: c.isSecret ? '' : c.value })), // Don't export secret values
+        settings: sanitizeProjectRecord(settings, knownSecrets),
+        constants: constants.map(c => ({
+          ...c,
+          value: c.isSecret || c.category === 'api_key' || looksLikeSecret(c.value) ? '' : c.value,
+        })),
       };
       const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -128,27 +142,43 @@ export default function SettingsPanel({
         try {
           const text = await file.text();
           const data = JSON.parse(text);
-          if (data.settings && onImportSettings) {
-            onImportSettings(data);
-            onShowToast?.('Settings imported successfully', 'success');
-          } else if (data.settings) {
-            // Apply settings directly
-            onUpdateSettings(data.settings);
-            // Import constants (but preserve existing secret values)
-            if (data.constants) {
-              data.constants.forEach((imported: ProjectConstant) => {
-                const existing = constants.find(c => c.key === imported.key);
-                if (existing) {
-                  // Update existing constant, preserve value if it's secret and import has empty value
-                  const value = imported.isSecret && !imported.value ? existing.value : imported.value;
-                  onUpdateConstant(existing.id, { ...imported, value });
-                } else {
-                  // Create new constant
-                  onCreateConstant(imported);
-                }
+          if (data && typeof data === 'object' && data.settings && typeof data.settings === 'object') {
+            const { cleaned: safeSettings } = stripUnsafeImportedSettings(
+              data.settings as Record<string, unknown>,
+            );
+            if (onImportSettings) {
+              onImportSettings({
+                ...data,
+                settings: safeSettings as ProjectSettings,
               });
+              onShowToast?.('Settings imported successfully', 'success');
+            } else {
+              // Apply sanitized settings directly (never let imported JSON override
+              // endpoint URLs or local-network security protections)
+              onUpdateSettings(safeSettings as Partial<ProjectSettings>);
+              // Import constants (preserve existing id, never downgrade isSecret from true to false)
+              if (Array.isArray(data.constants)) {
+                data.constants.forEach((imported: ProjectConstant) => {
+                  if (!imported || typeof imported !== 'object' || typeof imported.key !== 'string' || !imported.key) {
+                    return;
+                  }
+                  const { id: _ignoredId, ...rest } = imported;
+                  const existing = constants.find(c => c.key === imported.key);
+                  if (existing) {
+                    const isSecret = Boolean(existing.isSecret || imported.isSecret);
+                    const category = existing.category === 'api_key' ? 'api_key' : (imported.category ?? existing.category);
+                    const value = isSecret && !imported.value ? existing.value : (imported.value ?? '');
+                    onUpdateConstant(existing.id, { ...rest, isSecret, category, value });
+                  } else {
+                    const isSecret = Boolean(
+                      imported.isSecret || imported.category === 'api_key' || looksLikeSecret(imported.value),
+                    );
+                    onCreateConstant({ ...rest, isSecret });
+                  }
+                });
+              }
+              onShowToast?.('Settings imported successfully', 'success');
             }
-            onShowToast?.('Settings imported successfully', 'success');
           }
         } catch (err) {
           logger.error('Failed to import settings', { error: err });

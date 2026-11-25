@@ -488,7 +488,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let l = red[0];
     let part = n_h * hd + (h * runs + run) * hd;
-    let n = end - start;
+    var n = 0u;
+    if (end > start) { n = end - start; }
     for (var d = li; d < hd; d += 256u) {
         var acc = 0.0;
         for (var i = 0u; i < n; i++) { acc += sc[i] * bitcast<f32>(w[(start + i) * row + kvd + kh * hd + d]); }
@@ -563,7 +564,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     let l = red[0];
     let part = n_h * hd + (h * runs + run) * hd;
-    let n = end - start;
+    var n = 0u;
+    if (end > start) { n = end - start; }
     // a value column a thread (its 4 columns where the head is wider than 256 columns' threads... 4 at a time)
     for (var d4 = li; d4 < hd4; d4 += 256u) {
         var a0 = vec4<f32>(0.0);
@@ -1019,44 +1021,45 @@ fn lanes_of(halved: String, g: usize, hd: usize, lanes: usize, unroll: usize) ->
     let per = 32 / lanes;
     let parts = hd / 4 / lanes;
     let c = |i: usize| ["x", "y", "z", "w"][i % 4];
-    let mut scores = format!("    // the lane's part of a key ({lanes} lanes a key, its vec4s `sub`, `sub + {lanes}`, ...: a load's lanes side by side) and its\n    // key of the subgroup's {per}, and the queries' vec4s of that part\n    let lane = li % 32u;\n    let sub = lane % {lanes}u;\n    let kk = lane / {lanes}u;\n");
+    let mut scores = String::from("    var s0 = vec4<f32>(-3.4e38);\n    var s1 = vec4<f32>(-3.4e38);\n    if (start < end) {\n");
+    scores += &format!("        // the lane's part of a key ({lanes} lanes a key, its vec4s `sub`, `sub + {lanes}`, ...: a load's lanes side by side) and its\n        // key of the subgroup's {per}, and the queries' vec4s of that part\n        let lane = li % 32u;\n        let sub = lane % {lanes}u;\n        let kk = lane / {lanes}u;\n");
     for i in 0..g {
         for k in 0..parts {
-            scores += &format!("    let q{i}_{k} = buf[{i}u * hd4 + {}u + sub];\n", k * lanes);
+            scores += &format!("        let q{i}_{k} = buf[{i}u * hd4 + {}u + sub];\n", k * lanes);
         }
     }
     // (the run's 256 keys: the 8 subgroups' `per` at a time, `unroll` such turns a pass)
-    scores += &format!("    for (var j = 0u; j < 256u; j += {}u) {{\n", 8 * per * unroll);
+    scores += &format!("        for (var j = 0u; j < 256u; j += {}u) {{\n", 8 * per * unroll);
     for u in 0..unroll {
-        scores += &format!("        let key{u} = j + {}u + (li / 32u) * {per}u + kk;\n        let tk{u} = start + key{u};\n        let kb{u} = min(tk{u}, max(end, start + 1u) - 1u) * row4 + kh * hd4 + sub;\n", u * 8 * per);
+        scores += &format!("            let key{u} = j + {}u + (li / 32u) * {per}u + kk;\n            let tk{u} = start + key{u};\n            let kb{u} = min(tk{u}, end - 1u) * row4 + kh * hd4 + sub;\n", u * 8 * per);
         for k in 0..parts {
-            scores += &format!("        let k{u}_{k} = vec4<f32>(kv4[kb{u} + {}u]);\n", k * lanes);
+            scores += &format!("            let k{u}_{k} = vec4<f32>(kv4[kb{u} + {}u]);\n", k * lanes);
         }
     }
     let groups = g.div_ceil(4);
     for u in 0..unroll {
         for v in 0..groups {
             let sums: Vec<String> = (0..4).map(|i| if 4 * v + i < g { (0..parts).map(|k| format!("dot(q{}_{k}, k{u}_{k})", 4 * v + i)).collect::<Vec<_>>().join(" + ") } else { "0.0".into() }).collect();
-            scores += &format!("        var r{u}_{v} = vec4<f32>({});\n", sums.join(", "));
+            scores += &format!("            var r{u}_{v} = vec4<f32>({});\n", sums.join(", "));
         }
     }
     let mut m = lanes / 2;
     while m > 0 {
         for u in 0..unroll {
             for v in 0..groups {
-                scores += &format!("        r{u}_{v} += subgroupShuffleXor(r{u}_{v}, {m}u);\n");
+                scores += &format!("            r{u}_{v} += subgroupShuffleXor(r{u}_{v}, {m}u);\n");
             }
         }
         m /= 2;
     }
-    scores += "        if (sub == 0u) {\n";
+    scores += "            if (sub == 0u) {\n";
     for u in 0..unroll {
         for v in 0..2 {
             let parts: Vec<String> = (0..4).map(|i| if 4 * v + i < g { format!("r{u}_{}.{} * scale", v, c(i)) } else { "-3.4e38".into() }).collect();
-            scores += &format!("            sc[2u * key{u} + {v}u] = select(vec4<f32>(-3.4e38), vec4<f32>({}), tk{u} < end);\n", parts.join(", "));
+            scores += &format!("                sc[2u * key{u} + {v}u] = select(vec4<f32>(-3.4e38), vec4<f32>({}), tk{u} < end);\n", parts.join(", "));
         }
     }
-    scores += "        }\n    }\n    workgroupBarrier();\n    let t = start + li;\n    let live = t < end;\n    let s0 = sc[2u * li];\n    let s1 = sc[2u * li + 1u];\n";
+    scores += "            }\n        }\n        workgroupBarrier();\n        s0 = sc[2u * li];\n        s1 = sc[2u * li + 1u];\n    }\n    let t = start + li;\n    let live = start < end && t < end;\n";
     let rest = &halved[to..];
     // the run's largest and sum a head by subgroups (each subgroup's, then the 8 subgroups' in turn) where the
     // workgroup's halving steps took a barrier each, 16 of them
@@ -1070,20 +1073,20 @@ fn lanes_of(halved: String, g: usize, hd: usize, lanes: usize, unroll: usize) ->
     // loaded before their sums, where a row's load was waited on at its sum
     let values_from = rest.find("    let vb = start * row4 + kvd4 + kh * hd4 + d4;\n").expect("the values' start");
     let values_to = rest.find("    if (share > 0u) {").expect("the values' end");
-    let mut values = String::from("    let vb = kvd4 + kh * hd4 + d4;\n    let lastp = max(end, start + 1u) - 1u;\n");
-    values += &(0..g).map(|i| format!("    var v{i} = vec4<f32>(0.0);\n")).collect::<String>();
-    values += "    for (var i = first; i < first + hd4; i += 4u) {\n";
+    let mut values = (0..g).map(|i| format!("    var v{i} = vec4<f32>(0.0);\n")).collect::<String>();
+    values += "    if (start < end) {\n        let vb = kvd4 + kh * hd4 + d4;\n        let lastp = end - 1u;\n";
+    values += "        for (var i = first; i < first + hd4; i += 4u) {\n";
     for u in 0..4 {
-        values += &format!("        let vr{u} = vec4<f32>(kv4[min(start + i + {u}u, lastp) * row4 + vb]);\n");
+        values += &format!("            let vr{u} = vec4<f32>(kv4[min(start + i + {u}u, lastp) * row4 + vb]);\n");
     }
     for u in 0..4 {
-        values += &format!("        let w{u}a = sc[2u * (i + {u}u)];\n        let w{u}b = sc[2u * (i + {u}u) + 1u];\n");
+        values += &format!("            let w{u}a = sc[2u * (i + {u}u)];\n            let w{u}b = sc[2u * (i + {u}u) + 1u];\n");
     }
     for i in 0..g {
         let (h, comp) = (["a", "b"][i / 4], c(i));
-        values += &format!("        v{i} += w0{h}.{comp} * vr0 + w1{h}.{comp} * vr1 + w2{h}.{comp} * vr2 + w3{h}.{comp} * vr3;\n");
+        values += &format!("            v{i} += w0{h}.{comp} * vr0 + w1{h}.{comp} * vr1 + w2{h}.{comp} * vr2 + w3{h}.{comp} * vr3;\n");
     }
-    values += "    }\n";
+    values += "        }\n    }\n";
     let rest = format!("{}{}{}", &rest[..values_from], values, &rest[values_to..]);
     format!("{}{}{}", &halved[..from], scores, rest)
 }

@@ -133,20 +133,21 @@ const BLOCKED_TAURI_IMPORTS: ReadonlySet<string> = new Set([
 /**
  * Create an esbuild plugin for virtual file compilation
  */
-function createVirtualPlugin(sources: Map<string, string>, entryCode: string): esbuild.Plugin {
+function createVirtualPlugin(sources: Map<string, string>, entryPath: string): esbuild.Plugin {
   return {
     name: 'virtual-custom-node',
     setup(build) {
-      // Handle the entry point
-      build.onResolve({ filter: /^__entry__$/ }, () => ({
-        path: '__entry__',
+      // Handle the entry point directly so both `export default` and named exports are preserved.
+      const escapedEntry = entryPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      build.onResolve({ filter: new RegExp(`^${escapedEntry}$`) }, () => ({
+        path: entryPath,
         namespace: 'virtual',
       }));
 
       // Handle relative imports
       build.onResolve({ filter: /^\./ }, (args) => {
         let importerDir = '';
-        if (args.importer && args.importer !== '__entry__') {
+        if (args.importer && args.importer !== entryPath) {
           const lastSlash = args.importer.lastIndexOf('/');
           if (lastSlash !== -1) {
             importerDir = args.importer.slice(0, lastSlash + 1);
@@ -238,10 +239,6 @@ function createVirtualPlugin(sources: Map<string, string>, entryCode: string): e
 
       // Load virtual files
       build.onLoad({ filter: /.*/, namespace: 'virtual' }, (args) => {
-        if (args.path === '__entry__') {
-          return { contents: entryCode, loader: 'ts' };
-        }
-
         const content = sources.get(args.path);
         if (content !== undefined) {
           const loader = args.path.endsWith('.tsx') ? 'tsx' : 'ts';
@@ -266,13 +263,15 @@ async function compileSource(
   try {
     await initializeEsbuild();
 
+    // Use the virtual source file directly as the entry point (instead of a
+    // synthetic `export * from './source'` wrapper, which drops `export default`)
+    // and preserve the `.tsx` extension so JSX in custom node UIs compiles.
+    const entryPath = filename.endsWith('.tsx') ? 'source.tsx' : 'source.ts';
     const sources = new Map<string, string>();
-    sources.set('source.ts', source);
-
-    const entryCode = `export * from './source';`;
+    sources.set(entryPath, source);
 
     const result = await esbuild.build({
-      entryPoints: ['__entry__'],
+      entryPoints: [entryPath],
       bundle: true,
       write: false,
       format,
@@ -280,7 +279,7 @@ async function compileSource(
       platform: 'browser',
       target: 'es2020',
       minify: false,
-      plugins: [createVirtualPlugin(sources, entryCode)],
+      plugins: [createVirtualPlugin(sources, entryPath)],
       jsx: 'automatic',
       define: {
         'process.env.NODE_ENV': '"production"',

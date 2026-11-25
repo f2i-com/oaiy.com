@@ -62,9 +62,12 @@ impl Qwen35Chain {
         let s = st.dims;
         let mtp = m.mtp.as_ref().expect("a drafting chain's model has its layer");
         let mut g = sp.kv.lock().unwrap_or_else(|p| p.into_inner());
-        mtp_reserve(chain, &mut g, &s, past + t);
         let (hid_at, hid_rows) = *sp.hid_at.lock().unwrap_or_else(|p| p.into_inner());
         let carry = past > 0 && g.owner == owner && g.start == 0 && g.valid + 1 == past && hid_rows > 0 && hid_at + hid_rows == past;
+        if t <= 1 && !carry {
+            return;
+        }
+        mtp_reserve(chain, &mut g, &s, past + t);
         if !carry && (g.owner != owner || g.valid != past || g.start != 0) {
             // a chunk's attention reaches back to the cache's start: entries from 0, or none
             if past != 0 {
@@ -90,7 +93,9 @@ impl Qwen35Chain {
         let hid = if carry {
             let h = v(rows * s.d);
             rec.copy(&sp.hid, (hid_rows - 1) * s.d, &h, 0, s.d);
-            rec.copy(hidden, 0, &h, s.d, (t - 1) * s.d);
+            if t > 1 {
+                rec.copy(hidden, 0, &h, s.d, (t - 1) * s.d);
+            }
             h
         } else {
             first(hidden, rows * s.d)

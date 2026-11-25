@@ -469,6 +469,34 @@ function updateSessionCookies(session: BrowserSession, headers: Record<string, s
 }
 
 /**
+ * Check if a Content-Type header represents binary content that should be returned as a Data URL.
+ */
+function isBinaryContentType(contentType: string): boolean {
+  const lower = contentType.toLowerCase();
+  return (
+    lower.startsWith('image/') ||
+    lower.startsWith('audio/') ||
+    lower.startsWith('video/') ||
+    lower.startsWith('application/octet-stream') ||
+    lower.startsWith('application/pdf') ||
+    lower.startsWith('application/zip') ||
+    lower.startsWith('application/gzip') ||
+    lower.startsWith('application/x-tar') ||
+    lower.startsWith('font/')
+  );
+}
+
+/** Chunked Uint8Array -> base64 conversion (avoids call-stack overflow on large buffers). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(bin);
+}
+
+/**
  * Make an HTTP request
  */
 async function request(
@@ -478,7 +506,7 @@ async function request(
   body: string,
   sessionId: string | undefined,
   nodeId: string,
-  allowLocalNetwork: boolean = false
+  _allowLocalNetwork: boolean = false
 ): Promise<{
   status: number;
   headers: Record<string, string>;
@@ -495,7 +523,7 @@ async function request(
   validateRequestBody(body);
 
   ctx.onNodeStatus?.(nodeId, 'running');
-  ctx.log('info', `[Browser] ${method} request to ${url}${allowLocalNetwork ? ' (local network allowed)' : ''}`);
+  ctx.log('info', `[Browser] ${method} request to ${url}`);
 
   // Get session if provided
   const session = sessionId ? sessions.get(sessionId) : undefined;
@@ -531,72 +559,53 @@ async function request(
   }
 
   try {
-    // Use Tauri's native HTTP to bypass CORS restrictions
-    if (ctx.tauri) {
-      const result = await ctx.tauri.invoke<HttpResult>('http_request', {
-        request: {
-          url,
-          method,
-          headers,
-          body: body || null,
-          follow_redirects: true,
-          max_redirects: 10,
-          allow_private_networks: allowLocalNetwork,
-        }
-      });
-
-      // Update session cookies from Set-Cookie header
-      if (session && result.headers) {
-        updateSessionCookies(session, result.headers);
-      }
-
-      // Track the URL in session for auto-navigation in browser_control
-      if (session) {
-        session.currentUrl = result.url || url;
-      }
-
-      ctx.onNodeStatus?.(nodeId, 'completed');
-      ctx.log('success', `[Browser] Response: ${result.status}`);
-
-      // Handle Base64-encoded binary responses (images, PDFs, etc.)
-      let responseBody = result.body;
-      if (result.bodyIsBase64) {
-        // Get content-type for Data URL format
-        const contentType = result.headers['content-type'] || result.headers['Content-Type'] || 'application/octet-stream';
-        // Format as Data URL so downstream nodes (Image Save, etc.) can use it directly
-        responseBody = `data:${contentType};base64,${result.body}`;
-        ctx.log('info', `[Browser] Binary response converted to Data URL (${contentType})`);
-      }
-
-      // Limit response size
-      const limited = limitResponseSize(responseBody);
-      if (limited.truncated) {
-        ctx.log('warn', `[Browser] Response truncated to ${MAX_RESPONSE_BODY_SIZE / 1024 / 1024} MB`);
-      }
-
-      return {
-        status: result.status,
-        headers: result.headers,
-        body: limited.body,
-      };
-    }
-
-    // Fallback to browser fetch (will hit CORS issues for cross-origin)
-    const response = await ctx.fetch(url, {
-      method,
+    // Always route through the runtime's policy-enforced fetch (`ctx.secureFetch`) so
+    // `isLocalNetworkUrl` / `localNetworkWhitelist` / `onLocalNetworkPermission` are
+    // enforced consistently on desktop and web (and desktop still proxies through
+    // native `http_request` under the hood after policy approval).
+    const upMethod = (method || 'GET').toUpperCase();
+    const requestBody = upMethod !== 'GET' && upMethod !== 'HEAD' && body ? body : undefined;
+    const fetcher = ctx.secureFetch ?? ctx.fetch;
+    const response = await fetcher(url, {
+      method: upMethod,
       headers,
-      body: body || undefined,
+      body: requestBody,
+      signal: ctx.abortSignal,
+      nodeId,
+      purpose: 'Browser HTTP request',
     });
 
-    const responseBody = await response.text();
     const responseHeaders: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      responseHeaders[key] = value;
-    });
+    if (response.headers && typeof response.headers.forEach === 'function') {
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+    } else if (response.headers && typeof response.headers === 'object') {
+      for (const [key, value] of Object.entries(response.headers as unknown as Record<string, unknown>)) {
+        responseHeaders[key] = String(value);
+      }
+    }
 
     // Update session cookies from Set-Cookie header
     if (session) {
       updateSessionCookies(session, responseHeaders);
+      session.currentUrl = response.url || url;
+    }
+
+    // Handle binary responses (images, PDFs, etc.) as Data URLs
+    const contentType = responseHeaders['content-type'] || responseHeaders['Content-Type'] || '';
+    let responseBody: string;
+    if ((response as unknown as { bodyIsBase64?: boolean }).bodyIsBase64) {
+      const ct = contentType || 'application/octet-stream';
+      responseBody = `data:${ct};base64,${await response.text()}`;
+      ctx.log('info', `[Browser] Binary response converted to Data URL (${ct})`);
+    } else if (isBinaryContentType(contentType) && typeof response.arrayBuffer === 'function') {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const ct = contentType || 'application/octet-stream';
+      responseBody = `data:${ct};base64,${bytesToBase64(bytes)}`;
+      ctx.log('info', `[Browser] Binary response converted to Data URL (${ct})`);
+    } else {
+      responseBody = await response.text();
     }
 
     // Limit response size

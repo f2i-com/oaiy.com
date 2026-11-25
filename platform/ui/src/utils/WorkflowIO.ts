@@ -8,7 +8,7 @@
 import type { Node, Edge } from '@xyflow/react';
 import dagre from 'dagre';
 import type { WorkflowGraph, NodeType } from 'oaiy-core';
-import { looksLikeSecret, redactSecretsInText } from './ProjectIO';
+import { sanitizeNodeDataForType } from './ProjectIO';
 import { withoutRunOutputs } from './runOutputs';
 
 /** No project-constant secrets available in this path — still catches vendor-shaped keys. */
@@ -445,32 +445,32 @@ export function validateWorkflowEdge(edge: unknown, index: number): string | nul
  */
 export function filterNodeData(
   data: Record<string, unknown>,
-  options: { includeSensitive?: boolean } = {}
+  options: { includeSensitive?: boolean; nodeType?: string } = {}
 ): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(data)) {
-    // Optionally filter sensitive fields by NAME
-    if (!options.includeSensitive && SENSITIVE_FIELDS.includes(key)) continue;
-    // Keep persistent underscore fields (verbatim)
-    if (PERSISTENT_UNDERSCORE_FIELDS.includes(key)) {
+  if (options.includeSensitive) {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (PERSISTENT_UNDERSCORE_FIELDS.includes(key)) {
+        result[key] = value;
+        continue;
+      }
+      if (key.startsWith('_')) continue;
       result[key] = value;
-      continue;
     }
-    // Strip other underscore-prefixed fields (like _status)
-    if (key.startsWith('_')) continue;
-    // Redact secret-looking VALUES on export, for parity with the project-export
-    // path (sanitizeNodeData): SENSITIVE_FIELDS is name-only, so a literal key pasted
-    // into apiKeyConstant / endpoint / headers / bodyTemplate would otherwise leak
-    // verbatim into a shared workflow JSON. Drop a whole-value key; scrub a mid-string
-    // one (keeps a legitimate constant NAME like OPENAI_API_KEY, which isn't secret-shaped).
-    if (!options.includeSensitive && typeof value === 'string') {
-      if (looksLikeSecret(value)) continue;
-      result[key] = redactSecretsInText(value, NO_KNOWN_SECRETS);
-      continue;
-    }
-    result[key] = value;
+    return result;
   }
-  return result;
+
+  // Delegate to ProjectIO's schema-driven + recursive sanitizer so single-workflow
+  // exports strip every secret field, nested header/object/array secret, literal key
+  // pasted in *Constant/*EnvVar, and inline URL/body/header credential just like
+  // full project exports.
+  const sanitized = sanitizeNodeDataForType(data, options.nodeType, NO_KNOWN_SECRETS);
+  for (const field of PERSISTENT_UNDERSCORE_FIELDS) {
+    if (field in data) {
+      sanitized[field] = data[field];
+    }
+  }
+  return sanitized;
 }
 
 /**
@@ -494,7 +494,7 @@ export function prepareWorkflowForExport(
       id: n.id,
       type: n.type,
       position: n.position,
-      data: filterNodeData(n.data as Record<string, unknown>),
+      data: filterNodeData(n.data as Record<string, unknown>, { nodeType: n.type }),
     })),
     edges: edges.map((e) => ({
       id: e.id,

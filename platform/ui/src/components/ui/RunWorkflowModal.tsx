@@ -4,6 +4,7 @@ import type { Node } from '@xyflow/react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderOpen, Play } from 'lucide-react';
 import { pathToMediaUrl } from 'oaiy-core';
+import { mediaUrlBlocked } from '../../lib/localMedia';
 import { uiLogger as logger } from '../../utils/logger';
 
 /** A file's value as the field shows it: a browser's picked file (a blob: URL, its name after #) by its name. */
@@ -297,7 +298,7 @@ export default function RunWorkflowModal({
                         : currentPath && !currentPath.startsWith('data:')
                           ? pathToMediaUrl(currentPath)
                           : '';
-                    if (!previewSrc) return null;
+                    if (!previewSrc || mediaUrlBlocked(previewSrc)) return null;
                     return (
                       <button
                         type="button"

@@ -473,6 +473,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     };
     drop(fine);
     let hr_coords = given_coords(r, "coords_hr")?.unwrap_or(hr_coords);
+    if hr_coords.is_empty() {
+        candle_core::bail!("3d: no fine structure came out of the picture (is the object in view, on a plain background?)");
+    }
     let grid = hr_res / 16;
     dump_coords(r, "coords_hr", &hr_coords)?;
     let proj_hr = if let Some(naf) = &naf { Some(project(&seen1024, Some((naf, 512)), &hr_coords, grid, &cam, &dev)?) } else { None };
@@ -538,6 +541,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("meshing", 1, 3));
     simplify(&mut mesh, r.faces);
     report(event("meshing", 2, 3));
+    if mesh.triangles.is_empty() || mesh.positions.is_empty() {
+        candle_core::bail!("3d: no surface came out of the picture (is the object in view, on a plain background?)");
+    }
     let sampler = mesh::Voxels::new(&decoded.level.coords, &colors, res);
     let (mesh, textures) = if r.texture_size == 0 {
         mesh.color_from_voxels(&sampler);
@@ -547,7 +553,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         (baked.mesh, Some(baked.textures))
     };
     drop((surface, sampler));
-    let glb = glb::write(&mesh, textures.as_ref());
+    let glb = glb::write(&mesh, textures.as_ref())?;
     let path = r.output.join(format!("model-{stamp}-{}.glb", r.seed));
     std::fs::write(&path, &glb)?;
     report(event("meshing", 3, 3));
@@ -792,6 +798,9 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     };
     drop(fine);
     let hr_coords = given_coords(r, "coords_hr")?.unwrap_or(hr_coords);
+    if hr_coords.is_empty() {
+        candle_core::bail!("3d: no fine structure came out of the picture (is the object in view, on a plain background?)");
+    }
     let grid = hr_res / 16;
     dump_coords(r, "coords_hr", &hr_coords)?;
     let proj_hr = if let Some(naf) = &naf {
@@ -843,6 +852,9 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("meshing", 1, 3));
     simplify(&mut mesh, r.faces);
     report(event("meshing", 2, 3));
+    if mesh.triangles.is_empty() || mesh.positions.is_empty() {
+        candle_core::bail!("3d: no surface came out of the picture (is the object in view, on a plain background?)");
+    }
     let sampler = mesh::Voxels::new(&decoded.level.coords, &colors, res);
     let (mesh, textures) = if r.texture_size == 0 {
         mesh.color_from_voxels(&sampler);
@@ -852,7 +864,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         (baked.mesh, Some(baked.textures))
     };
     drop((surface, sampler));
-    let glb = glb::write(&mesh, textures.as_ref());
+    let glb = glb::write(&mesh, textures.as_ref())?;
     let path = r.output.join(format!("model-{stamp}-{}.glb", r.seed));
     std::fs::write(&path, &glb)?;
     report(event("meshing", 3, 3));

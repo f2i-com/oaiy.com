@@ -49,6 +49,9 @@ export function QuickConnectPopup({
     )
     .slice(0, 15); // Limit to 15 items
 
+  const popupLeft = Math.max(8, Math.min(state.position.x, window.innerWidth - 300));
+  const popupTop = Math.max(8, Math.min(state.position.y, window.innerHeight - 340));
+
   return (
     <>
       {/* Connection line from source handle to popup */}
@@ -60,8 +63,8 @@ export function QuickConnectPopup({
           <line
             x1={handlePosition.x}
             y1={handlePosition.y}
-            x2={Math.min(state.position.x, window.innerWidth - 300) + 8}
-            y2={Math.min(state.position.y, window.innerHeight - 340) + 40}
+            x2={popupLeft + 8}
+            y2={popupTop + 40}
             style={{ stroke: 'rgb(var(--accent-primary))' }}
             strokeWidth="3"
             strokeDasharray="8 4"
@@ -81,8 +84,8 @@ export function QuickConnectPopup({
         data-quick-connect-popup
         className="fixed z-50 flex max-h-80 w-72 flex-col overflow-hidden rounded-[var(--r-ctl)] border bg-surface-secondary shadow-[var(--shadow-lg)]"
         style={{
-          left: Math.min(state.position.x, window.innerWidth - 300),
-          top: Math.min(state.position.y, window.innerHeight - 340),
+          left: popupLeft,
+          top: popupTop,
           borderColor: 'rgb(var(--accent-primary) / 0.5)',
         }}
         onClick={(e) => e.stopPropagation()}

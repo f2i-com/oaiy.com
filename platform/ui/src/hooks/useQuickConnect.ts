@@ -43,6 +43,33 @@ export interface UseQuickConnectOptions {
   showDelay?: number;
 }
 
+/** Escape a string for safe interpolation inside a CSS attribute selector value. */
+function escapeCssAttr(value: string): string {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+    ? CSS.escape(value)
+    : value.replace(/["\\]/g, '\\$&');
+}
+
+/** Locate a React Flow handle element safely even when ids contain special characters or handleId is null. */
+function findHandleElement(
+  nodeId: string | null | undefined,
+  handleId: string | null | undefined,
+  handleType?: 'source' | 'target' | null,
+): Element | null {
+  if (!nodeId) return null;
+  const escapedNode = escapeCssAttr(nodeId);
+  if (handleId != null && handleId !== '') {
+    return document.querySelector(
+      `[data-nodeid="${escapedNode}"][data-handleid="${escapeCssAttr(handleId)}"]`,
+    );
+  }
+  const typeClass = handleType ? `.react-flow__handle.${handleType}` : '.react-flow__handle';
+  return (
+    document.querySelector(`[data-nodeid="${escapedNode}"]${typeClass}`) ??
+    document.querySelector(`[data-nodeid="${escapedNode}"].react-flow__handle`)
+  );
+}
+
 /**
  * Hook for managing quick connect functionality in the workflow builder.
  *
@@ -62,7 +89,8 @@ export function useQuickConnect({
   const showAtRef = useRef<((pos: { x: number; y: number }) => void) | null>(null);
   // Quick-connect state for connection drag
   const [quickConnectState, setQuickConnectState] = useState<QuickConnectState | null>(null);
-  const quickConnectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const quickConnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingConnectTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const connectionDragPositionRef = useRef<{ x: number; y: number } | null>(null);
   const quickConnectVisibleRef = useRef(false);
   const [viewportChangeCounter, setViewportChangeCounter] = useState(0);
@@ -104,8 +132,7 @@ export function useQuickConnect({
     const showAt = (pos: { x: number; y: number }) => {
       // Get the source handle element position for drawing connection line
       let sourceHandlePosition: { x: number; y: number } | null = null;
-      const handleSelector = `[data-nodeid="${params.nodeId}"][data-handleid="${params.handleId}"]`;
-      const handleElement = document.querySelector(handleSelector);
+      const handleElement = findHandleElement(params.nodeId, params.handleId, params.handleType);
       if (handleElement) {
         const rect = handleElement.getBoundingClientRect();
         sourceHandlePosition = {
@@ -162,12 +189,19 @@ export function useQuickConnect({
     }
   }, [handleConnectionDragMove]);
 
-  // Clean up pending timer + drag listener on unmount (e.g. keyed remount / flow switch mid-drag)
-  useEffect(() => () => {
-    if (quickConnectTimerRef.current) {
-      clearTimeout(quickConnectTimerRef.current);
-    }
-    document.removeEventListener('mousemove', handleConnectionDragMove);
+  // Clean up pending timers + drag listener on unmount (e.g. keyed remount / flow switch mid-drag)
+  useEffect(() => {
+    const connectTimers = pendingConnectTimersRef.current;
+    return () => {
+      if (quickConnectTimerRef.current) {
+        clearTimeout(quickConnectTimerRef.current);
+      }
+      for (const timer of connectTimers) {
+        clearTimeout(timer);
+      }
+      connectTimers.clear();
+      document.removeEventListener('mousemove', handleConnectionDragMove);
+    };
   }, [handleConnectionDragMove]);
 
   // Close popup
@@ -176,7 +210,7 @@ export function useQuickConnect({
     setQuickConnectState(null);
   }, []);
 
-  // Listen for clicks outside the popup to close it
+  // Listen for clicks outside the popup or Escape key to close it
   useEffect(() => {
     if (!quickConnectState?.isVisible) return;
 
@@ -196,11 +230,20 @@ export function useQuickConnect({
       handleQuickConnectClose();
     };
 
-    // Use capture phase to catch clicks before they're handled
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        handleQuickConnectClose();
+      }
+    };
+
+    // Use capture phase to catch clicks/Escape before they're handled
     document.addEventListener('mousedown', handleDocumentClick, true);
+    document.addEventListener('keydown', handleDocumentKeyDown, true);
 
     return () => {
       document.removeEventListener('mousedown', handleDocumentClick, true);
+      document.removeEventListener('keydown', handleDocumentKeyDown, true);
     };
   }, [quickConnectState?.isVisible, handleQuickConnectClose]);
 
@@ -232,8 +275,11 @@ export function useQuickConnect({
   const quickConnectHandlePosition = useMemo(() => {
     if (!quickConnectState?.isVisible) return null;
 
-    const handleSelector = `[data-nodeid="${quickConnectState.sourceNodeId}"][data-handleid="${quickConnectState.sourceHandleId}"]`;
-    const handleElement = document.querySelector(handleSelector);
+    const handleElement = findHandleElement(
+      quickConnectState.sourceNodeId,
+      quickConnectState.sourceHandleId,
+      quickConnectState.sourceHandleType,
+    );
     if (handleElement) {
       const rect = handleElement.getBoundingClientRect();
       return {
@@ -245,7 +291,7 @@ export function useQuickConnect({
     return quickConnectState.sourceHandlePosition;
     // Intentionally omit reactFlowWrapper from deps - it's a ref that shouldn't trigger recalculation
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [quickConnectState?.isVisible, quickConnectState?.sourceNodeId, quickConnectState?.sourceHandleId, quickConnectState?.sourceHandlePosition, nodes, viewportChangeCounter]);
+  }, [quickConnectState?.isVisible, quickConnectState?.sourceNodeId, quickConnectState?.sourceHandleId, quickConnectState?.sourceHandleType, quickConnectState?.sourceHandlePosition, nodes, viewportChangeCounter]);
 
   // Handle node selection from popup
   const handleQuickConnectNodeSelect = useCallback((nodeType: NodeType) => {
@@ -253,8 +299,8 @@ export function useQuickConnect({
 
     const { sourceNodeId, sourceHandleId, sourceHandleType, handleDataType } = quickConnectState;
 
-    // Get position near the cursor
-    const pos = connectionDragPositionRef.current || { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    // Place the new node at the popup's recorded drop/hold position (works for mouse and touch)
+    const pos = quickConnectState.position || connectionDragPositionRef.current || { x: window.innerWidth / 2, y: window.innerHeight / 2 };
     const flowPosition = reactFlowInstance.current.screenToFlowPosition(pos);
 
     // Get node definition to find the right handle to connect to
@@ -276,8 +322,9 @@ export function useQuickConnect({
     // Add the new node and get its ID
     const newNodeId = addNode(nodeType, flowPosition);
 
-    // Create the edge connection after a tick to ensure node exists
-    setTimeout(() => {
+    // Create the edge connection after a tick to ensure node exists (tracked so unmount clears it)
+    const timer = setTimeout(() => {
+      pendingConnectTimersRef.current.delete(timer);
       if (sourceHandleType === 'source') {
         // Dragging from an output - connect to new node's input
         onConnect({
@@ -296,6 +343,7 @@ export function useQuickConnect({
         });
       }
     }, 50);
+    pendingConnectTimersRef.current.add(timer);
 
     // Close the popup
     quickConnectVisibleRef.current = false;

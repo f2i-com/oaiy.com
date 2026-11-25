@@ -179,6 +179,8 @@ export function parseToolArgs(raw: string): { input: Record<string, unknown>; pa
 export class AnthropicStream {
   private blocks: Array<Record<string, unknown> | undefined> = [];
   private json = new Map<number, string>();
+  private finalized = new Set<number>();
+  private fallbackIdSeq = 0;
   private stopReason: string | null = null;
   private usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   private stopped = false;
@@ -202,9 +204,13 @@ export class AnthropicStream {
       case 'content_block_start': {
         const block: Record<string, unknown> = isRecord(payload.content_block) ? { ...payload.content_block } : { type: 'unknown' };
         if (block.type === 'tool_use') {
+          const rawId = typeof block.id === 'string' ? block.id.trim() : '';
+          const id = rawId || `call_${Date.now().toString(36)}_${++this.fallbackIdSeq}_${index >= 0 ? index : this.blocks.length}`;
+          block.id = id;
           block.input = {};
           this.json.set(index, '');
-          this.sink?.toolStart(index, typeof block.id === 'string' ? block.id : '', typeof block.name === 'string' ? block.name : '');
+          this.finalized.delete(index);
+          this.sink?.toolStart(index, id, typeof block.name === 'string' ? block.name : '');
         } else if (block.type === 'text') {
           block.text = typeof block.text === 'string' ? block.text : '';
           if (block.text) this.sink?.text(block.text as string);
@@ -231,15 +237,7 @@ export class AnthropicStream {
         break;
       }
       case 'content_block_stop': {
-        const block = this.blocks[index];
-        if (block?.type === 'tool_use') {
-          const raw = (this.json.get(index) ?? '').trim();
-          const parsed = parseToolArgs(raw);
-          block.input = parsed.input;
-          if (parsed.parseError) {
-            this.parseErrors.set(String(block.id), `The ${parsed.parseError}. Send the call again with a JSON object.`);
-          }
-        }
+        this.finalizeToolBlock(index);
         break;
       }
       case 'message_delta': {
@@ -260,9 +258,23 @@ export class AnthropicStream {
     }
   }
 
+  private finalizeToolBlock(index: number): void {
+    if (this.finalized.has(index)) return;
+    this.finalized.add(index);
+    const block = this.blocks[index];
+    if (block?.type !== 'tool_use') return;
+    const raw = (this.json.get(index) ?? '').trim();
+    const parsed = parseToolArgs(raw);
+    block.input = parsed.input;
+    if (parsed.parseError) {
+      this.parseErrors.set(String(block.id), `The ${parsed.parseError}. Send the call again with a JSON object.`);
+    }
+  }
+
   /** The reply as the non-streamed API returns it. */
   result(): Record<string, unknown> {
     if (!this.stopped && !this.delta) throw closedEarly();
+    for (const index of this.json.keys()) this.finalizeToolBlock(index);
     return {
       type: 'message',
       role: 'assistant',

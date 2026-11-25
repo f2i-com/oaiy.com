@@ -709,4 +709,17 @@ fn a_draw_on_the_device_is_the_hosts_top_k_softmax() {
     let x = up(&flat);
     assert_eq!(drawn(&x, 0, 1000, 50, 0.0, 3), vec![600, 600, 600]);
     assert_eq!(drawn(&x, 0, 1000, 1, 0.9, 2), vec![600, 600]);
+
+    // Regression test for Bug 12: NaN logits must map below -inf and never win top-1 or top-k.
+    let mut with_nan = vec![-10.0f32; 64];
+    with_nan[0] = f32::NAN;
+    with_nan[5] = f32::from_bits(0xffc0_0001); // negative NaN
+    with_nan[17] = 3.5;
+    with_nan[42] = 7.25;
+    let x_nan = up(&with_nan);
+    assert_eq!(drawn(&x_nan, 0, 64, 1, 0.0, 4), vec![42, 42, 42, 42]);
+    assert_eq!(drawn(&x_nan, 0, 64, 64, 0.0, 4), vec![42, 42, 42, 42]);
+    for tok in drawn(&x_nan, 0, 64, 2, 0.9, 50) {
+        assert!(tok == 17 || tok == 42, "NaN must never enter top-2: got {tok}");
+    }
 }

@@ -1,4 +1,4 @@
-import React, { act } from 'react';
+import React, { act, useEffect, useRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,7 +17,15 @@ const api = vi.hoisted(() => ({
   unpin: vi.fn(),
 }));
 vi.mock('./api', () => ({ network: api, NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.' }));
-vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
+vi.mock('./useVisiblePoll', () => ({
+  useVisiblePoll: (tick: () => void) => {
+    const saved = useRef(tick);
+    saved.current = tick;
+    useEffect(() => {
+      saved.current();
+    }, []);
+  },
+}));
 import NetworkPanel, { defaultDown, notInEffect } from './NetworkPanel';
 
 let container: HTMLDivElement;
@@ -612,5 +620,26 @@ describe('NetworkPanel', () => {
     api.status.mockRejectedValueOnce(new Error('the network settings file is damaged'));
     await mount();
     expect(container.querySelector('.load-error')!.textContent).toContain('OAIY Network’s status could not be read: the network settings file is damaged');
+  });
+
+  it('keeps the pairing card intact and allows retry if confirmPairing fails', async () => {
+    const waiting = { pairingId: 'p-retry', code: '999 111', status: 'approved_there' as const, worker: { nodeId: 'w1', name: 'Rig', address: '192.168.1.21:17975', fingerprint: '1111' } };
+    api.status.mockResolvedValue({ ...primary, pairings: [waiting] });
+    await mount();
+    expect(container.querySelector('[data-testid="network-pairing"]')).not.toBeNull();
+
+    // First attempt fails: card must stay open so the user can retry without losing the pairing.
+    api.confirmPairing.mockRejectedValueOnce(new Error('temporary network error'));
+    await act(async () => button('Yes, pair').click());
+    expect(container.querySelector('[data-testid="network-pairing"]')).not.toBeNull();
+    expect(container.textContent).toContain('temporary network error');
+    expect(button('Yes, pair').disabled).toBe(false);
+
+    // Retry succeeds: card closes and shows paired outcome.
+    api.status.mockResolvedValue(primary);
+    api.confirmPairing.mockResolvedValueOnce({ status: 'approved', node });
+    await act(async () => button('Yes, pair').click());
+    expect(container.querySelector('[data-testid="network-pairing"]')).toBeNull();
+    expect(container.textContent).toContain('Paired with Rig.');
   });
 });

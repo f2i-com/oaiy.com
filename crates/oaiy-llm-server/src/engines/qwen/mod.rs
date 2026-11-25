@@ -1527,7 +1527,10 @@ impl QwenEngine {
         let mut logits = Row::Logits(logits.unwrap());
         // (a greedy request's rows: the token alone where the model picks it on its GPU, megabytes of logits a check
         // not read back)
-        let greedy = job.sampling.temperature <= 0.0 && job.images.is_empty() && !top_log();
+        let greedy = job.sampling.temperature <= 0.0
+            && job.images.is_empty()
+            && !crate::engines::job::penalizes(&job.sampling)
+            && !top_log();
         let mut finish = Finish::Length;
         // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
         let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);

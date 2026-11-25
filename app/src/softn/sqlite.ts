@@ -57,6 +57,35 @@ const MAX_MEMORY_BYTES = 32n * 1024n * 1024n;
 const MAX_PAGE_READS = 200_000n;
 const READ_ONLY_SQL = /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*(?:SELECT|WITH|EXPLAIN|PRAGMA|VALUES)\b/i;
 
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  return new Error(typeof reason === 'string' && reason ? reason : 'aborted');
+}
+
+function checkAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 let cachedBindings: Promise<XdbWasmBindings> | null = null;
 
 interface NodeProcessLike {
@@ -287,13 +316,16 @@ async function openHydratedConnection(
   vfs: Vfs,
   root: string,
   requestedDb?: string,
+  signal?: AbortSignal,
 ): Promise<{
   conn: XdbWasmConnection;
   dbName: string;
   dbFile: string;
   existed: boolean;
 }> {
-  const { WasmConnection } = await loadXdbWasm();
+  checkAborted(signal);
+  const { WasmConnection } = await raceAbort(loadXdbWasm(), signal);
+  checkAborted(signal);
   const manifest = readManifest(vfs, root);
   const declared = readDeclaredDatabases(manifest);
   const { databases, sqlFiles, seedJsonFiles } = listSqliteDatabases(vfs, root);
@@ -333,6 +365,7 @@ async function openHydratedConnection(
     }
   }
 
+  checkAborted(signal);
   const conn = new WasmConnection(initialBytes, null, null, 4096, MAX_STEPS, MAX_MEMORY_BYTES, MAX_PAGE_READS);
 
   // Hydrate from seedSql / seedJson when starting from a fresh (unpersisted) DB
@@ -340,6 +373,7 @@ async function openHydratedConnection(
     try {
       const appliedSql = new Set<string>();
       const runSeedSql = (spec: string) => {
+        checkAborted(signal);
         const cleanPath = normalizePath(spec);
         if (!looksLikeSqlStatement(spec)) {
           if (cleanPath && vfs.exists(inApp(root, cleanPath))) {
@@ -363,6 +397,7 @@ async function openHydratedConnection(
       }
 
       if (decl?.seedJson !== undefined) {
+        checkAborted(signal);
         if (typeof decl.seedJson === 'string') {
           const cleanPath = normalizePath(decl.seedJson);
           let payload: string;
@@ -379,6 +414,7 @@ async function openHydratedConnection(
         }
       } else if (!decl && seedJsonFiles.length) {
         for (const f of seedJsonFiles) {
+          checkAborted(signal);
           const payload = vfs.readText(inApp(root, f));
           if (payload.trim()) conn.seed_json(payload);
         }
@@ -402,7 +438,7 @@ function closeConn(conn: XdbWasmConnection): void {
 export async function inspectSqliteSchema(
   vfs: Vfs,
   root = '',
-  options: { database?: string; table?: string } = {},
+  options: { database?: string; table?: string; signal?: AbortSignal } = {},
 ): Promise<{
   database: string;
   file: string;
@@ -416,8 +452,9 @@ export async function inspectSqliteSchema(
   views: Array<{ name: string; sql: string }>;
   triggers: Array<{ name: string; table: string; sql: string }>;
 }> {
-  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database);
+  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database, options.signal);
   try {
+    checkAborted(options.signal);
     const masterRaw = conn.execute_json(
       "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
       null,
@@ -438,6 +475,7 @@ export async function inspectSqliteSchema(
     const filterTable = options.table?.trim().toLowerCase();
 
     for (const r of rows) {
+      checkAborted(options.signal);
       const type = String(r[0] ?? '');
       const name = String(r[1] ?? '');
       const tbl = String(r[2] ?? '');
@@ -485,7 +523,7 @@ export async function querySqlite(
   vfs: Vfs,
   root: string,
   sql: string,
-  options: { database?: string; params?: unknown[]; limit?: number } = {},
+  options: { database?: string; params?: unknown[]; limit?: number; signal?: AbortSignal } = {},
 ): Promise<{
   database: string;
   file: string;
@@ -494,13 +532,15 @@ export async function querySqlite(
   rowCount: number;
   truncated: boolean;
 }> {
+  checkAborted(options.signal);
   if (!sql.trim()) throw new Error('SQL query cannot be empty.');
   if (!READ_ONLY_SQL.test(sql)) {
     throw new Error('sqlite_query only accepts read-only statements (SELECT, WITH, EXPLAIN, PRAGMA, VALUES). Use sqlite_execute for DDL/DML writes.');
   }
   const limit = Math.min(Math.max(Math.floor(options.limit ?? 100), 1), 500);
-  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database);
+  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database, options.signal);
   try {
+    checkAborted(options.signal);
     const paramsJson = options.params && options.params.length ? JSON.stringify(options.params) : null;
     const raw = conn.execute_json(sql, paramsJson);
     const parsed = JSON.parse(raw) as { columns?: string[]; rows?: unknown[][] };
@@ -524,7 +564,7 @@ export async function executeSqlite(
   vfs: Vfs,
   root: string,
   sql: string,
-  options: { database?: string; params?: unknown[]; registerInManifest?: boolean } = {},
+  options: { database?: string; params?: unknown[]; registerInManifest?: boolean; signal?: AbortSignal } = {},
 ): Promise<{
   database: string;
   file: string;
@@ -534,9 +574,11 @@ export async function executeSqlite(
   columns?: string[];
   rows?: Record<string, unknown>[];
 }> {
+  checkAborted(options.signal);
   if (!sql.trim()) throw new Error('SQL statement cannot be empty.');
-  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database);
+  const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database, options.signal);
   try {
+    checkAborted(options.signal);
     const paramsJson = options.params && options.params.length ? JSON.stringify(options.params) : null;
     const raw = conn.execute_json(sql, paramsJson);
     const parsed = JSON.parse(raw) as {
@@ -546,6 +588,7 @@ export async function executeSqlite(
       lastInsertRowid?: number;
     };
     const exported = conn.export_bytes();
+    checkAborted(options.signal);
     vfs.writeFile(inApp(root, dbFile), exported, { parents: true });
 
     // Optionally register a newly created database in manifest.json (for Container v2 apps)
@@ -592,7 +635,8 @@ export async function executeSqlite(
  * Validate a Container v2 app's declared/discovered SQLite databases, SQL schemas, and JSON seeds
  * using the real bundled XDB SQLite WASM engine. Called by `softn_check` (`checkApp`).
  */
-export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding[]> {
+export async function validateAppDatabases(vfs: Vfs, root = '', signal?: AbortSignal): Promise<Finding[]> {
+  checkAborted(signal);
   const manifest = readManifest(vfs, root);
   const declared = readDeclaredDatabases(manifest);
   const { databases, sqlFiles, seedJsonFiles } = listSqliteDatabases(vfs, root);
@@ -601,8 +645,9 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
   const findings: Finding[] = [];
   let bindings: XdbWasmBindings;
   try {
-    bindings = await loadXdbWasm();
-  } catch {
+    bindings = await raceAbort(loadXdbWasm(), signal);
+  } catch (err) {
+    if (signal?.aborted) throw err;
     // Runtime not installed in this test environment; skip WASM validation cleanly.
     return findings;
   }
@@ -652,6 +697,7 @@ export async function validateAppDatabases(vfs: Vfs, root = ''): Promise<Finding
   };
 
   for (const cfg of targets) {
+    checkAborted(signal);
     const file = cfg.file || `${cfg.name}.db`;
     const full = inApp(root, file);
     let initialBytes: Uint8Array | null = null;
