@@ -138,7 +138,6 @@ export class WorkspaceInstructions {
   reconcile(vfs: Vfs, touchedPaths: readonly string[]): string | null {
     const addedOrChanged: DiscoveredInstruction[] = [];
     const removed: string[] = [];
-    const seenDigests = new Set(this.seen.values());
 
     // 1. Check previously loaded instruction files for updates or deletion.
     for (const [path, prevDigest] of [...this.seen.entries()]) {
@@ -151,6 +150,9 @@ export class WorkspaceInstructions {
         addedOrChanged.push(current);
       }
     }
+
+    // Build digest set AFTER step 1 so a renamed file with identical content to a deleted file is not skipped.
+    const seenDigests = new Set(this.seen.values());
 
     // 2. Discover newly created root instructions or nested instruction files in directories touched this step.
     const dirsToScan = new Set<string>(['']);

@@ -53,7 +53,11 @@ function reachesUntrustedFlow(
 ): boolean {
   const byId = new Map(flows.map((f) => [f.id, f]));
   const isUntrusted = (f: Flow | undefined): boolean =>
-    Boolean(f && (f as { untrusted?: unknown }).untrusted === true);
+    Boolean(
+      f &&
+        ((f as { untrusted?: unknown }).untrusted === true ||
+          Boolean((f as { packageId?: unknown }).packageId)),
+    );
   if (flowId && isUntrusted(byId.get(flowId))) return true;
   const seen = new Set<string>(flowId ? [flowId] : []);
   const queue: Array<{ nodes?: unknown[] } | undefined> = [graph ?? byId.get(flowId ?? '')?.graph];
@@ -77,6 +81,27 @@ function reachesUntrustedFlow(
 }
 
 /**
+ * Resolve the authoritative owning package ID for a `pkg:*` custom node type.
+ * Prefers the ModuleRegistry's verified module source path (`package:{pkgId}/...`
+ * or `custom-node:{pkgId}/...`) so a spoofed `nodeModule.prefix` cannot borrow
+ * another package's granted permissions.
+ */
+function resolveAuthoritativePackageId(
+  nodeType: string,
+  moduleRegistry?: ModuleRegistry | null,
+): string {
+  const mod = moduleRegistry?.getModuleForNode?.(nodeType) as { path?: unknown } | undefined;
+  if (typeof mod?.path === 'string') {
+    const pathMatch = /^(?:package|custom-node):([^:/]+)\//.exec(mod.path);
+    if (pathMatch?.[1]) {
+      return pathMatch[1];
+    }
+  }
+  const m = /^pkg:([^:]+):(.+)$/.exec(nodeType);
+  return m?.[1] || '__unknown_pkg__';
+}
+
+/**
  * Collect distinct package IDs referenced by any `pkg:*` custom node reachable
  * from `graph` (including transitive subflows and macros).
  */
@@ -84,6 +109,7 @@ function collectReferencedPackageIds(
   flowId: string | undefined,
   graph: { nodes?: unknown[] } | undefined,
   flows: readonly Flow[],
+  moduleRegistry?: ModuleRegistry | null,
 ): string[] {
   const byId = new Map(flows.map((f) => [f.id, f]));
   const pkgIds = new Set<string>();
@@ -96,8 +122,7 @@ function collectReferencedPackageIds(
       const node = rawNode as { type?: unknown; data?: Record<string, unknown> } | null;
       if (!node) continue;
       if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
-        const m = /^pkg:([^:]+)(?::|$)/.exec(node.type);
-        pkgIds.add(m?.[1] || '__unknown_pkg__');
+        pkgIds.add(resolveAuthoritativePackageId(node.type, moduleRegistry));
       }
       const data = node.data;
       if (!data) continue;
@@ -861,13 +886,24 @@ export class JobManager {
       // route the runtime into hardened mode with least-privilege permissions so
       // UI Run, MacroRunnerModal, API bridge, remote dispatcher, and CLI ALL
       // enforce sandboxing uniformly.
-      const allKnownFlows = this.packageMacros.length > 0
-        ? [...this.availableFlows, ...this.packageMacros]
+      // Scope package macros strictly to jobs running under a matching packageId —
+      // never expose package macros globally to non-package user flows (prevents
+      // a loaded package from hijacking a trusted user flow's subflow/macro ID).
+      const scopedPackageMacros = job.packageId
+        ? this.packageMacros.filter((m) => !m.packageId || m.packageId === job.packageId)
+        : [];
+      const allKnownFlows = scopedPackageMacros.length > 0
+        ? [...this.availableFlows, ...scopedPackageMacros]
         : this.availableFlows;
       const untrustedImplicit =
         !job.packageId &&
         (currentProjectIsUntrusted() || reachesUntrustedFlow(job.flowId, job.graph, allKnownFlows));
-      const referencedPkgIds = collectReferencedPackageIds(job.flowId, job.graph, allKnownFlows);
+      const referencedPkgIds = collectReferencedPackageIds(
+        job.flowId,
+        job.graph,
+        allKnownFlows,
+        this.moduleRegistry,
+      );
       const hasPkgNodes = referencedPkgIds.length > 0;
 
       let effectivePackageId: string | null = job.packageId ?? null;
@@ -934,9 +970,9 @@ export class JobManager {
       }
 
       runtime.setAvailableFlows(this.availableFlows);
-      // Set package macros (higher priority than project macros)
-      if (this.packageMacros.length > 0) {
-        runtime.setPackageMacros(this.packageMacros);
+      // Set package macros ONLY when running inside a package context (scoped to that package)
+      if (job.packageId && scopedPackageMacros.length > 0) {
+        runtime.setPackageMacros(scopedPackageMacros);
       }
 
       // Update context with the runtime now that it's configured

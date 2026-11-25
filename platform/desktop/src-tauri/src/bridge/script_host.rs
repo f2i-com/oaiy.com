@@ -103,7 +103,7 @@
 //! line through a pipe the child reads with `readline`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -340,7 +340,7 @@ pub fn batch_deadline(request: &Value) -> Duration {
         .and_then(Value::as_array)
         .map(|jobs| {
             jobs.iter()
-                .map(|j| j.get("budgetMs").and_then(Value::as_u64).unwrap_or(DEFAULT_JOB_BUDGET_MS) + JOB_GRACE_MS)
+                .map(|j| j.get("budgetMs").and_then(Value::as_u64).unwrap_or(DEFAULT_JOB_BUDGET_MS).saturating_add(JOB_GRACE_MS))
                 .fold(0u64, u64::saturating_add)
         })
         .unwrap_or(0);
@@ -682,6 +682,9 @@ struct State {
     engine: Option<EngineIdentity>,
     instance: u64,
     children: u64,
+    /// Monotonic counter incremented by `shutdown()` so an in-flight `spawn()`
+    /// never installs a child that was superseded by a shutdown.
+    shutdown_epoch: u64,
     /// Earliest moment a replacement may be spawned, while unavailable.
     retry_at: Option<Instant>,
 }
@@ -741,6 +744,7 @@ impl ScriptHost {
                     engine: None,
                     instance: 0,
                     children: 0,
+                    shutdown_epoch: 0,
                     retry_at: None,
                 }),
             }),
@@ -912,6 +916,7 @@ impl ScriptHost {
     pub fn shutdown(&self) {
         let live = {
             let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.shutdown_epoch = s.shutdown_epoch.wrapping_add(1);
             let live = s.child.take();
             if live.is_some() {
                 s.health = Health::Starting;
@@ -982,7 +987,7 @@ impl ScriptHost {
 
     /// The current child, or a new one. Called under the batch lock.
     fn ensure_child(&self) -> Result<Arc<Live>, HostError> {
-        let generation = {
+        let (generation, epoch) = {
             let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(live) = &s.child {
                 if !live.gone.load(Ordering::Acquire) {
@@ -999,19 +1004,40 @@ impl ScriptHost {
             s.since = Instant::now();
             s.retry_at = None;
             s.children += 1;
-            s.children
+            (s.children, s.shutdown_epoch)
         };
         match self.spawn(generation) {
             Ok((live, identity, instance)) => {
-                let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                s.child = Some(live.clone());
-                s.health = Health::Ready;
-                s.since = Instant::now();
-                s.engine = Some(identity);
-                s.instance = instance;
+                let cancelled = {
+                    let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if s.shutdown_epoch != epoch {
+                        true
+                    } else {
+                        s.child = Some(live.clone());
+                        s.health = Health::Ready;
+                        s.since = Instant::now();
+                        s.engine = Some(identity);
+                        s.instance = instance;
+                        false
+                    }
+                };
+                if cancelled {
+                    live.terminate();
+                    return Err(HostError::Unavailable {
+                        reason: "the script host was shut down while starting".to_string(),
+                        retry_after: None,
+                    });
+                }
                 Ok(live)
             }
             Err(reason) => {
+                let cancelled = self.inner.state.lock().unwrap_or_else(|e| e.into_inner()).shutdown_epoch != epoch;
+                if cancelled {
+                    return Err(HostError::Unavailable {
+                        reason: "the script host was shut down while starting".to_string(),
+                        retry_after: None,
+                    });
+                }
                 self.mark_unavailable(reason, true);
                 Err(self.unavailable())
             }
@@ -1164,17 +1190,19 @@ impl ScriptHost {
     fn read_loop(&self, out: std::process::ChildStdout, live: Arc<Live>) {
         let mut reader = BufReader::new(out);
         let mut line = String::new();
+        let cap = MAX_REPLY_LINE_BYTES + 2;
         loop {
             line.clear();
-            match reader.read_line(&mut line) {
+            let n = match (&mut reader).take(cap as u64).read_line(&mut line) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+                Ok(n) => n,
+            };
+            let truncated = n == cap && !line.ends_with('\n');
             let text = line.trim_end_matches(['\r', '\n']);
-            if text.trim().is_empty() {
+            if !truncated && text.trim().is_empty() {
                 continue;
             }
-            let routed = if text.len() > MAX_REPLY_LINE_BYTES {
+            let routed = if truncated || text.len() > MAX_REPLY_LINE_BYTES {
                 Routed::Garbage
             } else {
                 live.waiters.lock().unwrap_or_else(|e| e.into_inner()).route(text)
@@ -1198,14 +1226,17 @@ impl ScriptHost {
                         "script host wrote a line that is not protocol JSON ({n}/{MAX_UNPARSEABLE_LINES}): {}",
                         worker::tail_of(text, 200)
                     );
-                    if n >= MAX_UNPARSEABLE_LINES {
-                        self.retire(
-                            &live,
+                    if truncated || n >= MAX_UNPARSEABLE_LINES {
+                        let reason = if truncated {
+                            format!(
+                                "the script host wrote a reply line larger than {MAX_REPLY_LINE_BYTES} bytes and was replaced"
+                            )
+                        } else {
                             format!(
                                 "the script host wrote {n} lines that are not protocol JSON and was replaced"
-                            ),
-                            true,
-                        );
+                            )
+                        };
+                        self.retire(&live, reason, true);
                         break;
                     }
                 }
@@ -1399,6 +1430,8 @@ mod tests {
         // Four Python jobs at 20 s each would be 86 s: capped.
         let four: Vec<Value> = (0..4).map(|i| json!({ "id": i.to_string(), "budgetMs": 20_000 })).collect();
         assert_eq!(d(Value::Array(four)), MAX_BATCH_DEADLINE);
+        // u64::MAX budgetMs must saturate to MAX_BATCH_DEADLINE instead of overflowing.
+        assert_eq!(d(json!([{ "id": "max", "budgetMs": u64::MAX }])), MAX_BATCH_DEADLINE);
     }
 
     #[test]
@@ -1542,6 +1575,7 @@ rl.on('line', (line) => {{
       if (src === 'hang') {{ await new Promise(() => {{}}); }}
       if (src === 'unavailable') {{ write({{ op: 'error', id: null, error: {{ code: 'engine_unavailable', message: 'ZIPP engine unavailable: stub says so' }} }}); process.exit(1); }}
       if (src.startsWith('garbage:')) {{ const n = Number(src.slice(8)); for (let i = 0; i < n; i++) process.stdout.write('not protocol ' + i + '\n'); }}
+      if (src === 'giant') {{ const chunk = 'x'.repeat(1024 * 1024); for (let i = 0; i < 20; i++) process.stdout.write(chunk); return; }}
       if (src === 'orphans') {{ write({{ op: 'result', id: 'nobody', result: {{ v: 1, results: [] }} }}); write({{ op: 'pong', engine: ENGINE, instance: 1, jobs }}); }}
       if (src === 'env') {{
         results.push({{ id: job.id, ok: true, value: {{
@@ -1875,6 +1909,120 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
             assert!(w[1].0 >= w[0].1, "batches overlapped in the child: {spans:?}");
         }
         assert_eq!(host.health().children, 1, "one child served all three");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn giant_unterminated_reply_line_is_bounded_and_retires_the_child() {
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let (dir, script) = stub_serve("giant", &stub_capabilities(), false);
+        let host = host_for_backoff(script, &node, Duration::ZERO);
+        assert_eq!(host.warm().health, Health::Ready);
+
+        let started = Instant::now();
+        match host.evaluate(&batch_request(vec![job("g", "giant")])) {
+            Err(HostError::Unavailable { reason, .. }) => {
+                assert!(reason.contains("larger than"), "{reason}");
+            }
+            other => panic!("expected Unavailable on oversized reply line, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "retires promptly: {:?}", started.elapsed());
+
+        // Replacement child serves subsequent work cleanly.
+        let r = host.evaluate(&batch_request(vec![job("ok", "recovered")]));
+        assert_eq!(value_of(&r, "ok"), json!("recovered"));
+        assert_eq!(host.health().children, 2);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_during_in_flight_spawn_terminates_child_and_does_not_install_it() {
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let caps = stub_capabilities();
+        let engine = {
+            let mut e = caps["engine"].clone();
+            e.as_object_mut().unwrap().remove("status");
+            e
+        };
+        let dir = std::env::temp_dir().join(format!("oaiy-stub-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stub.mjs");
+        let marker = dir.join("ping-seen");
+        let marker_js = serde_json::to_string(&marker.to_string_lossy().to_string()).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"import fs from 'node:fs';
+import readline from 'node:readline';
+const a = process.argv.slice(2);
+const CAPS = {caps};
+const ENGINE = {engine};
+const MARKER = {marker_js};
+if (a[0] === 'capabilities') {{ process.stdout.write(JSON.stringify(CAPS)); process.exit(0); }}
+if (a[0] !== 'script' || a[1] !== '--serve') process.exit(2);
+const write = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+let firstPing = true;
+const rl = readline.createInterface({{ input: process.stdin }});
+rl.on('line', (line) => {{
+  if (line.trim() === '') return;
+  const m = JSON.parse(line);
+  if (m.op === 'ping') {{
+    if (firstPing && !fs.existsSync(MARKER)) {{
+      firstPing = false;
+      fs.writeFileSync(MARKER, '1');
+      setTimeout(() => write({{ op: 'pong', id: m.id, engine: ENGINE, instance: 1, jobs: 0 }}), 400);
+      return;
+    }}
+    firstPing = false;
+    write({{ op: 'pong', id: m.id, engine: ENGINE, instance: 1, jobs: 0 }});
+    return;
+  }}
+  if (m.op === 'shutdown') {{ rl.close(); process.exit(0); }}
+  if (m.op === 'batch') {{
+    const results = m.request.jobs.map((j) => ({{ id: j.id, ok: true, value: j.source }}));
+    write({{ op: 'result', id: m.id, result: {{ v: 1, engine: ENGINE, results }} }});
+  }}
+}});
+"#
+            ),
+        )
+        .unwrap();
+
+        let host = Arc::new(host_for_backoff(script, &node, Duration::ZERO));
+        let host_bg = host.clone();
+        let handle = thread::spawn(move || host_bg.evaluate(&batch_request(vec![job("a", "first")])));
+
+        // Wait until the first child has started and received its initial ping (spawn() is mid-flight).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "stub never reached initial ping");
+
+        // Call shutdown() while spawn() is still waiting for the delayed pong.
+        host.shutdown();
+
+        match handle.join().unwrap() {
+            Err(HostError::Unavailable { reason, .. }) => {
+                assert!(reason.contains("shut down"), "{reason}");
+            }
+            other => panic!("expected Unavailable after shutdown during spawn, got {other:?}"),
+        }
+        assert!(host.inner.state.lock().unwrap().child.is_none(), "no leaked child installed after shutdown");
+        assert_eq!(host.health().health, Health::Starting);
+
+        // A subsequent request after shutdown starts a fresh child cleanly.
+        let r = host.evaluate(&batch_request(vec![job("b", "after")]));
+        assert_eq!(value_of(&r, "b"), json!("after"));
         host.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

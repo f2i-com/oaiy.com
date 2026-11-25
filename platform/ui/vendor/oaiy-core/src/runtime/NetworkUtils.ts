@@ -90,8 +90,15 @@ export function isLocalNetworkUrl(url: string): boolean {
     const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '');
     if (!hostname) return false;
 
-    // localhost and *.localhost (RFC 6761)
-    if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    // Local/internal DNS names aligned with shared/capabilities/local.ts
+    if (
+      hostname === 'localhost' ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      hostname.endsWith('.internal') ||
+      hostname.endsWith('.lan') ||
+      hostname.endsWith('.home.arpa')
+    ) {
       return true;
     }
 
@@ -107,6 +114,8 @@ export function isLocalNetworkUrl(url: string): boolean {
         : hostname;
       const groups = parseIpv6Groups(inner);
       if (groups) {
+        const ipv4From = (hi: number, lo: number) =>
+          `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
         const allZeroPrefix6 =
           groups[0] === 0 &&
           groups[1] === 0 &&
@@ -136,10 +145,34 @@ export function isLocalNetworkUrl(url: string): boolean {
           groups[4] === 0 &&
           groups[5] === 0xffff;
         if (isIpv4Mapped || allZeroPrefix6) {
-          const ipv4 = `${groups[6] >> 8}.${groups[6] & 0xff}.${groups[7] >> 8}.${groups[7] & 0xff}`;
-          if (isPrivateIpv4(ipv4)) return true;
+          if (isPrivateIpv4(ipv4From(groups[6], groups[7]))) return true;
+        }
+        // NAT64: 64:ff9b::/96 (well-known prefix carrying an IPv4 address)
+        // and 64:ff9b:1::/48 (RFC 8215 local-use NAT64 prefix)
+        if (groups[0] === 0x64 && groups[1] === 0xff9b) {
+          if (groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0) {
+            if (isPrivateIpv4(ipv4From(groups[6], groups[7]))) return true;
+          }
+          if (groups[2] === 1) {
+            return true;
+          }
+        }
+        // 6to4: 2002::/16 carries an embedded IPv4 address in groups[1..2]
+        if (groups[0] === 0x2002) {
+          if (isPrivateIpv4(ipv4From(groups[1], groups[2]))) return true;
+        }
+        // Teredo: 2001:0000::/32 carries an obfuscated (bit-inverted) IPv4 client address in groups[6..7]
+        if (groups[0] === 0x2001 && groups[1] === 0) {
+          if (isPrivateIpv4(ipv4From(~groups[6] & 0xffff, ~groups[7] & 0xffff))) return true;
         }
       }
+      return false;
+    }
+
+    // Single-label hostnames (e.g. "printer", "nas", "metadata") resolve via search domains,
+    // hosts files, or mDNS on the local network — never via public DNS.
+    if (!hostname.includes('.')) {
+      return true;
     }
 
     return false;

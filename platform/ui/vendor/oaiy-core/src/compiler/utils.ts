@@ -23,9 +23,13 @@ export function sanitizeId(id: string): string {
  * @param str - The string to escape
  * @returns The escaped string (without surrounding quotes)
  */
-export function escapeString(str: string): string {
+export function escapeString(str: unknown): string {
+  // Always coerce to string before JSON.stringify(...).slice(1, -1): passing a non-string
+  // (e.g. an array or object from untrusted flow JSON) would strip '['/']' or '{'/'}' instead
+  // of surrounding quotes, allowing crafted values to break out of generated JS string literals.
+  const s = typeof str === 'string' ? str : String(str ?? '');
   // Use JSON.stringify and strip the surrounding quotes for comprehensive escaping
-  const jsonEscaped = JSON.stringify(str);
+  const jsonEscaped = JSON.stringify(s);
   // Remove the surrounding quotes that JSON.stringify adds. U+2028 and U+2029 are escaped too: JSON leaves them as
   // they are, and to JavaScript they end a line, so one in a node's setting that a compiler writes into a `//`
   // comment (a label, a compare value) ended the comment and the rest of the setting ran as code.

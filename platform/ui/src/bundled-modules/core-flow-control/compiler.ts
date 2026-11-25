@@ -413,8 +413,16 @@ const CoreFlowControlCompiler: ModuleCompiler = {
         // them, names it `macroId`, `macroInputs` and `macroOutputs`: read both, or that node ran nothing, in silence)
         const macroWorkflowId = escapeString(String(data._macroWorkflowId || data.macroId || ''));
         const macroName = escapeString(String(data._macroName || data.macroName || 'unnamed'));
-        const macroInputs = (data._macroInputs as Array<{ id: string; name: string }>) || (data.macroInputs as Array<{ id: string; name: string }>) || [];
-        const macroOutputs = (data._macroOutputs as Array<{ id: string; name: string }>) || (data.macroOutputs as Array<{ id: string; name: string }>) || [];
+        const macroInputs = Array.isArray(data._macroInputs)
+          ? (data._macroInputs as Array<{ id?: unknown; name?: unknown }>)
+          : Array.isArray(data.macroInputs)
+            ? (data.macroInputs as Array<{ id?: unknown; name?: unknown }>)
+            : [];
+        const macroOutputs = Array.isArray(data._macroOutputs)
+          ? (data._macroOutputs as Array<{ id?: unknown; name?: unknown }>)
+          : Array.isArray(data.macroOutputs)
+            ? (data.macroOutputs as Array<{ id?: unknown; name?: unknown }>)
+            : [];
 
 
         if (!macroWorkflowId) {
@@ -424,19 +432,23 @@ const CoreFlowControlCompiler: ModuleCompiler = {
         } else {
           // Build input object from connected handles
           // Debug: Log what inputs we have access to
+          const sanitizeComment = (v: unknown) => String(v ?? '').replace(/[\r\n\u2028\u2029]+/g, ' ');
           const inputDebug: string[] = [];
           const inputParts: string[] = [];
           for (const input of macroInputs) {
-            const sourceVar = inputs.get(input.id) || 'null';
-            inputDebug.push(`${input.id}(${input.name})=${sourceVar}`);
-            inputParts.push(`"${escapeString(input.name)}": ${sourceVar}`);
+            if (!input || typeof input !== 'object') continue;
+            const inputId = String(input.id ?? '');
+            const inputName = String(input.name ?? '');
+            const sourceVar = inputs.get(inputId) || 'null';
+            inputDebug.push(`${sanitizeComment(inputId)}(${sanitizeComment(inputName)})=${sanitizeComment(sourceVar)}`);
+            inputParts.push(`"${escapeString(inputName)}": ${sourceVar}`);
           }
           const inputObj = inputParts.length > 0 ? `{${inputParts.join(', ')}}` : '{}';
 
           code += `
-  // Execute macro workflow: ${macroWorkflowId}${debug ? `
+  // Execute macro workflow: ${sanitizeComment(macroWorkflowId)}${debug ? `
   // DEBUG: Macro inputs mapping: ${inputDebug.join(', ')}
-  // DEBUG: Available inputs map keys: ${Array.from(inputs.keys()).join(', ') || 'NONE'}` : ''}
+  // DEBUG: Available inputs map keys: ${Array.from(inputs.keys()).map(sanitizeComment).join(', ') || 'NONE'}` : ''}
   let _macro_input_${sanitizedId} = ${inputObj};
   console.debug("[Macro] (${node.id}) Executing macro with inputs: " + JSON.stringify(_macro_input_${sanitizedId}).substring(0, 500));
   ${letOrAssign}${outputVar} = await Subflow.executeMacro("${macroWorkflowId}", _macro_input_${sanitizedId}, "${node.id}", "${macroName}");
@@ -448,9 +460,12 @@ const CoreFlowControlCompiler: ModuleCompiler = {
 
           // Assign (or declare when not pre-declared by enclosing loop) output variables for each macro output
           for (const output of macroOutputs) {
-            const outputSafeId = output.id.replace(/[^a-zA-Z0-9_]/g, '_');
+            if (!output || typeof output !== 'object') continue;
+            const outputId = String(output.id ?? '');
+            const outputName = String(output.name ?? '');
+            const outputSafeId = outputId.replace(/[^a-zA-Z0-9_]/g, '_');
             code += `
-  ${letOrAssign}${outputVar}_${outputSafeId} = ${outputVar}?.["${escapeString(output.name)}"] ?? null;`;
+  ${letOrAssign}${outputVar}_${outputSafeId} = ${outputVar}?.["${escapeString(outputName)}"] ?? null;`;
           }
         }
         break;

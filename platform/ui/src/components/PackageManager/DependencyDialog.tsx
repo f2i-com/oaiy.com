@@ -42,6 +42,7 @@ interface DependencyDialogProps {
     manifest: OAIYPackageManifest,
     grantedPermissions?: string[],
     verification?: PackageVerificationLevel,
+    contentHash?: string,
   ) => Promise<void>;
   /** Called when all dependencies are satisfied */
   onAllLoaded: () => void;
@@ -159,6 +160,7 @@ export function DependencyDialog({
     manifest: OAIYPackageManifest;
     requiredVersion?: string;
     verification: PackageVerificationLevel;
+    contentHash?: string;
   } | null>(null);
 
   // Check if all dependencies are satisfied
@@ -261,6 +263,7 @@ export function DependencyDialog({
         manifest,
         requiredVersion: dep?.version,
         verification: verification.verification,
+        contentHash: verification.contentHash,
       });
     } catch (err) {
       setStatuses(prev => {
@@ -283,7 +286,13 @@ export function DependencyDialog({
     const target = pendingTrust;
     setPendingTrust(null);
     try {
-      await onPackageLoaded(target.path, target.manifest, grantedPermissions, target.verification);
+      await onPackageLoaded(
+        target.path,
+        target.manifest,
+        grantedPermissions,
+        target.verification,
+        target.contentHash,
+      );
       setStatuses(prev => {
         const next = new Map(prev);
         next.set(target.depId, {

@@ -21,8 +21,10 @@
  * flow cannot use this to reach the rest of the desktop's API.
  */
 import type { RuntimeContext } from 'oaiy-core/src/module-types';
+import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from './examples';
 import { describeService, engineDefault, engineKindOf, extractPath, remoteModelOf, renderContractBody } from './contract';
+import { validatePath } from '../core-filesystem/runtime';
 import { getEngineBase } from '../../lib/engineEndpoint';
 
 /** What a contract call gives back. */
@@ -205,15 +207,17 @@ let listed: { at: number; services: CustomService[] } | null = null;
 
 /** OAIY's engine services, as the desktop lists them now (cached for 30 s). */
 export async function listOaiyServices(ctx: RuntimeContext): Promise<CustomService[]> {
+  // Enforce package `network:local` permission BEFORE checking the 30s cache so an
+  // untrusted package cannot read cached desktop/paired-worker inventory.
+  const lacksLocal = packageLacksLocalNetwork(ctx);
+  if (lacksLocal) {
+    throw new Error(`Package '${ctx.currentPackageId}' lacks required permission 'network:local'`);
+  }
   if (listed && Date.now() - listed.at < 30_000) return listed.services;
   const desktop = desktopAccess();
   const url = `${desktop.origin}/api/ai/engine/services`;
-  const lacksLocal = packageLacksLocalNetwork(ctx);
-  if (lacksLocal && !ctx.secureFetch) {
-    throw new Error(`Package '${ctx.currentPackageId}' lacks required permission 'network:local'`);
-  }
   const headers: Record<string, string> = {};
-  if (!lacksLocal && desktop.token) headers.Authorization = `Bearer ${desktop.token}`;
+  if (desktop.token) headers.Authorization = `Bearer ${desktop.token}`;
   const reply = ctx.secureFetch
     ? await ctx.secureFetch(url, { headers, signal: ctx.abortSignal })
     : await fetch(url, { headers, signal: ctx.abortSignal });
@@ -633,8 +637,14 @@ export async function runContract(
         bytes = got?.bytes ?? null;
         mime = got?.mime ?? null;
       } else {
-        // A path on this machine (a local rig's output file): passed on as is.
-        return { output, path: value, url: value };
+        // A path on this machine (a local rig's output file): only accept from a
+        // local-network endpoint and validate against traversal/device-path attacks.
+        if (!isLocalNetworkUrl(endpoint)) {
+          throw new Error(`${label}: refusing server-returned file path from non-local endpoint`);
+        }
+        const trimmed = value.trim();
+        validatePath(trimmed, `${label} file path`);
+        return { output, path: trimmed, url: trimmed };
       }
     }
     if (!bytes || bytes.length === 0) throw new Error(`${label}: the service returned no file`);

@@ -173,6 +173,8 @@ jobs:
     if: ${{ inputs.what == 'all' }}
     runs-on: macos-15
     timeout-minutes: 120
+    outputs:
+      dmg-sha256: ${{ steps.collect.outputs.dmg-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -322,6 +324,7 @@ jobs:
         run: node platform/desktop/scripts/smoke-server.mjs headless-dist
 
       - name: Collect
+        id: collect
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -333,6 +336,7 @@ jobs:
           cp "$dmg" "$out/oaiy-desktop-$VERSION-macos-arm64.dmg"
           tar -C headless-dist -czf "$out/oaiy-server-$VERSION-macos-arm64.tar.gz" .
           ( cd "$out" && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt )
+          echo "dmg-sha256=$(shasum -a 256 "$out/oaiy-desktop-$VERSION-macos-arm64.dmg" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "::notice::the app is signed ad hoc and is not notarised: macOS asks before it opens it the first time (docs/MAC.md)."
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -426,12 +430,22 @@ jobs:
       - name: Sign the app and make its image
         env:
           VERSION: ${{ inputs.version }}
+          UNSIGNED_SHA256: ${{ needs.dmg.outputs.dmg-sha256 }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ] || { echo "::error::the environment mac-signing has no certificate"; exit 1; }
+          # Verify the downloaded unsigned .dmg against the digest dmg recorded before importing the signing key or mounting it.
+          [[ "$UNSIGNED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::missing or malformed unsigned .dmg sha256 from dmg job: '${UNSIGNED_SHA256:-nothing}'"; exit 1; }
+          expected="oaiy-desktop-$VERSION-macos-arm64.dmg"
+          shopt -s nullglob
+          dmgs=(built/*.dmg)
+          shopt -u nullglob
+          [ "${#dmgs[@]}" -eq 1 ] && [ "${dmgs[0]}" = "built/$expected" ] || { echo "::error::expected sole .dmg built/$expected, found: ${dmgs[*]:-none}"; exit 1; }
+          got="$(shasum -a 256 "built/$expected" | cut -d' ' -f1)"
+          [ "$got" = "$UNSIGNED_SHA256" ] || { echo "::error::the unsigned .dmg does not match the digest dmg recorded ($got, not $UNSIGNED_SHA256)"; exit 1; }
           # A keychain of this job's own, for the certificate and its key; gone with the runner.
           keychain="$RUNNER_TEMP/oaiy-signing.keychain-db"
           key="$(openssl rand -base64 24)"
@@ -447,9 +461,9 @@ jobs:
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           echo "identities for signing code in the job's keychain: $(security find-identity -v -p codesigning "$keychain" | grep -c 'Developer ID Application')"
 
-          # The app, out of the image the build made.
+          # The app, out of the verified image the build made.
           mount="$RUNNER_TEMP/built-image"; stage="$RUNNER_TEMP/stage"; mkdir -p "$stage"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mount" built/*.dmg > /dev/null
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "built/$expected" > /dev/null
           cp -R "$mount/OAIY.app" "$stage/"
           hdiutil detach "$mount" > /dev/null
           app="$stage/OAIY.app"

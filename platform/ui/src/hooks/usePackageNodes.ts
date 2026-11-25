@@ -53,11 +53,18 @@ interface PackageNodesResult {
 }
 
 /**
- * Create a prefixed node ID
+ * Create a prefixed node ID keyed strictly on the verified owning packageId.
+ * Rejects colons in packageId/nodeId and ignores untrusted `nodeModule.prefix`
+ * overrides so a malicious package cannot spoof another package's namespace.
  */
-function createPrefixedNodeId(packageId: string, nodeId: string, customPrefix?: string): string {
-  const prefix = customPrefix || packageId;
-  return `pkg:${prefix}:${nodeId}`;
+export function createPrefixedNodeId(packageId: string, nodeId: string): string {
+  if (!packageId || typeof packageId !== 'string' || packageId.includes(':')) {
+    throw new Error(`Invalid packageId for node prefixing: ${JSON.stringify(packageId)}`);
+  }
+  if (!nodeId || typeof nodeId !== 'string' || nodeId.includes(':')) {
+    throw new Error(`Invalid nodeId for node prefixing: ${JSON.stringify(nodeId)}`);
+  }
+  return `pkg:${packageId}:${nodeId}`;
 }
 
 /**
@@ -231,11 +238,11 @@ export function usePackageNodes() {
               continue;
             }
 
-            // Create prefixed ID
+            // Create prefixed ID keyed strictly on the verified owning packageId
+            // (ignore untrusted nodeModule.prefix to prevent cross-package namespace spoofing)
             const prefixedId = createPrefixedNodeId(
               packageId,
               originalNode.id,
-              nodeModule.prefix
             );
 
             // Create node definition with prefixed ID
@@ -271,8 +278,8 @@ export function usePackageNodes() {
         }
 
         // Register with ModuleLoader for compiler support
-        // Create a package-specific module manifest with sanitized ID
-        const rawModuleId = `pkg-${nodeModule.prefix || packageId}-${manifest.id}`;
+        // Create a package-specific module manifest with sanitized ID keyed on verified packageId
+        const rawModuleId = `pkg-${packageId}-${manifest.id}`;
         const pkgModuleId = sanitizeModuleId(rawModuleId);
         const pkgModuleManifest: ModuleManifest = {
           ...manifest,

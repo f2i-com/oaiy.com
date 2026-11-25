@@ -12,10 +12,32 @@
  */
 
 import type { RuntimeContext, RuntimeModule } from 'oaiy-core';
+import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from '../core-service/examples';
 import { runContract } from '../core-service/contractRuntime';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
+import { validatePath } from '../core-filesystem/runtime';
 import { applyVideoOverrides, analyzeComfyUIVideoWorkflow } from './comfyui-video-analyzer';
+
+function assertLocalFilePathResponse(endpointUrl: string, returnedValue: unknown, label: string): string {
+  const raw = typeof returnedValue === 'string' ? returnedValue.trim() : '';
+  if (!raw) {
+    throw new Error(`${label}: server returned empty file path`);
+  }
+  if (/^(?:data:|blob:|https?:\/\/)/i.test(raw)) {
+    return raw;
+  }
+  if (!isLocalNetworkUrl(endpointUrl)) {
+    throw new Error(`${label}: refusing server-returned file path from non-local endpoint`);
+  }
+  validatePath(raw, `${label} file path`);
+  return raw;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.+$/, '');
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
 
 const VIDEO_FORMATS = new Set(['mp4', 'webm', 'mov', 'mkv', 'gif']);
 const FFMPEG_COLOR_PATTERN = /^(?:[A-Za-z]{1,20}|(?:0x|#)[0-9A-Fa-f]{6,8})(?:@(?:0(?:\.\d+)?|1(?:\.0+)?))?$/;
@@ -85,13 +107,23 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * Extract port number from a URL string
+ * Extract port number from a loopback HTTP(S) URL string.
+ * Returns null for non-loopback hosts or malformed URLs so remote endpoints
+ * never trigger local service auto-start or loopback rewriting.
  * @param url The URL to extract port from (e.g., "http://127.0.0.1:8765/generate")
- * @returns The port number or null if not found
+ * @returns The port number or null if not a loopback URL with an explicit port
  */
 function extractPortFromUrl(url: string): number | null {
-  const match = url.match(/:(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (!isLoopbackHost(parsed.hostname)) return null;
+    if (!parsed.port) return null;
+    const port = parseInt(parsed.port, 10);
+    return Number.isFinite(port) && port > 0 && port <= 65535 ? port : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -826,11 +858,12 @@ async function generateVideoWan2GP(
     const pollData = await pollResponse.json();
 
     if (pollData.status === 'completed') {
-      const videoUrl = pollData.video || pollData.path || '';
-      if (!videoUrl) {
+      const rawVideo = pollData.video || pollData.path || '';
+      if (!rawVideo) {
         ctx.onNodeStatus?.(nodeId, 'error');
         throw new Error('Wan2GP job completed but no video in response');
       }
+      const videoUrl = assertLocalFilePathResponse(baseUrl, rawVideo, 'VideoGen (Wan2GP)');
       ctx.onNodeStatus?.(nodeId, 'completed');
       ctx.log('success', `[VideoGen] Video generated: ${videoUrl}`);
       return videoUrl;
@@ -1973,12 +2006,13 @@ async function generateAvatar(
       throw new Error(result.message || 'Video Avatar generation failed');
     }
 
-    ctx.log('info', `[VideoAvatar] Generated video: ${result.video_path}`);
+    const videoPath = assertLocalFilePathResponse(apiUrl, result.video_path, 'VideoAvatar');
+    ctx.log('info', `[VideoAvatar] Generated video: ${videoPath}`);
     ctx.onNodeStatus?.(nodeId, 'completed');
 
     return {
-      video: result.video_path,
-      path: result.video_path,
+      video: videoPath,
+      path: videoPath,
     };
   } catch (error) {
     ctx.onNodeStatus?.(nodeId, 'error');
@@ -2286,7 +2320,8 @@ async function downloadVideo(
       throw new Error(result.message || 'Download failed');
     }
 
-    ctx.log('success', `[VideoDownloader] Downloaded: ${result.file_path} (${result.duration_seconds?.toFixed(1)}s)`);
+    const filePath = assertLocalFilePathResponse(apiUrl, result.file_path, 'VideoDownloader');
+    ctx.log('success', `[VideoDownloader] Downloaded: ${filePath} (${result.duration_seconds?.toFixed(1)}s)`);
     if (result.width && result.height) {
       ctx.log('info', `[VideoDownloader] Resolution: ${result.width}x${result.height}`);
     }
@@ -2294,8 +2329,8 @@ async function downloadVideo(
     ctx.onNodeStatus?.(nodeId, 'completed');
 
     return {
-      video: result.file_path,
-      path: result.file_path,
+      video: filePath,
+      path: filePath,
       duration: result.duration_seconds || 0,
       width: result.width || null,
       height: result.height || null,

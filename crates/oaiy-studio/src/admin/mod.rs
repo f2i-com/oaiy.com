@@ -811,4 +811,20 @@ mod tests {
         }
         config::validate(&cfg).unwrap();
     }
+
+    #[test]
+    fn ui_hardens_media_urls_key_forwarding_and_blank_links() {
+        for (i, line) in PAGE.lines().enumerate() {
+            if line.contains("target=\"_blank\"") {
+                assert!(
+                    line.contains("rel=\"noopener noreferrer\""),
+                    "ui.html:{} target=_blank link missing rel=\"noopener noreferrer\": {line}",
+                    i + 1
+                );
+            }
+        }
+        assert!(PAGE.contains("trustedMediaOrigin"), "ui.html must restrict key/media origins");
+        assert!(PAGE.contains("[\\x00-\\x1f\\x7f]"), "ui.html must reject ASCII control chars in media/file URLs");
+        assert!(PAGE.contains("\"/api/play/node/\" + encodeURIComponent(node) + \"/\""), "ui.html must scope peer image URLs to the peer node route");
+    }
 }

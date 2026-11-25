@@ -76,7 +76,7 @@ pub struct Kernel {
     /// The bindings, in the order the kernel takes them (by group, then number).
     pub bindings: Vec<Binding>,
     /// Whether the kernel takes a scratch buffer after the bindings' pointers (a kernel with cooperative matrices:
-    /// a fragment that would reach past its array is staged through its warp's 1 KB of it, 160 x 64 of them).
+    /// a fragment that would reach past its array is staged through its warp's 1 KB of it, 256 x 64 of them).
     pub scratch: bool,
 }
 

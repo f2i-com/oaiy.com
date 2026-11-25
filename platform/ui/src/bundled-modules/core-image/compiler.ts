@@ -207,18 +207,26 @@ const CoreImageCompiler: ModuleCompiler = {
         // Build the image inputs array literal
         const imageInputsCode = imageInputVars.length > 0 ? `[${imageInputVars.join(', ')}]` : 'null';
         const comfyNodeIdsCode = comfyImageInputNodeIds.length > 0
-          ? `[${comfyImageInputNodeIds.map(id => `"${escapeString(id)}"`).join(', ')}]`
+          ? `[${comfyImageInputNodeIds.map(id => `"${escapeString(String(id ?? ''))}"`).join(', ')}]`
           : 'null';
 
         // Build the image input configs array (with bypass settings)
         // Handle both old format (title, nodeType) and new format (label, inputName)
         let comfyImageInputConfigsCode = 'null';
         if (comfyImageInputConfigs.length > 0) {
-          const configItems = comfyImageInputConfigs.map((cfg: { nodeId?: string; title?: string; label?: string; nodeType?: string; inputName?: string; allowBypass?: boolean }) => {
-            const nodeId = cfg.nodeId || '';
-            const title = cfg.title || cfg.label || '';
-            const nodeType = cfg.nodeType || cfg.inputName || 'LoadImage';
-            const allowBypass = Boolean(cfg.allowBypass);
+          const configItems = comfyImageInputConfigs.map((cfg: unknown) => {
+            const c = (cfg && typeof cfg === 'object' ? cfg : {}) as {
+              nodeId?: unknown;
+              title?: unknown;
+              label?: unknown;
+              nodeType?: unknown;
+              inputName?: unknown;
+              allowBypass?: unknown;
+            };
+            const nodeId = String(c.nodeId || '');
+            const title = String(c.title || c.label || '');
+            const nodeType = String(c.nodeType || c.inputName || 'LoadImage');
+            const allowBypass = Boolean(c.allowBypass);
             return `{nodeId:"${escapeString(nodeId)}",title:"${escapeString(title)}",nodeType:"${escapeString(nodeType)}",allowBypass:${allowBypass}}`;
           });
           comfyImageInputConfigsCode = `[${configItems.join(',')}]`;
@@ -226,7 +234,7 @@ const CoreImageCompiler: ModuleCompiler = {
 
         // Build ALL image node IDs array (for bypassing unselected ones)
         const comfyAllImageNodeIdsCode = comfyAllImageNodeIds.length > 0
-          ? `[${comfyAllImageNodeIds.map(id => `"${escapeString(id)}"`).join(', ')}]`
+          ? `[${comfyAllImageNodeIds.map(id => `"${escapeString(String(id ?? ''))}"`).join(', ')}]`
           : 'null';
 
         // Image size limits for input images (0 = use defaults)

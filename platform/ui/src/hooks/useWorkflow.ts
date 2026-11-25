@@ -2,7 +2,8 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { flushSync } from 'react-dom';
 import { useNodesState, useEdgesState, type Node, type Edge, addEdge, reconnectEdge, type Connection, type EdgeChange } from '@xyflow/react';
 import { v4 as uuidv4 } from 'uuid';
-import { reachesUntrusted } from '../lib/flowIds';
+import { FLOW_REFS, reachesUntrusted } from '../lib/flowIds';
+import { untrustedWorkerFactory } from '../lib/zippPrefs';
 import { triggerDownloadFromBlob } from '../lib/download';
 import { invoke } from '@tauri-apps/api/core';
 import type { NodeType, LogEntry, WorkflowGraph, Flow, DatabaseRequest, DatabaseResult, ProjectSettings } from 'oaiy-core';
@@ -180,6 +181,66 @@ function currentProjectIsUntrusted(): boolean {
  */
 export function runIsUntrusted(flowId: string | undefined, graph: { nodes?: unknown[] }, flows: Flow[]): boolean {
   return currentProjectIsUntrusted() || reachesUntrusted(flowId, graph, flows);
+}
+
+function resolveAuthoritativePackageId(
+  nodeType: string,
+  moduleLoader: ReturnType<typeof getModuleLoader>,
+): string {
+  const mod = moduleLoader.getModuleForNode(nodeType) as { path?: unknown } | undefined;
+  if (typeof mod?.path === 'string') {
+    const pathMatch = /^(?:package|custom-node):([^:/]+)\//.exec(mod.path);
+    if (pathMatch?.[1]) {
+      return pathMatch[1];
+    }
+  }
+  const m = /^pkg:([^:]+):(.+)$/.exec(nodeType);
+  return m?.[1] || '__unknown_pkg__';
+}
+
+function collectReferencedPackageIds(
+  flowId: string | undefined,
+  graph: { nodes?: unknown[] } | undefined,
+  flows: readonly Flow[],
+  moduleLoader: ReturnType<typeof getModuleLoader>,
+): string[] {
+  const byId = new Map(flows.map((f) => [f.id, f]));
+  const pkgIds = new Set<string>();
+  const seenFlows = new Set<string>(flowId ? [flowId] : []);
+  const queue: Array<{ nodes?: unknown[] } | undefined> = [graph ?? byId.get(flowId ?? '')?.graph];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || !Array.isArray(current.nodes)) continue;
+    for (const rawNode of current.nodes) {
+      const node = rawNode as { type?: unknown; data?: Record<string, unknown> } | null;
+      if (!node) continue;
+      if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
+        pkgIds.add(resolveAuthoritativePackageId(node.type, moduleLoader));
+      }
+      const data = node.data;
+      if (!data) continue;
+      for (const field of FLOW_REFS) {
+        const ref = data[field];
+        if (typeof ref !== 'string' || !ref || seenFlows.has(ref)) continue;
+        seenFlows.add(ref);
+        const target = byId.get(ref);
+        if (target?.graph) queue.push(target.graph);
+      }
+    }
+  }
+  return Array.from(pkgIds);
+}
+
+function intersectPermissions(sets: Array<readonly string[]>): string[] {
+  if (sets.length === 0) return [];
+  const acc = new Set(sets[0]);
+  for (let i = 1; i < sets.length; i++) {
+    const next = new Set(sets[i]);
+    for (const perm of acc) {
+      if (!next.has(perm)) acc.delete(perm);
+    }
+  }
+  return Array.from(acc);
 }
 
 interface UseWorkflowOptions {
@@ -1127,23 +1188,46 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       undefined // Network permission handled at provider level
     );
 
-    // Wire up the Tauri invoke broker. The runtime no longer reaches into
-    // `window.__TAURI__` directly; we pass an explicit invoke so module
-    // contexts can be filtered (denylisted commands, etc.) before the
-    // call leaves JS.
+    // Wire up the Tauri invoke broker and untrusted worker factory (Zipp WASM / isolated Web Worker).
     runtime.setTauriInvoke(invoke);
+    runtime.setUntrustedWorkerFactory(untrustedWorkerFactory);
 
     // Set project settings for local network whitelist checking
     if (projectSettings) {
       runtime.setProjectSettings(projectSettings);
     }
 
-    // SECURITY: run an imported/shared (untrusted) project HARDENED — set flow context
+    // Connect module loader for dynamic node support (needed both for pkg:* resolution and runtime registration)
+    const moduleLoader = getModuleLoader();
+
+    // SECURITY: run an imported/shared (untrusted) project OR any flow embedding `pkg:*`
+    // custom package nodes (directly or via subflows/macros) HARDENED — set flow context
     // BEFORE registering modules so every module context immediately sees currentPackageId.
-    // A synthetic package context engages Web Worker isolation + the permission gate,
-    // granting only benign capabilities so a malicious logic_block can't run arbitrary JS /
-    // steal API keys in this origin. The user's own flows (no marker) stay trusted/unchanged.
-    if (loadedUntrustedRef.current || runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
+    const isUntrusted =
+      loadedUntrustedRef.current || runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current);
+    const referencedPkgIds = collectReferencedPackageIds(
+      flowIdRef.current,
+      graph,
+      availableFlowsRef.current,
+      moduleLoader,
+    );
+    const hasPkgNodes = referencedPkgIds.length > 0;
+
+    if (hasPkgNodes) {
+      const effectivePackageId =
+        referencedPkgIds.length === 1
+          ? referencedPkgIds[0]
+          : `pkg-composite:${referencedPkgIds.join(',')}`;
+      // Fail closed with [] permissions when running a pkg:* node through direct useWorkflow
+      const pkgPerms = isUntrusted ? intersectPermissions([[], UNTRUSTED_FLOW_PERMISSIONS]) : [];
+      runtime.setFlowContext(flowIdRef.current || 'workflow', effectivePackageId);
+      runtime.setPackagePermissions(pkgPerms);
+      addLog({
+        source: 'Security',
+        message: `Flow references custom package node(s) (${referencedPkgIds.join(', ')}) — running sandboxed with least-privilege permissions.`,
+        type: 'info',
+      });
+    } else if (isUntrusted) {
       runtime.setFlowContext(flowIdRef.current || 'imported-flow', UNTRUSTED_PACKAGE_ID);
       runtime.setPackagePermissions(UNTRUSTED_FLOW_PERMISSIONS);
       addLog({
@@ -1156,8 +1240,6 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       runtime.setFlowContext(flowIdRef.current, null);
     }
 
-    // Connect module loader for dynamic node support
-    const moduleLoader = getModuleLoader();
     runtime.setModuleRegistry(moduleLoader);
 
     // Register all module runtimes with the workflow runtime

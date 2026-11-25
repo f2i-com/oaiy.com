@@ -95,14 +95,29 @@ function createAudioMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> 
 // Helper Functions
 // ============================================
 
+function isLoopbackHost(hostname: string): boolean {
+    const h = hostname.toLowerCase().replace(/\.+$/, '');
+    return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
+
 /**
- * Extract port number from a URL string
+ * Extract port number from a loopback HTTP(S) URL string.
+ * Returns null for non-loopback hosts or malformed URLs so remote endpoints
+ * can never trigger local service auto-start or loopback rewriting.
  * @param url The URL to extract port from (e.g., "http://127.0.0.1:8765/tts")
- * @returns The port number or null if not found
+ * @returns The port number or null if not a loopback URL with an explicit port
  */
 function extractPortFromUrl(url: string): number | null {
-    const match = url.match(/:(\d+)/);
-    return match ? parseInt(match[1], 10) : null;
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        if (!isLoopbackHost(parsed.hostname)) return null;
+        if (!parsed.port) return null;
+        const port = parseInt(parsed.port, 10);
+        return Number.isFinite(port) && port > 0 && port <= 65535 ? port : null;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -121,16 +136,19 @@ async function resolveServiceUrl(
         throw new Error(`No API URL provided for service`);
     }
 
-    // Extract port from URL for dynamic service lookup
+    // Extract port from loopback URL for dynamic service lookup
     const port = extractPortFromUrl(userUrl);
     if (!port) {
-        // No port found, return URL as-is (could be external service)
+        // Not a loopback URL with an explicit port — return URL as-is
         return userUrl;
     }
 
-    // Extract the endpoint path for reconstructing the URL
-    const urlMatch = userUrl.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
-    const endpoint = urlMatch?.[2] || '';
+    let parsedUrl: URL;
+    try {
+        parsedUrl = new URL(userUrl);
+    } catch {
+        return userUrl;
+    }
 
     // Try to ensure service is ready (auto-start if needed)
     if (ctx.tauri) {
@@ -153,7 +171,9 @@ async function resolveServiceUrl(
                 if (!result.already_running) {
                     ctx.log('info', `[Audio] Service on port ${port} auto-started`);
                 }
-                return `http://127.0.0.1:${result.port}${endpoint}`;
+                parsedUrl.hostname = '127.0.0.1';
+                parsedUrl.port = String(result.port);
+                return parsedUrl.toString();
             } else if (result.error) {
                 ctx.log('warn', `[Audio] Service on port ${port} failed to start: ${result.error}`);
             }
@@ -910,7 +930,7 @@ async function textToSpeech(
         let audioUrl = outputPath;
         try {
             audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: outputPath });
-            ctx.log('info', `[TTS] Media URL: ${audioUrl}`);
+            ctx.log('info', `[TTS] Media URL: ${redactMediaToken(audioUrl)}`);
         } catch (e) {
             ctx.log('error', `[TTS] Failed to get media URL: ${e}`);
         }

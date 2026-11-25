@@ -20,7 +20,7 @@ const CoreVideoCompiler: ModuleCompiler = {
   },
 
   compileNode(nodeType: string, ctx: ModuleCompilerContext): string | null {
-    const { node, inputs, outputVar, skipVarDeclaration, escapeString, debugEnabled } = ctx;
+    const { node, inputs, outputVar, sanitizedId, skipVarDeclaration, escapeString, debugEnabled } = ctx;
     const data = node.data;
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
     const debug = debugEnabled ?? false;
@@ -396,8 +396,8 @@ const CoreVideoCompiler: ModuleCompiler = {
 
       for (let i = 0; i < effectiveImageCount; i++) {
         // Check for handleId from config first, then image_N, then fallback to 'image' for first input
-        const config = comfyImageInputConfigs[i] as { handleId?: string } | undefined;
-        const handleId = config?.handleId;
+        const config = comfyImageInputConfigs[i] as { handleId?: unknown } | undefined;
+        const handleId = typeof config?.handleId === 'string' ? config.handleId : undefined;
         let imageVar = handleId ? inputs.get(handleId) : null;
         if (!imageVar) imageVar = inputs.get(`image_${i}`);
         if (!imageVar && i === 0) imageVar = inputs.get('image');
@@ -406,25 +406,34 @@ const CoreVideoCompiler: ModuleCompiler = {
 
       const imageInputsCode = imageInputVars.length > 0 ? `[${imageInputVars.join(', ')}]` : 'null';
       const comfyNodeIdsCode = comfyImageInputNodeIds.length > 0
-        ? `[${comfyImageInputNodeIds.map(id => `"${escapeString(id)}"`).join(', ')}]`
+        ? `[${comfyImageInputNodeIds.map(id => `"${escapeString(String(id ?? ''))}"`).join(', ')}]`
         : 'null';
 
       // Handle both old format (title, nodeType) and new format (label, inputName, handleId)
       let comfyImageInputConfigsCode = 'null';
       if (comfyImageInputConfigs.length > 0) {
-        const configItems = comfyImageInputConfigs.map((cfg: { nodeId?: string; title?: string; label?: string; nodeType?: string; inputName?: string; handleId?: string; allowBypass?: boolean }) => {
-          const nodeId = cfg.nodeId || '';
-          const title = cfg.title || cfg.label || '';
-          const nodeType = cfg.nodeType || cfg.inputName || 'LoadImage';
-          const handleId = cfg.handleId || '';
-          const allowBypass = Boolean(cfg.allowBypass);
+        const configItems = comfyImageInputConfigs.map((cfg: unknown) => {
+          const c = (cfg && typeof cfg === 'object' ? cfg : {}) as {
+            nodeId?: unknown;
+            title?: unknown;
+            label?: unknown;
+            nodeType?: unknown;
+            inputName?: unknown;
+            handleId?: unknown;
+            allowBypass?: unknown;
+          };
+          const nodeId = String(c.nodeId || '');
+          const title = String(c.title || c.label || '');
+          const nodeType = String(c.nodeType || c.inputName || 'LoadImage');
+          const handleId = String(c.handleId || '');
+          const allowBypass = Boolean(c.allowBypass);
           return `{nodeId:"${escapeString(nodeId)}",title:"${escapeString(title)}",nodeType:"${escapeString(nodeType)}",handleId:"${escapeString(handleId)}",allowBypass:${allowBypass}}`;
         });
         comfyImageInputConfigsCode = `[${configItems.join(',')}]`;
       }
 
       const comfyAllImageNodeIdsCode = comfyAllImageNodeIds.length > 0
-        ? `[${comfyAllImageNodeIds.map(id => `"${escapeString(id)}"`).join(', ')}]`
+        ? `[${comfyAllImageNodeIds.map(id => `"${escapeString(String(id ?? ''))}"`).join(', ')}]`
         : 'null';
 
       // Video-specific parameters (coerce to numbers in case they're stored as strings or objects)
@@ -573,17 +582,17 @@ const CoreVideoCompiler: ModuleCompiler = {
         code = `
   // --- Node: ${node.id} (video_captions from STT segments) ---
   // Extract text and durations from STT segments
-  let _segments_${node.id.replace(/-/g, '_')} = ${segmentsVar};
-  let _text_${node.id.replace(/-/g, '_')} = Array.isArray(_segments_${node.id.replace(/-/g, '_')})
-    ? _segments_${node.id.replace(/-/g, '_')}.map(s => s.text || s.word || '').join(' ... ')
+  let _segments_${sanitizedId} = ${segmentsVar};
+  let _text_${sanitizedId} = Array.isArray(_segments_${sanitizedId})
+    ? _segments_${sanitizedId}.map(s => s.text || s.word || '').join(' ... ')
     : ${textVar};
-  let _durations_${node.id.replace(/-/g, '_')} = Array.isArray(_segments_${node.id.replace(/-/g, '_')})
-    ? _segments_${node.id.replace(/-/g, '_')}.map(s => (s.end || 0) - (s.start || 0))
+  let _durations_${sanitizedId} = Array.isArray(_segments_${sanitizedId})
+    ? _segments_${sanitizedId}.map(s => (s.end || 0) - (s.start || 0))
     : ${durationsVar};
-  console.log("[VideoCaptions] Using STT segments: " + _segments_${node.id.replace(/-/g, '_')}.length + " segments");
+  console.log("[VideoCaptions] Using STT segments: " + _segments_${sanitizedId}.length + " segments");
   ${letOrAssign}${outputVar} = await VideoFrames.videoCaptions(
     ${videoVar},
-    _text_${node.id.replace(/-/g, '_')},
+    _text_${sanitizedId},
     "${position}",
     ${fontSize},
     "${fontColor}",
@@ -591,7 +600,7 @@ const CoreVideoCompiler: ModuleCompiler = {
     ${padding},
     ${margin},
     "${node.id}",
-    _durations_${node.id.replace(/-/g, '_')}
+    _durations_${sanitizedId}
   );
   if (${outputVar} === "__ABORT__") {
     console.log("[Workflow] aborted");

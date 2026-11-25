@@ -29,6 +29,8 @@ export interface Budget {
   setLimit(app: string, limit: number): Promise<void>;
   /** The most bytes an hour `app` may send: 0 to 4 GiB. */
   setByteLimit(app: string, limit: number): Promise<void>;
+  /** Update both hourly limits together in one transaction after validating both. */
+  setLimits(app: string, limit: number, byteLimit: number): Promise<void>;
 }
 
 const limitKey = (app: string): string => `limit:${app}`;
@@ -109,6 +111,16 @@ export function createBudget(db: Db, now: () => number = Date.now): Budget {
     async setByteLimit(app, limit) {
       if (!Number.isInteger(limit) || limit < 0 || limit > MAX_BYTE_LIMIT) throw new Error(`The most bytes an hour is a whole number from 0 to ${MAX_BYTE_LIMIT}.`);
       await db.put('meta', byteLimitKey(app), limit);
+    },
+
+    async setLimits(app, limit, byteLimit) {
+      if (!Number.isInteger(limit) || limit < 0 || limit > MAX_LIMIT) throw new Error(`The most requests an hour is a whole number from 0 to ${MAX_LIMIT}.`);
+      if (!Number.isInteger(byteLimit) || byteLimit < 0 || byteLimit > MAX_BYTE_LIMIT) throw new Error(`The most bytes an hour is a whole number from 0 to ${MAX_BYTE_LIMIT}.`);
+      await db.transact(['meta'], 'readwrite', async (tx) => {
+        const meta = tx.objectStore('meta');
+        meta.put(limit, limitKey(app));
+        meta.put(byteLimit, byteLimitKey(app));
+      });
     },
   };
 }

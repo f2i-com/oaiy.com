@@ -396,6 +396,8 @@ export class Preview {
   private nextRequest = 1;
   /** Whether the frame shown now has said its bridge is there. */
   private bridgeReady = false;
+  /** Per-load authentication token for webpage bridge postMessages (null for frames without one). */
+  private bridgeToken: string | null = null;
   /** Checks, inspections, actions or screenshots running (edits wait to re-render until they are done). */
   private busy = 0;
   /** A page the frame asked to open while a request was running: opened once it has answered. */
@@ -778,8 +780,9 @@ export class Preview {
   }
 
   private fromBridge(event: MessageEvent): void {
-    const data = event.data as { __oaiyAgent?: boolean; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string; filename?: unknown; mime?: unknown; bytes?: unknown; userInitiated?: unknown };
+    const data = event.data as { __oaiyAgent?: boolean; __oaiyToken?: unknown; type?: string; level?: string; message?: string; at?: number; id?: number; result?: BridgeReply; path?: unknown; store?: unknown; kind?: string; filename?: unknown; mime?: unknown; bytes?: unknown; userInitiated?: unknown };
     if (!this.frame || event.source !== this.frame.contentWindow || data?.__oaiyAgent !== true) return;
+    if (this.bridgeToken !== null && data.__oaiyToken !== this.bridgeToken) return;
     if (data.type === 'bot:bridge') {
       this.bridgeReady = true;
     } else if (data.type === 'bot:problem' && typeof data.message === 'string') {
@@ -928,7 +931,7 @@ export class Preview {
       }, timeoutMs);
       this.requests.set(id, finish);
       signal?.addEventListener('abort', onAbort, { once: true });
-      frame.postMessage({ __oaiyAgent: true, id, ...message }, '*');
+      frame.postMessage({ __oaiyAgent: true, ...(this.bridgeToken !== null ? { __oaiyToken: this.bridgeToken } : {}), id, ...message }, '*');
     });
   }
 
@@ -1108,6 +1111,7 @@ export class Preview {
     this.kept = false;
     this.syntaxFiles = [];
     this.bridgeReady = false;
+    this.bridgeToken = null;
     this.current = { ok: false, errors: [], at: Date.now() };
     this.problems = [];
     this.collecting = null;
@@ -1292,6 +1296,11 @@ export class Preview {
     }
     if (generation !== this.generation) return;
     // Forms stay allowed so that a page's submit handlers run; the frame keeps them from going anywhere.
+    const bridgeToken =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    this.bridgeToken = bridgeToken;
     const frame = this.newFrame('Web page preview', `${import.meta.env.BASE_URL}webpage/index.html?v=${generation}`, 'allow-scripts allow-forms');
     this.frame = frame;
     const errors: string[] = [];
@@ -1318,7 +1327,7 @@ export class Preview {
         this.settle({ ok: all.length === 0, errors: all, warnings: warned });
       };
       frame.contentWindow!.postMessage(
-        { type: 'webpage:init', files: pageFiles(this.vfs, path), page: path, glue, wasm: bytes.slice(0), facade: FACADE, storage: this.storage.get(storageKey({ kind: 'page', path })) ?? {} },
+        { type: 'webpage:init', bridgeToken, files: pageFiles(this.vfs, path), page: path, glue, wasm: bytes.slice(0), facade: FACADE, storage: this.storage.get(storageKey({ kind: 'page', path })) ?? {} },
         '*',
         [channel.port2],
       );

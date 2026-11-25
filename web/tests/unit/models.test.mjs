@@ -16,7 +16,15 @@ const json = (body, status = 200) => new Response(JSON.stringify(body), { status
 function fakeFetch(table) {
   const calls = [];
   const impl = async (url, init) => {
-    calls.push({ url, headers: init?.headers, method: init?.method });
+    calls.push({
+      url,
+      headers: init?.headers,
+      method: init?.method,
+      redirect: init?.redirect,
+      credentials: init?.credentials,
+      cache: init?.cache,
+      referrerPolicy: init?.referrerPolicy,
+    });
     const answer = table[url];
     if (answer === undefined) throw new TypeError('Failed to fetch');
     if (answer instanceof Error) throw answer;
@@ -80,6 +88,35 @@ describe('listing models', () => {
     const { models, hidden } = M.chatModels([{ id: 'gpt-x' }, { id: 'text-embedding-3' }, { id: 'whisper-1' }, { id: 'claude-x' }, { id: 'dall-e-3' }]);
     assert.deepEqual(models.map((m) => m.id), ['gpt-x', 'claude-x']);
     assert.equal(hidden, 3);
+  });
+
+  it('never follows redirects, sends no credentials/referrer/cache, cancels redirect bodies, and turns malformed Anthropic URLs into network errors', async () => {
+    let cancelled = false;
+    const body = new ReadableStream({ cancel() { cancelled = true; } });
+    const f = fakeFetch({ 'https://api.openai.com/v1/models': { data: [{ id: 'gpt-x' }] } });
+    await M.listModels({ type: 'openai', apiKey: 'K' }, { fetchImpl: f.impl, page: PAGE });
+    assert.equal(f.calls[0].redirect, 'manual');
+    assert.equal(f.calls[0].credentials, 'omit');
+    assert.equal(f.calls[0].cache, 'no-store');
+    assert.equal(f.calls[0].referrerPolicy, 'no-referrer');
+
+    const redirectFetch = async () => new Response(body, { status: 302, headers: { location: 'https://evil.example/steal' } });
+    await assert.rejects(
+      M.listModels({ type: 'openai', apiKey: 'K' }, { fetchImpl: redirectFetch, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && /redirect/i.test(e.message) && !e.message.includes('evil.example'),
+    );
+    assert.equal(cancelled, true, 'redirect body was cancelled');
+
+    const opaqueRedirectFetch = async () => ({ type: 'opaqueredirect', status: 0, ok: false, body: { cancel: async () => {} } });
+    await assert.rejects(
+      M.listModels({ type: 'openai', apiKey: 'K' }, { fetchImpl: opaqueRedirectFetch, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && /redirect/i.test(e.message),
+    );
+
+    await assert.rejects(
+      M.listModels({ type: 'anthropic', apiKey: 'K', baseUrl: 'not a valid url' }, { fetchImpl: f.impl, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && e.kind === 'network',
+    );
   });
 });
 

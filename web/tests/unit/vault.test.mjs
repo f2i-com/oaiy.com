@@ -192,7 +192,8 @@ describe('the device vault', () => {
     await fresh.vault.set('key:b', 'entered-again-secret');
     assert.equal(await fresh.vault.health(), 'ok');
     assert.deepEqual(await fresh.vault.get(['key:a', 'key:b']), { 'key:b': 'entered-again-secret' });
-    assert.deepEqual(await fresh.vault.names(), ['key:b'], 'what could never open is not kept');
+    assert.deepEqual((await fresh.vault.names()).sort(), ['key:a', 'key:b'], 'other sealed entries stay listed so they remain marked unreadable');
+    assert.deepEqual(await fresh.vault.unreadable(['key:a', 'key:b']), ['key:a'], 'previously sealed entries that cannot open stay unreadable');
   });
 
   it('a corrupted wrapper is damaged too, and a database wiped under a live page is made again', async () => {

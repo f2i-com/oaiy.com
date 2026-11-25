@@ -71,8 +71,14 @@ export function createDeviceVault(db: Db, env: VaultEnv = { crypto: globalThis.c
     const record: VaultRecord = { v: 1, kid, wrappers: [{ type: 'device', id: DEVICE_KEY, iv, ct }], items: {} };
     await db.transact(['vault', 'keys'], 'readwrite', async (tx) => {
       const vault = tx.objectStore('vault');
-      if (!replace && (await request(vault.get(RECORD)))) return; // another document made it first: use its
-      vault.put(record, RECORD);
+      const existing = await request<VaultRecord | undefined>(vault.get(RECORD));
+      if (!replace && existing) return; // another document made it first: use its
+      // Replacing a damaged vault preserves existing item entries so other providers' keys stay marked unreadable until re-entered.
+      const next: VaultRecord = {
+        ...record,
+        items: replace && existing?.items ? { ...existing.items } : {},
+      };
+      vault.put(next, RECORD);
       tx.objectStore('keys').put(kek, DEVICE_KEY);
     });
     cached = null;
@@ -178,7 +184,7 @@ export function createDeviceVault(db: Db, env: VaultEnv = { crypto: globalThis.c
         try {
           sealedWith = await master();
         } catch (e) {
-          // Nothing that was sealed can be opened, and it cannot be kept: start the store again, so the secret being saved is kept.
+          // Start the store with a fresh master key while preserving existing entries so other keys remain marked unreadable until re-entered.
           if (e instanceof VaultError && e.code === 'damaged') {
             await create(true);
             continue;

@@ -29,7 +29,61 @@
   const MAGIC = '\u0000oaiy.agent.page:';
   /** Instructions for one entry into the page's code: a loop that never ends is stopped. */
   const BUDGET = 400_000_000;
-  const post = (message, transfer) => parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*', transfer || []);
+  // Cache host intrinsics at startup before any guest code runs so page-host logic stays
+  // immune to prototype or global tampering.
+  const nativeJsonParse = JSON.parse;
+  const nativeJsonStringify = JSON.stringify;
+  const nativeDateNow = Date.now;
+  const nativePerfNow = performance.now.bind(performance);
+  const nativePerfTimeOrigin = performance.timeOrigin;
+  const nativeObjectCreate = Object.create;
+  const nativeObjectKeys = Object.keys;
+  const nativeObjectEntries = Object.entries;
+  const nativeObjectAssign = Object.assign;
+  const nativeGetPrototypeOf = Object.getPrototypeOf;
+  const nativeSetPrototypeOf = Object.setPrototypeOf;
+  const nativeGetOwnPropDesc = Object.getOwnPropertyDescriptor;
+  const nativeGetOwnPropDescs = Object.getOwnPropertyDescriptors;
+  const nativeHasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+  const nativeObjToString = Function.prototype.call.bind(Object.prototype.toString);
+  const nativeArrayFrom = Array.from;
+  const nativeArrayIsArray = Array.isArray;
+  const nativeNumberIsFinite = Number.isFinite;
+  const nativeFunction = Function;
+  const nativeEval = eval;
+  const nativeAtob = atob.bind(window);
+  const nativeBtoa = btoa.bind(window);
+  const nativeCreateObjectURL = URL.createObjectURL.bind(URL);
+  const nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+  const nativeCryptoRandomValues = crypto.getRandomValues.bind(crypto);
+  const nativeCryptoRandomUUID = crypto.randomUUID.bind(crypto);
+  const nativeSetTimeout = window.setTimeout.bind(window);
+  const nativeQueueMicrotask = queueMicrotask.bind(window);
+  const nativeDOMParser = DOMParser;
+  const nativeURL = URL;
+  const nativeBlob = Blob;
+  const nativeTextDecoder = TextDecoder;
+  const nativeResponse = Response;
+  const nativeEvent = Event;
+  const nativeMouseEvent = MouseEvent;
+  const nativeUint8Array = Uint8Array;
+  const nativeUint32Array = Uint32Array;
+  const safeGet = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return undefined;
+    }
+  };
+  let bridgeToken = null;
+  let initialized = false;
+  let zdomToken = null;
+  const post = (message, transfer) =>
+    parentWindow.postMessage(
+      bridgeToken ? { __oaiyAgent: true, __oaiyToken: bridgeToken, ...message } : { __oaiyAgent: true, ...message },
+      '*',
+      transfer || [],
+    );
   const nativeConsole = { log: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console) };
   const threeHost = window.__oaiyAgentThree || null;
   const objectBlobs = new Map();
@@ -41,22 +95,22 @@
   if (threeHost && threeHost.modules) {
     const registerThreeModule = (mod) => {
       if (!mod || typeof mod !== 'object') return;
-      for (const k of Object.keys(mod)) {
+      for (const k of nativeObjectKeys(mod)) {
         if (k === 'default') continue;
         const val = mod[k];
         if (typeof val === 'function') {
           if (!ctorNames.has(val)) ctorNames.set(val, k);
           threeCtors.add(val);
           if (val.prototype) {
-            for (let p = val.prototype; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+            for (let p = val.prototype; p && p !== Object.prototype; p = nativeGetPrototypeOf(p)) {
               if (typeof p.constructor === 'function') threeCtors.add(p.constructor);
             }
           }
         }
       }
     };
-    if (Object.prototype.hasOwnProperty.call(threeHost.modules, 'three')) registerThreeModule(threeHost.modules.three);
-    for (const spec of Object.keys(threeHost.modules)) {
+    if (nativeHasOwn(threeHost.modules, 'three')) registerThreeModule(threeHost.modules.three);
+    for (const spec of nativeObjectKeys(threeHost.modules)) {
       if (spec !== 'three') registerThreeModule(threeHost.modules[spec]);
     }
   }
@@ -64,10 +118,11 @@
   const BLOCKED_PROTO_PROPS = new Set([
     '__proto__', 'constructor', 'prototype',
     '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
+    'contentWindow', 'contentDocument', 'getSVGDocument',
   ]);
   let lastUserGestureAt = 0;
   const markUserGesture = (event) => {
-    if (event && event.isTrusted) lastUserGestureAt = Date.now();
+    if (event && event.isTrusted) lastUserGestureAt = nativeDateNow();
   };
   window.addEventListener('pointerdown', markUserGesture, true);
   window.addEventListener('click', markUserGesture, true);
@@ -153,9 +208,9 @@
     const blob = objectBlobs.get(href);
     if (!blob) return false;
     const filename = download.trim() || 'export.bin';
-    const userInitiated = Boolean(directTrusted) || (Date.now() - lastUserGestureAt < 5000);
+    const userInitiated = Boolean(directTrusted) || (nativeDateNow() - lastUserGestureAt < 5000);
     blob.arrayBuffer().then((buf) => {
-      post({ type: 'bot:download', filename, mime: blob.type || 'application/octet-stream', bytes: new Uint8Array(buf), userInitiated }, [buf]);
+      post({ type: 'bot:download', filename, mime: blob.type || 'application/octet-stream', bytes: new nativeUint8Array(buf), userInitiated }, [buf]);
     }).catch(() => {});
     return true;
   };
@@ -167,7 +222,7 @@
   let windowIssued = false;
   let files = {};
   let pagePath = '';
-  let storage = { local: Object.create(null), session: Object.create(null) };
+  let storage = { local: nativeObjectCreate(null), session: nativeObjectCreate(null) };
   const notes = [];
 
   // --- paths and files -----------------------------------------------------------
@@ -330,13 +385,26 @@
 
   // --- the page's HTML -----------------------------------------------------------
 
+  const BLOCKED_TAGS = new Set(['base', 'iframe', 'frame', 'frameset', 'object', 'embed']);
   const DANGEROUS_HTTP_EQUIV = /^\s*(content-security-policy|refresh)\s*$/i;
+  const DANGEROUS_LINK_REL = /\b(?:dns-prefetch|preconnect|prefetch|prerender|modulepreload|import)\b/i;
   const isDangerousElement = (node) => {
     if (!(node instanceof Element)) return false;
-    const tag = node.localName;
-    if (tag === 'base') return true;
+    const tag = node.localName.toLowerCase();
+    if (BLOCKED_TAGS.has(tag)) return true;
     if (tag === 'meta' && DANGEROUS_HTTP_EQUIV.test(node.getAttribute('http-equiv') || '')) return true;
+    if (tag === 'link' && DANGEROUS_LINK_REL.test(node.getAttribute('rel') || '')) return true;
     return false;
+  };
+  const sanitizeElementAttrs = (el) => {
+    if (el.hasAttribute('ping')) el.removeAttribute('ping');
+    if (el.hasAttribute('shadowrootmode')) el.removeAttribute('shadowrootmode');
+    if (el.localName.toLowerCase() === 'link') {
+      for (const attrName of ['href', 'src']) {
+        const val = el.getAttribute(attrName);
+        if (val !== null && external(val.trim())) el.removeAttribute(attrName);
+      }
+    }
   };
   const stripDangerousTree = (node) => {
     if (!(node instanceof Node)) return;
@@ -344,9 +412,20 @@
       node.remove();
       return;
     }
+    if (node instanceof Element) {
+      sanitizeElementAttrs(node);
+      if (node.localName.toLowerCase() === 'template' && node.content) stripDangerousTree(node.content);
+      if (node.shadowRoot) stripDangerousTree(node.shadowRoot);
+    }
     if (node instanceof Element || node instanceof DocumentFragment || node instanceof Document) {
-      for (const el of [...node.querySelectorAll('base, meta[http-equiv]')]) {
-        if (isDangerousElement(el)) el.remove();
+      for (const el of [...node.querySelectorAll('*')]) {
+        if (isDangerousElement(el)) {
+          el.remove();
+          continue;
+        }
+        sanitizeElementAttrs(el);
+        if (el.localName.toLowerCase() === 'template' && el.content) stripDangerousTree(el.content);
+        if (el.shadowRoot) stripDangerousTree(el.shadowRoot);
       }
     }
   };
@@ -374,15 +453,15 @@
     const handlers = [];
     const elements = root.nodeType === 1 ? [root, ...root.querySelectorAll('*')] : [...root.querySelectorAll('*')];
     for (const el of elements) {
-      const tag = el.localName;
+      const tag = el.localName.toLowerCase();
       if (tag === 'script') {
         const type = (el.getAttribute('type') || '').trim();
         if (/^importmap$/i.test(type)) {
           if (importMap) {
             try {
-              const parsed = JSON.parse(el.textContent || '{}');
+              const parsed = nativeJsonParse(el.textContent || '{}');
               if (parsed && parsed.imports && typeof parsed.imports === 'object') {
-                Object.assign(importMap, parsed.imports);
+                nativeObjectAssign(importMap, parsed.imports);
               }
             } catch {
               /* ignore malformed importmap */
@@ -400,14 +479,16 @@
           continue;
         }
       }
-      if (tag === 'base' || (tag === 'meta' && DANGEROUS_HTTP_EQUIV.test(el.getAttribute('http-equiv') || ''))) {
+      if (tag === 'iframe') note('warn', `An <iframe> (${el.getAttribute('src') || 'no src'}) does not load in the preview.`);
+      if (isDangerousElement(el)) {
         el.remove();
         continue;
       }
-      if (tag === 'iframe') note('warn', `An <iframe> (${el.getAttribute('src') || 'no src'}) does not load in the preview.`);
       for (const attr of [...el.attributes]) {
         const name = attr.name.toLowerCase();
-        if (name.startsWith('on')) {
+        if (name === 'ping' || name === 'shadowrootmode') {
+          el.removeAttribute(attr.name);
+        } else if (name.startsWith('on')) {
           handlers.push([el, name, attr.value]);
           el.removeAttribute(attr.name);
           markListener(el, name.slice(2));
@@ -415,13 +496,22 @@
           el.setAttribute('style', rewriteCss(attr.value, base));
         } else if (name === 'srcset') {
           el.setAttribute('srcset', rewriteSrcset(attr.value, base));
+        } else if (tag === 'link' && (name === 'href' || name === 'src')) {
+          const val = attr.value.trim();
+          const isResourceRel = /stylesheet|icon|preload/i.test(el.getAttribute('rel') || '');
+          if (external(val)) {
+            if (isResourceRel) rewriteRef(val, base, `<link ${name}>`);
+            el.removeAttribute(attr.name);
+          } else if (isResourceRel) {
+            el.setAttribute(attr.name, rewriteRef(attr.value, base, `<link ${name}>`));
+          }
         } else if ((URL_ATTRS[name] && URL_ATTRS[name].includes(tag)) || (name === 'xlink:href' && tag === 'image')) {
-          if (tag === 'link' && !/stylesheet|icon|preload/i.test(el.getAttribute('rel') || '')) continue;
           el.setAttribute(attr.name, rewriteRef(attr.value, base, `<${tag} ${name}>`));
         }
       }
       if (tag === 'style') el.textContent = rewriteCss(el.textContent, base);
-      if (tag === 'template') handlers.push(...adopt(el.content, base, null));
+      if (tag === 'template' && el.content) handlers.push(...adopt(el.content, base, null));
+      if (el.shadowRoot) handlers.push(...adopt(el.shadowRoot, base, null));
     }
     return handlers;
   };
@@ -445,14 +535,14 @@
     }
     return id;
   };
-  const hasOwn = (obj, prop) => Object.prototype.hasOwnProperty.call(obj, prop);
+  const hasOwn = (obj, prop) => nativeHasOwn(obj, prop);
   const ctorNameOf = (ctor) => {
     if (typeof ctor !== 'function') return '';
     return ctorNames.get(ctor) || (threeHost && threeHost.ctorNames && threeHost.ctorNames.get(ctor)) || ctor.name || '';
   };
   const chainOf = (value) => {
     const chain = [];
-    for (let p = Object.getPrototypeOf(value); p && p !== Object.prototype && chain.length < 12; p = Object.getPrototypeOf(p)) {
+    for (let p = nativeGetPrototypeOf(value); p && p !== Object.prototype && chain.length < 12; p = nativeGetPrototypeOf(p)) {
       const name = ctorNameOf(p.constructor);
       if (!name || name === 'Object') break;
       chain.push(name);
@@ -461,7 +551,7 @@
   };
   const isThreeValue = (value) => {
     if (!value || typeof value !== 'object') return false;
-    for (let p = Object.getPrototypeOf(value); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+    for (let p = nativeGetPrototypeOf(value); p && p !== Object.prototype; p = nativeGetPrototypeOf(p)) {
       if (typeof p.constructor === 'function' && threeCtors.has(p.constructor)) return true;
     }
     return false;
@@ -477,21 +567,22 @@
   const toGuest = (v, depth = 0) => {
     if (v === undefined) return { $u: 1 };
     if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
-    if (typeof v === 'number') return Number.isFinite(v) ? v : { $num: String(v) };
+    if (typeof v === 'number') return nativeNumberIsFinite(v) ? v : { $num: String(v) };
     if (typeof v === 'bigint' || typeof v === 'symbol') return String(v);
     if (typeof v === 'function') return guestFnIds.has(v) ? { $f: guestFnIds.get(v) } : { $m: 1 };
     if (v === window) return { $win: 1 };
+    if (isForbiddenHostVal(v)) return { $u: 1 };
     if (depth > 6) return null;
-    if (Array.isArray(v) || isCollection(v)) return Array.from(v, (x) => toGuest(x, depth + 1));
-    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) return { $ta: v.constructor.name, d: Array.from(v) };
+    if (nativeArrayIsArray(v) || isCollection(v)) return nativeArrayFrom(v, (x) => toGuest(x, depth + 1));
+    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) return { $ta: v.constructor.name, d: nativeArrayFrom(v) };
     if (v instanceof ArrayBuffer) {
-      const bytes = new Uint8Array(v);
+      const bytes = new nativeUint8Array(v);
       if (bytes.byteLength > 1024) {
         let bin = '';
         for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-        return { $ab: btoa(bin) };
+        return { $ab: nativeBtoa(bin) };
       }
-      return { $ta: 'ArrayBuffer', d: Array.from(bytes) };
+      return { $ta: 'ArrayBuffer', d: nativeArrayFrom(bytes) };
     }
     if (v instanceof Date) return { $date: v.getTime() };
     if (v instanceof Promise) {
@@ -504,10 +595,10 @@
       return { $p: id };
     }
     if (handleObjects.has(v)) return wrapHandle(v);
-    const proto = Object.getPrototypeOf(v);
+    const proto = nativeGetPrototypeOf(v);
     if (proto === Object.prototype || proto === null) {
       const out = {};
-      for (const k of Object.keys(v)) {
+      for (const k of nativeObjectKeys(v)) {
         if (k === '__proto__') continue;
         out[k] = toGuest(v[k], depth + 1);
       }
@@ -532,10 +623,10 @@
   const TYPED = { Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array };
   const fromGuest = (v) => {
     if (v === null || typeof v !== 'object') return v;
-    if (Array.isArray(v)) return v.map(fromGuest);
-    if (hasOwn(v, '$o') && v.$o && typeof v.$o === 'object' && !Array.isArray(v.$o)) {
+    if (nativeArrayIsArray(v)) return v.map(fromGuest);
+    if (hasOwn(v, '$o') && v.$o && typeof v.$o === 'object' && !nativeArrayIsArray(v.$o)) {
       const out = {};
-      for (const k of Object.keys(v.$o)) {
+      for (const k of nativeObjectKeys(v.$o)) {
         if (k === '__proto__') continue;
         out[k] = fromGuest(v.$o[k]);
       }
@@ -551,18 +642,18 @@
     if (hasOwn(v, '$num')) return Number(v.$num);
     if (hasOwn(v, '$date')) return new Date(v.$date);
     if (hasOwn(v, '$ab')) {
-      const bin = atob(v.$ab);
-      const bytes = new Uint8Array(bin.length);
+      const bin = nativeAtob(v.$ab);
+      const bytes = new nativeUint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       return bytes.buffer;
     }
     if (hasOwn(v, '$ta')) {
       return v.$ta === 'ArrayBuffer'
-        ? new Uint8Array(v.d).buffer
-        : new ((hasOwn(TYPED, v.$ta) && TYPED[v.$ta]) || Uint8Array)(v.d);
+        ? new nativeUint8Array(v.d).buffer
+        : new ((hasOwn(TYPED, v.$ta) && TYPED[v.$ta]) || nativeUint8Array)(v.d);
     }
     const out = {};
-    for (const k of Object.keys(v)) {
+    for (const k of nativeObjectKeys(v)) {
       if (k === '__proto__') continue;
       out[k] = fromGuest(v[k]);
     }
@@ -641,16 +732,16 @@
       pending.push(payload);
       return undefined;
     }
-    return fromGuest(enter(() => engine.callFunction('__zdom_cb', payload)));
+    return fromGuest(enter(() => engine.callFunction('__zdom_cb', [zdomToken, payload[0], payload[1], payload[2]])));
   }
   function settle(id, ok, value) {
     promises.delete(id);
     if (dead) return;
     if (depth > 0) {
-      setTimeout(() => settle(id, ok, value));
+      nativeSetTimeout(() => settle(id, ok, value));
       return;
     }
-    enter(() => engine.callFunction('__zdom_settle', [id, ok, ok ? toGuest(value) : value]));
+    enter(() => engine.callFunction('__zdom_settle', [zdomToken, id, ok, ok ? toGuest(value) : value]));
   }
 
   // --- answering the page's code -------------------------------------------------------
@@ -661,7 +752,7 @@
     return objects.get(id);
   };
   const HTML_WRITERS = new Set(['innerHTML', 'outerHTML']);
-  const HTML_METHODS = new Set(['insertAdjacentHTML', 'setHTMLUnsafe', 'createContextualFragment']);
+  const HTML_METHODS = new Set(['insertAdjacentHTML', 'setHTMLUnsafe', 'createContextualFragment', 'parseFromString']);
   const REF_PROPS = new Set(['src', 'href', 'poster', 'data']);
   /** What the page's code just inserted, made loadable; its on* attributes become handlers on Zipp. */
   let harvested = [];
@@ -669,17 +760,79 @@
     if (!root || !root.querySelectorAll) return;
     for (const [el, name, code] of adopt(root, dirOf(pagePath), null)) harvested.push([toGuest(el), name, code]);
   };
+  /**
+   * Parse untrusted HTML into a detached, inert document fragment, strip dangerous
+   * elements/attributes (recursing into <template>.content), and harvest on* handlers
+   * BEFORE anything enters the live DOM.
+   */
+  const sanitizeHtmlFragment = (rawHtml, contextEl) => {
+    const html = String(rawHtml ?? '');
+    const frag = document.createDocumentFragment();
+    if (contextEl instanceof SVGElement && contextEl.localName.toLowerCase() !== 'foreignobject') {
+      const parsed = new nativeDOMParser().parseFromString(
+        `<svg xmlns="http://www.w3.org/2000/svg">${html}</svg>`,
+        'image/svg+xml',
+      );
+      const svgRoot = parsed.documentElement;
+      if (svgRoot && svgRoot.localName.toLowerCase() === 'svg' && !parsed.querySelector('parsererror')) {
+        stripDangerousTree(svgRoot);
+        harvest(svgRoot);
+        while (svgRoot.firstChild) frag.appendChild(document.adoptNode(svgRoot.firstChild));
+        return frag;
+      }
+    }
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html;
+    stripDangerousTree(tpl.content);
+    harvest(tpl.content);
+    while (tpl.content.firstChild) frag.appendChild(document.adoptNode(tpl.content.firstChild));
+    return frag;
+  };
   const cssValue = (v) => (typeof v === 'string' && v.includes('url(') ? rewriteCss(v, dirOf(pagePath)) : v);
   const refValue = (obj, prop, v) => {
     if (typeof v !== 'string' || !(obj instanceof Element)) return v;
     if (prop === 'srcset') return rewriteSrcset(v, dirOf(pagePath));
-    const tag = obj.localName;
+    const tag = obj.localName.toLowerCase();
     if (!REF_PROPS.has(prop) || tag === 'script') return v;
     if (prop === 'href' && tag !== 'link' && tag !== 'image' && tag !== 'use') return v;
     return rewriteRef(v, dirOf(pagePath), `${tag}.${prop}`);
   };
 
-  const INSERTS = new Set(['appendChild', 'append', 'prepend', 'insertBefore', 'replaceChild', 'after', 'before', 'replaceWith']);
+  const XLINK_NS = 'http://www.w3.org/1999/xlink';
+  const isLinkElement = (node) =>
+    node instanceof HTMLAnchorElement ||
+    node instanceof HTMLAreaElement ||
+    (typeof SVGAElement !== 'undefined' && node instanceof SVGAElement);
+  const linkHrefOf = (el) => {
+    if (!isLinkElement(el)) return null;
+    if (el.hasAttribute('href')) return el.getAttribute('href') || '';
+    if (typeof SVGAElement !== 'undefined' && el instanceof SVGAElement) {
+      if (el.hasAttributeNS && el.hasAttributeNS(XLINK_NS, 'href')) return el.getAttributeNS(XLINK_NS, 'href') || '';
+      if (el.hasAttribute('xlink:href')) return el.getAttribute('xlink:href') || '';
+    }
+    return null;
+  };
+  const findLinkInEvent = (event) => {
+    if (typeof event.composedPath === 'function') {
+      for (const node of event.composedPath()) {
+        if (isLinkElement(node) && linkHrefOf(node) !== null) return node;
+      }
+    }
+    if (event.target instanceof Element) {
+      const hit = event.target.closest('a[href], area[href]');
+      if (hit) return hit;
+      for (let cur = event.target; cur; cur = cur.parentElement) {
+        if (isLinkElement(cur) && linkHrefOf(cur) !== null) return cur;
+      }
+    }
+    return null;
+  };
+
+  const INSERTS = new Set([
+    'appendChild', 'append', 'prepend', 'insertBefore', 'replaceChild',
+    'after', 'before', 'replaceWith', 'insertAdjacentElement', 'insertNode',
+    'surroundContents', 'moveBefore',
+  ]);
   /** A <script> the page's code added (to load a library, say): it runs on Zipp, then fires load or error. */
   const runInserted = (el) => {
     if (dead || !el.isConnected || !JS_TYPES.test((el.getAttribute('type') || '').trim())) return;
@@ -690,17 +843,36 @@
       const path = external(src) ? null : resolve(src, dirOf(pagePath));
       if (path === null || !(path in files)) {
         note(external(src) ? 'warn' : 'error', external(src) ? `Not loaded: the script ${src}. The preview is offline, so only the project's own scripts run.` : `Missing script: ${src}.`);
-        el.dispatchEvent(new Event('error'));
+        el.dispatchEvent(new nativeEvent('error'));
         return;
       }
       code = textOf(path);
       name = path;
     }
-    const failed = enter(() => engine.callFunction('__zdom_run', [code, name]));
+    const failed = enter(() => engine.callFunction('__zdom_run', [zdomToken, code, name]));
     if (typeof failed === 'string') note('error', failed);
-    if (src) el.dispatchEvent(new Event(typeof failed === 'string' ? 'error' : 'load'));
+    if (src) el.dispatchEvent(new nativeEvent(typeof failed === 'string' ? 'error' : 'load'));
   };
 
+  /** Only these on* window event handlers may be written or deleted through the host window handle. */
+  const ALLOWED_WIN_SET_PROPS = new Set([
+    'onload', 'onresize', 'onscroll', 'onkeydown', 'onkeyup', 'onhashchange', 'onpopstate',
+    'onerror', 'onbeforeunload', 'onmessage', 'onpointerdown', 'onpointermove', 'onpointerup',
+    'onmousedown', 'onmousemove', 'onmouseup', 'onclick', 'onfocus', 'onblur', 'onwheel',
+    'ontouchstart', 'ontouchmove', 'ontouchend', 'onDOMContentLoaded',
+  ]);
+  /** Explicit allowlist of safe window getters/methods exposed through the host window handle. */
+  const ALLOWED_WIN_PROPS = new Set([
+    'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'devicePixelRatio',
+    'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset', 'screen', 'navigator',
+    'visualViewport', 'screenX', 'screenY', 'isSecureContext', 'customElements',
+    'addEventListener', 'removeEventListener', 'dispatchEvent', 'getComputedStyle',
+    'matchMedia', 'scrollTo', 'scrollBy', 'scroll', 'requestAnimationFrame',
+    'cancelAnimationFrame', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+    'getSelection', 'requestIdleCallback', 'cancelIdleCallback', 'createImageBitmap',
+    ...ALLOWED_WIN_SET_PROPS,
+  ]);
+  /** Defense-in-depth denylist of sensitive host window properties (enforced alongside ALLOWED_WIN_PROPS). */
   const BLOCKED_WIN_PROPS = new Set([
     'parent', 'top', 'opener', 'frames', 'frameElement', 'location',
     'history', 'navigation', 'globalThis', 'self', 'window',
@@ -709,13 +881,6 @@
     'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker',
     'modernScreenshot', 'console', 'localStorage', 'URL', 'WebAssembly',
     '__oaiyAgentListening', '__oaiyAgentBridge', '__oaiyAgentThree',
-  ]);
-  /** Only these on* window event handlers may be written or deleted through the host window handle. */
-  const ALLOWED_WIN_SET_PROPS = new Set([
-    'onload', 'onresize', 'onscroll', 'onkeydown', 'onkeyup', 'onhashchange', 'onpopstate',
-    'onerror', 'onbeforeunload', 'onmessage', 'onpointerdown', 'onpointermove', 'onpointerup',
-    'onmousedown', 'onmousemove', 'onmouseup', 'onclick', 'onfocus', 'onblur', 'onwheel',
-    'ontouchstart', 'ontouchmove', 'ontouchend', 'onDOMContentLoaded',
   ]);
   /** Explicit allowlist of DOM/Web API constructors exposed to guest scripts via zippDom.guest.js. */
   const ALLOWED_CTORS = new Set([
@@ -727,11 +892,74 @@
     'Headers', 'DOMMatrix', 'DOMPoint', 'DOMRect', 'AudioContext', 'OfflineAudioContext', 'Notification',
     'BroadcastChannel', 'MessageChannel', 'ReadableStream', 'Request', 'Response', 'CSSStyleSheet', 'FontFace',
   ]);
+  const hostCtors = new Map();
+  for (const name of ALLOWED_CTORS) {
+    const ctor = safeGet(() => window[name]);
+    if (typeof ctor === 'function') hostCtors.set(name, ctor);
+  }
+  const hostTop = safeGet(() => (window.top && window.top !== window ? window.top : null));
+  const hostOpener = safeGet(() => window.opener || null);
+  const hostNavigator = safeGet(() => window.navigator);
+  const FORBIDDEN_HOST_TARGETS = new Set([
+    Math, JSON, Reflect,
+    typeof Intl !== 'undefined' ? Intl : null,
+    typeof Atomics !== 'undefined' ? Atomics : null,
+    typeof WebAssembly !== 'undefined' ? WebAssembly : null,
+    console, performance, crypto,
+    safeGet(() => window.location),
+    safeGet(() => window.history),
+    safeGet(() => window.navigation),
+    safeGet(() => window.localStorage),
+    safeGet(() => window.sessionStorage),
+    safeGet(() => window.modernScreenshot),
+    threeHost, listening,
+    safeGet(() => window.caches),
+    safeGet(() => window.indexedDB),
+    safeGet(() => window.cookieStore),
+    safeGet(() => window.trustedTypes),
+    safeGet(() => window.speechSynthesis),
+    safeGet(() => window.clientInformation),
+    safeGet(() => window.external),
+    safeGet(() => window.styleMedia),
+  ].filter(Boolean));
+  const FORBIDDEN_INTRINSIC_TAGS = new Set([
+    '[object Reflect]', '[object WebAssembly]', '[object Math]', '[object JSON]',
+    '[object Intl]', '[object Atomics]', '[object Location]', '[object History]',
+    '[object Navigation]', '[object Storage]', '[object Console]', '[object Performance]',
+    '[object Crypto]', '[object CacheStorage]', '[object IDBFactory]', '[object CookieStore]',
+    '[object TrustedTypePolicyFactory]', '[object SpeechSynthesis]',
+  ]);
+  const READONLY_HOST_SINGLETONS = new Set([
+    hostNavigator,
+    safeGet(() => window.screen),
+    safeGet(() => window.visualViewport),
+    safeGet(() => window.customElements),
+    safeGet(() => document.implementation),
+    safeGet(() => document.fonts),
+    safeGet(() => hostNavigator && hostNavigator.clipboard),
+    safeGet(() => hostNavigator && hostNavigator.credentials),
+    safeGet(() => hostNavigator && hostNavigator.permissions),
+    safeGet(() => hostNavigator && hostNavigator.serviceWorker),
+    safeGet(() => hostNavigator && hostNavigator.storage),
+    safeGet(() => hostNavigator && hostNavigator.mediaDevices),
+    safeGet(() => hostNavigator && hostNavigator.geolocation),
+    safeGet(() => hostNavigator && hostNavigator.locks),
+    safeGet(() => hostNavigator && hostNavigator.gpu),
+  ].filter(Boolean));
+  const READONLY_HOST_TAGS = new Set([
+    '[object Navigator]', '[object Screen]', '[object ScreenOrientation]',
+    '[object VisualViewport]', '[object CustomElementRegistry]', '[object DOMImplementation]',
+    '[object FontFaceSet]', '[object Clipboard]', '[object CredentialsContainer]',
+    '[object Permissions]', '[object ServiceWorkerContainer]', '[object StorageManager]',
+    '[object MediaDevices]', '[object Geolocation]', '[object LockManager]',
+    '[object GPU]', '[object NetworkInformation]', '[object NavigatorUAData]',
+  ]);
   const isBlockedProp = (obj, prop) => {
     const p = String(prop);
     if (BLOCKED_PROTO_PROPS.has(p)) return true;
     if (p.startsWith('__oaiyAgent') || p.startsWith('__zdom')) return true;
-    return obj === window && BLOCKED_WIN_PROPS.has(p);
+    if (obj === window) return BLOCKED_WIN_PROPS.has(p) || !ALLOWED_WIN_PROPS.has(p);
+    return false;
   };
   const isHostPrototype = (obj) => {
     if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
@@ -746,15 +974,66 @@
       obj === Window.prototype ||
       obj === Document.prototype
     ) return true;
-    const desc = Object.getOwnPropertyDescriptor(obj, 'constructor');
+    const desc = nativeGetOwnPropDesc(obj, 'constructor');
     return Boolean(desc && typeof desc.value === 'function' && desc.value.prototype === obj);
   };
-  const isForbiddenHostVal = (val) =>
-    val === parentWindow ||
-    (window.top && window.top !== window && val === window.top) ||
-    (window.opener && val === window.opener);
+  const isForbiddenHostTarget = (val) => {
+    if (!val || typeof val !== 'object') return false;
+    if (FORBIDDEN_HOST_TARGETS.has(val)) return true;
+    try {
+      const tag = nativeObjToString(val);
+      if (tag === '[object Window]' && val !== window) return true;
+      if (FORBIDDEN_INTRINSIC_TAGS.has(tag)) return true;
+    } catch {
+      return true;
+    }
+    return false;
+  };
+  const isReadOnlyHostSingleton = (val) => {
+    if (!val || typeof val !== 'object') return false;
+    if (READONLY_HOST_SINGLETONS.has(val)) return true;
+    try {
+      return READONLY_HOST_TAGS.has(nativeObjToString(val));
+    } catch {
+      return true;
+    }
+  };
+  const isForbiddenHostVal = (val) => {
+    if (val === null || val === undefined) return false;
+    if (val === parentWindow || (hostTop && val === hostTop) || (hostOpener && val === hostOpener)) return true;
+    if (typeof val === 'function') {
+      if (val === nativeFunction || val === nativeEval) return true;
+      try {
+        if (val.constructor === val && val.name === 'Function') return true;
+        if (val !== nativeFunction && /^(?:Async)?(?:Generator)?Function$/.test(val.name || '') && val.prototype && typeof val.prototype.apply === 'function') return true;
+      } catch {
+        return true;
+      }
+      return false;
+    }
+    if (typeof val === 'object') {
+      if (isForbiddenHostTarget(val)) return true;
+      try {
+        if (val !== window && val.window === val) return true;
+        if (val !== window && val.self === val && typeof val.postMessage === 'function') return true;
+      } catch {
+        return true;
+      }
+    }
+    return false;
+  };
+  const isSafeStorageKey = (k) => typeof k === 'string' && k !== '__proto__' && k !== 'constructor' && k !== 'prototype';
+  const createNullStore = (initial) => {
+    const out = nativeObjectCreate(null);
+    if (initial && typeof initial === 'object' && !nativeArrayIsArray(initial)) {
+      for (const [k, v] of nativeObjectEntries(initial)) {
+        if (isSafeStorageKey(k) && typeof v === 'string') out[k] = v;
+      }
+    }
+    return out;
+  };
 
-  const OPS = Object.assign(Object.create(null), {
+  const OPS = nativeObjectAssign(nativeObjectCreate(null), {
     window: () => {
       if (!facadeBooting || windowIssued) throw new TypeError('window is not allowed');
       windowIssued = true;
@@ -768,7 +1047,7 @@
       if (isForbiddenHostVal(val)) return undefined;
       if (val && typeof val === 'object' && prop === 'uniforms' && obj && obj.isMaterial) {
         handleObjects.add(val);
-        for (const k of Object.keys(val)) {
+        for (const k of nativeObjectKeys(val)) {
           if (val[k] && typeof val[k] === 'object') handleObjects.add(val[k]);
         }
       } else if (
@@ -786,19 +1065,59 @@
     },
     set(id, prop, value) {
       const obj = target(id);
-      if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return undefined;
+      if (isBlockedProp(obj, prop) || isHostPrototype(obj) || typeof obj === 'function' || isForbiddenHostTarget(obj) || isReadOnlyHostSingleton(obj)) return undefined;
       if (obj === window && !ALLOWED_WIN_SET_PROPS.has(String(prop))) return undefined;
       let v = fromGuest(value);
-      if (obj instanceof Element && obj.localName === 'meta' && String(prop).toLowerCase() === 'httpequiv' && DANGEROUS_HTTP_EQUIV.test(String(v ?? ''))) {
-        return undefined;
+      const propLower = String(prop).toLowerCase();
+      if (obj instanceof Attr && (prop === 'value' || prop === 'nodeValue' || prop === 'textContent')) {
+        const attrName = obj.localName.toLowerCase();
+        const strVal = String(v ?? '');
+        if (attrName === 'http-equiv' && DANGEROUS_HTTP_EQUIV.test(strVal)) return undefined;
+        if (attrName === 'ping' || attrName === 'shadowrootmode' || attrName.startsWith('on')) return undefined;
+        if (obj.ownerElement && obj.ownerElement.localName.toLowerCase() === 'link') {
+          if (attrName === 'rel' && DANGEROUS_LINK_REL.test(strVal)) return undefined;
+          if ((attrName === 'href' || attrName === 'src') && external(strVal.trim())) {
+            rewriteRef(strVal.trim(), dirOf(pagePath), `<link ${attrName}>`);
+            return undefined;
+          }
+        }
+      }
+      if (obj instanceof Element) {
+        const tag = obj.localName.toLowerCase();
+        if (propLower === 'ping') return undefined;
+        if (tag === 'meta' && propLower === 'httpequiv' && DANGEROUS_HTTP_EQUIV.test(String(v ?? ''))) {
+          return undefined;
+        }
+        if (tag === 'link' && propLower === 'rel' && DANGEROUS_LINK_REL.test(String(v ?? ''))) {
+          return undefined;
+        }
+        if (tag === 'link' && (propLower === 'href' || propLower === 'src') && typeof v === 'string' && external(v.trim())) {
+          rewriteRef(v.trim(), dirOf(pagePath), `<link ${propLower}>`);
+          obj.removeAttribute(propLower);
+          return undefined;
+        }
       }
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
-      if (prop === 'outerHTML') {
+      if (prop === 'innerHTML' && (obj instanceof Element || (typeof ShadowRoot !== 'undefined' && obj instanceof ShadowRoot))) {
+        if (obj instanceof HTMLStyleElement) {
+          obj.textContent = rewriteCss(String(v ?? ''), dirOf(pagePath));
+          return undefined;
+        }
+        if (obj instanceof HTMLScriptElement) {
+          obj.textContent = String(v ?? '');
+          return undefined;
+        }
+        const frag = sanitizeHtmlFragment(v, obj instanceof Element ? obj : obj.host);
+        if (obj instanceof HTMLTemplateElement) obj.content.replaceChildren(frag);
+        else obj.replaceChildren(frag);
+        return undefined;
+      }
+      if (prop === 'outerHTML' && obj instanceof Element) {
         const parent = obj.parentNode;
-        const before = parent ? [...parent.childNodes] : [];
-        obj.outerHTML = v;
-        if (parent) for (const node of parent.childNodes) if (!before.includes(node)) harvest(node);
+        if (!parent) return undefined;
+        const frag = sanitizeHtmlFragment(v, parent instanceof Element ? parent : obj);
+        obj.replaceWith(frag);
         return undefined;
       }
       obj[prop] = v;
@@ -812,53 +1131,135 @@
     },
     del(id, prop) {
       const obj = target(id);
-      if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return;
+      if (isBlockedProp(obj, prop) || isHostPrototype(obj) || typeof obj === 'function' || isForbiddenHostTarget(obj) || isReadOnlyHostSingleton(obj)) return;
       if (obj === window && !ALLOWED_WIN_SET_PROPS.has(String(prop))) return;
       delete obj[prop];
     },
     call(id, method, args) {
       const obj = target(id);
-      if (isBlockedProp(obj, method)) throw new TypeError(`${method} is not allowed`);
+      if (isBlockedProp(obj, method) || isHostPrototype(obj) || typeof obj === 'function' || isForbiddenHostTarget(obj)) {
+        throw new TypeError(`${method} is not allowed`);
+      }
+      if (method === 'attachShadow') {
+        throw new TypeError('attachShadow is not allowed in the preview');
+      }
       if (obj instanceof Document && (method === 'write' || method === 'writeln' || method === 'open')) {
         throw new TypeError(`document.${method} is not allowed`);
       }
+      if (hostNavigator && obj === hostNavigator && method === 'sendBeacon') {
+        throw new TypeError('navigator.sendBeacon is not allowed in the preview');
+      }
       let list = (args || []).map(fromGuest);
       if (typeof obj[method] !== 'function') throw new TypeError(`${method} is not a function`);
+      if (obj === window && (method === 'setTimeout' || method === 'setInterval') && typeof list[0] !== 'function') {
+        throw new TypeError(`${method} requires a function`);
+      }
+      if (obj instanceof HTMLFormElement && (method === 'submit' || (method === 'requestSubmit' && !obj.isConnected))) {
+        return undefined;
+      }
       if (obj instanceof Event && method === 'preventDefault') guestPrevented.add(obj);
       if (obj instanceof Document && (method === 'createElement' || method === 'createElementNS')) {
         const rawTag = String(list[method === 'createElement' ? 0 : 1] ?? '');
         const localTag = (rawTag.includes(':') ? rawTag.slice(rawTag.lastIndexOf(':') + 1) : rawTag).trim().toLowerCase();
         if (localTag === 'base') throw new TypeError('<base> is not allowed in the preview');
+        if (BLOCKED_TAGS.has(localTag)) throw new TypeError(`<${localTag}> is not allowed in the preview`);
       }
       if (method === 'addEventListener' && typeof list[0] === 'string') markListener(obj, list[0].toLowerCase());
       if (method === 'setAttribute' || method === 'setAttributeNS') {
         const at = method === 'setAttribute' ? 0 : 1;
         const name = String(list[at]).toLowerCase();
-        if (obj instanceof Element && obj.localName === 'meta' && (name === 'http-equiv' || name.endsWith(':http-equiv')) && DANGEROUS_HTTP_EQUIV.test(String(list[at + 1] ?? ''))) {
-          return undefined;
+        const rawVal = String(list[at + 1] ?? '');
+        if (name === 'ping' || name === 'shadowrootmode') return undefined;
+        if (obj instanceof Element) {
+          const tag = obj.localName.toLowerCase();
+          if (tag === 'meta' && (name === 'http-equiv' || name.endsWith(':http-equiv')) && DANGEROUS_HTTP_EQUIV.test(rawVal)) {
+            return undefined;
+          }
+          if (tag === 'link' && name === 'rel' && DANGEROUS_LINK_REL.test(rawVal)) {
+            return undefined;
+          }
+          if (tag === 'link' && (name === 'href' || name === 'src') && external(rawVal.trim())) {
+            rewriteRef(rawVal.trim(), dirOf(pagePath), `<link ${name}>`);
+            obj.removeAttribute(name);
+            return undefined;
+          }
         }
         if (name.startsWith('on')) {
-          harvested.push([toGuest(obj), name, String(list[at + 1])]);
+          harvested.push([toGuest(obj), name, rawVal]);
           return undefined;
         }
-        if (name === 'style') list[at + 1] = cssValue(String(list[at + 1]));
-        else if (name === 'srcset' || REF_PROPS.has(name) || name === 'xlink:href') list[at + 1] = refValue(obj, name === 'xlink:href' ? 'href' : name, String(list[at + 1]));
+        if (name === 'style') list[at + 1] = cssValue(rawVal);
+        else if (name === 'srcset' || REF_PROPS.has(name) || name === 'xlink:href') list[at + 1] = refValue(obj, name === 'xlink:href' ? 'href' : name, rawVal);
       }
-      if ((method === 'setAttributeNode' || method === 'setAttributeNodeNS') && obj instanceof Element && obj.localName === 'meta' && list[0] instanceof Attr && list[0].localName === 'http-equiv' && DANGEROUS_HTTP_EQUIV.test(list[0].value || '')) {
-        return null;
+      if ((method === 'setAttributeNode' || method === 'setAttributeNodeNS') && obj instanceof Element && list[0] instanceof Attr) {
+        const attr = list[0];
+        const attrName = attr.localName.toLowerCase();
+        const tag = obj.localName.toLowerCase();
+        const attrVal = attr.value || '';
+        if (attrName === 'ping' || attrName === 'shadowrootmode') return null;
+        if (attrName.startsWith('on')) {
+          harvested.push([toGuest(obj), attrName, attrVal]);
+          return null;
+        }
+        if (attrName === 'http-equiv' && DANGEROUS_HTTP_EQUIV.test(attrVal)) return null;
+        if (tag === 'link' && attrName === 'rel' && DANGEROUS_LINK_REL.test(attrVal)) return null;
+        if (tag === 'link' && (attrName === 'href' || attrName === 'src') && external(attrVal.trim())) {
+          rewriteRef(attrVal.trim(), dirOf(pagePath), `<link ${attrName}>`);
+          obj.removeAttribute(attrName);
+          return null;
+        }
+      }
+      if (obj instanceof NamedNodeMap && (method === 'setNamedItem' || method === 'setNamedItemNS') && list[0] instanceof Attr) {
+        const attr = list[0];
+        const attrName = attr.localName.toLowerCase();
+        const attrVal = attr.value || '';
+        if (attrName === 'ping' || attrName === 'shadowrootmode' || attrName.startsWith('on')) return null;
+        if (attrName === 'http-equiv' && DANGEROUS_HTTP_EQUIV.test(attrVal)) return null;
+        if (attrName === 'rel' && DANGEROUS_LINK_REL.test(attrVal)) return null;
+        if ((attrName === 'href' || attrName === 'src') && external(attrVal.trim())) return null;
+      }
+      if (obj instanceof DOMTokenList && (method === 'add' || method === 'replace' || method === 'toggle')) {
+        if (list.some((tok) => typeof tok === 'string' && DANGEROUS_LINK_REL.test(tok))) return undefined;
       }
       if (obj instanceof CSSStyleDeclaration && method === 'setProperty') list[1] = cssValue(list[1]);
       if (method === 'insertAdjacentHTML') {
-        const parent = obj.parentNode;
-        const before = new Set([...obj.childNodes, ...(parent ? parent.childNodes : [])]);
-        obj.insertAdjacentHTML(...list);
-        for (const node of [...obj.childNodes, ...(parent ? parent.childNodes : [])]) if (!before.has(node)) harvest(node);
+        if (!(obj instanceof Element)) throw new TypeError('insertAdjacentHTML is not allowed on this object');
+        const pos = String(list[0] ?? '').toLowerCase();
+        if (pos !== 'beforebegin' && pos !== 'afterbegin' && pos !== 'beforeend' && pos !== 'afterend') {
+          throw new DOMException(`Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('${list[0]}') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.`, 'SyntaxError');
+        }
+        const ctxEl = (pos === 'beforebegin' || pos === 'afterend') && obj.parentNode instanceof Element ? obj.parentNode : obj;
+        const frag = sanitizeHtmlFragment(list[1], ctxEl);
+        if (pos === 'beforebegin') {
+          if (!obj.parentNode) throw new DOMException('The element has no parent.', 'NoModificationAllowedError');
+          obj.parentNode.insertBefore(frag, obj);
+        } else if (pos === 'afterbegin') {
+          obj.insertBefore(frag, obj.firstChild);
+        } else if (pos === 'beforeend') {
+          obj.appendChild(frag);
+        } else {
+          if (!obj.parentNode) throw new DOMException('The element has no parent.', 'NoModificationAllowedError');
+          obj.parentNode.insertBefore(frag, obj.nextSibling);
+        }
         return undefined;
       }
+      if (method === 'setHTMLUnsafe') {
+        if (obj instanceof Element || (typeof ShadowRoot !== 'undefined' && obj instanceof ShadowRoot)) {
+          const frag = sanitizeHtmlFragment(list[0], obj instanceof Element ? obj : obj.host);
+          obj.replaceChildren(frag);
+          if (method === 'setHTMLUnsafe') harvest(obj);
+          return undefined;
+        }
+        throw new TypeError('setHTMLUnsafe is not allowed on this object');
+      }
       if (INSERTS.has(method) || method === 'replaceChildren') {
-        if (method === 'appendChild' || method === 'insertBefore' || method === 'replaceChild') {
+        if (method === 'appendChild' || method === 'insertBefore' || method === 'replaceChild' || method === 'moveBefore' || method === 'insertNode' || method === 'surroundContents') {
           const inserted = list[0];
-          if (isDangerousElement(inserted)) return inserted;
+          if (isDangerousElement(inserted)) return method === 'insertNode' || method === 'surroundContents' ? undefined : inserted;
+          stripDangerousTree(inserted);
+        } else if (method === 'insertAdjacentElement') {
+          const inserted = list[1];
+          if (isDangerousElement(inserted)) return null;
           stripDangerousTree(inserted);
         } else {
           list = list.filter((arg) => {
@@ -868,31 +1269,57 @@
           });
         }
       }
-      if (method === 'click' && emitBlobDownload(obj)) return undefined;
+      if (method === 'click') {
+        if (emitBlobDownload(obj)) return undefined;
+        const linkTarget = isLinkElement(obj)
+          ? obj
+          : obj instanceof Element && !obj.isConnected
+            ? obj.closest('a[href], area[href]')
+            : null;
+        if (linkTarget) {
+          const href = (linkHrefOf(linkTarget) || '').trim();
+          if (href && !href.startsWith('#')) {
+            if (/^javascript:/i.test(href)) return undefined;
+            if (external(href)) {
+              note('warn', `A link to ${href} was clicked; the preview stays on this page.`);
+              return undefined;
+            }
+            const ev = new nativeMouseEvent('click', { bubbles: true, cancelable: true, composed: true });
+            linkTarget.dispatchEvent(ev);
+            if (!linkTarget.isConnected && !ev.defaultPrevented && !guestPrevented.has(ev)) {
+              post({ type: 'bot:navigate', path: resolve(href, dirOf(pagePath)) });
+            }
+            return undefined;
+          }
+        }
+      }
       const result = obj[method](...list);
       if (isForbiddenHostVal(result)) return undefined;
       if (method === 'setHTMLUnsafe') harvest(obj);
-      else if (HTML_METHODS.has(method) && result instanceof Node) harvest(result);
-      if (INSERTS.has(method)) for (const arg of list) if (arg instanceof HTMLScriptElement) setTimeout(() => runInserted(arg));
-      if (method === 'getContext' && result === null) note('warn', `canvas.getContext(${JSON.stringify(list[0])}) is not available here.`);
+      else if (HTML_METHODS.has(method) && result instanceof Node) {
+        stripDangerousTree(result);
+        harvest(result);
+      }
+      if (INSERTS.has(method)) for (const arg of list) if (arg instanceof HTMLScriptElement) nativeSetTimeout(() => runInserted(arg));
+      if (method === 'getContext' && result === null) note('warn', `canvas.getContext(${nativeJsonStringify(list[0])}) is not available here.`);
       return result;
     },
     new(name, args) {
       const ctorName = String(name);
-      if (!ALLOWED_CTORS.has(ctorName) || (ctorName !== 'URL' && isBlockedProp(window, ctorName))) throw new TypeError(`${ctorName} is not allowed`);
-      const C = window[ctorName];
+      if (!ALLOWED_CTORS.has(ctorName) || BLOCKED_PROTO_PROPS.has(ctorName)) throw new TypeError(`${ctorName} is not allowed`);
+      const C = hostCtors.get(ctorName);
       if (typeof C !== 'function') throw new TypeError(`${ctorName} is not available in the preview`);
       return new C(...(args || []).map(fromGuest));
     },
-    iter: (id) => Array.from(target(id)),
+    iter: (id) => nativeArrayFrom(target(id)),
     keys(id) {
       const obj = target(id);
-      if (obj instanceof DOMStringMap || obj instanceof Storage) return Object.keys(obj);
-      if (obj instanceof CSSStyleDeclaration) return Array.from(obj);
+      if (obj instanceof DOMStringMap || obj instanceof Storage) return nativeObjectKeys(obj);
+      if (obj instanceof CSSStyleDeclaration) return nativeArrayFrom(obj);
       // A plain record of the browser's (a DOMRect, say): its readable properties.
-      const keys = new Set(Object.keys(obj));
-      for (let p = Object.getPrototypeOf(obj); p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
-        for (const [k, d] of Object.entries(Object.getOwnPropertyDescriptors(p))) if (d.get && !BLOCKED_PROTO_PROPS.has(k)) keys.add(k);
+      const keys = new Set(nativeObjectKeys(obj));
+      for (let p = nativeGetPrototypeOf(obj); p && p !== Object.prototype; p = nativeGetPrototypeOf(p)) {
+        for (const [k, d] of nativeObjectEntries(nativeGetOwnPropDescs(p))) if (d.get && !BLOCKED_PROTO_PROPS.has(k)) keys.add(k);
       }
       return [...keys];
     },
@@ -915,8 +1342,9 @@
       }
     },
     write(html) {
-      document.body.insertAdjacentHTML('beforeend', String(html));
-      harvest(document.body);
+      if (!document.body) return;
+      const frag = sanitizeHtmlFragment(html, document.body);
+      document.body.appendChild(frag);
     },
     location: () => ({ origin: 'https://preview.oaiy.com', host: 'preview.oaiy.com', path: `/${pagePath}`, search: '' }),
     hash(value) {
@@ -939,17 +1367,27 @@
     },
     storage(area, action, arg) {
       const store = storage[area === 'session' ? 'session' : 'local'];
-      const badKey = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype';
-      if (action === 'get') return !badKey(arg) && Object.prototype.hasOwnProperty.call(store, arg) ? store[arg] : null;
+      if (action === 'get') return isSafeStorageKey(arg) && nativeHasOwn(store, arg) ? store[arg] : null;
       if (action === 'set') {
-        if (!badKey(arg[0])) store[arg[0]] = arg[1];
+        if (nativeArrayIsArray(arg) && isSafeStorageKey(arg[0]) && typeof arg[1] === 'string') {
+          store[arg[0]] = arg[1];
+        } else {
+          return undefined;
+        }
       } else if (action === 'remove') {
-        if (!badKey(arg)) delete store[arg];
-      } else if (action === 'clear') for (const k of Object.keys(store)) delete store[k];
-      else if (action === 'key') return Object.keys(store)[arg] ?? null;
-      else if (action === 'length') return Object.keys(store).length;
-      else if (action === 'keys') return Object.keys(store);
-      if (area !== 'session') post({ type: 'bot:storage', store: { ...store } });
+        if (isSafeStorageKey(arg)) delete store[arg];
+      } else if (action === 'clear') {
+        for (const k of nativeObjectKeys(store)) delete store[k];
+      } else if (action === 'key') {
+        return typeof arg === 'number' && Number.isInteger(arg) && arg >= 0 ? (nativeObjectKeys(store)[arg] ?? null) : null;
+      } else if (action === 'length') {
+        return nativeObjectKeys(store).length;
+      } else if (action === 'keys') {
+        return nativeObjectKeys(store);
+      } else {
+        return undefined;
+      }
+      if (area !== 'session') post({ type: 'bot:storage', store: createNullStore(store) });
       return undefined;
     },
     dialog(kind, message, value) {
@@ -957,12 +1395,12 @@
       notes.push({ level: 'info', text: `${kind}("${String(message).slice(0, 200)}")` });
       return kind === 'confirm' ? true : kind === 'prompt' ? value : undefined;
     },
-    now: () => performance.now(),
-    timeOrigin: () => performance.timeOrigin,
-    random: (n) => Array.from(crypto.getRandomValues(new Uint32Array(Math.min(Math.max(0, n | 0), 65536)))),
-    uuid: () => crypto.randomUUID(),
-    atob: (s) => atob(s),
-    btoa: (s) => btoa(s),
+    now: () => nativePerfNow(),
+    timeOrigin: () => nativePerfTimeOrigin,
+    random: (n) => nativeArrayFrom(nativeCryptoRandomValues(new nativeUint32Array(Math.min(Math.max(0, n | 0), 65536)))),
+    uuid: () => nativeCryptoRandomUUID(),
+    atob: (s) => nativeAtob(s),
+    btoa: (s) => nativeBtoa(s),
     fetch(url, method) {
       url = String(url);
       if (external(url)) throw new TypeError(`Failed to fetch ${url}: the preview is offline, so only the project's own files can be fetched`);
@@ -973,26 +1411,26 @@
       const data = files[path];
       if (typeof data === 'string') return { status: 200, type, text: data };
       try {
-        return { status: 200, type, text: new TextDecoder('utf-8', { fatal: true }).decode(data) };
+        return { status: 200, type, text: new nativeTextDecoder('utf-8', { fatal: true }).decode(data) };
       } catch {
         let binary = '';
         for (let i = 0; i < data.length; i += 0x8000) binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
-        return { status: 200, type, b64: btoa(binary) };
+        return { status: 200, type, b64: nativeBtoa(binary) };
       }
     },
     blob(url) {
       const path = resolve(String(url), dirOf(pagePath));
-      return path !== null && path in files ? new Blob([files[path]], { type: mimeOf(path) }) : new Blob([]);
+      return path !== null && path in files ? new nativeBlob([files[path]], { type: mimeOf(path) }) : new nativeBlob([]);
     },
     objectUrl(blob) {
       const b = fromGuest(blob);
-      if (!(b instanceof Blob)) throw new TypeError('URL.createObjectURL requires a Blob');
-      const url = URL.createObjectURL(b);
+      if (!(b instanceof nativeBlob)) throw new TypeError('URL.createObjectURL requires a Blob');
+      const url = nativeCreateObjectURL(b);
       if (objectBlobs.size >= MAX_OBJECT_BLOBS) {
         const oldest = objectBlobs.keys().next().value;
         if (oldest !== undefined) {
           objectBlobs.delete(oldest);
-          URL.revokeObjectURL(oldest);
+          nativeRevokeObjectURL(oldest);
         }
       }
       objectBlobs.set(url, b);
@@ -1001,7 +1439,7 @@
     revokeObjectUrl(url) {
       const u = String(url);
       objectBlobs.delete(u);
-      URL.revokeObjectURL(u);
+      nativeRevokeObjectURL(u);
       return undefined;
     },
     threeMod(spec) {
@@ -1009,7 +1447,7 @@
       const mod = threeHost && threeHost.modules && hasOwn(threeHost.modules, name) ? threeHost.modules[name] : null;
       if (!mod) throw new TypeError(`Bundled Three.js module "${spec}" is not available`);
       const out = {};
-      for (const k of Object.keys(mod)) {
+      for (const k of nativeObjectKeys(mod)) {
         const val = mod[k];
         if (typeof val === 'function') {
           const key = `${name}:${k}`;
@@ -1046,8 +1484,8 @@
       const C = threeCallables.get(String(key));
       if (!C || typeof prop !== 'string' || BLOCKED_STATIC_PROPS.has(prop) || isBlockedProp(C, prop)) return undefined;
       let hasSafe = false;
-      for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = Object.getPrototypeOf(cur)) {
-        if (Object.prototype.hasOwnProperty.call(cur, prop)) { hasSafe = true; break; }
+      for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = nativeGetPrototypeOf(cur)) {
+        if (nativeHasOwn(cur, prop)) { hasSafe = true; break; }
       }
       if (!hasSafe) return undefined;
       const val = C[prop];
@@ -1059,8 +1497,8 @@
       const C = threeCallables.get(String(key));
       let hasSafe = false;
       if (C && typeof prop === 'string' && !BLOCKED_STATIC_PROPS.has(prop) && !isBlockedProp(C, prop)) {
-        for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = Object.getPrototypeOf(cur)) {
-          if (Object.prototype.hasOwnProperty.call(cur, prop)) { hasSafe = true; break; }
+        for (let cur = C; cur && cur !== Function.prototype && cur !== Object.prototype; cur = nativeGetPrototypeOf(cur)) {
+          if (nativeHasOwn(cur, prop)) { hasSafe = true; break; }
         }
       }
       if (!hasSafe || typeof C[prop] !== 'function') throw new TypeError(`${key}.${prop} is not a function`);
@@ -1073,7 +1511,7 @@
     if (typeof key !== 'string' || !key.startsWith(MAGIC)) return null;
     let request;
     try {
-      request = JSON.parse(key.slice(MAGIC.length));
+      request = nativeJsonParse(key.slice(MAGIC.length));
     } catch {
       return { err: 'TypeError: malformed call' };
     }
@@ -1103,12 +1541,23 @@
   // Capture phase, registered before any guest scripts run: prevents external link navigation and
   // form submission even if a guest listener calls event.stopPropagation() / stopImmediatePropagation().
   const followLinks = (event) => {
-    if (!pagePath || event.defaultPrevented || event.button !== 0) return;
-    const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!pagePath) return;
+    if (event.type === 'click' && event.button !== 0) return;
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const link = findLinkInEvent(event);
     if (!link) return;
-    const href = link.getAttribute('href') || '';
-    if (href.startsWith('#') || href === '') return;
+    const href = (linkHrefOf(link) || '').trim();
+    if (href.startsWith('#') || href === '') {
+      if (event.type === 'auxclick') event.preventDefault();
+      return;
+    }
+    const alreadyPrevented = event.defaultPrevented;
     event.preventDefault();
+    if (event.type === 'auxclick') {
+      if (external(href)) note('warn', `A link to ${href} was clicked; the preview stays on this page.`);
+      return;
+    }
+    if (alreadyPrevented) return;
     if (emitBlobDownload(link, event.isTrusted)) return;
     if (/^javascript:/i.test(href)) return;
     if (external(href)) {
@@ -1116,13 +1565,14 @@
       return;
     }
     const targetPath = resolve(href, dirOf(pagePath));
-    queueMicrotask(() => {
+    nativeQueueMicrotask(() => {
       if (!guestPrevented.has(event)) post({ type: 'bot:navigate', path: targetPath });
     });
   };
   // A form has nowhere to go: its submit is only for the page's own handlers.
   const holdForms = (event) => event.preventDefault();
   window.addEventListener('click', followLinks, true);
+  window.addEventListener('auxclick', followLinks, true);
   window.addEventListener('submit', holdForms, true);
 
   // --- starting ----------------------------------------------------------------------------
@@ -1137,17 +1587,17 @@
   const start = async (message) => {
     files = message.files || {};
     pagePath = message.page;
-    storage = { local: { ...(message.storage || {}) }, session: {} };
+    storage = { local: createNullStore(message.storage), session: nativeObjectCreate(null) };
     const html = textOf(pagePath);
     const base = dirOf(pagePath);
-    const parsed = new DOMParser().parseFromString(html, 'text/html');
+    const parsed = new nativeDOMParser().parseFromString(html, 'text/html');
     const scripts = [];
-    const importMap = Object.create(null);
+    const importMap = nativeObjectCreate(null);
     const handlers = adopt(parsed.documentElement, base, scripts, importMap);
     // The engine is ready before the page's CSP forbids loading code.
     let glue = null;
     if (scripts.length || handlers.length) {
-      const url = URL.createObjectURL(new Blob([message.glue], { type: 'text/javascript' }));
+      const url = nativeCreateObjectURL(new nativeBlob([message.glue], { type: 'text/javascript' }));
       glue = await import(url);
       await glue.default({ module_or_path: message.wasm });
     }
@@ -1161,9 +1611,16 @@
     document.body.replaceWith(document.adoptNode(parsed.body));
     document.title = parsed.title || pagePath;
     if (!scripts.length && !handlers.length) {
-      setTimeout(report, 300);
+      nativeSetTimeout(report, 300);
       return;
     }
+
+    zdomToken = `${nativeCryptoRandomUUID()}-${nativeCryptoRandomUUID()}`;
+    if (typeof message.facade !== 'string' || !message.facade.includes('"__OAIY_ZDOM_TOKEN__"')) {
+      stop("the preview's DOM facade is missing its session token placeholder");
+      return;
+    }
+    const facadeSource = message.facade.replace('"__OAIY_ZDOM_TOKEN__"', () => nativeJsonStringify(zdomToken));
 
     engine = new glue.Engine();
     engine.setLocalStorageBridge({ getItem: answer, setItem() {}, removeItem() {}, clear() {} });
@@ -1171,7 +1628,7 @@
     engine.setInstructionBudget(BUDGET);
     facadeBooting = true;
     try {
-      engine.initScript(message.facade);
+      engine.initScript(facadeSource);
     } catch (error) {
       stop(`the preview's DOM did not start on Zipp: ${error && error.message ? error.message : error}`);
       return;
@@ -1179,7 +1636,7 @@
       facadeBooting = false;
     }
     // The page's on* attributes, then its scripts in order, each on its own as a browser runs them.
-    if (handlers.length) enter(() => engine.callFunction('__zdom_inline', [handlers.map(([el, name, code]) => [toGuest(el), name, code])]));
+    if (handlers.length) enter(() => engine.callFunction('__zdom_inline', [zdomToken, handlers.map(([el, name, code]) => [toGuest(el), name, code])]));
     for (const script of scripts) {
       if (dead) break;
       let code = script.code;
@@ -1191,8 +1648,8 @@
           const bindCode =
             bundledThree === 'three'
               ? 'globalThis.THREE = Object.assign({}, __zdom_import("three"));'
-              : `globalThis.THREE = globalThis.THREE || Object.assign({}, __zdom_import("three")); Object.assign(globalThis.THREE, __zdom_import(${JSON.stringify(bundledThree)}));`;
-          const failed = enter(() => engine.callFunction('__zdom_run', [bindCode, name]));
+              : `globalThis.THREE = globalThis.THREE || Object.assign({}, __zdom_import("three")); Object.assign(globalThis.THREE, __zdom_import(${nativeJsonStringify(bundledThree)}));`;
+          const failed = enter(() => engine.callFunction('__zdom_run', [zdomToken, bindCode, name]));
           if (typeof failed === 'string') note('error', failed);
           continue;
         }
@@ -1223,20 +1680,24 @@
           continue;
         }
       }
-      const failed = enter(() => engine.callFunction('__zdom_run', [code, name]));
+      const failed = enter(() => engine.callFunction('__zdom_run', [zdomToken, code, name]));
       if (typeof failed === 'string') note('error', failed);
     }
     if (!dead) {
-      document.dispatchEvent(new Event('readystatechange'));
-      document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
-      window.dispatchEvent(new Event('load'));
+      document.dispatchEvent(new nativeEvent('readystatechange'));
+      document.dispatchEvent(new nativeEvent('DOMContentLoaded', { bubbles: true }));
+      window.dispatchEvent(new nativeEvent('load'));
     }
-    setTimeout(report, 300);
+    nativeSetTimeout(report, 300);
   };
 
   window.addEventListener('message', (event) => {
     const data = event.data;
-    if (event.source !== parentWindow || !data || data.type !== 'webpage:init') return;
+    if (event.source !== parentWindow || !data || data.type !== 'webpage:init' || initialized) return;
+    initialized = true;
+    if (typeof data.bridgeToken === 'string' && data.bridgeToken && !bridgeToken) {
+      bridgeToken = data.bridgeToken;
+    }
     port = event.ports[0] || null;
     start(data).catch((error) => {
       note('error', `The preview could not show the page: ${error && error.message ? error.message : error}`);

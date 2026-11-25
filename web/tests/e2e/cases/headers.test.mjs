@@ -92,7 +92,8 @@ describe('every response of the providers host carries the whole set', () => {
   it('a site of the harness that is not the providers host is not given its headers (the check is on the right host)', async () => {
     const flows = await raw('/', { host: world.hosts.host('flows') });
     assert.equal(flows.headers['origin-agent-cluster'], undefined);
-    assert.equal(flows.headers['content-security-policy'], undefined);
+    assert.equal(flows.headers['x-frame-options'], 'DENY');
+    assert.equal(flows.headers['content-security-policy'], "frame-ancestors 'none'");
   });
 });
 

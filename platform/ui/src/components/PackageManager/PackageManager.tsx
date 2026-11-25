@@ -136,6 +136,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
             confirmLabel: 'Install anyway',
           });
           if (!ok) {
+            setPendingInstall(null);
             return;
           }
           overrideLimits = {

@@ -50,28 +50,17 @@ function resolveArg(a: string): string {
   }
   if (fsConfinementOn()) {
     // Server mode (`oaiy worker`): args are attacker-controlled. ALLOWLIST, not a denylist —
-    // reject ANY arg shaped like a URI scheme (`file:`, `http:`, `concat:`, `subfile:`,
-    // `crypto:`, `cache:`, `gopher:`, `rtmpt:`, `unix:`, …) so ffmpeg can't read a remote/exotic
-    // /local-file source. A denylist always loses to ffmpeg's protocol set + wrapper schemes
-    // (`cache:http://…`). Requiring 2+ chars before `:` spares Windows drive letters (`C:`) and
-    // value tokens that use `=` before any `:` (`scale=W:H`, `afade=t=out:st=…`).
-    if (/^[a-z][a-z0-9+.-]+:/i.test(n)) {
+    // reject ANY arg shaped like a URI scheme or comma-option protocol wrapper (`file:`, `http:`,
+    // `concat:`, `subfile,,start,0,,:`, `crypto:`, `cache:`, `gopher:`, `rtmpt:`, `unix:`, …) so
+    // ffmpeg can't read or write a remote/exotic/local-file source. Requiring 2+ chars before `:`
+    // (or `,` without a preceding `=`) spares Windows drive letters (`C:`) and value tokens that
+    // use `=` before any `:` (`scale=W:H`, `afade=t=out:st=…`, `hflip,scale=640:480`).
+    if (/^[a-z][a-z0-9+.-]+(?:,[^=]*)*:/i.test(n)) {
       throw new Error(`ffmpeg arg uses a disallowed protocol/URI scheme in server mode: ${a}`);
     }
     // Drive-relative `C:foo` slips past path.isAbsolute — confine it like an absolute path.
     if (/^[A-Za-z]:(?![\\/])/.test(a) || path.isAbsolute(a)) {
       return confineAbsolute(a);
-    }
-    // Block filtergraph expressions and virtual inputs that read or write arbitrary files
-    // on disk without going through `-i` (e.g., `movie=`, `movie@id=`, `amovie=`, `subtitles=`,
-    // `ass=`, `drawtext=textfile=`, `drawtext=fontfile=`, `metadata=mode=print:file=`,
-    // `sendcmd`, `asendcmd`, `lut3d`, `haldclut`, `lavfi`, `stats_file=`, `log_path=`,
-    // `filename=`, `model_path=`, `sofa=`).
-    if (
-      /(^|[;,:=\[\]\s])(a?movie|subtitles|ass|a?sendcmd|lut3d|haldclut)(?:@[^=,:;\[\]\s]+)?\s*=/i.test(a) ||
-      /(^|[;,:=\[\]\s])(textfile|fontfile|stats_file|log_path|file|filename|model_path|sofa)\s*=/i.test(a)
-    ) {
-      throw new Error(`ffmpeg filtergraph file-reading expression is not allowed in server mode: ${a}`);
     }
     // A bare relative path that traverses upward escapes the worker CWD/sandbox — reject it.
     // Value tokens (`copy`, `concat`, `0`, filtergraphs) contain no `..`, so they pass through.
@@ -83,13 +72,469 @@ function resolveArg(a: string): string {
 }
 
 /**
- * Flags that let ffmpeg read filtergraphs/presets from disk, write arbitrary auxiliary files,
- * or disable concat path safety — all rejected under server-mode confinement.
- * Covers stream-specifier suffixes (`-filter_script:v`, `-fpre:a`, `-preset:v`, …) and
- * ffmpeg's `-/option` read-value-from-file syntax.
+ * Flags that let ffmpeg read filtergraphs/presets/options from disk, widen protocols, enable
+ * external media references, pass arbitrary encoder file params, or write auxiliary files —
+ * all rejected under server-mode confinement.
+ * Covers stream-specifier suffixes (`-filter_script:v`, `-fpre:a`, `-protocol_whitelist:v`, …)
+ * and ffmpeg's `-/option` read-value-from-file syntax.
  */
 const DISALLOWED_CONFINED_FLAG =
-  /^-(?:\/|filter_script|filter_complex_script|(?:[fvas]pre|preset|sdp_file|vstats_file|passlogfile)(?::|$))/i;
+  /^-(?:\/|protocol_whitelist(?::|$)|filter_script|filter_complex_script|(?:[fvas]?pre|sdp_file|vstats_file|vstats|passlogfile|enable_drefs|use_absolute_path|x264-params|x264opts|x265-params|x265opts|svtav1-params|rav1e-params|aom-params|vpx-params|hls_key_info_file|hls_enc_key_url|hls_segment_filename|hls_base_url|hls_fmp4_init_filename|var_stream_map|master_pl_name|segment_list|init_seg_name|media_seg_name|maximum_manifest_size|allowed_extensions|allowed_segment_extensions|progress|report|dump_attachment|attach|stats_enc_pre|stats_enc_post|stats_mux_pre|stats_mux_post|lavfi)(?::|$))/i;
+
+/** Flags that accept a filtergraph expression (validated via `validateConfinedFiltergraph`). */
+const FILTERGRAPH_FLAG = /^-(?:[va]f|filter|filter_complex)(?::.*)?$/i;
+
+/** Built-in x264/x265 speed presets permitted for `-preset` under server confinement. */
+const SAFE_CODEC_PRESET =
+  /^(?:ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo)$/;
+
+/**
+ * Explicit allowlist of safe non-playlist, non-device `-f` container/demuxer/muxer formats
+ * permitted under server-mode confinement. Excludes `lavfi`, `tee`, `dash`, `hls`, `sdp`,
+ * `fifo`, `segment`, and all capture devices (`x11grab`, `gdigrab`, `dshow`, `avfoundation`, …).
+ */
+const ALLOWED_CONFINED_FORMATS = new Set([
+  'mp4',
+  'mov',
+  'mkv',
+  'matroska',
+  'webm',
+  'ogg',
+  'opus',
+  'mp3',
+  'wav',
+  'flac',
+  'aac',
+  'adts',
+  'm4a',
+  'aiff',
+  'alac',
+  'concat',
+  'image2',
+  'image2pipe',
+  'rawvideo',
+  'mpegts',
+  'avi',
+  'gif',
+  'apng',
+  'mjpeg',
+  's16le',
+  'f32le',
+  'u8',
+  'null',
+]);
+
+/**
+ * Explicit allowlist of pure audio/video filters permitted in confined filtergraphs.
+ * Filters that read or write external files (`movie`, `amovie`, `subtitles`, `ass`, `sendcmd`,
+ * `asendcmd`, `lut3d`, `haldclut`, `ssim`, `psnr`, `libvmaf`, `metadata`, `ametadata`, …) are
+ * excluded by default.
+ */
+const ALLOWED_CONFINED_FILTERS = new Set([
+  'scale',
+  'fps',
+  'crop',
+  'pad',
+  'trim',
+  'atrim',
+  'setpts',
+  'asetpts',
+  'concat',
+  'overlay',
+  'format',
+  'aformat',
+  'volume',
+  'fade',
+  'afade',
+  'aresample',
+  'amix',
+  'amerge',
+  'loudnorm',
+  'transpose',
+  'hflip',
+  'vflip',
+  'rotate',
+  'setsar',
+  'setdar',
+  'null',
+  'anull',
+  'copy',
+  'acopy',
+  'split',
+  'asplit',
+  'adelay',
+  'atempo',
+  'aloop',
+  'loop',
+  'tpad',
+  'apad',
+  'pan',
+  'channelmap',
+  'channelsplit',
+  'join',
+  'dynaudnorm',
+  'compand',
+  'highpass',
+  'lowpass',
+  'equalizer',
+  'bass',
+  'treble',
+  'silenceremove',
+  'silencedetect',
+  'volumedetect',
+  'ebur128',
+  'drawtext',
+  'drawbox',
+  'eq',
+  'hue',
+  'boxblur',
+  'gblur',
+  'unsharp',
+  'colorkey',
+  'chromakey',
+  'xfade',
+  'acrossfade',
+  'hstack',
+  'vstack',
+  'xstack',
+  'tile',
+  'thumbnail',
+  'select',
+  'aselect',
+  'showinfo',
+  'ashowinfo',
+  'reverse',
+  'areverse',
+  'color',
+  'anullsrc',
+  'geq',
+]);
+
+/** Filter option keys that accept filesystem paths — always rejected even on allowlisted filters. */
+const DISALLOWED_FILTER_OPTION_KEYS = new Set([
+  'textfile',
+  'fontfile',
+  'stats_file',
+  'log_path',
+  'file',
+  'filename',
+  'model_path',
+  'sofa',
+  'psfile',
+  'result',
+  'input',
+  'f',
+]);
+
+/** FFmpeg boolean (`OPT_BOOL` / info) flags that take no argument token. */
+const FFMPEG_BOOL_FLAGS = new Set([
+  '--',
+  '-y',
+  '-n',
+  '-vn',
+  '-an',
+  '-sn',
+  '-dn',
+  '-novn',
+  '-noan',
+  '-nosn',
+  '-nodn',
+  '-hide_banner',
+  '-stdin',
+  '-nostdin',
+  '-stats',
+  '-nostats',
+  '-shortest',
+  '-noshortest',
+  '-re',
+  '-benchmark',
+  '-benchmark_all',
+  '-ignore_unknown',
+  '-noignore_unknown',
+  '-copy_unknown',
+  '-nocopy_unknown',
+  '-accurate_seek',
+  '-noaccurate_seek',
+  '-copyts',
+  '-nocopyts',
+  '-start_at_zero',
+  '-nostart_at_zero',
+  '-fix_sub_duration',
+  '-nofix_sub_duration',
+  '-autorotate',
+  '-noautorotate',
+  '-autoscale',
+  '-noautoscale',
+  '-bitexact',
+  '-nobitexact',
+  '-dump',
+  '-nodump',
+  '-hex',
+  '-nohex',
+  '-xerror',
+  '-noxerror',
+  '-psnr',
+  '-nopsnr',
+  '-qphist',
+  '-noqphist',
+  '-find_stream_info',
+  '-nofind_stream_info',
+  '-recast_media',
+  '-norecast_media',
+  '-copyinkf',
+  '-nocopyinkf',
+  '-drop_changed',
+  '-nodrop_changed',
+  '-debug_ts',
+  '-nodebug_ts',
+  '-deinterlace',
+  '-intra',
+  '-sameq',
+  '-same_quant',
+  '-override_ffserver',
+  '-l',
+  '-h',
+  '-?',
+  '-help',
+  '-version',
+  '-buildconf',
+  '-formats',
+  '-muxers',
+  '-demuxers',
+  '-devices',
+  '-codecs',
+  '-decoders',
+  '-encoders',
+  '-bsfs',
+  '-protocols',
+  '-filters',
+  '-pix_fmts',
+  '-layouts',
+  '-sample_fmts',
+  '-dispositions',
+  '-colors',
+]);
+
+/**
+ * Scan one token using FFmpeg's `av_get_token` semantics up to any unquoted/unescaped terminator.
+ * Inside `'...'`, characters (including backslashes) are taken verbatim until the closing `'`.
+ * Outside `'...'`, `\` escapes the immediately following character.
+ */
+function scanFfmpegToken(
+  input: string,
+  start: number,
+  terminators: string,
+): { unquoted: string; end: number } {
+  let i = start;
+  while (i < input.length && (input[i] === ' ' || input[i] === '\t')) i++;
+  let unquoted = '';
+  let lastNonSpace = 0;
+  while (i < input.length && !terminators.includes(input[i])) {
+    const ch = input[i];
+    if (ch === '\\') {
+      if (i + 1 >= input.length) {
+        throw new Error('ffmpeg filtergraph has a trailing backslash escape and is not allowed in server mode');
+      }
+      unquoted += input[i + 1];
+      lastNonSpace = unquoted.length;
+      i += 2;
+    } else if (ch === "'") {
+      i++;
+      while (i < input.length && input[i] !== "'") {
+        unquoted += input[i];
+        i++;
+      }
+      if (i >= input.length) {
+        throw new Error('ffmpeg filtergraph has an unclosed single quote and is not allowed in server mode');
+      }
+      i++;
+      lastNonSpace = unquoted.length;
+    } else {
+      unquoted += ch;
+      if (ch !== ' ' && ch !== '\t') {
+        lastNonSpace = unquoted.length;
+      }
+      i++;
+    }
+  }
+  return { unquoted: unquoted.slice(0, lastNonSpace), end: i };
+}
+
+/** Find the first unquoted, unescaped `=` inside a filter option segment. */
+function findUnquotedEquals(seg: string): number {
+  let inQuote = false;
+  for (let i = 0; i < seg.length; i++) {
+    const ch = seg[i];
+    if (inQuote) {
+      if (ch === "'") inQuote = false;
+      continue;
+    }
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inQuote = true;
+      continue;
+    }
+    if (ch === '=') return i;
+  }
+  return -1;
+}
+
+/** Validate a filter option segment's key (rejecting quotes, backslashes, and file-path keys). */
+function validateFilterOptionSegment(rawSeg: string, filterBase: string, requireNamedForDrawtext: boolean): void {
+  const eqIdx = findUnquotedEquals(rawSeg);
+  if (eqIdx === -1) {
+    if (requireNamedForDrawtext && filterBase === 'drawtext') {
+      throw new Error(
+        `ffmpeg filtergraph drawtext positional argument is not allowed in server mode: ${rawSeg}`,
+      );
+    }
+    return;
+  }
+  const rawKey = rawSeg.slice(0, eqIdx).trim();
+  if (!rawKey || rawKey.includes("'") || rawKey.includes('\\')) {
+    throw new Error(
+      `ffmpeg filtergraph option key '${rawKey}' is not allowed in server mode`,
+    );
+  }
+  if (DISALLOWED_FILTER_OPTION_KEYS.has(rawKey.toLowerCase())) {
+    throw new Error(
+      `ffmpeg filtergraph option '${rawKey}' is not allowed in server mode`,
+    );
+  }
+  if (filterBase !== 'pan' && !/^[a-z][a-z0-9_-]*$/i.test(rawKey)) {
+    throw new Error(
+      `ffmpeg filtergraph option key '${rawKey}' is not allowed in server mode`,
+    );
+  }
+}
+
+/**
+ * Strictly parse and allowlist a confined FFmpeg filtergraph (`-vf`, `-af`, `-filter*`,
+ * `-filter_complex*`). Mirrors FFmpeg's two-level `av_get_token` parsing so quoted or
+ * backslash-escaped filter names and option keys (`'movie'=…`, `m\ovie=…`, `'textfile'=…`,
+ * `drawtext='textfile=/etc/passwd'`) cannot bypass validation.
+ */
+function validateConfinedFiltergraph(spec: string): void {
+  if (!spec || !spec.trim()) {
+    throw new Error('ffmpeg filtergraph is empty and is not allowed in server mode');
+  }
+  if (/[\u0000-\u001f\u007f]/.test(spec)) {
+    throw new Error('ffmpeg filtergraph contains control characters and is not allowed in server mode');
+  }
+
+  let pos = 0;
+  let filterCount = 0;
+  const skipWs = () => {
+    while (pos < spec.length && (spec[pos] === ' ' || spec[pos] === '\t')) pos++;
+  };
+  const consumeLinkLabels = () => {
+    while (pos < spec.length && spec[pos] === '[') {
+      const close = spec.indexOf(']', pos + 1);
+      if (close === -1) {
+        throw new Error('ffmpeg filtergraph has an unclosed link label and is not allowed in server mode');
+      }
+      const label = spec.slice(pos + 1, close);
+      if (!/^[A-Za-z0-9_.:-]+$/.test(label)) {
+        throw new Error(`ffmpeg filtergraph link label '[${label}]' is not allowed in server mode`);
+      }
+      pos = close + 1;
+      skipWs();
+    }
+  };
+
+  while (pos < spec.length) {
+    skipWs();
+    if (pos >= spec.length) break;
+
+    consumeLinkLabels();
+
+    // Parse raw filter name up to `=,;[` without unescaping so quotes/backslashes are caught directly.
+    const nameStart = pos;
+    while (pos < spec.length && !'=;,['.includes(spec[pos])) {
+      pos++;
+    }
+    const rawName = spec.slice(nameStart, pos).trim();
+    if (!rawName) {
+      throw new Error(`ffmpeg filtergraph is missing a filter name and is not allowed in server mode: ${spec}`);
+    }
+    if (rawName.includes("'") || rawName.includes('\\')) {
+      throw new Error(`ffmpeg filtergraph filter '${rawName}' is not allowed in server mode`);
+    }
+    const nameMatch = /^([a-z][a-z0-9_]*)(?:@([a-z0-9_-]+))?$/i.exec(rawName);
+    if (!nameMatch) {
+      throw new Error(`ffmpeg filtergraph filter '${rawName}' is not allowed in server mode`);
+    }
+    const filterBase = nameMatch[1].toLowerCase();
+    if (!ALLOWED_CONFINED_FILTERS.has(filterBase)) {
+      throw new Error(`ffmpeg filtergraph filter '${filterBase}' is not allowed in server mode`);
+    }
+    filterCount++;
+
+    if (pos < spec.length && spec[pos] === '=') {
+      pos++;
+      const rawArgsStart = pos;
+      const level1 = scanFfmpegToken(spec, pos, ',;[');
+      const rawArgs = spec.slice(rawArgsStart, level1.end);
+      pos = level1.end;
+
+      // Pass 1 (pre-Level-1): reject single quotes/backslashes in raw option keys (e.g. `scale='w'=640`).
+      let rawOptPos = 0;
+      while (rawOptPos < rawArgs.length) {
+        const seg = scanFfmpegToken(rawArgs, rawOptPos, ':');
+        const rawSeg = rawArgs.slice(rawOptPos, seg.end).trim();
+        validateFilterOptionSegment(rawSeg, filterBase, false);
+        if (seg.end < rawArgs.length && rawArgs[seg.end] === ':') {
+          rawOptPos = seg.end + 1;
+        } else {
+          break;
+        }
+      }
+
+      // Pass 2 (post-Level-1, matching FFmpeg's `av_opt_set_from_string`): validate unquoted options
+      // so level-1 quoted keys like `drawtext='textfile=/etc/passwd'` or `drawtext=/etc/passwd` are caught.
+      const unquotedArgs = level1.unquoted;
+      let optPos = 0;
+      if (unquotedArgs.length === 0 && filterBase === 'drawtext') {
+        throw new Error('ffmpeg filtergraph drawtext requires named options in server mode');
+      }
+      while (optPos < unquotedArgs.length) {
+        const seg = scanFfmpegToken(unquotedArgs, optPos, ':');
+        const rawSeg = unquotedArgs.slice(optPos, seg.end).trim();
+        validateFilterOptionSegment(rawSeg, filterBase, true);
+        if (seg.end < unquotedArgs.length && unquotedArgs[seg.end] === ':') {
+          optPos = seg.end + 1;
+          if (optPos === unquotedArgs.length && filterBase === 'drawtext') {
+            throw new Error('ffmpeg filtergraph drawtext trailing separator is not allowed in server mode');
+          }
+        } else {
+          break;
+        }
+      }
+    }
+
+    skipWs();
+    consumeLinkLabels();
+    skipWs();
+
+    if (pos < spec.length) {
+      if (spec[pos] !== ',' && spec[pos] !== ';') {
+        throw new Error(`ffmpeg filtergraph has unexpected syntax near '${spec.slice(pos, pos + 16)}' in server mode`);
+      }
+      pos++;
+      skipWs();
+      if (pos >= spec.length) {
+        throw new Error('ffmpeg filtergraph has a trailing separator and is not allowed in server mode');
+      }
+    }
+  }
+
+  if (filterCount === 0) {
+    throw new Error('ffmpeg filtergraph contains no filters and is not allowed in server mode');
+  }
+}
 
 /**
  * `ffprobe` flags that legitimately consume their immediately following argv token as a
@@ -116,27 +561,62 @@ const FFPROBE_VALUE_FLAGS = new Set([
 /** Max leading bytes inspected in `inspectConfinedInput` for playlists / concat manifests (256 KiB). */
 const INSPECT_PROBE_BYTES = 256 * 1024;
 
-/** Whether the `-i` at `at` reads a concat list (`-f concat` among the options before it, after the last input). */
-function concatInput(args: string[], at: number): boolean {
-  for (let j = at - 1; j >= 0 && args[j] !== '-i'; j--) {
-    if (args[j] === '-f' && String(args[j + 1] ?? '').toLowerCase() === 'concat') return true;
+/**
+ * Decode candidate header text slices from an input file buffer: UTF-8 plus UTF-16LE/UTF-16BE
+ * (both BOM-prefixed and BOM-less ASCII XML/text) so UTF-16 DASH/HLS/concat manifests cannot
+ * evade prefix checks via NUL bytes.
+ */
+function decodeHeaderCandidates(slice: Buffer): string[] {
+  const candidates: string[] = [];
+  const nul = slice.indexOf(0);
+  const utf8Head = (nul === -1 ? slice : slice.subarray(0, nul))
+    .toString('utf-8')
+    .replace(/^\uFEFF/, '');
+  if (utf8Head.length > 0) candidates.push(utf8Head);
+
+  const trimUtf16 = (s: string): string => {
+    const z = s.indexOf('\u0000');
+    return (z === -1 ? s : s.slice(0, z)).replace(/^\uFEFF/, '');
+  };
+
+  if (slice.length >= 4 && slice[0] === 0xff && slice[1] === 0xfe) {
+    const body = slice.subarray(2, 2 + ((slice.length - 2) & ~1));
+    candidates.push(trimUtf16(body.toString('utf16le')));
+  } else if (slice.length >= 4 && slice[0] === 0xfe && slice[1] === 0xff) {
+    const body = Buffer.from(slice.subarray(2, 2 + ((slice.length - 2) & ~1)));
+    body.swap16();
+    candidates.push(trimUtf16(body.toString('utf16le')));
+  } else if (slice.length >= 4) {
+    if (slice[1] === 0 && slice[3] === 0 && slice[0] !== 0) {
+      const body = slice.subarray(0, slice.length & ~1);
+      candidates.push(trimUtf16(body.toString('utf16le')));
+    } else if (slice[0] === 0 && slice[2] === 0 && slice[1] !== 0) {
+      const body = Buffer.from(slice.subarray(0, slice.length & ~1));
+      body.swap16();
+      candidates.push(trimUtf16(body.toString('utf16le')));
+    }
   }
-  return false;
+  return candidates;
 }
 
 /**
  * Inspect an input file under confinement regardless of whether `-f concat` was specified:
- * auto-probed `ffconcat` manifests are checked through `checkConcatList`, and HLS/DASH playlist
- * headers (`#EXTM3U`, `#EXT-X-`, `<MPD`) are rejected so an attacker-supplied playlist cannot
- * smuggle arbitrary file/network references past CLI arg checks.
+ * fails closed when the file does not exist (except `-` for stdin), checks auto-probed `ffconcat`
+ * manifests through `checkConcatList`, and rejects UTF-8/UTF-16 HLS/DASH playlist headers
+ * (`#EXTM3U`, `#EXT-X-`, `<MPD`, `<ns:MPD`) so an attacker-supplied playlist cannot smuggle
+ * arbitrary file/network references past CLI arg checks.
  */
 function inspectConfinedInput(
   inputArg: string,
   explicitConcat: boolean,
   seen = new Set<string>(),
-  requireExists = false,
 ): void {
-  if (inputArg === '-' && !explicitConcat) return;
+  if (inputArg === '-') {
+    if (explicitConcat) {
+      throw new Error('ffmpeg -f concat cannot read from stdin in server mode');
+    }
+    return;
+  }
   const diskPath = path.isAbsolute(inputArg)
     ? confineAbsolute(inputArg)
     : confineAbsolute(path.resolve(TMP_ROOT, inputArg));
@@ -153,8 +633,6 @@ function inspectConfinedInput(
   try {
     fd = fs.openSync(diskPath, 'r');
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException)?.code;
-    if (!requireExists && (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR')) return;
     throw new Error(`ffmpeg input could not be inspected: ${e instanceof Error ? e.message : String(e)}`);
   }
   let bytesRead = 0;
@@ -170,19 +648,17 @@ function inspectConfinedInput(
   }
   if (bytesRead === 0) return;
   const slice = buf.subarray(0, bytesRead);
-  const nul = slice.indexOf(0);
-  const head = (nul === -1 ? slice : slice.subarray(0, nul))
-    .toString('utf-8')
-    .replace(/^\uFEFF/, '');
-  if (/^\s*ffconcat\b/i.test(head)) {
-    checkConcatList(diskPath, seen);
-    return;
-  }
-  if (/(?:^|[\r\n])\s*(?:#EXTM3U\b|#EXT-X-)/i.test(head)) {
-    throw new Error(`ffmpeg playlist/HLS input is not allowed in server mode: ${inputArg}`);
-  }
-  if (/<MPD(?:\s|>|$)/i.test(head)) {
-    throw new Error(`ffmpeg DASH/MPD input is not allowed in server mode: ${inputArg}`);
+  for (const head of decodeHeaderCandidates(slice)) {
+    if (/^\s*ffconcat\b/i.test(head)) {
+      checkConcatList(diskPath, seen);
+      return;
+    }
+    if (/(?:^|[\r\n])\s*(?:#EXTM3U\b|#EXT-X-)/i.test(head)) {
+      throw new Error(`ffmpeg playlist/HLS input is not allowed in server mode: ${inputArg}`);
+    }
+    if (/<(?:[a-z_][a-z0-9._-]*:)?MPD(?:\s|\/|>|$)/i.test(head)) {
+      throw new Error(`ffmpeg DASH/MPD input is not allowed in server mode: ${inputArg}`);
+    }
   }
 }
 
@@ -194,7 +670,7 @@ function inspectConfinedInput(
 function checkConcatList(listPath: string, seen = new Set<string>()): void {
   let text: string;
   try {
-    text = fs.readFileSync(listPath, 'utf-8');
+    text = fs.readFileSync(listPath, 'utf-8').replace(/^\uFEFF/, '');
   } catch (e) {
     throw new Error(`ffmpeg concat list could not be read: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -237,7 +713,7 @@ function checkConcatList(listPath: string, seen = new Set<string>()): void {
       ? confineAbsolute(entryResolved)
       : confineAbsolute(path.resolve(baseDir, entryResolved));
     // Fail closed on missing/unreadable concat entries so a parser/path mismatch cannot skip inspection.
-    inspectConfinedInput(entryDiskPath, false, seen, true);
+    inspectConfinedInput(entryDiskPath, false, seen);
   }
 }
 
@@ -247,12 +723,10 @@ const mimeFor = (fmt: string): string =>
 /** Resolve and validate `run_command` argv for `ffmpeg`/`ffprobe` (exported for unit tests). */
 export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unknown[]): string[] {
   let resolved = rawArgs.map((x) => resolveArg(String(x)));
-  // Defense-in-depth under confinement: restrict ffmpeg/ffprobe to local file/pipe protocols,
-  // so even a protocol that slips past resolveArg's scheme check (e.g. `subfile` with
-  // comma-options, or a nested/wrapper protocol) can't reach a remote/exotic source.
-  // For ffmpeg, `-protocol_whitelist` is a per-input option emitted before each `-i`.
-  // For ffprobe, inputs may be passed positionally without `-i`, so `-protocol_whitelist file,pipe`
-  // is prepended unconditionally before all args and every positional input is inspected.
+  // Defense-in-depth under confinement: restrict ffmpeg/ffprobe to local file/pipe protocols
+  // on BOTH inputs and outputs, reject caller `-protocol_whitelist` instead of stripping it
+  // (preventing token-adjacency desync), allowlist `-f` formats and filtergraph filters, and
+  // inspect every input file (failing closed when missing).
   if (fsConfinementOn()) {
     const guarded: string[] = [];
     if (command === 'ffprobe') {
@@ -262,12 +736,9 @@ export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unkn
       command === 'ffprobe' &&
       resolved.some((tok, idx) => /^-f(?::.*)?$/i.test(tok) && String(resolved[idx + 1] ?? '').toLowerCase() === 'concat');
     let afterDashDash = false;
+    let inputIsConcat = false;
     for (let i = 0; i < resolved.length; i++) {
       const a = resolved[i];
-      if (!afterDashDash && /^-protocol_whitelist(?::.*)?$/i.test(a)) {
-        i++;
-        continue;
-      }
       if (!afterDashDash && DISALLOWED_CONFINED_FLAG.test(a)) {
         throw new Error(`ffmpeg option ${a} is not allowed in server mode`);
       }
@@ -276,21 +747,53 @@ export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unkn
         if (val !== '1') {
           throw new Error(`ffmpeg ${a} ${val ?? ''} is not allowed in server mode`.trim());
         }
+        guarded.push(a, val);
+        i++;
+        continue;
       }
-      if (!afterDashDash && /^-f(?::.*)?$/i.test(a) && resolved[i + 1] && String(resolved[i + 1]).toLowerCase() === 'lavfi') {
-        throw new Error('ffmpeg -f lavfi is not allowed in server mode');
+      if (!afterDashDash && /^-preset(?::.*)?$/i.test(a)) {
+        const val = resolved[i + 1];
+        if (val === undefined || !SAFE_CODEC_PRESET.test(val)) {
+          throw new Error(`ffmpeg option ${a} ${val ?? ''} is not allowed in server mode`.trim());
+        }
+        guarded.push(a, val);
+        i++;
+        continue;
+      }
+      if (!afterDashDash && /^-f(?::.*)?$/i.test(a)) {
+        const val = resolved[i + 1];
+        if (val === undefined || !ALLOWED_CONFINED_FORMATS.has(val.toLowerCase())) {
+          throw new Error(`ffmpeg format -f ${val ?? '(missing)'} is not allowed in server mode`);
+        }
+        if (command === 'ffmpeg' && val.toLowerCase() === 'concat') {
+          inputIsConcat = true;
+        }
+        guarded.push(a, val);
+        i++;
+        continue;
+      }
+      if (!afterDashDash && FILTERGRAPH_FLAG.test(a)) {
+        const val = resolved[i + 1];
+        if (val === undefined) {
+          throw new Error(`ffmpeg filtergraph option ${a} requires a value in server mode`);
+        }
+        validateConfinedFiltergraph(val);
+        guarded.push(a, val);
+        i++;
+        continue;
       }
       if (!afterDashDash && a === '-i') {
+        const inputArg = resolved[i + 1];
+        if (inputArg === undefined) {
+          throw new Error('ffmpeg -i requires an input path in server mode');
+        }
         if (command === 'ffmpeg') {
           guarded.push('-protocol_whitelist', 'file,pipe');
         }
-        guarded.push(a);
-        const inputArg = resolved[i + 1];
-        if (inputArg !== undefined) {
-          inspectConfinedInput(inputArg, command === 'ffprobe' ? ffprobeExplicitConcat : concatInput(resolved, i));
-          guarded.push(inputArg);
-          i++;
-        }
+        inspectConfinedInput(inputArg, command === 'ffprobe' ? ffprobeExplicitConcat : inputIsConcat);
+        inputIsConcat = false;
+        guarded.push(a, inputArg);
+        i++;
         continue;
       }
       if (command === 'ffprobe') {
@@ -311,8 +814,29 @@ export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unkn
           guarded.push(a);
           continue;
         }
+        guarded.push(a);
+        continue;
+      }
+      // command === 'ffmpeg'
+      if (a === '-' || !a.startsWith('-')) {
+        // Positional output path (including stdout `-`): enforce output protocol whitelist.
+        guarded.push('-protocol_whitelist', 'file,pipe', a);
+        continue;
       }
       guarded.push(a);
+      if (FFMPEG_BOOL_FLAGS.has(a.toLowerCase())) {
+        continue;
+      }
+      // Consume one value token for non-boolean flags, unless the next token looks like another flag
+      // (sparing negative numeric/stream values like `-5` or `-0:a` and flag bitmasks like `-movflags -faststart`).
+      const next = resolved[i + 1];
+      if (
+        next !== undefined &&
+        (!next.startsWith('-') || /^-\d/.test(next) || /^-(?:movflags|flags|fflags)(?::|$)/i.test(a))
+      ) {
+        guarded.push(next);
+        i++;
+      }
     }
     resolved = guarded;
   }
@@ -446,6 +970,9 @@ export function buildExtractFrameArgs(
   const requested =
     options.maxFrames != null ? Math.trunc(Number(options.maxFrames) || 0) : maxFramesCap;
   args.push('-frames:v', String(Math.min(Math.max(1, requested), maxFramesCap)));
+  if (confined) {
+    args.push('-protocol_whitelist', 'file,pipe');
+  }
   args.push('-y', path.join(outDir, `frame-%05d.${fmt}`));
   return { args, interval, fmt };
 }

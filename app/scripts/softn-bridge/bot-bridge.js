@@ -22,9 +22,13 @@
   'use strict';
   const parentWindow = window.parent;
   if (!parentWindow || parentWindow === window) return;
+  let bridgeToken = null;
   const post = (message) => {
     try {
-      parentWindow.postMessage({ __oaiyAgent: true, ...message }, '*');
+      parentWindow.postMessage(
+        bridgeToken ? { __oaiyAgent: true, __oaiyToken: bridgeToken, ...message } : { __oaiyAgent: true, ...message },
+        '*',
+      );
     } catch {
       /* the parent went away */
     }
@@ -632,7 +636,14 @@
 
   window.addEventListener('message', async (event) => {
     const data = event.data;
-    if (event.source !== parentWindow || !data || data.__oaiyAgent !== true || typeof data.id !== 'number') return;
+    if (event.source !== parentWindow || !data) return;
+    if (data.type === 'webpage:init' && typeof data.bridgeToken === 'string' && data.bridgeToken && !bridgeToken) {
+      bridgeToken = data.bridgeToken;
+      post({ type: 'bot:bridge' });
+      return;
+    }
+    if (data.__oaiyAgent !== true || typeof data.id !== 'number') return;
+    if (bridgeToken && data.__oaiyToken !== bridgeToken) return;
     let result;
     const done = [];
     try {

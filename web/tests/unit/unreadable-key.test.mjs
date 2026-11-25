@@ -128,6 +128,26 @@ describe('a key that is stored and cannot be opened', () => {
     }
   });
 
+  it('recovering one provider key after the wrapping key is gone keeps other providers marked unreadable and refused', async () => {
+    const w = await world({ handler: () => jsonResponse({ ok: true }) });
+    const other = await w.store.save(input({ name: 'Second' }), 'sk-second-KEY-1234567890');
+    await w.db.delete('keys', 'device');
+    const fresh = anotherDocument(w);
+    try {
+      await fresh.store.setKey(other.record.id, 'sk-recovered-KEY-9876543210');
+      const summaries = await fresh.store.summaries();
+      const firstSummary = summaries.find((s) => s.id === w.record.id);
+      const secondSummary = summaries.find((s) => s.id === other.record.id);
+      assert.deepEqual([firstSummary.hasKey, firstSummary.keyUnreadable], [true, true]);
+      assert.equal(secondSummary.hasKey, true);
+      assert.ok(!('keyUnreadable' in secondSummary));
+      assert.equal(await fresh.store.key(other.record.id), 'sk-recovered-KEY-9876543210');
+      await assert.rejects(() => fresh.store.key(w.record.id), M.store.KeyUnreadable);
+    } finally {
+      fresh.store.close();
+    }
+  });
+
   it('never puts the key, or a word of what damaged it, in what an app is told', async () => {
     const w = await world({ handler: () => jsonResponse({}) });
     await damage(w);

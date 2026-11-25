@@ -80,10 +80,18 @@ export function bodyBytes(body: unknown): number {
   return 0;
 }
 
+/** A provider answered with a redirect; the holder never follows one so a key is never sent elsewhere. */
+export class RedirectRefused extends Error {
+  constructor() {
+    super('The provider answered with a redirect. A redirect is not followed: a request goes only to the address the provider was saved with.');
+    this.name = 'RedirectRefused';
+  }
+}
+
 /**
  * A `fetch` for the holder's own calls to one provider (the model list, the connection test, the context probe): it goes only to the
  * provider's own origin, never follows a redirect, sends no credentials, and counts against the app's budget when `take` is given.
- * A call it refuses fails like a network error (a TypeError), as the browser's own refusals do.
+ * A call it refuses fails like a network error (a TypeError), as the browser's own refusals do; a redirect throws `RedirectRefused`.
  */
 export function guardedFetch(
   record: Pick<ProviderRecord, 'baseUrl'>,
@@ -101,7 +109,7 @@ export function guardedFetch(
     const response = await fetchImpl(url, { ...init, redirect: 'manual', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer' });
     if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
       void response.body?.cancel().catch(() => {});
-      throw new TypeError('blocked: a redirect is not followed');
+      throw new RedirectRefused();
     }
     return response;
   };

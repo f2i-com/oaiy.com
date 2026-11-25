@@ -725,60 +725,358 @@ var close = undefined;
 `;
 
 /**
- * Source-level patterns that indicate the script is trying to reach the
- * realm global by a route the global-shadow preamble cannot block.
+ * AST-level sandbox-escape detector (Acorn ESTree walk) for hardened mode.
  *
- * BEST-EFFORT ONLY — NOT a security boundary. Because we scan the
- * comment-and-string-STRIPPED source, an escape route assembled from string
- * fragments (\`['cons'+'tructor']\`) or reached by computed/bracket access
- * (\`[]['constructor']['constructor']('return this')()\`) evades every pattern
- * below. The real isolation boundary is the Web Worker realm (separate realm,
- * no DOM, no __TAURI_INTERNALS__, brokered host bridge); this scanner is only a
- * second layer that blocks naive/literal forms. The first matching label is
- * returned for the error message; \`null\` means "no literal escape token found"
- * (NOT "proven safe").
+ * The real isolation boundary is the Web Worker / Zipp WASM realm (separate realm,
+ * no DOM, no __TAURI_INTERNALS__, brokered host bridge); this AST walker is a
+ * belt-and-braces second layer that rejects literal escape forms (`globalThis`,
+ * `Function`, `eval`, `import()`, `import.meta`, `(function(){return this})()`,
+ * `() => this`, `.constructor.constructor` / `['constructor']['constructor']`,
+ * and unparseable/malformed scripts) without being fooled by regex literals.
  */
-const SANDBOX_ESCAPE_PATTERNS: Array<[RegExp, string]> = [
-  [/\bglobalThis\b/, 'globalThis'],
-  [/\bFunction\s*\(/, 'Function constructor'],
-  [/\beval\s*\(/, 'eval()'],
-  [/\bimport\s*\(/, 'dynamic import()'],
-  [/\bimport\s*\.\s*meta\b/, 'import.meta'],
-  // `(function(){return this})()` and minor variants.
-  [/\(\s*function\s*\([^)]*\)\s*\{\s*return\s+this\s*;?\s*\}\s*\)\s*\(/, '(function(){return this})()'],
-  // `()=>this` — arrow-function workflow trick: arrows inherit `this` so a
-  // bare `()=>this` evaluated at top level would yield the realm global.
-  // Strict-mode wrapping turns this into `undefined`, but we still flag it
-  // because it indicates intent to escape.
-  [/\(\s*\)\s*=>\s*this\b/, '() => this arrow'],
-  // `constructor.constructor("…")()` — string-evaluating via the Function
-  // constructor reachable from any object's prototype.
-  [/\.constructor\s*\.\s*constructor\b/, 'constructor.constructor chain'],
-];
+type EstreeNode = {
+  type: string;
+  [key: string]: unknown;
+};
+
+function staticMemberPropName(prop: EstreeNode | null | undefined, computed: boolean): string | null {
+  if (!prop) return null;
+  if (!computed && prop.type === 'Identifier' && typeof prop.name === 'string') {
+    return prop.name;
+  }
+  if (computed && prop.type === 'Literal' && typeof prop.value === 'string') {
+    return prop.value;
+  }
+  if (
+    computed &&
+    prop.type === 'TemplateLiteral' &&
+    Array.isArray(prop.expressions) &&
+    prop.expressions.length === 0 &&
+    Array.isArray(prop.quasis) &&
+    prop.quasis.length === 1
+  ) {
+    const cooked = (prop.quasis[0] as { value?: { cooked?: unknown } })?.value?.cooked;
+    return typeof cooked === 'string' ? cooked : null;
+  }
+  return null;
+}
+
+function unwrapChainOrSequence(node: EstreeNode | null | undefined): EstreeNode | null {
+  let cur = node ?? null;
+  while (cur) {
+    if (cur.type === 'ChainExpression' && cur.expression) {
+      cur = cur.expression as EstreeNode;
+    } else if (
+      cur.type === 'SequenceExpression' &&
+      Array.isArray(cur.expressions) &&
+      cur.expressions.length > 0
+    ) {
+      cur = cur.expressions[cur.expressions.length - 1] as EstreeNode;
+    } else {
+      break;
+    }
+  }
+  return cur;
+}
+
+function blockReturnsThis(block: EstreeNode | null | undefined): boolean {
+  if (!block || block.type !== 'BlockStatement' || !Array.isArray(block.body)) return false;
+  const stack: EstreeNode[] = [...(block.body as EstreeNode[])];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object' || typeof cur.type !== 'string') continue;
+    if (
+      cur.type === 'FunctionDeclaration' ||
+      cur.type === 'FunctionExpression' ||
+      cur.type === 'ArrowFunctionExpression' ||
+      cur.type === 'ClassDeclaration' ||
+      cur.type === 'ClassExpression'
+    ) {
+      continue;
+    }
+    if (cur.type === 'ReturnStatement') {
+      const arg = unwrapChainOrSequence(cur.argument as EstreeNode | null | undefined);
+      if (arg && arg.type === 'ThisExpression') return true;
+    }
+    for (const [key, val] of Object.entries(cur)) {
+      if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          if (item && typeof item === 'object' && typeof (item as EstreeNode).type === 'string') {
+            stack.push(item as EstreeNode);
+          }
+        }
+      } else if (val && typeof val === 'object' && typeof (val as EstreeNode).type === 'string') {
+        stack.push(val as EstreeNode);
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Returns the label of the first sandbox-escape pattern that the script
  * matches, or `null` if it looks safe to run in hardened mode.
  *
- * The scan reuses the comment-and-string stripper from
- * `verify-dist-fresh.cjs` (re-implemented here so oaiy-core has no script
- * dependency): it walks the source character-by-character, stripping line
- * comments, block comments, and string/template literals so the regexes
- * only match against actual code.
+ * Parses the script into an ESTree AST via Acorn (wrapped in an
+ * `async function*` so `await`, `yield`, and top-level `return` are all
+ * legal while still failing closed on malformed/unbalanced syntax) and walks
+ * executable AST nodes. Regex literals such as `/"/; globalThis; /"/;` are
+ * tokenized properly by Acorn and can never hide code behind fake strings.
  */
 export function detectSandboxEscape(script: string): string | null {
-  const stripped = stripCommentsAndStringsFromCode(script);
-  for (const [re, label] of SANDBOX_ESCAPE_PATTERNS) {
-    if (re.test(stripped)) {
-      return label;
-    }
+  let ast: EstreeNode;
+  try {
+    ast = acornParse(`async function* __oaiy_scan__() {\n${script}\n}`, {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+    }) as unknown as EstreeNode;
+  } catch {
+    return 'unparseable script';
   }
-  return null;
+
+  const body = Array.isArray(ast.body) ? (ast.body as EstreeNode[]) : [];
+  if (body.length !== 1 || body[0]?.type !== 'FunctionDeclaration') {
+    return 'unparseable script';
+  }
+  const fnBody = body[0].body as EstreeNode | undefined;
+  if (!fnBody) return 'unparseable script';
+
+  const walkPattern = (pat: EstreeNode | null | undefined): string | null => {
+    if (!pat || typeof pat !== 'object' || typeof pat.type !== 'string') return null;
+    switch (pat.type) {
+      case 'Identifier':
+        return null;
+      case 'AssignmentPattern':
+        return walkPattern(pat.left as EstreeNode) ?? walkExpr(pat.right as EstreeNode);
+      case 'RestElement':
+        return walkPattern(pat.argument as EstreeNode);
+      case 'ArrayPattern':
+        if (Array.isArray(pat.elements)) {
+          for (const el of pat.elements as Array<EstreeNode | null>) {
+            const hit = walkPattern(el);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      case 'ObjectPattern':
+        if (Array.isArray(pat.properties)) {
+          for (const prop of pat.properties as EstreeNode[]) {
+            if (!prop) continue;
+            if (prop.type === 'RestElement') {
+              const hit = walkPattern(prop.argument as EstreeNode);
+              if (hit) return hit;
+            } else if (prop.type === 'Property') {
+              if (prop.computed) {
+                const hit = walkExpr(prop.key as EstreeNode);
+                if (hit) return hit;
+              }
+              const hit = walkPattern(prop.value as EstreeNode);
+              if (hit) return hit;
+            }
+          }
+        }
+        return null;
+      case 'MemberExpression':
+        return walkExpr(pat);
+      default:
+        return walkExpr(pat);
+    }
+  };
+
+  const walkExpr = (node: EstreeNode | null | undefined): string | null => {
+    if (!node || typeof node !== 'object' || typeof node.type !== 'string') return null;
+
+    switch (node.type) {
+      case 'Identifier': {
+        const name = node.name;
+        if (name === 'globalThis') return 'globalThis';
+        if (name === 'eval') return 'eval()';
+        if (name === 'Function') return 'Function constructor';
+        return null;
+      }
+
+      case 'ImportExpression':
+        return 'dynamic import()';
+
+      case 'MetaProperty': {
+        const meta = (node.meta as EstreeNode | undefined)?.name;
+        const prop = (node.property as EstreeNode | undefined)?.name;
+        if (meta === 'import' && prop === 'meta') return 'import.meta';
+        return null;
+      }
+
+      case 'MemberExpression': {
+        const propName = staticMemberPropName(node.property as EstreeNode, Boolean(node.computed));
+        if (propName === 'constructor') {
+          const rawObj = node.object as EstreeNode | undefined;
+          const obj = rawObj?.type === 'ChainExpression' ? (rawObj.expression as EstreeNode) : rawObj;
+          if (
+            obj &&
+            obj.type === 'MemberExpression' &&
+            staticMemberPropName(obj.property as EstreeNode, Boolean(obj.computed)) === 'constructor'
+          ) {
+            return 'constructor.constructor chain';
+          }
+          if (obj && (obj.type === 'FunctionExpression' || obj.type === 'ArrowFunctionExpression')) {
+            return 'constructor.constructor chain';
+          }
+        }
+        const objHit = walkExpr(node.object as EstreeNode);
+        if (objHit) return objHit;
+        if (node.computed) {
+          return walkExpr(node.property as EstreeNode);
+        }
+        return null;
+      }
+
+      case 'CallExpression':
+      case 'NewExpression': {
+        const callee = unwrapChainOrSequence(node.callee as EstreeNode);
+        if (callee?.type === 'Identifier') {
+          if (callee.name === 'Function') return 'Function constructor';
+          if (callee.name === 'eval') return 'eval()';
+        }
+        if (
+          node.type === 'CallExpression' &&
+          callee?.type === 'FunctionExpression' &&
+          blockReturnsThis(callee.body as EstreeNode)
+        ) {
+          return '(function(){return this})()';
+        }
+        const calleeHit = walkExpr(node.callee as EstreeNode);
+        if (calleeHit) return calleeHit;
+        if (Array.isArray(node.arguments)) {
+          for (const arg of node.arguments as EstreeNode[]) {
+            const hit = walkExpr(arg);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      }
+
+      case 'ArrowFunctionExpression': {
+        const arrowBody = node.body as EstreeNode | undefined;
+        if (arrowBody?.type === 'ThisExpression' || blockReturnsThis(arrowBody)) {
+          return '() => this arrow';
+        }
+        if (Array.isArray(node.params)) {
+          for (const p of node.params as EstreeNode[]) {
+            const hit = walkPattern(p);
+            if (hit) return hit;
+          }
+        }
+        return walkExpr(arrowBody);
+      }
+
+      case 'FunctionDeclaration':
+      case 'FunctionExpression': {
+        if (Array.isArray(node.params)) {
+          for (const p of node.params as EstreeNode[]) {
+            const hit = walkPattern(p);
+            if (hit) return hit;
+          }
+        }
+        return walkExpr(node.body as EstreeNode);
+      }
+
+      case 'VariableDeclarator': {
+        const patHit = walkPattern(node.id as EstreeNode);
+        if (patHit) return patHit;
+        return walkExpr(node.init as EstreeNode);
+      }
+
+      case 'Property': {
+        if (node.computed) {
+          const keyHit = walkExpr(node.key as EstreeNode);
+          if (keyHit) return keyHit;
+        }
+        return walkExpr(node.value as EstreeNode);
+      }
+
+      case 'MethodDefinition':
+      case 'PropertyDefinition': {
+        if (node.computed) {
+          const keyHit = walkExpr(node.key as EstreeNode);
+          if (keyHit) return keyHit;
+        }
+        return walkExpr(node.value as EstreeNode);
+      }
+
+      case 'ClassDeclaration':
+      case 'ClassExpression': {
+        const superHit = walkExpr(node.superClass as EstreeNode);
+        if (superHit) return superHit;
+        return walkExpr(node.body as EstreeNode);
+      }
+
+      case 'LabeledStatement':
+        return walkExpr(node.body as EstreeNode);
+
+      case 'BreakStatement':
+      case 'ContinueStatement':
+      case 'Literal':
+      case 'TemplateElement':
+      case 'PrivateIdentifier':
+        return null;
+
+      case 'TemplateLiteral': {
+        if (Array.isArray(node.expressions)) {
+          for (const expr of node.expressions as EstreeNode[]) {
+            const hit = walkExpr(expr);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      }
+
+      case 'CatchClause': {
+        const paramHit = walkPattern(node.param as EstreeNode);
+        if (paramHit) return paramHit;
+        return walkExpr(node.body as EstreeNode);
+      }
+
+      case 'ForInStatement':
+      case 'ForOfStatement': {
+        const left = node.left as EstreeNode | undefined;
+        const leftHit = left?.type === 'VariableDeclaration' ? walkExpr(left) : walkPattern(left);
+        if (leftHit) return leftHit;
+        const rightHit = walkExpr(node.right as EstreeNode);
+        if (rightHit) return rightHit;
+        return walkExpr(node.body as EstreeNode);
+      }
+
+      default: {
+        for (const [key, val] of Object.entries(node)) {
+          if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+          if (Array.isArray(val)) {
+            for (const item of val) {
+              if (item && typeof item === 'object' && typeof (item as EstreeNode).type === 'string') {
+                const hit = walkExpr(item as EstreeNode);
+                if (hit) return hit;
+              }
+            }
+          } else if (val && typeof val === 'object' && typeof (val as EstreeNode).type === 'string') {
+            const hit = walkExpr(val as EstreeNode);
+            if (hit) return hit;
+          }
+        }
+        return null;
+      }
+    }
+  };
+
+  return walkExpr(fnBody);
 }
 
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  'return', 'case', 'throw', 'in', 'of', 'typeof', 'void', 'delete',
+  'yield', 'await', 'new', 'else', 'do', 'instanceof',
+]);
+
 /**
- * Strip line/block comments and the static text bodies of string and template
- * literals so an escape-pattern regex only matches actual executable code.
+ * Strip line/block comments and the static text bodies of string, template,
+ * and regex literals so callers scanning stripped source only see executable code.
  * Expressions inside template-literal `${...}` interpolations ARE preserved
  * (and recursively scanned) because JS executes them.
  */
@@ -789,6 +1087,7 @@ export function stripCommentsAndStringsFromCode(src: string): string {
 
   const scanCode = (stopAtClosingBrace: boolean): void => {
     let braceDepth = 0;
+    let canStartRegex = true;
     while (i < n) {
       const c = src[i];
       const c2 = src[i + 1];
@@ -796,6 +1095,7 @@ export function stripCommentsAndStringsFromCode(src: string): string {
         if (c === '{') {
           braceDepth++;
           out += c;
+          canStartRegex = true;
           i++;
           continue;
         }
@@ -805,19 +1105,15 @@ export function stripCommentsAndStringsFromCode(src: string): string {
           }
           braceDepth--;
           out += c;
+          canStartRegex = true;
           i++;
           continue;
         }
       }
       if (c === '/' && c2 === '/') {
-        // A // comment ends at ANY ECMAScript LineTerminator (LF, CR, U+2028 LS, U+2029 PS) — the
-        // engine resumes executing code after one, so the scanner must stop consuming the comment
-        // there too; otherwise a separator hidden inside a comment lets a globalThis/Function()
-        // payload slip past the escape-pattern regexes (defense-in-depth with the compiler's
-        // allowlisting of values that reach generated comments).
+        // A // comment ends at ANY ECMAScript LineTerminator (LF, CR, U+2028 LS, U+2029 PS)
         while (i < n) {
           const cc = src.charCodeAt(i);
-          // LF, CR, U+2028 (LS), U+2029 (PS) all end a // comment in JS — stop at any of them.
           if (cc === 10 || cc === 13 || cc === 0x2028 || cc === 0x2029) break;
           i++;
         }
@@ -827,6 +1123,37 @@ export function stripCommentsAndStringsFromCode(src: string): string {
         i += 2;
         while (i < n - 1 && !(src[i] === '*' && src[i + 1] === '/')) i++;
         i += 2;
+        continue;
+      }
+      if (c === '/' && canStartRegex) {
+        // Regex literal — scan respecting backslash escapes and [...] character classes
+        i++;
+        let inClass = false;
+        while (i < n) {
+          const cc = src[i];
+          const code = src.charCodeAt(i);
+          if (code === 10 || code === 13 || code === 0x2028 || code === 0x2029) break;
+          if (cc === '\\') {
+            i += 2;
+            continue;
+          }
+          if (cc === '[') {
+            inClass = true;
+            i++;
+            continue;
+          }
+          if (cc === ']') {
+            inClass = false;
+            i++;
+            continue;
+          }
+          i++;
+          if (cc === '/' && !inClass) break;
+        }
+        // Consume regex flags
+        while (i < n && /[a-zA-Z]/.test(src[i])) i++;
+        out += '/(?:)/';
+        canStartRegex = false;
         continue;
       }
       if (c === '"' || c === "'") {
@@ -839,13 +1166,33 @@ export function stripCommentsAndStringsFromCode(src: string): string {
           i++;
           if (cc === quote) break;
         }
+        canStartRegex = false;
         continue;
       }
       if (c === '`') {
         scanTemplateLiteral();
+        canStartRegex = false;
+        continue;
+      }
+      if (/[A-Za-z_$]/.test(c)) {
+        let end = i + 1;
+        while (end < n && /[A-Za-z0-9_$]/.test(src[end])) end++;
+        const word = src.slice(i, end);
+        out += word;
+        canStartRegex = REGEX_PRECEDING_KEYWORDS.has(word);
+        i = end;
+        continue;
+      }
+      if (/[0-9]/.test(c)) {
+        out += c;
+        canStartRegex = false;
+        i++;
         continue;
       }
       out += c;
+      if (!/\s/.test(c)) {
+        canStartRegex = !(c === ')' || c === ']' || c === '}');
+      }
       i++;
     }
   };
@@ -2102,8 +2449,16 @@ export class OAIYRuntime {
     this.packageMacros = [];
   }
 
+  private getScopedPackageMacros(): Flow[] {
+    if (!this.currentPackageId || this.packageMacros.length === 0) {
+      return [];
+    }
+    return this.packageMacros.filter((f) => !f.packageId || f.packageId === this.currentPackageId);
+  }
+
   private findFlowOrMacro(flowId: string): Flow | undefined {
-    const packageMacro = this.packageMacros.find(f => f.id === flowId);
+    const scopedMacros = this.getScopedPackageMacros();
+    const packageMacro = scopedMacros.find(f => f.id === flowId);
     if (packageMacro) return packageMacro;
     return this.availableFlows.find(f => f.id === flowId);
   }
@@ -2161,12 +2516,33 @@ export class OAIYRuntime {
       throw new Error(`Subflow not found: ${flowId}`);
     }
 
+    const hasPkgNode =
+      Array.isArray(flow.graph?.nodes) &&
+      flow.graph.nodes.some((n) => typeof n?.type === 'string' && n.type.startsWith('pkg:'));
+
+    if (!this.currentPackageId) {
+      if (
+        (flow as { untrusted?: unknown }).untrusted === true ||
+        Boolean((flow as { packageId?: unknown }).packageId) ||
+        hasPkgNode
+      ) {
+        throw new Error(
+          `Refusing to execute untrusted or package subflow '${flowId}' from a trusted workflow context`,
+        );
+      }
+    } else if (flow.packageId && flow.packageId !== this.currentPackageId) {
+      throw new Error(
+        `Refusing to execute subflow '${flowId}' owned by package '${flow.packageId}' from package '${this.currentPackageId}'`,
+      );
+    }
+
     this.assertCodeExecuteAllowedForGraph(flow.graph);
 
     const compiler = new OAIYCompiler();
     compiler.setAvailableFlows(this.availableFlows);
-    if (this.packageMacros.length > 0) {
-      compiler.setPackageMacros(this.packageMacros);
+    const scopedMacros = this.getScopedPackageMacros();
+    if (scopedMacros.length > 0) {
+      compiler.setPackageMacros(scopedMacros);
     }
     if (this.moduleRegistry) {
       compiler.setModuleRegistry(this.moduleRegistry);
@@ -2923,7 +3299,8 @@ ${WORKFLOW_TRAMPOLINE}`;
 
     const compiler = new OAIYCompiler();
     if (availableFlows) compiler.setAvailableFlows(availableFlows);
-    if (this.packageMacros.length > 0) compiler.setPackageMacros(this.packageMacros);
+    const scopedMacros = this.getScopedPackageMacros();
+    if (scopedMacros.length > 0) compiler.setPackageMacros(scopedMacros);
     if (this.moduleRegistry) compiler.setModuleRegistry(this.moduleRegistry);
     compiler.setProjectSettings(this.projectSettings);
 

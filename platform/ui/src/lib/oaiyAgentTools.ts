@@ -64,15 +64,28 @@ export const AGENT_TOOLS: Array<{ name: string; does: string }> = [
   { name: 'flow_run', does: 'runs a flow' },
 ];
 
+function currentProjectIsUntrusted(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const raw = localStorage.getItem('oaiy_project');
+    if (!raw) return false;
+    return (JSON.parse(raw) as { untrusted?: unknown })?.untrusted === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Whether `flow` is untrusted, reaches an untrusted subflow/macro, or contains
- * (directly or transitively) any `pkg:*` custom package node. Such flows must
- * never be published to the OAIY Desktop agent as a tool/hook or exposed for
- * remote runs.
+ * Whether `flow` is untrusted, part of an untrusted project, reaches an untrusted
+ * subflow/macro, or contains (directly or transitively) any `pkg:*` custom package
+ * node. Such flows must never be published to the OAIY Desktop agent as a tool/hook
+ * or exposed for remote runs.
  */
 export function isUntrustedOrPkgFlow(flow: Flow, allFlows?: readonly Flow[]): boolean {
   if (!flow) return true;
+  if (currentProjectIsUntrusted()) return true;
   if ((flow as { untrusted?: unknown }).untrusted === true) return true;
+  if (Boolean((flow as { packageId?: unknown }).packageId)) return true;
   const byId = new Map((allFlows ?? []).map((f) => [f.id, f]));
   const seen = new Set<string>(flow.id ? [flow.id] : []);
   const queue: Array<Flow['graph'] | undefined> = [flow.graph];
@@ -94,6 +107,7 @@ export function isUntrustedOrPkgFlow(flow: Flow, allFlows?: readonly Flow[]): bo
         const target = byId.get(ref);
         if (!target) continue;
         if ((target as { untrusted?: unknown }).untrusted === true) return true;
+        if (Boolean((target as { packageId?: unknown }).packageId)) return true;
         if (target.graph) queue.push(target.graph);
       }
     }

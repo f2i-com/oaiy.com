@@ -47,18 +47,44 @@ interface PendingPackage {
   path: string;
   manifest: OAIYPackageManifest;
   verification?: PackageVerificationLevel;
+  contentHash?: string;
   isReload?: boolean;
 }
 
-function reloadRequiresTrustReconfirm(
+export function reloadRequiresTrustReconfirm(
   prevManifest: OAIYPackageManifest,
   nextManifest: OAIYPackageManifest,
   prevVerification: PackageVerificationLevel | undefined,
   nextVerification: PackageVerificationLevel,
+  prevContentHash?: string,
+  nextContentHash?: string,
 ): boolean {
   // Trust / signature verification changed (e.g., dropped from signature_verified to unverified)
   if (prevVerification !== undefined && prevVerification !== nextVerification) {
     return true;
+  }
+  const prevEmbedded = prevManifest as OAIYPackageManifestWithEmbedded;
+  const nextEmbedded = nextManifest as OAIYPackageManifestWithEmbedded;
+  // Content hash changed: always re-prompt for non-signature-verified packages OR
+  // packages declaring custom nodes, services, macros, or embedded code.
+  const contentHashChanged =
+    Boolean(nextContentHash) &&
+    (prevContentHash === undefined || prevContentHash !== nextContentHash);
+  if (contentHashChanged) {
+    const declaresActiveComponents =
+      (prevManifest.nodes?.length ?? 0) > 0 ||
+      (nextManifest.nodes?.length ?? 0) > 0 ||
+      (prevManifest.services?.length ?? 0) > 0 ||
+      (nextManifest.services?.length ?? 0) > 0 ||
+      (prevManifest.macros?.length ?? 0) > 0 ||
+      (nextManifest.macros?.length ?? 0) > 0 ||
+      (prevEmbedded.embeddedCustomNodes?.length ?? 0) > 0 ||
+      (nextEmbedded.embeddedCustomNodes?.length ?? 0) > 0 ||
+      (prevEmbedded.embeddedNodeExtensions?.length ?? 0) > 0 ||
+      (nextEmbedded.embeddedNodeExtensions?.length ?? 0) > 0;
+    if (nextVerification !== 'signature_verified' || declaresActiveComponents) {
+      return true;
+    }
   }
   // Permissions expanded
   const prevPerms = new Set(prevManifest.permissions ?? []);
@@ -70,13 +96,16 @@ function reloadRequiresTrustReconfirm(
   for (const svc of nextManifest.services ?? []) {
     if (!prevServices.has(JSON.stringify(svc))) return true;
   }
+  // Macros added or modified
+  const prevMacros = new Set(prevManifest.macros ?? []);
+  for (const macroPath of nextManifest.macros ?? []) {
+    if (!prevMacros.has(macroPath)) return true;
+  }
   // Custom nodes or embedded custom nodes/extensions added or modified
   const prevNodes = new Set((prevManifest.nodes ?? []).map((n) => JSON.stringify(n)));
   for (const node of nextManifest.nodes ?? []) {
     if (!prevNodes.has(JSON.stringify(node))) return true;
   }
-  const prevEmbedded = prevManifest as OAIYPackageManifestWithEmbedded;
-  const nextEmbedded = nextManifest as OAIYPackageManifestWithEmbedded;
   const prevEmbeddedNodes = new Set((prevEmbedded.embeddedCustomNodes ?? []).map((n) => JSON.stringify(n)));
   for (const node of nextEmbedded.embeddedCustomNodes ?? []) {
     if (!prevEmbeddedNodes.has(JSON.stringify(node))) return true;
@@ -304,8 +333,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
 
   // Ref to track if package changed notification is already showing
   const changedPackageRef = useRef<ChangedPackage | null>(null);
-  // Track each loaded package's last verified trust/integrity outcome so hot-reload can detect changes
+  // Track each loaded package's last verified trust/integrity outcome & contentHash so hot-reload can detect changes
   const packageVerificationsRef = useRef<Map<string, PackageVerificationLevel>>(new Map());
+  const packageContentHashesRef = useRef<Map<string, string>>(new Map());
 
   // Helper to load a package's flows and add it to loaded packages
   const loadPackageFlows = useCallback(async (
@@ -362,7 +392,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         if (customNodeIds.length > 0) {
           flowData = prefixPackageNodeTypes(flowData, manifest.id, customNodeIds, nodeDefinitions);
         }
-        flows.push(flowData);
+        // Always tag package flows with untrusted + owning packageId so they can never
+        // execute in a trusted non-package context or cross-package context.
+        flows.push({ ...flowData, untrusted: true, packageId: manifest.id });
       } catch (err) {
         logger.warn(`Failed to load flow ${flowPath}`, { error: err });
       }
@@ -386,7 +418,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
           if (customNodeIds.length > 0) {
             macroData = prefixPackageNodeTypes(macroData, manifest.id, customNodeIds, nodeDefinitions);
           }
-          macros.push(macroData);
+          macros.push({ ...macroData, untrusted: true, packageId: manifest.id });
         } catch (err) {
           logger.warn(`Failed to load macro ${macroPath}`, { error: err });
         }
@@ -463,7 +495,12 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         contentHash: verification.contentHash,
       });
 
-      setPendingPackage({ path: packagePath, manifest: verification.manifest, verification: verification.verification });
+      setPendingPackage({
+        path: packagePath,
+        manifest: verification.manifest,
+        verification: verification.verification,
+        contentHash: verification.contentHash,
+      });
     } catch (err) {
       logger.error('Failed to load package', { error: err });
       onShowToast(`Failed to load package: ${err}`, 'error');
@@ -659,7 +696,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         if (customNodeIds.length > 0) {
           flowData = prefixPackageNodeTypes(flowData, packageId, customNodeIds, nodeDefinitions);
         }
-        flows.push(flowData);
+        flows.push({ ...flowData, untrusted: true, packageId });
       } catch (err) {
         logger.warn(`Failed to reload flow ${flowPath}`, { error: err });
       }
@@ -683,7 +720,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
           if (customNodeIds.length > 0) {
             macroData = prefixPackageNodeTypes(macroData, packageId, customNodeIds, nodeDefinitions);
           }
-          macros.push(macroData);
+          macros.push({ ...macroData, untrusted: true, packageId });
         } catch (err) {
           logger.warn(`Failed to reload macro ${macroPath}`, { error: err });
         }
@@ -737,6 +774,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     });
     if (pendingPackage.verification) {
       packageVerificationsRef.current.set(pendingPackage.manifest.id, pendingPackage.verification);
+    }
+    if (pendingPackage.contentHash) {
+      packageContentHashesRef.current.set(pendingPackage.manifest.id, pendingPackage.contentHash);
     }
 
     try {
@@ -800,6 +840,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     manifest: OAIYPackageManifest,
     grantedPermissions: string[] = [],
     verification?: PackageVerificationLevel,
+    contentHash?: string,
   ) => {
     const granted = [...grantedPermissions];
     const trustLevel: 'untrusted' | 'trusted' | 'verified' =
@@ -815,6 +856,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     });
     if (verification) {
       packageVerificationsRef.current.set(manifest.id, verification);
+    }
+    if (contentHash) {
+      packageContentHashesRef.current.set(manifest.id, contentHash);
     }
     // Load the dependency package (don't navigate to it)
     await loadPackageFlows(path, manifest, false);
@@ -875,6 +919,8 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     // Unload package nodes (path-based and embedded)
     unloadPackageNodes(packageId);
     unloadEmbeddedContent(packageId);
+    packageVerificationsRef.current.delete(packageId);
+    packageContentHashesRef.current.delete(packageId);
 
     // Remove from loaded packages
     setLoadedPackages(prev => {
@@ -918,22 +964,41 @@ export function usePackageManager(options: UsePackageManagerOptions) {
       }
 
       const manifest = verification.manifest;
+      if (manifest.id !== packageId) {
+        throw new Error(
+          `Refusing package reload: manifest id '${manifest.id}' does not match loaded package '${packageId}'`,
+        );
+      }
       const prevVerification = packageVerificationsRef.current.get(packageId);
+      const prevContentHash = packageContentHashesRef.current.get(packageId);
 
-      // Re-prompt TrustDialog if permissions, services, custom nodes expanded/changed or trust level changed
-      if (reloadRequiresTrustReconfirm(pkg.manifest, manifest, prevVerification, verification.verification)) {
+      // Re-prompt TrustDialog if permissions, services, custom nodes, macros, trust level, or contentHash changed
+      if (
+        reloadRequiresTrustReconfirm(
+          pkg.manifest,
+          manifest,
+          prevVerification,
+          verification.verification,
+          prevContentHash,
+          verification.contentHash,
+        )
+      ) {
         changedPackageRef.current = null;
         setChangedPackage(null);
         setPendingPackage({
           path: pkg.sourcePath,
           manifest,
           verification: verification.verification,
+          contentHash: verification.contentHash,
           isReload: true,
         });
         return;
       }
 
       packageVerificationsRef.current.set(packageId, verification.verification);
+      if (verification.contentHash) {
+        packageContentHashesRef.current.set(packageId, verification.contentHash);
+      }
       await applyReloadedPackage(packageId, pkg.sourcePath, manifest);
 
       changedPackageRef.current = null;

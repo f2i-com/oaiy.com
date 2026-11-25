@@ -137,9 +137,13 @@ export function engineDefault(list: CustomService[], kind: string): CustomServic
   return of.find((s) => s.default) ?? of.find((s) => !s.nodeId) ?? null;
 }
 
+/** Reserved prefixes owned by OAIY Desktop / engines / voice; custom entries must never shadow them. */
+const RESERVED_DESKTOP_SERVICE_PREFIX = /^(engine|voice|companion):/i;
+
 /**
  * The service `id` names. The user's own shadow same-id built-ins; OAIY's
- * (`companion:*`, `engine:*`, `voice:*`) never collide with them.
+ * (`companion:*`, `engine:*`, `voice:*`) never collide with them and can
+ * never be shadowed by entries in `oaiy.customServices`.
  */
 export function resolveService(
   id: string,
@@ -150,6 +154,9 @@ export function resolveService(
   const desktop = lists.desktop ?? readServiceKey(DESKTOP_SERVICE_STORAGE_KEY);
   const kind = engineKindOf(id);
   if (kind) return engineDefault(desktop, kind);
+  if (RESERVED_DESKTOP_SERVICE_PREFIX.test(id)) {
+    return desktop.find((s) => s.id === id) ?? null;
+  }
   return [...custom, ...desktop, ...BUILT_IN_SERVICES].find((s) => s.id === id) ?? null;
 }
 

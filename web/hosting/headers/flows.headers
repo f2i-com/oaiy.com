@@ -8,6 +8,8 @@
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
   Strict-Transport-Security: max-age=86400
+  X-Frame-Options: DENY
+  Content-Security-Policy: frame-ancestors 'none'
 /assets/compiler-sandbox-worker-*
   Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'
 /sw.js

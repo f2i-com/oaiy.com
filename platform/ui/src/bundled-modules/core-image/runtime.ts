@@ -6,8 +6,28 @@
  */
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
+import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from '../core-service/examples';
 import { imageDataUrl as pictureDataUrl, runContract } from '../core-service/contractRuntime';
+import { validatePath } from '../core-filesystem/runtime';
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.+$/, '');
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
+
+function extractLoopbackPort(url: string): number | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (!isLoopbackHost(parsed.hostname)) return null;
+    if (!parsed.port) return null;
+    const port = parseInt(parsed.port, 10);
+    return Number.isFinite(port) && port > 0 && port <= 65535 ? port : null;
+  } catch {
+    return null;
+  }
+}
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createImageMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -794,11 +814,14 @@ async function generateCustom(
 }
 
 /**
- * Auto-start Wan2GP service if not already running
+ * Auto-start Wan2GP service if targeting a loopback endpoint and not already running.
+ * Never invokes service auto-start or rewrites URLs for non-loopback hosts.
  */
 async function ensureWan2GPReady(baseUrl: string): Promise<string> {
-  const match = baseUrl.match(/:(\d+)/);
-  const port = match ? parseInt(match[1], 10) : 8773;
+  const port = extractLoopbackPort(baseUrl);
+  if (!port) {
+    return baseUrl;
+  }
 
   if (ctx.tauri) {
     try {
@@ -920,9 +943,19 @@ async function generateWan2GP(
     const pollData = await pollResponse.json();
 
     if (pollData.status === 'completed') {
-      if (pollData.image) return pollData.image;
-      if (pollData.path) return pollData.path;
-      throw new Error('Wan2GP job completed but no image in response');
+      const rawImage = pollData.image || pollData.path;
+      if (typeof rawImage !== 'string' || !rawImage.trim()) {
+        throw new Error('Wan2GP job completed but no image in response');
+      }
+      if (/^(?:data:|blob:|https?:\/\/)/i.test(rawImage)) {
+        return rawImage;
+      }
+      if (!isLocalNetworkUrl(baseUrl)) {
+        throw new Error('ImageGen (Wan2GP): refusing server-returned file path from non-local endpoint');
+      }
+      const trimmed = rawImage.trim();
+      validatePath(trimmed, 'ImageGen (Wan2GP) file path');
+      return trimmed;
     }
 
     if (pollData.status === 'failed') {

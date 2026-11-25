@@ -15,7 +15,7 @@ import { listRecordModels } from '@oaiy/shared/providers/models';
 import { providerTypeOf } from '@oaiy/shared/providers/adapters';
 import type { TestResult } from '@oaiy/shared/broker/protocol';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
-import { BudgetExhausted, budgetMessage, classifyFailure, guardedFetch, type PageInfo, type TakeResult } from './net';
+import { BudgetExhausted, RedirectRefused, budgetMessage, classifyFailure, guardedFetch, type PageInfo, type TakeResult } from './net';
 import { probeContext, type ProbeResult } from './probe';
 import { KeyUnreadable } from './store';
 
@@ -44,8 +44,11 @@ export interface Tester {
 
 const DUMMY_TOOL = { type: 'function', function: { name: 'noop', description: 'Does nothing.', parameters: { type: 'object', properties: {} } } };
 
+const isTimeoutError = (e: unknown): boolean => typeof e === 'object' && e !== null && 'name' in e && (e as { name: unknown }).name === 'TimeoutError';
+
 export function createTester(deps: TesterDeps): Tester {
   const budgetResult = (e: BudgetExhausted): TestResult => ({ ok: false, error: { kind: 'budget', message: budgetMessage(e.reason, e.limit, e.byteLimit) } });
+  const redirectResult = (e: RedirectRefused, models?: TestResult['models']): TestResult => ({ ok: false, ...(models ? { models } : {}), error: { kind: 'redirect', message: e.message } });
   const unreadableResult = (e: KeyUnreadable): TestResult => ({ ok: false, error: { kind: 'key-unreadable', message: e.message } });
 
   async function models(record: ProviderRecord): Promise<TestResult> {
@@ -58,12 +61,14 @@ export function createTester(deps: TesterDeps): Tester {
       throw e;
     }
     let exhausted: BudgetExhausted | null = null;
+    let redirected: RedirectRefused | null = null;
     const inner = guardedFetch(record, deps.fetchImpl, deps.take);
     const fetchImpl: typeof fetch = async (input, init) => {
       try {
         return await inner(input, init);
       } catch (e) {
         if (e instanceof BudgetExhausted) exhausted = e;
+        if (e instanceof RedirectRefused) redirected = e;
         throw e;
       }
     };
@@ -74,6 +79,12 @@ export function createTester(deps: TesterDeps): Tester {
       return { ok: true, models: list.map((m) => (m.label ? { id: m.id, label: m.label } : { id: m.id })) };
     } catch (e) {
       if (exhausted) return budgetResult(exhausted);
+      if (redirected) return redirectResult(redirected);
+      if (e instanceof RedirectRefused) return redirectResult(e);
+      if (isTimeoutError(e)) {
+        const context = { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl, pageOrigin: deps.page.origin, omitAddressPath: deps.providerText !== 'scrubbed' };
+        return { ok: false, error: { kind: 'timeout', message: describeConnectionError('timeout', context) } };
+      }
       if (!(e instanceof ProviderConnectionError)) return { ok: false, error: { kind: 'internal', message: 'The model list could not be read.' } };
       if (e.kind === 'network') {
         const failure = await classifyFailure(record, record.baseUrl, deps.page, deps.fetchImpl);
@@ -108,6 +119,8 @@ export function createTester(deps: TesterDeps): Tester {
       response = await guarded(url, { method: 'POST', headers: recordHeaders(record, key, [['content-type', 'application/json']]), body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
     } catch (e) {
       if (e instanceof BudgetExhausted) return budgetResult(e);
+      if (e instanceof RedirectRefused) return redirectResult(e, listed.models);
+      if (isTimeoutError(e)) return { ok: false, models: listed.models, error: { kind: 'timeout', message: describeConnectionError('timeout', context) } };
       const failure = await classifyFailure(record, record.baseUrl, deps.page, deps.fetchImpl);
       return { ok: false, models: listed.models, error: { kind: failure.kind, message: failure.message } };
     }

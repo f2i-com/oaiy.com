@@ -8,7 +8,7 @@ type Node = { data?: Record<string, unknown> } & Record<string, unknown>;
 type WithGraph = { id?: string; graph?: { nodes?: unknown[]; edges?: unknown[] } };
 
 /** The keys of a node's data that name another flow. */
-const FLOW_REFS = ['flowId', '_macroWorkflowId'] as const;
+export const FLOW_REFS = ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId'] as const;
 
 /** `flows` with the ids `ids` maps (old → new) rewritten in their nodes' references; each flow's own id is left to the caller. */
 export function rewriteFlowRefs<T extends WithGraph>(flows: T[], ids: ReadonlyMap<string, string>): T[] {

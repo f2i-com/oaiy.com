@@ -801,6 +801,199 @@ document.getElementById('status').textContent = 'dom:' + domIntact + ' url:' + p
   );
 });
 
+await check('Wave 4 sandbox hardening: <iframe>/contentWindow, ShadowRoot & detached <meta refresh>, __zdom_cb capability token, String hijack storage, and bridge auth', async () => {
+  await write({
+    'wave4sec/index.html': `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wave4 Security</title>
+<link rel="dns-prefetch" href="https://evil.example">
+<link rel="prefetch" href="https://evil.example/p.js">
+<link rel="stylesheet" href="https://evil.example/ext.css">
+</head>
+<body>
+<iframe id="static-if" src="about:blank"></iframe>
+<object id="static-obj" data="about:blank"></object>
+<embed id="static-emb" src="about:blank">
+<a id="ping-link" href="https://evil.example/track" ping="https://evil.example/ping">Ping Link</a>
+<div id="box"></div>
+<div id="outer-host"><span id="outer-target">old</span></div>
+<p id="report">pending</p>
+<script>
+// 1. Dynamic <iframe>/<frame>/<object>/<embed> creation must throw, and contentWindow/contentDocument must be blocked.
+const blockedTags = ['iframe', 'frame', 'frameset', 'object', 'embed'];
+const createBlocked = blockedTags.every((t) => {
+  try {
+    document.createElement(t);
+    return false;
+  } catch {
+    return true;
+  }
+});
+const parsedFrameDoc = new DOMParser().parseFromString('<iframe id="pif" src="about:blank"></iframe><meta http-equiv="refresh" content="0;url=https://evil.example/p">', 'text/html');
+const parserStripped = parsedFrameDoc.querySelector('iframe') === null && parsedFrameDoc.querySelector('meta[http-equiv]') === null;
+const contentWinBlocked = document.body.contentWindow === undefined && document.body.contentDocument === undefined && document.body.getSVGDocument === undefined;
+
+// 2. attachShadow blocked; detached pre-insertion sanitization strips <meta refresh>, <iframe>, and declarative shadowrootmode.
+let shadowBlocked = false;
+try {
+  document.getElementById('box').attachShadow({ mode: 'closed' });
+} catch {
+  shadowBlocked = true;
+}
+const box = document.getElementById('box');
+box.innerHTML = '<template shadowrootmode="open"><meta http-equiv="refresh" content="0;url=https://evil.example/sr"><iframe src="about:blank"></iframe></template><meta http-equiv="refresh" content="0;url=https://evil.example/ih"><span id="ok-ih">safe-ih</span>';
+box.insertAdjacentHTML('beforeend', '<meta http-equiv="refresh" content="0;url=https://evil.example/iah"><iframe src="about:blank"></iframe><em id="ok-iah">safe-iah</em>');
+document.getElementById('outer-target').outerHTML = '<meta http-equiv="refresh" content="0;url=https://evil.example/oh"><b id="ok-oh">safe-oh</b>';
+if (typeof box.setHTMLUnsafe === 'function') {
+  const s = document.createElement('div');
+  s.id = 'unsafe-wrap';
+  box.appendChild(s);
+  s.setHTMLUnsafe('<template shadowrootmode="open"><meta http-equiv="refresh" content="0;url=https://evil.example/dsd"></template><iframe src="about:blank"></iframe><i id="ok-shu">safe-shu</i>');
+}
+document.write('<meta http-equiv="refresh" content="0;url=https://evil.example/dw"><iframe src="about:blank"></iframe><u id="ok-dw">safe-dw</u>');
+
+// Attr mutation bypass attempt on http-equiv
+const safeMeta = document.createElement('meta');
+safeMeta.setAttribute('http-equiv', 'x-benign');
+document.head.appendChild(safeMeta);
+const heAttr = safeMeta.getAttributeNode('http-equiv');
+if (heAttr) {
+  heAttr.value = 'refresh';
+  heAttr.nodeValue = 'refresh';
+  heAttr.textContent = 'refresh';
+}
+
+// Detached programmatic anchor click must not navigate the frame
+const detachedA = document.createElement('a');
+detachedA.href = 'https://evil.example/detached';
+detachedA.click();
+
+// 3. __zdom_* capability token rejection and non-writable/non-configurable lock
+let cbRejected = false;
+try {
+  __zdom_cb('wrong-token', 1, null, []);
+} catch {
+  cbRejected = true;
+}
+let runRejected = false;
+try {
+  __zdom_run('wrong-token', '1+1', 'forged');
+} catch {
+  runRejected = true;
+}
+let settleRejected = false;
+try {
+  __zdom_settle('wrong-token', 1, true, null);
+} catch {
+  settleRejected = true;
+}
+let inlineRejected = false;
+try {
+  __zdom_inline('wrong-token', []);
+} catch {
+  inlineRejected = true;
+}
+const origCbRef = globalThis.__zdom_cb;
+const origEntryRef = globalThis.__zdom_entry;
+try { globalThis.__zdom_cb = () => 'hijacked'; } catch {}
+try { globalThis.__zdom_entry = { cb: () => 'hijacked' }; } catch {}
+const hooksLocked = globalThis.__zdom_cb === origCbRef && globalThis.__zdom_entry === origEntryRef;
+
+// 4. String = () => ['__proto__'] storage hardening
+const origString = globalThis.String;
+globalThis.String = () => ['__proto__'];
+localStorage.setItem('pollute', 'yes');
+sessionStorage.setItem('pollute', 'yes');
+globalThis.String = origString;
+localStorage.setItem('legit', 'ok4');
+const storageSafe = ({}).polluted === undefined && localStorage.getItem('legit') === 'ok4';
+
+// 5. PopStateEvent encodes type safely (no wire-handle forgery)
+let popOk = false;
+try {
+  const ev = new PopStateEvent({ $h: 1 }, { state: { a: 1 } });
+  popOk = ev && typeof ev.type === 'string';
+} catch {
+  popOk = true;
+}
+
+document.getElementById('report').textContent =
+  'create:' + createBlocked +
+  ' parse:' + parserStripped +
+  ' cw:' + contentWinBlocked +
+  ' shadow:' + shadowBlocked +
+  ' tok:' + (cbRejected && runRejected && settleRejected && inlineRejected) +
+  ' lock:' + hooksLocked +
+  ' store:' + storageSafe +
+  ' pop:' + popOk;
+</script>
+</body>
+</html>`,
+  });
+  const checked = await tool('page_check', { path: 'wave4sec/index.html' });
+  expect(!checked.isError, checked.content);
+  const inspected = await tool('page_inspect', {});
+  expect(
+    inspected.content.includes('create:true parse:true cw:true shadow:true tok:true lock:true store:true pop:true'),
+    inspected.content,
+  );
+  expect(
+    inspected.content.includes('safe-ih') && inspected.content.includes('safe-iah') && inspected.content.includes('safe-oh') && inspected.content.includes('safe-dw'),
+    inspected.content,
+  );
+
+  // Verify host DOM invariants AND per-load bridgeToken rejection of forged postMessage from iframe!
+  const hostState = await frame().evaluate(() => {
+    // Attempt to forge bot:download and bot:storage without the per-load __oaiyToken
+    window.parent.postMessage({
+      __oaiyAgent: true,
+      type: 'bot:download',
+      filename: 'forged.txt',
+      mime: 'text/plain',
+      bytes: new Uint8Array([102, 111, 114, 103, 101, 100]),
+      userInitiated: false,
+    }, '*');
+    window.parent.postMessage({
+      __oaiyAgent: true,
+      __oaiyToken: 'wrong-bridge-token',
+      type: 'bot:storage',
+      store: { forged: '1' },
+    }, '*');
+    const templates = [...document.querySelectorAll('template')];
+    const nestedBadInTemplates = templates.some((t) => t.content.querySelector('meta[http-equiv], iframe, base, object, embed') !== null);
+    const hasShadowHost = [...document.querySelectorAll('*')].some((el) => el.shadowRoot !== null);
+    const links = [...document.querySelectorAll('link')];
+    return {
+      url: location.href,
+      blockedTags: document.querySelectorAll('iframe, frame, frameset, object, embed, base').length,
+      refreshMeta: [...document.querySelectorAll('meta[http-equiv]')].filter((m) => /refresh/i.test(m.getAttribute('http-equiv') || '')).length,
+      prefetchLinks: links.filter((l) => /dns-prefetch|preconnect|prefetch|prerender|modulepreload|import/i.test(l.getAttribute('rel') || '')).length,
+      externalLinkHrefs: links.filter((l) => /^(?:https?:)?\/\//i.test(l.getAttribute('href') || '')).length,
+      pingAttrs: document.querySelectorAll('[ping]').length,
+      shadowRootModeAttrs: document.querySelectorAll('[shadowrootmode]').length,
+      nestedBadInTemplates,
+      hasShadowHost,
+    };
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  const forgedExportExists = await page.evaluate(() => window.harness.preview.vfs.exists('/exports/forged.txt'));
+  expect(
+    hostState.url.includes('/webpage/') &&
+      hostState.blockedTags === 0 &&
+      hostState.refreshMeta === 0 &&
+      hostState.prefetchLinks === 0 &&
+      hostState.externalLinkHrefs === 0 &&
+      hostState.pingAttrs === 0 &&
+      hostState.shadowRootModeAttrs === 0 &&
+      !hostState.nestedBadInTemplates &&
+      !hostState.hasShadowHost &&
+      !forgedExportExists,
+    JSON.stringify({ hostState, forgedExportExists }),
+  );
+});
+
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

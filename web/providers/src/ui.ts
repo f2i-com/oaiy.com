@@ -89,27 +89,30 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
   async function drawList(): Promise<void> {
     const summaries = await ctx.store.summaries();
     const records = new Map((await ctx.store.list()).map((r) => [r.id, r]));
-    const items = summaries.map((s) => {
-      const record = records.get(s.id) as ProviderRecord;
-      const result = h('p', { class: 'result', attrs: { role: 'status' } });
-      const check = h('button', { class: 'button', text: 'Check', on: { click: () => void runCheck(record, result, check) } });
-      const remove = h('button', { class: 'button danger', text: 'Remove' });
-      remove.addEventListener('click', () => {
-        if (remove.dataset.sure !== '1') {
-          remove.dataset.sure = '1';
-          remove.textContent = 'Really remove?';
-          return;
-        }
-        void ctx.store.remove(s.id);
-      });
-      return h(
-        'li',
-        { class: 'row' },
-        h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), result),
-        h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', on: { click: () => openForm(record) } }), remove),
-      );
-    });
-    fill(listBox, h('h2', { text: 'Your providers' }), summaries.length === 0 ? h('p', { class: 'fine', text: 'None yet. Add one below.' }) : h('ul', { class: 'rows' }, ...items));
+    const items = summaries
+      .map((s) => {
+        const record = records.get(s.id);
+        if (!record) return null;
+        const result = h('p', { class: 'result', attrs: { role: 'status' } });
+        const check = h('button', { class: 'button', text: 'Check', on: { click: () => void runCheck(record, result, check) } });
+        const remove = h('button', { class: 'button danger', text: 'Remove' });
+        remove.addEventListener('click', () => {
+          if (remove.dataset.sure !== '1') {
+            remove.dataset.sure = '1';
+            remove.textContent = 'Really remove?';
+            return;
+          }
+          void ctx.store.remove(s.id);
+        });
+        return h(
+          'li',
+          { class: 'row' },
+          h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), result),
+          h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', on: { click: () => openForm(record) } }), remove),
+        );
+      })
+      .filter((el): el is HTMLLIElement => el !== null);
+    fill(listBox, h('h2', { text: 'Your providers' }), items.length === 0 ? h('p', { class: 'fine', text: 'None yet. Add one below.' }) : h('ul', { class: 'rows' }, ...items));
   }
 
   async function runCheck(record: ProviderRecord, out: HTMLElement, button: HTMLButtonElement): Promise<void> {
@@ -126,7 +129,11 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
 
   // --- The form ---------------------------------------------------------------
   function openForm(record: ProviderRecord | null, preset?: Preset): void {
-    const chosen = preset ?? presets.find((p) => p.id === record?.preset) ?? presets.find((p) => p.id === 'custom')!;
+    const chosen =
+      preset ??
+      presets.find((p) => p.id === record?.preset) ??
+      (record?.kind === 'local-server' ? presets.find((p) => p.id === 'local-server') : undefined) ??
+      presets.find((p) => p.id === 'custom')!;
     form = { preset: chosen, editing: record, serverKind: record?.serverKind ?? chosen.serverKinds?.[0]?.id, models: [] };
     drawForm();
   }
@@ -144,17 +151,27 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     if (!form) return drawIdleForm();
     const state = form;
     const { preset, editing } = state;
+    const effectiveDialect = editing?.dialect ?? preset.dialect;
+    const effectiveKind = editing?.kind ?? preset.kind;
     const start = editing ? undefined : inputFromPreset(preset, state.serverKind);
 
     const name = h('input', { attrs: { type: 'text', autocomplete: 'off', maxlength: '80' }, value: editing?.name ?? String(start?.name ?? '') });
     const address = h('input', { attrs: { type: 'url', autocomplete: 'off', spellcheck: 'false', placeholder: 'https://…' }, value: editing?.baseUrl ?? String(start?.baseUrl ?? '') });
-    const key = h('input', { attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: editing ? 'Stored on this device. Leave empty to keep it.' : preset.kind === 'local-server' ? 'Usually empty' : 'Paste the key' } });
+    const key = h('input', { attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: editing ? 'Stored on this device. Leave empty to keep it.' : effectiveKind === 'local-server' ? 'Usually empty' : 'Paste the key' } });
     const modelText = h('input', { attrs: { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'or type a model name' }, value: editing?.model ?? '' });
     const modelSelect = h('select', { attrs: { 'aria-label': 'Model' } });
     // What the holder bounds for this provider (volume, not cost): the largest request, and a cap on the length of a chat reply.
     const maxBody = h('input', { attrs: { type: 'number', min: '1', max: '32768', step: '1', placeholder: '1024 (the default)' }, value: editing?.limits?.maxBodyBytes ? String(Math.round(editing.limits.maxBodyBytes / 1024)) : '' });
     const maxTokens = h('input', { attrs: { type: 'number', min: '1', max: '1000000', step: '1', placeholder: 'No cap' }, value: editing?.limits?.maxOutputTokens ? String(editing.limits.maxOutputTokens) : '' });
-    const extras = (preset.extraHeaders ?? []).map((headerName) => ({
+    const extraHeaderNames: string[] = [];
+    const seenHeaderNames = new Set<string>();
+    for (const headerName of [...(preset.extraHeaders ?? []), ...(editing?.extraHeaders?.map((x) => x.name) ?? [])]) {
+      const lower = headerName.toLowerCase();
+      if (seenHeaderNames.has(lower)) continue;
+      seenHeaderNames.add(lower);
+      extraHeaderNames.push(headerName);
+    }
+    const extras = extraHeaderNames.map((headerName) => ({
       headerName,
       input: h('input', { attrs: { type: 'text', autocomplete: 'off', placeholder: 'Optional' }, value: editing?.extraHeaders?.find((x) => x.name.toLowerCase() === headerName.toLowerCase())?.value ?? '' }),
     }));
@@ -191,12 +208,13 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     const draft = (): RecordInput => ({
       id: editing?.id,
       name: name.value,
-      dialect: preset.dialect,
-      kind: preset.kind,
+      dialect: effectiveDialect,
+      kind: effectiveKind,
+      caps: editing?.caps,
       baseUrl: address.value,
       model: modelText.value,
-      preset: preset.id,
-      serverKind: preset.kind === 'local-server' ? state.serverKind : undefined,
+      preset: editing ? editing.preset : preset.id,
+      serverKind: effectiveKind === 'local-server' ? state.serverKind : undefined,
       extraHeaders: extras.map((x) => ({ name: x.headerName, value: x.input.value })),
       contextTokens: editing?.contextTokens,
       parallelAgents: editing?.parallelAgents,
@@ -269,7 +287,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       serverHelp,
       field('Name', name),
       serverSelect ? field('Which server', serverSelect) : null,
-      field('Address', address, preset.editableBase || preset.kind === 'local-server' ? 'The API address, ending in its version (for example /v1).' : 'Change this only if you know why: the key is sent to this address.'),
+      field('Address', address, preset.editableBase || effectiveKind === 'local-server' ? 'The API address, ending in its version (for example /v1).' : 'Change this only if you know why: the key is sent to this address.'),
       field('API key', key, preset.keyHint),
       preset.keyUrl ? h('a', { class: 'fine', text: 'Where to get a key', attrs: { href: preset.keyUrl, target: '_blank', rel: 'noopener noreferrer' } }) : null,
       ...extras.map((x) => field(x.headerName, x.input)),
@@ -297,27 +315,49 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
         const bytesLimit = h('input', { attrs: { type: 'number', min: '0', max: '4096', step: '1', 'aria-label': `MiB an hour for ${app}` }, value: String(Math.round(usage.byteLimit / 1024 / 1024)) });
         const status = h('span', { class: 'fine', attrs: { role: 'status' } });
         const set = h('button', { class: 'button', text: 'Set' });
-        set.addEventListener('click', () =>
+        const origin =
+          app === MODAL_APP
+            ? 'the Test and Load models buttons of the embedded modal'
+            : [...ctx.apps]
+                .filter(([, name]) => name === app)
+                .map(([o]) => o)
+                .join(', ');
+        const usageLine = h('span', { class: 'fine' });
+        const worstLine = h('span', { class: 'fine' });
+        const renderUsage = (u: { used: number; limit: number; bytes: number; byteLimit: number }): void => {
+          usageLine.textContent = ` ${origin} · ${u.used} of ${u.limit} requests and ${mib(u.bytes)} of ${mib(u.byteLimit)} used this hour`;
+          worstLine.textContent = `Worst case an hour: ${u.limit} requests, at most ${mib(Math.min(u.byteLimit, u.limit * largest))} sent.`;
+        };
+        renderUsage(usage);
+        set.addEventListener('click', () => {
+          const rawLimit = limit.value.trim();
+          const rawMib = bytesLimit.value.trim();
+          const nextLimit = rawLimit === '' ? NaN : Number(rawLimit);
+          const nextMib = rawMib === '' ? NaN : Number(rawMib);
+          if (!Number.isFinite(nextLimit) || nextLimit < 0 || !Number.isInteger(nextLimit) || nextLimit > 100_000) {
+            status.textContent = 'The most requests an hour is a whole number from 0 to 100000.';
+            return;
+          }
+          if (!Number.isFinite(nextMib) || nextMib < 0 || nextMib > 4096) {
+            status.textContent = 'The most MiB an hour is a number from 0 to 4096.';
+            return;
+          }
+          const nextBytes = Math.round(nextMib * 1024 * 1024);
           void ctx.budget
-            .setLimit(app, Number(limit.value))
-            .then(() => ctx.budget.setByteLimit(app, Math.round(Number(bytesLimit.value) * 1024 * 1024)))
+            .setLimits(app, nextLimit, nextBytes)
+            .then(() => ctx.budget.usage(app))
             .then(
-              () => (status.textContent = 'Saved.'),
+              (updated) => {
+                renderUsage(updated);
+                status.textContent = 'Saved.';
+              },
               (e: unknown) => (status.textContent = e instanceof Error ? e.message : 'Not saved.'),
-            ),
-        );
-        const origin = app === MODAL_APP ? 'the Test and Load models buttons of the embedded modal' : ([...ctx.apps].find(([, name]) => name === app)?.[0] ?? '');
+            );
+        });
         return h(
           'li',
           { class: 'row' },
-          h(
-            'div',
-            { class: 'grow' },
-            h('strong', { text: app }),
-            h('span', { class: 'fine', text: ` ${origin} · ${usage.used} of ${usage.limit} requests and ${mib(usage.bytes)} of ${mib(usage.byteLimit)} used this hour` }),
-            h('br'),
-            h('span', { class: 'fine', text: `Worst case an hour: ${usage.limit} requests, at most ${mib(Math.min(usage.byteLimit, usage.limit * largest))} sent.` }),
-          ),
+          h('div', { class: 'grow' }, h('strong', { text: app }), usageLine, h('br'), worstLine),
           h('div', { class: 'actions' }, limit, h('span', { class: 'fine', text: 'requests' }), bytesLimit, h('span', { class: 'fine', text: 'MiB' }), set, status),
         );
       }),

@@ -2917,12 +2917,25 @@ export class Sessions {
         session.running = null;
         this.hooks.finished?.(session);
         if (afterEnd && !session.callId) afterEnd.outreach();
+        // If call.ended arrived while awaiting save()/saveIndex() (while session.running was still set),
+        // drain that deferred afterEnd now before finish() releases a next call or deliver() queues unread.
+        const lateAfterEnd = session.afterEnd as Session['afterEnd'];
+        session.afterEnd = undefined;
+        if (lateAfterEnd && !session.callId && this.list.includes(session)) {
+          lateAfterEnd.note();
+          if (unread.length && !callOver) {
+            session.agent.turns.push({ role: 'user', text: unread.join('\n\n'), at: Date.now() });
+          }
+          await this.save(session);
+          lateAfterEnd.outreach();
+        }
         // A booking promised but not requested: the agent is told once, and requests it.
         if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
           session.bookingNudged = true;
           unread.push(BOOKING_NUDGE);
         }
-        if (!callOver && unread.length) this.deliver(session, unread.join('\n\n'));
+        const callOverNow = !!onCall && session.callId !== onCall;
+        if (!callOverNow && unread.length) this.deliver(session, unread.join('\n\n'));
         this.hooks.changed();
       } finally {
         session.running = null;

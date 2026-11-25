@@ -739,7 +739,11 @@ async function chat(
         input = existing.length === 1 ? existing[0] : existing;
       }
     } catch (err) {
-      ctx?.log?.('warn', `[AI] video frame extraction skipped: ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/lacks required permission|not have the .* permission|permission denied|Refusing|Path traversal|Dangerous path|Reserved device|Drive-relative|Local network access/i.test(msg)) {
+        throw err;
+      }
+      ctx?.log?.('warn', `[AI] video frame extraction skipped: ${msg}`);
     }
   }
 
@@ -1651,8 +1655,9 @@ async function extractVideoFrames(videoInput: unknown, numFrames: number): Promi
   if (!videoInput) return [];
   const n = Math.max(1, Math.min(128, Math.floor(numFrames || 0) || 8));
 
-  // Resolve the input to a URL we can hand to the <video> element.
+  // Resolve the input to a path/URL string.
   let videoUrl: string | null = null;
+  let revokeObjectUrl: string | null = null;
   let videoPath: string | null = null;
   if (typeof videoInput === 'object') {
     const obj = videoInput as { path?: string; outputPath?: string; video?: string };
@@ -1662,18 +1667,49 @@ async function extractVideoFrames(videoInput: unknown, numFrames: number): Promi
   }
   if (!videoPath || typeof videoPath !== 'string' || videoPath.length === 0) return [];
 
-  if (videoPath.startsWith('http://') || videoPath.startsWith('https://') ||
-      videoPath.startsWith('blob:') || videoPath.startsWith('data:')) {
+  const isHttp = videoPath.startsWith('http://') || videoPath.startsWith('https://');
+  const isBlobOrData = videoPath.startsWith('blob:') || videoPath.startsWith('data:');
+  const isFileUrl = videoPath.startsWith('file://');
+  const isLocalPath =
+    /^[a-zA-Z]:[\\/]/.test(videoPath) || videoPath.startsWith('/') || videoPath.startsWith('\\\\');
+
+  if (isFileUrl || isLocalPath) {
+    // Enforce filesystem:read permission for packages + validatePath BEFORE probing any local file.
+    if (
+      ctx?.currentPackageId &&
+      !(typeof ctx.hasPermission === 'function' && ctx.hasPermission('filesystem:read'))
+    ) {
+      throw new Error(
+        `Refusing local video frame extraction: package '${ctx.currentPackageId}' lacks required permission 'filesystem:read'`,
+      );
+    }
+    let localPath: string;
+    if (isFileUrl) {
+      const stripped = /^file:\/\/\/[a-zA-Z]:[\\/]/.test(videoPath)
+        ? videoPath.replace(/^file:\/\/\//, '')
+        : videoPath.replace(/^file:\/\//, '');
+      try {
+        localPath = decodeURIComponent(stripped);
+      } catch {
+        throw new Error('AI video input: invalid percent-encoding in file:// URL');
+      }
+    } else {
+      localPath = videoPath;
+    }
+    validatePath(localPath, 'AI video input');
+    videoUrl = `file:///${localPath.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+  } else if (isHttp) {
+    if (!ctx?.secureFetch) {
+      throw new Error('Refusing HTTP(S) video frame extraction without policy-enforced secureFetch');
+    }
+  } else if (isBlobOrData) {
     videoUrl = videoPath;
-  } else if (videoPath.startsWith('file://')) {
-    videoUrl = videoPath;
-  } else if (/^[a-zA-Z]:[\\/]/.test(videoPath) || videoPath.startsWith('/') || videoPath.startsWith('\\\\')) {
-    // Windows / Unix absolute path — wrap in file:// for the <video>
-    // element. The renderer's asset protocol whitelist needs to allow
-    // this path; the Tauri app config already does so for the oaiy
-    // models / temp dirs.
-    videoUrl = `file:///${videoPath.replace(/\\/g, '/').replace(/^\/+/, '')}`;
   } else {
+    return [];
+  }
+
+  if (typeof document === 'undefined') {
+    ctx?.log?.('warn', '[AI] video frame extraction skipped — DOM document unavailable');
     return [];
   }
 
@@ -1682,85 +1718,114 @@ async function extractVideoFrames(videoInput: unknown, numFrames: number): Promi
     return [];
   }
 
+  if (isHttp) {
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+      ctx?.log?.('warn', '[AI] video frame extraction skipped — URL.createObjectURL unavailable');
+      return [];
+    }
+    // Fetch HTTP(S) videos through ctx.secureFetch so SSRF, local-network, and package
+    // network policies are enforced before loading into an offscreen <video> element.
+    const resp = await ctx.secureFetch!(videoPath, {
+      method: 'GET',
+      purpose: 'Fetch video for AI frame extraction',
+      signal: ctx.abortSignal,
+    });
+    if (!resp.ok) {
+      ctx?.log?.('warn', `[AI] video fetch failed: HTTP ${resp.status}`);
+      return [];
+    }
+    const blob = await resp.blob();
+    revokeObjectUrl = URL.createObjectURL(blob);
+    videoUrl = revokeObjectUrl;
+  }
+
+  if (!videoUrl) return [];
+
   // Offscreen <video> + <canvas>. We seek to evenly-spaced timestamps
-  // and snapshot. If anything fails, return what we have.
+  // and snapshot. Always revoke Blob URLs in finally.
   const video = document.createElement('video');
   video.crossOrigin = 'anonymous';
   video.muted = true;
   video.preload = 'auto';
   video.src = videoUrl;
   try {
-    await new Promise<void>((resolve, reject) => {
-      const onLoaded = () => { cleanup(); resolve(); };
-      const onError = () => { cleanup(); reject(new Error('video load failed')); };
-      const cleanup = () => {
-        video.removeEventListener('loadedmetadata', onLoaded);
-        video.removeEventListener('error', onError);
-      };
-      video.addEventListener('loadedmetadata', onLoaded);
-      video.addEventListener('error', onError);
-    });
-  } catch (err) {
-    ctx?.log?.('warn', `[AI] video metadata load failed: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
-  }
-  const duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-  if (duration <= 0) {
-    ctx?.log?.('warn', '[AI] video duration unknown, skipping frame extraction');
-    return [];
-  }
-
-  const w = video.videoWidth;
-  const h = video.videoHeight;
-  if (w <= 0 || h <= 0) return [];
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const cctx = canvas.getContext('2d');
-  if (!cctx) return [];
-
-  // Evenly-spaced timestamps. Avoid t=0 and t=duration exactly — the
-  // first/last frame can be a black frame on some encoders.
-  const timestamps: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const t = duration * ((i + 0.5) / n);
-    timestamps.push(Math.min(t, Math.max(0, duration - 0.05)));
-  }
-
-  const tempDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_temp_dir');
-  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const out: string[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
     try {
       await new Promise<void>((resolve, reject) => {
-        const onSeeked = () => { cleanup(); resolve(); };
-        const onError = () => { cleanup(); reject(new Error('seek failed')); };
+        const onLoaded = () => { cleanup(); resolve(); };
+        const onError = () => { cleanup(); reject(new Error('video load failed')); };
         const cleanup = () => {
-          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('loadedmetadata', onLoaded);
           video.removeEventListener('error', onError);
         };
-        video.addEventListener('seeked', onSeeked);
+        video.addEventListener('loadedmetadata', onLoaded);
         video.addEventListener('error', onError);
-        video.currentTime = timestamps[i];
       });
-      cctx.drawImage(video, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL('image/png');
-      const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
-      const framePath = `${tempDir}/oaiy-llm-frame-${stamp}-${String(i).padStart(3, '0')}.png`;
-      await ctx.tauri.invoke('plugin:oaiy-filesystem|write_file', {
-        path: framePath,
-        content: base64,
-        contentType: 'base64',
-        createDirs: true,
-      });
-      out.push(framePath);
     } catch (err) {
-      ctx?.log?.('warn', `[AI] frame ${i} extract failed: ${err instanceof Error ? err.message : String(err)}`);
+      ctx?.log?.('warn', `[AI] video metadata load failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+    const duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    if (duration <= 0) {
+      ctx?.log?.('warn', '[AI] video duration unknown, skipping frame extraction');
+      return [];
+    }
+
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (w <= 0 || h <= 0) return [];
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const cctx = canvas.getContext('2d');
+    if (!cctx) return [];
+
+    // Evenly-spaced timestamps. Avoid t=0 and t=duration exactly — the
+    // first/last frame can be a black frame on some encoders.
+    const timestamps: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const t = duration * ((i + 0.5) / n);
+      timestamps.push(Math.min(t, Math.max(0, duration - 0.05)));
+    }
+
+    const tempDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_temp_dir');
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const out: string[] = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onSeeked = () => { cleanup(); resolve(); };
+          const onError = () => { cleanup(); reject(new Error('seek failed')); };
+          const cleanup = () => {
+            video.removeEventListener('seeked', onSeeked);
+            video.removeEventListener('error', onError);
+          };
+          video.addEventListener('seeked', onSeeked);
+          video.addEventListener('error', onError);
+          video.currentTime = timestamps[i];
+        });
+        cctx.drawImage(video, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL('image/png');
+        const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+        const framePath = `${tempDir}/oaiy-llm-frame-${stamp}-${String(i).padStart(3, '0')}.png`;
+        await ctx.tauri.invoke('plugin:oaiy-filesystem|write_file', {
+          path: framePath,
+          content: base64,
+          contentType: 'base64',
+          createDirs: true,
+        });
+        out.push(framePath);
+      } catch (err) {
+        ctx?.log?.('warn', `[AI] frame ${i} extract failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    ctx?.log?.('info', `[AI] extracted ${out.length}/${n} frames from video (${duration.toFixed(2)}s, ${w}x${h})`);
+    return out;
+  } finally {
+    video.src = '';
+    if (revokeObjectUrl) {
+      URL.revokeObjectURL(revokeObjectUrl);
     }
   }
-  video.src = '';
-  ctx?.log?.('info', `[AI] extracted ${out.length}/${n} frames from video (${duration.toFixed(2)}s, ${w}x${h})`);
-  return out;
 }
 
 /**

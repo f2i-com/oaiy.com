@@ -1230,6 +1230,8 @@ export class ChatPane {
     this.cards.clear();
     for (const timer of this.redrawTimers.values()) clearTimeout(timer);
     this.redrawTimers.clear();
+    for (const frame of this.redrawFrames.values()) if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
+    this.redrawFrames.clear();
     this.redraws.clear();
     this.current = null;
     this.thinking = null;
@@ -1749,12 +1751,18 @@ export class ChatPane {
   /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls for the same box came before it ran (each box is drawn: a replayed conversation has many). */
   private redraws = new Map<HTMLElement, () => void>();
   private redrawTimers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+  private redrawFrames = new Map<HTMLElement, number>();
   private cancelRedraw(key: HTMLElement): void {
     this.redraws.delete(key);
     const timer = this.redrawTimers.get(key);
     if (timer !== undefined) {
       clearTimeout(timer);
       this.redrawTimers.delete(key);
+    }
+    const frame = this.redrawFrames.get(key);
+    if (frame !== undefined) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
+      this.redrawFrames.delete(key);
     }
   }
   private redraw(key: HTMLElement, draw: () => void): void {
@@ -1766,11 +1774,15 @@ export class ChatPane {
       const latest = this.redraws.get(key);
       this.redraws.delete(key);
       if (!latest) return;
-      requestAnimationFrame(() => {
+      const prevFrame = this.redrawFrames.get(key);
+      if (prevFrame !== undefined && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(prevFrame);
+      const frame = requestAnimationFrame(() => {
+        this.redrawFrames.delete(key);
         if (!key.isConnected) return;
         latest();
         this.scroll();
       });
+      this.redrawFrames.set(key, frame);
     }, STREAM_REDRAW_MS);
     this.redrawTimers.set(key, timer);
   }
@@ -2483,8 +2495,13 @@ export class ChatPane {
     const from = pageStart(this.hiddenTurns, REPLAY_PAGE);
     const page = this.hiddenTurns.slice(from);
     this.hiddenTurns = this.hiddenTurns.slice(0, from);
-    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way };
+    const live = { current: this.current, thinking: this.thinking, draft: this.draft, quiet: this.quiet, callOver: this.callOver, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way };
     const anchor = this.topAnchor();
+    this.current = null;
+    this.thinking = null;
+    this.draft = null;
+    this.quiet = null;
+    this.callOver = false;
     // The page's marks follow the plan as it was then, not as it is now; its dividers, the way things came then.
     this.currentPlan = planAfter(this.hiddenTurns);
     this.way = lastWay(this.hiddenTurns);
@@ -2503,7 +2520,7 @@ export class ChatPane {
       if (this.older.isConnected) this.older.after(...this.sink.children);
       else this.feed.prepend(...this.sink.children);
       this.sink = null;
-      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way } = live);
+      ({ current: this.current, thinking: this.thinking, draft: this.draft, quiet: this.quiet, callOver: this.callOver, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way } = live);
       this.showPlan(this.currentPlan);
       this.showOlder();
       // What the reader was looking at stays where it was (at the bottom, the log keeps to it).

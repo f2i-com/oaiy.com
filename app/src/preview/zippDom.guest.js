@@ -15,20 +15,26 @@
  * a function of the page {$f: id}, undefined {$u: 1}, a promise {$p: id},
  * a typed array {$ta: name, d: [...]}, a date {$date: ms}.
  */
-var __zdom_entry = (function () {
+var __zdom_entry = (function (__ZDOM_TOKEN) {
 var __jsonStringify = JSON.stringify;
 var __jsonParse = JSON.parse;
 var __isArray = Array.isArray;
+var __objProto = Object.prototype;
 var __hasOwn = Object.prototype.hasOwnProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __objKeys = Object.keys;
 var __getProtoOf = Object.getPrototypeOf;
 var __objCreate = Object.create;
+var __objFreeze = Object.freeze;
 var __defineProp = Object.defineProperty;
+var __Proxy = Proxy;
 var __isView = typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView ? ArrayBuffer.isView : null;
 var __arrayFrom = Array.from;
 var __fromCharCode = String.fromCharCode;
 var __Uint8Array = Uint8Array;
+var __Uint8ClampedArray = typeof Uint8ClampedArray !== 'undefined' ? Uint8ClampedArray : null;
+var __Uint16Array = typeof Uint16Array !== 'undefined' ? Uint16Array : null;
 var __ArrayBuffer = ArrayBuffer;
 var __Date = Date;
 var __Promise = Promise;
@@ -56,11 +62,31 @@ var __arrayConcat = __call.bind(Array.prototype.concat);
 var __arrayFilter = __call.bind(Array.prototype.filter);
 var __strReplace = __call.bind(String.prototype.replace);
 var __strCharCodeAt = __call.bind(String.prototype.charCodeAt);
+var __strSlice = __call.bind(String.prototype.slice);
+var __strSplit = __call.bind(String.prototype.split);
+var __strTrim = __call.bind(String.prototype.trim);
+var __strIndexOf = __call.bind(String.prototype.indexOf);
+var __strToLowerCase = __call.bind(String.prototype.toLowerCase);
+var __strToUpperCase = __call.bind(String.prototype.toUpperCase);
 var __regexExec = __call.bind(RegExp.prototype.exec);
+var __regexTest = __call.bind(RegExp.prototype.test);
 var __dateGetTime = __call.bind(Date.prototype.getTime);
+var __promiseResolve = __Promise.resolve.bind(__Promise);
+var __promiseReject = __Promise.reject.bind(__Promise);
+var __promiseThen = __call.bind(__Promise.prototype.then);
+var __symIterator = typeof Symbol !== 'undefined' ? Symbol.iterator : null;
+var __symToStringTag = typeof Symbol !== 'undefined' ? Symbol.toStringTag : null;
 var __subarray = typeof Uint8Array !== 'undefined' && Uint8Array.prototype.subarray ? __call.bind(Uint8Array.prototype.subarray) : null;
 var __btoa = typeof globalThis.btoa === 'function' ? globalThis.btoa : btoa;
 var __atob = typeof globalThis.atob === 'function' ? globalThis.atob : atob;
+if (typeof __ZDOM_TOKEN !== 'string' || !__ZDOM_TOKEN || __ZDOM_TOKEN === '__OAIY_ZDOM_TOKEN__') {
+  throw new __TypeError('missing session token');
+}
+function __assertToken(token) {
+  if (typeof token !== 'string' || token !== __ZDOM_TOKEN) {
+    throw new __TypeError('unauthorized host entry call');
+  }
+}
 var window = globalThis;
 var self = window;
 var __MAGIC = '\u0000oaiy.agent.page:';
@@ -140,7 +166,7 @@ function __host(op, a, b, c) {
 function __flush() {
   var queued = __jsonParse(__channel('ls.getItem', __MAGIC + '["flush"]'));
   var list = queued && __hasOwnCall(queued, 'ok') && __isArray(queued.ok) ? queued.ok : [];
-  for (var i = 0; i < list.length; i++) __zdom_cb(list[i][0], list[i][1], list[i][2]);
+  for (var i = 0; i < list.length; i++) __cb(list[i][0], list[i][1], list[i][2]);
 }
 
 function __cls(name, chain, exposeGlobal) {
@@ -150,7 +176,7 @@ function __cls(name, chain, exposeGlobal) {
   var C = function () {
     throw new __TypeError('Illegal constructor');
   };
-  C.prototype = __objCreate(parent ? parent.prototype : Object.prototype);
+  C.prototype = __objCreate(parent ? parent.prototype : __objProto);
   C.prototype.constructor = C;
   __defineProp(C, 'name', { value: name });
   __classes[name] = C;
@@ -161,7 +187,7 @@ function __cls(name, chain, exposeGlobal) {
 function __isPlain(v) {
   if (v === null || typeof v !== 'object') return false;
   var proto = __getProtoOf(v);
-  return proto === Object.prototype || proto === null || __isArray(v);
+  return proto === __objProto || proto === null || __isArray(v);
 }
 
 function __encode(v) {
@@ -220,7 +246,7 @@ function __threeCtor(key, name, chain) {
   }
   F.prototype = __cls(name || 'Object', chain || ['Object'], false).prototype;
   var statics = __objCreate(null);
-  return new Proxy(F, {
+  return new __Proxy(F, {
     construct: function (_t, args) {
       var encoded = [];
       for (var i = 0; i < args.length; i++) encoded[i] = __encode(args[i]);
@@ -333,15 +359,15 @@ function __wrap(id, chain, noGlobal) {
     var s = __special[chain[i]];
     if (s) for (var key in s) special[key] = s[key];
   }
-  var proxy = new Proxy(target, {
+  var proxy = new __Proxy(target, {
     get: function (t, k) {
       if (typeof k === 'symbol') {
-        if (k === Symbol.iterator) {
+        if (k === __symIterator) {
           return function () {
-            return __host('iter', id)[Symbol.iterator]();
+            return __host('iter', id)[__symIterator]();
           };
         }
-        if (k === Symbol.toStringTag) return chain[0];
+        if (k === __symToStringTag) return chain[0];
         return undefined;
       }
       if (k === 'then') return undefined;
@@ -377,7 +403,7 @@ function __wrap(id, chain, noGlobal) {
       return true;
     },
     has: function (t, k) {
-      if (typeof k === 'symbol') return k === Symbol.iterator;
+      if (typeof k === 'symbol') return k === __symIterator;
       if (__hasOwnCall(extra, k) || special[k]) return true;
       return __host('has', id, k);
     },
@@ -407,7 +433,7 @@ function __wrap(id, chain, noGlobal) {
 }
 
 /** A callback from the frame: a listener, timer or observer of the page's. */
-function __zdom_cb(fnId, thisValue, args) {
+function __cb(fnId, thisValue, args) {
   var fn = __mapGet(__fns, fnId);
   if (!fn) return { $u: 1 };
   try {
@@ -416,6 +442,11 @@ function __zdom_cb(fnId, thisValue, args) {
     __report(error, 'in a callback');
     return { $u: 1 };
   }
+}
+
+function __zdom_cb_entry(token, fnId, thisValue, args) {
+  __assertToken(token);
+  return __cb(fnId, thisValue, args);
 }
 
 /** A promise the page's code left behind (an async handler's, say): its failure is reported, as a browser reports an unhandled rejection. */
@@ -429,7 +460,8 @@ function __watch(value, where) {
   return value;
 }
 
-function __zdom_settle(pid, ok, value) {
+function __zdom_settle_entry(token, pid, ok, value) {
+  __assertToken(token);
   var p = __mapGet(__promises, pid);
   if (!p) return;
   __mapDel(__promises, pid);
@@ -452,17 +484,19 @@ function __inlineHandlers(list) {
       var fn = new __Function('event', code);
       el[name] = fn;
     } catch (error) {
-      __host('log', 'error', 'SyntaxError in the ' + name + ' attribute ("' + __String(code).slice(0, 80) + '"): ' + error.message);
+      __host('log', 'error', 'SyntaxError in the ' + name + ' attribute ("' + __strSlice(__String(code), 0, 80) + '"): ' + error.message);
     }
   }
 }
 
-function __zdom_inline(list) {
+function __zdom_inline_entry(token, list) {
+  __assertToken(token);
   __inlineHandlers(list);
 }
 
 /** One of the page's scripts, in the global scope as a browser runs it. */
-function __zdom_run(source, name) {
+function __zdom_run_entry(token, source, name) {
+  __assertToken(token);
   try {
     __watch((0, eval)(source), 'in ' + name);
     return null;
@@ -476,7 +510,7 @@ function __format(v) {
   if (v === undefined) return 'undefined';
   if (v && typeof v === 'object' && __weakMapHas(__wrapperIds, v)) {
     try {
-      return '<' + __String(v.tagName || v.nodeName || 'object').toLowerCase() + (v.id ? '#' + v.id : '') + '>';
+      return '<' + __strToLowerCase(__String(v.tagName || v.nodeName || 'object')) + (v.id ? '#' + v.id : '') + '>';
     } catch (e) {
       return '[object]';
     }
@@ -539,7 +573,7 @@ var document = __host('document');
   var readOnly = ['innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'devicePixelRatio', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset', 'screen', 'navigator', 'visualViewport', 'screenX', 'screenY', 'isSecureContext', 'customElements'];
   readOnly.forEach(function (name) {
     try {
-      Object.defineProperty(window, name, {
+      __defineProp(window, name, {
         get: function () {
           return __win[name];
         },
@@ -567,8 +601,9 @@ var document = __host('document');
   // Handlers set as window.onload = ... (and friends) go to the real window.
   ['onload', 'onresize', 'onscroll', 'onkeydown', 'onkeyup', 'onhashchange', 'onpopstate', 'onerror', 'onbeforeunload', 'onmessage', 'onpointerdown', 'onpointermove', 'onpointerup', 'onmousedown', 'onmousemove', 'onmouseup', 'onclick', 'onfocus', 'onblur', 'onwheel', 'ontouchstart', 'ontouchmove', 'ontouchend', 'onDOMContentLoaded'].forEach(function (name) {
     var current = null;
-    if (Object.getOwnPropertyDescriptor(window, name) && !Object.getOwnPropertyDescriptor(window, name).configurable) return;
-    Object.defineProperty(window, name, {
+    var desc = __getOwnPropDesc(window, name);
+    if (desc && !desc.configurable) return;
+    __defineProp(window, name, {
       get: function () {
         return current;
       },
@@ -580,6 +615,7 @@ var document = __host('document');
     });
   });
 })();
+var __setTimeout = window.setTimeout;
 var parent = window;
 var top = window;
 var frames = window;
@@ -593,20 +629,20 @@ var frames = window;
       for (var i = 0; i < arguments.length; i++) args[i] = __encode(arguments[i]);
       return __host('new', name, args);
     };
-    Object.defineProperty(C, 'name', { value: name });
+    __defineProp(C, 'name', { value: name });
     globalThis[name] = C;
   });
   globalThis.URL.createObjectURL = function (blob) {
     return __host('objectUrl', __encode(blob));
   };
   globalThis.URL.revokeObjectURL = function (url) {
-    __host('revokeObjectUrl', String(url));
+    __host('revokeObjectUrl', __String(url));
   };
   var chains = {
     EventTarget: [], Node: ['EventTarget'], Element: ['Node', 'EventTarget'], HTMLElement: ['Element', 'Node', 'EventTarget'], SVGElement: ['Element', 'Node', 'EventTarget'],
     Document: ['Node', 'EventTarget'], CharacterData: ['Node', 'EventTarget'],
   };
-  for (var name in chains) __cls(name, [name].concat(chains[name]));
+  for (var name in chains) __cls(name, __arrayConcat([name], chains[name]));
   var constants = { ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16 };
   for (var c in constants) {
     __classes.Node[c] = constants[c];
@@ -632,18 +668,19 @@ var frames = window;
     globalThis[n].prototype = __classes[n].prototype;
   });
 })();
+var __TextEncoder = globalThis.TextEncoder;
 
 // A page's storage: kept by OAIY for this page, apart from everything else.
 function __storage(area) {
   var api = {
     getItem: function (k) {
-      return __host('storage', area, 'get', String(k));
+      return __host('storage', area, 'get', __String(k));
     },
     setItem: function (k, v) {
-      __host('storage', area, 'set', [String(k), String(v)]);
+      __host('storage', area, 'set', [__String(k), __String(v)]);
     },
     removeItem: function (k) {
-      __host('storage', area, 'remove', String(k));
+      __host('storage', area, 'remove', __String(k));
     },
     clear: function () {
       __host('storage', area, 'clear');
@@ -652,7 +689,7 @@ function __storage(area) {
       return __host('storage', area, 'key', i);
     },
   };
-  return new Proxy(api, {
+  return new __Proxy(api, {
     get: function (t, k) {
       if (k === 'length') return __host('storage', area, 'length');
       if (typeof k === 'symbol' || k in t) return t[k];
@@ -676,20 +713,22 @@ var localStorage = __storage('local');
 var sessionStorage = __storage('session');
 
 var __cookies = (function () {
-  var jar = {};
+  var jar = __objCreate(null);
   return {
     get: function () {
-      return Object.keys(jar).map(function (k) {
-        return k + '=' + jar[k];
-      }).join('; ');
+      var keys = __objKeys(jar);
+      var parts = [];
+      for (var i = 0; i < keys.length; i++) parts[i] = keys[i] + '=' + jar[keys[i]];
+      return __arrayJoin(parts, '; ');
     },
     set: function (v) {
-      var first = String(v).split(';')[0];
-      var eq = first.indexOf('=');
+      var raw = __String(v);
+      var first = __strSplit(raw, ';')[0];
+      var eq = __strIndexOf(first, '=');
       if (eq < 0) return;
-      var name = first.slice(0, eq).trim();
-      var value = first.slice(eq + 1).trim();
-      if (/max-age=0|expires=Thu, 01 Jan 1970/i.test(v)) delete jar[name];
+      var name = __strTrim(__strSlice(first, 0, eq));
+      var value = __strTrim(__strSlice(first, eq + 1));
+      if (__regexTest(/max-age=0|expires=Thu, 01 Jan 1970/i, raw)) delete jar[name];
       else jar[name] = value;
     },
   };
@@ -703,13 +742,13 @@ var location = (function () {
       return info.origin + info.path + (info.search || '') + (this.hash || '');
     },
     set href(v) {
-      __host('navigate', String(v));
+      __host('navigate', __String(v));
     },
     get hash() {
       return __host('hash');
     },
     set hash(v) {
-      __host('hash', String(v));
+      __host('hash', __String(v));
     },
     get pathname() {
       return info.path;
@@ -723,10 +762,10 @@ var location = (function () {
     hostname: info.host,
     port: '',
     assign: function (v) {
-      __host('navigate', String(v));
+      __host('navigate', __String(v));
     },
     replace: function (v) {
-      __host('navigate', String(v));
+      __host('navigate', __String(v));
     },
     reload: function () {
       __host('navigate', info.path);
@@ -772,22 +811,22 @@ var history = (function () {
   };
 })();
 var PopStateEvent = function (type, init) {
-  return __host('new', 'PopStateEvent', [type, __encode(init || {})]);
+  return __host('new', 'PopStateEvent', [__encode(type), __encode(init || {})]);
 };
 
 // Dialogs do not block the preview: the page carries on, and OAIY notes them.
 function alert(message) {
-  __host('dialog', 'alert', message === undefined ? '' : String(message));
+  __host('dialog', 'alert', message === undefined ? '' : __String(message));
 }
 function confirm(message) {
-  return __host('dialog', 'confirm', message === undefined ? '' : String(message));
+  return __host('dialog', 'confirm', message === undefined ? '' : __String(message));
 }
 function prompt(message, value) {
-  return __host('dialog', 'prompt', message === undefined ? '' : String(message), value === undefined ? '' : String(value));
+  return __host('dialog', 'prompt', message === undefined ? '' : __String(message), value === undefined ? '' : __String(value));
 }
 function print() {}
 function open(url) {
-  __host('log', 'warn', 'window.open("' + url + '") does nothing in the preview');
+  __host('log', 'warn', 'window.open("' + __String(url) + '") does nothing in the preview');
   return null;
 }
 function close() {}
@@ -810,7 +849,14 @@ var performance = {
 var crypto = {
   getRandomValues: function (array) {
     var values = __host('random', array.length);
-    for (var i = 0; i < values.length; i++) array[i] = array instanceof Uint8Array || array instanceof Uint8ClampedArray ? values[i] & 255 : array instanceof Uint16Array ? values[i] & 65535 : values[i];
+    for (var i = 0; i < values.length; i++) {
+      array[i] =
+        (array instanceof __Uint8Array || (__Uint8ClampedArray && array instanceof __Uint8ClampedArray))
+          ? values[i] & 255
+          : (__Uint16Array && array instanceof __Uint16Array)
+            ? values[i] & 65535
+            : values[i];
+    }
     return array;
   },
   randomUUID: function () {
@@ -824,33 +870,33 @@ function btoa(s) {
   return __host('btoa', __String(s));
 }
 function structuredClone(v) {
-  return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+  return v === undefined ? undefined : __jsonParse(__jsonStringify(v));
 }
 function queueMicrotask(fn) {
-  Promise.resolve().then(fn);
+  __promiseThen(__promiseResolve(), fn);
 }
 
 // The page is offline: fetch reads the project's own files.
 function fetch(input, init) {
-  var url = typeof input === 'string' ? input : input && input.url !== undefined ? String(input.url) : String(input);
-  var method = init && init.method ? String(init.method).toUpperCase() : 'GET';
+  var url = typeof input === 'string' ? input : input && input.url !== undefined ? __String(input.url) : __String(input);
+  var method = init && init.method ? __strToUpperCase(__String(init.method)) : 'GET';
   var got;
   try {
     got = __host('fetch', url, method);
   } catch (error) {
-    return Promise.reject(new TypeError(error.message));
+    return __promiseReject(new __TypeError(error.message));
   }
-  return Promise.resolve(__response(got, url));
+  return __promiseResolve(__response(got, url));
 }
 function __response(got, url) {
   var used = false;
   var take = function () {
-    if (used) throw new TypeError('Body has already been consumed.');
+    if (used) throw new __TypeError('Body has already been consumed.');
     used = true;
   };
   var text = function () {
     take();
-    return __Promise.resolve(got.text !== undefined ? got.text : __atob(got.b64));
+    return __promiseResolve(got.text !== undefined ? got.text : __atob(got.b64));
   };
   return {
     ok: got.status >= 200 && got.status < 300,
@@ -859,27 +905,30 @@ function __response(got, url) {
     url: url,
     type: 'basic',
     redirected: false,
-    headers: { get: function (k) { return String(k).toLowerCase() === 'content-type' ? got.type : null; }, has: function (k) { return String(k).toLowerCase() === 'content-type'; } },
+    headers: {
+      get: function (k) { return __strToLowerCase(__String(k)) === 'content-type' ? got.type : null; },
+      has: function (k) { return __strToLowerCase(__String(k)) === 'content-type'; },
+    },
     get bodyUsed() {
       return used;
     },
     text: text,
     json: function () {
-      return text().then(function (t) {
-        return JSON.parse(t);
+      return __promiseThen(text(), function (t) {
+        return __jsonParse(t);
       });
     },
     arrayBuffer: function () {
       take();
       var binary = got.text !== undefined ? null : __atob(got.b64);
-      if (binary === null) return __Promise.resolve(new TextEncoder().encode(got.text).buffer);
+      if (binary === null) return __promiseResolve(new __TextEncoder().encode(got.text).buffer);
       var bytes = new __Uint8Array(binary.length);
       for (var i = 0; i < binary.length; i++) bytes[i] = __strCharCodeAt(binary, i);
-      return __Promise.resolve(bytes.buffer);
+      return __promiseResolve(bytes.buffer);
     },
     blob: function () {
       take();
-      return Promise.resolve(__host('blob', url));
+      return __promiseResolve(__host('blob', url));
     },
     clone: function () {
       return __response(got, url);
@@ -890,15 +939,15 @@ function XMLHttpRequest() {
   var xhr = this;
   var method = 'GET';
   var url = '';
-  var listeners = {};
+  var listeners = __objCreate(null);
   xhr.readyState = 0;
   xhr.status = 0;
   xhr.responseText = '';
   xhr.response = null;
   xhr.responseType = '';
   xhr.open = function (m, u) {
-    method = String(m).toUpperCase();
-    url = String(u);
+    method = __strToUpperCase(__String(m));
+    url = __String(u);
     xhr.readyState = 1;
   };
   xhr.setRequestHeader = function () {};
@@ -925,14 +974,14 @@ function XMLHttpRequest() {
     try {
       got = __host('fetch', url, method);
     } catch (error) {
-      setTimeout(function () {
+      __setTimeout(function () {
         xhr.readyState = 4;
         fire('error');
         fire('loadend');
       }, 0);
       return;
     }
-    setTimeout(function () {
+    __setTimeout(function () {
       xhr.status = got.status;
       xhr.responseText = got.text !== undefined ? got.text : __atob(got.b64);
       xhr.response = xhr.responseType === 'json' ? __jsonParse(xhr.responseText) : xhr.responseText;
@@ -945,7 +994,7 @@ function XMLHttpRequest() {
 }
 
 // Expose only public browser globals and host entry hooks; internal bridge state
-// (__MAGIC, __channel, __host, __win, __wrappers, __fns) remains closed inside this IIFE.
+// (__MAGIC, __channel, __host, __win, __wrappers, __fns, __ZDOM_TOKEN) remains closed inside this IIFE.
 var __exports = {
   window: window,
   self: self,
@@ -982,14 +1031,25 @@ for (var __k in __exports) {
     globalThis[__k] = __exports[__k];
   } catch (_e) {}
 }
-return {
-  cb: __zdom_cb,
-  settle: __zdom_settle,
-  inline: __zdom_inline,
-  run: __zdom_run,
-};
+return __objFreeze({
+  cb: __zdom_cb_entry,
+  settle: __zdom_settle_entry,
+  inline: __zdom_inline_entry,
+  run: __zdom_run_entry,
+});
+})("__OAIY_ZDOM_TOKEN__");
+function __zdom_cb(token, fnId, thisValue, args) { return __zdom_entry.cb(token, fnId, thisValue, args); }
+function __zdom_settle(token, pid, ok, value) { return __zdom_entry.settle(token, pid, ok, value); }
+function __zdom_inline(token, list) { return __zdom_entry.inline(token, list); }
+function __zdom_run(token, source, name) { return __zdom_entry.run(token, source, name); }
+(function () {
+  var define = Object.defineProperty;
+  var lock = function (k, v) {
+    define(globalThis, k, { value: v, writable: false, configurable: false });
+  };
+  lock('__zdom_entry', __zdom_entry);
+  lock('__zdom_cb', __zdom_cb);
+  lock('__zdom_settle', __zdom_settle);
+  lock('__zdom_inline', __zdom_inline);
+  lock('__zdom_run', __zdom_run);
 })();
-function __zdom_cb(fnId, thisValue, args) { return __zdom_entry.cb(fnId, thisValue, args); }
-function __zdom_settle(pid, ok, value) { return __zdom_entry.settle(pid, ok, value); }
-function __zdom_inline(list) { return __zdom_entry.inline(list); }
-function __zdom_run(source, name) { return __zdom_entry.run(source, name); }

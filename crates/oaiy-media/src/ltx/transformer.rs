@@ -317,13 +317,17 @@ pub fn connector(
     mut progress: impl FnMut(usize),
 ) -> Result<Tensor> {
     let prefix = format!("{PREFIX}{name}.");
-    let registers = store.tensor(&format!("{prefix}learnable_registers"), dev, false)?;
     let n = features.dim(1)?;
-    let ids: Vec<u32> = (n..1024).map(|i| (i % 128) as u32).collect();
-    let padding = registers
-        .index_select(&Tensor::new(ids.as_slice(), dev)?, 0)?
-        .unsqueeze(0)?;
-    let mut x = Tensor::cat(&[features, &padding], 1)?;
+    let mut x = if n < 1024 {
+        let registers = store.tensor(&format!("{prefix}learnable_registers"), dev, false)?;
+        let ids: Vec<u32> = (n..1024).map(|i| (i % 128) as u32).collect();
+        let padding = registers
+            .index_select(&Tensor::new(ids.as_slice(), dev)?, 0)?
+            .unsqueeze(0)?;
+        Tensor::cat(&[features, &padding], 1)?
+    } else {
+        features.clone()
+    };
     let rope = Rope::positions(
         &(0..1024).map(|i| vec![i as f32]).collect::<Vec<_>>(),
         &[4096.],

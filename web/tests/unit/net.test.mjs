@@ -35,7 +35,35 @@ describe('the guard on the holder\'s own calls', () => {
     assert.equal(f.calls.length, 2);
 
     const redirecting = M.net.guardedFetch(record, stubFetch(() => new Response(null, { status: 307, headers: { location: 'https://evil.example/' } })).impl);
-    await assert.rejects(redirecting('https://api.openai.com/v1/models'), /redirect is not followed/);
+    await assert.rejects(redirecting('https://api.openai.com/v1/models'), (e) => e instanceof M.net.RedirectRefused && /redirect is not followed/i.test(e.message));
+  });
+
+  it('tester classifies redirects as redirect and chat Timeouts as timeout without running a no-cors probe', async () => {
+    const rec = { id: 'p_1', v: 1, name: 'Test', dialect: 'openai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', caps: ['chat'], kind: 'external', via: 'broker', model: 'm' };
+
+    const redirModels = stubFetch(() => new Response(null, { status: 302, headers: { location: 'https://evil.example/' } }));
+    const t1 = M.tester.createTester({ fetchImpl: redirModels.impl, page: PAGE, key: async () => 'sk-test' });
+    const r1 = await t1.models(rec);
+    assert.equal(r1.ok, false);
+    assert.equal(r1.error.kind, 'redirect');
+    assert.equal(redirModels.calls.length, 1, 'no no-cors probe on redirect');
+
+    const redirChat = stubFetch((c) => (c.url.endsWith('/models') ? jsonResponse({ data: [{ id: 'm' }] }) : new Response(null, { status: 307, headers: { location: 'https://evil.example/' } })));
+    const t2 = M.tester.createTester({ fetchImpl: redirChat.impl, page: PAGE, key: async () => 'sk-test' });
+    const r2 = await t2.test(rec);
+    assert.equal(r2.ok, false);
+    assert.equal(r2.error.kind, 'redirect');
+    assert.equal(redirChat.calls.length, 2, 'models + chat only, no no-cors probe');
+
+    const timeoutChat = stubFetch((c) => {
+      if (c.url.endsWith('/models')) return jsonResponse({ data: [{ id: 'm' }] });
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    });
+    const t3 = M.tester.createTester({ fetchImpl: timeoutChat.impl, page: PAGE, key: async () => 'sk-test' });
+    const r3 = await t3.test(rec);
+    assert.equal(r3.ok, false);
+    assert.equal(r3.error.kind, 'timeout');
+    assert.equal(timeoutChat.calls.length, 2, 'models + chat only, no no-cors probe on timeout');
   });
 });
 

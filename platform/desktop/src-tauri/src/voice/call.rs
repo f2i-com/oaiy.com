@@ -1559,7 +1559,7 @@ where
                                     if tools.sent >= transfer::TOOLS_BEFORE_LAST {
                                         return Err(transfer::refused("unavailable", "tool_limit"));
                                     }
-                                    if transfer.busy() {
+                                    if transfer.busy() || tools.transfer_pending() {
                                         return Err(transfer::refused("refused", "pending_request"));
                                     }
                                     let verdict = ring.authorise(&ids.call, reason);
@@ -1579,6 +1579,7 @@ where
                                         if tools.may_send(&name) {
                                             send_waiting(waiting, &mut tools, &mut pending_tools, &mut finishing, &out_tx, &ids).await;
                                         } else if let Err(refused) = tools.wait(waiting) {
+                                            ring.request_refused(&ids.call);
                                             refused.refuse("too many tool calls are waiting on this call");
                                         }
                                     }
@@ -4063,6 +4064,49 @@ mod tests {
         assert!(aokie.hub.live_calls().contains(&aokie.call));
         assert!(aokie.event("call.ended", Duration::from_millis(300)).await.is_none(), "and nobody was told it ended");
         assert!(aokie.hub.call_facts(&aokie.call).is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_transfer_while_queued_or_on_wire_is_refused_as_pending_request() {
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+
+        // A lookup is on the wire, so the first transfer waits behind it (`tools.transfer_pending()` is true, `transfer.busy()` is false).
+        let lookup = asking(&aokie, "lookup_business_data", json!({"question": "Open today?"}));
+        let lookup_call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("lookup sent");
+        let first_transfer = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        // Give the call loop a tick to enqueue the first transfer before sending the duplicate.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(tries(&aokie).attempts_this_call, 1);
+
+        // Duplicate transfer while the first is queued MUST be refused as `pending_request` without spending another try.
+        let dup_while_queued = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+        assert_eq!(
+            (dup_while_queued["ok"].clone(), dup_while_queued["output"]["status"].clone(), dup_while_queued["output"]["reason"].clone()),
+            (json!(false), json!("refused"), json!("pending_request")),
+            "{dup_while_queued}"
+        );
+        assert_eq!(tries(&aokie).attempts_this_call, 1, "duplicate while queued must not consume a try");
+
+        // Answer the lookup so the first transfer moves onto the wire (still unanswered by phone, so `transfer.busy()` is still false).
+        aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "toolCallId": lookup_call["toolCallId"], "ok": true, "output": {"digest": "Yes"}}));
+        assert_eq!(answer_of(lookup).await.unwrap()["ok"], true);
+        let transfer_call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("first transfer sent");
+        assert_eq!(transfer_call["name"], transfer::TOOL);
+
+        // Duplicate transfer while the first is on the wire MUST also be refused as `pending_request`.
+        let dup_while_on_wire = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+        assert_eq!(
+            (dup_while_on_wire["ok"].clone(), dup_while_on_wire["output"]["status"].clone(), dup_while_on_wire["output"]["reason"].clone()),
+            (json!(false), json!("refused"), json!("pending_request")),
+            "{dup_while_on_wire}"
+        );
+        assert_eq!(tries(&aokie).attempts_this_call, 1, "duplicate while on wire must not consume a try");
+        assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(250)).await.is_none(), "no second transfer reaches the phone");
+
+        // Complete the first transfer cleanly.
+        aokie.send(ringing(&aokie, transfer_call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+        assert_eq!(answer_of(first_transfer).await.unwrap()["output"]["status"], "ringing");
     }
 
     // The whole of it in one process: the ring on the desktop, the phone plugin, the messages.

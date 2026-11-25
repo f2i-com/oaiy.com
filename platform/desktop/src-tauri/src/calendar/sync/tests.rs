@@ -39,6 +39,8 @@ struct Fake {
     edit_before_put: Option<(String, &'static str, &'static str)>,
     /// Refuse (400) a record whose notes contain this.
     refuse_notes: Option<&'static str>,
+    /// Override `deletedSince` in incremental list responses (to test malformed timestamps).
+    deleted_since_override: Option<String>,
 }
 
 fn fmt(t: DateTime<Utc>) -> String {
@@ -60,6 +62,7 @@ impl Fake {
             drop_next_create_reply: false,
             edit_before_put: None,
             refuse_notes: None,
+            deleted_since_override: None,
         }
     }
 
@@ -175,7 +178,8 @@ impl Fake {
             recs.sort_by(|a, b| (a.updated, &a.id).cmp(&(b.updated, &b.id)));
             recs.truncate(limit);
             let deleted: Vec<Value> = self.tombstones.iter().filter(|(_, t)| *t >= since).map(|(id, t)| json!({"id": id, "deletedAt": fmt(*t)})).collect();
-            return (200, json!({"responses": recs.iter().map(|r| self.json(r)).collect::<Vec<_>>(), "deleted": deleted, "deletedSince": EPOCH, "deletedComplete": true, "serverTime": fmt(self.clock)}));
+            let deleted_since = self.deleted_since_override.as_deref().unwrap_or(EPOCH);
+            return (200, json!({"responses": recs.iter().map(|r| self.json(r)).collect::<Vec<_>>(), "deleted": deleted, "deletedSince": deleted_since, "deletedComplete": true, "serverTime": fmt(self.clock)}));
         }
         // Newest first, by offset, as FormLogic lists without updatedSince.
         recs.sort_by(|a, b| b.born.cmp(&a.born));
@@ -1086,6 +1090,33 @@ fn calendar_sync_rejects_invalid_form_and_response_path_segments() {
     assert!(
         matches!(err, Failure::Refused(ref m) if m.contains("form id")),
         "expected Failure::Refused for traversal form id, got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unparseable_deleted_since_falls_back_to_full_sync_instead_of_trusting_option_ord() {
+    let (cal, dir) = calendar();
+    let (fake, base) = formlogic();
+    let a = cal.create(new_appt("Cut", "2026-10-02T14:00", "Sam")).unwrap();
+    run(&cal, &base).unwrap();
+    let ra = remote_id(&cal, &a.id).unwrap();
+
+    // Server deletes the record without a tombstone AND returns an unparseable non-empty `deletedSince`.
+    // Previously `when("not-a-date") <= when(&since)` evaluated `None <= Some(_)` as `true`, skipping the full fallback!
+    {
+        let mut f = fake.lock().unwrap();
+        f.records.retain(|r| r.id != ra);
+        f.deleted_since_override = Some("not-a-timestamp".into());
+    }
+    let out = run(&cal, &base).unwrap();
+    assert_eq!(out.removed, 1, "full fallback must detect the missing record via lookup");
+    assert!(cal.get(&a.id).is_none(), "deleted appointment must be removed locally");
+    let f = fake.lock().unwrap();
+    assert!(
+        f.log.iter().any(|l| l.starts_with(&format!("GET /api/v1/forms/F1/responses/{ra}"))),
+        "must fall back to full sync and look up missing record: {:?}",
+        f.log
     );
     let _ = std::fs::remove_dir_all(dir);
 }

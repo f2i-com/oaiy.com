@@ -39,6 +39,11 @@ export function invalidateDynamicOptions() {}
 export function subscribeToDynamicOptionsInvalidation() { return () => {}; }
 export function definitionOf() { return { name: 'File Input' }; }
 export function CollapsibleNodeWrapper({ children }) { return createElement('div', null, children); }
+export function registerNodeComponent() {}
+export function unregisterNodeComponent() {}
+export function refreshNodeTypes() {}
+export function getRegisteredNodeTypes() { return []; }
+export function GenericNode() { return null; }
 `;
 
 const dialogStub = `export async function open() { return null; }`;
@@ -64,6 +69,8 @@ const aliases = {
     build.onLoad({ filter: /^xyflow$/, namespace: 'stub' }, () => ({ contents: xyflowStub, loader: 'js' }));
     build.onResolve({ filter: /^virtual:sandbox-runtime$/ }, () => ({ path: 'sandbox-rt', namespace: 'stub' }));
     build.onLoad({ filter: /^sandbox-rt$/, namespace: 'stub' }, () => ({ contents: sandboxRuntimeStub, loader: 'js' }));
+    build.onResolve({ filter: /\?url$/ }, (a) => ({ path: a.path, namespace: 'asset-url' }));
+    build.onLoad({ filter: /.*/, namespace: 'asset-url' }, (a) => ({ contents: `export default ${JSON.stringify(a.path)};`, loader: 'js' }));
     build.onResolve({ filter: /^oaiy-core\/modules\// }, (a) => ({
       path: path.join(UI, 'src/bundled-modules', `${a.path.slice('oaiy-core/modules/'.length)}.ts`),
     }));
@@ -86,11 +93,14 @@ await esbuild.build({
   stdin: {
     contents: `
 export { default as BrowserRuntime } from './src/bundled-modules/core-browser/runtime.ts';
+export { default as BrowserCompiler } from './src/bundled-modules/core-browser/compiler.ts';
 export { default as ServiceRuntime } from './src/bundled-modules/core-service/runtime.ts';
 export { default as AIRuntime } from './src/bundled-modules/core-ai/runtime.ts';
 export { default as AudioRuntime, sanitizeAudioFilename, sanitizeAudioFormat, resolveLocalMediaUrl, redactMediaToken } from './src/bundled-modules/core-audio/runtime.ts';
 export { default as ImageRuntime } from './src/bundled-modules/core-image/runtime.ts';
+export { default as ImageCompiler } from './src/bundled-modules/core-image/compiler.ts';
 export { default as VideoRuntime, sanitizeVideoFilename, sanitizeVideoFormat, sanitizeFfmpegColor } from './src/bundled-modules/core-video/runtime.ts';
+export { default as VideoCompiler } from './src/bundled-modules/core-video/compiler.ts';
 export { default as SubflowRuntime } from './src/bundled-modules/core-flow-control/runtime.ts';
 export { default as FlowControlCompiler } from './src/bundled-modules/core-flow-control/compiler.ts';
 export { kindOfAddress } from './src/bundled-modules/core-flow-control/ui/outputValue.ts';
@@ -103,12 +113,18 @@ export { default as DatabaseCompiler } from './src/bundled-modules/core-database
 export { default as UtilityRuntime } from './src/bundled-modules/core-utility/runtime.ts';
 export { default as UtilityCompiler } from './src/bundled-modules/core-utility/compiler.ts';
 export { default as Core3DCompiler } from './src/bundled-modules/core-3d/compiler.ts';
-export { desktopCredential, desktopFileBytes, runContract, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
-export { OAIYRuntime, OAIYCompiler, JobManager, getModuleLoader } from 'oaiy-core';
+export { resolveService } from './src/bundled-modules/core-service/contract.ts';
+export { desktopCredential, desktopFileBytes, listOaiyServices, runContract, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
+export { OAIYRuntime, OAIYCompiler, JobManager, getModuleLoader, createTemplateCompiler } from 'oaiy-core';
+export { escapeString } from 'oaiy-core/src/compiler/utils.ts';
 export { detectSandboxEscape, stripCommentsAndStringsFromCode } from 'oaiy-core/src/runtime.ts';
 export { isLocalNetworkUrl, matchesWhitelistEntry, getHostPort } from 'oaiy-core/src/runtime/NetworkUtils.ts';
 export { convertSelectionToMacro, analyzeSelection } from 'oaiy-core/src/macro/selection-analyzer.ts';
-export { parseImportedProject, sanitizeProjectForExport, stripUnsafeImportedSettings, sanitizeProjectRecord, looksLikeSecret, isSecretConstant, UNSAFE_IMPORTED_SETTING_KEYS } from './src/utils/ProjectIO.ts';
+export { parseImportedProject, registerImportedServices, sanitizeProjectForExport, stripUnsafeImportedSettings, sanitizeProjectRecord, looksLikeSecret, isSecretConstant, UNSAFE_IMPORTED_SETTING_KEYS } from './src/utils/ProjectIO.ts';
+export { listAllServices, deleteService } from './src/utils/serviceRegistry.ts';
+export { FLOW_REFS, reachesUntrusted, rewriteFlowRefs } from './src/lib/flowIds.ts';
+export { createPrefixedNodeId } from './src/hooks/usePackageNodes.ts';
+export { reloadRequiresTrustReconfirm } from './src/hooks/usePackageManager.ts';
 export { filterNodeData, prepareWorkflowForExport } from './src/utils/WorkflowIO.ts';
 export { sanitizeDataForSandbox, sanitizeSandboxUpdates } from './src/lib/sandboxData.ts';
 export { publishAsTool, publishAsHook, withdrawTool, withdrawHook, isUntrustedOrPkgFlow } from './src/lib/oaiyAgentTools.ts';
@@ -1976,6 +1992,509 @@ await check('28. Wave-3: outputValue malformed %ZZ, ProjectIO non-array resilien
   }
   const sandboxClientSrc = fs.readFileSync(path.join(UI, 'src/services/compilerSandbox.ts'), 'utf8');
   assert.ok(sandboxClientSrc.includes('w.terminate()'), 'compilerSandbox must terminate ephemeral worker per compile');
+});
+
+// ---------------------------------------------------------------------------
+// Wave-4 Security & Correctness Regressions
+// ---------------------------------------------------------------------------
+await check('29. Wave-4: escapeString non-string coercion, compiler call sites & createTemplateCompiler single-pass substitution', async () => {
+  // escapeString must coerce arrays/objects/null/numbers before JSON.stringify(...).slice(1, -1)
+  const payloadArr = [1, '"; evil(); //'];
+  const escapedArr = M.escapeString(payloadArr);
+  assert.equal(/(?<!\\)"/.test(escapedArr), false, `unescaped quote breakout leaked: ${escapedArr}`);
+  assert.equal(new Function(`return "${escapedArr}";`)(), String(payloadArr));
+  assert.equal(JSON.parse(`"${escapedArr}"`), String(payloadArr));
+  assert.equal(M.escapeString(null), '');
+  assert.equal(M.escapeString(undefined), '');
+  assert.equal(JSON.parse(`"${M.escapeString({ a: '"; evil()' })}"`), '[object Object]');
+  assert.equal(M.escapeString(123), '123');
+
+  // core-image & core-video ComfyUI config arrays with crafted non-string elements stay valid JS literals
+  const imgCode = M.ImageCompiler.compileNode('image_gen', {
+    node: {
+      id: 'img1',
+      type: 'image_gen',
+      data: {
+        apiFormat: 'comfyui',
+        comfyImageInputNodeIds: [['1', '"); evil(); ("']],
+        comfyImageInputConfigs: [{ nodeId: ['1', '"); evil()'], title: { x: 1 }, nodeType: ['LoadImage'] }],
+        comfyAllImageNodeIds: [['9', '"); evil()']],
+      },
+    },
+    inputs: new Map([['prompt', 'node_in']]),
+    outputVar: 'node_img1_out',
+    sanitizedId: 'img1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  assert.doesNotThrow(() => new Function(`async function f(){ let node_in = "p"; let workflow_context = {}; ${imgCode} }`), 'core-image compiled code must parse cleanly');
+  assert.equal(/(?<!\\)"\); evil\(\)/.test(imgCode), false);
+
+  const vidCode = M.VideoCompiler.compileNode('video_captions', {
+    node: { id: 'pkg:com.x:cap.1', type: 'video_captions', data: { text: 'hi' } },
+    inputs: new Map([['video', 'v_in'], ['segments', 'seg_in']]),
+    outputVar: 'node_cap_out',
+    sanitizedId: 'pkg_com_x_cap_1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  assert.doesNotThrow(() => new Function(`async function f(){ let v_in, seg_in, workflow_context = {}; ${vidCode} }`), 'video_captions must use ctx.sanitizedId for dotted/colon node IDs');
+  assert.ok(vidCode.includes('_segments_pkg_com_x_cap_1'));
+
+  // core-flow-control macro node guards non-array _macroInputs/_macroOutputs and strips newlines in debug comments
+  const macroCode = M.FlowControlCompiler.compileNode('macro', {
+    node: {
+      id: 'm1',
+      type: 'macro',
+      data: {
+        _macroWorkflowId: 'wf-1',
+        _macroName: 'Demo',
+        _macroInputs: [{ id: 'in1\nevil()', name: ['x', '": evil()'] }],
+        _macroOutputs: [{ id: 42, name: ['out', '"] = evil(); //'] }],
+      },
+    },
+    inputs: new Map(),
+    outputVar: 'node_m1_out',
+    sanitizedId: 'm1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+    debugEnabled: true,
+  });
+  assert.doesNotThrow(() => new Function(`async function f(){ let workflow_context = {}; ${macroCode} }`), 'macro compiled code must parse cleanly');
+  assert.equal(macroCode.includes('\nevil()'), false, 'debug comment must not allow newline breakout');
+
+  // createTemplateCompiler single-pass substitution prevents props -> data second-pass expansion
+  const defs = new Map([
+    [
+      'pkg:demo:echo',
+      {
+        id: 'pkg:demo:echo',
+        name: 'Echo',
+        inputs: [],
+        outputs: [{ id: 'out', name: 'out', type: 'string' }],
+        properties: [{ id: 'text', name: 'Text', type: 'string', default: '' }],
+        compiler: {
+          template: '{{outputVar}} = [{{props.text}}, {{data.payload}}];',
+        },
+      },
+    ],
+  ]);
+  const tplCompiler = M.createTemplateCompiler('Demo', defs);
+  const compiledTpl = tplCompiler.compileNode('pkg:demo:echo', {
+    node: {
+      id: 't1',
+      type: 'pkg:demo:echo',
+      data: {
+        text: '{{data.payload}}',
+        payload: '; globalThis.pwned = 1; //',
+      },
+    },
+    inputs: new Map(),
+    outputVar: 'node_t1_out',
+    sanitizedId: 't1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  assert.ok(compiledTpl);
+  const evaluated = new Function(`let workflow_context = {}; ${compiledTpl}\nreturn node_t1_out;`)();
+  assert.deepEqual(evaluated, ['{{data.payload}}', '; globalThis.pwned = 1; //']);
+});
+
+await check('30. Wave-4: registerImportedServices blocks built-in/desktop/reserved prefixes & strips secrets; resolveService prevents shadowing', () => {
+  const prevCustom = store.get('oaiy.customServices');
+  const prevDesktop = store.get('oaiy.desktopServices');
+  store.delete('oaiy.customServices');
+  store.set('oaiy.desktopServices', JSON.stringify([
+    { id: 'desktop-svc', name: 'Desktop', endpoint: 'http://127.0.0.1:17972/api/ai/engine/x', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+    { id: 'engine:llm:flash', name: 'Engine Flash', endpoint: 'http://127.0.0.1:17972/api/ai/providers/oaiy-engine/v1/chat/completions', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+    { id: 'voice:transcribe', name: 'Voice', endpoint: 'http://127.0.0.1:17972/api/voice/transcribe', method: 'POST', headers: '{}', bodyTemplate: '', responseType: 'json', responsePath: 'text' },
+    { id: 'companion:rig', name: 'Rig', endpoint: 'http://127.0.0.1:9000/run', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+  ]));
+  try {
+    const res = M.registerImportedServices({
+      services: [
+        // Reserved prefixes must be skipped
+        { id: 'engine:llm:evil', name: 'Evil', endpoint: 'https://evil.example/v1', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        { id: 'voice:transcribe', name: 'Evil Voice', endpoint: 'https://evil.example/v', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        { id: 'companion:rig', name: 'Evil Rig', endpoint: 'https://evil.example/r', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        // Built-in ID collision must be skipped
+        { id: 'ollama-chat', name: 'Shadow Ollama', endpoint: 'https://evil.example/ollama', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        // Desktop ID collision must be skipped
+        { id: 'desktop-svc', name: 'Shadow Desktop', endpoint: 'https://evil.example/d', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        // Invalid endpoint schemes / relative desktop path must be skipped
+        { id: 'bad-proto', name: 'Bad', endpoint: 'javascript:alert(1)', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        { id: 'rel-path', name: 'Rel', endpoint: '/api/ai/engine/gateway/v1/images', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        // Invalid ID format must be skipped
+        { id: 'bad id:colon', name: 'Bad ID', endpoint: 'https://ok.example/v1', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+        // Legitimate custom service: accepted, but apiKeyConstant & auth/{{apiKey}} headers stripped
+        {
+          id: 'legit-imported-svc',
+          name: 'Legit',
+          endpoint: 'https://api.example.com/v1/run',
+          method: 'POST',
+          headers: JSON.stringify({ Authorization: 'Bearer {{apiKey}}', 'X-Api-Key': 'raw', 'X-Custom': 'val-{{apiKey}}', Accept: 'application/json' }),
+          bodyTemplate: '{"q": {{input}}}',
+          responseType: 'json',
+          responsePath: 'out',
+          apiKeyConstant: 'OPENAI_API_KEY',
+          isBuiltIn: true,
+          group: 'engine',
+        },
+      ],
+    });
+    assert.equal(res.added, 1, `expected only 1 valid service added, got ${JSON.stringify(res)}`);
+    assert.equal(res.skipped, 8);
+    const saved = M.listAllServices().find((s) => s.id === 'legit-imported-svc');
+    assert.ok(saved);
+    assert.equal(saved.apiKeyConstant, undefined, 'apiKeyConstant must be stripped');
+    assert.equal(saved.isBuiltIn, false);
+    assert.equal(saved.group, undefined);
+    assert.deepEqual(JSON.parse(saved.headers), { Accept: 'application/json' }, 'auth and {{apiKey}} headers must be stripped');
+
+    // resolveService must NEVER let custom entries shadow reserved desktop prefixes
+    const spoofedCustom = [
+      { id: 'engine:llm:flash', name: 'Spoof', endpoint: 'https://evil.example/e', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+      { id: 'voice:transcribe', name: 'Spoof', endpoint: 'https://evil.example/v', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+      { id: 'companion:rig', name: 'Spoof', endpoint: 'https://evil.example/c', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+      { id: 'engine:image:not-installed', name: 'Spoof', endpoint: 'https://evil.example/ni', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '' },
+    ];
+    assert.equal(M.resolveService('engine:llm:flash', { custom: spoofedCustom })?.endpoint, 'http://127.0.0.1:17972/api/ai/providers/oaiy-engine/v1/chat/completions');
+    assert.equal(M.resolveService('voice:transcribe', { custom: spoofedCustom })?.endpoint, 'http://127.0.0.1:17972/api/voice/transcribe');
+    assert.equal(M.resolveService('companion:rig', { custom: spoofedCustom })?.endpoint, 'http://127.0.0.1:9000/run');
+    assert.equal(M.resolveService('engine:image:not-installed', { custom: spoofedCustom }), null);
+  } finally {
+    if (prevCustom === undefined) store.delete('oaiy.customServices');
+    else store.set('oaiy.customServices', prevCustom);
+    if (prevDesktop === undefined) store.delete('oaiy.desktopServices');
+    else store.set('oaiy.desktopServices', prevDesktop);
+  }
+});
+
+await check('31. Wave-4: PackageMacros isolation, executeSubflow fail-closed & createPrefixedNodeId / authoritative packageId', async () => {
+  // 1) Non-package job must NOT see packageMacros even when a package macro shares an ID with a user macro
+  const trustedMacro = {
+    id: 'shared-macro-id',
+    name: 'User Macro',
+    isMacro: true,
+    createdAt: '',
+    updatedAt: '',
+    graph: {
+      nodes: [],
+      edges: [],
+    },
+  };
+  const evilPkgMacro = {
+    id: 'shared-macro-id',
+    name: 'Hijack Macro',
+    isMacro: true,
+    untrusted: true,
+    packageId: 'com.evil',
+    createdAt: '',
+    updatedAt: '',
+    graph: {
+      nodes: [{ id: 'lb1', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return "HIJACKED"' } }],
+      edges: [],
+    },
+  };
+  const rtTrusted = new M.OAIYRuntime({ useWorkerForUntrusted: false });
+  rtTrusted.setAvailableFlows([trustedMacro]);
+  rtTrusted.setPackageMacros([evilPkgMacro]);
+  await rtTrusted.registerDynamicModule({
+    manifest: { id: 'core-flow-control', name: 'Subflow', version: '1.0.0', nodes: [] },
+    runtime: M.SubflowRuntime,
+  });
+  // Calling shared-macro-id from trusted context (no currentPackageId) must resolve trustedMacro, NOT evilPkgMacro
+  const resTrusted = await rtTrusted.executeScript('return await Subflow.execute("shared-macro-id", {});');
+  assert.notEqual(resTrusted, 'HIJACKED', 'trusted context must never resolve packageMacros');
+
+  // 2) Trusted context must fail closed if availableFlows contains an untrusted, packageId-tagged, or pkg:* subflow
+  const rtGuard = new M.OAIYRuntime({ useWorkerForUntrusted: false });
+  rtGuard.setAvailableFlows([
+    { id: 'u-sub', name: 'Untrusted', untrusted: true, createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } },
+    { id: 'p-sub', name: 'PkgTagged', packageId: 'com.evil', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } },
+    { id: 'n-sub', name: 'HasPkgNode', createdAt: '', updatedAt: '', graph: { nodes: [{ id: 'x', type: 'pkg:com.evil:n', position: { x: 0, y: 0 }, data: {} }], edges: [] } },
+  ]);
+  await rtGuard.registerDynamicModule({
+    manifest: { id: 'core-flow-control', name: 'Subflow', version: '1.0.0', nodes: [] },
+    runtime: M.SubflowRuntime,
+  });
+  for (const id of ['u-sub', 'p-sub', 'n-sub']) {
+    await assert.rejects(
+      () => rtGuard.executeScript(`return await Subflow.execute("${id}", {});`),
+      /Refusing to execute untrusted or package subflow/,
+      `trusted context must reject subflow ${id}`,
+    );
+  }
+
+  // 3) JobManager does not attach packageMacros to non-package jobs
+  const jm = new M.JobManager({ databaseHandler: async () => ({ success: true, data: [] }) });
+  jm.setAvailableFlows([
+    { id: 'user-only', name: 'User', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } },
+  ]);
+  jm.setPackageMacros([evilPkgMacro]);
+  const jobId = jm.submit('caller', 'Caller', { nodes: [], edges: [] });
+  const doneJob = await new Promise((resolve) => {
+    const unsub = jm.onStateChange((jobs) => {
+      const j = jobs.find((x) => x.id === jobId);
+      if (j && (j.status === 'completed' || j.status === 'failed' || j.status === 'aborted')) {
+        unsub();
+        resolve(j);
+      }
+    });
+  });
+  assert.equal(doneJob.status, 'completed', `non-package job should complete cleanly without packageMacros contamination (got ${doneJob.error})`);
+
+  // 4) createPrefixedNodeId enforces verified packageId and rejects colons
+  assert.equal(M.createPrefixedNodeId('com.real', 'my_node'), 'pkg:com.real:my_node');
+  assert.throws(() => M.createPrefixedNodeId('com.trusted:spoof', 'my_node'), /Invalid packageId/);
+  assert.throws(() => M.createPrefixedNodeId('com.real', 'bad:node'), /Invalid nodeId/);
+
+  // 5) JobManager resolves authoritative packageId from moduleRegistry.getModuleForNode().path over spoofed node type prefix
+  const lookedUp = [];
+  const spoofRegistry = {
+    getNodeDefinition: () => ({ id: 'pkg:com.trusted:steal', name: 'Steal', inputs: [], outputs: [{ id: 'out', name: 'out', type: 'string' }], compiler: {} }),
+    getModuleForNode: () => ({
+      path: 'package:com.actual-evil/nodes',
+      compiler: { name: 'Evil', getNodeTypes: () => ['pkg:com.trusted:steal'], compileNode: (_t, c) => `let ${c.outputVar} = 1;` },
+      manifest: { id: 'pkg-evil' },
+    }),
+    getCompiler: () => ({ name: 'Evil', getNodeTypes: () => ['pkg:com.trusted:steal'], compileNode: (_t, c) => `let ${c.outputVar} = 1;` }),
+    getAllNodeDefinitions: () => [],
+    getAllModules: () => [],
+  };
+  const jmSpoof = new M.JobManager({
+    databaseHandler: async () => ({ success: true, data: [] }),
+    moduleRegistry: spoofRegistry,
+    packagePermissionsLookup: (pkgId) => {
+      lookedUp.push(pkgId);
+      return pkgId === 'com.trusted' ? ['filesystem', 'process:execute'] : [];
+    },
+  });
+  const spoofJobId = jmSpoof.submit('f-spoof', 'Spoof', {
+    nodes: [{ id: 's1', type: 'pkg:com.trusted:steal', position: { x: 0, y: 0 }, data: {} }],
+    edges: [],
+  });
+  await new Promise((resolve) => {
+    const unsub = jmSpoof.onStateChange((jobs) => {
+      const j = jobs.find((x) => x.id === spoofJobId);
+      if (j && (j.status === 'completed' || j.status === 'failed' || j.status === 'aborted')) {
+        unsub();
+        resolve(j);
+      }
+    });
+  });
+  assert.deepEqual(lookedUp, ['com.actual-evil'], 'JobManager must look up authoritative owning packageId from module path, not spoofed prefix');
+});
+
+await check('32. Wave-4: detectSandboxEscape Acorn AST walk defeats regex-literal bypass and fails closed on parse errors', () => {
+  // Regex-literal bypass that previously broke the char-scanner
+  assert.equal(M.detectSandboxEscape('/"/; globalThis; /"/;'), 'globalThis');
+  assert.equal(M.detectSandboxEscape('/\'/; eval("1"); /\'/;'), 'eval()');
+  assert.equal(M.detectSandboxEscape('/`/; Function("return this")(); /`/;'), 'Function constructor');
+  assert.ok(M.stripCommentsAndStringsFromCode('/"/; globalThis; /"/;').includes('globalThis'));
+
+  // AST catches computed constructor chains, indirect eval, new Function, import(), import.meta, arrows & IIFEs
+  assert.equal(M.detectSandboxEscape('const x = ({})["constructor"]["constructor"]("return this")();'), 'constructor.constructor chain');
+  assert.equal(M.detectSandboxEscape('const x = (() => {}).constructor("return this")();'), 'constructor.constructor chain');
+  assert.equal(M.detectSandboxEscape('const x = (0, eval)("1");'), 'eval()');
+  assert.equal(M.detectSandboxEscape('const x = new Function("return 1");'), 'Function constructor');
+  assert.equal(M.detectSandboxEscape('const x = import("./mod.js");'), 'dynamic import()');
+  assert.equal(M.detectSandboxEscape('const x = import.meta.url;'), 'import.meta');
+  assert.equal(M.detectSandboxEscape('const x = (function(){ return this; })();'), '(function(){return this})()');
+  assert.equal(M.detectSandboxEscape('const x = () => this;'), '() => this arrow');
+
+  // Fails closed on syntax / wrapper-breakout errors
+  assert.equal(M.detectSandboxEscape('const x = 1 +;'), 'unparseable script');
+  assert.equal(M.detectSandboxEscape('}; globalThis; {'), 'unparseable script');
+
+  // Legitimate compiled workflow code (await, yield, top-level return, division, strings) stays allowed
+  assert.equal(M.detectSandboxEscape('const a = 10 / 2; const s = "globalThis"; yield Utility.requireCodeExecute([]); return await Foo.bar(a, s);'), null);
+});
+
+await check('33. Wave-4: NetworkUtils aligns with shared/capabilities/local.ts (.internal, .local, .lan, .home.arpa, single-label, NAT64, 6to4, Teredo)', () => {
+  for (const localUrl of [
+    'http://metadata.google.internal/computeMetadata/v1/',
+    'http://printer.local:631/',
+    'http://router.lan/',
+    'http://nas.home.arpa/',
+    'http://intranet:8080/',
+    'http://[64:ff9b::127.0.0.1]/',
+    'http://[64:ff9b::169.254.169.254]/',
+    'http://[64:ff9b:1::1]/',
+    'http://[2002:7f00:0001::1]/',
+    'http://[2002:a9fe:a9fe::1]/',
+    // Teredo encoding client 127.0.0.1 => inverted 0x7f00 -> 0x80ff, 0x0001 -> 0xfffe
+    'http://[2001:0000:4136:e378:8000:63bf:80ff:fffe]/',
+  ]) {
+    assert.equal(M.isLocalNetworkUrl(localUrl), true, `expected local/private: ${localUrl}`);
+  }
+  for (const pubUrl of [
+    'https://api.openai.com/v1/chat/completions',
+    'http://[2606:4700:4700::1111]/',
+    'http://[64:ff9b::8.8.8.8]/',
+    'http://[2002:0808:0808::1]/',
+  ]) {
+    assert.equal(M.isLocalNetworkUrl(pubUrl), false, `expected public: ${pubUrl}`);
+  }
+});
+
+await check('34. Wave-4: core-utility template {{toString}}, core-browser quoted CSS selector & flowIds FLOW_REFS', async () => {
+  // template {{toString}} / {{constructor}} / {{__proto__}} must not inherit Object.prototype methods
+  const tmplCode = M.UtilityCompiler.compileNode('template', {
+    node: { id: 'tpl1', type: 'template', data: { template: 'Hi {{input}} {{toString}} {{constructor}} {{__proto__}}' } },
+    inputs: new Map([['input', 'node_in']]),
+    outputVar: 'node_tpl1_out',
+    sanitizedId: 'tpl1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  const tmplOut = new Function(`let node_in = "World"; let workflow_context = {}; ${tmplCode}\nreturn node_tpl1_out;`)();
+  assert.equal(tmplOut, 'Hi World {{toString}} {{constructor}} {{__proto__}}');
+
+  // core-browser quoted CSS selector on session page must NOT double-escape quotes
+  const browserCode = M.BrowserCompiler.compileNode('browser_extract', {
+    node: { id: 'bx1', type: 'browser_extract', data: { type: 'selector', selector: 'a[href="https://example.com"]', attribute: 'data-x="1"' } },
+    inputs: new Map([['session', 'sess_var']]),
+    outputVar: 'node_bx1_out',
+    sanitizedId: 'bx1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  let capturedProbe = '';
+  const evalFn = new Function(
+    'Browser',
+    'sess_var',
+    `return (async () => { let workflow_context = {}; ${browserCode}; return node_bx1_out; })();`,
+  );
+  await evalFn(
+    { evaluateJson: async (_id, script) => { capturedProbe = script; return 'ok'; } },
+    { id: 's1' },
+  );
+  // Evaluating the probe's selector assignment must yield the exact unescaped CSS selector
+  assert.ok(capturedProbe.includes('const sel = "a[href=\\"https://example.com\\"]";'), `probe selector was corrupted: ${capturedProbe}`);
+  const extractedSel = new Function(`return ${capturedProbe.replace(/const r =[\s\S]*/, 'return [sel, attr]; })()')};`)();
+  assert.deepEqual(extractedSel, ['a[href="https://example.com"]', 'data-x="1"']);
+
+  // flowIds.ts FLOW_REFS covers all 5 flow/macro reference fields
+  assert.deepEqual([...M.FLOW_REFS], ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']);
+  const untrustedTarget = { id: 'u1', untrusted: true, graph: { nodes: [], edges: [] } };
+  for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+    const g = { nodes: [{ id: 'n1', type: 'macro', data: { [field]: 'u1' } }] };
+    assert.equal(M.reachesUntrusted('caller', g, [untrustedTarget]), true, `reachesUntrusted must trace ${field}`);
+  }
+});
+
+await check('35. Wave-4: core-ai extractVideoFrames guards, contractRuntime cache/path hardening, non-local file_path & UI/registry fixes', async () => {
+  // 1) core-ai extractVideoFrames rejects file:// without filesystem:read and path traversal
+  const aiPkg = M.AIRuntime.createMethods({
+    log() {},
+    onNodeStatus() {},
+    currentPackageId: 'pkg-no-fs',
+    hasPermission: () => false,
+    secureFetch: async () => mockResp(200, { choices: [{ message: { content: 'ok' } }] }),
+  });
+  await assert.rejects(
+    () => aiPkg.chat('', 'describe', null, 'https://api.example.com/v1/chat/completions', 'm', '', false, 64, 0, 'text', false, 'auto', 'n1', [], '', 0, 0, false, '', 'file:///etc/passwd', 2),
+    /lacks required permission 'filesystem:read'/,
+  );
+  const aiTrusted = M.AIRuntime.createMethods({
+    log() {},
+    onNodeStatus() {},
+    secureFetch: async () => mockResp(200, { choices: [{ message: { content: 'ok' } }] }),
+  });
+  await assert.rejects(
+    () => aiTrusted.chat('', 'describe', null, 'https://api.example.com/v1/chat/completions', 'm', '', false, 64, 0, 'text', false, 'auto', 'n1', [], '', 0, 0, false, '', 'file:///tmp/../etc/passwd', 2),
+    /Path traversal/,
+  );
+
+  // 2) contractRuntime listOaiyServices checks network:local BEFORE 30s cache & runContract rejects non-local file paths
+  const origDesktop = globalThis.__OAIY_DESKTOP__;
+  globalThis.__OAIY_DESKTOP__ = { origin: 'http://127.0.0.1:17972', token: 'tok' };
+  try {
+    // Warm the 30s cache as a trusted caller
+    const warm = await M.listOaiyServices({
+      log() {},
+      secureFetch: async () => mockResp(200, { services: [{ id: 'engine:llm:m', endpoint: '/api/ai/providers/oaiy-engine/v1/chat/completions' }] }),
+    });
+    assert.equal(warm.length, 1);
+    // Package lacking network:local MUST still be denied even though the cache is warm
+    await assert.rejects(
+      () => M.listOaiyServices({ log() {}, currentPackageId: 'pkg-no-local', hasPermission: () => false }),
+      /lacks required permission 'network:local'/,
+    );
+  } finally {
+    if (origDesktop === undefined) delete globalThis.__OAIY_DESKTOP__;
+    else globalThis.__OAIY_DESKTOP__ = origDesktop;
+  }
+
+  await assert.rejects(
+    () => M.runContract(
+      { log() {}, secureFetch: async () => mockResp(200, { path: '/etc/passwd' }) },
+      { id: 'remote-vid', name: 'RemoteVid', endpoint: 'https://remote.example.com/make', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: 'path', output: 'video' },
+      {},
+      { nodeId: 'v1' },
+    ),
+    /non-local endpoint/,
+  );
+
+  // 3) core-video refuses non-local file_path and does NOT call ensure_service_ready_by_port for remote URLs
+  const autoStartPorts = [];
+  const vidMod = M.VideoRuntime.createMethods({
+    log() {},
+    onNodeStatus() {},
+    tauri: {
+      invoke: async (cmd, args) => {
+        if (cmd === 'ensure_service_ready_by_port') autoStartPorts.push(args);
+        return { success: true, port: 8768 };
+      },
+    },
+    fetch: async () => mockResp(200, { success: true, video_path: '/etc/passwd', file_path: '/etc/passwd' }),
+  });
+  await assert.rejects(
+    () => vidMod.generateAvatar('/tmp/a.png', '/tmp/a.wav', 'hi', 'https://remote.example.com:8768/generate', 5, 20, 'va1'),
+    /non-local endpoint/,
+  );
+  assert.equal(autoStartPorts.length, 0, 'remote URL must never trigger ensure_service_ready_by_port');
+
+  // 4) oaiyAgentTools checks project-level untrusted state
+  const prevProj = store.get('oaiy_project');
+  store.set('oaiy_project', JSON.stringify({ id: 'p1', name: 'Imported', untrusted: true, flows: [] }));
+  try {
+    const cleanFlow = { id: 'f-clean', name: 'Clean', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } };
+    assert.equal(M.isUntrustedOrPkgFlow(cleanFlow), true, 'project-level untrusted must block isUntrustedOrPkgFlow');
+  } finally {
+    if (prevProj === undefined) store.delete('oaiy_project');
+    else store.set('oaiy_project', prevProj);
+  }
+
+  // 5) reloadRequiresTrustReconfirm re-prompts on contentHash change for unverified or active-component packages
+  const baseManifest = { id: 'com.demo', name: 'Demo', version: '1.0.0', entryFlow: 'main.json', flows: ['main.json'], permissions: [] };
+  assert.equal(M.reloadRequiresTrustReconfirm(baseManifest, baseManifest, 'hash_matched', 'hash_matched', 'hash-a', 'hash-b'), true);
+  assert.equal(M.reloadRequiresTrustReconfirm(baseManifest, baseManifest, 'signature_verified', 'signature_verified', 'hash-a', 'hash-b'), false);
+  const withMacros = { ...baseManifest, macros: ['m.json'] };
+  assert.equal(M.reloadRequiresTrustReconfirm(withMacros, withMacros, 'signature_verified', 'signature_verified', 'hash-a', 'hash-b'), true);
+
+  // 6) Static assertions for PackageManager oversize-cancel, useDesktopFlows mirror guard, core-audio token redaction, customNodeRegistry unload
+  const pmSrc = fs.readFileSync(path.join(UI, 'src/components/PackageManager/PackageManager.tsx'), 'utf8');
+  assert.match(pmSrc, /if \(!ok\) \{\s*setPendingInstall\(null\);\s*return;\s*\}/);
+  const dfSrc = fs.readFileSync(path.join(UI, 'src/hooks/useDesktopFlows.ts'), 'utf8');
+  assert.ok(dfSrc.includes('!isUntrustedOrPkgFlow(f, flows)'), 'useDesktopFlows must guard tool/hook mirroring with !isUntrustedOrPkgFlow');
+  const audioSrc = fs.readFileSync(path.join(UI, 'src/bundled-modules/core-audio/runtime.ts'), 'utf8');
+  assert.ok(audioSrc.includes('redactMediaToken(audioUrl)'), 'core-audio must redact media token in TTS Media URL log');
+  const regSrc = fs.readFileSync(path.join(UI, 'src/services/customNodeRegistry.ts'), 'utf8');
+  assert.ok(regSrc.includes('moduleLoader.unloadModule(moduleId)'), 'customNodeRegistry.unregisterPackageNodes must unload ModuleLoader modules');
 });
 
 finish();

@@ -263,7 +263,9 @@ const CoreBrowserCompiler: ModuleCompiler = {
             // A selector on a session's page is run in the page, on its own DOM: as the extraction does it
             // (each match's text, inner HTML or attribute; one alone as itself), where there is no DOM to parse
             // HTML into (the CLI), which answered "" for every selector.
-            const probe = `(() => { const sel = ${JSON.stringify(selector)}; const attr = ${JSON.stringify(attribute)}; ` +
+            const rawSelector = String(data.selector || '');
+            const rawAttribute = String(data.attribute || 'text');
+            const probe = `(() => { const sel = ${JSON.stringify(rawSelector)}; const attr = ${JSON.stringify(rawAttribute)}; ` +
               `const r = Array.from(document.querySelectorAll(sel)).map(e => attr === 'text' ? (e.textContent || '') : attr === 'html' ? e.innerHTML : (e.getAttribute(attr) || '')); ` +
               `return r.length === 1 ? r[0] : r; })()`;
             code += `

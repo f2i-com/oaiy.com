@@ -68,6 +68,9 @@ const registeredNodes = new Map<string, RegisteredCustomNode>();
 // Map from package ID to list of node types
 const packageNodes = new Map<string, string[]>();
 
+// Map from package ID to list of ModuleLoader module IDs registered for its custom nodes
+const packageModuleIds = new Map<string, string[]>();
+
 // Version counter for cache invalidation
 let registryVersion = 0;
 
@@ -79,6 +82,12 @@ let registryVersion = 0;
  * Get the full node type for a custom node
  */
 export function getFullNodeType(packageId: string, nodeId: string): string {
+  if (!packageId || typeof packageId !== 'string' || packageId.includes(':')) {
+    throw new Error(`Invalid packageId for custom node: ${JSON.stringify(packageId)}`);
+  }
+  if (!nodeId || typeof nodeId !== 'string' || nodeId.includes(':')) {
+    throw new Error(`Invalid nodeId for custom node: ${JSON.stringify(nodeId)}`);
+  }
   return `pkg:${packageId}:${nodeId}`;
 }
 
@@ -277,6 +286,11 @@ export async function registerCustomNode(
         moduleCompiler
       );
       if (result.success) {
+        const existingModules = packageModuleIds.get(packageId) || [];
+        if (!existingModules.includes(moduleManifest.id)) {
+          existingModules.push(moduleManifest.id);
+          packageModuleIds.set(packageId, existingModules);
+        }
         logger.debug(`Registered with ModuleLoader: ${fullType}`);
       } else {
         logger.warn(`ModuleLoader registration failed`, { error: result.error });
@@ -339,6 +353,16 @@ export function unregisterPackageNodes(packageId: string): void {
     registeredNodes.delete(nodeType);
     unregisterCompiler(nodeType);
     logger.debug(`Unregistered: ${nodeType}`);
+  }
+
+  const moduleIds = packageModuleIds.get(packageId) || [];
+  if (moduleIds.length > 0) {
+    const moduleLoader = getModuleLoader();
+    for (const moduleId of moduleIds) {
+      void moduleLoader.unloadModule(moduleId);
+      logger.debug(`Unloaded from ModuleLoader: ${moduleId}`);
+    }
+    packageModuleIds.delete(packageId);
   }
 
   packageNodes.delete(packageId);

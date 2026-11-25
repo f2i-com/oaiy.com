@@ -1529,11 +1529,37 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const gb = mb => (mb / 1024).toFixed(1);
 const bytesGb = b => (b / 1073741824).toFixed(1);
-const fileUrl = u => !u || !key ? u : u + (u.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
-const safeMediaUrl = u => {
-  if (typeof u !== "string") return "";
+const trustedMediaOrigin = origin => {
+  if (!origin || origin === "null") return false;
+  if (origin === location.origin) return true;
+  if (state?.gateway_url) {
+    try { if (origin === new URL(state.gateway_url).origin) return true; } catch {}
+  }
+  return false;
+};
+const fileUrl = u => {
+  if (!u || !key || typeof u !== "string" || /[\x00-\x1f\x7f]/.test(u)) return u;
+  let parsed;
+  try { parsed = new URL(u, location.origin); } catch { return u; }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !trustedMediaOrigin(parsed.origin)) return u;
+  const hashIdx = u.indexOf("#");
+  const base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
+  const hash = hashIdx >= 0 ? u.slice(hashIdx) : "";
+  return base + (base.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key) + hash;
+};
+const safeMediaUrl = (u, node) => {
+  if (typeof u !== "string" || /[\x00-\x1f\x7f]/.test(u)) return "";
   const s = u.trim();
-  return /^(\/|https?:\/\/|blob:)/i.test(s) && !s.startsWith("//") && !s.startsWith("/\\") ? s : "";
+  if (!s) return "";
+  let parsed;
+  try { parsed = new URL(s, location.origin); } catch { return ""; }
+  if (node) {
+    const prefix = "/api/play/node/" + encodeURIComponent(node) + "/";
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.origin === location.origin && parsed.pathname.startsWith(prefix) ? parsed.href : "";
+  }
+  if (parsed.protocol === "blob:") return parsed.origin === location.origin ? parsed.href : "";
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  return trustedMediaOrigin(parsed.origin) ? parsed.href : "";
 };
 const safeJobId = id => {
   if (typeof id !== "string" || id === "." || id === ".." || !/^[A-Za-z0-9._-]+$/.test(id)) throw new Error("Invalid job ID");
@@ -2800,7 +2826,7 @@ function renderState() {
   keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">`
       : AUDIO_ICONS[j.kind] && j.files[0] ? `<div class="ph icon" data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open the result"><svg viewBox="0 0 24 24" aria-hidden="true">${AUDIO_ICONS[j.kind]}</svg></div>` : '<div class="ph"></div>'}
     <div><div class="p">${esc(jobTitle(j))}</div><div class="muted small">${[esc(j.model), esc(jobSize(j)), statusText(j)].filter(Boolean).join(", ")}</div></div>
-    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${esc(j.id)}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" data-open>Open</a>` : ""}</div></div>`,
+    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${esc(j.id)}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" rel="noopener noreferrer" data-open>Open</a>` : ""}</div></div>`,
     nothingYet);
   $$("#ov-jobs [data-job]").forEach(el => el.onclick = () => openViewer(el.dataset.job));
   const all = [...state.media.jobs, ...priv];
@@ -3227,7 +3253,7 @@ $("#img-model").addEventListener("change", renderImageHints);
 
 // The stage shows one result large; the strip keeps this session's.
 function stageShow(k, item) {
-  const url = safeMediaUrl(item.url), poster = safeMediaUrl(item.poster);
+  const url = safeMediaUrl(item.url, item.node), poster = safeMediaUrl(item.poster, item.node);
   if (!url) { toast("Refused an unsafe media URL", true); return; }
   const stage = $(`#${k}-stage`);
   $$(".shown, .actions", stage).forEach(x => x.remove());
@@ -3235,7 +3261,7 @@ function stageShow(k, item) {
   $(".expiry", stage)?.remove(); $(".gone", stage)?.remove();
   const media = item.video ? `<video class="shown" src="${esc(url)}" poster="${esc(poster)}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(url)}" alt="${esc(item.prompt)}">`;
   if (item.expires) stage.insertAdjacentHTML("afterbegin", `<div class="expiry">Incognito: deleted at ${new Date(item.expires).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}. Save it to keep it.</div>`);
-  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(url)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
+  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer" data-open>Open</a><a class="btn" href="${esc(url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
   $("[data-reuse]", stage).onclick = () => { $(`#${k}-prompt`).value = item.prompt; $(`#${k}-prompt`).focus(); };
   $(".shown", stage).onerror = () => {
     $$(".shown, .actions, .expiry", stage).forEach(x => x.remove());
@@ -3245,7 +3271,7 @@ function stageShow(k, item) {
 }
 function stageAdd(k, items) {
   const strip = $(`#${k}-strip`);
-  const valid = items.map(item => ({...item, url: safeMediaUrl(item.url), poster: safeMediaUrl(item.poster)})).filter(item => item.url);
+  const valid = items.map(item => ({...item, url: safeMediaUrl(item.url, item.node), poster: safeMediaUrl(item.poster, item.node)})).filter(item => item.url);
   if (!valid.length) {
     if (items.length) toast("Refused an unsafe media URL", true);
     return;
@@ -3310,7 +3336,7 @@ $("#img-form").onsubmit = async e => {
   try {
     // (an edit on a paired computer is a picture request with its pictures in it, as its picture route takes it)
     const r = await api(c.node ? playUrl(c, "images") : refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
-    stageAdd("img", r.data.map(d => ({url: fileUrl(safeMediaUrl(d.url)), prompt: body.prompt, expires: expiry("img")})));
+    stageAdd("img", r.data.map(d => ({url: fileUrl(safeMediaUrl(d.url, c.node)), node: c.node || undefined, prompt: body.prompt, expires: expiry("img")})));
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
@@ -3356,7 +3382,7 @@ $("#vid-form").onsubmit = async e => {
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
     const j = c.node ? null : state.media.jobs.find(j => j.id === v.id);
-    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`${route}/${encodeURIComponent(safeJobId(v.id))}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: c.node ? 0 : expiry("vid")}]);
+    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`${route}/${encodeURIComponent(safeJobId(v.id))}/content`), node: c.node || undefined, poster: j?.preview, prompt: body.prompt, video: true, expires: c.node ? 0 : expiry("vid")}]);
   } catch (err) { toast(err.message, true); }
   vidJobId = null; vidRoute = null; progress("vid", null); $("#vid-go").disabled = false;
 };
@@ -3640,10 +3666,10 @@ function openViewer(id) {
     ["Length", (j.kind === "video" || j.kind === "music" || j.kind === "sound") && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
     ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
-  const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank" data-open>Image ${i + 2}</a>`).join("");
+  const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank" rel="noopener noreferrer" data-open>Image ${i + 2}</a>`).join("");
   const glb = j.kind === "model3d";
   // (the result's own: open, save, its other pictures; then reuse; Remove last, apart from them)
-  $("#viewer-actions").innerHTML = (file && glb ? `<a class="btn" href="${esc(file)}" download="model.glb">Download GLB</a>` : file ? `<a class="btn" href="${esc(file)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
+  $("#viewer-actions").innerHTML = (file && glb ? `<a class="btn" href="${esc(file)}" download="model.glb">Download GLB</a>` : file ? `<a class="btn" href="${esc(file)}" target="_blank" rel="noopener noreferrer" data-open>Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
     + others + `<button class="btn" id="viewer-reuse"${glb || !j.prompt ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>`;
   $("#viewer-reuse").onclick = () => {
     const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : j.kind === "music" ? "music" : j.kind === "sound" ? "sound" : "image";
@@ -3941,7 +3967,7 @@ function dlCard(m, group, hw = hostHardware()) {
     `<span title="${esc(m.license)}">${esc(m.license)}</span>`,
   ];
   // (what to do, before the download: said as done, "is accepted … then a token is saved", it read as done already)
-  const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener">its page on huggingface.co</a>` : "its page on huggingface.co";
+  const page = m.licence_url ? `<a href="${esc(m.licence_url)}" target="_blank" rel="noopener noreferrer">its page on huggingface.co</a>` : "its page on huggingface.co";
   const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>${dl.token
       ? `Accept its licence on ${page}, signed in as the account your saved token is from, before you download it.`
       : dl.token_host ? `Accept its licence on ${page} (signed in) before you download it. ${tokenLine()}`

@@ -273,6 +273,7 @@ export function createBroker(deps: BrokerDeps): Broker {
           },
           controller.signal,
         )
+        .catch(() => send({ id, t: 'error', error: errorBody('internal', 'The request could not be made.') }))
         .finally(() => inFlight.delete(id));
     }
 

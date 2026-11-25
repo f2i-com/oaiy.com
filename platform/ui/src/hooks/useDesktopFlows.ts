@@ -35,7 +35,7 @@
 import { useEffect, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { Flow, OAIYProject } from 'oaiy-core';
-import { hookFlowId, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
+import { hookFlowId, isUntrustedOrPkgFlow, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
 import { withNodeServices, withoutNodeServices } from '../bundled-modules/core-service/contract';
 import { withoutProviderSeeds } from '../utils/NodeDefaults';
 
@@ -428,11 +428,14 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
             synced.current.set(id, key);
             there.current.add(id);
             // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
-            for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
-              if (!there.current.has(copyId)) continue;
-              const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
-              const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
-              if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: withNodeServices(f.graph.nodes), edges: f.graph.edges });
+            // Never mirror an untrusted flow, untrusted project, transitive untrusted caller, or pkg:* flow.
+            if (!isUntrustedOrPkgFlow(f, flows)) {
+              for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
+                if (!there.current.has(copyId)) continue;
+                const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+                const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
+                if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: withNodeServices(f.graph.nodes), edges: f.graph.edges });
+              }
             }
           }
           // Deleted here, by the person: removed there too (and as the agent's tool, or what goes in front of one).

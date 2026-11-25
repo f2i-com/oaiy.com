@@ -205,7 +205,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
         if (debug) {
           console.log(`[Template Compiler] Node ${node.id}: found templateVars:`, templateVars);
         }
-        const varMap: Record<string, string> = {};
+        const varMap: Record<string, string> = Object.create(null);
 
         // Render a connected value into a template slot at RUNTIME. The old
         // `"" + (v || '')` coercion silently dropped falsy values (0, false,
@@ -219,16 +219,16 @@ const CoreUtilityCompiler: ModuleCompiler = {
         let firstInputVar: string | null = null;
 
         // Get custom input names from node data (e.g., ['value', 'count'])
-        const inputNames = (data.inputNames as string[]) || [];
-        // Map from standard handle IDs to custom names
-        const handleToName: Record<string, string> = {
+        const inputNames = Array.isArray(data.inputNames) ? (data.inputNames as string[]) : [];
+        // Map from standard handle IDs to custom names (null-prototype to avoid Object.prototype hits)
+        const handleToName: Record<string, string> = Object.assign(Object.create(null), {
           'input': inputNames[0] || 'input',
           'input2': inputNames[1] || 'input2',
           'input3': inputNames[2] || 'input3',
           'input4': inputNames[3] || 'input4',
           'input5': inputNames[4] || 'input5',
           'input6': inputNames[5] || 'input6',
-        };
+        });
 
         // Build map of template variable -> source variable
         for (const [handleId, sourceVar] of inputs) {
@@ -301,7 +301,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // Substitute connected variables
           for (const varName of templateVars) {
             const cleanName = varName.replace(/\{\{|\}\}/g, '');
-            if (varMap[cleanName]) {
+            if (Object.prototype.hasOwnProperty.call(varMap, cleanName)) {
               code += `
     _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{${cleanName}}}").join(${slot(varMap[cleanName])});`;
             }
@@ -329,7 +329,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // Substitute connected variables
           for (const varName of templateVars) {
             const cleanName = varName.replace(/\{\{|\}\}/g, '');
-            if (varMap[cleanName]) {
+            if (Object.prototype.hasOwnProperty.call(varMap, cleanName)) {
               code += `
   _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{${cleanName}}}").join(${slot(varMap[cleanName])});`;
             }

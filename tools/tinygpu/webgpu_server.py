@@ -62,7 +62,7 @@ SHIMS = pathlib.Path.home() / ".local" / "bin"
 DOCKER_BINS = ("/Applications/Docker.app/Contents/Resources/bin", str(pathlib.Path.home() / ".docker" / "bin"), "/usr/local/bin", "/opt/homebrew/bin")
 ALIGN = 256
 PROTOCOL = 3   # the requests as below; a client of another version is told so at HELLO (crates/wgpu-tinygpu's PROTOCOL)
-SCRATCH = 160 * 64 * 1024   # a kernel's scratch, where it takes one (wgsl-cuda's SCRATCH_BYTES: 1 KB a warp)
+SCRATCH = 256 * 64 * 1024   # a kernel's scratch, where it takes one (wgsl-cuda's SCRATCH_BYTES: 1 KB a warp)
 
 # the queue's own copies and clears: kernels on the compute queue, so they keep their place among the dispatches. One
 # kernel a translation unit: tinygrad reads a program's registers and stack from the cubin's .nv.info, taking the last

@@ -77,4 +77,14 @@ describe('the budget', () => {
     await h.db.put('budget', 'agent', [at + 10 * HOUR, at + 10 * HOUR]);
     assert.deepEqual(await h.budget.usage('agent'), { used: 0, limit: 600, bytes: 0, byteLimit: 64 * 1024 * 1024 });
   });
+
+  it('setLimits validates both limits before persisting anything', async () => {
+    const h = makeHolder();
+    await h.budget.setLimits('agent', 10, 8 * 1024 * 1024);
+    assert.equal(await h.budget.limit('agent'), 10);
+    assert.equal(await h.budget.byteLimit('agent'), 8 * 1024 * 1024);
+    await assert.rejects(h.budget.setLimits('agent', 25, -1), /whole number/);
+    assert.equal(await h.budget.limit('agent'), 10, 'first limit was not partially persisted');
+    assert.equal(await h.budget.byteLimit('agent'), 8 * 1024 * 1024);
+  });
 });

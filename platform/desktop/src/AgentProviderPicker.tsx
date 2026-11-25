@@ -50,17 +50,26 @@ export function looksLocal(url: string): boolean {
   } catch {
     return false;
   }
-  return (
+  if (
     host === 'localhost' ||
     host.endsWith('.localhost') ||
     host.endsWith('.local') ||
     host.endsWith('.lan') ||
-    host === '::1' ||
+    host === '::1'
+  ) {
+    return true;
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  const octets = m.slice(1).map(Number);
+  if (octets.some((n) => n > 255)) return false;
+  const [a, b] = octets;
+  return (
     host === '0.0.0.0' ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    a === 127 ||
+    a === 10 ||
+    (a === 192 && b === 168) ||
+    (a === 172 && b >= 16 && b <= 31)
   );
 }
 

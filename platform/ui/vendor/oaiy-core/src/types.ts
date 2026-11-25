@@ -529,10 +529,15 @@ export interface Flow {
    */
   remote?: boolean;
   /**
-   * Flow arrived from an untrusted source (shared link, imported project/flow).
+   * Flow arrived from an untrusted source (shared link, imported project/flow, or loaded package).
    * Executed under hardened sandbox restrictions with minimal permissions.
    */
   untrusted?: boolean;
+  /**
+   * Owning package ID when this flow or macro was loaded from a `.oaiy` package.
+   * Used to isolate package macros to their owning package context.
+   */
+  packageId?: string;
 }
 
 /**

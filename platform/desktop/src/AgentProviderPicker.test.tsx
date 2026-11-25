@@ -255,9 +255,21 @@ describe('a provider that does not answer', () => {
 
 describe('the helpers', () => {
   it('tell a local address from one on the internet', () => {
-    for (const url of ['http://localhost:1234/v1', 'http://127.0.0.1:11434', 'http://[::1]:8000', 'http://192.168.1.20:1234', 'http://10.0.0.5', 'http://box.local:8080', 'http://172.20.0.2'])
+    for (const url of ['http://localhost:1234/v1', 'http://127.0.0.1:11434', 'http://[::1]:8000', 'http://0.0.0.0:8000', 'http://192.168.1.20:1234', 'http://10.0.0.5', 'http://box.local:8080', 'http://172.20.0.2'])
       expect(looksLocal(url), url).toBe(true);
-    for (const url of ['https://api.openai.com/v1', 'https://openrouter.ai/api/v1', 'http://172.32.0.1', 'not a url']) expect(looksLocal(url), url).toBe(false);
+    for (const url of [
+      'https://api.openai.com/v1',
+      'https://openrouter.ai/api/v1',
+      'http://172.32.0.1',
+      'http://172.15.0.1',
+      'http://10.example.com/v1',
+      'http://127.example.com/v1',
+      'http://192.168.example.com/v1',
+      'http://172.16.example.com/v1',
+      'http://10.0.0.256/v1',
+      'not a url',
+    ])
+      expect(looksLocal(url), url).toBe(false);
   });
 
   it('pick a free id, the model to start on, and the providers the Agent can use', () => {
@@ -276,10 +288,12 @@ describe('Wave-3 provider picker hardening', () => {
   it('rejects non-local plain http:// URLs instead of granting allowLocal', async () => {
     await render();
     await change(select('Provider'), 'preset:openai-compatible');
-    await change(input('Address'), 'http://remote.example.com/v1');
-    await click(button(/Connect/));
-    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Plain http:// is only allowed');
-    expect(m.upsert).not.toHaveBeenCalled();
+    for (const url of ['http://remote.example.com/v1', 'http://10.example.com/v1', 'http://127.example.com/v1']) {
+      await change(input('Address'), url);
+      await click(button(/Connect/));
+      expect(host.querySelector('[role="alert"]')?.textContent, url).toContain('Plain http:// is only allowed');
+      expect(m.upsert).not.toHaveBeenCalled();
+    }
   });
 
   it('rolls back upsert when setKey fails on a new provider', async () => {

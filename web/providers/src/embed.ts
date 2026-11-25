@@ -13,7 +13,6 @@ import type { Context } from './context';
 import { createTester } from './test';
 import { describe } from './ui';
 import { keyText } from './words';
-import type { ProviderRecord } from '@oaiy/shared/providers/types';
 
 export function mountEmbed(root: HTMLElement, ctx: Context): void {
   // The modal is a frame of the holder's own origin, so an app cannot read what it shows: a provider's words may be shown (as text, scrubbed).
@@ -35,11 +34,10 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
   async function draw(): Promise<void> {
     const summaries = await ctx.store.summaries();
     const records = new Map((await ctx.store.list()).map((r) => [r.id, r]));
-    if (summaries.length === 0) return fill(list, h('li', { class: 'fine', text: 'No providers yet. Open the Providers page to add one.' }));
-    fill(
-      list,
-      ...summaries.map((s) => {
-        const record = records.get(s.id) as ProviderRecord;
+    const items = summaries
+      .map((s) => {
+        const record = records.get(s.id);
+        if (!record) return null;
         const status = h('p', { class: 'result', attrs: { role: 'status' } });
         const select = h('select', { attrs: { 'aria-label': `Model for ${s.name}` } }, h('option', { text: s.model ?? 'No model chosen', attrs: { value: s.model ?? '' } }));
         const load = h('button', { class: 'button', text: 'Load models' });
@@ -79,8 +77,10 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
           h('div', { class: 'grow' }, h('strong', { text: s.name }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), status),
           h('div', { class: 'actions' }, select, load, use, test),
         );
-      }),
-    );
+      })
+      .filter((el): el is HTMLLIElement => el !== null);
+    if (items.length === 0) return fill(list, h('li', { class: 'fine', text: 'No providers yet. Open the Providers page to add one.' }));
+    fill(list, ...items);
   }
 
   ctx.store.onChange(() => void draw());

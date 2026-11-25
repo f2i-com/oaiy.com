@@ -73,28 +73,47 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
         : `OAIY Desktop ${health.version} is running at ${origin}. Pair with it so text messages to the phone come here.`;
   }
 
+  const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+    signal.aborted
+      ? Promise.resolve()
+      : new Promise((resolve) => {
+          const onAbort = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+          }, ms);
+          signal.addEventListener('abort', onAbort, { once: true });
+        });
+
   async function runPairing(): Promise<void> {
     pairing?.abort();
     const abort = (pairing = new AbortController());
     pair.disabled = true;
     try {
-      const request = await startPairing(DESKTOP_ORIGIN, `OAIY on ${location.host}`);
+      const request = await startPairing(DESKTOP_ORIGIN, `OAIY on ${location.host}`, abort.signal);
+      if (abort.signal.aborted) return;
       code.textContent = request.code;
       code.hidden = false;
       status.textContent = 'In OAIY Desktop, approve the pairing request that shows this code:';
       const until = Date.now() + 5 * 60_000;
       let missed = 0;
       while (!abort.signal.aborted && Date.now() < until) {
-        await new Promise((r) => setTimeout(r, 1500));
+        await sleep(1500, abort.signal);
+        if (abort.signal.aborted) return;
         // (a look that did not get through is tried again: the desktop busy for a moment does not end the pairing)
         let now: Awaited<ReturnType<typeof pairingStatus>>;
         try {
-          now = await pairingStatus(DESKTOP_ORIGIN, request.pairingId);
+          now = await pairingStatus(DESKTOP_ORIGIN, request.pairingId, abort.signal);
           missed = 0;
         } catch (error) {
+          if (abort.signal.aborted) return;
           if (++missed >= 5) throw error;
           continue;
         }
+        if (abort.signal.aborted) return;
         if (now.status === 'approved' && now.token) {
           desktop = { origin: DESKTOP_ORIGIN, token: now.token };
           options.paired(desktop);
@@ -114,10 +133,11 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
         status.textContent = 'The pairing was not approved within 5 minutes: try again.';
       }
     } catch (error) {
+      if (abort.signal.aborted) return;
       code.hidden = true;
       status.textContent = `Could not pair: ${(error as Error).message}`;
     } finally {
-      pair.disabled = false;
+      if (pairing === abort) pair.disabled = false;
     }
   }
 

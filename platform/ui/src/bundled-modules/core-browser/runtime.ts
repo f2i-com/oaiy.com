@@ -76,14 +76,29 @@ const isWebShim = (): boolean =>
 // SERVICE HELPERS
 // =============================================================================
 
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.+$/, '');
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
+
 /**
- * Extract port number from a URL string
+ * Extract port number from a loopback HTTP(S) URL string.
+ * Returns null for non-loopback hosts or malformed URLs so remote URLs never
+ * trigger local service auto-start or loopback rewriting.
  * @param url The URL to extract port from (e.g., "http://127.0.0.1:8769")
- * @returns The port number or null if not found
+ * @returns The port number or null if not a loopback URL with an explicit port
  */
 function extractPortFromUrl(url: string): number | null {
-  const match = url.match(/:(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (!isLoopbackHost(parsed.hostname)) return null;
+    if (!parsed.port) return null;
+    const port = parseInt(parsed.port, 10);
+    return Number.isFinite(port) && port > 0 && port <= 65535 ? port : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

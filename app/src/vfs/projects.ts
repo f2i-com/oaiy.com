@@ -291,6 +291,7 @@ export class OpenProject {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | null = null;
+  private closed = false;
   /** Errors writing behind, for the UI. */
   onError: (message: string) => void = () => {};
 
@@ -352,6 +353,7 @@ export class OpenProject {
   }
 
   private queue(change: VfsChange): void {
+    if (this.closed) return;
     if (change.type === 'reset') {
       // A whole new tree (an import): rewrite everything.
       this.pending.clear();
@@ -401,7 +403,7 @@ export class OpenProject {
       if (this.retries > 3 && Date.now() - this.lastErrorAt < 60_000) return;
       this.lastErrorAt = Date.now();
       this.onError(`Saving ${failed.length === 1 ? failed[0].label : `${failed.length} files`} to ${HERE}'s storage failed:${failed[0].error}.${this.retries <= 3 ? ' Trying again.' : ' Export the project to keep a copy.'}`);
-      if (this.retries <= 3 && !this.timer) this.timer = setTimeout(() => void this.flush(), 2000 * this.retries);
+      if (!this.closed && this.retries <= 3 && !this.timer) this.timer = setTimeout(() => void this.flush(), 2000 * this.retries);
     });
     return this.flushing;
   }
@@ -578,7 +580,13 @@ export class OpenProject {
   }
 
   async close(): Promise<void> {
-    await this.flush();
     this.unsubscribe?.();
+    this.unsubscribe = null;
+    await this.flush();
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
   }
 }

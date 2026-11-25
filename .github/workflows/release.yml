@@ -227,6 +227,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: |
           set -euo pipefail
           out="$PWD/release"; mkdir -p "$out"

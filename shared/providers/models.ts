@@ -172,7 +172,23 @@ async function getJson(
   try {
     if (options.signal?.aborted) controller.abort();
     controller.signal.throwIfAborted();
-    const resp = await doFetch(url, { method: 'GET', headers, signal: controller.signal });
+    const resp = await doFetch(url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+      redirect: 'manual',
+      credentials: 'omit',
+      cache: 'no-store',
+      referrerPolicy: 'no-referrer',
+    });
+    if (resp.type === 'opaqueredirect' || (resp.status >= 300 && resp.status < 400)) {
+      void resp.body?.cancel().catch(() => {});
+      throw new ProviderConnectionError(
+        'http',
+        'The provider answered with a redirect. It is not followed: a request goes only to the address the provider was saved with.',
+        resp.status >= 300 && resp.status < 400 ? resp.status : undefined,
+      );
+    }
     if (!resp.ok) {
       const kind = kindForStatus(resp.status);
       const found = options.providerText === 'omit' ? undefined : await errorDetail(resp);
@@ -217,7 +233,21 @@ async function listFrom(target: ListTarget, options: ListModelsOptions): Promise
     const seen = new Set<string>();
     let after: string | null = null;
     for (let page = 0; page < MAX_PAGES; page++) {
-      const url = new URL(endpoints.models);
+      let url: URL;
+      try {
+        url = new URL(endpoints.models);
+      } catch {
+        const pageInfo = options.page ?? currentPage();
+        throw new ProviderConnectionError(
+          'network',
+          describeConnectionError('network', {
+            ...context,
+            ...(options.providerText === 'omit' ? { omitAddressPath: true } : {}),
+            url: endpoints.models,
+            pageOrigin: pageInfo.origin,
+          }),
+        );
+      }
       url.searchParams.set('limit', '1000');
       if (after) url.searchParams.set('after_id', after);
       const body = await getJson(url.toString(), headers, context, options);
@@ -244,7 +274,8 @@ async function listFrom(target: ListTarget, options: ListModelsOptions): Promise
     return sortModels(models);
   } catch (err) {
     const first = err instanceof ProviderConnectionError ? err : null;
-    const retryable = first && !['cancelled', 'mixed-content', 'auth'].includes(first.kind);
+    const isRedirect = first?.kind === 'http' && (first.status === undefined || (first.status >= 300 && first.status < 400));
+    const retryable = first && !isRedirect && !['cancelled', 'mixed-content', 'auth'].includes(first.kind);
     if (!endpoints.ollamaTags || !retryable) throw err;
     try {
       const body = await getJson(endpoints.ollamaTags, target.tagsHeaders ?? headers, context, options);

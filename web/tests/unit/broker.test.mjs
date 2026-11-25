@@ -385,6 +385,29 @@ describe('abort, timeout and how many at once', () => {
     assert.equal(ninth.error.code, 'too-many');
     for (const id of ids) await client.call({ op: 'abort', target: id });
   });
+
+  it('an internal storage failure during fetch sends an internal error event instead of hanging', async () => {
+    const w = await world({ handler: () => jsonResponse({ ok: true }) });
+    const client = await w.connect();
+    const origGet = w.store.get;
+    w.store.get = async () => { throw new Error('IndexedDB transaction aborted'); };
+    try {
+      const result = await client.fetch({ provider: w.record.id, path: '/models', method: 'GET' });
+      assert.equal(result.error.code, 'internal');
+      assert.doesNotMatch(result.error.message, /IndexedDB/);
+    } finally {
+      w.store.get = origGet;
+    }
+    const origTake = w.budget.take;
+    w.budget.take = async () => { throw new Error('IndexedDB quota exceeded'); };
+    try {
+      const result = await client.fetch({ provider: w.record.id, path: '/models', method: 'GET' });
+      assert.equal(result.error.code, 'internal');
+      assert.doesNotMatch(result.error.message, /IndexedDB/);
+    } finally {
+      w.budget.take = origTake;
+    }
+  });
 });
 
 describe('the budget, where a request leaves', () => {

@@ -37,7 +37,7 @@ socket with a short wait: Docker Desktop open with its engine not answering held
 """
 from __future__ import annotations
 
-import collections, hashlib, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
+import collections, errno, hashlib, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 CARD = pathlib.Path(__file__).resolve().parent
@@ -491,6 +491,115 @@ def start(name: str, work) -> dict:
     return {"started": True, "job": job.view()}
 
 
+def verify_tinygpu_zip(zipped: pathlib.Path):
+    """Verify `zipped` is a valid archive whose entries stay strictly inside `TinyGPU.app/`."""
+    try:
+        z = zipfile.ZipFile(zipped, "r")
+    except (zipfile.BadZipFile, OSError) as e:
+        raise RuntimeError(f"TinyGPU.zip is not a valid archive: {e}") from e
+    with z:
+        infos = z.infolist()
+        if not infos:
+            raise RuntimeError("TinyGPU.zip is empty")
+        has_program = False
+        for info in infos:
+            name = info.filename
+            if not name or "\\" in name or "\x00" in name or name.startswith("/"):
+                raise RuntimeError(f"TinyGPU.zip contains an unsafe entry: {name!r}")
+            trimmed = name.rstrip("/")
+            if not trimmed:
+                raise RuntimeError(f"TinyGPU.zip contains an unsafe entry: {name!r}")
+            parts = trimmed.split("/")
+            if any(p in ("", ".", "..") or ":" in p for p in parts):
+                raise RuntimeError(f"TinyGPU.zip contains a path traversal entry: {name!r}")
+            if parts[0] != "TinyGPU.app":
+                raise RuntimeError(f"TinyGPU.zip contains an unexpected top-level entry: {name!r}")
+            if trimmed == "TinyGPU.app/Contents/MacOS/TinyGPU" and not info.is_dir():
+                is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
+                if is_symlink:
+                    raise RuntimeError("TinyGPU.zip's executable is a symlink")
+                has_program = True
+        if not has_program:
+            raise RuntimeError("TinyGPU.zip does not contain TinyGPU.app/Contents/MacOS/TinyGPU")
+
+
+def verify_staged_tinygpu_tree(stage: pathlib.Path) -> pathlib.Path:
+    """Verify an extracted staging directory holds only `TinyGPU.app` with no symlink escapes."""
+    entries = list(stage.iterdir())
+    if len(entries) != 1 or entries[0].name != "TinyGPU.app":
+        names = [e.name for e in entries]
+        raise RuntimeError(f"TinyGPU.zip extracted unexpected top-level entries: {names}")
+    app = entries[0]
+    if not app.is_dir() or app.is_symlink():
+        raise RuntimeError("TinyGPU.zip did not extract a TinyGPU.app directory")
+    app_root = app.resolve()
+    for root, dirs, files in os.walk(app, followlinks=False):
+        base = pathlib.Path(root)
+        for entry in (*dirs, *files):
+            p = base / entry
+            if p.is_symlink():
+                target = p.resolve(strict=False)
+                if target != app_root and app_root not in target.parents:
+                    raise RuntimeError(f"TinyGPU.app contains a symlink escaping the bundle: {p.relative_to(app)}")
+    program = app / "Contents" / "MacOS" / "TinyGPU"
+    if not program.is_file() or program.is_symlink() or app_root not in program.resolve().parents:
+        raise RuntimeError("TinyGPU.app is missing a valid Contents/MacOS/TinyGPU executable")
+    return app
+
+
+def verify_tinygpu_app(app: pathlib.Path) -> str:
+    """Verify `app`'s code signature, non-empty Apple TeamIdentifier, and macOS Gatekeeper notarization."""
+    if not app.is_dir() or app.is_symlink():
+        raise RuntimeError(f"{app} is not a valid TinyGPU.app bundle")
+    program = app / "Contents" / "MacOS" / "TinyGPU"
+    if not program.is_file() or program.is_symlink():
+        raise RuntimeError(f"{app} is missing a valid Contents/MacOS/TinyGPU executable")
+    app_root = app.resolve()
+    if app_root not in program.resolve().parents:
+        raise RuntimeError(f"{app} executable escapes bundle root")
+    signed = quiet(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], 60)
+    if signed.returncode != 0:
+        raise RuntimeError(f"TinyGPU.app's signature does not check out: {(signed.stderr or signed.stdout).strip()}")
+    info = quiet(["/usr/bin/codesign", "-dv", str(app)], 30)
+    if info.returncode != 0:
+        raise RuntimeError(f"TinyGPU.app's signing identity could not be read: {(info.stderr or info.stdout).strip()}")
+    combined = f"{info.stderr}\n{info.stdout}"
+    team_match = re.search(r"^TeamIdentifier=(.+)$", combined, re.MULTILINE)
+    team = team_match.group(1).strip() if team_match else ""
+    if not team or team.lower() == "not set" or not re.fullmatch(r"[A-Z0-9]{10}", team):
+        raise RuntimeError(f"TinyGPU.app has no valid Apple TeamIdentifier (got {team or 'none'})")
+    expected_team = os.environ.get("OAIY_TINYGPU_TEAM_ID", "").strip()
+    if expected_team and team != expected_team:
+        raise RuntimeError(f"TinyGPU.app TeamIdentifier {team} does not match expected {expected_team}")
+    gatekeeper = quiet(["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose", str(app)], 60)
+    if gatekeeper.returncode != 0:
+        raise RuntimeError(f"TinyGPU.app failed macOS Gatekeeper assessment: {(gatekeeper.stderr or gatekeeper.stdout).strip()}")
+    return team
+
+
+def install_tinygpu_app(zipped: pathlib.Path, dest: pathlib.Path) -> str:
+    """Extract `zipped` privately, verify entries/signature/Gatekeeper, and atomically move into `dest`."""
+    verify_tinygpu_zip(zipped)
+    with tempfile.TemporaryDirectory(prefix="oaiy-tinygpu-") as tmp:
+        stage = pathlib.Path(tmp)
+        r = quiet(["/usr/bin/ditto", "-xk", str(zipped), str(stage)], 120)
+        if r.returncode != 0:
+            raise RuntimeError(f"TinyGPU.app could not be unpacked: {(r.stderr or r.stdout).strip()}")
+        staged_app = verify_staged_tinygpu_tree(stage)
+        team = verify_tinygpu_app(staged_app)
+        try:
+            os.rename(staged_app, dest)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise RuntimeError(f"TinyGPU.app could not be moved into {dest.parent}: {e}") from e
+            with tempfile.TemporaryDirectory(prefix=".TinyGPU-stage-", dir=str(dest.parent)) as same_fs_tmp:
+                same_fs_app = pathlib.Path(same_fs_tmp) / "TinyGPU.app"
+                shutil.copytree(staged_app, same_fs_app, symlinks=True)
+                verify_tinygpu_app(same_fs_app)
+                os.rename(same_fs_app, dest)
+        return team
+
+
 def tinygpu_zip(job: Job) -> pathlib.Path:
     """TinyGPU.app's zip: the plugin's own (card/firmware), else the one tinygrad's commit names, downloaded from
     tinygrad's releases (as tinygrad itself would) into the plugin's data folder."""
@@ -509,33 +618,39 @@ def tinygpu_zip(job: Job) -> pathlib.Path:
     job.step = "Downloading TinyGPU.app"
     job.say(f"downloading {url}")
     kept.parent.mkdir(parents=True, exist_ok=True)
-    part = kept.with_suffix(".part")
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "oaiy-egpu-plugin"}), timeout=60) as r, open(part, "wb") as f:
-        shutil.copyfileobj(r, f)
-    part.rename(kept)
+    part = kept.with_name(f"{kept.name}.{os.getpid()}.part")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "oaiy-egpu-plugin"}), timeout=60) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f)
+        verify_tinygpu_zip(part)
+        part.replace(kept)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
     job.say(f"downloaded {kept.stat().st_size / 2**20:.1f} MB")
     return kept
 
 
 def install_driver(job: Job):
-    """TinyGPU.app into /Applications where it is not there (its signature checked), then its `install`, which asks
-    macOS for its driver extension: macOS then asks the person to allow it, in System Settings, which is opened."""
+    """TinyGPU.app into /Applications where it is not there (its archive, signature, TeamIdentifier and Gatekeeper
+    assessment checked in a private temp folder first), then its `install`, which asks macOS for its driver extension:
+    macOS then asks the person to allow it, in System Settings, which is opened."""
     if driver()["enabled"]:
         job.step = "The driver is allowed already"
         return
-    if not TINYGPU_PROGRAM.is_file():
+    if TINYGPU_APP.is_symlink():
+        raise RuntimeError(f"{TINYGPU_APP} is a symlink: refusing to use or replace it")
+    program = TINYGPU_APP / "Contents" / "MacOS" / "TinyGPU"
+    if TINYGPU_APP.exists() and not program.is_file():
+        raise RuntimeError(f"{TINYGPU_APP} exists without Contents/MacOS/TinyGPU: remove it first and try again")
+    if not TINYGPU_APP.exists():
         zipped = tinygpu_zip(job)
-        job.step = "Putting TinyGPU.app in Applications"
-        r = quiet(["/usr/bin/ditto", "-xk", str(zipped), "/Applications"], 120)
-        if r.returncode != 0:
-            raise RuntimeError(f"TinyGPU.app could not be put in Applications: {(r.stderr or r.stdout).strip()}")
-    signed = quiet(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(TINYGPU_APP)], 60)
-    if signed.returncode != 0:
-        raise RuntimeError(f"TinyGPU.app's signature does not check out: {signed.stderr.strip()}")
-    team = re.search(r"TeamIdentifier=(\S+)", quiet(["/usr/bin/codesign", "-dv", str(TINYGPU_APP)], 30).stderr)
-    job.say(f"TinyGPU.app is signed{f' (team {team.group(1)})' if team else ''}")
+        job.step = "Verifying and putting TinyGPU.app in Applications"
+        install_tinygpu_app(zipped, TINYGPU_APP)
+    team = verify_tinygpu_app(TINYGPU_APP)
+    job.say(f"TinyGPU.app is signed and notarized (team {team})")
     job.step = "Asking macOS for the driver"
-    asking = subprocess.Popen([str(TINYGPU_PROGRAM), "install"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    asking = subprocess.Popen([str(program), "install"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     opened = False
     began = time.monotonic()
     # (its install may wait for the person's answer: ten minutes for it, and done as soon as the driver is allowed)

@@ -66,16 +66,21 @@ async function main(): Promise<void> {
       ['-i', dummyMp4, '-filter_script:v', 'script.txt', 'out.mp4'],
       ['-i', dummyMp4, '-filter_complex_script', 'script.txt', 'out.mp4'],
       ['-i', dummyMp4, '-filter_complex_script:0', 'script.txt', 'out.mp4'],
+      ['-i', dummyMp4, '-pre', 'default', 'out.mp4'],
       ['-i', dummyMp4, '-fpre', 'p.ffpreset', 'out.mp4'],
       ['-i', dummyMp4, '-vpre', 'default', 'out.mp4'],
       ['-i', dummyMp4, '-apre', 'default', 'out.mp4'],
       ['-i', dummyMp4, '-spre', 'default', 'out.mp4'],
-      ['-i', dummyMp4, '-preset', 'fast', 'out.mp4'],
-      ['-i', dummyMp4, '-preset:v', 'fast', 'out.mp4'],
+      ['-i', dummyMp4, '-preset', 'p.ffpreset', 'out.mp4'],
+      ['-i', dummyMp4, '-preset:v', 'sub/fast', 'out.mp4'],
+      ['-i', dummyMp4, '-preset:v', 'custom', 'out.mp4'],
+      ['-i', dummyMp4, '-preset'],
       ['-i', dummyMp4, '-sdp_file', 'out.sdp', 'out.mp4'],
       ['-i', dummyMp4, '-vstats_file', 'stats.log', 'out.mp4'],
       ['-i', dummyMp4, '-passlogfile', 'pass', 'out.mp4'],
       ['-i', dummyMp4, '-/vf', 'script.txt', 'out.mp4'],
+      ['-protocol_whitelist', 'file,http,https', '-i', dummyMp4, 'out.mp4'],
+      ['-protocol_whitelist:v', 'file,http', '-i', dummyMp4, 'out.mp4'],
       ['-safe', '0', '-i', dummyMp4, 'out.mp4'],
       ['-safe', 'false', '-i', dummyMp4, 'out.mp4'],
       ['-safe'],
@@ -135,7 +140,7 @@ async function main(): Promise<void> {
     }
 
     // Valid `-safe 1` + valid auto-probed concat: verify child CWD is pinned to TMP_ROOT
-    // and `-protocol_whitelist file,pipe` is injected before `-i` (and caller's whitelist replaced).
+    // and `-protocol_whitelist file,pipe` is injected before `-i` (and before outputs).
     const goodConcat = path.join(tmpRoot, 'good-concat.txt');
     fs.writeFileSync(goodConcat, "ffconcat version 1.0\nfile 'clip.mp4'\n");
     const r1 = await ffmpeg.runCommand({
@@ -148,8 +153,6 @@ async function main(): Promise<void> {
         'concat',
         '-safe',
         '1',
-        '-protocol_whitelist',
-        'file,http,https,tcp,tls',
         '-i',
         goodConcat,
       ],
@@ -164,18 +167,23 @@ async function main(): Promise<void> {
     const wlPos = seen.argv.indexOf('-protocol_whitelist');
     const iPos = seen.argv.indexOf('-i');
     check(
-      'runCommand replaces caller -protocol_whitelist with file,pipe before -i',
-      wlPos !== -1 && seen.argv[wlPos + 1] === 'file,pipe' && iPos === wlPos + 2 && !seen.argv.includes('file,http,https,tcp,tls'),
+      'runCommand injects -protocol_whitelist file,pipe before -i',
+      wlPos !== -1 && seen.argv[wlPos + 1] === 'file,pipe' && iPos === wlPos + 2,
       `argv=${JSON.stringify(seen.argv)}`,
     );
 
-    // extractVideoFrames arg builder inserts `-protocol_whitelist file,pipe` before `-i` when confined.
+    // extractVideoFrames arg builder inserts `-protocol_whitelist file,pipe` before `-i` and output when confined.
     const { args: confinedArgs } = ffmpeg.buildExtractFrameArgs(dummyMp4, { maxFrames: 2 }, tmpRoot, true);
     const exWl = confinedArgs.indexOf('-protocol_whitelist');
     const exI = confinedArgs.indexOf('-i');
+    const exLastWl = confinedArgs.lastIndexOf('-protocol_whitelist');
     check(
-      'extractVideoFrames passes -protocol_whitelist file,pipe before -i when confined',
-      exWl !== -1 && confinedArgs[exWl + 1] === 'file,pipe' && exI === exWl + 2,
+      'extractVideoFrames passes -protocol_whitelist file,pipe before -i and output when confined',
+      exWl !== -1 &&
+        confinedArgs[exWl + 1] === 'file,pipe' &&
+        exI === exWl + 2 &&
+        exLastWl > exI &&
+        confinedArgs[exLastWl + 1] === 'file,pipe',
       `args=${JSON.stringify(confinedArgs)}`,
     );
     const { args: unconfinedArgs } = ffmpeg.buildExtractFrameArgs(dummyMp4, { maxFrames: 2 }, tmpRoot, false);
@@ -188,12 +196,10 @@ async function main(): Promise<void> {
     // 1b. Wave-3 FFmpeg & ffprobe bypass regressions (P0 #1 & #2)
     // -----------------------------------------------------------------------
     // ffprobe unconditionally prepends `-protocol_whitelist file,pipe` before all args,
-    // strips caller's `-protocol_whitelist`, and inspects positional inputs.
+    // rejects caller `-protocol_whitelist`, and inspects positional inputs.
     const ffprobeGoodArgs = ffmpeg.buildRunCommandArgs('ffprobe', [
       '-v',
       'error',
-      '-protocol_whitelist',
-      'file,http,https',
       '-show_entries',
       'format=duration',
       '-of',
@@ -201,12 +207,16 @@ async function main(): Promise<void> {
       dummyMp4,
     ]);
     check(
-      'ffprobe prepends -protocol_whitelist file,pipe before all args and strips caller whitelist',
+      'ffprobe prepends -protocol_whitelist file,pipe before all args',
       ffprobeGoodArgs[0] === '-protocol_whitelist' &&
         ffprobeGoodArgs[1] === 'file,pipe' &&
-        !ffprobeGoodArgs.includes('file,http,https') &&
         ffprobeGoodArgs[ffprobeGoodArgs.length - 1] === fs.realpathSync(dummyMp4),
       `args=${JSON.stringify(ffprobeGoodArgs)}`,
+    );
+    await expectThrows(
+      'ffprobe rejects caller -protocol_whitelist instead of stripping it',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: ['-v', 'error', '-protocol_whitelist', 'file,http', dummyMp4] }),
+      /not allowed in server mode/i,
     );
 
     // ffprobe positional inputs pointing to playlists or auto-probed/explicit concat lists MUST be rejected.
@@ -256,11 +266,11 @@ async function main(): Promise<void> {
       await expectThrows(
         `rejects confined filtergraph ${label}`,
         () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, '-vf', fg, 'out.mp4'] }),
-        /filtergraph file-reading expression is not allowed/i,
+        /filtergraph.*is not allowed/i,
       );
     }
 
-    // Benign filtergraphs still pass buildRunCommandArgs cleanly.
+    // Benign filtergraphs still pass buildRunCommandArgs cleanly, and outputs receive `-protocol_whitelist file,pipe`.
     const benignArgs = ffmpeg.buildRunCommandArgs('ffmpeg', [
       '-i',
       dummyMp4,
@@ -268,7 +278,163 @@ async function main(): Promise<void> {
       'fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24',
       'out.mp4',
     ]);
-    check('benign filtergraph passes confined arg check', benignArgs.includes('fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24'));
+    const outIdx = benignArgs.indexOf('out.mp4');
+    check(
+      'benign filtergraph passes confined arg check and guards output with -protocol_whitelist file,pipe',
+      benignArgs.includes('fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24') &&
+        outIdx >= 2 &&
+        benignArgs[outIdx - 2] === '-protocol_whitelist' &&
+        benignArgs[outIdx - 1] === 'file,pipe',
+      `args=${JSON.stringify(benignArgs)}`,
+    );
+
+    // -----------------------------------------------------------------------
+    // 1b-w4. Wave-4 FFmpeg/ffprobe allowlist hardening regressions (P0 #1-#4)
+    // -----------------------------------------------------------------------
+    // Token-adjacency desync vectors, muxer/capture-device formats, dangerous encoder/mov/hls flags.
+    for (const [label, badArgs] of [
+      ['-f -protocol_whitelist x lavfi desync', ['-f', '-protocol_whitelist', 'x', 'lavfi', '-i', dummyMp4, 'out.mp4']],
+      ['-f -protocol_whitelist x concat desync', ['-f', '-protocol_whitelist', 'x', 'concat', '-safe', '1', '-i', evilConcat, 'out.mp4']],
+      ['-f tee output muxer smuggling', ['-i', dummyMp4, '-f', 'tee', '[f=rawvideo]/etc/passwd']],
+      ['-x264-params csv=/abs', ['-i', dummyMp4, '-x264-params', 'csv=/etc/passwd', 'out.mp4']],
+      ['-x265-params csv=/abs', ['-i', dummyMp4, '-x265-params', 'csv=/etc/passwd', 'out.mp4']],
+      ['-svtav1-params', ['-i', dummyMp4, '-svtav1-params', 'stat-file=/etc/passwd', 'out.mp4']],
+      ['-rav1e-params', ['-i', dummyMp4, '-rav1e-params', 'low_latency=1', 'out.mp4']],
+      ['-hls_key_info_file', ['-i', dummyMp4, '-hls_key_info_file', dummyMp4, 'out.mp4']],
+      ['-maximum_manifest_size', ['-maximum_manifest_size', '99999999', '-i', dummyMp4, 'out.mp4']],
+      ['-enable_drefs 1 -use_absolute_path 1', ['-enable_drefs', '1', '-use_absolute_path', '1', '-i', dummyMp4, 'out.mp4']],
+      ['-use_absolute_path 1', ['-use_absolute_path', '1', '-i', dummyMp4, 'out.mp4']],
+      ['-f gdigrab capture device', ['-f', 'gdigrab', '-i', dummyMp4, 'out.mp4']],
+      ['-f x11grab capture device', ['-f', 'x11grab', '-i', dummyMp4, 'out.mp4']],
+      ['-f dshow capture device', ['-f', 'dshow', '-i', dummyMp4, 'out.mp4']],
+      ['-f avfoundation capture device', ['-f', 'avfoundation', '-i', dummyMp4, 'out.mp4']],
+      ['-f dash format', ['-f', 'dash', '-i', dummyMp4, 'out.mp4']],
+      ['-f hls format', ['-f', 'hls', '-i', dummyMp4, 'out.mp4']],
+      ['-f sdp format', ['-f', 'sdp', '-i', dummyMp4, 'out.mp4']],
+      ['-f lavfi format', ['-f', 'lavfi', '-i', dummyMp4, 'out.mp4']],
+      ['-lavfi alias', ['-i', dummyMp4, '-lavfi', 'scale=640:480', 'out.mp4']],
+      ['subfile comma-option protocol', ['-i', 'subfile,,start,0,end,100,,:/etc/passwd', 'out.mp4']],
+      ['missing confined -i input fails closed', ['-i', path.join(tmpRoot, 'nonexistent-input.mp4'), 'out.mp4']],
+    ] as Array<[string, string[]]>) {
+      await expectThrows(
+        `Wave-4 rejects ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: badArgs }),
+        /not allowed in server mode|disallowed protocol|could not be inspected|outside the server fs sandbox/i,
+      );
+    }
+
+    // Filtergraph parser & strict allowlist bypasses (quotes, backslashes, non-allowlisted filters, positional drawtext).
+    for (const [label, flag, fg] of [
+      ["'movie'=... quoted filter name", '-vf', "'movie'=/etc/passwd"],
+      ['m\\ovie=... backslash filter name', '-vf', 'm\\ovie=/etc/passwd'],
+      ['ssim=f=/abs non-allowlisted filter + f key', '-filter_complex', '[0:v][0:v]ssim=f=/etc/passwd'],
+      ["drawtext='textfile'=... quoted option key", '-vf', "drawtext='textfile'=/etc/passwd"],
+      ['drawtext=t\\extfile=... backslash option key', '-vf', 'drawtext=t\\extfile=/etc/passwd'],
+      ["drawtext='text=hi:textfile=...' level-1 quoted key", '-vf', "drawtext='text=hi:textfile=/etc/passwd'"],
+      ['drawtext=/etc/passwd positional fontfile', '-vf', 'drawtext=/etc/passwd'],
+      ['drawtext=::/etc/passwd positional textfile', '-vf', 'drawtext=::/etc/passwd'],
+      ['-filter:v non-allowlisted filter', '-filter:v', 'haldclut=file=/etc/passwd'],
+      ['-af non-allowlisted filter', '-af', 'amovie=/etc/passwd'],
+    ] as Array<[string, string, string]>) {
+      await expectThrows(
+        `Wave-4 filtergraph rejects ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, flag, fg, 'out.mp4'] }),
+        /filtergraph.*is not allowed/i,
+      );
+    }
+
+    // UTF-16LE / UTF-16BE / namespace-prefixed <mpd:MPD manifests MUST be rejected.
+    const utf16LeBomMpd = path.join(tmpRoot, 'utf16le-bom.mpd');
+    fs.writeFileSync(
+      utf16LeBomMpd,
+      Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>\n', 'utf16le')]),
+    );
+    const utf16BeBomMpd = path.join(tmpRoot, 'utf16be-bom.mpd');
+    const utf16BeBody = Buffer.from('<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>\n', 'utf16le');
+    utf16BeBody.swap16();
+    fs.writeFileSync(utf16BeBomMpd, Buffer.concat([Buffer.from([0xfe, 0xff]), utf16BeBody]));
+    const utf16NoBomNsMpd = path.join(tmpRoot, 'utf16-nobom-ns.mpd');
+    fs.writeFileSync(
+      utf16NoBomNsMpd,
+      Buffer.from('<?xml version="1.0"?>\n<mpd:MPD xmlns:mpd="urn:mpeg:dash:schema:mpd:2011"></mpd:MPD>\n', 'utf16le'),
+    );
+    const utf8NsMpd = path.join(tmpRoot, 'utf8-ns.mpd');
+    fs.writeFileSync(utf8NsMpd, '<?xml version="1.0"?>\n<ns0:MPD xmlns:ns0="urn:mpeg:dash:schema:mpd:2011"></ns0:MPD>\n');
+
+    for (const [label, f] of [
+      ['UTF-16LE BOM MPD', utf16LeBomMpd],
+      ['UTF-16BE BOM MPD', utf16BeBomMpd],
+      ['UTF-16LE BOM-less namespace MPD', utf16NoBomNsMpd],
+      ['UTF-8 namespace-prefixed <ns0:MPD', utf8NsMpd],
+    ] as const) {
+      await expectThrows(
+        `Wave-4 rejects ${label} on ffmpeg`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', f, 'out.mp4'] }),
+        /DASH\/MPD/i,
+      );
+      await expectThrows(
+        `Wave-4 rejects ${label} on ffprobe`,
+        () => ffmpeg.runCommand({ command: 'ffprobe', args: [f] }),
+        /DASH\/MPD/i,
+      );
+    }
+
+    // Legitimate OAIY audio/video workflows (core-audio, core-video, core-service) MUST pass cleanly under confinement!
+    const oaiyValidCases: Array<[string, string[]]> = [
+      [
+        'core-audio fadeAudio',
+        ['-i', dummyMp4, '-vcodec', 'copy', '-af', 'afade=t=out:st=10:d=2:curve=exp', '-y', 'faded.mp4'],
+      ],
+      [
+        'core-video extendVideos',
+        ['-i', dummyMp4, '-vf', 'tpad=stop_mode=clone:stop_duration=3.00', '-c:a', 'copy', '-y', 'ext.mp4'],
+      ],
+      [
+        'core-video mixAudio with safe -preset fast',
+        [
+          '-i', dummyMp4, '-i', dummyMp4,
+          '-filter_complex', '[0:v]tpad=stop_mode=clone:stop_duration=2.50[vout]',
+          '-map', '[vout]', '-map', '1:a', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+          '-c:a', 'aac', '-af', 'volume=1', '-y', 'mixed.mp4',
+        ],
+      ],
+      [
+        'core-video videoPip circle (geq + overlay + enable + volume expr + adelay + amix)',
+        [
+          '-i', dummyMp4, '-itsoffset', '2', '-i', dummyMp4,
+          '-filter_complex',
+          "[1:v]scale=iw*0.25:-1,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gt(pow(X-W/2,2)+pow(Y-H/2,2),pow(min(W,H)/2,2)),0,255)'[pip];[0:v][pip]overlay=W-w-20:H-h-20:eof_action=pass:enable='lte(t,10)'[vout];[0:a]volume='if(between(t,2,10),0.3,1)':eval=frame[a0];[1:a]adelay=2000|2000,volume=1[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+          '-map', '[vout]', '-map', '[aout]', '-c:v', 'libx264', '-c:a', 'aac', '-y', 'pip.mp4',
+        ],
+      ],
+      [
+        'core-service wav16k with -f wav',
+        ['-hide_banner', '-loglevel', 'error', '-y', '-i', dummyMp4, '-vn', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', '-f', 'wav', 'stt.wav'],
+      ],
+      [
+        'stdin/stdout pipe (-i - ... -)',
+        ['-i', '-', '-f', 'wav', '-'],
+      ],
+    ];
+    for (const [label, raw] of oaiyValidCases) {
+      let built: string[] | null = null;
+      let err = '';
+      try {
+        built = ffmpeg.buildRunCommandArgs('ffmpeg', raw);
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e);
+      }
+      const outToken = raw[raw.length - 1];
+      const outPos = built ? built.lastIndexOf(outToken) : -1;
+      check(
+        `Wave-4 allows legitimate OAIY workflow: ${label}`,
+        built !== null &&
+          outPos >= 2 &&
+          built[outPos - 2] === '-protocol_whitelist' &&
+          built[outPos - 1] === 'file,pipe',
+        err || `built=${JSON.stringify(built)}`,
+      );
+    }
 
     // Concat list parser hardening: backslash/quote escapes & ENOENT fail-closed.
     const concatEscapes: Array<[string, string, RegExp]> = [

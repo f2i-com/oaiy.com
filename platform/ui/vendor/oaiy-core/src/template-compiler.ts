@@ -48,65 +48,62 @@ export function createTemplateCompiler(
       const template = definition.compiler.template;
       const letOrAssign = ctx.skipVarDeclaration ? '' : 'let ';
 
-      // Build the code by replacing template placeholders
-      let code = template;
+      // Build the code in a single pass so substituted values (for instance, a prop value
+      // containing "{{data.x}}" or "{{inputs.y}}") are never re-scanned and expanded as
+      // template placeholders.
+      const code = template.replace(
+        /\{\{(outputVar|sanitizedId|nodeId|(inputs|props|data)\.(\w+))\}\}/g,
+        (match, token: string, group?: string, key?: string) => {
+          if (token === 'outputVar') return ctx.outputVar;
+          if (token === 'sanitizedId') return ctx.sanitizedId;
+          if (token === 'nodeId') return ctx.node.id;
 
-      // Replace {{outputVar}}
-      code = code.replace(/\{\{outputVar\}\}/g, ctx.outputVar);
-
-      // Replace {{sanitizedId}}
-      code = code.replace(/\{\{sanitizedId\}\}/g, ctx.sanitizedId);
-
-      // Replace {{nodeId}}
-      code = code.replace(/\{\{nodeId\}\}/g, ctx.node.id);
-
-      // Replace {{inputs.X}} with the input variable or null
-      code = code.replace(/\{\{inputs\.(\w+)\}\}/g, (_, inputId) => {
-        const inputVar = ctx.inputs.get(inputId);
-        if (inputVar) {
-          return inputVar;
-        }
-        // No connected input - return null
-        return 'null';
-      });
-
-      // Replace {{props.X}} with property value from node data or default
-      // NOTE: String values are wrapped in quotes for proper code embedding
-      code = code.replace(/\{\{props\.(\w+)\}\}/g, (_, propId) => {
-        const value = ctx.node.data?.[propId];
-        if (value !== undefined) {
-          // Escape the value for safe embedding in code
-          if (typeof value === 'string') {
-            // Wrap in quotes - escapeString returns content without quotes
-            return `"${ctx.escapeString(value)}"`;
+          if (group === 'inputs' && key) {
+            const inputVar = ctx.inputs.get(key);
+            return inputVar || 'null';
           }
-          return JSON.stringify(value);
-        }
-        // Check for default value in property definition
-        const propDef = definition.properties?.find(p => p.id === propId);
-        if (propDef?.default !== undefined) {
-          if (typeof propDef.default === 'string') {
-            // Wrap in quotes - escapeString returns content without quotes
-            return `"${ctx.escapeString(propDef.default)}"`;
-          }
-          return JSON.stringify(propDef.default);
-        }
-        return '""';
-      });
 
-      // Replace {{data.X}} with raw node data
-      // NOTE: String values are wrapped in quotes for proper code embedding
-      code = code.replace(/\{\{data\.(\w+)\}\}/g, (_, dataKey) => {
-        const value = ctx.node.data?.[dataKey];
-        if (value !== undefined) {
-          if (typeof value === 'string') {
-            // Wrap in quotes - escapeString returns content without quotes
-            return `"${ctx.escapeString(value)}"`;
+          if (group === 'props' && key) {
+            const hasOwn = Boolean(
+              ctx.node.data && Object.prototype.hasOwnProperty.call(ctx.node.data, key)
+            );
+            const value = hasOwn ? ctx.node.data[key] : undefined;
+            if (value !== undefined) {
+              if (typeof value === 'string') {
+                // Wrap in quotes - escapeString returns content without quotes
+                return `"${ctx.escapeString(value)}"`;
+              }
+              return JSON.stringify(value) ?? 'null';
+            }
+            // Check for default value in property definition
+            const propDef = definition.properties?.find(p => p.id === key);
+            if (propDef?.default !== undefined) {
+              if (typeof propDef.default === 'string') {
+                return `"${ctx.escapeString(propDef.default)}"`;
+              }
+              return JSON.stringify(propDef.default) ?? 'null';
+            }
+            return '""';
           }
-          return JSON.stringify(value);
+
+          if (group === 'data' && key) {
+            const hasOwn = Boolean(
+              ctx.node.data && Object.prototype.hasOwnProperty.call(ctx.node.data, key)
+            );
+            const value = hasOwn ? ctx.node.data[key] : undefined;
+            if (value !== undefined) {
+              if (typeof value === 'string') {
+                // Wrap in quotes - escapeString returns content without quotes
+                return `"${ctx.escapeString(value)}"`;
+              }
+              return JSON.stringify(value) ?? 'null';
+            }
+            return 'null';
+          }
+
+          return match;
         }
-        return 'null';
-      });
+      );
 
       // Build the full code block with variable declaration and context storage
       const outputVarName = definition.compiler.outputVariable

@@ -24,10 +24,12 @@ import {
   createEmptyProject,
 } from './ProjectDefaults';
 import {
+  BUILT_IN_SERVICES,
   listAllServices,
   saveService,
   type CustomService,
 } from './serviceRegistry';
+import { listDesktopServices } from '../lib/desktopServices';
 
 /**
  * Shape of the exported project JSON. Strict superset of OAIYProject —
@@ -523,12 +525,46 @@ export const exportProjectToFile = (project: OAIYProject): void => {
   triggerDownloadFromBlob(`oaiy-project-${project.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.json`, blob);
 };
 
+const RESERVED_IMPORTED_SERVICE_PREFIX = /^(engine|voice|companion):/i;
+const VALID_IMPORTED_SERVICE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const IMPORTED_CREDENTIAL_HEADER_KEY = /auth|cookie|key|token|secret|passw/i;
+const IMPORTED_API_KEY_PLACEHOLDER = /\{\{\s*apiKey\s*\}\}/i;
+
+function isValidHttpServiceUrl(raw: unknown): raw is string {
+  if (typeof raw !== 'string' || !raw.trim()) return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeImportedServiceHeaders(rawHeaders: unknown): string {
+  if (typeof rawHeaders !== 'string' || !rawHeaders.trim()) return '{}';
+  try {
+    const parsed = JSON.parse(rawHeaders);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '{}';
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v !== 'string') continue;
+      if (IMPORTED_API_KEY_PLACEHOLDER.test(v)) continue;
+      if (IMPORTED_CREDENTIAL_HEADER_KEY.test(k)) continue;
+      clean[k] = v;
+    }
+    return JSON.stringify(clean);
+  } catch {
+    return '{}';
+  }
+}
+
 /**
  * Register any embedded services from an imported project into the
  * local `oaiy.customServices` registry. Skips services that already
- * exist by id so re-importing the same project doesn't duplicate.
- * Returns the count of newly-registered services so the caller can
- * surface a "Re-added N services" toast.
+ * exist by id, collide with built-in/desktop/reserved ids, or carry
+ * invalid endpoints; strips `apiKeyConstant` and credential/`{{apiKey}}`
+ * headers so an untrusted import cannot shadow built-in/desktop services
+ * or bind to the user's saved secrets.
  */
 export function registerImportedServices(
   imported: Pick<ExportedProject, 'services'>,
@@ -537,6 +573,8 @@ export function registerImportedServices(
   if (incoming.length === 0) return { added: 0, skipped: 0 };
   const existing = listAllServices();
   const existingIds = new Set(existing.map((s) => s.id));
+  const builtInIds = new Set(BUILT_IN_SERVICES.map((s) => s.id));
+  const desktopIds = new Set(listDesktopServices().map((s) => s.id));
   let added = 0;
   let skipped = 0;
   for (const svc of incoming) {
@@ -544,13 +582,54 @@ export function registerImportedServices(
       skipped++;
       continue;
     }
-    if (existingIds.has(svc.id)) {
+    const id = svc.id;
+    if (
+      RESERVED_IMPORTED_SERVICE_PREFIX.test(id) ||
+      !VALID_IMPORTED_SERVICE_ID.test(id) ||
+      existingIds.has(id) ||
+      builtInIds.has(id) ||
+      desktopIds.has(id)
+    ) {
       skipped++;
       continue;
     }
-    // Always strip isBuiltIn — anything coming through this path is the
-    // receiving user's own copy from here on.
-    saveService({ ...svc, isBuiltIn: false });
+    if (!isValidHttpServiceUrl(svc.endpoint)) {
+      skipped++;
+      continue;
+    }
+    if (svc.filesUrl !== undefined && !isValidHttpServiceUrl(svc.filesUrl)) {
+      skipped++;
+      continue;
+    }
+    if (svc.job && typeof svc.job === 'object') {
+      const jobUrls = [
+        svc.job.statusUrl,
+        svc.job.contentUrl,
+        svc.job.contentFallbackUrl,
+        svc.job.cancelUrl,
+      ].filter((u): u is string => typeof u === 'string' && u.length > 0);
+      if (jobUrls.some((u) => !isValidHttpServiceUrl(u.replace(/\{id\}/g, 'id')))) {
+        skipped++;
+        continue;
+      }
+    }
+    // Always strip isBuiltIn, apiKeyConstant, desktop/engine metadata, and auth/{{apiKey}} headers
+    // so an imported service can neither masquerade as a desktop/built-in entry nor auto-attach saved secrets.
+    const {
+      apiKeyConstant: _strippedApiKeyConstant,
+      isBuiltIn: _strippedBuiltIn,
+      group: _strippedGroup,
+      default: _strippedDefault,
+      nodeId: _strippedNodeId,
+      nodeName: _strippedNodeName,
+      ...rest
+    } = svc;
+    saveService({
+      ...rest,
+      headers: sanitizeImportedServiceHeaders(svc.headers),
+      isBuiltIn: false,
+    });
+    existingIds.add(id);
     added++;
   }
   return { added, skipped };

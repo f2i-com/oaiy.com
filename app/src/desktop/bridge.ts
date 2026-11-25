@@ -121,20 +121,21 @@ export async function desktopHealth(origin = DESKTOP_ORIGIN, signal?: AbortSigna
 }
 
 /** Ask to pair: the desktop shows `code`, and the person approves it there. */
-export async function startPairing(origin: string, label: string): Promise<{ pairingId: string; code: string }> {
+export async function startPairing(origin: string, label: string, signal?: AbortSignal): Promise<{ pairingId: string; code: string }> {
   const body = await reply(await fetch(`${origin}/api/bridge/pairing`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     // An Agent's access (its phone, calendar, contacts and settings tools), not an app's: the desktop asks the person for it.
     body: JSON.stringify({ product: 'oaiy-app', label, access: 'agent' }),
+    signal,
   }));
   if (!isRecord(body) || typeof body.pairingId !== 'string' || typeof body.code !== 'string') throw new DesktopError('OAIY Desktop did not start pairing');
   return { pairingId: body.pairingId, code: body.code };
 }
 
 /** Where a pairing request stands; the token once it is approved. */
-export async function pairingStatus(origin: string, pairingId: string): Promise<{ status: 'pending' | 'approved' | 'denied' | 'expired'; token?: string }> {
-  const resp = await fetch(`${origin}/api/bridge/pairing/${encodeURIComponent(pairingId)}`);
+export async function pairingStatus(origin: string, pairingId: string, signal?: AbortSignal): Promise<{ status: 'pending' | 'approved' | 'denied' | 'expired'; token?: string }> {
+  const resp = await fetch(`${origin}/api/bridge/pairing/${encodeURIComponent(pairingId)}`, { signal });
   if (resp.status === 404) return { status: 'expired' };
   const body = await reply(resp);
   const status = isRecord(body) ? String(body.status) : '';

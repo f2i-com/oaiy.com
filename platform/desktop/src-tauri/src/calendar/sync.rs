@@ -931,7 +931,8 @@ fn list(api: &Api, form: &str, cursor: Option<&str>) -> Result<Option<Pulled>, F
         return Ok(Some(Pulled { records, deleted: Vec::new(), server_time: None, full: true }));
     };
     let deleted_since = first.get("deletedSince").and_then(Value::as_str).unwrap_or("").to_string();
-    let mut whole = first.get("deletedComplete").and_then(Value::as_bool).unwrap_or(false) && !deleted_since.is_empty() && when(&deleted_since) <= when(&since);
+    let mut whole = first.get("deletedComplete").and_then(Value::as_bool).unwrap_or(false)
+        && matches!((when(&deleted_since), when(&since)), (Some(d), Some(s)) if d <= s);
     let mut records = responses(&first);
     let mut deleted = deleted_ids(&first);
     let mut n = records.len();

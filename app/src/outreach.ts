@@ -1572,7 +1572,7 @@ export class Outreach {
     const now = this.now();
     let found = false;
     for (const c of this.campaigns) {
-      if (c.kind !== 'text') continue;
+      if (c.kind !== 'text' || this.unstarted(c)) continue;
       for (const p of c.people) {
         if (!p.attempt || !(p.number === number || (p.number !== TEST && samePerson(p.number, number)))) continue;
         found = true;
@@ -1702,6 +1702,7 @@ export class Outreach {
   about(number: string): { c: Campaign; p: Person } | null {
     const now = this.now();
     for (const c of [...this.campaigns].reverse()) {
+      if (this.unstarted(c)) continue;
       const p = c.people.find((x) => x.number === number || (x.number !== TEST && number !== TEST && samePerson(x.number, number)));
       if (p && (!FINAL.has(p.state) ? c.state === 'running' || c.state === 'paused' || p.state !== 'queued' : now - (p.doneAt ?? 0) < 2 * 60 * 60_000)) return { c, p };
     }

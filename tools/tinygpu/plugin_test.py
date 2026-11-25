@@ -6,7 +6,7 @@ and looked at now on `setup.status {refresh: true}`. No Docker, card or system_p
 """
 from __future__ import annotations
 
-import importlib.util, io, json, os, pathlib, socket, sys, tempfile, threading, time, unittest
+import importlib.util, io, json, os, pathlib, socket, sys, tempfile, threading, time, unittest, zipfile
 from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -285,6 +285,117 @@ class Commands(unittest.TestCase):
             plugin.main()
         self.assertEqual(seen, [{"refresh": True}, None, None])
         self.assertEqual([json.loads(l)["result"]["ok"] for l in out.getvalue().splitlines()], [True, True, True])
+
+
+class TinyGpuVerification(unittest.TestCase):
+    def make_zip(self, entries: dict[str, bytes]) -> pathlib.Path:
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="egpu-zip-"))
+        zpath = tmp / "TinyGPU.zip"
+        with zipfile.ZipFile(zpath, "w") as z:
+            for name, content in entries.items():
+                zi = zipfile.ZipInfo("placeholder")
+                zi.filename = name
+                z.writestr(zi, content)
+        return zpath
+
+    def test_zip_rejects_traversal_and_extra_top_level_entries(self):
+        good = self.make_zip({"TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"})
+        plugin.verify_tinygpu_zip(good)
+        for bad_entries in [
+            {"../Evil.app/Contents/MacOS/TinyGPU": b"x"},
+            {"TinyGPU.app/../Evil.app/x": b"x", "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"},
+            {"/Applications/Evil.app/x": b"x", "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"},
+            {"Other.app/foo": b"x", "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"},
+            {"TinyGPU.app\\Contents\\MacOS\\TinyGPU": b"bin"},
+            {"TinyGPU.app/Contents/Info.plist": b"plist"},
+        ]:
+            z = self.make_zip(bad_entries)
+            with mock.patch.object(os, "sep", "/"):
+                with self.assertRaises(RuntimeError, msg=f"should reject {list(bad_entries)}"):
+                    plugin.verify_tinygpu_zip(z)
+
+    def test_verify_tinygpu_app_rejects_adhoc_or_failed_gatekeeper_and_accepts_notarized(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="egpu-app-"))
+        app = root / "TinyGPU.app"
+        prog = app / "Contents" / "MacOS" / "TinyGPU"
+        prog.parent.mkdir(parents=True)
+        prog.write_bytes(b"bin")
+
+        def run_with(verify_rc=0, dv_stderr="TeamIdentifier=A1B2C3D4E5\n", spctl_rc=0):
+            def fake_quiet(argv, timeout, env=None):
+                if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
+                    return plugin.subprocess.CompletedProcess(argv, verify_rc, "", "bad sig" if verify_rc else "")
+                if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
+                    return plugin.subprocess.CompletedProcess(argv, 0, "", dv_stderr)
+                if argv[0] == "/usr/sbin/spctl":
+                    return plugin.subprocess.CompletedProcess(argv, spctl_rc, "", "rejected" if spctl_rc else "accepted")
+                raise AssertionError(f"unexpected command: {argv}")
+            with mock.patch.object(plugin, "quiet", side_effect=fake_quiet):
+                return plugin.verify_tinygpu_app(app)
+
+        self.assertEqual(run_with(), "A1B2C3D4E5")
+        with self.assertRaises(RuntimeError):
+            run_with(verify_rc=1)
+        with self.assertRaises(RuntimeError):
+            run_with(dv_stderr="TeamIdentifier=not set\n")
+        with self.assertRaises(RuntimeError):
+            run_with(dv_stderr="Identifier=org.tinygrad.tinygpu\n")
+        with self.assertRaises(RuntimeError):
+            run_with(spctl_rc=3)
+
+    def test_install_tinygpu_app_verifies_in_temp_dir_before_moving_to_dest(self):
+        z = self.make_zip({"TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"})
+        apps_dir = pathlib.Path(tempfile.mkdtemp(prefix="egpu-apps-"))
+        dest = apps_dir / "TinyGPU.app"
+
+        def fake_ditto_and_checks(spctl_rc: int):
+            def fake_quiet(argv, timeout, env=None):
+                if argv[0] == "/usr/bin/ditto":
+                    stage = pathlib.Path(argv[-1])
+                    self.assertNotEqual(stage.resolve(), apps_dir.resolve(), "must not extract directly into Applications")
+                    with zipfile.ZipFile(argv[-2], "r") as zf:
+                        zf.extractall(stage)
+                    return plugin.subprocess.CompletedProcess(argv, 0, "", "")
+                if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
+                    return plugin.subprocess.CompletedProcess(argv, 0, "", "")
+                if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
+                    return plugin.subprocess.CompletedProcess(argv, 0, "", "TeamIdentifier=A1B2C3D4E5\n")
+                if argv[0] == "/usr/sbin/spctl":
+                    return plugin.subprocess.CompletedProcess(argv, spctl_rc, "", "rejected" if spctl_rc else "accepted")
+                raise AssertionError(f"unexpected command: {argv}")
+            return fake_quiet
+
+        with mock.patch.object(plugin, "quiet", side_effect=fake_ditto_and_checks(spctl_rc=3)):
+            with self.assertRaises(RuntimeError):
+                plugin.install_tinygpu_app(z, dest)
+        self.assertFalse(dest.exists(), "failed verification must not leave TinyGPU.app in Applications")
+
+        with mock.patch.object(plugin, "quiet", side_effect=fake_ditto_and_checks(spctl_rc=0)):
+            team = plugin.install_tinygpu_app(z, dest)
+        self.assertEqual(team, "A1B2C3D4E5")
+        self.assertTrue((dest / "Contents" / "MacOS" / "TinyGPU").is_file())
+
+    def test_install_driver_verifies_existing_app_before_execution(self):
+        apps_dir = pathlib.Path(tempfile.mkdtemp(prefix="egpu-existing-"))
+        dest = apps_dir / "TinyGPU.app"
+        prog = dest / "Contents" / "MacOS" / "TinyGPU"
+        prog.parent.mkdir(parents=True)
+        prog.write_bytes(b"bin")
+        job = plugin.Job("driver")
+
+        def fail_spctl(argv, timeout, env=None):
+            if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
+                return plugin.subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
+                return plugin.subprocess.CompletedProcess(argv, 0, "", "TeamIdentifier=not set\n")
+            return plugin.subprocess.CompletedProcess(argv, 3, "", "rejected")
+
+        with mock.patch.object(plugin, "TINYGPU_APP", dest), \
+             mock.patch.object(plugin, "driver", return_value={"installed": False, "enabled": False, "app": True, "state": "absent", "said": ""}), \
+             mock.patch.object(plugin, "quiet", side_effect=fail_spctl), \
+             mock.patch.object(plugin.subprocess, "Popen", side_effect=AssertionError("must not execute unverified TinyGPU.app")):
+            with self.assertRaises(RuntimeError):
+                plugin.install_driver(job)
 
 
 if __name__ == "__main__":
