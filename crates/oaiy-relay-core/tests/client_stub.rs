@@ -891,12 +891,7 @@ fn unauthenticated_x_oaiy_time_does_not_shift_offset_clock() {
     let poisoned_time = T0 + 86_400;
     let http = oaiy_relay_core::testing::ScriptedHttp::new(move |req| {
         if req.url.ends_with("/v1/health") {
-            return Ok(oaiy_relay_core::testing::json_response(
-                200,
-                &[],
-                r#"{"ok":true,"time":1,"authHeaderSeen":false}"#,
-                poisoned_time,
-            ));
+            return Ok(oaiy_relay_core::testing::json_response(200, &[], r#"{"ok":true,"time":1,"authHeaderSeen":false}"#, poisoned_time));
         }
         Ok(oaiy_relay_core::testing::json_response(
             200,
@@ -941,15 +936,18 @@ fn unauthenticated_x_oaiy_time_does_not_shift_offset_clock() {
 fn read_info_requires_x_oaiy_sig_and_426_re_proves_with_nonce() {
     // P1-2: read_info() must reject a 200 /v1/info without X-OAIY-Sig.
     let e = env(quick());
-    let valid_resp = e.stub.handle(&HttpRequest {
-        method: Method::Get,
-        url: format!("{}/v1/info", e.stub.public_url()),
-        headers: vec![],
-        body: None,
-        timeout: Duration::from_secs(5),
-        max_response_bytes: oaiy_relay_core::client::relay::MAX_RESPONSE_BYTES,
-        cancel: Cancel::new(),
-    }).unwrap();
+    let valid_resp = e
+        .stub
+        .handle(&HttpRequest {
+            method: Method::Get,
+            url: format!("{}/v1/info", e.stub.public_url()),
+            headers: vec![],
+            body: None,
+            timeout: Duration::from_secs(5),
+            max_response_bytes: oaiy_relay_core::client::relay::MAX_RESPONSE_BYTES,
+            cancel: Cancel::new(),
+        })
+        .unwrap();
     let unsigned_body = valid_resp.body.clone();
     let unsigned_http = oaiy_relay_core::testing::ScriptedHttp::new(move |_| {
         Ok(HttpResponse {

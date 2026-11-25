@@ -1263,7 +1263,8 @@ mod unix {
         symlink(untrusted.join("link2"), safe.0.join("link1")).unwrap();
         fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
 
-        let error = open_at(safe.0.join("link1").join("keys"), ProviderChoice::Keyfile).err().expect("chained symlink through untrusted dir must be refused");
+        let error =
+            open_at(safe.0.join("link1").join("keys"), ProviderChoice::Keyfile).err().expect("chained symlink through untrusted dir must be refused");
         assert!(matches!(&error, KeyError::Permissions(why) if why.contains("above the keys directory") && why.contains("sticky")), "{error:?}");
         assert!(!real.join("keys").exists(), "nothing was created through a chained symlink in an untrusted dir");
 

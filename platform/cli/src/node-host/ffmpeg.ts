@@ -60,7 +60,14 @@ function stripStreamSpec(flag: string): string {
 /** Map virtual-root / absolute path args onto real files; leave flags alone. */
 function resolveArg(a: string): string {
   const n = a.replace(/\\/g, '/');
-  if (n.startsWith('/tmp') || n.startsWith('/oaiy') || n.startsWith('/downloads')) {
+  if (
+    n === '/tmp' ||
+    n.startsWith('/tmp/') ||
+    n === '/oaiy' ||
+    n.startsWith('/oaiy/') ||
+    n === '/downloads' ||
+    n.startsWith('/downloads/')
+  ) {
     return resolvePath(a);
   }
   if (fsConfinementOn()) {

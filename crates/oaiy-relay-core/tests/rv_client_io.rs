@@ -1118,7 +1118,7 @@ fn finding_the_relay_time_does_not_follow_a_step_of_the_wall_clock() {
         move || T0 + c.monotonic().as_secs() as i64
     };
     let t2 = truth.clone();
-    let stub = StubRelay::with_clocks(quick(), move || t2(), || Duration::ZERO);
+    let stub = StubRelay::with_clocks(quick(), t2, || Duration::ZERO);
     let client = RelayClient::new(
         RelayUrl::parse("https://relay.stub.test").unwrap(),
         Some(stub.relay_thumbprint()),

@@ -54,6 +54,12 @@ fn check_ancestors_of(start: &File, mut dev: u64, mut ino: u64, display_path: &P
     Err(KeyError::Permissions(format!("{}: more than {MAX_DEPTH} directories above the keys directory", display_path.display())))
 }
 
+struct WalkCtx<'a> {
+    root_display: &'a Path,
+    uid: u32,
+    hops: usize,
+}
+
 /// Recursively resolves `target_path` component by component with `openat(..., O_NOFOLLOW)`, `statat(..., SYMLINK_NOFOLLOW)`,
 /// and `readlinkat`. Every traversed parent directory is checked with [`perm::check_ancestor`], and every intermediate
 /// symbolic link (including chained links inside link targets) must belong to `uid` or root and stay within [`MAX_SYMLINKS`].
@@ -62,15 +68,14 @@ fn check_ancestors_of(start: &File, mut dev: u64, mut ino: u64, display_path: &P
 /// refused, and if `create_missing` is true any missing directories are created via `mkdirat(..., 0700)` anchored to the
 /// already-verified parent descriptor (avoiding path re-traversal TOCTOU).
 fn walk_from(
+    ctx: &mut WalkCtx<'_>,
     start_dir: Option<File>,
     start_display: PathBuf,
     target_path: &Path,
-    root_display: &Path,
-    uid: u32,
     final_must_be_dir: bool,
     create_missing: bool,
-    hops: &mut usize,
 ) -> Result<File, KeyError> {
+    let (root_display, uid) = (ctx.root_display, ctx.uid);
     let (mut dir, mut cur_display) = match start_dir {
         Some(d) if !target_path.is_absolute() => (d, start_display),
         _ => {
@@ -79,10 +84,7 @@ fn walk_from(
             (File::from(root_fd), PathBuf::from("/"))
         }
     };
-    let comps: Vec<Component<'_>> = target_path
-        .components()
-        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
-        .collect();
+    let comps: Vec<Component<'_>> = target_path.components().filter(|c| !matches!(c, Component::RootDir | Component::CurDir)).collect();
     if comps.is_empty() {
         return Ok(dir);
     }
@@ -95,8 +97,9 @@ fn walk_from(
         })?;
 
         if matches!(comp, Component::ParentDir) {
-            let next_fd = openat(&dir, "..", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
-                .map_err(|e| errno("inspect the directories above the keys directory", e))?;
+            let next_fd =
+                openat(&dir, "..", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+                    .map_err(|e| errno("inspect the directories above the keys directory", e))?;
             dir = File::from(next_fd);
             cur_display.push("..");
             continue;
@@ -110,25 +113,36 @@ fn walk_from(
             Err(Errno::NOENT) if create_missing && final_must_be_dir => {
                 // Create missing directories directly under the verified parent fd at mode 0700; on EEXIST re-open with
                 // O_DIRECTORY | O_NOFOLLOW and verify owner/mode so a concurrent racer cannot swap in a symlink or loose dir.
-                match mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
+                match mkdirat(&dir, name, Mode::RWXU) {
                     Ok(()) | Err(Errno::EXIST) => {}
                     Err(e) => return Err(errno("create the keys directory", e)),
                 }
-                let next_fd = openat(&dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
-                    .map_err(|e| match e {
-                        Errno::LOOP if is_final => KeyError::Permissions(format!("{}: is a symbolic link", root_display.display())),
-                        Errno::LOOP => KeyError::Permissions(format!("{}: {} is a symbolic link", root_display.display(), next_display.display())),
-                        Errno::NOTDIR if is_final => KeyError::Permissions(format!("{}: is not a directory", root_display.display())),
-                        Errno::NOTDIR => KeyError::Permissions(format!("{}: {} is not a directory", root_display.display(), next_display.display())),
-                        other => errno(if is_final { "open the keys directory" } else { "inspect the directories above the keys directory" }, other),
-                    })?;
+                let next_fd =
+                    openat(&dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+                        .map_err(|e| match e {
+                            Errno::LOOP if is_final => KeyError::Permissions(format!("{}: is a symbolic link", root_display.display())),
+                            Errno::LOOP => {
+                                KeyError::Permissions(format!("{}: {} is a symbolic link", root_display.display(), next_display.display()))
+                            }
+                            Errno::NOTDIR if is_final => KeyError::Permissions(format!("{}: is not a directory", root_display.display())),
+                            Errno::NOTDIR => {
+                                KeyError::Permissions(format!("{}: {} is not a directory", root_display.display(), next_display.display()))
+                            }
+                            other => {
+                                errno(if is_final { "open the keys directory" } else { "inspect the directories above the keys directory" }, other)
+                            }
+                        })?;
                 let next = File::from(next_fd);
                 if is_final {
                     return Ok(next);
                 }
                 let next_meta = next.metadata().map_err(|e| KeyError::io("inspect the directories above the keys directory", e))?;
                 perm::check_ancestor(&perm::meta_of(&next_meta), uid).map_err(|why| {
-                    KeyError::Permissions(format!("{}: the directory {} above the keys directory {why}", root_display.display(), next_display.display()))
+                    KeyError::Permissions(format!(
+                        "{}: the directory {} above the keys directory {why}",
+                        root_display.display(),
+                        next_display.display()
+                    ))
                 })?;
                 dir = next;
                 cur_display = next_display;
@@ -164,33 +178,33 @@ fn walk_from(
                     st.st_uid
                 )));
             }
-            if *hops >= MAX_SYMLINKS {
+            if ctx.hops >= MAX_SYMLINKS {
                 return Err(KeyError::Permissions(format!(
                     "{}: too many symbolic links above the keys directory (more than {MAX_SYMLINKS})",
                     root_display.display()
                 )));
             }
-            *hops += 1;
-            let raw_target = readlinkat(&dir, name, Vec::new())
-                .map_err(|e| errno("inspect the directories above the keys directory", e))?;
+            ctx.hops += 1;
+            let raw_target = readlinkat(&dir, name, Vec::new()).map_err(|e| errno("inspect the directories above the keys directory", e))?;
             let target_bytes = raw_target.as_bytes();
             if target_bytes.is_empty() {
                 return Err(errno("inspect the directories above the keys directory", Errno::NOENT));
             }
             let target = PathBuf::from(OsStr::from_bytes(target_bytes));
             let base_dir = (!target.is_absolute()).then_some(dir);
-            let next = walk_from(base_dir, cur_display, &target, root_display, uid, false, false, hops)?;
+            let next = walk_from(ctx, base_dir, cur_display, &target, false, false)?;
             let next_meta = next.metadata().map_err(|e| KeyError::io("inspect the directories above the keys directory", e))?;
             check_ancestors_of(&next, next_meta.dev(), next_meta.ino(), root_display, uid)?;
             dir = next;
             cur_display = next_display;
         } else {
-            let next_fd = openat(&dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
-                .map_err(|e| match e {
-                    Errno::LOOP => KeyError::Permissions(format!("{}: {} is a symbolic link", root_display.display(), next_display.display())),
-                    Errno::NOTDIR => KeyError::Permissions(format!("{}: {} is not a directory", root_display.display(), next_display.display())),
-                    other => errno("inspect the directories above the keys directory", other),
-                })?;
+            let next_fd =
+                openat(&dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+                    .map_err(|e| match e {
+                        Errno::LOOP => KeyError::Permissions(format!("{}: {} is a symbolic link", root_display.display(), next_display.display())),
+                        Errno::NOTDIR => KeyError::Permissions(format!("{}: {} is not a directory", root_display.display(), next_display.display())),
+                        other => errno("inspect the directories above the keys directory", other),
+                    })?;
             dir = File::from(next_fd);
             cur_display = next_display;
         }
@@ -201,8 +215,8 @@ fn walk_from(
 /// Walks every syntactic component of `path` (which must be absolute and normalized), checking every parent directory and
 /// every intermediate symbolic link hop. When `create_missing` is true, missing directories are created via `mkdirat(..., 0700)`.
 fn walk_syntactic(path: &Path, uid: u32, create_missing: bool) -> Result<File, KeyError> {
-    let mut hops = 0;
-    walk_from(None, PathBuf::from("/"), path, path, uid, true, create_missing, &mut hops)
+    let mut ctx = WalkCtx { root_display: path, uid, hops: 0 };
+    walk_from(&mut ctx, None, PathBuf::from("/"), path, true, create_missing)
 }
 
 /// The keys folder, held open.

@@ -300,6 +300,16 @@ export function fsConfinementOn(): boolean {
  */
 export function resolvePath(p: string): string {
   if (!p) return TMP_ROOT;
+  // On POSIX hosts (e.g. Linux CI where os.tmpdir() === '/tmp'), an already-resolved
+  // absolute path inside ALLOWED_ROOTS (such as `/tmp/oaiy-cli-.../tmp/clip.mp4`) also
+  // starts with `/tmp/`. Recognize genuine paths already inside ALLOWED_ROOTS first so
+  // we don't re-apply the `/tmp` virtual-root prefix and double-prepend TMP_ROOT.
+  if (path.isAbsolute(p)) {
+    const resolved = path.resolve(p);
+    if (ALLOWED_ROOTS.some((root) => resolved === root || resolved.startsWith(root + path.sep))) {
+      return confineAbsolute(p);
+    }
+  }
   const norm = p.replace(/\\/g, '/');
   if (norm === '/oaiy' || norm.startsWith('/oaiy/')) {
     return within(DATA_DIR, stripLead(norm.slice('/oaiy'.length)));
