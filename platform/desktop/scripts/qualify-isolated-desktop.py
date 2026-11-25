@@ -88,7 +88,7 @@ def request(owners, process, port, method, route, origin=True):
         owners.verify(process, port)  # Recheck before sending even one HTTP byte.
         headers = {"Content-Type": "application/json"}
         if origin:
-            headers["Origin"] = "tauri://localhost"
+            headers["Origin"] = "http://tauri.localhost"
         connection.request(method, route, body=b"{}" if method == "POST" else None, headers=headers)
         response = connection.getresponse()
         data = response.read(1024 * 1024 + 1)

@@ -1113,8 +1113,9 @@ export default function App() {
             </div>
           )}
           {/* A page in a webview of its own: the desktop lays it over this box (and takes it away while a call rings,
-              whose dialog it would cover). */}
-          {embedded && <EmbeddedPage key={view} page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing || menuOpen} />}
+              whose dialog it would cover). Distinct key prefix from the sibling `.content-page` so React never hits
+              a duplicate-key collision and duplicates EmbeddedPage nodes across re-renders. */}
+          {embedded && <EmbeddedPage key={`embedded-${view}`} page={view as 'agent' | 'flows' | 'engines'} covered={ringShowing || menuOpen} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset. `revisit`
               suppresses the entrance animation the second time you open a panel,
@@ -1124,7 +1125,7 @@ export default function App() {
           <div
             hidden={embedded}
             className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView || view === 'setup' ? ' page-fill' : ''}`}
-            key={view}
+            key={`content-${view}`}
           >
             {isolatedUnavailable ? (
               <div className="panel">

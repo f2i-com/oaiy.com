@@ -26,7 +26,7 @@ vi.mock('./useSetupState', () => ({
   carryGuideDismissal: vi.fn().mockResolvedValue(false),
   guideDismissed: () => true,
 }));
-vi.mock('./EmbeddedPage', () => ({ default: () => null }));
+vi.mock('./EmbeddedPage', () => ({ default: ({ page }: { page: string }) => <div className="embedded-page" data-page={page} /> }));
 vi.mock('./PairingPrompt', () => ({ default: () => <p className="app-pairing-prompt">An app wants to connect</p> }));
 vi.mock('./ConnectionsPanel', () => ({ default: () => <p>The Connections page</p> }));
 vi.mock('./OverviewPanel', () => ({ default: () => <p>The Overview</p> }));
@@ -309,5 +309,27 @@ describe('the dashboard’s frame while OAIY is not answering', () => {
     await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })));
     await settle();
     expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+  });
+
+  it('mounts exactly one EmbeddedPage per embedded view with no duplicate React keys across re-renders', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const view of ['agent', 'flows', 'engines'] as const) {
+        await go(view);
+        const themeBtn = host.querySelector<HTMLButtonElement>('.top-actions .icon-button')!;
+        // Force several App re-renders while the embedded page stays open.
+        for (let i = 0; i < 4; i++) {
+          await act(async () => themeBtn.click());
+          await settle();
+        }
+        const nodes = Array.from(host.querySelectorAll('.embedded-page'));
+        expect(nodes).toHaveLength(1);
+        expect(nodes[0].getAttribute('data-page')).toBe(view);
+      }
+      const keyWarnings = errors.mock.calls.flat().filter((arg) => /same key|unique "key"/i.test(String(arg)));
+      expect(keyWarnings).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
