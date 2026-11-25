@@ -65,8 +65,18 @@ export function attest(dir, env = process.env, log = console.log) {
     if (!Array.isArray(evidence.artifacts) || evidence.artifacts.length === 0) refuse(`${name}: lists no artifacts`);
     for (const artifact of evidence.artifacts) {
       if (typeof artifact?.name !== 'string' || !/^[0-9a-f]{64}$/.test(artifact?.sha256 ?? '')) refuse(`${name}: malformed artifact entry ${JSON.stringify(artifact)}`);
+      if (
+        artifact.name.length === 0 ||
+        artifact.name !== path.basename(artifact.name) ||
+        artifact.name === '.' ||
+        artifact.name === '..' ||
+        /[\\/]/.test(artifact.name)
+      ) {
+        refuse(`${name}: invalid artifact name ${JSON.stringify(artifact.name)}`);
+      }
       const artifactPath = path.join(dir, artifact.name);
       if (!fs.existsSync(artifactPath)) refuse(`${name}: artifact ${artifact.name} is missing from ${dir}`);
+      if (!fs.statSync(artifactPath).isFile()) refuse(`${name}: artifact ${artifact.name} is not a regular file`);
       const actual = crypto.createHash('sha256').update(fs.readFileSync(artifactPath)).digest('hex');
       if (actual !== artifact.sha256) refuse(`${name}: ${artifact.name} digest ${actual} differs from the recorded ${artifact.sha256}`);
     }

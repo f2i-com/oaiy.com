@@ -92,6 +92,8 @@ export { default as AudioRuntime, sanitizeAudioFilename, sanitizeAudioFormat, re
 export { default as ImageRuntime } from './src/bundled-modules/core-image/runtime.ts';
 export { default as VideoRuntime, sanitizeVideoFilename, sanitizeVideoFormat, sanitizeFfmpegColor } from './src/bundled-modules/core-video/runtime.ts';
 export { default as SubflowRuntime } from './src/bundled-modules/core-flow-control/runtime.ts';
+export { default as FlowControlCompiler } from './src/bundled-modules/core-flow-control/compiler.ts';
+export { kindOfAddress } from './src/bundled-modules/core-flow-control/ui/outputValue.ts';
 export { default as Model3DRuntime } from './src/bundled-modules/core-3d/runtime.ts';
 export { default as AgentRuntime, taskText } from './src/bundled-modules/core-agent/runtime.ts';
 export { default as FilesystemRuntime, validatePath } from './src/bundled-modules/core-filesystem/runtime.ts';
@@ -101,14 +103,15 @@ export { default as DatabaseCompiler } from './src/bundled-modules/core-database
 export { default as UtilityRuntime } from './src/bundled-modules/core-utility/runtime.ts';
 export { default as UtilityCompiler } from './src/bundled-modules/core-utility/compiler.ts';
 export { default as Core3DCompiler } from './src/bundled-modules/core-3d/compiler.ts';
-export { desktopCredential, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
+export { desktopCredential, desktopFileBytes, runContract, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
 export { OAIYRuntime, OAIYCompiler, JobManager, getModuleLoader } from 'oaiy-core';
+export { detectSandboxEscape, stripCommentsAndStringsFromCode } from 'oaiy-core/src/runtime.ts';
 export { isLocalNetworkUrl, matchesWhitelistEntry, getHostPort } from 'oaiy-core/src/runtime/NetworkUtils.ts';
 export { convertSelectionToMacro, analyzeSelection } from 'oaiy-core/src/macro/selection-analyzer.ts';
 export { parseImportedProject, sanitizeProjectForExport, stripUnsafeImportedSettings, sanitizeProjectRecord, looksLikeSecret, isSecretConstant, UNSAFE_IMPORTED_SETTING_KEYS } from './src/utils/ProjectIO.ts';
 export { filterNodeData, prepareWorkflowForExport } from './src/utils/WorkflowIO.ts';
 export { sanitizeDataForSandbox, sanitizeSandboxUpdates } from './src/lib/sandboxData.ts';
-export { withdrawTool, withdrawHook } from './src/lib/oaiyAgentTools.ts';
+export { publishAsTool, publishAsHook, withdrawTool, withdrawHook, isUntrustedOrPkgFlow } from './src/lib/oaiyAgentTools.ts';
 export { isReadOnlySql } from './src/lib/sqlReadOnly.ts';
 export { normalizeSql } from './src/tauri-shim/sql.ts';
 export { PermissionRequestQueue } from './src/lib/permissionQueue.ts';
@@ -551,7 +554,7 @@ await check('5b. core-service & core-ai malformed template errors and core-audio
         return null;
       },
     },
-    fetch: async () => mockResp(200, { path: '/tmp/out.wav' }, { 'content-type': 'application/json' }),
+    fetch: async () => mockResp(200, { audio: 'UklGRg==' }, { 'content-type': 'application/json' }),
   };
   await M.AudioRuntime.createMethods(audioCtx).textToSpeechV2({
     nodeId: 'tts1',
@@ -561,8 +564,8 @@ await check('5b. core-service & core-ai malformed template errors and core-audio
     externalMethod: 'POST',
     externalHeaders: '{}',
     externalBodyTemplate: '{"text": {{text}}}',
-    externalResponseType: 'file_path',
-    externalResponsePath: 'path',
+    externalResponseType: 'base64_wav',
+    externalResponsePath: 'audio',
     externalApiKeyConstant: 'TTS_KEY',
   });
   assert.ok(audioLogs.length > 0);
@@ -1041,7 +1044,8 @@ await check('16. buildModuleInvokeBroker enforces per-command permissions, drops
   await assert.rejects(() => broker.invoke('ensure_service_ready_by_port', { port: 8188 }), /service:start/);
 
   // Browser local-network URL interception (both browser_v2_http_request and browser_v2_goto)
-  rt.setPackagePermissions(['browser', 'network']);
+  // `network` does NOT imply `network:local`, so explicit `network:local` is required here.
+  rt.setPackagePermissions(['browser', 'network:local']);
   await assert.rejects(
     () => broker.invoke('plugin:oaiy-browser|browser_v2_http_request', { request: { url: 'http://127.0.0.1:8188/api' } }),
     /Local network access denied/,
@@ -1052,8 +1056,8 @@ await check('16. buildModuleInvokeBroker enforces per-command permissions, drops
   );
   assert.equal(prompted.length, 2, 'must prompt local-network consent for browser_v2_http_request & browser_v2_goto');
 
-  // Package with browser but WITHOUT network/network:local is rejected outright for local URLs
-  rt.setPackagePermissions(['browser']);
+  // Package with browser + network (WITHOUT network:local) is rejected outright for local URLs
+  rt.setPackagePermissions(['browser', 'network']);
   await assert.rejects(
     () => broker.invoke('plugin:oaiy-browser|browser_v2_goto', { sessionId: 's1', url: 'http://127.0.0.1:8188/' }),
     /network:local/,
@@ -1508,6 +1512,470 @@ await check('23. core-database, core-agent, core-flow-control, core-utility, sql
   const trustSrc = fs.readFileSync(path.join(UI, 'src/components/PackageManager/TrustDialog.tsx'), 'utf8');
   assert.ok(trustSrc.includes("'filesystem:read'") && trustSrc.includes("'network:local'"), 'TrustDialog must include filesystem:read & network:local in HIGH_RISK_PERMISSIONS');
   assert.ok(/diffusion\s*:/.test(trustSrc), 'TrustDialog must define PERMISSION_INFO entry for diffusion');
+});
+
+// ---------------------------------------------------------------------------
+// Wave-3 Security & Correctness Regressions
+// ---------------------------------------------------------------------------
+await check('24. Wave-3: condition AST breakout rejection, pre-run code:execute gate, and template-literal stripCommentsAndStringsFromCode', async () => {
+  const compileCond = (expression) =>
+    M.FlowControlCompiler.compileNode('condition', {
+      node: { id: 'c1', type: 'condition', data: { expression } },
+      inputs: new Map([['input', 'node_in']]),
+      outputVar: 'node_c1_out',
+      sanitizedId: 'c1',
+      skipVarDeclaration: false,
+      escapeString: (s) => s,
+      sanitizeId: (s) => s,
+      isInLoop: false,
+    });
+
+  // Malicious statement/paren breakouts must be rejected by Acorn AST validation
+  for (const badExpr of [
+    'true); evil(); (true',
+    '1) + (2',
+    '1), (2',
+    'true); } evil(); { (true',
+    'let x = 1',
+    'if (true) {}',
+  ]) {
+    assert.throws(() => compileCond(badExpr), /Condition \(c1\):/, `must reject breakout expression: ${badExpr}`);
+  }
+
+  // Legitimate JS expressions (including trailing single-line comments and object literals) compile cleanly
+  for (const goodExpr of [
+    'input && input.length > 0',
+    'input === "ok" // trailing comment',
+    '{ a: 1 }.a === 1',
+    '(() => true)()',
+  ]) {
+    const code = compileCond(goodExpr);
+    assert.ok(code.includes('Utility.requireCodeExecute'), `valid expression should compile: ${goodExpr}`);
+  }
+
+  // Pre-run code:execute gate rejects graphs with logic_block or condition expression BEFORE compiling/running
+  const rt = new M.OAIYRuntime({ useWorkerForUntrusted: false });
+  rt.setFlowContext('f1', 'pkg-untrusted');
+  rt.setPackagePermissions(['network']);
+  await assert.rejects(
+    () =>
+      rt.runWorkflow({
+        nodes: [{ id: 'lb1', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: '1 + 1' } }],
+        edges: [],
+      }),
+    /lacks required permission 'code:execute'.*logic_block/,
+  );
+  await assert.rejects(
+    () =>
+      rt.runWorkflow({
+        nodes: [{ id: 'c_expr', type: 'condition', position: { x: 0, y: 0 }, data: { expression: 'true); evil(); (true' } }],
+        edges: [],
+      }),
+    /lacks required permission 'code:execute'.*condition expression/,
+    'must reject condition expression BEFORE compiling (so breakout syntax never even reaches compiler)',
+  );
+
+  // stripCommentsAndStringsFromCode preserves/recurses into template literal ${...} expressions
+  assert.equal(M.detectSandboxEscape('const s = `globalThis`;'), null, 'static template text must not false-positive');
+  assert.equal(M.detectSandboxEscape('const s = `\\${globalThis}`;'), null, 'escaped ${} must not false-positive');
+  assert.equal(M.detectSandboxEscape('const s = `${globalThis}`;'), 'globalThis', 'must detect escape inside ${...}');
+  assert.equal(
+    M.detectSandboxEscape('const s = `outer ${`inner ${eval("1")}`}`;'),
+    'eval()',
+    'must detect escape inside nested template literal ${...}',
+  );
+  assert.equal(
+    M.detectSandboxEscape('const s = `${(() => { const x = "}"; /* } */ return globalThis; })()}`;'),
+    'globalThis',
+    'must track braces, strings, and comments inside ${...}',
+  );
+  const stripped = M.stripCommentsAndStringsFromCode('`plain ${foo("bar")} tail`');
+  assert.equal(stripped, '`${foo("")}`');
+});
+
+await check('25. Wave-3: network does NOT imply network:local, complete broker permissions, ctx.modules/callModule gating, and proxy local-network checks', async () => {
+  const invoked = [];
+  const rt = new M.OAIYRuntime({
+    useWorkerForUntrusted: false,
+    callbacks: {
+      onLocalNetworkPermission: async () => ({ allowed: false, remember: false }),
+    },
+  });
+  rt.setTauriInvoke(async (cmd, args) => {
+    invoked.push({ cmd, args });
+    return { ok: true, status: 200, headers: {}, body: 'ok' };
+  });
+  let probeCtx;
+  await rt.registerDynamicModule({
+    manifest: { id: 'probe-w3', name: 'ProbeW3', version: '1.0.0', nodes: [] },
+    runtime: {
+      name: 'Filesystem',
+      createMethods(ctx) {
+        probeCtx = ctx;
+        return {
+          readFile: () => 'secret-file-contents',
+        };
+      },
+      methods: {},
+    },
+  });
+
+  rt.setFlowContext('f1', 'pkg-net-only');
+  rt.setPackagePermissions(['network']);
+  assert.equal(rt.hasPackagePermission('network'), true);
+  assert.equal(rt.hasPackagePermission('network:local'), false, '`network` must NOT imply `network:local`');
+
+  // Newly added broker command permissions
+  for (const [cmd, perm] of [
+    ['get_media_url', 'filesystem:read'],
+    ['get_video_info', 'filesystem:read'],
+    ['extract_video_frames', 'filesystem:read'],
+    ['extract_video_frames_batch', 'filesystem:read'],
+    ['resize_image', 'filesystem:read'],
+    ['cleanup_temp_dir', 'filesystem'],
+    ['get_service_port', 'service:start'],
+  ]) {
+    await assert.rejects(
+      () => probeCtx.tauri.invoke(cmd, {}),
+      new RegExp(perm.replace(':', ':')),
+      `broker must require ${perm} for ${cmd}`,
+    );
+  }
+
+  // http_request requires 'network' when package lacks it
+  rt.setPackagePermissions([]);
+  await assert.rejects(
+    () => probeCtx.tauri.invoke('http_request', { request: { url: 'https://example.com/' } }),
+    /required permission 'network'/,
+  );
+  await assert.rejects(
+    () => probeCtx.secureFetch('https://example.com/'),
+    /lacks required permission 'network'/,
+    'performHttpRequest must enforce network permission for non-local URLs',
+  );
+
+  // ctx.modules and ctx.callModule enforce REQUIRED_PERMISSIONS_BY_KIND
+  assert.throws(() => probeCtx.modules.Filesystem.readFile('/etc/passwd'), /filesystem:read/);
+  assert.throws(() => probeCtx.callModule('Filesystem', 'readFile', '/etc/passwd'), /filesystem:read/);
+  rt.setPackagePermissions(['filesystem:read']);
+  assert.equal(probeCtx.modules.Filesystem.readFile('/tmp/ok'), 'secret-file-contents');
+  assert.equal(probeCtx.callModule('Filesystem', 'readFile', '/tmp/ok'), 'secret-file-contents');
+
+  // Browser proxy local-network gating in buildModuleInvokeBroker
+  rt.setPackagePermissions(['browser']);
+  await assert.rejects(
+    () => probeCtx.tauri.invoke('plugin:oaiy-browser|browser_v2_create_session', {
+      config: { mode: 'chromium', proxy: { type: 'http', host: '127.0.0.1', port: 8080 } },
+    }),
+    /network:local/,
+  );
+  await assert.rejects(
+    () => probeCtx.tauri.invoke('plugin:oaiy-browser|browser_v2_http_request', {
+      request: { url: 'https://example.com', options: { proxy: 'socks5://127.0.0.1:1080' } },
+    }),
+    /network:local/,
+  );
+});
+
+await check('26. Wave-3: JobManager forces hardened sandboxing on pkg:* custom nodes (direct & transitive) with intersected permissions', async () => {
+  const seenLogs = [];
+  const lookupCalls = [];
+  let capturedCtx = null;
+  const fakePkgCompiler = {
+    name: 'FakePkg',
+    getNodeTypes: () => ['pkg:com.alpha:fetch', 'pkg:com.beta:transform'],
+    compileNode: (_type, ctx) => `let ${ctx.outputVar} = "ok";`,
+  };
+  const fakeModuleRegistry = {
+    nodeToModule: new Map([
+      ['pkg:com.alpha:fetch', 'fake-pkg'],
+      ['pkg:com.beta:transform', 'fake-pkg'],
+      ['subflow', 'core-flow-control'],
+    ]),
+    getNodeDefinition: (type) => {
+      if (type.startsWith('pkg:')) {
+        return { id: type, name: type, inputs: [], outputs: [{ id: 'out', name: 'out', type: 'string' }], compiler: {} };
+      }
+      if (type === 'subflow') {
+        return { id: 'subflow', name: 'Subflow', inputs: [], outputs: [{ id: 'result', name: 'result', type: 'any' }], compiler: {} };
+      }
+      return undefined;
+    },
+    getModuleForNode: (type) => {
+      if (type.startsWith('pkg:')) return { compiler: fakePkgCompiler, manifest: { id: 'fake-pkg' } };
+      if (type === 'subflow') return { compiler: M.FlowControlCompiler, manifest: { id: 'core-flow-control' } };
+      return undefined;
+    },
+    getCompiler: (type) => {
+      if (type.startsWith('pkg:')) return fakePkgCompiler;
+      if (type === 'subflow') return M.FlowControlCompiler;
+      return undefined;
+    },
+    getAllNodeDefinitions: () => [],
+    getAllModules: () => [
+      {
+        manifest: { id: 'probe-pkg', name: 'ProbePkg', version: '1.0.0', nodes: [] },
+        runtime: {
+          name: 'ProbePkg',
+          createMethods(ctx) {
+            capturedCtx = ctx;
+            return {};
+          },
+          methods: {},
+        },
+      },
+    ],
+  };
+  const jm = new M.JobManager({
+    databaseHandler: async () => ({ success: true, data: [] }),
+    moduleRegistry: fakeModuleRegistry,
+    packagePermissionsLookup: (pkgId) => {
+      lookupCalls.push(pkgId);
+      if (pkgId === 'com.alpha') return ['network', 'filesystem:read'];
+      if (pkgId === 'com.beta') return ['network'];
+      return null;
+    },
+  });
+  jm.setAvailableFlows([
+    {
+      id: 'sub-with-pkg',
+      name: 'SubPkg',
+      createdAt: '',
+      updatedAt: '',
+      graph: {
+        nodes: [{ id: 'p2', type: 'pkg:com.beta:transform', position: { x: 0, y: 0 }, data: {} }],
+        edges: [],
+      },
+    },
+  ]);
+  jm.onLog((_jobId, entry) => seenLogs.push(entry));
+  const jobId = jm.submit('regular-flow', 'Regular with pkg node', {
+    nodes: [
+      { id: 'p1', type: 'pkg:com.alpha:fetch', position: { x: 0, y: 0 }, data: {} },
+      { id: 's1', type: 'subflow', position: { x: 100, y: 0 }, data: { flowId: 'sub-with-pkg' } },
+    ],
+    edges: [],
+  });
+  const finalJob = await new Promise((resolve) => {
+    const unsub = jm.onStateChange((jobs) => {
+      const j = jobs.find((x) => x.id === jobId);
+      if (j && (j.status === 'completed' || j.status === 'failed' || j.status === 'aborted')) {
+        unsub();
+        resolve(j);
+      }
+    });
+  });
+  assert.equal(finalJob.status, 'failed');
+  assert.match(
+    String(finalJob.error || ''),
+    /Refusing to run untrusted package code in-thread/,
+    `JobManager must force hardened Worker/Zipp execution for flows with pkg:* nodes (got: ${finalJob.error})`,
+  );
+  assert.deepEqual(new Set(lookupCalls), new Set(['com.alpha', 'com.beta']));
+  assert.ok(capturedCtx && capturedCtx.currentPackageId, 'runtime must receive non-null effectivePackageId');
+  assert.equal(capturedCtx.hasPermission('network'), true, 'intersection keeps shared permission network');
+  assert.equal(capturedCtx.hasPermission('filesystem:read'), false, 'intersection drops permission missing from com.beta');
+  assert.equal(capturedCtx.hasPermission('network:local'), false, 'intersection never grants network:local');
+  assert.ok(seenLogs.some((l) => l.source === 'Security' && /custom package node/i.test(l.message)));
+
+  // Unconfirmed package defaults to [] permissions
+  capturedCtx = null;
+  const unconfirmedJobId = jm.submit('regular-unconfirmed', 'Unconfirmed pkg', {
+    nodes: [{ id: 'p3', type: 'pkg:com.unconfirmed:run', position: { x: 0, y: 0 }, data: {} }],
+    edges: [],
+  });
+  await new Promise((resolve) => {
+    const unsub = jm.onStateChange((jobs) => {
+      const j = jobs.find((x) => x.id === unconfirmedJobId);
+      if (j && (j.status === 'completed' || j.status === 'failed' || j.status === 'aborted')) {
+        unsub();
+        resolve(j);
+      }
+    });
+  });
+  assert.equal(capturedCtx.currentPackageId, 'com.unconfirmed');
+  assert.equal(capturedCtx.hasPermission('network'), false, 'unconfirmed package must default to [] permissions');
+});
+
+await check('27. Wave-3: __CHUNK_REF: arbitrary file reader removed from core-ai, desktopFileBytes path/token/auth hardening, core-audio file_path & oaiyAgentTools untrusted blocking', async () => {
+  // 1) core-ai must NOT parse or read __CHUNK_REF: from prompts
+  const tauriCalls = [];
+  const sentBodies = [];
+  const aiMod = M.AIRuntime.createMethods({
+    log() {},
+    onNodeStatus() {},
+    tauri: {
+      invoke: async (cmd, args) => {
+        tauriCalls.push({ cmd, args });
+        return 'SECRET_FILE_CONTENTS';
+      },
+    },
+    secureFetch: async (_url, init) => {
+      sentBodies.push(String(init?.body || ''));
+      return mockResp(200, { choices: [{ message: { content: 'ok' } }] });
+    },
+  });
+  const chunkPayload = '__CHUNK_REF:{"path":"/etc/passwd","index":0,"total":1,"startByte":0,"endByte":100}__';
+  const aiOut = await aiMod.chat('', chunkPayload, null, 'https://api.example.com/v1/chat/completions', 'm', '', false, 32, 0, 'text', false, 'auto', 'n1');
+  assert.equal(aiOut, 'ok');
+  assert.equal(
+    tauriCalls.some((c) => c.cmd.includes('read_chunk_content')),
+    false,
+    'core-ai must never invoke read_chunk_content on __CHUNK_REF: prompts',
+  );
+  assert.ok(sentBodies[0].includes('__CHUNK_REF:'), 'literal prompt text should pass through unmodified');
+
+  // 2) desktopFileBytes restricts paths, routes through ctx.secureFetch, and omits desktop.token for packages lacking network:local
+  const origDesktop = globalThis.__OAIY_DESKTOP__;
+  globalThis.__OAIY_DESKTOP__ = { origin: 'http://127.0.0.1:17972', token: 'desktop-secret' };
+  try {
+    // Non-file desktop API route returns null (even though desktopCredential allows it for contract calls)
+    const nonFile = await M.desktopFileBytes('http://127.0.0.1:17972/api/ai/engine/services');
+    assert.equal(nonFile, null, 'desktopFileBytes must reject non-file-serving routes');
+
+    // Allowed file-serving path routes through ctx.secureFetch and omits desktop.token when package lacks network:local
+    const capturedHeaders = [];
+    const fileRes = await M.desktopFileBytes(
+      'http://127.0.0.1:17972/files/demo.png',
+      undefined,
+      {
+        log() {},
+        currentPackageId: 'pkg-no-local',
+        hasPermission: () => false,
+        secureFetch: async (_u, init) => {
+          capturedHeaders.push(init?.headers || {});
+          return mockResp(200, 'png-bytes', { 'content-type': 'image/png' });
+        },
+      },
+    );
+    assert.ok(fileRes && fileRes.bytes.length > 0);
+    assert.equal(capturedHeaders[0].Authorization, undefined, 'must NOT attach desktop.token when package lacks network:local');
+
+    // Strips case-insensitive lowercase authorization before setting Authorization in contractRuntime send()
+    const sendHeaders = [];
+    await M.runContract(
+      {
+        log() {},
+        secureFetch: async (_u, init) => {
+          sendHeaders.push(init?.headers || {});
+          return mockResp(200, { data: [{ b64_json: 'QUJD' }] });
+        },
+      },
+      {
+        id: 'engine:image:test',
+        name: 'Test',
+        endpoint: 'http://127.0.0.1:17972/api/ai/engine/gateway/v1/images/generations',
+        method: 'POST',
+        headers: JSON.stringify({ authorization: 'Bearer attacker-forged' }),
+        bodyTemplate: '{}',
+        responseType: 'json',
+        responsePath: 'data.0.b64_json',
+        output: 'image',
+      },
+      {},
+      { nodeId: 'n1' },
+    );
+    assert.equal(sendHeaders[0].authorization, undefined, 'lowercase authorization must be stripped');
+    assert.equal(sendHeaders[0].Authorization, 'Bearer desktop-secret');
+  } finally {
+    if (origDesktop === undefined) delete globalThis.__OAIY_DESKTOP__;
+    else globalThis.__OAIY_DESKTOP__ = origDesktop;
+  }
+
+  // 3) core-audio rejects file_path from non-local endpoints and never falls back to get_media_url on permission denial
+  const mediaUrlCalls = [];
+  const audioMod = M.AudioRuntime.createMethods({
+    log() {},
+    onNodeStatus() {},
+    fetch: async () => mockResp(200, { audio_path: '/etc/passwd' }),
+    tauri: {
+      invoke: async (cmd) => {
+        if (cmd === 'plugin:oaiy-filesystem|get_app_data_dir') return '/app';
+        if (cmd === 'plugin:oaiy-filesystem|native_copy_file') {
+          throw new Error("Refusing module invoke 'plugin:oaiy-filesystem|native_copy_file': package 'p' lacks required permission 'filesystem'");
+        }
+        if (cmd === 'get_media_url') {
+          mediaUrlCalls.push(cmd);
+          return 'http://127.0.0.1/media/leaked';
+        }
+        return null;
+      },
+    },
+  });
+  await assert.rejects(
+    () =>
+      audioMod.textToSpeechV2({
+        provider: 'external',
+        text: 'hi',
+        externalUrl: 'https://remote-attacker.example/tts',
+        externalMethod: 'POST',
+        externalHeaders: '{}',
+        externalBodyTemplate: '{}',
+        externalResponseType: 'file_path',
+        externalResponsePath: 'audio_path',
+        nodeId: 'tts1',
+      }),
+    /non-local endpoint/,
+  );
+  await assert.rejects(
+    () =>
+      audioMod.textToSpeechV2({
+        provider: 'external',
+        text: 'hi',
+        externalUrl: 'http://127.0.0.1:8765/tts',
+        externalMethod: 'POST',
+        externalHeaders: '{}',
+        externalBodyTemplate: '{}',
+        externalResponseType: 'file_path',
+        externalResponsePath: 'audio_path',
+        nodeId: 'tts2',
+      }),
+    /lacks required permission/,
+  );
+  assert.equal(mediaUrlCalls.length, 0, 'core-audio must NEVER fall back to get_media_url on permission denial');
+
+  // 4) oaiyAgentTools blocks untrusted, transitive-untrusted, and pkg:* flows
+  const untrustedFlow = { id: 'u1', name: 'Untrusted', untrusted: true, createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } };
+  const pkgFlow = { id: 'p1', name: 'Pkg', createdAt: '', updatedAt: '', graph: { nodes: [{ id: 'n1', type: 'pkg:evil:run', position: { x: 0, y: 0 }, data: {} }], edges: [] } };
+  const callerFlow = { id: 'c1', name: 'Caller', createdAt: '', updatedAt: '', graph: { nodes: [{ id: 's1', type: 'subflow', position: { x: 0, y: 0 }, data: { flowId: 'u1' } }], edges: [] } };
+  assert.equal(M.isUntrustedOrPkgFlow(untrustedFlow), true);
+  assert.equal(M.isUntrustedOrPkgFlow(pkgFlow), true);
+  assert.equal(M.isUntrustedOrPkgFlow(callerFlow, [untrustedFlow, callerFlow]), true);
+  await assert.rejects(() => M.publishAsTool(untrustedFlow, { name: 't', description: 'd' }), /Untrusted flows/);
+  await assert.rejects(() => M.publishAsHook(pkgFlow, { tool: 'write_file', mode: 'before' }), /Untrusted flows/);
+  await assert.rejects(() => M.publishAsTool(callerFlow, { name: 't', description: 'd' }, [untrustedFlow, callerFlow]), /Untrusted flows/);
+});
+
+await check('28. Wave-3: outputValue malformed %ZZ, ProjectIO non-array resilience, and compiler-sandbox LockManager/locks isolation', async () => {
+  // outputValue.ts must not throw on malformed percent-encoding in ComfyUI filename query
+  assert.doesNotThrow(() => M.kindOfAddress('http://127.0.0.1:8188/view?filename=%ZZ'));
+  assert.equal(M.kindOfAddress('http://127.0.0.1:8188/view?filename=%ZZ.png'), 'image');
+  assert.equal(M.kindOfAddress('http://127.0.0.1:8188/view?filename=%ZZ'), null);
+
+  // ProjectIO.parseImportedProject handles non-array / null / corrupted endpoint & constant bags
+  const malformedProject = JSON.stringify({
+    name: 'Corrupt Bags',
+    flows: [null, 'bad', { id: 'f1', name: 'Valid', graph: { nodes: [], edges: [] } }],
+    llmEndpoints: 'not-an-array',
+    imageGenEndpoints: { bad: true },
+    httpPresets: 42,
+    constants: [null, 123, { noKey: true }, { id: 'c1', key: 'GOOD_KEY', value: 'ok', category: 'custom', isSecret: false }],
+  });
+  const parsed = M.parseImportedProject(malformedProject);
+  assert.equal(parsed.flows.length, 1);
+  assert.equal(parsed.flows[0].untrusted, true);
+  assert.ok(Array.isArray(parsed.llmEndpoints) && parsed.llmEndpoints.length > 0);
+  assert.ok(Array.isArray(parsed.imageGenEndpoints) && parsed.imageGenEndpoints.length > 0);
+  assert.ok(Array.isArray(parsed.httpPresets) && parsed.httpPresets.length > 0);
+  assert.ok(parsed.constants.some((c) => c.key === 'GOOD_KEY'));
+
+  // compiler-sandbox-worker neutralizes LockManager, locks, and navigator.locks across prototypes
+  const workerSrc = fs.readFileSync(path.join(UI, 'src/sandbox/compiler-sandbox-worker.ts'), 'utf8');
+  for (const name of ['LockManager', 'locks', 'storage']) {
+    assert.ok(workerSrc.includes(`'${name}'`), `compiler-sandbox-worker must neutralize ${name}`);
+  }
+  const sandboxClientSrc = fs.readFileSync(path.join(UI, 'src/services/compilerSandbox.ts'), 'utf8');
+  assert.ok(sandboxClientSrc.includes('w.terminate()'), 'compilerSandbox must terminate ephemeral worker per compile');
 });
 
 finish();

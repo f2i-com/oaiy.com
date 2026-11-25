@@ -328,3 +328,29 @@ test('4.18.7 stream-probe: counts as an admin hold (released when done) and enfo
     eq([429, 'rate_limited'], [$refused['status'], $refused['json']['error']['code'] ?? '']);
     eq(0, $r->ctx()->holds->liveCount(), 'refused stream-probe left no marker');
 });
+
+test('4.18.7 hold fails closed with 503 unavailable (Retry-After 2) when the hold marker cannot be acquired, matching stream-probe; wait=0 still works', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    @mkdir($r->data . '/holds', 0700, true);
+    $blocker = $r->data . '/holds/admin';
+    file_put_contents($blocker, 'block-hold-dir');
+    try {
+        $t0 = microtime(true);
+        $res = $r->call($d, 'GET', '/v1/admin/hold', null, ['wait' => '2']);
+        $elapsed = microtime(true) - $t0;
+        eq(503, $res['status'], $res['body']);
+        eq('unavailable', $res['json']['error']['code'] ?? '');
+        eq('2', $res['headers']['retry-after'] ?? '');
+        ok($elapsed < 1.0, 'failed closed immediately without waiting: ' . round($elapsed, 2) . 's');
+
+        $probe = $r->call($d, 'GET', '/v1/admin/stream-probe');
+        eq(503, $probe['status'], $probe['body']);
+        eq('unavailable', $probe['json']['error']['code'] ?? '');
+        eq('2', $probe['headers']['retry-after'] ?? '');
+
+        eq(200, $r->call($d, 'GET', '/v1/admin/hold', null, ['wait' => '0'])['status'], 'wait=0 needs no hold marker');
+    } finally {
+        @unlink($blocker);
+    }
+});

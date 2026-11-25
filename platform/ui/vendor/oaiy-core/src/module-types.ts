@@ -546,6 +546,12 @@ export interface RuntimeContext {
    */
   hasPermission?: (permission: string) => boolean;
 
+  /**
+   * Enforce the runtime's local-network permission policy (including package
+   * `network:local` gating, whitelist, and user consent prompt) for a target URL.
+   */
+  ensureLocalNetworkAllowed?: (url: string, purpose?: string) => Promise<void>;
+
   // -----------------------------------------------------------------------
   // Log privacy
   // -----------------------------------------------------------------------

@@ -615,6 +615,23 @@ export const parseImportedProject = (content: string): ExportedProject => {
     );
   }
 
+  const isValidObject = (v: unknown): v is Record<string, unknown> =>
+    Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
+  const rawFlows = imported.flows.filter((f) => isValidObject(f));
+  const rawLlmEndpoints = Array.isArray(imported.llmEndpoints)
+    ? imported.llmEndpoints.filter((e) => isValidObject(e) && typeof e.id === 'string')
+    : [];
+  const rawImageGenEndpoints = Array.isArray(imported.imageGenEndpoints)
+    ? imported.imageGenEndpoints.filter((e) => isValidObject(e) && typeof e.id === 'string')
+    : [];
+  const rawHttpPresets = Array.isArray(imported.httpPresets)
+    ? imported.httpPresets.filter((p) => isValidObject(p) && typeof p.id === 'string')
+    : [];
+  const rawConstants = Array.isArray(imported.constants)
+    ? imported.constants.filter((c) => isValidObject(c) && typeof c.key === 'string')
+    : [];
+
   // Merge with defaults for any missing fields
   return {
     ...createEmptyProject(),
@@ -624,7 +641,7 @@ export const parseImportedProject = (content: string): ExportedProject => {
     // only good copy). Mark imported flows untrusted so externally obtained project
     // JSON runs sandboxed (hardened worker + minimal permissions) by default.
     flows: ensureUniqueFlowIds(
-      imported.flows.map((f) => ({
+      rawFlows.map((f) => ({
         ...f,
         untrusted: true,
         graph:
@@ -636,26 +653,26 @@ export const parseImportedProject = (content: string): ExportedProject => {
     // Preserve user's custom endpoints, add defaults if missing
     llmEndpoints: [
       ...defaultLLMEndpoints,
-      ...(imported.llmEndpoints || []).filter(
+      ...rawLlmEndpoints.filter(
         (e) => !defaultLLMEndpoints.find((d) => d.id === e.id)
       ),
     ],
     imageGenEndpoints: [
       ...defaultImageGenEndpoints,
-      ...(imported.imageGenEndpoints || []).filter(
+      ...rawImageGenEndpoints.filter(
         (e) => !defaultImageGenEndpoints.find((d) => d.id === e.id)
       ),
     ],
     httpPresets: [
       ...defaultHttpPresets,
-      ...(imported.httpPresets || []).filter(
+      ...rawHttpPresets.filter(
         (p) => !defaultHttpPresets.find((d) => d.id === p.id)
       ),
     ],
     // Merge constants - preserve imported values for matching keys and ensure
     // any api_key or secret-looking value is flagged isSecret: true.
     constants: defaultConstants.map((dc) => {
-      const imported_c = (imported.constants || []).find((c) => c.key === dc.key);
+      const imported_c = rawConstants.find((c) => c.key === dc.key);
       if (!imported_c) return dc;
       return {
         ...dc,
@@ -663,7 +680,7 @@ export const parseImportedProject = (content: string): ExportedProject => {
         isSecret: isSecretConstant(dc) || isSecretConstant(imported_c),
       };
     }).concat(
-      (imported.constants || [])
+      rawConstants
         .filter((c) => !defaultConstants.find((d) => d.key === c.key))
         .map((c) => (isSecretConstant(c) ? { ...c, isSecret: true } : c))
     ),

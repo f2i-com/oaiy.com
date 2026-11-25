@@ -64,6 +64,7 @@ import { Zip, ZipDeflate, strToU8, unzipSync } from 'fflate';
 import type { ProviderConfig } from '../agent/providers/types';
 import { EMPTY_MEDIA, type MediaSettings } from '../agent/media';
 import type { NetGateSettings } from '../gate/netgate';
+import { safeResultsPath } from '../outreach';
 import { PersonIndex } from '../phoneNumbers';
 import { DEFAULT_AGENT_SETTINGS, DEFAULT_MESSAGE_SETTINGS, INSTRUCTIONS_MAX, loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders, thinkTokensOf, type AgentSettings, type MessageSettings, type Settings } from '../settings';
 
@@ -1067,6 +1068,9 @@ async function unionDoNotContact(storage: AgentStorage, item: Item, data: Uint8A
   return { data: new TextEncoder().encode(JSON.stringify(list)), ...(warn ? { warn } : {}) };
 }
 
+/** Non-final in-flight person states that must be reset when a campaign is restored from a backup. */
+const IN_FLIGHT_PERSON_STATES = new Set(['dialling', 'ringing', 'on_call', 'sending', 'ended']);
+
 /** A campaign as it is written: never running, and nothing it waits for (whatever the archive says). */
 function pausedCampaign(data: Uint8Array): Uint8Array | null {
   let campaign: unknown;
@@ -1080,6 +1084,18 @@ function pausedCampaign(data: Uint8Array): Uint8Array | null {
   campaign.waitingFor = '';
   // It was never approved on this computer: it is started by a person, and only then.
   campaign.approvedAt = 0;
+  // Confine resultsPath strictly under /outreach/ and clear untrusted post-campaign runner instructions.
+  campaign.resultsPath = safeResultsPath(campaign.resultsPath, campaign.id);
+  campaign.afterwards = '';
+  // Reset any in-flight call/send states from the source machine so restored attempts cannot match live events.
+  if (Array.isArray(campaign.people)) {
+    for (const person of campaign.people) {
+      if (isObject(person) && typeof person.state === 'string' && IN_FLIGHT_PERSON_STATES.has(person.state)) {
+        person.state = 'queued';
+        delete person.attempt;
+      }
+    }
+  }
   // Nothing from a backup auto-posts into a conversation or auto-triggers a runner report.
   if (isObject(campaign.report)) {
     campaign.report.pending = false;

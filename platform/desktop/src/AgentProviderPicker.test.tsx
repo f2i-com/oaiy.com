@@ -271,3 +271,65 @@ describe('the helpers', () => {
     expect(agentCapable(list).map((p) => p.id)).toEqual(['a', 'e']);
   });
 });
+
+describe('Wave-3 provider picker hardening', () => {
+  it('rejects non-local plain http:// URLs instead of granting allowLocal', async () => {
+    await render();
+    await change(select('Provider'), 'preset:openai-compatible');
+    await change(input('Address'), 'http://remote.example.com/v1');
+    await click(button(/Connect/));
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Plain http:// is only allowed');
+    expect(m.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rolls back upsert when setKey fails on a new provider', async () => {
+    m.setKey.mockRejectedValueOnce(new Error('500: keyring locked'));
+    await render();
+    await change(select('Provider'), 'preset:openai');
+    await change(input('API key'), 'sk-broken');
+    await click(button(/Connect/));
+    expect(m.upsert).toHaveBeenCalledTimes(1);
+    expect(m.remove).toHaveBeenCalledWith('openai');
+    expect(saved).toEqual([]);
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('keyring locked');
+  });
+
+  it('probes via a temporary id without clobbering an existing working API key if probing fails', async () => {
+    saved = [
+      provider({
+        id: 'openai',
+        name: 'OpenAI',
+        baseUrl: 'https://api.openai.com/v1',
+        allowLocal: false,
+        hasKey: true,
+        model: 'gpt-5.5',
+      }),
+    ];
+    m.models.mockRejectedValueOnce(new Error('502: transient failure'));
+    await render();
+    await click(button(/Change its address/));
+    await change(input('Address'), 'https://api.openai.com/v1');
+    await change(input('API key'), 'sk-bad-replacement');
+    m.models.mockRejectedValueOnce(new Error('502: 401 invalid key'));
+    await click(button(/^Connect/));
+    // Must have probed under a temp probe id and deleted it, NEVER calling setKey('openai', ...).
+    expect(m.setKey).not.toHaveBeenCalledWith('openai', expect.anything());
+    expect(m.setKey).toHaveBeenCalledWith('openai-probe', 'sk-bad-replacement');
+    expect(m.remove).toHaveBeenCalledWith('openai-probe');
+    expect(saved).toHaveLength(1);
+    expect(saved[0].id).toBe('openai');
+    expect(saved[0].hasKey).toBe(true);
+  });
+
+  it('does not call onPick after unmounting while models are loading', async () => {
+    saved = [provider({ id: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', model: 'gemma4' })];
+    let resolveModels!: (list: string[]) => void;
+    m.models.mockImplementationOnce(() => new Promise<string[]>((r) => (resolveModels = r)));
+    await render({ provider: 'ollama', model: 'gemma4', name: 'Ollama' });
+    act(() => root.unmount());
+    root = createRoot(host);
+    await act(async () => resolveModels(['gemma4']));
+    await settle();
+    expect(onPick).not.toHaveBeenCalled();
+  });
+});

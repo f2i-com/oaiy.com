@@ -109,11 +109,14 @@ export interface SpillOptions {
   maxInlineChars?: number;
   maxInlineLines?: number;
   previewChars?: number;
+  /** When false (read-only call/SMS sessions), truncate inline without writing spill files to VFS. */
+  allowWrite?: boolean;
 }
 
 /**
  * Bound a tool output with recoverable verbatim spill storage in VFS.
- * Returns the original text untouched if it is within budget, excluded, or if VFS write fails.
+ * Returns the original text untouched if it is within budget or excluded.
+ * When `allowWrite` is false (or VFS refuses writes under `/.oaiy/spill/`), truncates inline without touching VFS.
  */
 export function maybeSpillOutput(
   vfs: Vfs,
@@ -134,20 +137,23 @@ export function maybeSpillOutput(
     return { text: content, omittedBytes: 0, totalLines };
   }
 
-  const safeId = sanitizeSegment(callId, String(Date.now()), 28);
-  const safeTool = sanitizeSegment(toolName, 'tool', 28);
-  let spillPath = `${SPILL_DIR}/${safeId}-${safeTool}.txt`;
-  while (vfs.exists(spillPath)) {
-    spillSeq++;
-    spillPath = `${SPILL_DIR}/${safeId}-${spillSeq}-${safeTool}.txt`;
-  }
-
-  try {
-    vfs.writeFile(spillPath, content, { parents: true });
-    pruneOldSpills(vfs, spillPath);
-  } catch {
-    // Storage failure must never hide valid tool output.
-    return { text: content, omittedBytes: 0, totalLines };
+  let spillPath: string | undefined;
+  if (options.allowWrite !== false) {
+    const safeId = sanitizeSegment(callId, String(Date.now()), 28);
+    const safeTool = sanitizeSegment(toolName, 'tool', 28);
+    let candidate = `${SPILL_DIR}/${safeId}-${safeTool}.txt`;
+    try {
+      while (vfs.exists(candidate)) {
+        spillSeq++;
+        candidate = `${SPILL_DIR}/${safeId}-${spillSeq}-${safeTool}.txt`;
+      }
+      vfs.writeFile(candidate, content, { parents: true });
+      pruneOldSpills(vfs, candidate);
+      spillPath = candidate;
+    } catch {
+      // Read-only view or storage refusal: fall back to clean inline truncation without writing to VFS.
+      spillPath = undefined;
+    }
   }
 
   // Keep symmetric head + tail preview bounded by both characters and lines.
@@ -183,15 +189,17 @@ export function maybeSpillOutput(
   const totalBytes = encoder.encode(content).byteLength;
   const keptBytes = encoder.encode(head).byteLength + encoder.encode(tail).byteLength;
   const omittedBytes = Math.max(0, totalBytes - keptBytes);
-  const readHint =
-    totalLines <= 5 && totalBytes > 10_000
-      ? `read_file({"path": "${spillPath}", "char_start": 0, "char_count": 10000})`
-      : `read_file({"path": "${spillPath}", "offset": 1, "limit": 200})`;
-  const notice =
-    `[Full ${toolName} output (${totalLines.toLocaleString()} lines, ${totalBytes.toLocaleString()} bytes; ` +
-    `${omittedBytes.toLocaleString()} bytes omitted above) saved verbatim to ${spillPath}. ` +
-    `Use ${readHint} or search_file({"path": "${spillPath}", "pattern": "..."}) to inspect specific parts.]`;
+  const notice = spillPath
+    ? `[Full ${toolName} output (${totalLines.toLocaleString()} lines, ${totalBytes.toLocaleString()} bytes; ` +
+      `${omittedBytes.toLocaleString()} bytes omitted above) saved verbatim to ${spillPath}. ` +
+      `Use ${
+        totalLines <= 5 && totalBytes > 10_000
+          ? `read_file({"path": "${spillPath}", "char_start": 0, "char_count": 10000})`
+          : `read_file({"path": "${spillPath}", "offset": 1, "limit": 200})`
+      } or search_file({"path": "${spillPath}", "pattern": "..."}) to inspect specific parts.]`
+    : `[${toolName} output truncated inline (${totalLines.toLocaleString()} lines, ${totalBytes.toLocaleString()} bytes; ` +
+      `${omittedBytes.toLocaleString()} bytes omitted above).]`;
 
   const text = `${head}\n\n[...]\n\n${tail}\n\n${notice}`;
-  return { text, spillPath, omittedBytes, totalLines };
+  return spillPath ? { text, spillPath, omittedBytes, totalLines } : { text, omittedBytes, totalLines };
 }

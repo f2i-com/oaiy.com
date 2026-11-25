@@ -96,7 +96,10 @@ final class DevicesApi
         }
         if ($set) {
             $cols = implode(', ', array_map(static fn(string $c): string => $c . ' = ?', array_keys($set)));
-            $ctx->db->write(fn(Db $db) => $db->exec("UPDATE devices SET $cols WHERE id = ?", array_merge(array_values($set), [$p->id])));
+            $ctx->db->write(function (Db $db) use ($p, $cols, $set): void {
+                Mailbox::requireActive($db, $p->id, 'revoked');
+                $db->exec("UPDATE devices SET $cols WHERE id = ?", array_merge(array_values($set), [$p->id]));
+            });
         }
         return Response::json(200, ['v' => 1, 'time' => $now]);
     }
@@ -171,8 +174,12 @@ final class DevicesApi
             throw ApiError::make('invalid_request');
         }
         $cols = implode(', ', array_map(static fn(string $c): string => $c . ' = ?', array_keys($set)));
-        $ctx->db->write(fn(Db $db) => $db->exec("UPDATE devices SET $cols WHERE id = ? AND revoked_at IS NULL", array_merge(array_values($set), [$row['id']])));
-        $fresh = $ctx->db->one('SELECT * FROM devices WHERE id = ?', [$row['id']]);
+        $fresh = $ctx->db->write(function (Db $db) use ($p, $row, $cols, $set): ?array {
+            Mailbox::requireActive($db, $p->id, 'revoked');
+            Mailbox::requireActive($db, (string)$row['id'], 'not_found');
+            $db->exec("UPDATE devices SET $cols WHERE id = ? AND revoked_at IS NULL", array_merge(array_values($set), [$row['id']]));
+            return $db->one('SELECT * FROM devices WHERE id = ?', [$row['id']]);
+        });
         return Response::json(200, ['v' => 1, 'device' => Devices::present($fresh ?? $row), 'time' => Clock::now()]);
     }
 
@@ -180,7 +187,12 @@ final class DevicesApi
     public static function revoke(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         $row = self::manageable($ctx, $p, $m[1], true);
-        Devices::revoke($ctx, (string)$row['id']);
+        $now = Clock::now();
+        $done = $ctx->db->write(function (Db $db) use ($ctx, $p, $row, $now): array {
+            Mailbox::requireActive($db, $p->id, 'revoked');
+            return Devices::revokeInTx($ctx, $db, (string)$row['id'], false, $now);
+        });
+        Devices::markRevoked($ctx, $done);
         return Response::noContent();
     }
 
@@ -191,11 +203,18 @@ final class DevicesApi
         if ($role !== 'phone') {
             throw ApiError::make('invalid_request');
         }
-        $ids = [];
-        foreach ($ctx->db->all('SELECT id FROM devices WHERE role = ? AND owner_desktop = ? AND revoked_at IS NULL ORDER BY created_at ASC', ['phone', $p->id]) as $r) {
-            $ids = array_merge($ids, Devices::revoke($ctx, (string)$r['id']));
-        }
-        return Response::json(200, ['v' => 1, 'revoked' => $ids, 'time' => Clock::now()]);
+        $now = Clock::now();
+        $ids = $ctx->db->write(function (Db $db) use ($ctx, $p, $now): array {
+            $db->gate('roster:' . $p->id);
+            Mailbox::requireActive($db, $p->id, 'revoked');
+            $revoked = [];
+            foreach ($db->all('SELECT id FROM devices WHERE role = ? AND owner_desktop = ? AND revoked_at IS NULL ORDER BY created_at ASC', ['phone', $p->id]) as $r) {
+                $revoked = array_merge($revoked, Devices::revokeInTx($ctx, $db, (string)$r['id'], false, $now));
+            }
+            return $revoked;
+        });
+        Devices::markRevoked($ctx, $ids);
+        return Response::json(200, ['v' => 1, 'revoked' => $ids, 'time' => $now]);
     }
 
     // ------------------------------------------------------------------------------------------ GET /v1/presence

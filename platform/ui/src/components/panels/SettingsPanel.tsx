@@ -165,7 +165,9 @@ export default function SettingsPanel({
                   const { id: _ignoredId, ...rest } = imported;
                   const existing = constants.find(c => c.key === imported.key);
                   if (existing) {
-                    const isSecret = Boolean(existing.isSecret || imported.isSecret);
+                    const isSecret = Boolean(
+                      existing.isSecret || imported.isSecret || imported.category === 'api_key' || looksLikeSecret(imported.value),
+                    );
                     const category = existing.category === 'api_key' ? 'api_key' : (imported.category ?? existing.category);
                     const value = isSecret && !imported.value ? existing.value : (imported.value ?? '');
                     onUpdateConstant(existing.id, { ...rest, isSecret, category, value });

@@ -110,8 +110,11 @@ fn avg_pool(x: &Tensor, oh: usize, ow: usize) -> Result<Tensor> {
 impl Naf {
     pub fn load(path: &Path, dev: &Device) -> Result<Self> {
         let mut pth = Pth::open(path)?;
-        let Value::Dict(items) = pth.root.clone() else { candle_core::bail!("{}: not a state dict", path.display()) };
-        let sd: HashMap<String, Value> = items.into_iter().filter_map(|(k, v)| if let Value::Str(k) = k { Some((k, v)) } else { None }).collect();
+        let Value::Dict(ref items) = pth.root else { candle_core::bail!("{}: not a state dict", path.display()) };
+        let sd: HashMap<String, Value> = items
+            .iter()
+            .filter_map(|(k, v)| if let Value::Str(k) = k { Some((k.clone(), v.clone())) } else { None })
+            .collect();
         let mut t = |k: &str| -> Result<Tensor> {
             let v = sd.get(k).ok_or_else(|| candle_core::Error::Msg(format!("NAF: no {k}")))?.clone();
             pth.tensor(&v, dev)?.to_dtype(DType::F32)

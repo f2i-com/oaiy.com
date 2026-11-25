@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { shortcut } from '../../lib/keys';
 import type { Flow, OAIYPackageManifest } from 'oaiy-core';
-import { oaiyDesktop } from '../../lib/oaiyAgentTools';
+import { isUntrustedOrPkgFlow, oaiyDesktop } from '../../lib/oaiyAgentTools';
 import { shared as keptOnDesktop } from '../../hooks/useDesktopFlows';
 import type { ExampleFlow } from '../../lib/exampleFlows';
 import ConfirmDialog from '../ui/ConfirmDialog';
@@ -633,7 +633,7 @@ export default function FlowsSidebar({
             <>
               <MenuItem icon={<Pencil size={14} />} label="Rename" onSelect={() => handleStartRename(menuFlow)} />
               <MenuItem icon={<Copy size={14} />} label="Duplicate" onSelect={() => onDuplicateFlow(menuFlow.id)} />
-              {oaiyDesktop() && (
+              {oaiyDesktop() && !isUntrustedOrPkgFlow(menuFlow, flows) && (
                 <MenuItem
                   icon={<Wrench size={14} />}
                   label="Give it to the agent…"
@@ -641,7 +641,7 @@ export default function FlowsSidebar({
                   onSelect={() => setAgentFlow(menuFlow)}
                 />
               )}
-              {oaiyDesktop() && onSetFlowRemote && !menuFlow.isMacro && !menuFlow.localOnly && (
+              {oaiyDesktop() && onSetFlowRemote && !menuFlow.isMacro && !menuFlow.localOnly && !isUntrustedOrPkgFlow(menuFlow, flows) && (
                 <MenuItem
                   icon={<Globe size={14} />}
                   label={menuFlow.remote ? 'Stop apps running it' : 'Let apps run it'}
@@ -695,7 +695,9 @@ export default function FlowsSidebar({
           )}
         </Menu>
 
-        {agentFlow && <AgentToolDialog flow={agentFlow} onClose={() => setAgentFlow(null)} onDone={(message) => addToast(message, 'success')} />}
+        {agentFlow && !isUntrustedOrPkgFlow(agentFlow, flows) && (
+          <AgentToolDialog flow={agentFlow} allFlows={flows} onClose={() => setAgentFlow(null)} onDone={(message) => addToast(message, 'success')} />
+        )}
 
         <ConfirmDialog
           isOpen={deleteConfirm !== null}

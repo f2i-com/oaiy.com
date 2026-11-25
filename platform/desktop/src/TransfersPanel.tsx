@@ -95,14 +95,16 @@ export default function TransfersPanel() {
 
   // Whether the form differs from what is saved, as of now: a reading that lands while the owner edits leaves the form alone.
   const editing = useRef(false);
-  // (each save counted: a reading asked before a save answers what was there before it, and is not taken)
+  // (each save counted: a reading asked before or during a save answers what was there before it, and is not taken)
   const writes = useRef(0);
+  const inFlightWrites = useRef(0);
   const load = useCallback(
     (live: () => boolean = () => true) => {
+      if (inFlightWrites.current > 0) return Promise.resolve();
       const asked = writes.current;
       return ring.settings().then(
         (r) => {
-          if (!live() || editing.current || asked !== writes.current) return;
+          if (!live() || editing.current || inFlightWrites.current > 0 || asked !== writes.current) return;
           adopt(r.settings, r.features);
           setLoadProblem(r.loadProblem ?? null);
           setError(null);
@@ -169,9 +171,15 @@ export default function TransfersPanel() {
   };
   /** "Who else can change this", opened by the person (it opens by itself while transfers are being turned on). */
   const [whoOpen, setWhoOpen] = useState(false);
+  // Being turned on, and not saved yet: the moment to read who else can change it, so that line opens by itself.
+  const turningOn = !!current && !!saved && current.enabled && !saved.enabled;
+  useEffect(() => {
+    if (turningOn) setWhoOpen(true);
+  }, [turningOn]);
 
   const save = async () => {
     if (!current || !saved) return;
+    inFlightWrites.current += 1;
     writes.current += 1;
     setSaving(true);
     setError(null);
@@ -196,6 +204,7 @@ export default function TransfersPanel() {
         windowsCompanions: current.windowsCompanions,
         excludedDevices: current.excludedDevices,
       }));
+      writes.current += 1;
       editing.current = false;
       adopt(r.settings, r.features);
       setJustSaved(true);
@@ -203,6 +212,7 @@ export default function TransfersPanel() {
     } catch (e) {
       setError(`Not saved: ${errText(e)}`);
     } finally {
+      inFlightWrites.current -= 1;
       setSaving(false);
     }
   };
@@ -245,8 +255,6 @@ export default function TransfersPanel() {
   const on = current.enabled;
   // What is saved is what rings, and the desktop says what a caller would get: a warning about a setting not yet saved would say something it is not doing.
   const nothingRings = preview?.enabled && !preview.rings && preview.cause ? preview : null;
-  // Being turned on, and not saved yet: the moment to read who else can change it, so that line opens by itself.
-  const turningOn = on && !saved!.enabled;
   // The switch's one line: what a caller who asks for you would get. As saved, by the desktop's own words; a switch
   // moved and not saved yet says that saving is what makes it so.
   const outcome =
@@ -272,7 +280,7 @@ export default function TransfersPanel() {
           </span>
         </label>
         {/* Who else could turn this on: one closed line under the switch, open by itself while it is being turned on. */}
-        <details className="transfers-who" open={turningOn || whoOpen} onToggle={(e) => setWhoOpen((e.currentTarget as HTMLDetailsElement).open)}>
+        <details className="transfers-who" open={whoOpen} onToggle={(e) => setWhoOpen((e.currentTarget as HTMLDetailsElement).open)}>
           <summary>Who else can change this</summary>
           <div className="transfers-warning" data-testid="consent-not-signed">
             <TriangleAlert size={14} aria-hidden />

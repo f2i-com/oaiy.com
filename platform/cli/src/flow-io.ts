@@ -67,12 +67,49 @@ export function loadFlowFile(file: string): LoadedFlow {
   return { graph: normalizeGraph(data), name, flows: siblingFlows(data) };
 }
 
+/** Hard caps on `.oaiy` zip package extraction to prevent zip-bomb / entry-flood OOMs. */
+const MAX_PACKAGE_ENTRIES = 512;
+const MAX_PACKAGE_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
+
 /** Load a `.oaiy` package (a zip): manifest.json → entryFlow → graph. */
 function loadPackage(file: string, fallbackName: string): LoadedFlow {
-  const entries = unzipSync(new Uint8Array(fs.readFileSync(file)));
+  let entryCount = 0;
+  let totalUncompressed = 0;
+  const entries = unzipSync(new Uint8Array(fs.readFileSync(file)), {
+    filter(entry) {
+      entryCount += 1;
+      if (entryCount > MAX_PACKAGE_ENTRIES) {
+        throw new Error(`.oaiy: package exceeds maximum entry count (${MAX_PACKAGE_ENTRIES})`);
+      }
+      if (!entry.name.toLowerCase().endsWith('.json')) {
+        return false;
+      }
+      const claimed = Math.max(entry.originalSize, entry.size);
+      if (!Number.isFinite(claimed) || claimed < 0 || totalUncompressed + claimed > MAX_PACKAGE_UNCOMPRESSED_BYTES) {
+        throw new Error(
+          `.oaiy: package exceeds maximum uncompressed JSON size (${MAX_PACKAGE_UNCOMPRESSED_BYTES} bytes)`,
+        );
+      }
+      totalUncompressed += claimed;
+      return true;
+    },
+  });
+  let actualUncompressed = 0;
+  for (const buf of Object.values(entries)) {
+    actualUncompressed += buf.byteLength;
+    if (actualUncompressed > MAX_PACKAGE_UNCOMPRESSED_BYTES) {
+      throw new Error(
+        `.oaiy: package exceeds maximum uncompressed JSON size (${MAX_PACKAGE_UNCOMPRESSED_BYTES} bytes)`,
+      );
+    }
+  }
   // zip paths use forward slashes; tolerate either separator from the manifest.
-  const get = (p: string): Uint8Array | undefined =>
-    entries[p] ?? entries[p.replace(/\\/g, '/')];
+  const hasOwn = (k: string) => Object.prototype.hasOwnProperty.call(entries, k);
+  const get = (p: string): Uint8Array | undefined => {
+    if (hasOwn(p)) return entries[p];
+    const norm = p.replace(/\\/g, '/');
+    return hasOwn(norm) ? entries[norm] : undefined;
+  };
 
   const manifestRaw = get('manifest.json');
   if (!manifestRaw) throw new Error('.oaiy: no manifest.json in package');

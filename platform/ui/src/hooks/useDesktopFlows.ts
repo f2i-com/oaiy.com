@@ -349,6 +349,15 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
   const pushing = useRef(false);
   const pushAgain = useRef(false);
   const pushRef = useRef<() => Promise<void>>(async () => {});
+  // Shared async queue/mutex serializing pull() and push() so a periodic pull
+  // cannot interleave with an in-flight push or another overlapping pull tick.
+  const syncQueue = useRef<Promise<void>>(Promise.resolve());
+  const pulling = useRef(false);
+  const enqueueSync = (task: () => Promise<void>): Promise<void> => {
+    const run = syncQueue.current.then(task, task);
+    syncQueue.current = run.catch(() => {});
+    return run;
+  };
 
   const call = async (method: string, path: string, body?: unknown): Promise<Response | null> => {
     if (!desktop) return null;
@@ -382,70 +391,72 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
   refreshRef.current = refreshStates;
 
   /** Send what changed here, and remove what was deleted here: one at a time, again after if asked meanwhile. */
-  const push = async (): Promise<void> => {
-    if (!desktop) return;
+  const push = (): Promise<void> => {
+    if (!desktop) return Promise.resolve();
     // Not before the first pull: a flow changed there while the editor was closed comes here first.
-    if (!pulledOnce.current) return;
+    if (!pulledOnce.current) return Promise.resolve();
     if (pushing.current) {
       pushAgain.current = true;
-      return;
+      return syncQueue.current;
     }
     pushing.current = true;
-    try {
-      do {
-        pushAgain.current = false;
-        if (forgetAsked) {
-          forgetAsked = false;
-          synced.current = new Map();
-          keep();
-        }
-        const flows = latest.current.flows;
-        const current = new Map(flows.filter(shared).map((f) => [f.id, f]));
-        for (const [id, f] of current) {
-          const key = flowKey(f);
-          if (synced.current.get(id) === key) continue;
-          // Into the document as the desktop has it, so what the editor does not show (a description the agent
-          // reads) is not lost.
-          const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
-          const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
-          const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
-          // (not sent: said once, and tried again after the next pull, as nothing says the two agree)
-          if (!saved?.ok) {
-            tellUnsaved(f, await refusal(saved));
-            continue;
+    return enqueueSync(async () => {
+      try {
+        do {
+          pushAgain.current = false;
+          if (forgetAsked) {
+            forgetAsked = false;
+            synced.current = new Map();
+            keep();
           }
-          toldUnsaved.delete(id);
-          synced.current.set(id, key);
-          there.current.add(id);
-          // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
-          for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
-            if (!there.current.has(copyId)) continue;
-            const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
-            const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
-            if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: withNodeServices(f.graph.nodes), edges: f.graph.edges });
+          const flows = latest.current.flows;
+          const current = new Map(flows.filter(shared).map((f) => [f.id, f]));
+          for (const [id, f] of current) {
+            const key = flowKey(f);
+            if (synced.current.get(id) === key) continue;
+            // Into the document as the desktop has it, so what the editor does not show (a description the agent
+            // reads) is not lost.
+            const stored = there.current.has(id) ? await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`) : null;
+            const doc = stored?.ok ? ((await stored.json().catch(() => null)) as Doc | null) : null;
+            const saved = await call('PUT', `/api/bridge/flows/${encodeURIComponent(id)}`, toDoc(f, doc));
+            // (not sent: said once, and tried again after the next pull, as nothing says the two agree)
+            if (!saved?.ok) {
+              tellUnsaved(f, await refusal(saved));
+              continue;
+            }
+            toldUnsaved.delete(id);
+            synced.current.set(id, key);
+            there.current.add(id);
+            // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
+            for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
+              if (!there.current.has(copyId)) continue;
+              const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+              const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
+              if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: withNodeServices(f.graph.nodes), edges: f.graph.edges });
+            }
           }
-        }
-        // Deleted here, by the person: removed there too (and as the agent's tool, or what goes in front of one).
-        for (const id of [...deletedHere]) {
-          // (one here again, and kept in step: not removed)
-          if (flows.some((f) => f.id === id && shared(f))) {
+          // Deleted here, by the person: removed there too (and as the agent's tool, or what goes in front of one).
+          for (const id of [...deletedHere]) {
+            // (one here again, and kept in step: not removed)
+            if (flows.some((f) => f.id === id && shared(f))) {
+              deletedHere.delete(id);
+              continue;
+            }
+            const gone = await call('DELETE', `/api/bridge/flows/${encodeURIComponent(id)}`);
+            if (!gone || !(gone.ok || gone.status === 404)) continue;
+            synced.current.delete(id);
             deletedHere.delete(id);
-            continue;
+            for (const copyId of [toolFlowId({ id } as Flow), hookFlowId({ id } as Flow)]) {
+              if (there.current.has(copyId)) await call('DELETE', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+            }
           }
-          const gone = await call('DELETE', `/api/bridge/flows/${encodeURIComponent(id)}`);
-          if (!gone || !(gone.ok || gone.status === 404)) continue;
-          synced.current.delete(id);
-          deletedHere.delete(id);
-          for (const copyId of [toolFlowId({ id } as Flow), hookFlowId({ id } as Flow)]) {
-            if (there.current.has(copyId)) await call('DELETE', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
-          }
-        }
-        keep();
-        refreshStates();
-      } while (pushAgain.current);
-    } finally {
-      pushing.current = false;
-    }
+          keep();
+          refreshStates();
+        } while (pushAgain.current);
+      } finally {
+        pushing.current = false;
+      }
+    });
   };
   pushRef.current = push;
 
@@ -453,56 +464,66 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
   useEffect(() => {
     if (!desktop) return;
     let live = true;
-    const pull = async () => {
-      const resp = await call('GET', '/api/bridge/flows');
-      unreachable.current = !resp?.ok;
-      if (!resp?.ok) {
-        refreshRef.current();
-        return;
-      }
-      const list = ((await resp.json().catch(() => ({}))) as { flows?: Array<{ flowId?: string }> }).flows ?? [];
-      const ids = list.map((f) => String(f.flowId ?? '')).filter(Boolean);
-      there.current = new Set(ids);
-      const now = new Date().toISOString();
-      const flows = new Map<string, Flow>();
-      /** Flows whose document there still has Ollama's defaults on an AI LLM node with a service: sent back without. */
-      const seeded = new Set<string>();
-      // A tool's copy (`tool-…`) is the tool, and a hook's (`hook-…`) the hook, not second flows.
-      for (const id of ids.filter((id) => !id.startsWith('tool-') && !id.startsWith('hook-'))) {
-        const doc = await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`);
-        const body = doc?.ok ? ((await doc.json().catch(() => ({}))) as Doc) : null;
-        const flow = body ? fromDoc(id, body, now) : null;
-        if (!flow || !body) continue;
-        flows.set(id, flow);
-        if (carriesProviderSeeds(body)) seeded.add(id);
-      }
-      if (!live) return;
-      if (forgetAsked) {
-        forgetAsked = false;
-        synced.current = new Map();
-      }
-      // (left as they are: flows deleted here, for the push to remove there, and flows here that are not the
-      // desktop's, a local-only one of the same id, which a flow there must not come in over)
-      const leave = new Set([...deletedHere, ...latest.current.flows.filter((f) => !shared(f)).map((f) => f.id)]);
-      const { put, remove, synced: agreed } = reconcile(flows, latest.current.flows.filter(shared), synced.current, leave, there.current);
-      // (not taken for agreed, so the push below sends this side's, without them: the desktop's runs read the document)
-      for (const id of seeded) agreed.delete(id);
-      synced.current = agreed;
-      keep();
-      pulledOnce.current = true;
-      refreshStates();
-      if (put.length || remove.length) {
-        setProject((prev) => {
-          const replaced = new Map(put.map((f) => [f.id, f]));
-          const kept = prev.flows.filter((f) => !remove.includes(f.id)).map((f) => replaced.get(f.id) ?? f);
-          const added = put.filter((f) => !prev.flows.some((p) => p.id === f.id));
-          return { ...prev, flows: [...kept, ...added] };
-        });
-        const replaced = put.filter((f) => latest.current.flows.some((p) => p.id === f.id)).map((f) => f.id);
-        if (replaced.length) onChanged.current?.(replaced);
-      }
-      // (what changed here meanwhile, or did not reach the desktop before, is sent now)
-      void pushRef.current();
+    const pull = (): Promise<void> => {
+      if (pulling.current) return Promise.resolve();
+      pulling.current = true;
+      return enqueueSync(async () => {
+        try {
+          if (!live) return;
+          const resp = await call('GET', '/api/bridge/flows');
+          unreachable.current = !resp?.ok;
+          if (!resp?.ok) {
+            refreshRef.current();
+            return;
+          }
+          const list = ((await resp.json().catch(() => ({}))) as { flows?: Array<{ flowId?: string }> }).flows ?? [];
+          const ids = list.map((f) => String(f.flowId ?? '')).filter(Boolean);
+          there.current = new Set(ids);
+          const now = new Date().toISOString();
+          const flows = new Map<string, Flow>();
+          /** Flows whose document there still has Ollama's defaults on an AI LLM node with a service: sent back without. */
+          const seeded = new Set<string>();
+          // A tool's copy (`tool-…`) is the tool, and a hook's (`hook-…`) the hook, not second flows.
+          for (const id of ids.filter((id) => !id.startsWith('tool-') && !id.startsWith('hook-'))) {
+            const doc = await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`);
+            const body = doc?.ok ? ((await doc.json().catch(() => ({}))) as Doc) : null;
+            const flow = body ? fromDoc(id, body, now) : null;
+            if (!flow || !body) continue;
+            flows.set(id, flow);
+            if (carriesProviderSeeds(body)) seeded.add(id);
+          }
+          if (!live) return;
+          if (forgetAsked) {
+            forgetAsked = false;
+            synced.current = new Map();
+          }
+          // (left as they are: flows deleted here, for the push to remove there, and flows here that are not the
+          // desktop's, a local-only one of the same id, which a flow there must not come in over)
+          const leave = new Set([...deletedHere, ...latest.current.flows.filter((f) => !shared(f)).map((f) => f.id)]);
+          const { put, remove, synced: agreed } = reconcile(flows, latest.current.flows.filter(shared), synced.current, leave, there.current);
+          // (not taken for agreed, so the push below sends this side's, without them: the desktop's runs read the document)
+          for (const id of seeded) agreed.delete(id);
+          synced.current = agreed;
+          keep();
+          pulledOnce.current = true;
+          refreshStates();
+          if (put.length || remove.length) {
+            setProject((prev) => {
+              const replaced = new Map(put.map((f) => [f.id, f]));
+              const kept = prev.flows.filter((f) => !remove.includes(f.id)).map((f) => replaced.get(f.id) ?? f);
+              const added = put.filter((f) => !prev.flows.some((p) => p.id === f.id));
+              return { ...prev, flows: [...kept, ...added] };
+            });
+            const replaced = put.filter((f) => latest.current.flows.some((p) => p.id === f.id)).map((f) => f.id);
+            if (replaced.length) onChanged.current?.(replaced);
+          }
+        } finally {
+          pulling.current = false;
+        }
+      }).then(() => {
+        // (what changed here meanwhile, or did not reach the desktop before, is sent now — serialized after pull)
+        if (live && pulledOnce.current) void pushRef.current();
+      });
     };
     void pull();
     const timer = window.setInterval(() => void pull(), PULL_MS);

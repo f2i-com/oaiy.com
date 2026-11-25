@@ -304,6 +304,7 @@ final class Mailbox
     /** Delete a mailbox and everything in it (a revoked device). Call inside write(). */
     public function purgeInTx(Db $db, string $mailbox): void
     {
+        $this->lockMailbox($db, $mailbox);
         $db->exec('DELETE FROM items WHERE mailbox = ?', [$mailbox]);
         $db->exec('DELETE FROM mailboxes WHERE id = ?', [$mailbox]);
     }

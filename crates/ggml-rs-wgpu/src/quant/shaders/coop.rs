@@ -582,12 +582,12 @@ fn word_at(o: u32) -> u32 {
 /// with the tokens two steps ahead too). Metal's [`coop8_tiled`] reads them as it decodes, [`COOP_Q6K_STEP`] and
 /// [`COOP_Q8_0_STEP`].
 const COOP_AHEAD_HELPERS: &str = r#"fn byte(o: u32) -> u32 { return (w[o >> 2u] >> ((o & 3u) * 8u)) & 0xffu; }
-// The 16 bytes at `o`, an even offset, as four words (each a word, or the halves of two).
+// The 16 bytes at `o`, an even offset, as four words (guarded so `w[i + 4u]` is never read when `(o & 2u) == 0u`).
 fn words4_at(o: u32) -> vec4<u32> {
     let i = o >> 2u;
     let a = vec4<u32>(w[i], w[i + 1u], w[i + 2u], w[i + 3u]);
-    let odd = vec4<u32>((a.x >> 16u) | (a.y << 16u), (a.y >> 16u) | (a.z << 16u), (a.z >> 16u) | (a.w << 16u), (a.w >> 16u) | (w[i + 4u] << 16u));
-    return select(a, odd, vec4<bool>((o & 2u) != 0u));
+    if ((o & 2u) == 0u) { return a; }
+    return vec4<u32>((a.x >> 16u) | (a.y << 16u), (a.y >> 16u) | (a.z << 16u), (a.z >> 16u) | (a.w << 16u), (a.w >> 16u) | (w[i + 4u] << 16u));
 }
 "#;
 const COOP_Q6K_AHEAD_REGS: &str = r#"    var q6l = vec4<u32>();

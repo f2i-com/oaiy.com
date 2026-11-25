@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { Laptop, Loader2, Network, RotateCcw, Server, Star, TriangleAlert } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { engines, network, type NetworkModel, type NetworkNode, type NetworkStatus } from './api';
@@ -50,9 +50,6 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
   useVisiblePoll(() => void refresh(), 5000);
 
   const choose = async (kind: string, id: string | null) => {
@@ -60,7 +57,9 @@ export default function EngineWorkersPanel({ onOpenNetworking }: { onOpenNetwork
     setActionError(null);
     reads.current++;
     try {
-      setStatus(await network.setDefault(kind, id));
+      const next = await network.setDefault(kind, id);
+      reads.current++;
+      setStatus(next);
       await refresh();
     } catch (e) {
       setActionError(`The default was not changed: ${e instanceof Error ? e.message : String(e)}`);

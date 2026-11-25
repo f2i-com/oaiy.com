@@ -5,8 +5,9 @@
 // Same convention as the other panel tests: raw react-dom/client + act.
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { DownloadProgress } from './SetupParts';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DownloadProgress, usePoll } from './SetupParts';
+import { invalidate, useCached } from './useCached';
 import type { EngineDownload } from './api';
 
 let host: HTMLDivElement;
@@ -48,5 +49,72 @@ describe('the setup wizard’s download line', () => {
     expect(line({ id: 'm', status: 'downloading', done: 0, total: GB, speed: 0 })).toBe('0 B of 1.0 GB');
     expect(line({ id: 'm', status: 'queued', done: 0, total: 0 })).toBe('Waiting to start…');
     expect(line({ id: 'm', status: 'downloading', done: MB, total: GB, speed: MB, filesDone: 1, filesTotal: 3 })).toBe('1.0 MB of 1.0 GB · 1.0 MB/s · file 2 of 3');
+  });
+});
+
+describe('usePoll and useCached race hardening', () => {
+  afterEach(() => {
+    invalidate();
+  });
+
+  it('usePoll drops stale out-of-order responses and ignores results after enabled turns false', async () => {
+    const resolvers: Array<(v: string) => void> = [];
+    const load = vi.fn(() => new Promise<string>((r) => resolvers.push(r)));
+    let triggerRefresh!: () => Promise<void>;
+
+    function Probe({ enabled }: { enabled: boolean }) {
+      const [val, refresh] = usePoll(load, 60_000, enabled);
+      triggerRefresh = refresh;
+      return <span data-testid="val">{val ?? 'none'}</span>;
+    }
+
+    await act(async () => root.render(<Probe enabled />));
+    // Start a second refresh before the first resolves.
+    let p2!: Promise<void>;
+    await act(async () => {
+      p2 = triggerRefresh();
+    });
+    expect(resolvers).toHaveLength(2);
+    // Second resolves first with "newer", then first resolves late with "stale".
+    await act(async () => {
+      resolvers[1]('newer');
+      await p2;
+    });
+    expect(host.querySelector('[data-testid="val"]')?.textContent).toBe('newer');
+    await act(async () => {
+      resolvers[0]('stale');
+    });
+    expect(host.querySelector('[data-testid="val"]')?.textContent).toBe('newer');
+
+    // Start another refresh, disable polling before it resolves: must not overwrite.
+    await act(async () => {
+      void triggerRefresh();
+    });
+    expect(resolvers).toHaveLength(3);
+    await act(async () => root.render(<Probe enabled={false} />));
+    await act(async () => {
+      resolvers[2]('after-disable');
+    });
+    expect(host.querySelector('[data-testid="val"]')?.textContent).toBe('newer');
+  });
+
+  it('useCached drops stale responses from a previous key', async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    function Probe({ k }: { k: string }) {
+      const { data } = useCached(k, () => new Promise<string>((r) => (resolvers[k] = r)));
+      return <span data-testid="val">{data ?? 'none'}</span>;
+    }
+
+    await act(async () => root.render(<Probe k="key-a" />));
+    await act(async () => root.render(<Probe k="key-b" />));
+    await act(async () => {
+      resolvers['key-b']('value-b');
+    });
+    expect(host.querySelector('[data-testid="val"]')?.textContent).toBe('value-b');
+    // Late response for key-a must NOT overwrite key-b's state.
+    await act(async () => {
+      resolvers['key-a']('value-a');
+    });
+    expect(host.querySelector('[data-testid="val"]')?.textContent).toBe('value-b');
   });
 });

@@ -21,6 +21,38 @@ use std::path::Path;
 /// The side the square is made with Real-ESRGAN.
 const UPSCALED: u32 = 2048;
 
+const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_SIDE: u32 = 16_384;
+const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Decodes an input picture with strict file-size, dimension, pixel-count, and decoder-allocation caps.
+pub(crate) fn decode_bounded(path: &Path) -> Result<image::DynamicImage> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_IMAGE_FILE_BYTES {
+        candle_core::bail!("3d: input picture must be a regular file of at most 64 MiB: {}", path.display());
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+
+    let mut dim_reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    dim_reader.limits(limits.clone());
+    let (dw, dh) = dim_reader.into_dimensions().map_err(candle_core::Error::wrap)?;
+    if u64::from(dw) * u64::from(dh) > MAX_IMAGE_PIXELS {
+        candle_core::bail!("3d: input picture is too large ({dw}x{dh}; limit is {MAX_IMAGE_PIXELS} pixels)");
+    }
+
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(candle_core::Error::wrap)?;
+    if u64::from(img.width()) * u64::from(img.height()) > MAX_IMAGE_PIXELS {
+        candle_core::bail!("3d: input picture is too large ({}x{}; limit is {MAX_IMAGE_PIXELS} pixels)", img.width(), img.height());
+    }
+    Ok(img)
+}
+
 pub struct Prepared {
     /// Square, the object on black.
     pub image: RgbImage,
@@ -129,7 +161,7 @@ pub fn cuts_out(img: &RgbaImage) -> bool {
 }
 
 pub fn prepare(path: &Path, helpers: &Helpers) -> Result<Prepared> {
-    let img = image::ImageReader::open(path)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
+    let img = decode_bounded(path)?;
     let mut original = img.to_rgba8();
     let has_alpha = cuts_out(&original);
     // A picture merely a little translucent (an alpha channel an export left
@@ -282,4 +314,28 @@ pub fn imagenet(x: &Tensor) -> Result<Tensor> {
     let mean = Tensor::from_vec(vec![0.485f32, 0.456, 0.406], (3, 1, 1), dev)?;
     let std = Tensor::from_vec(vec![0.229f32, 0.224, 0.225], (3, 1, 1), dev)?;
     x.broadcast_sub(&mean)?.broadcast_div(&std)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_bounded_rejects_oversized_png_dimensions_before_allocating() {
+        let dir = std::env::temp_dir().join(format!("oaiy-media-model3d-prep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bomb.png");
+        // Minimal PNG header claiming 20000 x 20000 RGBA (exceeds MAX_IMAGE_SIDE and MAX_IMAGE_PIXELS).
+        let mut png = Vec::new();
+        png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]); // PNG signature
+        png.extend_from_slice(&13u32.to_be_bytes()); // IHDR length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&20_000u32.to_be_bytes()); // width
+        png.extend_from_slice(&20_000u32.to_be_bytes()); // height
+        png.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        png.extend_from_slice(&0u32.to_be_bytes()); // dummy CRC (dimension reader rejects on limits/header)
+        std::fs::write(&path, &png).unwrap();
+        assert!(decode_bounded(&path).is_err(), "oversized PNG must be rejected cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

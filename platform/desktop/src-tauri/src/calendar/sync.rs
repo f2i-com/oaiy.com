@@ -571,11 +571,10 @@ static HTTP: crate::link::net::LaneClient<reqwest::blocking::Client> =
     crate::link::net::LaneClient::new(build_http);
 
 fn build_http() -> Result<reqwest::blocking::Client, String> {
-    crate::link::net::blocking_builder(crate::link::net::Keep::Burst)
+    crate::link::creds::client_builder(crate::link::net::Keep::Burst)
         // Short enough that "Sync now" answers inside the page's own wait.
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -623,6 +622,7 @@ impl Api {
             return Err(Failure::Refused(format!("FormLogic would not list its apps: {}", said(&apps.body, apps.status))));
         }
         let id = find_form(&apps.body).ok_or_else(|| Failure::Refused("this FormLogic account has no appointments form (the Aokie receptionist pack)".into()))?;
+        let id = crate::link::oauth::path_segment(&id, "form id").map_err(Failure::Refused)?;
         *FORM.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.base.clone(), id.clone()));
         Ok(id)
     }
@@ -743,11 +743,26 @@ fn answers_over(a: &Appointment, base: Option<&Value>) -> Value {
     v
 }
 
+/// Validate `form` as a single URL path segment and return `/api/v1/forms/{form}/responses`.
+fn forms_responses_path(form: &str) -> Result<String, Failure> {
+    let seg = crate::link::oauth::path_segment(form, "form id").map_err(Failure::Refused)?;
+    Ok(format!("/api/v1/forms/{seg}/responses"))
+}
+
+/// Validate `rid` as a single URL path segment and append it to `responses_path`.
+fn response_item_path(responses_path: &str, rid: &str) -> Result<String, Failure> {
+    let seg = crate::link::oauth::path_segment(rid, "response id").map_err(Failure::Refused)?;
+    Ok(format!("{responses_path}/{seg}"))
+}
+
 /// What a FormLogic record says, as a change of the local appointment.
 fn change_from(answers: &Value) -> Change {
     let text = |k: &str| answers.get(k).and_then(Value::as_str).map(str::to_string);
     let start = match (text("date"), text("time")) {
-        (Some(d), Some(t)) if !d.is_empty() && !t.is_empty() => Some(format!("{d}T{}", &t[..t.len().min(5)])),
+        (Some(d), Some(t)) if !d.is_empty() && !t.is_empty() => {
+            let hhmm: String = t.chars().take(5).collect();
+            Some(format!("{d}T{hhmm}"))
+        }
         (Some(d), _) if !d.is_empty() => Some(format!("{d}T09:00")),
         _ => None,
     };
@@ -892,7 +907,7 @@ fn start_over(b: &mut Book) {
 /// when the changes since `cursor` cannot be told whole (a FormLogic without
 /// `updatedSince`, or deletions older than it keeps).
 fn list(api: &Api, form: &str, cursor: Option<&str>) -> Result<Option<Pulled>, Failure> {
-    let path = format!("/api/v1/forms/{form}/responses");
+    let path = forms_responses_path(form)?;
     let since = cursor
         .and_then(when)
         .map(|t| (t - OVERLAP).format("%Y-%m-%d %H:%M:%S").to_string())
@@ -966,10 +981,12 @@ fn deleted_ids(v: &Value) -> Vec<String> {
 /// looked up: gone only if FormLogic says so, as a listing read in pages can
 /// miss one that moved while it was read.
 fn look_up_missing(cal: &Calendar, api: &Api, form: &str, pulled: &mut Pulled) -> Result<(), Failure> {
+    let base_path = forms_responses_path(form)?;
     let listed: HashSet<String> = pulled.records.iter().filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string)).chain(pulled.deleted.iter().cloned()).collect();
     let missing: Vec<String> = cal.list(None, None).iter().filter_map(|a| remote(a).id).filter(|id| !listed.contains(id)).take(MAX_LOOKUPS).collect();
     for rid in missing {
-        let reply = api.get(&format!("/api/v1/forms/{form}/responses/{}", enc(&rid)))?;
+        let item_path = response_item_path(&base_path, &rid)?;
+        let reply = api.get(&item_path)?;
         match reply.status {
             404 => pulled.deleted.push(rid),
             200 => {
@@ -1158,7 +1175,7 @@ fn reconcile(b: &mut Book, i: usize, stamp: &Stamp, theirs: &Value, out: &mut Ou
 
 /// Send what changed here: changes, new appointments, deletions.
 fn push(cal: &Calendar, api: &Api, form: &str, ctx: &Ctx, out: &mut Outcome) -> Result<(), Failure> {
-    let path = format!("/api/v1/forms/{form}/responses");
+    let path = forms_responses_path(form)?;
     for a in cal.list(None, None) {
         let r = remote(&a);
         if r.id.is_some() && changed_here(&a, &r) && !refused_now(&a, &r) {
@@ -1187,8 +1204,9 @@ fn put_one(cal: &Calendar, api: &Api, path: &str, a: &Appointment, out: &mut Out
     for _ in 0..2 {
         let r = remote(&a);
         let Some(rid) = r.id.clone() else { return Ok(()) };
+        let item_path = response_item_path(path, &rid)?;
         let body = answers_over(&a, r.base.as_ref());
-        let reply = api.send(reqwest::Method::PUT, &format!("{path}/{}", enc(&rid)), Some(&json!({ "answers": body })), r.etag.as_deref())?;
+        let reply = api.send(reqwest::Method::PUT, &item_path, Some(&json!({ "answers": body })), r.etag.as_deref())?;
         match reply.status {
             200..=299 => {
                 let sent = a.updated_at.clone();
@@ -1352,7 +1370,8 @@ fn delete_tombstoned(cal: &Calendar, api: &Api, path: &str, ctx: &Ctx, out: &mut
         }
         let mut done = true;
         for rid in &targets {
-            let reply = api.send(reqwest::Method::DELETE, &format!("{path}/{}", enc(rid)), None, None)?;
+            let item_path = response_item_path(path, rid)?;
+            let reply = api.send(reqwest::Method::DELETE, &item_path, None, None)?;
             match reply.status {
                 200..=299 | 404 => {}
                 s => {
@@ -1376,7 +1395,8 @@ fn delete_tombstoned(cal: &Calendar, api: &Api, path: &str, ctx: &Ctx, out: &mut
         }
     }
     for rid in discard {
-        let reply = api.send(reqwest::Method::DELETE, &format!("{path}/{}", enc(&rid)), None, None)?;
+        let item_path = response_item_path(path, &rid)?;
+        let reply = api.send(reqwest::Method::DELETE, &item_path, None, None)?;
         if matches!(reply.status, 200..=299 | 404) {
             save(cal, |b| {
                 b.sync.discard.retain(|d| *d != rid);

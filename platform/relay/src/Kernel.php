@@ -95,7 +95,11 @@ final class Kernel
             $res = self::finalise($compat ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal')), Clock::now());
         }
         ob_end_clean();
-        $res->emit();
+        try {
+            $res->emit();
+        } catch (\Throwable $e) {
+            Log::error($e, 'emit');
+        }
         if ($kernel !== null) {
             $kernel->finish();
         }

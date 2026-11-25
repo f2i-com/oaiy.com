@@ -1,6 +1,19 @@
 import { memo, useRef, useEffect, useCallback, useMemo, useState, type ChangeEvent } from 'react';
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { mediaUrlBlocked } from '../../../lib/localMedia';
+
+function isSafeAudioUrl(url: string | undefined): url is string {
+    if (!url || typeof url !== 'string') return false;
+    if (mediaUrlBlocked(url)) return false;
+    const t = url.trim().toLowerCase();
+    return (
+        t.startsWith('http://') ||
+        t.startsWith('https://') ||
+        t.startsWith('blob:') ||
+        t.startsWith('data:audio/')
+    );
+}
 
 interface MusicGenNodeData {
     prompt?: string;
@@ -86,11 +99,24 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
         { id: 'path', type: 'source', position: Position.Right, color: '!bg-slate-400', size: 'sm', label: 'path' },
     ], []);
 
+    useEffect(() => {
+        return () => {
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current.src = '';
+                audioRef.current = null;
+            }
+            setIsPlaying(false);
+        };
+    }, [data.audioPath]);
+
+    const playableAudioUrl = isSafeAudioUrl(data.audioPath) ? data.audioPath : null;
+
     const handlePlayPause = () => {
-        if (!data.audioPath) return;
+        if (!playableAudioUrl) return;
 
         if (!audioRef.current) {
-            audioRef.current = new Audio(data.audioPath);
+            audioRef.current = new Audio(playableAudioUrl);
             audioRef.current.onended = () => setIsPlaying(false);
         }
 
@@ -98,7 +124,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
             audioRef.current.pause();
             setIsPlaying(false);
         } else {
-            audioRef.current.play();
+            void audioRef.current.play().catch(() => setIsPlaying(false));
             setIsPlaying(true);
         }
     };
@@ -208,7 +234,7 @@ function MusicGenNode({ data }: MusicGenNodeProps) {
                     </div>
 
                     {/* Audio Preview */}
-                    {data.audioPath && (
+                    {playableAudioUrl && (
                         <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/30 rounded">
                             <button
                                 type="button"

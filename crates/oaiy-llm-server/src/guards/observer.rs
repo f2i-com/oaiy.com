@@ -426,9 +426,27 @@ fn check_schema(value: &Json, schema: &Json, path: &str, depth: usize) -> std::r
 /// runner retains its full catalog. Never silently clip a tool's argument body.
 fn focused_context(context: &str, draft: &str) -> String {
     let Ok(value) = Json::parse(context.as_bytes()) else { return context.to_owned(); };
+    // Completed reviews pass `review_draft`'s JSON `{"calls":[{"name":...}, ...]}`; fall back to DSML
+    // `name="..."` matching for raw unfinished drafts.
+    let json_names: Option<std::collections::HashSet<String>> = Json::parse(draft.as_bytes()).ok().and_then(|d| {
+        let calls = d.get("calls").and_then(Json::as_array)?;
+        let mut names = std::collections::HashSet::new();
+        for call in calls {
+            if let Some(name) = call.get("name").and_then(Json::as_str) {
+                names.insert(name.to_owned());
+                if let Some((ns, bare)) = name.split_once("::") {
+                    names.insert(format!("{ns}.{bare}"));
+                }
+            }
+        }
+        Some(names)
+    });
     let tools: Vec<Json> = value.get("tools").and_then(Json::as_array).into_iter().flatten()
         .filter(|tool| tool.get("function").and_then(|f| f.get("name")).and_then(Json::as_str)
-            .is_some_and(|name| draft.contains(&format!("name=\"{name}\""))))
+            .is_some_and(|name| match &json_names {
+                Some(names) => names.contains(name),
+                None => draft.contains(&format!("name=\"{name}\"")),
+            }))
         .cloned().collect();
     let names = value.get("tools").and_then(Json::as_array).into_iter().flatten()
         .filter_map(|t| t.get("function").and_then(|f|f.get("name")).cloned()).collect();
@@ -488,6 +506,19 @@ mod tests {
         assert!(result.contains("path"));
         assert!(result.contains("write_file")); // catalog name retained
         assert!(!result.contains("large schema"));
+    }
+    #[test]
+    fn focused_context_preserves_schemas_for_json_review_draft() {
+        let input = r#"{"latest_user_request":"inspect and read","tools":[{"function":{"name":"list_files","parameters":{"path":"dir_schema"}}},{"function":{"name":"fs.read_file","parameters":{"file":"read_schema"}}},{"function":{"name":"write_file","parameters":{"content":"large unused schema"}}}]}"#;
+        let raw_draft = "Thinking.<｜DSML｜ calls><｜DSML｜ invoke name=\"list_files\"><｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter></｜DSML｜ invoke><｜DSML｜ invoke name=\"fs::read_file\"><｜DSML｜ parameter name=\"file\" string=\"true\">Cargo.toml</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let normalized = review_draft(raw_draft).unwrap();
+        let focused = focused_context(input, &normalized);
+        let parsed = Json::parse(focused.as_bytes()).unwrap();
+        let selected = parsed.get("selected_tool_schemas").and_then(Json::as_array).unwrap();
+        let selected_names: Vec<&str> = selected.iter().filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Json::as_str)).collect();
+        assert_eq!(selected_names, vec!["list_files", "fs.read_file"]);
+        assert!(focused.contains("dir_schema") && focused.contains("read_schema"));
+        assert!(!focused.contains("large unused schema"));
     }
     #[test]
     fn decisions_are_strict_bounded_and_not_executable() {

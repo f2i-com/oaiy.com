@@ -7,7 +7,7 @@ use crate::api::gateway::{incognito_mode, json_reply};
 use crate::models::downloads::{PeerModel, PeerModels, PeerReply, PeerRequest};
 use crate::util::{error_json, str_or};
 use crate::Studio;
-use oaiy_engine::http::{respond_head, Request, Stream};
+use oaiy_engine::http::{reason, respond_head, Request};
 use oaiy_engine::json::Json;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -27,7 +27,81 @@ const TARGETS: [(&str, &str); 9] = [
 ];
 
 /// The headers of that computer's answer passed on with a body of known length (its type and length are said anyway).
-const KEPT: [&str; 5] = ["Content-Range", "Accept-Ranges", "Content-Disposition", "X-Sample-Rate", "Cache-Control"];
+/// `Content-Disposition` is handled separately so untrusted `inline` dispositions are never forwarded.
+const KEPT: [&str; 4] = ["Content-Range", "Accept-Ranges", "X-Sample-Rate", "Cache-Control"];
+
+/// Hardening headers always attached to relayed peer responses so a paired peer cannot execute active content in
+/// Studio's origin.
+const RELAY_NOSNIFF: (&str, &str) = ("X-Content-Type-Options", "nosniff");
+const RELAY_CSP: (&str, &str) = ("Content-Security-Policy", "default-src 'none'; sandbox");
+
+/// Allowlist of safe non-active MIME types a paired peer may relay without coercion. Active or unknown types
+/// (`text/html`, `image/svg+xml`, `*xml*`, `*javascript*`, etc.) return `None` and are coerced to
+/// `application/octet-stream` with `Content-Disposition: attachment`.
+fn safe_media_type(raw: &str) -> Option<&str> {
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    let essence = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let allowed = matches!(
+        essence.as_str(),
+        "application/json"
+            | "text/event-stream"
+            | "text/plain"
+            | "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+            | "model/gltf-binary"
+            | "application/octet-stream"
+    ) || essence
+        .strip_prefix("video/")
+        .or_else(|| essence.strip_prefix("audio/"))
+        .is_some_and(|sub| {
+            !sub.is_empty()
+                && sub.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+                && !sub.contains("xml")
+                && !sub.contains("html")
+                && !sub.contains("script")
+        });
+    allowed.then_some(raw.trim())
+}
+
+/// Only forward an upstream `Content-Disposition` when it is explicitly an `attachment` disposition without control
+/// bytes (never `inline`).
+fn safe_attachment_disposition(raw: &str) -> Option<&str> {
+    let v = raw.trim();
+    if v.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    let head = v.split(';').next().unwrap_or("").trim();
+    head.eq_ignore_ascii_case("attachment").then_some(v)
+}
+
+/// Write the head of a chunked response with extra security/disposition headers.
+fn start_chunked_head(w: &mut TcpStream, status: u16, content_type: &str, extra: &[(&str, &str)]) -> io::Result<()> {
+    let valid = |s: &str| !s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    if !valid(content_type) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid stream Content-Type header"));
+    }
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type, *\r\n\
+         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Private-Network: true\r\n",
+        reason(status),
+    );
+    for (k, v) in extra {
+        if !valid(k) || !valid(v) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid response header"));
+        }
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("Connection: keep-alive\r\n\r\n");
+    w.write_all(head.as_bytes())?;
+    w.flush()
+}
 
 fn err(w: &mut TcpStream, status: u16, message: &str) -> io::Result<bool> {
     let (kind, code) = match status {
@@ -137,11 +211,29 @@ pub fn handle(studio: &Studio, req: &Request, w: &mut TcpStream, rest: &str, pee
 fn relay(w: &mut TcpStream, reply: PeerReply) -> io::Result<bool> {
     let PeerReply { status, content_type, headers, mut body } = reply;
     let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let (safe_ct, coerced) = match safe_media_type(&content_type) {
+        Some(ct) => (ct, false),
+        None => ("application/octet-stream", true),
+    };
+    let is_sse = safe_ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream");
+    let disposition = if coerced {
+        Some("attachment")
+    } else {
+        header("content-disposition").and_then(safe_attachment_disposition)
+    };
     let length = header("content-length").and_then(|n| n.trim().parse::<u64>().ok());
-    match length.filter(|_| !content_type.contains("event-stream")) {
+    match length.filter(|_| !is_sse) {
         Some(len) => {
-            let extra: Vec<(&str, &str)> = KEPT.iter().filter_map(|k| header(k).map(|v| (*k, v))).collect();
-            respond_head(w, status, &content_type, &extra, len, true)?;
+            let mut extra: Vec<(&str, &str)> = KEPT
+                .iter()
+                .filter_map(|k| header(k).filter(|v| !v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)).map(|v| (*k, v)))
+                .collect();
+            if let Some(disp) = disposition {
+                extra.push(("Content-Disposition", disp));
+            }
+            extra.push(RELAY_NOSNIFF);
+            extra.push(RELAY_CSP);
+            respond_head(w, status, safe_ct, &extra, len, true)?;
             let sent = io::copy(&mut body.by_ref().take(len), w)?;
             w.flush()?;
             if sent < len {
@@ -151,7 +243,13 @@ fn relay(w: &mut TcpStream, reply: PeerReply) -> io::Result<bool> {
             Ok(true)
         }
         None => {
-            let mut out = Stream::start_status(w, status, &content_type)?;
+            let mut extra = Vec::with_capacity(3);
+            if let Some(disp) = disposition {
+                extra.push(("Content-Disposition", disp));
+            }
+            extra.push(RELAY_NOSNIFF);
+            extra.push(RELAY_CSP);
+            start_chunked_head(w, status, safe_ct, &extra)?;
             let mut piece = vec![0u8; 64 << 10];
             loop {
                 // (a stream that broke there is broken here too: the connection closes without the chunked end)
@@ -159,9 +257,13 @@ fn relay(w: &mut TcpStream, reply: PeerReply) -> io::Result<bool> {
                 if n == 0 {
                     break;
                 }
-                out.send(&piece[..n])?;
+                write!(w, "{n:x}\r\n")?;
+                w.write_all(&piece[..n])?;
+                w.write_all(b"\r\n")?;
+                w.flush()?;
             }
-            out.finish()?;
+            w.write_all(b"0\r\n\r\n")?;
+            w.flush()?;
             Ok(true)
         }
     }
@@ -452,5 +554,70 @@ mod tests {
         assert_eq!(first.get("default"), Some(&Json::Bool(true)));
         assert_eq!(first.get("context_tokens").and_then(Json::as_i64), Some(65536));
         assert_eq!(models_json(None), Json::Arr(Vec::new()));
+    }
+
+    /// Relayed peer responses allowlist safe non-active MIME types, coerce active/other types to
+    /// `application/octet-stream` with `Content-Disposition: attachment` (never forwarding `inline`), and always
+    /// attach `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox` on both
+    /// fixed-length and streamed replies.
+    #[test]
+    fn relayed_peer_responses_harden_mime_types_and_csp() {
+        let s = studio("harden");
+        // Fixed-length active/unknown types are coerced and never forwarded inline.
+        for bad_ct in ["text/html", "text/html; charset=utf-8", "image/svg+xml", "application/xhtml+xml", "text/xml", "application/javascript", "video/svg+xml"] {
+            let body = b"<script>alert(1)</script>";
+            let peer = fake(PeerReply {
+                status: 200,
+                content_type: bad_ct.into(),
+                headers: vec![("content-length".into(), body.len().to_string()), ("content-disposition".into(), "inline; filename=\"x.html\"".into())],
+                body: Box::new(io::Cursor::new(body.to_vec())),
+            });
+            let out = served(&s, request("GET", "/api/play/node/abc123/files/x", ""), "abc123/files/x", &peer);
+            assert!(out.contains("Content-Type: application/octet-stream\r\n"), "{bad_ct}: {out}");
+            assert!(out.contains("Content-Disposition: attachment\r\n"), "{bad_ct}: {out}");
+            assert!(!out.contains("inline"), "{bad_ct}: {out}");
+            assert!(out.contains("X-Content-Type-Options: nosniff\r\n"), "{bad_ct}: {out}");
+            assert!(out.contains("Content-Security-Policy: default-src 'none'; sandbox\r\n"), "{bad_ct}: {out}");
+        }
+        // Streamed (no Content-Length) active type is also coerced + hardened.
+        let peer = fake(PeerReply {
+            status: 200,
+            content_type: "text/html".into(),
+            headers: vec![("content-disposition".into(), "inline".into())],
+            body: Box::new(io::Cursor::new(b"<html></html>".to_vec())),
+        });
+        let out = served(&s, request("GET", "/api/play/node/abc123/files/s", ""), "abc123/files/s", &peer);
+        assert!(out.contains("Transfer-Encoding: chunked\r\n"), "{out}");
+        assert!(out.contains("Content-Type: application/octet-stream\r\n"), "{out}");
+        assert!(out.contains("Content-Disposition: attachment\r\n"), "{out}");
+        assert!(!out.contains("inline"), "{out}");
+        assert!(out.contains("X-Content-Type-Options: nosniff\r\n"), "{out}");
+        assert!(out.contains("Content-Security-Policy: default-src 'none'; sandbox\r\n"), "{out}");
+
+        // Safe allowlisted types keep their Content-Type, drop `inline` disposition, and still get nosniff + sandbox CSP.
+        for ok_ct in ["application/json", "text/plain; charset=utf-8", "image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "audio/wav", "model/gltf-binary", "application/octet-stream"] {
+            let peer = fake(PeerReply {
+                status: 200,
+                content_type: ok_ct.into(),
+                headers: vec![("content-length".into(), "2".into()), ("content-disposition".into(), "inline".into())],
+                body: Box::new(io::Cursor::new(b"{}".to_vec())),
+            });
+            let out = served(&s, request("GET", "/api/play/node/abc123/files/ok", ""), "abc123/files/ok", &peer);
+            assert!(out.contains(&format!("Content-Type: {ok_ct}\r\n")), "{ok_ct}: {out}");
+            assert!(!out.contains("Content-Disposition:"), "{ok_ct}: {out}");
+            assert!(out.contains("X-Content-Type-Options: nosniff\r\n"), "{ok_ct}: {out}");
+            assert!(out.contains("Content-Security-Policy: default-src 'none'; sandbox\r\n"), "{ok_ct}: {out}");
+        }
+        // Streamed SSE keeps `text/event-stream` and includes nosniff + sandbox CSP.
+        let peer = fake(PeerReply {
+            status: 200,
+            content_type: "text/event-stream".into(),
+            headers: Vec::new(),
+            body: Box::new(io::Cursor::new(b"data: [DONE]\n\n".to_vec())),
+        });
+        let out = served(&s, request("POST", "/api/play/node/abc123/chat", "{}"), "abc123/chat", &peer);
+        assert!(out.contains("Content-Type: text/event-stream\r\n"), "{out}");
+        assert!(out.contains("X-Content-Type-Options: nosniff\r\n"), "{out}");
+        assert!(out.contains("Content-Security-Policy: default-src 'none'; sandbox\r\n"), "{out}");
     }
 }

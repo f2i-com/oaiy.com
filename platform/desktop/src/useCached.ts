@@ -65,23 +65,48 @@ export function useCached<T>(
   // inline, so a new identity every render would restart the interval endlessly.
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+  const mountedRef = useRef(true);
+  const keyRef = useRef(key);
+  keyRef.current = key;
+  const prevKeyRef = useRef(key);
+  const seqRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      seqRef.current += 1;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
+    const seq = ++seqRef.current;
+    const reqKey = key;
     try {
       const next = await fetcherRef.current();
-      put(key, next);
+      if (!mountedRef.current || keyRef.current !== reqKey || seq !== seqRef.current) return;
+      put(reqKey, next);
       setData(next);
       setError(null);
     } catch (e) {
+      if (!mountedRef.current || keyRef.current !== reqKey || seq !== seqRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [key]);
 
   useEffect(() => {
     let cancelled = false;
-    // Adopt whatever another panel may have cached for this key since mount.
+    // Adopt whatever another panel may have cached for this key since mount, and
+    // invalidate any in-flight refresh from a previous key.
     const cached = peek<T>(key);
-    if (cached !== undefined) setData(cached);
+    if (prevKeyRef.current !== key) {
+      prevKeyRef.current = key;
+      seqRef.current += 1;
+      setData(cached);
+      setError(null);
+    } else if (cached !== undefined) {
+      setData(cached);
+    }
 
     const tick = async () => {
       if (cancelled) return;

@@ -210,7 +210,9 @@ async function call(
   }
   // OAIY Desktop's own engine routes take its credential, as a contract service's call does (contractRuntime): the
   // engine's language model picked here (a service, not a contract) was refused "authentication required".
-  if (!Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')) {
+  // Never attach the desktop credential for a packaged/untrusted run lacking `network:local`.
+  const canUseDesktopToken = !ctx.currentPackageId || Boolean(ctx.hasPermission?.('network:local'));
+  if (canUseDesktopToken && !Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')) {
     const credential = desktopCredential(endpoint, desktopAccess());
     if (credential) headers['Authorization'] = `Bearer ${credential}`;
   }

@@ -1248,6 +1248,40 @@ mod unix {
         assert!(!real.join("keys").exists(), "nothing was created through a symlink inside an untrusted parent");
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
+
+    #[test]
+    fn chained_intermediate_symlink_through_untrusted_dir_and_symlink_loop_are_refused() {
+        let safe = Scratch::new("chain-safe");
+        let real = safe.0.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // safe/link1 -> untrusted/link2 -> safe/real (link2 sits inside a world-writable non-sticky dir).
+        let untrusted = safe.0.join("untrusted");
+        fs::create_dir(&untrusted).unwrap();
+        symlink(&real, untrusted.join("link2")).unwrap();
+        symlink(untrusted.join("link2"), safe.0.join("link1")).unwrap();
+        fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = open_at(safe.0.join("link1").join("keys"), ProviderChoice::Keyfile).err().expect("chained symlink through untrusted dir must be refused");
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("above the keys directory") && why.contains("sticky")), "{error:?}");
+        assert!(!real.join("keys").exists(), "nothing was created through a chained symlink in an untrusted dir");
+
+        // Tightening the intermediate dir allows the safe chain, creating nested missing directories via mkdirat at 0700.
+        fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o700)).unwrap();
+        let nested = safe.0.join("link1").join("nested").join("keys");
+        assert!(open_at(&nested, ProviderChoice::Keyfile).is_ok());
+        assert_eq!(mode_of(&real.join("nested")), 0o700);
+        assert_eq!(mode_of(&real.join("nested").join("keys")), 0o700);
+
+        // Symlink loop is refused by MAX_SYMLINKS.
+        let loop_a = safe.0.join("loop_a");
+        let loop_b = safe.0.join("loop_b");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        let loop_err = open_at(loop_a.join("keys"), ProviderChoice::Keyfile).err().expect("symlink loop must be refused");
+        assert!(matches!(&loop_err, KeyError::Permissions(why) if why.contains("too many symbolic links")), "{loop_err:?}");
+    }
 }
 
 /// What Windows adds: a junction is a reparse point that `std` follows, and the folder is held open so that it cannot be swapped.

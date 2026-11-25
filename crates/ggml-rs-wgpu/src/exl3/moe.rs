@@ -482,12 +482,14 @@ pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &De
         let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
         let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
         let (suh, svh) = (buf(&g.suh), buf(&g.svh));
+        let gy = (count as u32).min(65535);
+        let gz = (count as u32).div_ceil(65535).max(1);
         if let (true, Some(table)) = (pairs, silu) {
-            rec.dispatch_wide("exl3-pre-swiglu-table", chain_shader("pre-swiglu-table"), [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide("exl3-pre-swiglu-table", chain_shader("pre-swiglu-table"), [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits(), count as u32], ((g.k / 128) as u32, gy, gz));
         } else if pairs {
-            rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide("exl3-pre-swiglu", chain_shader("pre-swiglu"), [&xb, &suh, &d, &jb, &xb, &d, &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits(), count as u32], ((g.k / 128) as u32, gy, gz));
         } else {
-            rec.dispatch_wide("exl3-pre", chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide("exl3-pre", chain_shader("pre"), [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1, 0, 0, 0, 0, 0, count as u32], ((g.k / 128) as u32, gy, gz));
         }
         let ntiles = (g.n / 16) as u32;
         let splits = if matches!(order, Order::Many(..)) { 1 } else { g.splits };
@@ -525,7 +527,7 @@ pub(super) fn group_pass(rec: &mut crate::chain::Recorder<'_>, g: &Group, x: &De
                 }
             }
         }
-        rec.dispatch_wide("exl3-post", chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits], ((g.n / 128) as u32, count as u32, 1));
+        rec.dispatch_wide("exl3-post", chain_shader("post"), [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, splits, 0, 0, 0, 0, 0, count as u32], ((g.n / 128) as u32, gy, gz));
     }
 }
 
@@ -540,22 +542,24 @@ pub(super) fn group_pass_skipping(rec: &mut crate::chain::Recorder<'_>, g: &Grou
     let buf = |v: &DeviceVec| v.inner.downcast_ref::<wgpu::Buffer>().expect("a WebGPU chain's vector").clone();
     let (xb, jb, xhb, pb, yb) = (buf(x), buf(jobs), buf(xh), buf(part), buf(y));
     let (suh, svh) = (buf(&g.suh), buf(&g.svh));
+    let gy = (count as u32).min(65535);
+    let gz = (count as u32).div_ceil(65535).max(1);
     match (pairs, silu) {
         (true, Some(table)) => {
             let (name, src) = skipping_shader("pre-swiglu-table", 0);
-            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits()], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &xb, &buf(table), &xhb, &drw], &[g.k as u32, 1, 2, 0, 2, 1, limit.to_bits(), count as u32], ((g.k / 128) as u32, gy, gz));
         }
         (true, None) => panic!("moe: a fused down pass looks its SwiGLU up in a table"),
         (false, _) => {
             let (name, src) = skipping_shader("pre", 0);
-            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1], ((g.k / 128) as u32, count as u32, 1));
+            rec.dispatch_wide(name, src, [&xb, &suh, &d, &jb, &d, &d, &xhb, &drw], &[g.k as u32, 1, 0, 0, 0, 0, 0, count as u32], ((g.k / 128) as u32, gy, gz));
         }
     }
     let ntiles = (g.n / 16) as u32;
     let (name, src) = skipping_shader("mm", g.tw);
     rec.dispatch_wide(name, src, [&g.words, &xhb, &jb, &d, &d, &d, &pb, &drw], &[g.n as u32, g.k as u32, g.tw as u32, g.splits, g.mwords as u32, 0], (ntiles.min(65535), ntiles.div_ceil(65535), count as u32 * g.splits));
     let (name, src) = skipping_shader("post", 0);
-    rec.dispatch_wide(name, src, [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits], ((g.n / 128) as u32, count as u32, 1));
+    rec.dispatch_wide(name, src, [&pb, &svh, &jb, &d, &d, &d, &yb, &drw], &[g.n as u32, g.splits, 0, 0, 0, 0, 0, count as u32], ((g.n / 128) as u32, gy, gz));
 }
 
 impl Exl3MoeGrouped {

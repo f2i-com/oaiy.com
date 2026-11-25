@@ -226,9 +226,61 @@ pub fn show_ui(ui_url: &str) {
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "OAIY";
 
+fn reg_exe() -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(std::env::var_os("SystemRoot")?);
+    if !root.is_absolute() {
+        return None;
+    }
+    let path = root.join("System32").join("reg.exe");
+    path.is_file().then_some(path)
+}
+
+/// Quote one argument for Windows `CommandLineToArgvW` / MSVC CRT parsing:
+/// wrap in `"..."`, doubling backslashes before `"` or the closing `"`,
+/// and escaping embedded `"`.
+fn quote_win_arg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+fn autostart_command(exe: &std::path::Path, config: &std::path::Path) -> Option<String> {
+    let exe = exe.to_str()?;
+    let config = config.to_str()?;
+    if exe.is_empty() || config.is_empty() || exe.contains(['\0', '\r', '\n']) || config.contains(['\0', '\r', '\n']) {
+        return None;
+    }
+    Some(format!("{} --config {} --open none {}", quote_win_arg(exe), quote_win_arg(config), crate::AUTOSTART_FLAG))
+}
+
 fn reg(args: &[&str]) -> bool {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg")
+    let Some(exe) = reg_exe() else { return false };
+    std::process::Command::new(exe)
         .args(args)
         .creation_flags(0x0800_0000)
         .stdout(std::process::Stdio::null())
@@ -244,9 +296,9 @@ fn autostart() -> bool {
 
 fn set_autostart(on: bool) {
     if on {
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-        let config = TRAY.get().map(|t| t.running.studio.config_path.display().to_string()).unwrap_or_default();
-        let command = format!("\"{exe}\" --config \"{config}\" --open none {}", crate::AUTOSTART_FLAG);
+        let Ok(exe) = std::env::current_exe() else { return };
+        let Some(tray) = TRAY.get() else { return };
+        let Some(command) = autostart_command(&exe, &tray.running.studio.config_path) else { return };
         reg(&["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &command, "/f"]);
     } else {
         reg(&["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
@@ -404,7 +456,8 @@ pub fn run(running: Running, show_balloon: bool) {
     let already: Vec<String> = running.studio.media.list().iter().filter(|j| j.finished()).map(|j| j.id.clone()).collect();
     let ui_url = running.ui_url.clone();
     let tray = Tray { running, announced: Mutex::new(already), icon: AtomicIsize::new(load_icon() as isize) };
-    if TRAY.set(tray).is_err() {
+    if let Err(tray) = TRAY.set(tray) {
+        tray.running.studio.shutdown();
         return;
     }
     let class = wide("OaiyStudioTray");
@@ -427,6 +480,9 @@ pub fn run(running: Running, show_balloon: bool) {
         CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPED, 0, 0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null())
     };
     if hwnd.is_null() {
+        if let Some(tray) = TRAY.get() {
+            tray.running.studio.shutdown();
+        }
         message_box("Could not create the notification-area window.");
         return;
     }
@@ -471,5 +527,19 @@ mod tests {
         assert!(width(32) >= 32);
         assert!(width(1000) >= 48, "the largest when none is big enough");
         assert!(ico_image(b"\0\0\x01\0\x01\0", 16).is_none());
+    }
+
+    #[test]
+    fn win_arg_quoting_and_reg_exe_resolution() {
+        assert_eq!(quote_win_arg(r"C:\Program Files\OAIY\oaiy-studio-tray.exe"), r#""C:\Program Files\OAIY\oaiy-studio-tray.exe""#);
+        assert_eq!(quote_win_arg(r#"C:\dir with trailing\"#), r#""C:\dir with trailing\\""#);
+        assert_eq!(quote_win_arg(r#"C:\a"b\c\"#), r#""C:\a\"b\c\\""#);
+        assert_eq!(quote_win_arg(r#"C:\a\"b"#), r#""C:\a\\\"b""#);
+        assert!(autostart_command(std::path::Path::new(""), std::path::Path::new("cfg.json")).is_none());
+        assert!(autostart_command(std::path::Path::new("a.exe"), std::path::Path::new("bad\ncfg")).is_none());
+        let cmd = autostart_command(std::path::Path::new(r"C:\OAIY\tray.exe"), std::path::Path::new(r"C:\Users\Me\cfg\")).unwrap();
+        assert_eq!(cmd, format!(r#""C:\OAIY\tray.exe" --config "C:\Users\Me\cfg\\" --open none {}"#, crate::AUTOSTART_FLAG));
+        let reg_path = reg_exe().expect("System32\\reg.exe must resolve on Windows");
+        assert!(reg_path.is_absolute() && reg_path.ends_with(std::path::Path::new("System32").join("reg.exe")));
     }
 }

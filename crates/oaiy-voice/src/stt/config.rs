@@ -32,6 +32,11 @@ pub struct ModelConfig {
     pub att_context: [i64; 2],
 }
 
+/// Upper bounds on front-end settings so untrusted configs cannot trigger huge filterbank or FFT allocations.
+pub const MAX_SAMPLE_RATE: usize = 384_000;
+pub const MAX_N_FFT: usize = 65_536;
+pub const MAX_N_MELS: usize = 4_096;
+
 impl ModelConfig {
     /// The defaults of the Parakeet 0.6B models, for what a config leaves out.
     pub fn parakeet() -> Self {
@@ -41,11 +46,11 @@ impl ModelConfig {
     /// Validate front-end and decoding settings so malformed configs fail cleanly instead of panicking.
     pub fn validate(&self) -> Result<()> {
         let m = &self.mel;
-        if m.sample_rate == 0 {
-            return Err(bad("sample_rate must be > 0"));
+        if m.sample_rate == 0 || m.sample_rate > MAX_SAMPLE_RATE {
+            return Err(bad(format!("sample_rate must be in 1..={MAX_SAMPLE_RATE}, got {}", m.sample_rate)));
         }
-        if m.n_fft < 2 || !m.n_fft.is_power_of_two() {
-            return Err(bad(format!("n_fft must be a power of two >= 2, got {}", m.n_fft)));
+        if m.n_fft < 2 || m.n_fft > MAX_N_FFT || !m.n_fft.is_power_of_two() {
+            return Err(bad(format!("n_fft must be a power of two in 2..={MAX_N_FFT}, got {}", m.n_fft)));
         }
         if m.win_length == 0 || m.win_length > m.n_fft {
             return Err(bad(format!("win_length must be in 1..={}, got {}", m.n_fft, m.win_length)));
@@ -53,8 +58,8 @@ impl ModelConfig {
         if m.hop_length == 0 {
             return Err(bad("hop_length must be > 0"));
         }
-        if m.n_mels == 0 {
-            return Err(bad("n_mels must be > 0"));
+        if m.n_mels == 0 || m.n_mels > MAX_N_MELS {
+            return Err(bad(format!("n_mels must be in 1..={MAX_N_MELS}, got {}", m.n_mels)));
         }
         if !m.log_guard.is_finite() || m.log_guard <= 0.0 {
             return Err(bad(format!("log_guard must be finite and > 0, got {}", m.log_guard)));
@@ -388,5 +393,21 @@ mod tests {
         assert!(ModelConfig::from_hf(config, Some(br#"{"n_fft":500}"#)).is_err());
         assert!(ModelConfig::from_hf(config, Some(br#"{"hop_length":0}"#)).is_err());
         assert!(ModelConfig::from_nemo_yaml(&NEMO.replace("sample_rate: 16000", "sample_rate: 0")).is_err());
+
+        // Oversized n_fft, n_mels, and sample_rate must fail validation cleanly.
+        assert!(ModelConfig::from_hf(config, Some(br#"{"n_fft":131072}"#)).is_err());
+        assert!(ModelConfig::from_hf(config, Some(br#"{"feature_size":4097}"#)).is_err());
+        assert!(ModelConfig::from_hf(config, Some(br#"{"sampling_rate":384001}"#)).is_err());
+        assert!(ModelConfig::from_nemo_yaml(&NEMO.replace("n_fft: 512", "n_fft: 131072")).is_err());
+        assert!(ModelConfig::from_nemo_yaml(&NEMO.replace("features: 128", "features: 4097")).is_err());
+        assert!(ModelConfig::from_nemo_yaml(&NEMO.replace("sample_rate: 16000", "sample_rate: 384001")).is_err());
+
+        // Exact upper bounds still validate cleanly.
+        let mut at_max = ModelConfig::parakeet();
+        at_max.mel.sample_rate = MAX_SAMPLE_RATE;
+        at_max.mel.n_fft = MAX_N_FFT;
+        at_max.mel.win_length = MAX_N_FFT;
+        at_max.mel.n_mels = MAX_N_MELS;
+        assert!(at_max.validate().is_ok());
     }
 }

@@ -777,51 +777,108 @@ export function detectSandboxEscape(script: string): string | null {
 }
 
 /**
- * Strip line/block comments and the bodies of string and template literals
- * so an escape-pattern regex only matches actual executable code.
+ * Strip line/block comments and the static text bodies of string and template
+ * literals so an escape-pattern regex only matches actual executable code.
+ * Expressions inside template-literal `${...}` interpolations ARE preserved
+ * (and recursively scanned) because JS executes them.
  */
-function stripCommentsAndStringsFromCode(src: string): string {
-  let out = '';
-  let i = 0;
+export function stripCommentsAndStringsFromCode(src: string): string {
   const n = src.length;
-  while (i < n) {
-    const c = src[i];
-    const c2 = src[i + 1];
-    if (c === '/' && c2 === '/') {
-      // A // comment ends at ANY ECMAScript LineTerminator (LF, CR, U+2028 LS, U+2029 PS) — the
-      // engine resumes executing code after one, so the scanner must stop consuming the comment
-      // there too; otherwise a separator hidden inside a comment lets a globalThis/Function()
-      // payload slip past the escape-pattern regexes (defense-in-depth with the compiler's
-      // allowlisting of values that reach generated comments).
-      while (i < n) {
-        const cc = src.charCodeAt(i);
-        // LF, CR, U+2028 (LS), U+2029 (PS) all end a // comment in JS — stop at any of them.
-        if (cc === 10 || cc === 13 || cc === 0x2028 || cc === 0x2029) break;
-        i++;
+  let i = 0;
+  let out = '';
+
+  const scanCode = (stopAtClosingBrace: boolean): void => {
+    let braceDepth = 0;
+    while (i < n) {
+      const c = src[i];
+      const c2 = src[i + 1];
+      if (stopAtClosingBrace) {
+        if (c === '{') {
+          braceDepth++;
+          out += c;
+          i++;
+          continue;
+        }
+        if (c === '}') {
+          if (braceDepth === 0) {
+            return;
+          }
+          braceDepth--;
+          out += c;
+          i++;
+          continue;
+        }
       }
-      continue;
-    }
-    if (c === '/' && c2 === '*') {
-      i += 2;
-      while (i < n - 1 && !(src[i] === '*' && src[i + 1] === '/')) i++;
-      i += 2;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === '`') {
-      const quote = c;
-      out += c + c;
+      if (c === '/' && c2 === '/') {
+        // A // comment ends at ANY ECMAScript LineTerminator (LF, CR, U+2028 LS, U+2029 PS) — the
+        // engine resumes executing code after one, so the scanner must stop consuming the comment
+        // there too; otherwise a separator hidden inside a comment lets a globalThis/Function()
+        // payload slip past the escape-pattern regexes (defense-in-depth with the compiler's
+        // allowlisting of values that reach generated comments).
+        while (i < n) {
+          const cc = src.charCodeAt(i);
+          // LF, CR, U+2028 (LS), U+2029 (PS) all end a // comment in JS — stop at any of them.
+          if (cc === 10 || cc === 13 || cc === 0x2028 || cc === 0x2029) break;
+          i++;
+        }
+        continue;
+      }
+      if (c === '/' && c2 === '*') {
+        i += 2;
+        while (i < n - 1 && !(src[i] === '*' && src[i + 1] === '/')) i++;
+        i += 2;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const quote = c;
+        out += c + c;
+        i++;
+        while (i < n) {
+          const cc = src[i];
+          if (cc === '\\') { i += 2; continue; }
+          i++;
+          if (cc === quote) break;
+        }
+        continue;
+      }
+      if (c === '`') {
+        scanTemplateLiteral();
+        continue;
+      }
+      out += c;
       i++;
-      while (i < n) {
-        const cc = src[i];
-        if (cc === '\\') { i += 2; continue; }
-        i++;
-        if (cc === quote) break;
-      }
-      continue;
     }
-    out += c;
+  };
+
+  const scanTemplateLiteral = (): void => {
+    out += '`';
     i++;
-  }
+    while (i < n) {
+      const cc = src[i];
+      if (cc === '\\') {
+        i += 2;
+        continue;
+      }
+      if (cc === '`') {
+        out += '`';
+        i++;
+        return;
+      }
+      if (cc === '$' && src[i + 1] === '{') {
+        out += '${';
+        i += 2;
+        scanCode(true);
+        if (i < n && src[i] === '}') {
+          out += '}';
+          i++;
+        }
+        continue;
+      }
+      i++;
+    }
+  };
+
+  scanCode(false);
   return out;
 }
 
@@ -935,6 +992,7 @@ export class OAIYRuntime {
   // handlers. See buildModulesProxy().
   private modulesProxy?: Record<string, Record<string, (...args: any[]) => any>>;
   private readonly moduleMethodProxies = new Map<string, Record<string, (...args: any[]) => any>>();
+  private readonly moduleMethodWrappers = new Map<string, (...args: any[]) => any>();
 
   /**
    * Whether to run hardened (package-context) workflows in a Web Worker.
@@ -1141,6 +1199,14 @@ export class OAIYRuntime {
    * module broker when `currentPackageId` is set (hardened/untrusted runs).
    */
   private static readonly REQUIRED_PERMISSION_BY_TAURI_COMMAND: Readonly<Record<string, string>> = {
+    'get_media_url': 'filesystem:read',
+    'get_video_info': 'filesystem:read',
+    'extract_video_frames': 'filesystem:read',
+    'extract_video_frames_batch': 'filesystem:read',
+    'resize_image': 'filesystem:read',
+    'cleanup_temp_dir': 'filesystem',
+    'http_request': 'network',
+    'get_service_port': 'service:start',
     'plugin:oaiy-filesystem|read_file': 'filesystem:read',
     'plugin:oaiy-filesystem|list_folder': 'filesystem:read',
     'plugin:oaiy-filesystem|read_chunk_content': 'filesystem:read',
@@ -1253,20 +1319,57 @@ export class OAIYRuntime {
             return Promise.reject(new Error(message));
           }
         }
-        // Intercept browser navigation & HTTP impersonation commands so they cannot
+        // Intercept browser navigation, session proxy, & HTTP impersonation commands so they cannot
         // bypass local-network consent / SSRF protection by talking to the browser
         // plugin directly.
         if (
           cmd === 'plugin:oaiy-browser|browser_v2_http_request' ||
           cmd === 'plugin:oaiy-browser|browser_v2_goto' ||
           cmd === 'plugin:oaiy-browser|browser_v2_navigate' ||
-          cmd === 'plugin:oaiy-browser|webview_navigate'
+          cmd === 'plugin:oaiy-browser|browser_v2_create_session' ||
+          cmd === 'plugin:oaiy-browser|webview_navigate' ||
+          cmd === 'plugin:oaiy-browser|webview_create'
         ) {
           const raw = (args ?? {}) as Record<string, unknown>;
           const req =
             raw.request && typeof raw.request === 'object' && !Array.isArray(raw.request)
               ? (raw.request as Record<string, unknown>)
               : raw;
+          const cfg =
+            raw.config && typeof raw.config === 'object' && !Array.isArray(raw.config)
+              ? (raw.config as Record<string, unknown>)
+              : null;
+          const reqOpts =
+            req.options && typeof req.options === 'object' && !Array.isArray(req.options)
+              ? (req.options as Record<string, unknown>)
+              : null;
+          const rawOpts =
+            raw.options && typeof raw.options === 'object' && !Array.isArray(raw.options)
+              ? (raw.options as Record<string, unknown>)
+              : null;
+
+          const toProxyUrl = (val: unknown): string | null => {
+            if (typeof val === 'string' && val.trim()) {
+              const s = val.trim();
+              return /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`;
+            }
+            if (val && typeof val === 'object' && !Array.isArray(val)) {
+              const p = val as Record<string, unknown>;
+              if (p.type === 'none') return null;
+              if (typeof p.url === 'string' && p.url.trim()) return toProxyUrl(p.url);
+              if (typeof p.server === 'string' && p.server.trim()) return toProxyUrl(p.server);
+              if (typeof p.host === 'string' && p.host.trim()) {
+                const scheme = p.type === 'socks5' ? 'socks5' : 'http';
+                const rawHost = p.host.trim();
+                const host = rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost;
+                const port = p.port !== undefined && p.port !== null && String(p.port).trim() ? `:${String(p.port).trim()}` : '';
+                return `${scheme}://${host}${port}`;
+              }
+            }
+            return null;
+          };
+
+          const urlsToCheck: Array<{ url: string; purpose: string }> = [];
           const targetUrl =
             typeof req.url === 'string'
               ? req.url
@@ -1274,9 +1377,21 @@ export class OAIYRuntime {
                 ? req.uri
                 : '';
           if (targetUrl) {
-            return this.ensureLocalNetworkAllowed(targetUrl, `Browser request (${cmd})`).then(
-              () => inner(cmd, args) as Promise<T>,
-            );
+            urlsToCheck.push({ url: targetUrl, purpose: `Browser request (${cmd})` });
+          }
+          for (const proxyCandidate of [raw.proxy, req.proxy, cfg?.proxy, reqOpts?.proxy, rawOpts?.proxy]) {
+            const proxyUrl = toProxyUrl(proxyCandidate);
+            if (proxyUrl) {
+              urlsToCheck.push({ url: proxyUrl, purpose: `Browser proxy (${cmd})` });
+            }
+          }
+          if (urlsToCheck.length > 0) {
+            return (async () => {
+              for (const item of urlsToCheck) {
+                await this.ensureLocalNetworkAllowed(item.url, item.purpose);
+              }
+              return inner(cmd, args) as Promise<T>;
+            })();
           }
         }
         // Never allow raw `http_request` calls to bypass local-network permission /
@@ -1333,9 +1448,8 @@ export class OAIYRuntime {
       return true;
     }
     if (this.packagePermissions.has(permission)) return true;
-    // `filesystem` implies `filesystem:read`; `network` implies `network:local`.
+    // `filesystem` implies `filesystem:read`. (`network` does NOT imply `network:local`.)
     if (permission === 'filesystem:read' && this.packagePermissions.has('filesystem')) return true;
-    if (permission === 'network:local' && this.packagePermissions.has('network')) return true;
     return false;
   }
 
@@ -1554,6 +1668,12 @@ export class OAIYRuntime {
         url,
         hostPort,
         purpose,
+        ...(this.currentPackageId
+          ? {
+              packageId: this.currentPackageId,
+              hasLocalNetworkPermission: this.hasPackagePermission('network:local'),
+            }
+          : {}),
       });
 
       if (!response.allowed) {
@@ -1577,6 +1697,12 @@ export class OAIYRuntime {
     extra: { bodyBase64?: string; signal?: AbortSignal } = {}
   ): Promise<{ status: number; headers: Record<string, string>; body: string; url?: string; bodyIsBase64?: boolean }> {
     const isLocalNetwork = this.isLocalNetworkUrl(url);
+
+    if (!isLocalNetwork && this.currentPackageId && !this.hasPackagePermission('network')) {
+      throw new Error(
+        `Package '${this.currentPackageId}' lacks required permission 'network' for ${this.getHostPort(url)}`,
+      );
+    }
 
     await this.ensureLocalNetworkAllowed(url, 'HTTP request from workflow');
 
@@ -1863,6 +1989,29 @@ export class OAIYRuntime {
    * sibling's ctx was built still resolves. The inner method-proxies are cached so
    * a given method's function reference is stable across reads (identity-safe).
    */
+  /**
+   * Enforce the same fail-closed classification + permission check as `host.call`
+   * for cross-module calls via `ctx.modules` and `ctx.callModule`.
+   */
+  private checkModuleKindPermission(kind: string): void {
+    if (!this.currentPackageId) return;
+    const isClassified =
+      kind in REQUIRED_PERMISSIONS_BY_KIND ||
+      NO_PERMISSION_REQUIRED_KINDS.has(kind);
+    if (!isClassified) {
+      throw new Error(
+        `Refusing to call ${kind}: method is not permission-declared. ` +
+          `Add an entry to REQUIRED_PERMISSIONS_BY_KIND or NO_PERMISSION_REQUIRED_KINDS in runtime.ts.`,
+      );
+    }
+    const required = REQUIRED_PERMISSIONS_BY_KIND[kind];
+    if (required && !this.hasPackagePermission(required)) {
+      throw new Error(
+        `Refusing to call ${kind}: the active package does not have the '${required}' permission.`,
+      );
+    }
+  }
+
   private buildModulesProxy(): Record<string, Record<string, (...args: any[]) => any>> {
     if (!this.modulesProxy) {
       this.modulesProxy = new Proxy(
@@ -1875,8 +2024,22 @@ export class OAIYRuntime {
               methodProxy = new Proxy({} as Record<string, (...args: any[]) => any>, {
                 get: (_t, methodName) => {
                   if (typeof methodName !== 'string') return undefined;
-                  const handler = this.moduleFunctionHandlers[`${modName}.${methodName}`];
-                  if (handler) return handler;
+                  const kind = `${modName}.${methodName}`;
+                  if (kind in this.moduleFunctionHandlers) {
+                    let wrapped = this.moduleMethodWrappers.get(kind);
+                    if (!wrapped) {
+                      wrapped = (...args: unknown[]) => {
+                        this.checkModuleKindPermission(kind);
+                        const current = this.moduleFunctionHandlers[kind];
+                        if (!current) {
+                          throw new Error(`ctx.modules: module method not registered: ${kind}`);
+                        }
+                        return current(...args);
+                      };
+                      this.moduleMethodWrappers.set(kind, wrapped);
+                    }
+                    return wrapped;
+                  }
                   // Unknown method: return a thunk that throws a CLEAR error when called
                   // (vs a cryptic "undefined is not a function"). Feature-detection should
                   // use `'method' in ctx.modules.X` (the has-trap below), not typeof.
@@ -1945,11 +2108,60 @@ export class OAIYRuntime {
     return this.availableFlows.find(f => f.id === flowId);
   }
 
+  /**
+   * Pre-compile / pre-run `code:execute` gate: when running under a package or
+   * untrusted context that lacks `code:execute`, reject any graph (or reachable
+   * subflow/macro) containing a `logic_block` or a `condition` node in expression
+   * mode BEFORE compiling or executing the generated script.
+   */
+  private assertCodeExecuteAllowedForGraph(graph: WorkflowGraph): void {
+    if (!this.currentPackageId || this.hasPackagePermission('code:execute')) {
+      return;
+    }
+    const seenFlows = new Set<string>();
+    const queue: Array<WorkflowGraph | undefined> = [graph];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || !Array.isArray(current.nodes)) continue;
+      for (const node of current.nodes) {
+        if (!node) continue;
+        if (node.type === 'logic_block') {
+          this.onNodeStatus?.(node.id, 'error');
+          throw new Error(
+            `Refusing to run workflow: package '${this.currentPackageId}' lacks required permission 'code:execute' for logic_block node '${node.id}'`,
+          );
+        }
+        if (node.type === 'condition') {
+          const d = (node.data ?? {}) as Record<string, unknown>;
+          const hasExpr =
+            (typeof d.expression === 'string' && d.expression.trim().length > 0) ||
+            (typeof d.expr === 'string' && d.expr.trim().length > 0);
+          if (hasExpr) {
+            this.onNodeStatus?.(node.id, 'error');
+            throw new Error(
+              `Refusing to run workflow: package '${this.currentPackageId}' lacks required permission 'code:execute' for condition expression in node '${node.id}'`,
+            );
+          }
+        }
+        const data = (node.data ?? {}) as Record<string, unknown>;
+        for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+          const ref = data[field];
+          if (typeof ref !== 'string' || !ref || seenFlows.has(ref)) continue;
+          seenFlows.add(ref);
+          const target = this.findFlowOrMacro(ref);
+          if (target?.graph) queue.push(target.graph);
+        }
+      }
+    }
+  }
+
   private async executeSubflow(flowId: string, inputs: Record<string, unknown>): Promise<unknown> {
     const flow = this.findFlowOrMacro(flowId);
     if (!flow) {
       throw new Error(`Subflow not found: ${flowId}`);
     }
+
+    this.assertCodeExecuteAllowedForGraph(flow.graph);
 
     const compiler = new OAIYCompiler();
     compiler.setAvailableFlows(this.availableFlows);
@@ -2053,6 +2265,8 @@ export class OAIYRuntime {
         return runtimeSelf.currentFlowId ?? undefined;
       },
       hasPermission: (perm: string) => this.hasPackagePermission(perm),
+      ensureLocalNetworkAllowed: (url: string, purpose?: string) =>
+        this.ensureLocalNetworkAllowed(url, purpose ?? 'Module local network access'),
       formatPath: (p: string) =>
         formatPathForLog(p, (this.projectSettings.logPathPolicy ?? 'tilde') as LogPathPolicy),
       // Modules call into Tauri exclusively through this filtered broker.
@@ -2067,10 +2281,12 @@ export class OAIYRuntime {
       // cross-module calls are safe under parallel execution. See buildModulesProxy.
       modules: this.buildModulesProxy(),
       callModule: (modName: string, methodName: string, ...args: unknown[]) => {
-        const handler = this.moduleFunctionHandlers[`${modName}.${methodName}`];
+        const kind = `${modName}.${methodName}`;
+        const handler = this.moduleFunctionHandlers[kind];
         if (!handler) {
-          throw new Error(`callModule: module method not registered: ${modName}.${methodName}`);
+          throw new Error(`callModule: module method not registered: ${kind}`);
         }
+        this.checkModuleKindPermission(kind);
         return handler(...args);
       },
       // Per-job collection store for the Database module. Routes through the host
@@ -2702,6 +2918,8 @@ ${WORKFLOW_TRAMPOLINE}`;
     if (availableFlows) {
       this.availableFlows = availableFlows;
     }
+
+    this.assertCodeExecuteAllowedForGraph(graph);
 
     const compiler = new OAIYCompiler();
     if (availableFlows) compiler.setAvailableFlows(availableFlows);

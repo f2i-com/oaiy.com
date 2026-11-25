@@ -35,6 +35,34 @@ pub enum Value {
     Mark,
 }
 
+impl Drop for Value {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        match self {
+            Value::List(xs) | Value::Tuple(xs) => work.append(xs),
+            Value::Dict(pairs) => {
+                for (k, v) in std::mem::take(pairs) {
+                    work.push(k);
+                    work.push(v);
+                }
+            }
+            _ => return,
+        }
+        while let Some(mut cur) = work.pop() {
+            match &mut cur {
+                Value::List(xs) | Value::Tuple(xs) => work.append(xs),
+                Value::Dict(pairs) => {
+                    for (k, v) in std::mem::take(pairs) {
+                        work.push(k);
+                        work.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Value {
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
@@ -319,10 +347,17 @@ fn storage_dtype(name: &str) -> Result<DType> {
     })
 }
 
+fn check_depth(depth: usize) -> Result<usize> {
+    if depth > MAX_PICKLE_DEPTH {
+        return Err(bad("pickle nesting too deep"));
+    }
+    Ok(depth)
+}
+
 /// Interpret a pickle (protocols 2 to 4) with only data-building operations.
 fn unpickle(b: &[u8]) -> Result<Value> {
-    let mut stack: Vec<Value> = Vec::new();
-    let mut memo: HashMap<u32, Value> = HashMap::new();
+    let mut stack: Vec<(Value, usize)> = Vec::new();
+    let mut memo: HashMap<u32, (Value, usize)> = HashMap::new();
     let mut budget = MAX_PICKLE_NODES;
     let mut i: usize = 0;
     let take = |i: &mut usize, n: usize| -> Result<&[u8]> {
@@ -331,9 +366,9 @@ fn unpickle(b: &[u8]) -> Result<Value> {
         *i = end;
         Ok(s)
     };
-    let pop = |stack: &mut Vec<Value>| stack.pop().ok_or_else(|| bad("empty stack"));
-    let pop_mark = |stack: &mut Vec<Value>| -> Result<Vec<Value>> {
-        let at = stack.iter().rposition(|v| matches!(v, Value::Mark)).ok_or_else(|| bad("no mark"))?;
+    let pop = |stack: &mut Vec<(Value, usize)>| stack.pop().ok_or_else(|| bad("empty stack"));
+    let pop_mark = |stack: &mut Vec<(Value, usize)>| -> Result<Vec<(Value, usize)>> {
+        let at = stack.iter().rposition(|(v, _)| matches!(v, Value::Mark)).ok_or_else(|| bad("no mark"))?;
         let items = stack.split_off(at + 1);
         stack.pop();
         Ok(items)
@@ -345,77 +380,130 @@ fn unpickle(b: &[u8]) -> Result<Value> {
         match op {
             0x80 => { take(&mut i, 1)?; } // PROTO
             0x95 => { take(&mut i, 8)?; } // FRAME
-            b'.' => return pop(&mut stack),
-            b'(' => stack.push(Value::Mark),
-            b'}' => stack.push(Value::Dict(Vec::new())),
-            b']' => stack.push(Value::List(Vec::new())),
-            b')' => stack.push(Value::Tuple(Vec::new())),
-            b'N' => stack.push(Value::None),
-            0x88 => stack.push(Value::Bool(true)),
-            0x89 => stack.push(Value::Bool(false)),
-            b'K' => { let v = take(&mut i, 1)?[0]; stack.push(Value::Int(v as i64)); }
-            b'M' => { let v = take(&mut i, 2)?; stack.push(Value::Int(u16::from_le_bytes([v[0], v[1]]) as i64)); }
-            b'J' => { let v = take(&mut i, 4)?; stack.push(Value::Int(i32::from_le_bytes(v.try_into().unwrap()) as i64)); }
+            b'.' => return Ok(pop(&mut stack)?.0),
+            b'(' => stack.push((Value::Mark, 0)),
+            b'}' => stack.push((Value::Dict(Vec::new()), 0)),
+            b']' => stack.push((Value::List(Vec::new()), 0)),
+            b')' => stack.push((Value::Tuple(Vec::new()), 0)),
+            b'N' => stack.push((Value::None, 0)),
+            0x88 => stack.push((Value::Bool(true), 0)),
+            0x89 => stack.push((Value::Bool(false), 0)),
+            b'K' => { let v = take(&mut i, 1)?[0]; stack.push((Value::Int(v as i64), 0)); }
+            b'M' => { let v = take(&mut i, 2)?; stack.push((Value::Int(u16::from_le_bytes([v[0], v[1]]) as i64), 0)); }
+            b'J' => { let v = take(&mut i, 4)?; stack.push((Value::Int(i32::from_le_bytes(v.try_into().unwrap()) as i64), 0)); }
             0x8a => {
                 let n = take(&mut i, 1)?[0] as usize;
                 let v = take(&mut i, n)?;
                 if n > 8 { return Err(bad("an integer wider than 64 bits")); }
                 let mut w = [if v.last().is_some_and(|x| x & 0x80 != 0) { 0xff } else { 0 }; 8];
                 w[..n].copy_from_slice(v);
-                stack.push(Value::Int(i64::from_le_bytes(w)));
+                stack.push((Value::Int(i64::from_le_bytes(w)), 0));
             }
-            b'G' => { let v = take(&mut i, 8)?; stack.push(Value::Float(f64::from_be_bytes(v.try_into().unwrap()))); }
+            b'G' => { let v = take(&mut i, 8)?; stack.push((Value::Float(f64::from_be_bytes(v.try_into().unwrap())), 0)); }
             b'X' => {
                 let n = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()) as usize;
-                stack.push(Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()));
+                stack.push((Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()), 0));
             }
             0x8c => {
                 let n = take(&mut i, 1)?[0] as usize;
-                stack.push(Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()));
+                stack.push((Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()), 0));
             }
             b'q' => {
                 let k = take(&mut i, 1)?[0] as u32;
-                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, clone_budgeted(top, &mut budget)?);
+                let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
             }
             b'r' => {
                 let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, clone_budgeted(top, &mut budget)?);
+                let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
             }
             0x94 => {
                 let k = memo.len() as u32;
-                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, clone_budgeted(top, &mut budget)?);
+                let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
             }
             b'h' => {
                 let k = take(&mut i, 1)?[0] as u32;
-                let val = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
-                stack.push(clone_budgeted(val, &mut budget)?);
+                let (val, depth) = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
+                stack.push((clone_budgeted(val, &mut budget)?, *depth));
             }
             b'j' => {
                 let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
-                let val = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
-                stack.push(clone_budgeted(val, &mut budget)?);
+                let (val, depth) = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
+                stack.push((clone_budgeted(val, &mut budget)?, *depth));
             }
-            b't' => { let items = pop_mark(&mut stack)?; stack.push(Value::Tuple(items)); }
-            0x85 => { let a = pop(&mut stack)?; stack.push(Value::Tuple(vec![a])); }
-            0x86 => { let b2 = pop(&mut stack)?; let a = pop(&mut stack)?; stack.push(Value::Tuple(vec![a, b2])); }
-            0x87 => { let c = pop(&mut stack)?; let b2 = pop(&mut stack)?; let a = pop(&mut stack)?; stack.push(Value::Tuple(vec![a, b2, c])); }
-            b'a' => { let v = pop(&mut stack)?; match stack.last_mut() { Some(Value::List(l)) => l.push(v), _ => return Err(bad("APPEND to a non-list")) } }
-            b'e' => { let items = pop_mark(&mut stack)?; match stack.last_mut() { Some(Value::List(l)) => l.extend(items), _ => return Err(bad("APPENDS to a non-list")) } }
+            b't' => {
+                let items = pop_mark(&mut stack)?;
+                let depth = match items.iter().map(|(_, d)| *d).max() {
+                    Some(m) => check_depth(m.saturating_add(1))?,
+                    None => 0,
+                };
+                stack.push((Value::Tuple(items.into_iter().map(|(v, _)| v).collect()), depth));
+            }
+            0x85 => {
+                let (a, da) = pop(&mut stack)?;
+                let depth = check_depth(da.saturating_add(1))?;
+                stack.push((Value::Tuple(vec![a]), depth));
+            }
+            0x86 => {
+                let (b2, db) = pop(&mut stack)?;
+                let (a, da) = pop(&mut stack)?;
+                let depth = check_depth(da.max(db).saturating_add(1))?;
+                stack.push((Value::Tuple(vec![a, b2]), depth));
+            }
+            0x87 => {
+                let (c, dc) = pop(&mut stack)?;
+                let (b2, db) = pop(&mut stack)?;
+                let (a, da) = pop(&mut stack)?;
+                let depth = check_depth(da.max(db).max(dc).saturating_add(1))?;
+                stack.push((Value::Tuple(vec![a, b2, c]), depth));
+            }
+            b'a' => {
+                let (v, dv) = pop(&mut stack)?;
+                match stack.last_mut() {
+                    Some((Value::List(l), dl)) => {
+                        *dl = check_depth((*dl).max(dv.saturating_add(1)))?;
+                        l.push(v);
+                    }
+                    _ => return Err(bad("APPEND to a non-list")),
+                }
+            }
+            b'e' => {
+                let items = pop_mark(&mut stack)?;
+                let max_d = items.iter().map(|(_, d)| *d).max();
+                match stack.last_mut() {
+                    Some((Value::List(l), dl)) => {
+                        if let Some(m) = max_d {
+                            *dl = check_depth((*dl).max(m.saturating_add(1)))?;
+                        }
+                        l.extend(items.into_iter().map(|(v, _)| v));
+                    }
+                    _ => return Err(bad("APPENDS to a non-list")),
+                }
+            }
             b's' => {
-                let v = pop(&mut stack)?;
-                let k = pop(&mut stack)?;
-                match stack.last_mut() { Some(Value::Dict(d)) => d.push((k, v)), _ => return Err(bad("SETITEM on a non-dict")) }
+                let (v, dv) = pop(&mut stack)?;
+                let (k, dk) = pop(&mut stack)?;
+                match stack.last_mut() {
+                    Some((Value::Dict(d), dd)) => {
+                        *dd = check_depth((*dd).max(dk.max(dv).saturating_add(1)))?;
+                        d.push((k, v));
+                    }
+                    _ => return Err(bad("SETITEM on a non-dict")),
+                }
             }
             b'u' => {
                 let items = pop_mark(&mut stack)?;
                 if items.len() % 2 != 0 {
                     return Err(bad("SETITEMS with odd item count"));
                 }
-                let Some(Value::Dict(d)) = stack.last_mut() else { return Err(bad("SETITEMS on a non-dict")) };
-                let mut it = items.into_iter();
+                let max_d = items.iter().map(|(_, d)| *d).max();
+                let Some((Value::Dict(d), dd)) = stack.last_mut() else { return Err(bad("SETITEMS on a non-dict")) };
+                if let Some(m) = max_d {
+                    *dd = check_depth((*dd).max(m.saturating_add(1)))?;
+                }
+                let mut it = items.into_iter().map(|(v, _)| v);
                 while let (Some(k), Some(v)) = (it.next(), it.next()) {
                     d.push((k, v));
                 }
@@ -429,31 +517,31 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                 };
                 let module = line(&mut i)?;
                 let name = line(&mut i)?;
-                stack.push(global(&module, &name)?);
+                stack.push((global(&module, &name)?, 0));
             }
             0x93 => {
-                let name = pop(&mut stack)?;
-                let module = pop(&mut stack)?;
-                let (Value::Str(m), Value::Str(n)) = (module, name) else { return Err(bad("bad STACK_GLOBAL")) };
-                stack.push(global(&m, &n)?);
+                let (name, _) = pop(&mut stack)?;
+                let (module, _) = pop(&mut stack)?;
+                let (Value::Str(m), Value::Str(n)) = (&module, &name) else { return Err(bad("bad STACK_GLOBAL")) };
+                stack.push((global(m, n)?, 0));
             }
             b'Q' => {
                 // A persistent id: ('storage', storage type, key, location, numel).
-                let pid = pop(&mut stack)?;
-                let Value::Tuple(t) = pid else { return Err(bad("bad persistent id")) };
+                let (pid, _) = pop(&mut stack)?;
+                let Value::Tuple(t) = &pid else { return Err(bad("bad persistent id")) };
                 match t.as_slice() {
                     [Value::Str(kind), Value::Global(storage), Value::Str(key), ..] if kind == "storage" => {
-                        stack.push(Value::Storage { key: key.clone(), dtype: storage_dtype(storage)? });
+                        stack.push((Value::Storage { key: key.clone(), dtype: storage_dtype(storage)? }, 0));
                     }
                     _ => return Err(bad("unsupported persistent id")),
                 }
             }
             b'R' => {
-                let args = pop(&mut stack)?;
-                let f = pop(&mut stack)?;
-                let Value::Global(f) = f else { return Err(bad("REDUCE on a non-global")) };
-                let Value::Tuple(args) = args else { return Err(bad("REDUCE without a tuple")) };
-                stack.push(match f.as_str() {
+                let (args, _) = pop(&mut stack)?;
+                let (f, _) = pop(&mut stack)?;
+                let Value::Global(f) = &f else { return Err(bad("REDUCE on a non-global")) };
+                let Value::Tuple(args) = &args else { return Err(bad("REDUCE without a tuple")) };
+                let out = match f.as_str() {
                     "collections.OrderedDict" => Value::Dict(Vec::new()),
                     "torch._utils._rebuild_tensor_v2" => match args.as_slice() {
                         [Value::Storage { key, dtype }, Value::Int(offset), shape, stride, ..] => {
@@ -484,7 +572,8 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                         _ => return Err(bad("bad _rebuild_tensor_v2 arguments")),
                     },
                     other => return Err(bad(format!("{other} is not callable here"))),
-                });
+                };
+                stack.push((out, 0));
             }
             // BUILD: the state set on an OrderedDict or a tensor (none that matters here).
             b'b' => { pop(&mut stack)?; }
@@ -529,6 +618,33 @@ mod tests {
         mismatch.extend_from_slice(b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpuK\x02tQ");
         mismatch.extend_from_slice(b"K\x00K\x01K\x02\x86K\x01\x85\x89tR.");
         assert!(unpickle(&mismatch).is_err(), "shape/stride rank mismatch must fail");
+    }
+
+    #[test]
+    fn pickle_rejects_deep_non_memo_nesting_without_stack_overflow() {
+        // 1500 chained TUPLE1 (0x85) opcodes without any memo ops must fail cleanly via depth cap, never stack overflow.
+        let mut deep_tuple = vec![0x80, 2, b'N'];
+        deep_tuple.resize(deep_tuple.len() + 1500, 0x85);
+        deep_tuple.push(b'.');
+        let err = unpickle(&deep_tuple).expect_err("deep TUPLE1 chain must fail");
+        assert!(err.to_string().contains("too deep"), "{err}");
+
+        // Deep list nesting via APPEND (b'a') without memo ops must also fail cleanly.
+        let mut deep_list = vec![0x80, 2];
+        for _ in 0..=MAX_PICKLE_DEPTH + 10 {
+            deep_list.push(b']');
+        }
+        for _ in 0..=MAX_PICKLE_DEPTH + 9 {
+            deep_list.push(b'a');
+        }
+        deep_list.push(b'.');
+        assert!(unpickle(&deep_list).is_err(), "deep list APPEND chain must fail");
+
+        // Exact boundary MAX_PICKLE_DEPTH succeeds and drops iteratively.
+        let mut at_limit = vec![0x80, 2, b'N'];
+        at_limit.resize(at_limit.len() + MAX_PICKLE_DEPTH, 0x85);
+        at_limit.push(b'.');
+        assert!(unpickle(&at_limit).is_ok(), "nesting at MAX_PICKLE_DEPTH should succeed");
     }
 
     #[test]

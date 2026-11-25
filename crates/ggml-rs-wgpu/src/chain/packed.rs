@@ -101,12 +101,14 @@ impl Recorder<'_> {
         let d = self.gpu().dummy().clone();
         let drw = self.gpu().dummy_rw().clone();
         let imap = c.imap.as_ref().map_or(&d, buffer).clone();
+        let gy = (rows as u32).min(65535);
+        let gz = (rows as u32).div_ceil(65535).max(1);
         match up {
             Some(u) => {
                 assert!(x.len >= rows * k && u.len >= rows * k, "chain: a SwiGLU's {rows} rows of {k}");
-                self.dispatch_wide("exl3-pre-swiglu", crate::exl3::chain_shader("pre-swiglu"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), buffer(u), &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32, 1, 0, 1, 0], ((k / 128) as u32, rows as u32, 1));
+                self.dispatch_wide("exl3-pre-swiglu", crate::exl3::chain_shader("pre-swiglu"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), buffer(u), &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32, 1, 0, 1, 0, 0, rows as u32], ((k / 128) as u32, gy, gz));
             }
-            None => self.dispatch_wide("exl3-pre", crate::exl3::chain_shader("pre"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32], ((k / 128) as u32, rows as u32, 1)),
+            None => self.dispatch_wide("exl3-pre", crate::exl3::chain_shader("pre"), [buffer(x), buffer(&c.suh), &imap, buffer(&jobs), &d, &d, buffer(&xh), &drw], &[k as u32, c.imap.is_none() as u32, 0, 0, 0, 0, 0, rows as u32], ((k / 128) as u32, gy, gz)),
         }
         let ntiles = (n / 16) as u32;
         let grid = |z: usize| (ntiles.min(65535), ntiles.div_ceil(65535), z as u32 * splits);
@@ -161,7 +163,7 @@ impl Recorder<'_> {
         let post = crate::exl3::chain_shader("post");
         let post_out = if c.omap.is_some() { buffer(&yt) } else { buffer(y) };
         let parts = if coop { coop_splits as u32 } else { splits };
-        self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, parts], ((n / 128) as u32, rows as u32, 1));
+        self.dispatch_wide("exl3-post", post, [buffer(&part), buffer(&c.svh), buffer(&jobs), &d, &d, &d, post_out, &drw], &[n as u32, parts, 0, 0, 0, 0, 0, rows as u32], ((n / 128) as u32, gy, gz));
         if let Some(omap) = &c.omap {
             let gather = crate::exl3::chain_shader("gather");
             self.dispatch_wide("exl3-gather", gather, [buffer(&yt), buffer(omap), buffer(&jobs), &d, &d, &d, buffer(y), &drw], &[n as u32], ((n as u32).div_ceil(256), rows as u32, 1));

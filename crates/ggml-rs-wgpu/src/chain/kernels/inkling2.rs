@@ -1155,6 +1155,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         workgroupBarrier();
     }
     let q_fac = min(1.0, qk_clip / (sqrt(part[0]) + 1e-6)) * tau;
+    workgroupBarrier();
     for (var d = li; d < head_dim; d += 128u) { q_loc[d] *= q_fac; }
 
     var rsq = 0.0;
@@ -2115,6 +2116,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         workgroupBarrier();
     }
     let q_fac = min(1.0, qk_clip / (sqrt(part[0]) + 1e-6)) * tau;
+    workgroupBarrier();
     for (var d = li; d < head_dim; d += 128u) { q_loc[d] *= q_fac; }
 
     var rsq = 0.0;

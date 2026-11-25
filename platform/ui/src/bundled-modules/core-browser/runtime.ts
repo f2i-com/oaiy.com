@@ -1157,15 +1157,36 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   const upSince = Number.isFinite(startedAtMs) ? startedAtMs : Date.now();
 
   // Ask OAIY Desktop to start it if it isn't already (returns immediately —
-  // the readiness poll below is what actually gates us).
-  try {
-    await companionFetchJson(
-      `${desktopApi()}/api/services/ensure-by-port`,
-      { method: 'POST', headers: desktopAuth(), body: JSON.stringify({ port }) },
-      4000
-    );
-  } catch {
-    // Non-fatal: it may already be running, or the start call lagged.
+  // the readiness poll below is what actually gates us). Route through the
+  // brokered `ensure_service_ready_by_port` Tauri command when available so
+  // `service:start` permission gating is enforced uniformly; never fall back
+  // to raw fetch on permission denial.
+  const canStartService = !ctx.currentPackageId || Boolean(ctx.hasPermission?.('service:start'));
+  if (canStartService) {
+    let ensuredViaBroker = false;
+    if (ctx.tauri) {
+      try {
+        const res = await ctx.tauri.invoke<{ success?: boolean } | null>('ensure_service_ready_by_port', { port });
+        if (res != null) ensuredViaBroker = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/lacks required permission|not have the .* permission|permission denied/i.test(msg)) {
+          throw err;
+        }
+        // Non-fatal: it may already be running, or the start call lagged.
+      }
+    }
+    if (!ensuredViaBroker) {
+      try {
+        await companionFetchJson(
+          `${desktopApi()}/api/services/ensure-by-port`,
+          { method: 'POST', headers: desktopAuth(), body: JSON.stringify({ port }) },
+          4000
+        );
+      } catch {
+        // Non-fatal: it may already be running, or the start call lagged.
+      }
+    }
   }
 
   const base = `http://127.0.0.1:${port}`;
@@ -1243,6 +1264,18 @@ function browserServiceRefusesThisPage(): string {
  */
 const companionBrowser = {
   async createSession(config: BrowserSessionConfigV2): Promise<string> {
+    if (config.proxy && config.proxy.type !== 'none' && config.proxy.host) {
+      const scheme = config.proxy.type === 'socks5' ? 'socks5' : 'http';
+      const host = config.proxy.host.includes(':') && !config.proxy.host.startsWith('[')
+        ? `[${config.proxy.host}]`
+        : config.proxy.host;
+      const proxyUrl = `${scheme}://${host}${config.proxy.port ? `:${config.proxy.port}` : ''}`;
+      if (ctx.ensureLocalNetworkAllowed) {
+        await ctx.ensureLocalNetworkAllowed(proxyUrl, 'Browser proxy (companion createSession)');
+      } else if (isLocalNetworkUrl(proxyUrl) && ctx.currentPackageId && !ctx.hasPermission?.('network:local')) {
+        throw new Error('[Browser] Local network proxy requires network:local permission');
+      }
+    }
     try {
       const base = await resolveDesktopBrowserBase();
       const r = await companionFetchJson<{ sessionId?: string }>(
@@ -1260,6 +1293,11 @@ const companionBrowser = {
     }
   },
   async goto(sessionId: string, url: string, options: BrowserGotoOptions): Promise<BrowserNavigateResult> {
+    if (ctx.ensureLocalNetworkAllowed) {
+      await ctx.ensureLocalNetworkAllowed(url, 'Browser navigation (companion gotoV2)');
+    } else if (isLocalNetworkUrl(url) && ctx.currentPackageId && !ctx.hasPermission?.('network:local')) {
+      throw new Error('[Browser] Local network access requires network:local permission');
+    }
     const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ url?: string; title?: string; status?: number }>(
       `${base}/session/${sessionId}/goto`,

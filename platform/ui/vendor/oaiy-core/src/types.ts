@@ -964,6 +964,10 @@ export interface LocalNetworkPermissionRequest {
   nodeId?: string;
   /** Optional description of what the request is for */
   purpose?: string;
+  /** Active package ID (or untrusted flow sentinel) if this request originates from hardened mode */
+  packageId?: string;
+  /** Whether the active package was explicitly granted `network:local` */
+  hasLocalNetworkPermission?: boolean;
 }
 
 /**

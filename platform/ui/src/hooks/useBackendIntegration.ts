@@ -184,6 +184,9 @@ export function useBackendIntegration(
   };
 
   const forgetShare = () => {
+    if (share?.hash_edit) {
+      setFlowPassword(share.hash_edit, null);
+    }
     setShare(null);
     writeShareToStorage(null);
   };

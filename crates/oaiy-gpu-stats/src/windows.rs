@@ -163,7 +163,8 @@ fn dedicated(luid: LUID, segments: u32) -> Option<i64> {
         // SAFETY: a segment's statistics are answered in the union's SegmentInformation; its fields are plain integers.
         let info = unsafe { result.SegmentInformation };
         if info.Aperture == 0 {
-            *own.get_or_insert(0i64) += info.BytesResident.min(i64::MAX as u64) as i64;
+            let acc = own.get_or_insert(0i64);
+            *acc = acc.saturating_add(info.BytesResident.min(i64::MAX as u64) as i64);
         }
     }
     own

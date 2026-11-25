@@ -65,7 +65,14 @@ export function kindOfAddress(value: string): OutputKind | null {
   if (v.startsWith('data:audio/')) return 'audio';
   if (v.startsWith('data:model/gltf')) return 'model3d';
   const comfy = /\/view\?filename=([^&]+)/.exec(v);
-  const tail = comfy ? decodeURIComponent(comfy[1]) : v;
+  let tail = v;
+  if (comfy) {
+    try {
+      tail = decodeURIComponent(comfy[1]);
+    } catch {
+      tail = comfy[1];
+    }
+  }
   for (const [kind, re] of ENDINGS) if (re.test(tail)) return kind;
   return null;
 }

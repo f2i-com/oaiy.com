@@ -167,6 +167,14 @@ fn parse_opts(args: &[String], o: &mut Opts) -> Result<(), String> {
         match a {
             "-q" | "--quiet" => o.quiet = true,
             "--json" => o.json = true,
+            _ if a.starts_with("--json=") => {
+                let v = &a["--json=".len()..];
+                if v.is_empty() {
+                    return Err("--json= needs a file path".into());
+                }
+                o.json = true;
+                o.json_out = Some(v.to_string());
+            }
             "--raw" => o.raw = true,
             "--stats" => o.stats = true,
             // (the two the CUDA backend had: named, so a script written for it says why it stopped)
@@ -260,11 +268,17 @@ pub(crate) struct LlamaBackend {
     pub backend: Arc<dyn ggml_rs::Backend>,
 }
 
+fn gib_to_bytes(g: u64) -> Result<u64, String> {
+    g.checked_mul(1u64 << 30)
+        .ok_or_else(|| format!("--webgpu-gb: {g} GiB overflows u64 bytes"))
+}
+
 fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
     if o.webgpu {
         #[cfg(feature = "webgpu")]
         {
-            let b = ggml_rs_wgpu::WgpuBackend::new(o.webgpu_gb.map(|g| g << 30)).map_err(|e| format!("webgpu init: {e}"))?;
+            let budget = o.webgpu_gb.map(gib_to_bytes).transpose()?;
+            let b = ggml_rs_wgpu::WgpuBackend::new(budget).map_err(|e| format!("webgpu init: {e}"))?;
             if !o.quiet {
                 let a = b.adapter();
                 eprintln!("oaiy-llm: WebGPU on {} ({}, {}), weights up to {} GiB", a.name, a.backend, a.device_type, b.usage().1 >> 30);
@@ -564,24 +578,55 @@ fn cmd_chat(args: &[String]) -> i32 {
 /// streamed, CPU or CUDA), timed by the bench module, which also owns the
 /// JSON result schema.
 ///
-/// `--json` alone prints the schema JSON to stdout; `--json FILE` writes it
-/// to a file and keeps the human summary. `--json` takes no value in
-/// parse_opts, so the optional file is split out here: a non-option token
-/// right after `--json` becomes the file.
-fn cmd_bench(args: &[String]) -> i32 {
+fn looks_like_model(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".gguf") || check_gguf(path).is_ok()
+}
+
+/// Rewrites `bench`'s `--json FILE` shorthand to `--json-out FILE` only when
+/// `FILE` does not look like a GGUF model and another positional argument
+/// supplies the model, so `--json MODEL.gguf` never steals or overwrites a model.
+fn rewrite_bench_json_args(args: &[String]) -> Vec<String> {
+    let mut positional_indices = Vec::new();
+    let mut skip_next = false;
+    for (i, a) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        if !is_flag(a) && !a.starts_with("--json=") {
+            positional_indices.push(i);
+        }
+    }
     let mut rewritten: Vec<String> = Vec::with_capacity(args.len());
     for (i, a) in args.iter().enumerate() {
-        if a == "--json" && i + 1 < args.len() && !is_flag(&args[i + 1]) {
+        if a == "--json"
+            && i + 1 < args.len()
+            && !is_flag(&args[i + 1])
+            && !looks_like_model(&args[i + 1])
+            && positional_indices.iter().any(|&p| p != i + 1)
+        {
             rewritten.push("--json-out".to_string());
         } else {
             rewritten.push(a.clone());
         }
     }
+    rewritten
+}
+
+/// `--json` prints the schema JSON to stdout; `--json=FILE`, `--json-out FILE`,
+/// or `--json FILE` (when a separate model positional is given and `FILE` is
+/// not a GGUF model) writes it to a file and keeps the human summary.
+fn cmd_bench(args: &[String]) -> i32 {
+    let rewritten = rewrite_bench_json_args(args);
     let base = Opts {
         max_tokens: 64,
         ..opts_init()
     };
-    match parse_cmd(&rewritten, base, "oaiy-llm bench MODEL.gguf [-n N] [--budget N] [--cuda] [--json [FILE]]") {
+    match parse_cmd(&rewritten, base, "oaiy-llm bench MODEL.gguf [-n N] [--budget N] [--webgpu] [--json | --json=FILE | --json-out FILE]") {
         Ok(o) => bench::run(&o),
         Err(rc) => rc,
     }
@@ -604,8 +649,8 @@ fn cmd_info(args: &[String]) -> i32 {
     let arch = g.architecture().unwrap_or("unknown").to_string();
     let key = |k: &str| g.get_u64(&format!("{arch}.{k}")).ok();
     let name = g.get_str("general.name").unwrap_or("").to_string();
-    let params: u64 = g.tensors().iter().map(|t| t.numel()).sum();
-    let bytes: u64 = g.tensors().iter().map(|t| t.nbytes()).sum();
+    let params: u64 = g.tensors().iter().fold(0u64, |acc, t| acc.saturating_add(t.numel()));
+    let bytes: u64 = g.tensors().iter().fold(0u64, |acc, t| acc.saturating_add(t.nbytes()));
     let experts = key("expert_count").unwrap_or(0);
     let top_k = key("expert_used_count").unwrap_or(0);
     let templated = g.get_str("tokenizer.chat_template").is_ok();
@@ -614,7 +659,7 @@ fn cmd_info(args: &[String]) -> i32 {
     for t in g.tensors() {
         let k = format!("{:?}", t.dtype);
         match quant.iter_mut().find(|(n, _)| *n == k) {
-            Some((_, b)) => *b += t.nbytes(),
+            Some((_, b)) => *b = b.saturating_add(t.nbytes()),
             None => quant.push((k, t.nbytes())),
         }
     }
@@ -750,7 +795,7 @@ fn help() {
          \x20 --raw          plain continuation, no chat template (the default\n\
          \x20                for a GGUF without one)\n\
          \x20 --json         machine-readable output for info, tokenize and\n\
-         \x20                bench; `bench --json FILE` writes it to FILE\n\
+         \x20                bench; `--json=FILE` or `--json-out FILE` writes it to FILE\n\
          \x20 --trace-out F  on `run`, record the routed (layer, expert)\n\
          \x20                sequence per token as JSONL\n\
          \n\
@@ -794,4 +839,71 @@ fn run(args: &[String]) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&args));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ss(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn json_flag_does_not_steal_model_positional_and_supports_explicit_output() {
+        // `--json model.gguf` must keep model.gguf as the model positional.
+        let mut o = opts_init();
+        let rw = rewrite_bench_json_args(&ss(&["--json", "model.gguf"]));
+        parse_opts(&rw, &mut o).unwrap();
+        assert!(o.json);
+        assert_eq!(o.json_out, None);
+        assert_eq!(o.pos, vec!["model.gguf"]);
+
+        // `--json weights_no_ext` with no other positional must also keep it as the model.
+        let mut o_noext = opts_init();
+        let rw_noext = rewrite_bench_json_args(&ss(&["--json", "weights_no_ext"]));
+        parse_opts(&rw_noext, &mut o_noext).unwrap();
+        assert!(o_noext.json);
+        assert_eq!(o_noext.json_out, None);
+        assert_eq!(o_noext.pos, vec!["weights_no_ext"]);
+
+        // `model.gguf --json other.gguf` must never rewrite other.gguf into --json-out.
+        let mut o_gguf = opts_init();
+        let rw_gguf = rewrite_bench_json_args(&ss(&["model.gguf", "--json", "other.gguf"]));
+        parse_opts(&rw_gguf, &mut o_gguf).unwrap();
+        assert!(o_gguf.json);
+        assert_eq!(o_gguf.json_out, None);
+        assert_eq!(o_gguf.pos, vec!["model.gguf", "other.gguf"]);
+
+        // `model.gguf -n 4 --json bench.json` preserves legacy `--json FILE` output.
+        let mut o_legacy = opts_init();
+        let rw_legacy = rewrite_bench_json_args(&ss(&["model.gguf", "-n", "4", "--json", "bench.json"]));
+        parse_opts(&rw_legacy, &mut o_legacy).unwrap();
+        assert!(o_legacy.json);
+        assert_eq!(o_legacy.json_out.as_deref(), Some("bench.json"));
+        assert_eq!(o_legacy.pos, vec!["model.gguf"]);
+
+        let mut o2 = opts_init();
+        parse_opts(&ss(&["--json=out.json", "model.gguf"]), &mut o2).unwrap();
+        assert!(o2.json);
+        assert_eq!(o2.json_out.as_deref(), Some("out.json"));
+        assert_eq!(o2.pos, vec!["model.gguf"]);
+
+        let mut o3 = opts_init();
+        parse_opts(&ss(&["model.gguf", "--json-out", "out.json"]), &mut o3).unwrap();
+        assert!(o3.json);
+        assert_eq!(o3.json_out.as_deref(), Some("out.json"));
+        assert_eq!(o3.pos, vec!["model.gguf"]);
+
+        let mut o4 = opts_init();
+        assert!(parse_opts(&ss(&["--json=", "model.gguf"]), &mut o4).is_err());
+    }
+
+    #[test]
+    fn gib_to_bytes_checks_overflow() {
+        assert_eq!(gib_to_bytes(0).unwrap(), 0);
+        assert_eq!(gib_to_bytes(24).unwrap(), 24u64 << 30);
+        assert!(gib_to_bytes(1u64 << 34).is_err());
+        assert!(gib_to_bytes(u64::MAX).is_err());
+    }
 }

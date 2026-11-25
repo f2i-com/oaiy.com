@@ -217,7 +217,12 @@ impl<'a> Py<'a> {
         String::from_utf8(out).map_err(|e| e.to_string())
     }
 
-    fn value(&mut self) -> Result<Json, String> {
+    const MAX_DEPTH: usize = 64;
+
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth > Self::MAX_DEPTH {
+            return Err("LFM2 tool call nesting too deep".into());
+        }
         match self.peek().ok_or("a value missing in an LFM2 call")? {
             b'\'' | b'"' => Ok(Json::Str(self.string()?)),
             open @ (b'[' | b'(') => {
@@ -225,7 +230,7 @@ impl<'a> Py<'a> {
                 self.at += 1;
                 let mut items = Vec::new();
                 while self.peek() != Some(close) {
-                    items.push(self.value()?);
+                    items.push(self.value(depth + 1)?);
                     if self.peek() == Some(b',') {
                         self.at += 1;
                     } else {
@@ -239,12 +244,12 @@ impl<'a> Py<'a> {
                 self.at += 1;
                 let mut members = Vec::new();
                 while self.peek() != Some(b'}') {
-                    let key = match self.value()? {
+                    let key = match self.value(depth + 1)? {
                         Json::Str(s) => s,
                         other => other.to_json(),
                     };
                     self.eat(b':')?;
-                    members.push((key, self.value()?));
+                    members.push((key, self.value(depth + 1)?));
                     if self.peek() == Some(b',') {
                         self.at += 1;
                     } else {
@@ -285,7 +290,7 @@ impl<'a> Py<'a> {
         while self.peek() != Some(b')') {
             let key = self.name()?;
             self.eat(b'=')?;
-            args.push((key, self.value()?));
+            args.push((key, self.value(0)?));
             if self.peek() == Some(b',') {
                 self.at += 1;
             } else {
@@ -356,11 +361,7 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
         (Some(_), None) => true,
         _ => false,
     };
-    match normalize_in(text, tools, false) {
-        Ok(out) => Ok(out),
-        Err(_) if has_implicit_thought => normalize_in(text, tools, true),
-        Err(e) => Err(e),
-    }
+    normalize_in(text, tools, has_implicit_thought)
 }
 
 /// [`normalize`], starting inside a `<think>` block when `started_in_thought` is true so

@@ -138,6 +138,43 @@ fn a_call_written_by_the_template_reads_back() {
     );
 }
 
+/// A syntactically valid declared tool call mentioned inside an implicit `<think>` block (opened by the prompt, so
+/// `</think>` appears before any `<think>`) must remain verbatim reasoning text and NEVER be promoted to a live DSML
+/// tool call.
+#[test]
+fn implicit_thought_tool_call_is_never_promoted_to_live_dsml() {
+    let tools = tools();
+    let hypothetical = "Maybe I could call <|tool_call_start|>[get_weather(city='Paris', days=3)]<|tool_call_end|>, or just answer directly.</think>No tool needed.";
+    let got = normalize(hypothetical, &tools).unwrap();
+    assert_eq!(got, hypothetical);
+    assert!(!got.contains(DSML), "hypothetical call in implicit thinking must not become DSML: {got}");
+
+    // If a real call follows `</think>`, only the post-thinking call is promoted; the hypothetical one stays verbatim.
+    let mixed = "Considering <|tool_call_start|>[get_weather(city='Paris', days=3)]<|tool_call_end|>, better search instead.</think><|tool_call_start|>[search(query='weather')]<|tool_call_end|>";
+    let got_mixed = normalize(mixed, &tools).unwrap();
+    assert_eq!(
+        got_mixed,
+        format!("Considering <|tool_call_start|>[get_weather(city='Paris', days=3)]<|tool_call_end|>, better search instead.</think>{}", dsml(&[("search", &[("query", true, "weather")])]))
+    );
+}
+
+/// Deeply nested Python literals in LFM2 tool call arguments fail cleanly instead of overflowing the stack.
+#[test]
+fn deeply_nested_py_value_rejects_without_stack_overflow() {
+    let tools = tools();
+    let nested_open = format!("<|tool_call_start|>[search(query='x', filters={})]<|tool_call_end|>", "[".repeat(200));
+    let err_open = normalize(&nested_open, &tools).unwrap_err();
+    assert!(err_open.contains("nesting too deep"), "{err_open}");
+
+    let nested_balanced = format!("<|tool_call_start|>[search(query='x', filters={}1{})]<|tool_call_end|>", "[".repeat(200), "]".repeat(200));
+    let err_balanced = normalize(&nested_balanced, &tools).unwrap_err();
+    assert!(err_balanced.contains("nesting too deep"), "{err_balanced}");
+
+    let nested_dicts = format!("<|tool_call_start|>[search(query='x', filters={}1{})]<|tool_call_end|>", "{'a':".repeat(200), "}".repeat(200));
+    let err_dicts = normalize(&nested_dicts, &tools).unwrap_err();
+    assert!(err_dicts.contains("nesting too deep"), "{err_dicts}");
+}
+
 /// The cosine of two rows of logits.
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();

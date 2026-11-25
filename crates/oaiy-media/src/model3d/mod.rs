@@ -375,7 +375,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // 1. The picture.
     report(event("preparing_image", 0, 1));
     let prepared = if r.prepared {
-        let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
+        let img = prepare::decode_bounded(&r.image)?;
         prepare::Prepared { image: img.to_rgb8(), cutout: img.to_rgba8(), matte: "prepared", upscaled: None }
     } else {
         prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &dev, webgpu: None })?
@@ -680,7 +680,7 @@ fn generate_webgpu(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("preparing_image", 0, 1));
     let prepared = stages.time("prepare", || -> Result<prepare::Prepared> {
         if r.prepared {
-            let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
+            let img = prepare::decode_bounded(&r.image)?;
             Ok(prepare::Prepared { image: img.to_rgb8(), cutout: img.to_rgba8(), matte: "prepared", upscaled: None })
         } else {
             prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &cpu, webgpu: Some(r.device) })

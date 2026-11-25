@@ -17,6 +17,7 @@ import { CopyLink } from '../ui/CopyButton';
 import SectionPage, { Card, EmptyState } from '../chrome/SectionPage';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { oaiyDesktop } from '../../lib/oaiyAgentTools';
+import { mediaUrlBlocked } from '../../lib/localMedia';
 
 /**
  * Format a value for display (handles various types)
@@ -55,6 +56,7 @@ function formatValue(value: unknown, depth = 0): string {
  */
 function isSafeUrl(url: string): boolean {
   if (!url || typeof url !== 'string') return false;
+  if (mediaUrlBlocked(url)) return false;
   const trimmed = url.trim().toLowerCase();
   return (
     trimmed.startsWith('http://') ||

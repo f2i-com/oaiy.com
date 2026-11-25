@@ -51,10 +51,14 @@ final class CalibrationApi
         $wait = min($wait, self::MAX_HOLD);
         // A hold pins a worker. It is counted in the registry like any other, one credential may have 16 at once, and it has a budget of
         // hold time (Holds::ADMIN_BURST_S): with no bound a credential could keep every worker pinned for as long as it liked.
+        $hold = null;
         if ($wait > 0) {
             self::admitHold($ctx, $p, $wait);
+            $hold = $ctx->holds->acquire('admin', 'tok:' . $p->tokenId, 'core', $wait, $ctx->holds->adminCap());
+            if ($hold === null) {
+                throw ApiError::make('unavailable', 2);
+            }
         }
-        $hold = $wait > 0 ? $ctx->holds->acquire('admin', 'tok:' . $p->tokenId, 'core', $wait, $ctx->holds->adminCap()) : null;
         try {
             if (function_exists('set_time_limit')) {
                 @set_time_limit($wait + 10);

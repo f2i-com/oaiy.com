@@ -6,10 +6,29 @@
 
 import type { RuntimeContext, RuntimeModule } from 'oaiy-core';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
+import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from '../core-service/examples';
 import { runContract } from '../core-service/contractRuntime';
+import { validatePath } from '../core-filesystem/runtime';
 
 const AUDIO_FORMATS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac']);
+
+function isPermissionDenialError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /lacks required permission|not have the .* permission|permission denied|not on the allowlist|on the denylist|Access denied/i.test(msg);
+}
+
+function assertLocalFilePathResponse(endpointUrl: string, returnedPath: string, label: string): string {
+    if (!isLocalNetworkUrl(endpointUrl)) {
+        throw new Error(`${label}: refusing server-returned file_path from non-local endpoint`);
+    }
+    const trimmed = String(returnedPath ?? '').trim();
+    if (!trimmed) {
+        throw new Error(`${label}: server returned empty file path`);
+    }
+    validatePath(trimmed, `${label} file_path`);
+    return trimmed;
+}
 
 export function sanitizeAudioFilename(name: string | undefined, fallback: string): string {
     const cleaned = String(name ?? '')
@@ -542,9 +561,8 @@ async function runTtsExternal(
             throw new Error(`TTS external: responsePath '${responsePath}' not found in response`);
         }
         if (responseType === 'file_path') {
-            // Server-side file path — copy to our output dir so the
-            // media server can serve it via a token URL.
-            const srcPath = String(value);
+            // Server-side file path — only accepted from local endpoints and validated before use.
+            const srcPath = assertLocalFilePathResponse(renderedUrl, String(value), 'TTS external');
             try {
                 await ctx.tauri.invoke('plugin:oaiy-filesystem|native_copy_file', {
                     source: srcPath,
@@ -552,11 +570,16 @@ async function runTtsExternal(
                     createDirs: true,
                 });
             } catch (copyErr) {
+                if (isPermissionDenialError(copyErr)) {
+                    throw copyErr;
+                }
                 ctx.log('warn', `[TTS:external] copy failed, returning original path: ${copyErr}`);
                 let audioUrl: string = srcPath;
                 try {
                     audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: srcPath });
-                } catch { /* fall through */ }
+                } catch (mediaErr) {
+                    if (isPermissionDenialError(mediaErr)) throw mediaErr;
+                }
                 ctx.onNodeStatus?.(opts.nodeId, 'completed');
                 return { audio: audioUrl, path: srcPath };
             }
@@ -755,7 +778,8 @@ async function textToSpeech(
                 throw new Error(`TTS failed: ${result.message || 'Unknown error'}`);
             }
 
-            ctx.log('info', `[TTS] Generated audio: ${result.audio_path}`);
+            const srcAudioPath = assertLocalFilePathResponse(apiUrl, result.audio_path, 'TTS');
+            ctx.log('info', `[TTS] Generated audio: ${srcAudioPath}`);
 
             // Copy the file to our output directory
             const safeFilename = sanitizeAudioFilename(filename, 'tts');
@@ -763,17 +787,20 @@ async function textToSpeech(
 
             try {
                 await ctx.tauri.invoke('plugin:oaiy-filesystem|native_copy_file', {
-                    source: result.audio_path,
+                    source: srcAudioPath,
                     destination: outputPath,
                     createDirs: true
                 });
                 ctx.log('info', `[TTS] Copied audio to ${outputPath}`);
             } catch (copyError) {
+                if (isPermissionDenialError(copyError)) {
+                    throw copyError;
+                }
                 // If copy fails, use the original path directly
                 ctx.log('warn', `[TTS] Copy failed, using original path: ${copyError}`);
-                const audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: result.audio_path });
+                const audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: srcAudioPath });
                 ctx.onNodeStatus?.(nodeId, 'completed');
-                return { audio: audioUrl, path: result.audio_path, durationMs: result.duration_ms };
+                return { audio: audioUrl, path: srcAudioPath, durationMs: result.duration_ms };
             }
 
             // Get media server URL for playback
@@ -1288,6 +1315,7 @@ async function generateMusic(
             audioPath = result.audio_path;
         }
 
+        audioPath = assertLocalFilePathResponse(apiUrl, audioPath, 'Music Gen');
         ctx.log('info', `[Music Gen] Generated audio: ${audioPath}`);
 
         // Get app data dir for output
@@ -1306,6 +1334,9 @@ async function generateMusic(
             });
             ctx.log('info', `[Music Gen] Copied audio to ${outputPath}`);
         } catch (copyError) {
+            if (isPermissionDenialError(copyError)) {
+                throw copyError;
+            }
             // If copy fails, use the original path directly
             ctx.log('warn', `[Music Gen] Copy failed, using original path: ${copyError}`);
             const audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: audioPath });
@@ -1403,7 +1434,8 @@ async function grabAudio(
             throw new Error(`Audio download failed: ${result.message || 'Unknown error'}`);
         }
 
-        ctx.log('info', `[Audio DL] Downloaded audio: ${result.audio_path} (${result.duration_seconds}s)`);
+        const srcAudioPath = assertLocalFilePathResponse(apiUrl, result.audio_path, 'Audio DL');
+        ctx.log('info', `[Audio DL] Downloaded audio: ${srcAudioPath} (${result.duration_seconds}s)`);
 
         // Get app data dir for output
         const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
@@ -1413,17 +1445,20 @@ async function grabAudio(
         // Copy the file to our output directory
         try {
             await ctx.tauri.invoke('plugin:oaiy-filesystem|native_copy_file', {
-                source: result.audio_path,
+                source: srcAudioPath,
                 destination: outputPath,
                 createDirs: true
             });
             ctx.log('info', `[Audio DL] Copied audio to ${outputPath}`);
         } catch (copyError) {
+            if (isPermissionDenialError(copyError)) {
+                throw copyError;
+            }
             // If copy fails, use the original path directly
             ctx.log('warn', `[Audio DL] Copy failed, using original path: ${copyError}`);
-            const audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: result.audio_path });
+            const audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: srcAudioPath });
             ctx.onNodeStatus?.(nodeId, 'completed');
-            return { audio: audioUrl, path: result.audio_path, duration: result.duration_seconds || 0 };
+            return { audio: audioUrl, path: srcAudioPath, duration: result.duration_seconds || 0 };
         }
 
         // Get media server URL for playback

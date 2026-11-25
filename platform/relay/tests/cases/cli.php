@@ -382,6 +382,51 @@ test('4.18.8 bin/relay import: requires every core and secret file in manifest, 
     ok(is_file($imported . '/web.config'), 'web.config guard written on import');
 });
 
+test('4.18.8 Fs::resolveLoose and Doctor::resolveLoose resolve symlinks before collapsing .. so symlink-into-webroot/../data is detected as inside webroot', function () {
+    $base = str_replace('\\', '/', (string)realpath(Tmp::dir('symlink-webroot')));
+    mkdir($base . '/public/sub/deep', 0700, true);
+    mkdir($base . '/outside/nested', 0700, true);
+    $inLink = $base . '/outside/link-into-public';
+    $outLink = $base . '/public/link-outside';
+    $makeLink = static function (string $target, string $link): bool {
+        if (@symlink($target, $link)) {
+            return true;
+        }
+        if (DIRECTORY_SEPARATOR === '\\') {
+            exec('cmd /c mklink /J ' . escapeshellarg(str_replace('/', '\\', $link)) . ' ' . escapeshellarg(str_replace('/', '\\', $target)) . ' 2>&1', $out, $rc);
+            return $rc === 0;
+        }
+        return false;
+    };
+    if (!$makeLink($base . '/public/sub/deep', $inLink) || !$makeLink($base . '/outside/nested', $outLink)) {
+        skip('host does not allow creating directory symlinks or junctions');
+    }
+    try {
+        $pub = $base . '/public';
+        // Symlink pointing inside webroot followed by /../data (missing target) resolves to public/sub/data -> INSIDE webroot.
+        eq(true, Oaiy\Relay\Fs::isInside($inLink . '/../data', $pub), 'Fs::isInside detects symlink/../data inside webroot');
+        eq(true, Oaiy\Relay\Doctor::isInsideLoose($inLink . '/../data', $pub), 'Doctor::isInsideLoose detects symlink/../data inside webroot');
+        eq(true, Oaiy\Relay\Installer::dataInsideWebroot($inLink . '/../data', $pub), 'Installer::dataInsideWebroot detects symlink/../data inside webroot');
+        // Two .. segments still stay inside public/data; three escape to base/outside-data.
+        eq(true, Oaiy\Relay\Fs::isInside($inLink . '/../../data', $pub), 'two .. still inside webroot');
+        eq(true, Oaiy\Relay\Doctor::isInsideLoose($inLink . '/../../data', $pub));
+        eq(false, Oaiy\Relay\Fs::isInside($inLink . '/../../../outside-data', $pub), 'three .. escape webroot');
+        eq(false, Oaiy\Relay\Doctor::isInsideLoose($inLink . '/../../../outside-data', $pub));
+        // Also when the target directory exists.
+        mkdir($base . '/public/sub/existing-data', 0700, true);
+        eq(true, Oaiy\Relay\Fs::isInside($inLink . '/../existing-data', $pub), 'existing target via symlink/.. inside webroot');
+        eq(true, Oaiy\Relay\Doctor::isInsideLoose($inLink . '/../existing-data', $pub));
+        // Reverse: symlink inside webroot pointing outside, followed by /../escape, resolves outside webroot.
+        eq(false, Oaiy\Relay\Fs::isInside($outLink . '/../escape', $pub), 'symlink leaving webroot followed by /.. is outside');
+        eq(false, Oaiy\Relay\Doctor::isInsideLoose($outLink . '/../escape', $pub));
+    } finally {
+        @rmdir($inLink);
+        @unlink($inLink);
+        @rmdir($outLink);
+        @unlink($outLink);
+    }
+});
+
 test('4.18.8 bin/relay export: refuses an existing folder and a folder inside the web root', function () {
     Relay::sqliteOnly();
     $r = Relay::make();

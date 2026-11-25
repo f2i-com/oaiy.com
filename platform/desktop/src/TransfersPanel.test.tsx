@@ -114,6 +114,12 @@ describe('Transfers', () => {
     await click(box('Transfer calls to me'));
     expect(warning()).not.toBeNull();
     expect(who().open).toBe(true);
+    // The user can still manually close it while transfers are unsaved.
+    await act(async () => {
+      who().open = false;
+      who().dispatchEvent(new Event('toggle'));
+    });
+    expect(who().open).toBe(false);
     // A desktop that keeps it on says it as well, closed again (it is on already).
     await act(async () => root.unmount());
     root = createRoot(host);

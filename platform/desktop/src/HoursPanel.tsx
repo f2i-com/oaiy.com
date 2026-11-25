@@ -596,6 +596,8 @@ export function CallVoice({ phonePage }: { phonePage?: { where: string; open: ()
   const [delay, setDelay] = useState<number | null | undefined>(undefined);
   const player = useRef<HTMLAudioElement | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const mounted = useRef(true);
+  const hearSeq = useRef(0);
   const fail = (title: string, e: unknown) => toast.push({ kind: 'error', title, body: errText(e) });
   // What a voice is heard saying is the phone's own greeting (Aokie's `greeting` setting, set in the Phone section under
   // Settings, Greeting & brief), read from it, so the sample is what callers hear. The phone's connector is the phone
@@ -637,29 +639,53 @@ export function CallVoice({ phonePage }: { phonePage?: { where: string; open: ()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
+    mounted.current = true;
     void load();
-    return () => player.current?.pause();
+    return () => {
+      mounted.current = false;
+      hearSeq.current += 1;
+      player.current?.pause();
+      player.current = null;
+    };
   }, [load]);
 
   const hear = async (voice: string) => {
+    const seq = ++hearSeq.current;
     setSpeaking(voice);
+    let url: string | null = null;
+    let revoked = false;
+    let audio: HTMLAudioElement | null = null;
+    const revoke = () => {
+      if (url && !revoked) {
+        revoked = true;
+        URL.revokeObjectURL(url);
+      }
+    };
     try {
       // What callers hear first: the phone's greeting.
       const blob = await voices.hear(voice, greetingOf(greeting));
+      if (!mounted.current || seq !== hearSeq.current) return;
       player.current?.pause();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
+      url = URL.createObjectURL(blob);
+      audio = new Audio(url);
       player.current = audio;
       // "Speaking…" until it has been said (or stopped), and the clip let go then.
       const done = () => {
-        URL.revokeObjectURL(url);
-        if (player.current === audio) setSpeaking(null);
+        revoke();
+        if (player.current === audio) {
+          player.current = null;
+          if (mounted.current && seq === hearSeq.current) setSpeaking(null);
+        }
       };
       for (const ev of ['ended', 'pause', 'error']) audio.addEventListener(ev, done, { once: true });
       await audio.play();
     } catch (e) {
-      fail('Could not speak', e);
-      setSpeaking(null);
+      revoke();
+      if (audio && player.current === audio) player.current = null;
+      if (mounted.current && seq === hearSeq.current) {
+        fail('Could not speak', e);
+        setSpeaking(null);
+      }
     }
   };
   const choose = async (voice: string) => {

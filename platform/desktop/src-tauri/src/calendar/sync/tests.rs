@@ -1031,3 +1031,61 @@ fn every_appointment_made_here_has_an_id_of_the_shape_a_restore_takes() {
     assert!(all.iter().any(|a| a.source == "formlogic"), "one of them came from FormLogic");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn change_from_handles_multibyte_utf8_time_without_panicking() {
+    // Byte index 5 lands inside a 3-byte UTF-8 character (`\u{202F}` or `é`).
+    let c1 = change_from(&json!({ "date": "2026-10-05", "time": "09:3\u{202F}AM" }));
+    assert_eq!(c1.start.as_deref(), Some("2026-10-05T09:3\u{202F}"));
+    let c2 = change_from(&json!({ "date": "2026-10-05", "time": "09:30:45" }));
+    assert_eq!(c2.start.as_deref(), Some("2026-10-05T09:30"));
+    let c3 = change_from(&json!({ "date": "2026-10-05", "time": "😀😀😀😀😀😀" }));
+    assert_eq!(c3.start.as_deref(), Some("2026-10-05T😀😀😀😀😀"));
+}
+
+#[test]
+fn calendar_http_client_does_not_follow_credentialed_redirects() {
+    use crate::link::testkit::{Provider, Reply};
+
+    let target = Provider::start(|_| Reply::ok("{}"));
+    let target_url = format!("{}/stolen", target.base);
+    let redirector = Provider::start(move |_| Reply::redirect(302, &target_url));
+
+    let api = Api::new(&redirector.base, "flk_secret_token").unwrap();
+    let reply = api.get("/api/v1/app-logic").unwrap();
+    assert_eq!(reply.status, 302, "302 redirect must not be followed");
+    assert!(
+        target.requests().is_empty(),
+        "credentialed calendar sync must never follow redirects to another target"
+    );
+}
+
+#[test]
+fn calendar_sync_rejects_invalid_form_and_response_path_segments() {
+    for bad in ["", ".", "..", "../admin", "a/b", "a\\b", "a?x=1", "a#frag", "a%2fb", "a b"] {
+        assert!(
+            matches!(forms_responses_path(bad), Err(Failure::Refused(_))),
+            "forms_responses_path accepted {bad:?}"
+        );
+        assert!(
+            matches!(response_item_path("/api/v1/forms/F1/responses", bad), Err(Failure::Refused(_))),
+            "response_item_path accepted {bad:?}"
+        );
+    }
+    assert_eq!(forms_responses_path("F1").unwrap(), "/api/v1/forms/F1/responses");
+    assert_eq!(
+        response_item_path("/api/v1/forms/F1/responses", "resp_1-2").unwrap(),
+        "/api/v1/forms/F1/responses/resp_1-2"
+    );
+
+    // End-to-end: a server returning a traversal form id is refused before hitting /responses.
+    let (cal, dir) = calendar();
+    let (fake, base) = formlogic();
+    fake.lock().unwrap().form = "../admin".into();
+    let err = run(&cal, &base).unwrap_err();
+    assert!(
+        matches!(err, Failure::Refused(ref m) if m.contains("form id")),
+        "expected Failure::Refused for traversal form id, got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

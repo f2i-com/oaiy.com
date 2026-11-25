@@ -699,6 +699,108 @@ document.getElementById('result').textContent = 'domOk:' + domOk + ' unsafe:' + 
   }
 });
 
+await check('Wave 3 sandbox & offline preview hardening: Function.prototype.call/Array.prototype.push hijack, dynamic <meta http-equiv="refresh">/<base>, and capture-phase external link blocking', async () => {
+  await write({
+    'wave3sec/index.html': `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Wave3 Security</title></head>
+<body>
+<div id="mount"></div>
+<a id="ext" href="https://evil.example/escape">External Link</a>
+<p id="status">pending</p>
+<script>
+const origCall = Function.prototype.call;
+const origApply = Function.prototype.apply;
+const origPush = Array.prototype.push;
+const origBtoa = globalThis.btoa;
+const origAtob = globalThis.atob;
+
+// Attempt to hijack Function.prototype.call/apply, Array.prototype.push, and btoa/atob.
+Function.prototype.call = function () { return { $h: 1, c: ['Window'] }; };
+Function.prototype.apply = function () { return ['window']; };
+Array.prototype.push = function () { throw new Error('push hijacked'); };
+globalThis.btoa = function () { return 'evil'; };
+globalThis.atob = function () { return 'evil'; };
+
+// DOM operations must keep working through uncurried primordials and indexed writes.
+const mount = document.getElementById('mount');
+const badge = document.createElement('span');
+badge.textContent = 'uncurried-ok';
+mount.appendChild(badge);
+const domIntact = mount.textContent === 'uncurried-ok';
+
+// Guest URL constructor still works even though host window.URL is blocked.
+const parsedPath = new URL('https://example.com/hello').pathname;
+
+// Restore prototypes before remaining checks so standard JS helpers run normally.
+Function.prototype.call = origCall;
+Function.prototype.apply = origApply;
+Array.prototype.push = origPush;
+globalThis.btoa = origBtoa;
+globalThis.atob = origAtob;
+
+// Dynamic <base> creation must throw.
+let baseBlocked = false;
+try {
+  document.createElement('base');
+} catch {
+  baseBlocked = true;
+}
+
+// Dynamic <meta http-equiv="refresh"> via setAttribute, httpEquiv, and DOMParser + appendChild must be blocked.
+const m1 = document.createElement('meta');
+m1.setAttribute('http-equiv', 'refresh');
+m1.setAttribute('content', '0;url=https://evil.example/1');
+document.head.appendChild(m1);
+
+const m2 = document.createElement('meta');
+m2.httpEquiv = 'Refresh';
+m2.content = '0;url=https://evil.example/2';
+document.head.appendChild(m2);
+
+const parsed = new DOMParser().parseFromString('<meta http-equiv="refresh" content="0;url=https://evil.example/3"><base href="https://evil.example/">', 'text/html');
+const m3 = parsed.querySelector('meta');
+if (m3) document.head.appendChild(m3);
+const b3 = parsed.querySelector('base');
+if (b3) document.head.appendChild(b3);
+
+// Register stopPropagation / stopImmediatePropagation click handlers trying to bypass followLinks.
+window.__extClicked = 0;
+window.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'ext') e.stopImmediatePropagation();
+}, true);
+document.getElementById('ext').addEventListener('click', (e) => {
+  window.__extClicked++;
+  e.stopPropagation();
+});
+
+document.getElementById('status').textContent = 'dom:' + domIntact + ' url:' + parsedPath + ' baseBlocked:' + baseBlocked;
+</script>
+</body>
+</html>`,
+  });
+  const checked = await tool('page_check', { path: 'wave3sec/index.html' });
+  expect(!checked.isError, checked.content);
+  const inspected = await tool('page_inspect', {});
+  expect(inspected.content.includes('dom:true url:/hello baseBlocked:true'), inspected.content);
+
+  // Clicking the external link with stopPropagation / stopImmediatePropagation must stay on the offline preview.
+  const clicked = await tool('page_interact', { actions: [{ click: 'External Link' }, { wait: 150 }] });
+  expect(!clicked.isError && clicked.content.includes('dom:true url:/hello baseBlocked:true'), clicked.content);
+
+  // Host DOM must contain ZERO <base> or <meta http-equiv="refresh"> elements, and frame URL must still be our preview frame.
+  const hostState = await frame().evaluate(() => ({
+    url: location.href,
+    baseCount: document.querySelectorAll('base').length,
+    refreshMetaCount: [...document.querySelectorAll('meta[http-equiv]')].filter((m) => /refresh/i.test(m.getAttribute('http-equiv') || '')).length,
+    stillWave3: document.getElementById('status')?.textContent || '',
+  }));
+  expect(
+    hostState.url.includes('/webpage/') && hostState.baseCount === 0 && hostState.refreshMetaCount === 0 && hostState.stillWave3.includes('dom:true'),
+    JSON.stringify(hostState),
+  );
+});
+
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

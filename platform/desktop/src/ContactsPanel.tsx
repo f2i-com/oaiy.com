@@ -49,13 +49,18 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
   const [nudge, setNudge] = useState(0);
   const [exporting, setExporting] = useState(false);
 
+  // (each local write counted: a reading asked before one lands says what was there before, and would overwrite it)
+  const writes = useRef(0);
   const load = useCallback(async () => {
+    const asked = writes.current;
     try {
       const r = await api.list();
+      if (asked !== writes.current) return;
       setList(r.contacts ?? []);
       setError(null);
       setMissing(false);
     } catch (e) {
+      if (asked !== writes.current) return;
       if (isNotFound(e)) setMissing(true);
       else setError(errText(e));
     }
@@ -114,10 +119,13 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
     if (side?.kind === 'contact' && list && !current) setSide(null);
   }, [side, list, current]);
 
-  const replace = (c: Contact) => setList((l) => {
-    const rest = (l ?? []).filter((x) => x.key !== c.key);
-    return [...rest, c].sort(byName);
-  });
+  const replace = (c: Contact) => {
+    writes.current += 1;
+    setList((l) => {
+      const rest = (l ?? []).filter((x) => x.key !== c.key);
+      return [...rest, c].sort(byName);
+    });
+  };
 
   const exportCsv = async () => {
     setExporting(true);
@@ -236,6 +244,7 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
                   onDirty={setDirty}
                   onSaved={replace}
                   onDeleted={(c) => {
+                    writes.current += 1;
                     setDirty(false);
                     setSide(null);
                     setList((l) => (l ?? []).filter((x) => x.key !== c.key));
@@ -261,6 +270,7 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
               {side.kind === 'import' && (
                 <ImportPanel
                   onImported={() => {
+                    writes.current += 1;
                     setSide(null);
                     void load();
                   }}
@@ -379,11 +389,11 @@ function ContactEditor({
 
   const save = async () => {
     setSaving(true);
+    let fresh = base;
     try {
       const change: ContactChange = {};
       if (nameChanged || pin) change.name = keptName(name);
       if (notesChanged) change.notes = keptNotes(notes);
-      let fresh = base;
       if (Object.keys(change).length) fresh = await api.save(base.key, change);
       // The facts to forget, by where each is now (the last first), each checked by what it says.
       const doomed = fresh.facts
@@ -400,6 +410,16 @@ function ContactEditor({
       setJustSaved(true);
       onSaved(fresh);
     } catch (e) {
+      if (fresh !== base) {
+        setBase(fresh);
+        if (nameChanged || pin) {
+          setName(fresh.name);
+          setPin(false);
+        }
+        if (notesChanged) setNotes(fresh.notes);
+        setRemoved((r) => new Set([...r].filter((id) => fresh.facts.some((f) => factId(f) === id))));
+        onSaved(fresh);
+      }
       toast.push({ kind: 'error', title: 'Not saved', body: errText(e) });
     } finally {
       setSaving(false);
@@ -707,10 +727,12 @@ function ImportPanel({ onImported, onClose }: { onImported: (r: ImportReport) =>
       .finally(() => n === seq.current && setBusy(null));
   }, [file, country, replaceNames]);
 
+  useEffect(() => () => { seq.current += 1; }, []);
+
   const choose = async (f: File | undefined) => {
     if (!f) return;
-    // (a preview still on its way for the file before is not this one's)
-    seq.current++;
+    // (a preview or file read still on its way for the file before is not this one's)
+    const n = ++seq.current;
     setReport(null);
     setBusy(null);
     if (f.size > MAX_FILE) {
@@ -718,7 +740,9 @@ function ImportPanel({ onImported, onClose }: { onImported: (r: ImportReport) =>
       setProblem('That file is over 8 MB: split it, and import each part.');
       return;
     }
-    setFile({ name: f.name, text: await fileText(f) });
+    const text = await fileText(f);
+    if (n !== seq.current) return;
+    setFile({ name: f.name, text });
   };
 
   const changes = report ? report.added + report.updated : 0;

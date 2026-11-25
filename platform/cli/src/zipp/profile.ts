@@ -89,6 +89,98 @@ export interface PreambleDeclarations {
   lexical: string[];
 }
 
+/**
+ * Recursively collect top-level bindings introduced by `node`.
+ *
+ * At program top level (`topLevel === true`), `var`, `let`, `const`, `function`,
+ * and `class` all introduce top-level bindings (with `let`/`const`/`class` being
+ * lexical). Inside nested non-function, non-class statements (`BlockStatement`,
+ * `IfStatement`, `For*Statement`, `WhileStatement`, `DoWhileStatement`,
+ * `SwitchStatement`, `TryStatement`, `LabeledStatement`, `WithStatement`),
+ * `var` declarations and Annex-B `FunctionDeclaration`s still hoist to program
+ * top level in classic scripts, whereas nested `let`/`const`/`class` remain
+ * block-scoped and function/class bodies create their own scopes.
+ */
+function collectTopLevelBindings(
+  node: Node | null | undefined,
+  topLevel: boolean,
+  names: string[],
+  lexical: string[],
+): void {
+  if (!node || typeof node.type !== 'string') return;
+  switch (node.type) {
+    case 'VariableDeclaration': {
+      const isVar = node.kind === 'var';
+      if (!topLevel && !isVar) return;
+      const found: string[] = [];
+      for (const declarator of node.declarations as Node[]) bindingNames(declarator.id, found);
+      names.push(...found);
+      if (topLevel && !isVar) lexical.push(...found);
+      return;
+    }
+    case 'FunctionDeclaration': {
+      const id = node.id as Node | null;
+      if (id?.name) names.push(id.name as string);
+      return;
+    }
+    case 'ClassDeclaration': {
+      if (topLevel) {
+        const id = node.id as Node | null;
+        if (id?.name) {
+          const name = id.name as string;
+          names.push(name);
+          lexical.push(name);
+        }
+      }
+      return;
+    }
+    case 'BlockStatement': {
+      for (const stmt of node.body as Node[]) collectTopLevelBindings(stmt, false, names, lexical);
+      return;
+    }
+    case 'IfStatement': {
+      collectTopLevelBindings(node.consequent as Node | null, false, names, lexical);
+      collectTopLevelBindings(node.alternate as Node | null, false, names, lexical);
+      return;
+    }
+    case 'ForStatement': {
+      const init = node.init as Node | null;
+      if (init?.type === 'VariableDeclaration') collectTopLevelBindings(init, false, names, lexical);
+      collectTopLevelBindings(node.body as Node | null, false, names, lexical);
+      return;
+    }
+    case 'ForInStatement':
+    case 'ForOfStatement': {
+      const left = node.left as Node | null;
+      if (left?.type === 'VariableDeclaration') collectTopLevelBindings(left, false, names, lexical);
+      collectTopLevelBindings(node.body as Node | null, false, names, lexical);
+      return;
+    }
+    case 'WhileStatement':
+    case 'DoWhileStatement':
+    case 'WithStatement':
+    case 'LabeledStatement': {
+      collectTopLevelBindings(node.body as Node | null, false, names, lexical);
+      return;
+    }
+    case 'SwitchStatement': {
+      for (const clause of node.cases as Node[]) {
+        for (const stmt of clause.consequent as Node[]) collectTopLevelBindings(stmt, false, names, lexical);
+      }
+      return;
+    }
+    case 'TryStatement': {
+      collectTopLevelBindings(node.block as Node | null, false, names, lexical);
+      const handler = node.handler as Node | null;
+      if (handler) collectTopLevelBindings(handler.body as Node | null, false, names, lexical);
+      collectTopLevelBindings(node.finalizer as Node | null, false, names, lexical);
+      return;
+    }
+    default:
+      return;
+  }
+}
+
 /** Parse `source` as a classic script and list its top-level declarations. Throws `ScriptProfileError` when it does not parse. */
 export function scanTopLevelDeclarations(source: string, what = 'the preamble'): PreambleDeclarations {
   let program: acorn.Program;
@@ -100,18 +192,7 @@ export function scanTopLevelDeclarations(source: string, what = 'the preamble'):
   const names: string[] = [];
   const lexical: string[] = [];
   for (const statement of program.body as unknown as Node[]) {
-    if (statement.type === 'VariableDeclaration') {
-      const found: string[] = [];
-      for (const declarator of statement.declarations as Node[]) bindingNames(declarator.id, found);
-      names.push(...found);
-      if (statement.kind !== 'var') lexical.push(...found);
-    } else if (statement.type === 'FunctionDeclaration' && (statement.id as Node | null)?.name) {
-      names.push((statement.id as Node).name as string);
-    } else if (statement.type === 'ClassDeclaration' && (statement.id as Node | null)?.name) {
-      const name = (statement.id as Node).name as string;
-      names.push(name);
-      lexical.push(name);
-    }
+    collectTopLevelBindings(statement, true, names, lexical);
   }
   return { names, lexical };
 }

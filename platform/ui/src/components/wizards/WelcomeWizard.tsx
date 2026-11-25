@@ -47,6 +47,8 @@ export interface WelcomeWizardProps {
   onClose: () => void;
   /** Save a service (caller routes to serviceRegistry.saveService). */
   onSaveService: (svc: CustomService) => void;
+  /** Remove a service added during this run (caller routes to serviceRegistry.deleteService). */
+  onRemoveService?: (id: string) => void;
   /** Save an API key constant (caller routes to project constants). */
   onSaveApiKey: (constantName: string, value: string) => void;
   /**
@@ -81,8 +83,12 @@ export interface WelcomeWizardProps {
 type Step = 1 | 2 | 3 | 4;
 
 export default function WelcomeWizard(props: WelcomeWizardProps) {
-  const { isOpen, onClose, onSaveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants, resolveApiKey, inOaiy } = props;
+  const { isOpen, onClose, onSaveService, onRemoveService, onSaveApiKey, onCreateStarterFlow, existingServices, configuredKeyConstants, resolveApiKey, inOaiy } = props;
   const [step, setStep] = useState<Step>(1);
+  const [removedIds, setRemovedIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    if (!isOpen) setRemovedIds(new Set());
+  }, [isOpen]);
   // The model the service will run: chosen from the provider's own list, which Test asks for. None is written here.
   const [use, setUse] = useState<PresetUse>('chat');
   const [model, setModel] = useState<string>('');
@@ -270,7 +276,7 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
     const seen = new Set<string>();
     const out: CustomService[] = [];
     for (const s of [...savedServices, ...existingServices]) {
-      if (s && s.id && !seen.has(s.id)) { seen.add(s.id); out.push(s); }
+      if (s && s.id && !removedIds.has(s.id) && !seen.has(s.id)) { seen.add(s.id); out.push(s); }
     }
     return out;
   })();
@@ -299,9 +305,11 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
   }, [commitCurrent, resetForm, flowServices]);
 
   const removeService = useCallback((id: string) => {
+    onRemoveService?.(id);
+    setRemovedIds((prev) => new Set([...prev, id]));
     setSavedServices((prev) => prev.filter((s) => s.id !== id));
     setFlowServiceId((prev) => (prev === id ? '' : prev));
-  }, []);
+  }, [onRemoveService]);
 
   const createFlowAndAdvance = useCallback(() => {
     const svc = flowServices.find((s) => s.id === flowServiceId) ?? flowServices[0];

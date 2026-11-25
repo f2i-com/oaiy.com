@@ -20,11 +20,12 @@ import { useEffect, useRef } from 'react';
  * restart the interval on every render — the mistake that turns a poll into a
  * request storm.
  */
-export function useVisiblePoll(tick: () => void, intervalMs: number): void {
+export function useVisiblePoll(tick: () => void, intervalMs: number, enabled = true): void {
   const saved = useRef(tick);
   saved.current = tick;
 
   useEffect(() => {
+    if (!enabled) return;
     let id: number | undefined;
 
     const run = () => saved.current();
@@ -49,5 +50,5 @@ export function useVisiblePoll(tick: () => void, intervalMs: number): void {
       document.removeEventListener('visibilitychange', onVis);
       window.removeEventListener('focus', start);
     };
-  }, [intervalMs]);
+  }, [intervalMs, enabled]);
 }

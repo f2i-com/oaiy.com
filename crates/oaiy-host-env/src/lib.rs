@@ -51,6 +51,14 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Picks the fallback working directory when leaving `$APPDIR`: `OWD` if it is an existing directory,
+/// otherwise `HOME` if it is an existing directory.
+fn fallback_dir(owd: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    owd.map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .or_else(|| home.map(PathBuf::from).filter(|dir| dir.is_dir()))
+}
+
 /// `command` given the computer's environment where this process runs from an AppImage, and left as it is elsewhere.
 /// Before a command's own `env`s, so that a value it sets on purpose stays (this sets those the AppImage changed).
 /// Not for a command whose environment is cleared and built by hand: that one is built from [`vars`].
@@ -63,8 +71,7 @@ pub fn apply(command: &mut Command) -> &mut Command {
         };
     }
     if command.get_current_dir().is_none() && std::env::current_dir().is_ok_and(|dir| dir.starts_with(&appdir)) {
-        let started_in = std::env::var_os("OWD").map(PathBuf::from).filter(|dir| dir.is_dir());
-        if let Some(dir) = started_in.or_else(|| std::env::var_os("HOME").map(PathBuf::from)) {
+        if let Some(dir) = fallback_dir(std::env::var_os("OWD"), std::env::var_os("HOME")) {
             command.current_dir(dir);
         }
     }
@@ -200,5 +207,14 @@ mod tests {
         let names: Vec<String> = vars().into_iter().map(|(k, _)| k).collect();
         let expected: Vec<String> = std::env::vars_os().filter_map(|(k, v)| v.into_string().ok().and(k.into_string().ok())).collect();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn fallback_dir_ignores_missing_owd_and_home() {
+        let existing = std::env::temp_dir();
+        let missing = existing.join(format!("oaiy-host-env-definitely-missing-{}", std::process::id()));
+        assert_eq!(fallback_dir(Some(missing.clone().into()), Some(missing.clone().into())), None);
+        assert_eq!(fallback_dir(Some(missing.clone().into()), Some(existing.clone().into())), Some(existing.clone()));
+        assert_eq!(fallback_dir(Some(existing.clone().into()), Some(missing.into())), Some(existing));
     }
 }

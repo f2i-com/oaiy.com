@@ -143,7 +143,8 @@ export async function sendAIRequest(
   request: AIRequest,
 ): Promise<AIResponse> {
   const model = resolveModel(provider, request.modelOverride);
-  if (!model) {
+  const followsEngine = provider.followEngine === true && provider.serverKind === 'oaiy' && provider.type !== 'anthropic';
+  if (!model && !followsEngine) {
     // No model, no request. There used to be a default name per provider
     // here; model names change faster than Studio ships, so a guessed one
     // either failed with a confusing 404 or quietly ran something the
@@ -176,7 +177,7 @@ export async function sendAIRequest(
     // Studios saved gateways and local servers as `openai` too.
     body = {
       // Following OAIY's Engines: the engine answers with the model chosen there.
-      ...(provider.followEngine ? {} : { model }),
+      ...(followsEngine && !request.modelOverride?.trim() ? {} : { model }),
       ...(isOpenAIHost(url) ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
       messages: [
         { role: 'system', content: request.system },
@@ -545,6 +546,7 @@ export async function testProvider(
   provider: ProviderConfig,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<ProviderTestResult> {
+  const followsEngine = provider.followEngine === true && provider.serverKind === 'oaiy' && provider.type !== 'anthropic';
   let models: ModelInfo[] | null = null;
   try {
     models = await listModels(provider, { signal: options.signal, ownWindow: pageHost().kind === 'oaiy-window' });
@@ -553,12 +555,12 @@ export async function testProvider(
     // A local server may serve chat without a model list; the reply below
     // is then the whole test. Anything else fails here.
     const listless = error && (provider.type === 'local' || provider.type === 'custom') && error.kind === 'not-found';
-    if (!listless || !resolveModel(provider)) {
+    if (!listless || (!resolveModel(provider) && !followsEngine)) {
       return { ok: false, message: error?.message ?? String(err), kind: error?.kind ?? 'network', models: null };
     }
   }
   const model = resolveModel(provider);
-  if (!model) return { ok: true, models: models ?? [], replied: false, modelListed: null };
+  if (!model && !followsEngine) return { ok: true, models: models ?? [], replied: false, modelListed: null };
   try {
     await sendAIRequest(provider, {
       system: 'This is a connection test. Reply with one word.',
@@ -571,5 +573,5 @@ export async function testProvider(
     const error = err instanceof AIProviderError ? err : null;
     return { ok: false, message: error?.message ?? String(err), kind: error?.kind ?? 'network', models };
   }
-  return { ok: true, models: models ?? [], replied: true, modelListed: models && models.length > 0 ? models.some((m) => m.id === model) : null };
+  return { ok: true, models: models ?? [], replied: true, modelListed: model && models && models.length > 0 ? models.some((m) => m.id === model) : null };
 }

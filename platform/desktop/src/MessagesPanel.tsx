@@ -91,6 +91,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
       setBusyIds((prev) => new Set(prev).add(id));
       try {
         const next = await api.mark(id, state);
+        writes.current += 1;
         setList((prev) => prev?.map((m) => (m.id === id ? next : m)) ?? prev);
       } catch (e) {
         toast.push({ kind: 'error', title: 'Could not change the message', body: errText(e) });
@@ -107,15 +108,18 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
   );
 
   const remove = async (id: string) => {
+    asking.current.add(id);
     writes.current += 1;
     setBusyIds((prev) => new Set(prev).add(id));
     try {
       await api.remove(id);
+      writes.current += 1;
       setList((prev) => prev?.filter((m) => m.id !== id) ?? prev);
       setConfirming(null);
     } catch (e) {
       toast.push({ kind: 'error', title: 'Could not delete the message', body: errText(e) });
     } finally {
+      asking.current.delete(id);
       setBusyIds((prev) => {
         const rest = new Set(prev);
         rest.delete(id);

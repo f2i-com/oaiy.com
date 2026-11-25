@@ -22,7 +22,7 @@
 # Settings, from the environment (the defaults are the reference install of the guide):
 #   OAIYCTL_ENV_FILE   /etc/oaiy/oaiy.env
 #   OAIYCTL_USER       oaiy
-#   OAIYCTL_SERVER     /opt/oaiy/current/oaiy-server
+#   OAIYCTL_SERVER     /usr/local/bin/oaiy-server
 #   OAIYCTL_UNIT       oaiy-server        (the service whose running server is compared)
 #   OAIYCTL_PROC       /proc              (where the environment of a running process is read)
 
@@ -30,7 +30,7 @@ set -eu
 
 env_file=${OAIYCTL_ENV_FILE:-/etc/oaiy/oaiy.env}
 service_user=${OAIYCTL_USER:-oaiy}
-server=${OAIYCTL_SERVER:-/opt/oaiy/current/oaiy-server}
+server=${OAIYCTL_SERVER:-/usr/local/bin/oaiy-server}
 unit=${OAIYCTL_UNIT:-oaiy-server}
 proc=${OAIYCTL_PROC:-/proc}
 
@@ -49,15 +49,17 @@ if [ "$current_user" != "$service_user" ]; then
     exit 1
   fi
   self=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")
-  exec sudo -u "$service_user" -- env \
+  exec sudo -u "$service_user" -- env -- \
     "OAIYCTL_ENV_FILE=$env_file" "OAIYCTL_USER=$service_user" "OAIYCTL_SERVER=$server" \
     "OAIYCTL_UNIT=$unit" "OAIYCTL_PROC=$proc" \
-    "$self" "$@"
+    /bin/sh -- "$self" "$@"
 fi
 
 # As the service user: the OAIY_* settings of the environment file. One KEY=VALUE per line, as systemd reads it:
 # blank lines and lines starting with # or ; are skipped, one pair of quotes round a value is removed, and nothing is
-# evaluated (the file is read, not sourced).
+# evaluated (the file is read, not sourced). Clear any ambient OAIY_DATA_DIR first so invoking directly as the service
+# user cannot silently inherit a different data folder than the environment file names.
+unset OAIY_DATA_DIR
 if [ -r "$env_file" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     case $line in

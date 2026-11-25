@@ -399,14 +399,25 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     });
   }, []);
 
+  const selectableRowIds = viewingRawResult
+    ? []
+    : data
+        .map((row) => row._id)
+        .filter((id): id is string => typeof id === 'string');
+  const canMutateRows = !viewingRawResult && selectableRowIds.length > 0;
+
   // Select all
   const toggleSelectAll = useCallback(() => {
-    if (selectedRows.size === data.length) {
+    if (!canMutateRows) {
+      setSelectedRows(new Set());
+      return;
+    }
+    if (selectedRows.size === selectableRowIds.length) {
       setSelectedRows(new Set());
     } else {
-      setSelectedRows(new Set(data.map(row => row._id as string)));
+      setSelectedRows(new Set(selectableRowIds));
     }
-  }, [data, selectedRows]);
+  }, [canMutateRows, selectableRowIds, selectedRows]);
 
   // Get columns from data
   const getColumns = (): string[] => {
@@ -547,7 +558,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
           flush
           actions={
             <>
-              {selectedRows.size > 0 && (
+              {canMutateRows && selectedRows.size > 0 && (
                 <button onClick={deleteSelectedRecords} className="btn btn-danger btn-sm">
                   <Trash2 size={12} /> Delete {selectedRows.size}
                 </button>
@@ -638,34 +649,40 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
               <table className="oaiy-table min-w-max">
                 <thead>
                   <tr>
-                    <th className="w-8">
-                      <input
-                        type="checkbox"
-                        checked={selectedRows.size === data.length && data.length > 0}
-                        onChange={toggleSelectAll}
-                        aria-label="Select every record"
-                      />
-                    </th>
+                    {canMutateRows && (
+                      <th className="w-8">
+                        <input
+                          type="checkbox"
+                          checked={selectedRows.size === selectableRowIds.length && selectableRowIds.length > 0}
+                          onChange={toggleSelectAll}
+                          aria-label="Select every record"
+                        />
+                      </th>
+                    )}
                     {columns.map(col => (
                       <th key={col}>{col}</th>
                     ))}
-                    <th className="w-10" aria-label="Actions"></th>
+                    {canMutateRows && <th className="w-10" aria-label="Actions"></th>}
                   </tr>
                 </thead>
                 <tbody>
                   {data.map((row, i) => {
-                    const id = row._id as string;
-                    const isSelected = selectedRows.has(id);
+                    const rowId = !viewingRawResult && typeof row._id === 'string' ? row._id : null;
+                    const isSelected = rowId !== null && selectedRows.has(rowId);
                     return (
                       <tr key={i} className={isSelected ? 'selected' : undefined}>
-                        <td>
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onChange={() => toggleRowSelection(id)}
-                            aria-label="Select this record"
-                          />
-                        </td>
+                        {canMutateRows && (
+                          <td>
+                            {rowId !== null && (
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleRowSelection(rowId)}
+                                aria-label="Select this record"
+                              />
+                            )}
+                          </td>
+                        )}
                         {columns.map(col => (
                           <td
                             key={col}
@@ -676,16 +693,20 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
                             {formatValue(row[col])}
                           </td>
                         ))}
-                        <td>
-                          <button
-                            onClick={() => deleteRecord(id)}
-                            className="oaiy-icon-btn sm"
-                            title="Delete this record"
-                            aria-label="Delete record"
-                          >
-                            <Trash2 size={13} />
-                          </button>
-                        </td>
+                        {canMutateRows && (
+                          <td>
+                            {rowId !== null && (
+                              <button
+                                onClick={() => deleteRecord(rowId)}
+                                className="oaiy-icon-btn sm"
+                                title="Delete this record"
+                                aria-label="Delete record"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            )}
+                          </td>
+                        )}
                       </tr>
                     );
                   })}

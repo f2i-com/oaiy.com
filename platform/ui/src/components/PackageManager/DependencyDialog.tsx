@@ -9,8 +9,11 @@ import { useState, useCallback } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { Check, FolderOpen, Layers } from 'lucide-react';
-import type { OAIYPackageManifest } from 'oaiy-core';
+import type { OAIYPackageManifest, PackagePermission } from 'oaiy-core';
 import Dialog from '../ui/Dialog';
+import { TrustDialog } from './TrustDialog';
+
+type PackageVerificationLevel = 'unverified' | 'hash_matched' | 'signature_verified';
 
 interface PackageDependency {
   id: string;
@@ -33,8 +36,13 @@ interface DependencyDialogProps {
   dependencies: PackageDependency[];
   /** Map of currently loaded packages (id -> manifest) */
   loadedPackages: Map<string, { manifest: OAIYPackageManifest }>;
-  /** Called when a dependency package is loaded */
-  onPackageLoaded: (path: string, manifest: OAIYPackageManifest) => Promise<void>;
+  /** Called when a dependency package is verified, confirmed in TrustDialog, and loaded */
+  onPackageLoaded: (
+    path: string,
+    manifest: OAIYPackageManifest,
+    grantedPermissions?: string[],
+    verification?: PackageVerificationLevel,
+  ) => Promise<void>;
   /** Called when all dependencies are satisfied */
   onAllLoaded: () => void;
   /** Called when user wants to continue anyway without all deps */
@@ -144,6 +152,15 @@ export function DependencyDialog({
     return initial;
   });
 
+  // Pending dependency awaiting explicit TrustDialog confirmation
+  const [pendingTrust, setPendingTrust] = useState<{
+    depId: string;
+    path: string;
+    manifest: OAIYPackageManifest;
+    requiredVersion?: string;
+    verification: PackageVerificationLevel;
+  } | null>(null);
+
   // Check if all dependencies are satisfied
   const allSatisfied = Array.from(statuses.values()).every(
     s => s.status === 'loaded'
@@ -175,10 +192,33 @@ export function DependencyDialog({
         return next;
       });
 
-      // Read the manifest
-      const manifest = await invoke<OAIYPackageManifest>('read_package', {
+      // Verify archive integrity, size, and signature before presenting TrustDialog
+      const verification = await invoke<{
+        manifest: OAIYPackageManifest;
+        size: { withinDefaults: boolean; exceedsHardMax: boolean };
+        verification: PackageVerificationLevel;
+        contentHash: string;
+      } | null>('verify_package_for_load', {
         packagePath: path,
       });
+
+      if (!verification || !verification.manifest) {
+        setStatuses(prev => {
+          const next = new Map(prev);
+          const current = next.get(depId);
+          if (current) {
+            next.set(depId, {
+              ...current,
+              status: 'missing',
+              error: 'Package verification failed or is unavailable in this environment',
+            });
+          }
+          return next;
+        });
+        return;
+      }
+
+      const manifest = verification.manifest;
 
       // Check if it's the right package
       if (manifest.id !== depId) {
@@ -214,19 +254,13 @@ export function DependencyDialog({
         return;
       }
 
-      // Load the package
-      await onPackageLoaded(path, manifest);
-
-      // Update status to loaded
-      setStatuses(prev => {
-        const next = new Map(prev);
-        next.set(depId, {
-          id: depId,
-          requiredVersion: dep?.version,
-          status: 'loaded',
-          loadedVersion: manifest.version,
-        });
-        return next;
+      // Gate loading behind explicit TrustDialog permission review
+      setPendingTrust({
+        depId,
+        path,
+        manifest,
+        requiredVersion: dep?.version,
+        verification: verification.verification,
       });
     } catch (err) {
       setStatuses(prev => {
@@ -242,7 +276,53 @@ export function DependencyDialog({
         return next;
       });
     }
-  }, [dependencies, onPackageLoaded]);
+  }, [dependencies]);
+
+  const handleDependencyTrustConfirm = useCallback(async (grantedPermissions: PackagePermission[]) => {
+    if (!pendingTrust) return;
+    const target = pendingTrust;
+    setPendingTrust(null);
+    try {
+      await onPackageLoaded(target.path, target.manifest, grantedPermissions, target.verification);
+      setStatuses(prev => {
+        const next = new Map(prev);
+        next.set(target.depId, {
+          id: target.depId,
+          requiredVersion: target.requiredVersion,
+          status: 'loaded',
+          loadedVersion: target.manifest.version,
+        });
+        return next;
+      });
+    } catch (err) {
+      setStatuses(prev => {
+        const next = new Map(prev);
+        const current = next.get(target.depId);
+        if (current) {
+          next.set(target.depId, {
+            ...current,
+            status: 'missing',
+            error: String(err),
+          });
+        }
+        return next;
+      });
+    }
+  }, [pendingTrust, onPackageLoaded]);
+
+  const handleDependencyTrustCancel = useCallback(() => {
+    if (!pendingTrust) return;
+    const depId = pendingTrust.depId;
+    setPendingTrust(null);
+    setStatuses(prev => {
+      const next = new Map(prev);
+      const current = next.get(depId);
+      if (current) {
+        next.set(depId, { ...current, status: 'missing', error: undefined });
+      }
+      return next;
+    });
+  }, [pendingTrust]);
 
   if (!isOpen) return null;
 
@@ -320,6 +400,14 @@ export function DependencyDialog({
           <Check size={15} className="mt-0.5 shrink-0" />
           <span className="flex-1">Every package it needs is loaded.</span>
         </div>
+      )}
+
+      {pendingTrust && (
+        <TrustDialog
+          manifest={pendingTrust.manifest}
+          onConfirm={(perms) => { void handleDependencyTrustConfirm(perms); }}
+          onCancel={handleDependencyTrustCancel}
+        />
       )}
     </Dialog>
   );

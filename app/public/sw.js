@@ -119,7 +119,8 @@ self.addEventListener('message', (event) => {
   if (event.data?.type !== 'cache' || !Array.isArray(event.data.urls)) return;
   const urls = event.data.urls.filter((u) => {
     try {
-      return new URL(u).origin === SCOPE.origin;
+      const parsed = new URL(u);
+      return parsed.origin === SCOPE.origin && parsed.pathname.startsWith(SCOPE.pathname);
     } catch {
       return false;
     }
@@ -145,7 +146,9 @@ function isolate(response, pathname) {
 self.addEventListener('fetch', (event) => {
   const request = event.request;
   const url = new URL(request.url);
-  if (request.method !== 'GET' || url.origin !== SCOPE.origin) return;
+  if (request.method !== 'GET' || url.origin !== SCOPE.origin || !url.pathname.startsWith(SCOPE.pathname)) return;
+  if (request.headers?.has?.('authorization')) return;
+  if ((request.headers?.get?.('accept') || '').toLowerCase().includes('text/event-stream')) return;
   event.respondWith(
     (async () => {
       const cache = await caches.open(CACHE);
@@ -153,9 +156,17 @@ self.addEventListener('fetch', (event) => {
       // (the SoftN runtime, an icon opened in a tab, the preview frame) are cached as themselves.
       const shell = request.mode === 'navigate' && request.destination === 'document' && (url.pathname === SCOPE.pathname || url.pathname === `${SCOPE.pathname}index.html`);
       const key = shell ? new URL('./index.html', SCOPE).href : request;
+      const cacheable = (response) => {
+        if (!response || response.status !== 200 || response.type !== 'basic') return false;
+        const ct = (response.headers?.get?.('content-type') || '').toLowerCase();
+        if (ct.includes('text/event-stream')) return false;
+        const cc = (response.headers?.get?.('cache-control') || '').toLowerCase();
+        if (/(?:^|,)\s*(?:no-store|private)\b/.test(cc)) return false;
+        return true;
+      };
       const network = fetch(request)
         .then((response) => {
-          if (response.ok && response.type === 'basic') cache.put(key, response.clone());
+          if (cacheable(response)) cache.put(key, response.clone()).catch(() => {});
           return response;
         })
         .catch(() => null);

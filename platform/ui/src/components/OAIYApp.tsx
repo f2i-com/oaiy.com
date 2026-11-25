@@ -44,7 +44,7 @@ import { useBackendIntegration } from '../hooks/useBackendIntegration';
 import type { QueuedRun, RunOutcome, FlowSnapshot } from '../lib/backendDispatcher';
 import WelcomeWizard from './wizards/WelcomeWizard';
 import { hasCompletedWizard } from '../lib/wizardPrefs';
-import { saveService, listAllServices } from '../utils/serviceRegistry';
+import { saveService, deleteService, listAllServices } from '../utils/serviceRegistry';
 import { listDesktopServices } from '../lib/desktopServices';
 import { inOaiyWindow } from '../lib/oaiyWindow';
 import { desktopSaveState, shared as sharedWithDesktop, subscribeDesktopFlowUnsaved, subscribeDesktopSaveState, type DesktopSaveState } from '../hooks/useDesktopFlows';
@@ -53,7 +53,7 @@ import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import { PermissionRequestQueue } from '../lib/permissionQueue';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
-import { oaiyDesktop } from '../lib/oaiyAgentTools';
+import { isUntrustedOrPkgFlow, oaiyDesktop } from '../lib/oaiyAgentTools';
 import { takeBootNotice } from '../lib/bootNotice';
 import { listenForFlowsIntents } from '../lib/flowsIntents';
 
@@ -749,6 +749,7 @@ export default function OAIYApp() {
       onUpdateFlow={updateFlow}
       onUpdateFlowGraph={updateFlowGraph}
       onReloadMacros={reloadMacros}
+      getPackagePermissions={(pkgId) => getPackagePermissionContext(pkgId)?.grantedPermissions ?? null}
     >
     {/* Promise-style confirm replacement for native window.confirm.
         Mounted here so every modal/panel below can call useConfirmDialog()
@@ -829,7 +830,7 @@ export default function OAIYApp() {
                   <PanelLeft size={16} />
                 </ShellIconAction>
               )}
-              {followsOaiy && section === 'workflows' && activeFlow && (
+              {followsOaiy && section === 'workflows' && activeFlow && !isUntrustedOrPkgFlow(activeFlow, project.flows) && (
                 <ShellIconAction
                   label="Give this flow to the agent"
                   title={`Give "${activeFlow.name}" to OAIY's agent: as a tool of its own, or before or instead of one of its tools`}
@@ -948,7 +949,11 @@ export default function OAIYApp() {
               onDuplicateFlow={duplicateFlow}
               onRenameFlow={renameFlow}
               onSetFlowLocalOnly={setFlowLocalOnly}
-              onSetFlowRemote={(flowId, remote) => updateFlow(flowId, { remote })}
+              onSetFlowRemote={(flowId, remote) => {
+                const target = project.flows.find((f) => f.id === flowId);
+                if (remote && target && isUntrustedOrPkgFlow(target, project.flows)) return;
+                updateFlow(flowId, { remote });
+              }}
               examples={EXAMPLE_FLOWS}
               onAddExample={(example) => {
                 // (on the models this computer has: a step whose model is not here takes the default of its kind)
@@ -1051,6 +1056,7 @@ export default function OAIYApp() {
               key={`${activeFlowId}-${resetCounter}`}
               initialGraph={activeFlow.graph}
               onGraphChange={handleGraphChange}
+              onMarkUntrusted={() => updateFlow(activeFlow.id, { untrusted: true })}
               availableFlows={getAllFlows().filter(f => f.id !== activeFlowId)}
               llmEndpoints={project.llmEndpoints}
               projectConstants={project.constants}
@@ -1150,8 +1156,8 @@ export default function OAIYApp() {
         />}
       </main>
 
-      {agentToolOpen && activeFlow && (
-        <AgentToolDialog flow={activeFlow} onClose={() => setAgentToolOpen(false)} onDone={(message) => addToast(message, 'success')} />
+      {agentToolOpen && activeFlow && !isUntrustedOrPkgFlow(activeFlow, project.flows) && (
+        <AgentToolDialog flow={activeFlow} allFlows={project.flows} onClose={() => setAgentToolOpen(false)} onDone={(message) => addToast(message, 'success')} />
       )}
 
       <NewFlowDialog
@@ -1227,6 +1233,7 @@ export default function OAIYApp() {
         resolveApiKey={(constantName) => (project.constants ?? []).find((c) => c.key === constantName && !!c.value)?.value}
         // (no toast: the wizard lists each service it adds)
         onSaveService={(svc) => saveService(svc)}
+        onRemoveService={(id) => deleteService(id)}
         onSaveApiKey={(constantName, value) => {
           // Wired into project constants as a secret. The runtime resolves
           // it via ctx.getConstant at run time — same as keys typed in

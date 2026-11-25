@@ -91,7 +91,7 @@ const clock = (iso: string) => new Date(iso).toLocaleTimeString(undefined, { hou
  * the person (a storage node to approve, by its fingerprint), is said under that line, in view. The lines that only
  * say each part is fine (listening, checked in, the address) are under "Details".
  */
-function LinkedAccount({ account, onDisconnect }: { account: LinkStatus; onDisconnect: () => void }) {
+function LinkedAccount({ account, onDisconnect, disconnecting }: { account: LinkStatus; onDisconnect: () => void; disconnecting?: boolean }) {
   const who = account.connectorName ?? account.connectorId ?? 'your account';
   const granted = scopeWords(account.grantedScopes);
   const node = account.dataNodeSupported ? account.dataNode : null;
@@ -197,7 +197,7 @@ function LinkedAccount({ account, onDisconnect }: { account: LinkStatus; onDisco
             ))}
           </details>
         </span>
-        <button className="btn-tiny btn-danger" onClick={onDisconnect}>
+        <button className="btn-tiny btn-danger" disabled={disconnecting} onClick={onDisconnect}>
           Disconnect
         </button>
       </li>
@@ -231,11 +231,13 @@ export default function ConnectionsPanel() {
   // the next poll wipes the message from the button they pressed a second ago.
   const [statusError, setStatusError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
+  const [unlinking, setUnlinking] = useState(false);
   const [removingCopies, setRemovingCopies] = useState(false);
   const [relayBusy, setRelayBusy] = useState(false);
-  // (the latest reading of each wins: a poll asked before a change lands after it with what was there before, and would
-  // show a disconnected account, or a cancelled link, back for a moment)
+  // (the latest reading of each wins: a poll asked before or during a change lands after it with what was there before,
+  // and would show a disconnected account, or a cancelled link, back for a moment)
   const accountAsk = useRef(0);
+  const inFlightWrites = useRef(0);
   const pairAsk = useRef(0);
   const relayAsk = useRef(0);
 
@@ -253,10 +255,11 @@ export default function ConnectionsPanel() {
   }, []);
 
   const refreshAccount = useCallback(async () => {
+    if (inFlightWrites.current > 0) return;
     const mine = ++accountAsk.current;
     try {
       const next = await linkApi.status();
-      if (mine !== accountAsk.current) return;
+      if (mine !== accountAsk.current || inFlightWrites.current > 0) return;
       setAccount(next);
       put('linkStatus', next);
       setStatusError(null);
@@ -270,7 +273,7 @@ export default function ConnectionsPanel() {
           : f;
       });
     } catch (e) {
-      if (mine === accountAsk.current) setStatusError(e instanceof Error ? e.message : String(e));
+      if (mine === accountAsk.current && inFlightWrites.current === 0) setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -329,17 +332,22 @@ export default function ConnectionsPanel() {
 
   const cancelLink = async () => {
     setAccountError(null);
+    inFlightWrites.current += 1;
     accountAsk.current++;
     try {
       const next = await linkApi.cancel();
+      accountAsk.current++;
       setAccount(next);
       put('linkStatus', next);
     } catch (err) {
       setAccountError(err instanceof Error ? err.message : String(err));
+    } finally {
+      inFlightWrites.current -= 1;
     }
   };
 
   const unlink = async () => {
+    if (unlinking) return;
     const name = account?.connectorName ?? 'this account';
     if (
       !(await ask(
@@ -348,9 +356,12 @@ export default function ConnectionsPanel() {
     )
       return;
     setAccountError(null);
+    setUnlinking(true);
+    inFlightWrites.current += 1;
     accountAsk.current++;
     try {
       const next = await linkApi.unlink();
+      accountAsk.current++;
       setAccount(next);
       put('linkStatus', next);
       if (next.linked || next.linkError) {
@@ -369,6 +380,9 @@ export default function ConnectionsPanel() {
       }
     } catch (err) {
       setAccountError(err instanceof Error ? err.message : String(err));
+    } finally {
+      inFlightWrites.current -= 1;
+      setUnlinking(false);
     }
   };
 
@@ -376,9 +390,11 @@ export default function ConnectionsPanel() {
   const removeCopies = async () => {
     setAccountError(null);
     setRemovingCopies(true);
+    inFlightWrites.current += 1;
     accountAsk.current++;
     try {
       const next = await linkApi.removeCopies();
+      accountAsk.current++;
       setAccount(next);
       put('linkStatus', next);
       if (next.linkError) {
@@ -389,6 +405,7 @@ export default function ConnectionsPanel() {
     } catch (err) {
       setAccountError(err instanceof Error ? err.message : String(err));
     } finally {
+      inFlightWrites.current -= 1;
       setRemovingCopies(false);
     }
   };
@@ -704,7 +721,7 @@ export default function ConnectionsPanel() {
         )}
 
         {account?.linked ? (
-          <LinkedAccount account={account} onDisconnect={() => void unlink()} />
+          <LinkedAccount account={account} disconnecting={unlinking} onDisconnect={() => void unlink()} />
         ) : account && account.available.length === 0 ? (
           <p className="form-hint">
             No connectors are available in this build. Drop a connector descriptor into the

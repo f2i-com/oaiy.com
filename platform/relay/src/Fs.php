@@ -120,10 +120,12 @@ final class Fs
     }
 
     /**
-     * A path with symlinks resolved, for a path that may not exist yet: the nearest existing ancestor is resolved and the
-     * missing rest appended (a fresh install has no data/ folder yet, and that is exactly when it must be checked).
+     * A path with symlinks resolved, for a path that may not exist yet: components are resolved progressively with
+     * realpath() on the existing prefix before collapsing any `..` segment, falling back to lexical normalization
+     * only once a non-existent component is reached (a fresh install has no data/ folder yet, and that is exactly
+     * when it must be checked).
      */
-    private static function resolveLoose(string $path): ?string
+    public static function resolveLoose(string $path): ?string
     {
         $cur = str_replace('\\', '/', $path);
         if (preg_match('#^([A-Za-z]:)?/#', $cur) !== 1) {
@@ -138,32 +140,44 @@ final class Fs
             $prefix = $m[1];
             $cur = substr($cur, 2);
         }
-        $parts = [];
+        $root = @realpath($prefix . '/');
+        $resolved = $root !== false ? rtrim(str_replace('\\', '/', $root), '/') : $prefix;
+        $tail = [];
         foreach (explode('/', $cur) as $seg) {
             if ($seg === '' || $seg === '.') {
                 continue;
             }
             if ($seg === '..') {
-                array_pop($parts);
+                if ($tail) {
+                    array_pop($tail);
+                    continue;
+                }
+                $parent = @realpath($resolved . '/..');
+                if ($parent !== false) {
+                    $resolved = rtrim(str_replace('\\', '/', $parent), '/');
+                    continue;
+                }
+                if ($resolved !== '' && preg_match('#^[A-Za-z]:$#D', $resolved) !== 1) {
+                    $pos = strrpos($resolved, '/');
+                    if ($pos !== false) {
+                        $resolved = substr($resolved, 0, $pos);
+                    }
+                }
                 continue;
             }
-            $parts[] = $seg;
-        }
-        $tail = [];
-        while ($parts) {
-            $real = @realpath($prefix . '/' . implode('/', $parts));
-            if ($real !== false) {
-                $real = rtrim(str_replace('\\', '/', $real), '/');
-                return $tail ? $real . '/' . implode('/', $tail) : $real;
+            if (!$tail) {
+                $next = @realpath($resolved . '/' . $seg);
+                if ($next !== false) {
+                    $resolved = rtrim(str_replace('\\', '/', $next), '/');
+                    continue;
+                }
             }
-            array_unshift($tail, array_pop($parts));
+            $tail[] = $seg;
         }
-        $root = @realpath($prefix . '/');
-        if ($root !== false) {
-            $root = rtrim(str_replace('\\', '/', $root), '/');
-            return $tail ? $root . '/' . implode('/', $tail) : $root;
+        if ($tail) {
+            return $resolved . '/' . implode('/', $tail);
         }
-        return $prefix . '/' . implode('/', $tail);
+        return ($resolved === '' || preg_match('#^[A-Za-z]:$#D', $resolved) === 1) ? $resolved . '/' : $resolved;
     }
 
     /** True when $inner is $outer or inside it (both resolved; symlinks followed; $inner may not exist yet). */

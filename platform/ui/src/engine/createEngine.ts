@@ -226,6 +226,8 @@ export interface CreateEngineOptions {
   scriptExecutor?: ScriptExecutor | null;
   /** Refuse to run flow code when no `scriptExecutor` is set (fail closed). */
   requireScriptExecutor?: boolean;
+  /** Look up granted permissions for packages referenced by `pkg:*` nodes in regular flows. */
+  packagePermissionsLookup?: (packageId: string) => readonly string[] | null | undefined;
 }
 
 /**
@@ -257,5 +259,6 @@ export function createEngine(opts: CreateEngineOptions = {}): JobManager {
     // no Worker factory was supplied (the CLI's case).
     scriptExecutor: opts.scriptExecutor ?? null,
     requireScriptExecutor: opts.requireScriptExecutor ?? false,
+    packagePermissionsLookup: opts.packagePermissionsLookup,
   });
 }

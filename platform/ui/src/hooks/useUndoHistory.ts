@@ -20,7 +20,12 @@ interface Options {
 }
 
 export function useUndoHistory({ nodes, edges, setNodes, setEdges, onRemoved }: Options) {
-  const history = useRef(new UndoHistory());
+  const history = useRef<UndoHistory | null>(null);
+  if (history.current === null) {
+    const seeded = new UndoHistory();
+    seeded.record({ nodes, edges });
+    history.current = seeded;
+  }
   const latest = useRef<CanvasState>({ nodes, edges });
   latest.current = { nodes, edges };
   const removedRef = useRef(onRemoved);
@@ -28,7 +33,7 @@ export function useUndoHistory({ nodes, edges, setNodes, setEdges, onRemoved }: 
   const [, redraw] = useState(0);
 
   const settle = useCallback((state: CanvasState) => {
-    const before = history.current.record(state);
+    const before = history.current!.record(state);
     if (!before) return;
     redraw((n) => n + 1);
     const here = new Set(state.nodes.map((n) => n.id));
@@ -55,8 +60,8 @@ export function useUndoHistory({ nodes, edges, setNodes, setEdges, onRemoved }: 
     [setNodes, setEdges],
   );
 
-  const undo = useCallback(() => apply(history.current.undo(latest.current)), [apply]);
-  const redo = useCallback(() => apply(history.current.redo(latest.current)), [apply]);
+  const undo = useCallback(() => apply(history.current!.undo(latest.current)), [apply]);
+  const redo = useCallback(() => apply(history.current!.redo(latest.current)), [apply]);
 
   return { undo, redo, canUndo: history.current.canUndo, canRedo: history.current.canRedo };
 }

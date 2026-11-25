@@ -4,7 +4,20 @@ import type { Flow, MacroPortDefinition } from 'oaiy-core';
 import { useJobQueue } from '../../contexts/JobQueueContext';
 import { open } from '@tauri-apps/plugin-dialog';
 import { uiLogger as logger } from '../../utils/logger';
+import { mediaUrlBlocked } from '../../lib/localMedia';
 import Dialog from './Dialog';
+
+function isSafeMediaSrc(url: string, kind: 'image' | 'video' | 'audio'): boolean {
+  if (!url || typeof url !== 'string') return false;
+  if (mediaUrlBlocked(url)) return false;
+  const t = url.trim().toLowerCase();
+  return (
+    t.startsWith('http://') ||
+    t.startsWith('https://') ||
+    t.startsWith('blob:') ||
+    t.startsWith(`data:${kind}/`)
+  );
+}
 
 interface MacroRunnerModalProps {
   macro: Flow;
@@ -255,8 +268,11 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
 
     const stringValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
 
-    // Check if it's an image (data URL or file path)
-    if (output.type === 'image' || (typeof value === 'string' && (value.startsWith('data:image/') || /\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(value)))) {
+    // Check if it's an image (safe http/https/blob/data:image URL, not blocked local media)
+    if (
+      (output.type === 'image' || (typeof value === 'string' && (value.startsWith('data:image/') || /\.(png|jpg|jpeg|gif|webp|bmp)(\?|#|$)/i.test(value)))) &&
+      isSafeMediaSrc(stringValue, 'image')
+    ) {
       return (
         <div className="mt-2">
           <img
@@ -268,8 +284,11 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
       );
     }
 
-    // Check if it's a video
-    if (output.type === 'video' || (typeof value === 'string' && /\.(mp4|mov|avi|mkv|webm)$/i.test(value))) {
+    // Check if it's a video (safe URL scheme and not blocked)
+    if (
+      (output.type === 'video' || (typeof value === 'string' && /\.(mp4|mov|avi|mkv|webm)(\?|#|$)/i.test(value))) &&
+      isSafeMediaSrc(stringValue, 'video')
+    ) {
       return (
         <div className="mt-2">
           <video
@@ -281,8 +300,11 @@ export default function MacroRunnerModal({ macro, onClose, onShowToast }: MacroR
       );
     }
 
-    // Check if it's audio
-    if (output.type === 'audio' || (typeof value === 'string' && /\.(mp3|wav|ogg|flac|m4a|aac)$/i.test(value))) {
+    // Check if it's audio (safe URL scheme and not blocked)
+    if (
+      (output.type === 'audio' || (typeof value === 'string' && /\.(mp3|wav|ogg|flac|m4a|aac)(\?|#|$)/i.test(value))) &&
+      isSafeMediaSrc(stringValue, 'audio')
+    ) {
       return (
         <div className="mt-2">
           <audio src={stringValue} controls className="w-full" />

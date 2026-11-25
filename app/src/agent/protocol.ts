@@ -454,8 +454,9 @@ export async function sendTurn(
   tools: ToolSpec[],
   options: RequestOptions = {},
 ): Promise<Reply> {
-  const model = provider.modelId?.trim();
-  if (!model) throw new AIProviderError('no-model', `${provider.name} has no model chosen. Open settings and pick one of its models.`);
+  const model = provider.modelId?.trim() ?? '';
+  const followsEngine = provider.followEngine === true && provider.serverKind === 'oaiy' && provider.type !== 'anthropic';
+  if (!model && !followsEngine) throw new AIProviderError('no-model', `${provider.name} has no model chosen. Open settings and pick one of its models.`);
   const url = providerEndpoints(provider).chat;
   const maxTokens = options.maxOutputTokens ?? 16_384;
   if (provider.type === 'anthropic') {
@@ -474,7 +475,7 @@ export async function sendTurn(
   const includeReasoning = /deepseek/i.test(url) || /deepseek[-_]?(?:r1|reasoner)/i.test(model);
   const body: Record<string, unknown> = {
     // Following OAIY's Engines: no model named, so the engine uses the one chosen there (naming the last one seen would load it back).
-    ...(provider.followEngine ? {} : { model }),
+    ...(followsEngine ? {} : { model }),
     stream: true,
     stream_options: { include_usage: true },
     messages: openAIMessages(system, turns, includeReasoning),

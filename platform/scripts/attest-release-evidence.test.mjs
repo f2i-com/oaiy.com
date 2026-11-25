@@ -85,6 +85,23 @@ console.log('attest-release-evidence');
   ok('a missing artifact refuses', r.refused && r.unchanged, r.message);
 }
 {
+  // Path traversal, subdirectories, empty/dot names, and non-regular-file targets must be refused.
+  for (const badName of ['', '.', '..', '../escape.zip', 'sub/oaiy-web-0.0.1.zip', 'sub\\oaiy-web-0.0.1.zip']) {
+    const dir = fixture();
+    const evPath = path.join(dir, 'release-evidence-web.json');
+    const ev = JSON.parse(fs.readFileSync(evPath, 'utf8'));
+    ev.artifacts[0].name = badName;
+    fs.writeFileSync(evPath, JSON.stringify(ev, null, 2));
+    const r = refuses(dir, env(), /invalid artifact name/);
+    ok(`invalid artifact name ${JSON.stringify(badName)} refuses`, r.refused && r.unchanged, r.message);
+  }
+  const dir = fixture();
+  fs.rmSync(path.join(dir, 'oaiy-web-0.0.1.zip'));
+  fs.mkdirSync(path.join(dir, 'oaiy-web-0.0.1.zip'));
+  const r = refuses(dir, env(), /not a regular file/);
+  ok('a directory in place of an artifact refuses', r.refused && r.unchanged, r.message);
+}
+{
   const r = refuses(fixture({ audit: 'pass' }), env(), /expected verification.status "unverified"/);
   ok('a build job that stamped pass itself is refused', r.refused && r.unchanged, r.message);
 }

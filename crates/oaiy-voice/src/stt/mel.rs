@@ -201,18 +201,23 @@ pub fn slaney_filters(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64
     let logstep = 6.4f64.ln() / 27.0;
     let hz_to_mel = |f: f64| if f >= min_log_hz { min_log_mel + (f / min_log_hz).ln() / logstep } else { f / f_sp };
     let mel_to_hz = |m: f64| if m >= min_log_mel { min_log_hz * (logstep * (m - min_log_mel)).exp() } else { f_sp * m };
-    let bins = n_fft / 2 + 1;
+    let bins = (n_fft / 2).checked_add(1).expect("slaney_filters: n_fft overflow");
+    let total = n_mels.checked_mul(bins).expect("slaney_filters: filterbank size overflow");
+    let mel_steps = n_mels.checked_add(1).expect("slaney_filters: n_mels overflow");
+    let mel_edges = n_mels.checked_add(2).expect("slaney_filters: n_mels overflow");
     let freqs: Vec<f64> = (0..bins).map(|i| i as f64 * sr / n_fft as f64).collect();
     let (lo, hi) = (hz_to_mel(fmin), hz_to_mel(fmax));
-    let step = (hi - lo) / (n_mels + 1) as f64;
-    let mel_f: Vec<f64> = (0..n_mels + 2).map(|i| mel_to_hz(lo + step * i as f64)).collect();
-    let mut w = vec![0f32; n_mels * bins];
+    let step = (hi - lo) / mel_steps as f64;
+    let mel_f: Vec<f64> = (0..mel_edges).map(|i| mel_to_hz(lo + step * i as f64)).collect();
+    let mut w = vec![0f32; total];
     for m in 0..n_mels {
         let enorm = 2.0 / (mel_f[m + 2] - mel_f[m]);
+        let row = m.checked_mul(bins).expect("slaney_filters: row offset overflow");
         for (b, f) in freqs.iter().enumerate() {
             let lower = (f - mel_f[m]) / (mel_f[m + 1] - mel_f[m]);
             let upper = (mel_f[m + 2] - f) / (mel_f[m + 2] - mel_f[m + 1]);
-            w[m * bins + b] = (lower.min(upper).max(0.0) * enorm) as f32;
+            let idx = row.checked_add(b).expect("slaney_filters: index overflow");
+            w[idx] = (lower.min(upper).max(0.0) * enorm) as f32;
         }
     }
     w

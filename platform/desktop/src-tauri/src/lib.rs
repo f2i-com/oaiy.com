@@ -363,25 +363,50 @@ fn open_path(webview: tauri::Webview, path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Open an external URL (e.g. https://oaiy.com) in the system default browser.
-/// Unlike `open_path`, this does NOT existence-check — it hands the URL to the
-/// OS handler. Guarded to http/https so the UI can't ask us to launch arbitrary
-/// schemes. Invoked from the header's oaiy.com link.
-#[tauri::command]
-fn open_url(webview: tauri::Webview, url: String) -> Result<(), String> {
-    dashboard_only(&webview)?;
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("only http(s) URLs are allowed".into());
-    }
-    // Reject ASCII control chars and shell-dangerous metacharacters so the URL
-    // can't be used to inject commands into a launcher. '%' is intentionally
-    // allowed (valid percent-encoding).
-    if url
-        .chars()
-        .any(|c| c.is_ascii_control() || matches!(c, '"' | '&' | '^' | '|' | '<' | '>' | '`'))
+/// Validate and normalize an external `http(s)` URL before passing it to the OS
+/// browser launcher. Allows `&` in query strings (required by multi-param OAuth
+/// authorization URLs), while rejecting non-http(s) schemes, missing hosts,
+/// quotes, whitespace, NUL, and ASCII control characters.
+pub(super) fn validate_external_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_whitespace() || c == '"')
     {
         return Err("URL contains disallowed characters".into());
     }
+    let rest = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .ok_or_else(|| "only http(s) URLs are allowed".to_string())?;
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err("URL must include a host".into());
+    }
+    let parsed = reqwest::Url::parse(raw).map_err(|_| "invalid URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http(s) URLs are allowed".into());
+    }
+    if parsed.host_str().is_none_or(|h| h.is_empty()) {
+        return Err("URL must include a host".into());
+    }
+    let normalized = parsed.as_str();
+    if normalized
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_whitespace() || c == '"')
+    {
+        return Err("URL contains disallowed characters".into());
+    }
+    Ok(normalized.to_string())
+}
+
+/// Open an external URL (e.g. https://oaiy.com) in the system default browser.
+/// Unlike `open_path`, this does NOT existence-check — it hands the URL to the
+/// OS handler. Guarded to http/https so the UI can't ask us to launch arbitrary
+/// schemes. Invoked from the header's oaiy.com link and OAuth flows.
+#[tauri::command]
+fn open_url(webview: tauri::Webview, url: String) -> Result<(), String> {
+    dashboard_only(&webview)?;
+    let url = validate_external_url(&url)?;
     #[cfg(target_os = "windows")]
     std::process::Command::new(resolved_system_exe("System32", "rundll32.exe", "rundll32"))
         .args(["url.dll,FileProtocolHandler", &url])
@@ -2272,5 +2297,37 @@ mod config_pointer_tests {
         assert!(config_obj_for_change(&p).unwrap().is_empty());
         let aside = p.with_file_name(format!("{}.corrupt", p.file_name().unwrap().to_string_lossy()));
         assert_eq!(std::fs::read_to_string(aside).unwrap(), typo, "what was in it is kept");
+    }
+
+    #[test]
+    fn validate_external_url_allows_multi_param_oauth_and_rejects_unsafe_inputs() {
+        use super::gui::validate_external_url;
+
+        let oauth = "https://provider.example.com/oauth/authorize?response_type=code&client_id=oaiy-desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fcb&state=s123&code_challenge=abc_1-2&code_challenge_method=S256";
+        assert_eq!(validate_external_url(oauth).unwrap(), oauth);
+        assert_eq!(
+            validate_external_url("http://127.0.0.1:8080/login?a=1&b=2").unwrap(),
+            "http://127.0.0.1:8080/login?a=1&b=2"
+        );
+
+        for bad in [
+            "",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:user@example.com",
+            "ftp://example.com/file",
+            "https://",
+            "http:///no-host",
+            "https://example.com/a b",
+            "https://example.com/?a=1\n",
+            "https://example.com/?a=1\r\n",
+            "https://example.com/?a=1\0",
+            "https://example.com/?a=\"b\"",
+        ] {
+            assert!(
+                validate_external_url(bad).is_err(),
+                "expected validate_external_url to reject {bad:?}"
+            );
+        }
     }
 }

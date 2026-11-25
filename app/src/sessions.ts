@@ -2226,9 +2226,9 @@ export class Sessions {
     // A call that failed (the phone's voice link broke, say) says why: the person sees it in the call's record.
     const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
     const endNote = failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.';
+    const endedLink = session.outreach;
     const finishOutreach = () => {
-      const link = session.outreach;
-      if (link && this.outreach?.callEnded(link, conversationLines(session.agent.view()).slice(-8))) this.queueRun(session, OUTREACH_AFTER_CALL);
+      if (endedLink && this.outreach?.callEnded(endedLink, conversationLines(session.agent.view()).slice(-8))) this.queueRun(session, OUTREACH_AFTER_CALL);
     };
     if (running) {
       // Wait until the aborting run settles before appending the call-ended note or evaluating outreach lines.
@@ -2887,43 +2887,47 @@ export class Sessions {
       failed = (error as Error).message;
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {
-      stopHolding();
-      stopHoldWord();
-      session.inTool = false;
-      session.parting = undefined;
-      // The task this run was (none, when it was a message of the person's).
-      const task = session.answers?.findIndex((a) => a.prompt === prompt) ?? -1;
-      if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
-      session.running = null;
-      session.controller = null;
-      session.answering = undefined;
-      const alive = this.list.includes(session);
-      const afterEnd = session.afterEnd;
-      session.afterEnd = undefined;
-      if (!alive) {
-        finish();
+      try {
+        stopHolding();
+        stopHoldWord();
+        session.inTool = false;
+        session.parting = undefined;
+        // The task this run was (none, when it was a message of the person's).
+        const task = session.answers?.findIndex((a) => a.prompt === prompt) ?? -1;
+        if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
+        session.controller = null;
+        session.answering = undefined;
+        const alive = this.list.includes(session);
+        const afterEnd = session.afterEnd;
+        session.afterEnd = undefined;
+        if (!alive) {
+          session.running = null;
+          this.hooks.changed();
+          return;
+        }
+        session.lastAt = Date.now();
+        // Messages that came as it finished: its next turn.
+        const unread = session.agent.takeUnread();
+        // Its call has ended: append any deferred end note now that agent.run() and heard… settled, then keep any last unread words.
+        const callOver = !!onCall && session.callId !== onCall;
+        if (afterEnd && !session.callId) afterEnd.note();
+        if (callOver && unread.length && !session.callId) session.agent.turns.push({ role: 'user', text: unread.join('\n\n'), at: Date.now() });
+        await this.save(session);
+        await this.saveIndex();
+        session.running = null;
+        this.hooks.finished?.(session);
+        if (afterEnd && !session.callId) afterEnd.outreach();
+        // A booking promised but not requested: the agent is told once, and requests it.
+        if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
+          session.bookingNudged = true;
+          unread.push(BOOKING_NUDGE);
+        }
+        if (!callOver && unread.length) this.deliver(session, unread.join('\n\n'));
         this.hooks.changed();
-        return;
+      } finally {
+        session.running = null;
+        finish();
       }
-      session.lastAt = Date.now();
-      // Messages that came as it finished: its next turn.
-      const unread = session.agent.takeUnread();
-      // Its call has ended: append any deferred end note now that agent.run() and heard… settled, then keep any last unread words.
-      const callOver = !!onCall && session.callId !== onCall;
-      if (afterEnd && !session.callId) afterEnd.note();
-      if (callOver && unread.length && !session.callId) session.agent.turns.push({ role: 'user', text: unread.join('\n\n'), at: Date.now() });
-      finish();
-      await this.save(session);
-      await this.saveIndex();
-      this.hooks.finished?.(session);
-      if (afterEnd && !session.callId) afterEnd.outreach();
-      // A booking promised but not requested: the agent is told once, and requests it.
-      if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
-        session.bookingNudged = true;
-        unread.push(BOOKING_NUDGE);
-      }
-      if (!callOver && unread.length) this.deliver(session, unread.join('\n\n'));
-      this.hooks.changed();
     }
   }
 

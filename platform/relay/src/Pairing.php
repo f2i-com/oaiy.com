@@ -63,6 +63,11 @@ final class Pairing
             $why = 'pid_ended'; // burned, or its third response was rejected
             return null;
         }
+        $dev = $db->one('SELECT revoked_at FROM devices WHERE id = ?' . ($lock ? $db->forShare() : ''), [(string)$row['desktop_dev']]);
+        if ($dev === null || $dev['revoked_at'] !== null) {
+            $why = 'desktop_revoked';
+            return null;
+        }
         return $row;
     }
 
@@ -155,6 +160,7 @@ final class Pairing
                 // 16th and 17th. The gate is taken first, before any read, so the second waits for the first to commit and counts it.
                 $db->gate('pair:' . $p->id);
                 $row = $db->one('SELECT desktop_dev, app_id, offer, mac, desktop_thumb, exp, state FROM pairings WHERE pid = ?' . $db->forUpdate(), [$pid]);
+                Mailbox::requireActive($db, $p->id, 'revoked');
                 if ($row !== null) {
                     if ($row['exp'] > $now && $row['state'] !== 'expired') {
                         // The pid is in use. The same desktop's identical request is a retry of one whose answer was lost: it gets the
@@ -288,6 +294,7 @@ final class Pairing
             $revoked = [];
             $row = self::owned($db, $p, $pid, $now);
             if (!$approve) {
+                Mailbox::requireActive($db, $p->id, 'revoked');
                 if ($row['state'] === 'denied') {
                     return ['state' => 'denied', 'deviceId' => null];
                 }
@@ -298,6 +305,7 @@ final class Pairing
                 return ['state' => 'denied', 'deviceId' => null];
             }
             if ($row['state'] === 'approved') {
+                Mailbox::requireActive($db, $p->id, 'revoked');
                 // The same approval again (the desktop's outbox retries) answers the same; one for another key is a conflict.
                 $th = is_array($doc['phone'] ?? null) && is_string($doc['phone']['thumbprint'] ?? null) ? $doc['phone']['thumbprint'] : '';
                 $dev = $db->one('SELECT thumbprint FROM devices WHERE id = ?', [(string)$row['phone_dev']]);
@@ -471,6 +479,7 @@ final class Pairing
         $now = Clock::now();
         $state = $ctx->db->write(function (Db $db) use ($p, $pid, $now): string {
             $row = self::owned($db, $p, $pid, $now);
+            Mailbox::requireActive($db, $p->id, 'revoked');
             if ($row['state'] !== 'answered') {
                 throw ApiError::make('conflict');
             }
@@ -492,6 +501,7 @@ final class Pairing
         $now = Clock::now();
         $ctx->db->write(function (Db $db) use ($p, $pid, $now): void {
             $row = self::owned($db, $p, $pid, $now, true);
+            Mailbox::requireActive($db, $p->id, 'revoked');
             if ($row['state'] === 'expired') {
                 return;
             }

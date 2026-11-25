@@ -185,6 +185,270 @@ async function main(): Promise<void> {
     );
 
     // -----------------------------------------------------------------------
+    // 1b. Wave-3 FFmpeg & ffprobe bypass regressions (P0 #1 & #2)
+    // -----------------------------------------------------------------------
+    // ffprobe unconditionally prepends `-protocol_whitelist file,pipe` before all args,
+    // strips caller's `-protocol_whitelist`, and inspects positional inputs.
+    const ffprobeGoodArgs = ffmpeg.buildRunCommandArgs('ffprobe', [
+      '-v',
+      'error',
+      '-protocol_whitelist',
+      'file,http,https',
+      '-show_entries',
+      'format=duration',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
+      dummyMp4,
+    ]);
+    check(
+      'ffprobe prepends -protocol_whitelist file,pipe before all args and strips caller whitelist',
+      ffprobeGoodArgs[0] === '-protocol_whitelist' &&
+        ffprobeGoodArgs[1] === 'file,pipe' &&
+        !ffprobeGoodArgs.includes('file,http,https') &&
+        ffprobeGoodArgs[ffprobeGoodArgs.length - 1] === fs.realpathSync(dummyMp4),
+      `args=${JSON.stringify(ffprobeGoodArgs)}`,
+    );
+
+    // ffprobe positional inputs pointing to playlists or auto-probed/explicit concat lists MUST be rejected.
+    await expectThrows(
+      'ffprobe rejects positional HLS playlist input',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: ['-v', 'error', '-show_format', hlsFile] }),
+      /playlist\/HLS/i,
+    );
+    await expectThrows(
+      'ffprobe rejects bare positional DASH playlist input',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: [dashFile] }),
+      /DASH\/MPD/i,
+    );
+    await expectThrows(
+      'ffprobe rejects positional auto-probed ffconcat input',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: ['-show_format', evilConcat] }),
+      /outside the server fs sandbox/i,
+    );
+    await expectThrows(
+      'ffprobe rejects positional explicit -f concat input even when -f concat comes after input',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: [evilConcat, '-f', 'concat', '-safe', '1'] }),
+      /outside the server fs sandbox/i,
+    );
+    await expectThrows(
+      'ffprobe rejects positional playlist after --',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: ['--', hlsFile] }),
+      /playlist\/HLS/i,
+    );
+
+    // Filtergraph bypasses: leading `=` delimiter, `@instance` suffixes, and file-path filter options.
+    for (const [label, fg] of [
+      ['drawtext=textfile=...', 'drawtext=textfile=/etc/passwd:fontsize=24'],
+      ['drawtext=fontfile=...', 'drawtext=fontfile=/etc/passwd:text=hi'],
+      ['movie@x=...', 'movie@x=/etc/passwd'],
+      ['[0:v]movie@id=...', '[0:v]movie@id=/etc/passwd[out]'],
+      ['amovie@a1=...', 'scale=640:480,amovie@a1=/etc/passwd'],
+      ['subtitles@s=...', 'subtitles@s=/etc/passwd'],
+      ['lut3d@l=...', 'lut3d@l=/etc/passwd'],
+      ['metadata=mode=print:file=...', 'metadata=mode=print:file=/tmp/leak.txt'],
+      ['ametadata=file=...', 'ametadata=file=/tmp/leak.txt'],
+      ['psnr=stats_file=...', 'psnr=stats_file=/tmp/stats.log'],
+      ['libvmaf=log_path=...', 'libvmaf=log_path=/tmp/vmaf.json'],
+      ['movie=filename=...', 'foo=filename=/etc/passwd'],
+      ['dnn_processing=model_path=...', 'dnn_processing=model_path=/etc/passwd'],
+      ['sofalizer=sofa=...', 'sofalizer=sofa=/etc/passwd'],
+    ] as const) {
+      await expectThrows(
+        `rejects confined filtergraph ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, '-vf', fg, 'out.mp4'] }),
+        /filtergraph file-reading expression is not allowed/i,
+      );
+    }
+
+    // Benign filtergraphs still pass buildRunCommandArgs cleanly.
+    const benignArgs = ffmpeg.buildRunCommandArgs('ffmpeg', [
+      '-i',
+      dummyMp4,
+      '-vf',
+      'fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24',
+      'out.mp4',
+    ]);
+    check('benign filtergraph passes confined arg check', benignArgs.includes('fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24'));
+
+    // Concat list parser hardening: backslash/quote escapes & ENOENT fail-closed.
+    const concatEscapes: Array<[string, string, RegExp]> = [
+      ['backslash protocol escape', "ffconcat version 1.0\nfile http\\://169.254.169.254/\n", /disallowed quotes or backslashes/i],
+      ['split single-quote escape', "ffconcat version 1.0\nfile 'http'://169.254.169.254/\n", /malformed quoting/i],
+      ['single-quote backslash splice', "ffconcat version 1.0\nfile 'clip'\\''..'/etc/passwd'\n", /disallowed quotes or backslashes/i],
+      ['backslash inside single quotes', "ffconcat version 1.0\nfile 'clip\\evil.mp4'\n", /disallowed quotes or backslashes/i],
+      ['double-quoted entry', 'ffconcat version 1.0\nfile "clip.mp4"\n', /disallowed quotes or backslashes/i],
+      ['unquoted whitespace', 'ffconcat version 1.0\nfile clip.mp4 extra\n', /disallowed quotes or backslashes/i],
+      ['missing concat entry fails closed on ENOENT', "ffconcat version 1.0\nfile 'does-not-exist.mp4'\n", /could not be inspected/i],
+    ];
+    for (const [idx, [label, content, errPat]] of concatEscapes.entries()) {
+      const f = path.join(tmpRoot, `concat-escape-${idx}.txt`);
+      fs.writeFileSync(f, content);
+      await expectThrows(
+        `checkConcatList rejects ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-f', 'concat', '-safe', '1', '-i', f, 'out.mp4'] }),
+        errPat,
+      );
+    }
+
+    // >4 KB padded `.mpd` (leading XML comment) MUST still be detected by inspectConfinedInput.
+    const paddedMpd = path.join(tmpRoot, 'padded.mpd');
+    const xmlPadding = `<!-- ${'A'.repeat(16 * 1024)} -->\n`;
+    fs.writeFileSync(paddedMpd, `<?xml version="1.0"?>\n${xmlPadding}<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>\n`);
+    await expectThrows(
+      'runCommand rejects >4 KB comment-padded .mpd playlist',
+      () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', paddedMpd, 'out.mp4'] }),
+      /DASH\/MPD/i,
+    );
+    await expectThrows(
+      'ffprobe rejects >4 KB comment-padded positional .mpd playlist',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: [paddedMpd] }),
+      /DASH\/MPD/i,
+    );
+
+    // -----------------------------------------------------------------------
+    // 1c. ScriptHost early-death respawn cap & backoff (P1 #7)
+    // -----------------------------------------------------------------------
+    const { ScriptHost } = await import('../src/zipp/script-host');
+    const crashWorker = path.join(sandbox, 'crash-worker.mjs');
+    fs.writeFileSync(crashWorker, 'process.exit(2);\n');
+    const fakeArtifact = {
+      module: {} as WebAssembly.Module,
+      scriptWorkerEntry: crashWorker,
+      workflowWorkerEntry: crashWorker,
+      identity: {
+        name: 'zipp' as const,
+        release: 'test',
+        version: '0.0.0',
+        revision: '0',
+        variant: 'test',
+        bundle: 'test',
+        wasmSha256: '0'.repeat(64),
+        glueSha256: '0'.repeat(64),
+        languages: ['javascript'],
+      },
+    };
+    const crashHost = new ScriptHost(fakeArtifact, {
+      keepWarm: true,
+      maxRespawnFailures: 3,
+      respawnBackoffMs: 15,
+    });
+    try {
+      await crashHost.warm().catch(() => undefined);
+      // Wait long enough for 2 backoff retries (15 ms + 30 ms) plus margin;
+      // if respawn storm were uncapped, instance would keep climbing indefinitely.
+      await new Promise((r) => setTimeout(r, 350));
+      const instancesAtCap = crashHost.instance;
+      check(
+        'ScriptHost stops keepWarm auto-respawning after maxRespawnFailures early deaths',
+        instancesAtCap === 3,
+        `instance=${instancesAtCap}`,
+      );
+      await new Promise((r) => setTimeout(r, 150));
+      check(
+        'ScriptHost does not spawn further workers after stopping auto-respawn',
+        crashHost.instance === instancesAtCap,
+        `instance=${crashHost.instance} expected=${instancesAtCap}`,
+      );
+      // Next job lazily attempts a spawn and reports host error instead of hanging.
+      const lazyResp = await crashHost.run({ v: 1, jobs: [{ id: 'j1', mode: 'program', source: '1' }] });
+      check(
+        'ScriptHost lazily retries spawn on next job after auto-respawn pause',
+        'results' in lazyResp && lazyResp.results[0]?.ok === false && lazyResp.results[0]?.errorKind === 'host' && crashHost.instance === 4,
+        `resp=${JSON.stringify(lazyResp)} instance=${crashHost.instance}`,
+      );
+    } finally {
+      await crashHost.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // 1d. flow-io.ts zip-bomb & entry-count caps (P2 #14)
+    // -----------------------------------------------------------------------
+    const { zipSync, strToU8 } = await import('fflate');
+    const { loadFlowFile } = await import('../src/flow-io');
+
+    // Too many entries (> 512) rejected.
+    const manyEntries: Record<string, Uint8Array> = {
+      'manifest.json': strToU8(JSON.stringify({ name: 'many', entryFlow: 'flow.json' })),
+      'flow.json': strToU8(JSON.stringify({ nodes: [], edges: [] })),
+    };
+    for (let i = 0; i < 520; i++) manyEntries[`extra-${i}.txt`] = strToU8('x');
+    const manyZipPath = path.join(sandbox, 'many.oaiy');
+    fs.writeFileSync(manyZipPath, zipSync(manyEntries));
+    await expectThrows(
+      'loadFlowFile rejects .oaiy package with >512 entries',
+      async () => loadFlowFile(manyZipPath),
+      /maximum entry count/i,
+    );
+
+    // Highly-compressible >32 MiB JSON zip bomb rejected without OOM.
+    const bombJson = `"${'A'.repeat(33 * 1024 * 1024)}"`;
+    const bombZipPath = path.join(sandbox, 'bomb.oaiy');
+    fs.writeFileSync(
+      bombZipPath,
+      zipSync({
+        'manifest.json': strToU8(JSON.stringify({ name: 'bomb', entryFlow: 'flow.json' })),
+        'flow.json': strToU8(bombJson),
+      }),
+    );
+    await expectThrows(
+      'loadFlowFile rejects .oaiy package exceeding 32 MiB uncompressed JSON cap',
+      async () => loadFlowFile(bombZipPath),
+      /maximum uncompressed JSON size/i,
+    );
+
+    // Non-.json entries are skipped by the filter while valid JSON package loads cleanly.
+    const goodPkgPath = path.join(sandbox, 'good.oaiy');
+    fs.writeFileSync(
+      goodPkgPath,
+      zipSync({
+        'manifest.json': strToU8(JSON.stringify({ id: 'pkg-1', name: 'Good', entryFlow: 'flow.json' })),
+        'flow.json': strToU8(JSON.stringify({ nodes: [], edges: [] })),
+        'assets/huge.bin': new Uint8Array(64 * 1024),
+      }),
+    );
+    const loadedPkg = loadFlowFile(goodPkgPath);
+    check('loadFlowFile loads valid .oaiy package while skipping non-JSON entries', loadedPkg.name === 'Good' && loadedPkg.package?.id === 'pkg-1');
+
+    // -----------------------------------------------------------------------
+    // 1e. zipp/profile.ts block-hoisted var & Annex-B function detection (P2 #15)
+    // -----------------------------------------------------------------------
+    const { scanTopLevelDeclarations, parseScriptProfile, sha256Hex } = await import('../src/zipp/profile');
+    const hoistedCases: Array<[string, string, string]> = [
+      ['BlockStatement var', '{ var host = 1; }', 'host'],
+      ['IfStatement consequent var', 'if (true) { var __emit = 1; }', '__emit'],
+      ['IfStatement alternate Annex-B function', 'if (false) {} else { function __replies() {} }', '__replies'],
+      ['ForStatement init var', 'for (var host = 0; host < 1; host++) {}', 'host'],
+      ['ForInStatement left var', 'for (var __oaiyConsole in {}) {}', '__oaiyConsole'],
+      ['ForOfStatement left destructuring var', 'for (var { host } of []) {}', 'host'],
+      ['WhileStatement body var', 'while (false) var host = 1;', 'host'],
+      ['DoWhileStatement body var', 'do { var __emit = 1; } while (false);', '__emit'],
+      ['SwitchStatement case var', 'switch (1) { case 1: var host = 1; break; }', 'host'],
+      ['TryStatement catch var', 'try {} catch (e) { var __replies = 1; }', '__replies'],
+      ['TryStatement finally Annex-B function', 'try {} finally { function host() {} }', 'host'],
+      ['LabeledStatement var', 'lbl: var host = 1;', 'host'],
+      ['WithStatement var', 'with ({}) { var __emit = 1; }', '__emit'],
+    ];
+    for (const [label, preamble, forbidden] of hoistedCases) {
+      const decls = scanTopLevelDeclarations(preamble);
+      check(`scanTopLevelDeclarations collects ${label}`, decls.names.includes(forbidden) && !decls.lexical.includes(forbidden), `decls=${JSON.stringify(decls)}`);
+      await expectThrows(
+        `parseScriptProfile rejects ${label}`,
+        async () => parseScriptProfile({ v: 1, preamble, preambleSha256: sha256Hex(preamble) }),
+        new RegExp(`declares "${forbidden}"`),
+      );
+    }
+
+    // Block-scoped let/const/class and vars inside functions/classes MUST NOT be treated as top-level.
+    const scopedDecls = scanTopLevelDeclarations(
+      '{ let host = 1; const __emit = 2; class __replies {} } function ok() { var host = 1; function __emit() {} } class C { m() { var __oaiyConsole = 1; } }',
+    );
+    check(
+      'scanTopLevelDeclarations ignores block-scoped lexicals and function/class-scoped vars',
+      scopedDecls.names.join(',') === 'ok,C' && scopedDecls.lexical.join(',') === 'C',
+      `decls=${JSON.stringify(scopedDecls)}`,
+    );
+
+    // -----------------------------------------------------------------------
     // 2. Lexer-aware normalizeSql() (P2-6)
     // -----------------------------------------------------------------------
     const cases: Array<[string, string, string]> = [

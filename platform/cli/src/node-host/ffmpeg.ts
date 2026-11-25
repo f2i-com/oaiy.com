@@ -62,10 +62,15 @@ function resolveArg(a: string): string {
     if (/^[A-Za-z]:(?![\\/])/.test(a) || path.isAbsolute(a)) {
       return confineAbsolute(a);
     }
-    // Block filtergraph expressions and virtual inputs that read arbitrary files from disk
-    // without going through `-i` (e.g., `movie=`, `amovie=`, `subtitles=`, `ass=`,
-    // `drawtext=...textfile=`, `sendcmd`, `asendcmd`, `lut3d`, `haldclut`, `lavfi`).
-    if (/(^|[;,[\]\s])(a?movie|subtitles|ass|a?sendcmd|lut3d|haldclut)\s*=/i.test(a) || /(^|[;,:[\]\s])textfile\s*=/i.test(a)) {
+    // Block filtergraph expressions and virtual inputs that read or write arbitrary files
+    // on disk without going through `-i` (e.g., `movie=`, `movie@id=`, `amovie=`, `subtitles=`,
+    // `ass=`, `drawtext=textfile=`, `drawtext=fontfile=`, `metadata=mode=print:file=`,
+    // `sendcmd`, `asendcmd`, `lut3d`, `haldclut`, `lavfi`, `stats_file=`, `log_path=`,
+    // `filename=`, `model_path=`, `sofa=`).
+    if (
+      /(^|[;,:=\[\]\s])(a?movie|subtitles|ass|a?sendcmd|lut3d|haldclut)(?:@[^=,:;\[\]\s]+)?\s*=/i.test(a) ||
+      /(^|[;,:=\[\]\s])(textfile|fontfile|stats_file|log_path|file|filename|model_path|sofa)\s*=/i.test(a)
+    ) {
       throw new Error(`ffmpeg filtergraph file-reading expression is not allowed in server mode: ${a}`);
     }
     // A bare relative path that traverses upward escapes the worker CWD/sandbox — reject it.
@@ -86,6 +91,31 @@ function resolveArg(a: string): string {
 const DISALLOWED_CONFINED_FLAG =
   /^-(?:\/|filter_script|filter_complex_script|(?:[fvas]pre|preset|sdp_file|vstats_file|passlogfile)(?::|$))/i;
 
+/**
+ * `ffprobe` flags that legitimately consume their immediately following argv token as a
+ * non-input option value. Any other non-flag token passed to `ffprobe` under confinement
+ * is treated as a positional input path and inspected via `inspectConfinedInput`.
+ */
+const FFPROBE_VALUE_FLAGS = new Set([
+  '-v',
+  '-loglevel',
+  '-print_format',
+  '-of',
+  '-show_entries',
+  '-select_streams',
+  '-f',
+  '-safe',
+  '-probesize',
+  '-analyzeduration',
+  '-read_intervals',
+  '-max_probe_packets',
+  '-fpsprobesize',
+  '-threads',
+]);
+
+/** Max leading bytes inspected in `inspectConfinedInput` for playlists / concat manifests (256 KiB). */
+const INSPECT_PROBE_BYTES = 256 * 1024;
+
 /** Whether the `-i` at `at` reads a concat list (`-f concat` among the options before it, after the last input). */
 function concatInput(args: string[], at: number): boolean {
   for (let j = at - 1; j >= 0 && args[j] !== '-i'; j--) {
@@ -95,12 +125,17 @@ function concatInput(args: string[], at: number): boolean {
 }
 
 /**
- * Inspect an `-i` input file under confinement regardless of whether `-f concat` was specified:
+ * Inspect an input file under confinement regardless of whether `-f concat` was specified:
  * auto-probed `ffconcat` manifests are checked through `checkConcatList`, and HLS/DASH playlist
  * headers (`#EXTM3U`, `#EXT-X-`, `<MPD`) are rejected so an attacker-supplied playlist cannot
  * smuggle arbitrary file/network references past CLI arg checks.
  */
-function inspectConfinedInput(inputArg: string, explicitConcat: boolean, seen = new Set<string>()): void {
+function inspectConfinedInput(
+  inputArg: string,
+  explicitConcat: boolean,
+  seen = new Set<string>(),
+  requireExists = false,
+): void {
   if (inputArg === '-' && !explicitConcat) return;
   const diskPath = path.isAbsolute(inputArg)
     ? confineAbsolute(inputArg)
@@ -119,13 +154,17 @@ function inspectConfinedInput(inputArg: string, explicitConcat: boolean, seen = 
     fd = fs.openSync(diskPath, 'r');
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
-    if (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR') return;
+    if (!requireExists && (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR')) return;
     throw new Error(`ffmpeg input could not be inspected: ${e instanceof Error ? e.message : String(e)}`);
   }
   let bytesRead = 0;
-  const buf = Buffer.alloc(4096);
+  const buf = Buffer.alloc(INSPECT_PROBE_BYTES);
   try {
-    bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    while (bytesRead < buf.length) {
+      const n = fs.readSync(fd, buf, bytesRead, buf.length - bytesRead, bytesRead);
+      if (n <= 0) break;
+      bytesRead += n;
+    }
   } finally {
     fs.closeSync(fd);
   }
@@ -169,19 +208,116 @@ function checkConcatList(listPath: string, seen = new Set<string>()): void {
       if (['duration', 'inpoint', 'outpoint'].includes(directive)) continue;
       throw new Error(`ffmpeg concat list directive '${directive}' is not allowed in server mode`);
     }
-    // `file 'a'\''b'` is a'b: the list's own quoting, undone
+    // Only accept either a strict single-quoted literal (`'...'` with no quotes,
+    // backslashes, or control chars inside) or a safe bare path (no quotes,
+    // backslashes, whitespace, or control chars). This prevents parser differentials
+    // against ffmpeg's `av_get_token` (e.g., `http\://...`, `'http'://...`, `'a'\''b'`).
     const quoted = (m?.[2] ?? '').trim();
-    const file = quoted.startsWith("'") ? quoted.replace(/^'|'$/g, '').replace(/'\\''/g, "'") : quoted;
+    if (!quoted) {
+      throw new Error('ffmpeg concat list file entry is empty in server mode');
+    }
+    let file: string;
+    if (quoted.startsWith("'")) {
+      if (!quoted.endsWith("'") || quoted.length < 2) {
+        throw new Error(`ffmpeg concat list file entry has malformed quoting in server mode: ${quoted}`);
+      }
+      const inner = quoted.slice(1, -1);
+      if (!inner || /['"\\\u0000-\u001f]/.test(inner)) {
+        throw new Error(`ffmpeg concat list file entry contains disallowed quotes or backslashes in server mode: ${quoted}`);
+      }
+      file = inner;
+    } else {
+      if (/['"\\\s\u0000-\u001f]/.test(quoted)) {
+        throw new Error(`ffmpeg concat list file entry contains disallowed quotes or backslashes in server mode: ${quoted}`);
+      }
+      file = quoted;
+    }
     const entryResolved = resolveArg(file);
     const entryDiskPath = path.isAbsolute(entryResolved)
       ? confineAbsolute(entryResolved)
       : confineAbsolute(path.resolve(baseDir, entryResolved));
-    inspectConfinedInput(entryDiskPath, false, seen);
+    // Fail closed on missing/unreadable concat entries so a parser/path mismatch cannot skip inspection.
+    inspectConfinedInput(entryDiskPath, false, seen, true);
   }
 }
 
 const mimeFor = (fmt: string): string =>
   fmt === 'png' ? 'image/png' : fmt === 'jpg' || fmt === 'jpeg' ? 'image/jpeg' : `image/${fmt}`;
+
+/** Resolve and validate `run_command` argv for `ffmpeg`/`ffprobe` (exported for unit tests). */
+export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unknown[]): string[] {
+  let resolved = rawArgs.map((x) => resolveArg(String(x)));
+  // Defense-in-depth under confinement: restrict ffmpeg/ffprobe to local file/pipe protocols,
+  // so even a protocol that slips past resolveArg's scheme check (e.g. `subfile` with
+  // comma-options, or a nested/wrapper protocol) can't reach a remote/exotic source.
+  // For ffmpeg, `-protocol_whitelist` is a per-input option emitted before each `-i`.
+  // For ffprobe, inputs may be passed positionally without `-i`, so `-protocol_whitelist file,pipe`
+  // is prepended unconditionally before all args and every positional input is inspected.
+  if (fsConfinementOn()) {
+    const guarded: string[] = [];
+    if (command === 'ffprobe') {
+      guarded.push('-protocol_whitelist', 'file,pipe');
+    }
+    const ffprobeExplicitConcat =
+      command === 'ffprobe' &&
+      resolved.some((tok, idx) => /^-f(?::.*)?$/i.test(tok) && String(resolved[idx + 1] ?? '').toLowerCase() === 'concat');
+    let afterDashDash = false;
+    for (let i = 0; i < resolved.length; i++) {
+      const a = resolved[i];
+      if (!afterDashDash && /^-protocol_whitelist(?::.*)?$/i.test(a)) {
+        i++;
+        continue;
+      }
+      if (!afterDashDash && DISALLOWED_CONFINED_FLAG.test(a)) {
+        throw new Error(`ffmpeg option ${a} is not allowed in server mode`);
+      }
+      if (!afterDashDash && /^-safe(?::.*)?$/i.test(a)) {
+        const val = resolved[i + 1];
+        if (val !== '1') {
+          throw new Error(`ffmpeg ${a} ${val ?? ''} is not allowed in server mode`.trim());
+        }
+      }
+      if (!afterDashDash && /^-f(?::.*)?$/i.test(a) && resolved[i + 1] && String(resolved[i + 1]).toLowerCase() === 'lavfi') {
+        throw new Error('ffmpeg -f lavfi is not allowed in server mode');
+      }
+      if (!afterDashDash && a === '-i') {
+        if (command === 'ffmpeg') {
+          guarded.push('-protocol_whitelist', 'file,pipe');
+        }
+        guarded.push(a);
+        const inputArg = resolved[i + 1];
+        if (inputArg !== undefined) {
+          inspectConfinedInput(inputArg, command === 'ffprobe' ? ffprobeExplicitConcat : concatInput(resolved, i));
+          guarded.push(inputArg);
+          i++;
+        }
+        continue;
+      }
+      if (command === 'ffprobe') {
+        if (!afterDashDash && a === '--') {
+          afterDashDash = true;
+          guarded.push(a);
+          continue;
+        }
+        if (!afterDashDash && FFPROBE_VALUE_FLAGS.has(a.toLowerCase())) {
+          guarded.push(a);
+          if (i + 1 < resolved.length) {
+            guarded.push(resolved[++i]);
+          }
+          continue;
+        }
+        if (afterDashDash || !a.startsWith('-') || a === '-') {
+          inspectConfinedInput(a, ffprobeExplicitConcat);
+          guarded.push(a);
+          continue;
+        }
+      }
+      guarded.push(a);
+    }
+    resolved = guarded;
+  }
+  return resolved;
+}
 
 /** `run_command`: spawn ffmpeg/ffprobe (only those) with path-resolved args. */
 export async function runCommand(args: Record<string, unknown>): Promise<RunCommandResult> {
@@ -194,45 +330,7 @@ export async function runCommand(args: Record<string, unknown>): Promise<RunComm
     };
   }
   const bin = command === 'ffprobe' ? FFPROBE : FFMPEG;
-  let resolved = ((args.args as unknown[]) ?? []).map((x) => resolveArg(String(x)));
-  // Defense-in-depth under confinement: restrict ffmpeg to local file/pipe protocols, so even a
-  // protocol that slips past resolveArg's scheme check (e.g. `subfile` with comma-options, or a
-  // nested/wrapper protocol) can't reach a remote/exotic source. `-protocol_whitelist` is an
-  // input option — emit it before each `-i`. A whitelist the caller set is replaced, not kept: the
-  // video append node sets `file,http,https,tcp,tls` for its concat list, and keeping it let a list
-  // entry (a URL from the run's input) be fetched from anywhere. A concat list's own entries are
-  // files ffmpeg opens without them being args, so each is checked as an arg is.
-  if (fsConfinementOn()) {
-    const guarded: string[] = [];
-    for (let i = 0; i < resolved.length; i++) {
-      const a = resolved[i];
-      if (/^-protocol_whitelist(?::.*)?$/i.test(a)) {
-        i++;
-        continue;
-      }
-      if (DISALLOWED_CONFINED_FLAG.test(a)) {
-        throw new Error(`ffmpeg option ${a} is not allowed in server mode`);
-      }
-      if (/^-safe(?::.*)?$/i.test(a)) {
-        const val = resolved[i + 1];
-        if (val !== '1') {
-          throw new Error(`ffmpeg ${a} ${val ?? ''} is not allowed in server mode`.trim());
-        }
-      }
-      if (a === '-f' && resolved[i + 1] && String(resolved[i + 1]).toLowerCase() === 'lavfi') {
-        throw new Error('ffmpeg -f lavfi is not allowed in server mode');
-      }
-      if (a === '-i') {
-        guarded.push('-protocol_whitelist', 'file,pipe');
-        const inputArg = resolved[i + 1];
-        if (inputArg !== undefined) {
-          inspectConfinedInput(inputArg, concatInput(resolved, i));
-        }
-      }
-      guarded.push(a);
-    }
-    resolved = guarded;
-  }
+  const resolved = buildRunCommandArgs(command, (args.args as unknown[]) ?? []);
   // Pin child CWD to TMP_ROOT so bare relative paths can never read from the inherited worker CWD.
   ensureDir(TMP_ROOT);
   // ffmpeg won't mkdir an output's parent — make sure resolved dirs exist.

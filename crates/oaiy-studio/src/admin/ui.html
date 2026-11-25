@@ -1530,6 +1530,15 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
 const gb = mb => (mb / 1024).toFixed(1);
 const bytesGb = b => (b / 1073741824).toFixed(1);
 const fileUrl = u => !u || !key ? u : u + (u.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+const safeMediaUrl = u => {
+  if (typeof u !== "string") return "";
+  const s = u.trim();
+  return /^(\/|https?:\/\/|blob:)/i.test(s) && !s.startsWith("//") && !s.startsWith("/\\") ? s : "";
+};
+const safeJobId = id => {
+  if (typeof id !== "string" || id === "." || id === ".." || !/^[A-Za-z0-9._-]+$/.test(id)) throw new Error("Invalid job ID");
+  return id;
+};
 // Remote control ports need the key on media links too (an <img> sends no header).
 const keyed = jobs => { for (const j of jobs || []) { j.files = (j.files || []).map(fileUrl); j.preview = fileUrl(j.preview); } return jobs; };
 const key = (() => { try { const k = new URLSearchParams(location.search).get("key"); if (k) sessionStorage.setItem("studio-key", k); return sessionStorage.getItem("studio-key") || ""; } catch { return ""; } })();
@@ -2791,7 +2800,7 @@ function renderState() {
   keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">`
       : AUDIO_ICONS[j.kind] && j.files[0] ? `<div class="ph icon" data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open the result"><svg viewBox="0 0 24 24" aria-hidden="true">${AUDIO_ICONS[j.kind]}</svg></div>` : '<div class="ph"></div>'}
     <div><div class="p">${esc(jobTitle(j))}</div><div class="muted small">${[esc(j.model), esc(jobSize(j)), statusText(j)].filter(Boolean).join(", ")}</div></div>
-    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" data-open>Open</a>` : ""}</div></div>`,
+    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${esc(j.id)}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" data-open>Open</a>` : ""}</div></div>`,
     nothingYet);
   $$("#ov-jobs [data-job]").forEach(el => el.onclick = () => openViewer(el.dataset.job));
   const all = [...state.media.jobs, ...priv];
@@ -2803,12 +2812,12 @@ function renderState() {
     tpl.innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
       <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${[esc(active.model), esc(jobSize(active))].filter(Boolean).join(", ")}`}: ${statusText(active)}</div></div>
-      <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
+      <button class="btn warn" data-cancel="${esc(active.id)}">Cancel</button></div>`;
     morph($("#now"), tpl.content);
   }
   const busy = all.filter(j => j.status === "in_progress" || j.status === "queued").length;
   $("#gallery-count").hidden = !busy; $("#gallery-count").textContent = busy;
-  $$("[data-cancel]").forEach(b => b.onclick = () => api(`/api/jobs/${b.dataset.cancel}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)));
+  $$("[data-cancel]").forEach(b => b.onclick = () => { try { api(`/api/jobs/${encodeURIComponent(safeJobId(b.dataset.cancel))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } });
   if ($("#v-gallery").classList.contains("on")) renderGallery(state.media.jobs);
   $("#cfg-path").textContent = "Configuration: " + state.config_path;
 }
@@ -3218,30 +3227,37 @@ $("#img-model").addEventListener("change", renderImageHints);
 
 // The stage shows one result large; the strip keeps this session's.
 function stageShow(k, item) {
+  const url = safeMediaUrl(item.url), poster = safeMediaUrl(item.poster);
+  if (!url) { toast("Refused an unsafe media URL", true); return; }
   const stage = $(`#${k}-stage`);
   $$(".shown, .actions", stage).forEach(x => x.remove());
   $(`#${k}-empty`).hidden = true;
   $(".expiry", stage)?.remove(); $(".gone", stage)?.remove();
-  const media = item.video ? `<video class="shown" src="${esc(item.url)}" poster="${esc(item.poster || "")}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(item.url)}" alt="${esc(item.prompt)}">`;
+  const media = item.video ? `<video class="shown" src="${esc(url)}" poster="${esc(poster)}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(url)}" alt="${esc(item.prompt)}">`;
   if (item.expires) stage.insertAdjacentHTML("afterbegin", `<div class="expiry">Incognito: deleted at ${new Date(item.expires).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}. Save it to keep it.</div>`);
-  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(item.url)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(item.url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
+  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(url)}" target="_blank" data-open>Open</a><a class="btn" href="${esc(url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
   $("[data-reuse]", stage).onclick = () => { $(`#${k}-prompt`).value = item.prompt; $(`#${k}-prompt`).focus(); };
   $(".shown", stage).onerror = () => {
     $$(".shown, .actions, .expiry", stage).forEach(x => x.remove());
     stage.insertAdjacentHTML("afterbegin", `<div class="gone">${item.expires ? "This incognito result has been deleted, as incognito results are after a while." : "This file is no longer there."}</div>`);
   };
-  $$(`#${k}-strip button`).forEach(b => b.setAttribute("aria-pressed", b.dataset.url === item.url));
+  $$(`#${k}-strip button`).forEach(b => b.setAttribute("aria-pressed", b.dataset.url === url));
 }
 function stageAdd(k, items) {
   const strip = $(`#${k}-strip`);
-  for (const item of [...items].reverse()) {
+  const valid = items.map(item => ({...item, url: safeMediaUrl(item.url), poster: safeMediaUrl(item.poster)})).filter(item => item.url);
+  if (!valid.length) {
+    if (items.length) toast("Refused an unsafe media URL", true);
+    return;
+  }
+  for (const item of [...valid].reverse()) {
     const b = document.createElement("button");
     b.type = "button"; b.dataset.url = item.url; b.title = item.prompt;
-    b.innerHTML = item.video ? `<video src="${esc(item.url)}" poster="${esc(item.poster || "")}" muted preload="metadata"></video>` : `<img src="${esc(item.url)}" alt="">`;
+    b.innerHTML = item.video ? `<video src="${esc(item.url)}" poster="${esc(item.poster)}" muted preload="metadata"></video>` : `<img src="${esc(item.url)}" alt="">`;
     b.onclick = () => stageShow(k, item);
     strip.prepend(b);
   }
-  if (items[0]) stageShow(k, items[0]);
+  stageShow(k, valid[0]);
 }
 function progress(k, text, pct) {
   const bar = $(`#${k}-progress`);
@@ -3275,8 +3291,8 @@ function watchJob(kind, prompt) {
   }, 700);
   return () => { clearInterval(tick); progress("img", null); imgJobId = null; };
 }
-$("#img-cancel").onclick = () => imgJobId && api(`/api/jobs/${imgJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
-$("#vid-cancel").onclick = () => vidJobId && api(vidRoute ? `${vidRoute}/${vidJobId}` : `/api/jobs/${vidJobId}/cancel`, {method: vidRoute ? "DELETE" : "POST"}).then(refresh, e => toast(e.message, true));
+$("#img-cancel").onclick = () => { if (!imgJobId) return; try { api(`/api/jobs/${encodeURIComponent(safeJobId(imgJobId))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
+$("#vid-cancel").onclick = () => { if (!vidJobId) return; try { const id = encodeURIComponent(safeJobId(vidJobId)); api(vidRoute ? `${vidRoute}/${id}` : `/api/jobs/${id}/cancel`, {method: vidRoute ? "DELETE" : "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
 // Incognito results are deleted this long after they finish (see media.rs).
 const expiry = kind => saved?.privacy?.incognito ? Date.now() + (kind === "vid" ? 30 : 10) * 60000 : 0;
 $("#img-form").onsubmit = async e => {
@@ -3294,7 +3310,7 @@ $("#img-form").onsubmit = async e => {
   try {
     // (an edit on a paired computer is a picture request with its pictures in it, as its picture route takes it)
     const r = await api(c.node ? playUrl(c, "images") : refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
-    stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt, expires: expiry("img")})));
+    stageAdd("img", r.data.map(d => ({url: fileUrl(safeMediaUrl(d.url)), prompt: body.prompt, expires: expiry("img")})));
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
@@ -3330,17 +3346,17 @@ $("#vid-form").onsubmit = async e => {
   const route = playUrl(c, "videos");
   try {
     let v = await api(route, {method: "POST", body});
-    vidJobId = v.id; vidRoute = c.node ? route : null;
+    vidJobId = safeJobId(v.id); vidRoute = c.node ? route : null;
     while (v.status === "queued" || v.status === "in_progress") {
       const j = c.node ? null : state?.media?.jobs?.find(j => j.id === v.id);
       progress("vid", v.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : c.node ? ` on ${c.nodeName}` : ""), v.progress);
       await new Promise(r => setTimeout(r, 1500));
-      v = await api(`${route}/${v.id}`);
+      v = await api(`${route}/${encodeURIComponent(safeJobId(v.id))}`);
     }
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
     const j = c.node ? null : state.media.jobs.find(j => j.id === v.id);
-    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`${route}/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: c.node ? 0 : expiry("vid")}]);
+    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`${route}/${encodeURIComponent(safeJobId(v.id))}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: c.node ? 0 : expiry("vid")}]);
   } catch (err) { toast(err.message, true); }
   vidJobId = null; vidRoute = null; progress("vid", null); $("#vid-go").disabled = false;
 };
@@ -3391,7 +3407,7 @@ function watchSpeech(input) {
   }, 700);
   return () => { clearInterval(tick); spProgress(null); spJobId = null; };
 }
-$("#sp-cancel").onclick = () => spJobId && api(`/api/jobs/${spJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#sp-cancel").onclick = () => { if (!spJobId) return; try { api(`/api/jobs/${encodeURIComponent(safeJobId(spJobId))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
 function addSpeech(text, url, voice, canSave) {
   $("#sp-empty").hidden = true; $("#sp-results").hidden = false;
   const el = document.createElement("div"); el.className = "sp-item";
@@ -3445,7 +3461,7 @@ function muProgress(text, pct) {
   bar.hidden = false; $("#mu-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
 $("#mu-instrumental").onchange = () => { $("#mu-lyrics").disabled = $("#mu-instrumental").checked; };
-$("#mu-cancel").onclick = () => muJobId && api(`${muRoute}/${muJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#mu-cancel").onclick = () => { if (!muJobId) return; try { api(`${muRoute}/${encodeURIComponent(safeJobId(muJobId))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
 function addSong(song, url) {
   $("#mu-empty").hidden = true; $("#mu-results").hidden = false;
   const el = document.createElement("div"); el.className = "sp-item";
@@ -3470,16 +3486,16 @@ $("#mu-form").onsubmit = async e => {
     const r = await fetch(muRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
-    muJobId = job.id;
+    muJobId = safeJobId(job.id);
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`${muRoute}/${job.id}`);
+      job = await api(`${muRoute}/${encodeURIComponent(safeJobId(job.id))}`);
       const live = c.node ? job : [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
       const stage = live?.stage && MUSIC_STAGES[live.stage];
       muProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }
     if (job.status !== "completed") throw new Error(job.error?.message || `The song ${job.status}`);
-    addSong(job, fileUrl(`${muRoute}/${job.id}/content`));
+    addSong(job, fileUrl(`${muRoute}/${encodeURIComponent(safeJobId(job.id))}/content`));
   } catch (err) { toast(err.message, true); }
   muJobId = null; muProgress(null); $("#mu-go").disabled = false; refresh();
 };
@@ -3492,7 +3508,7 @@ function sfxProgress(text, pct) {
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#sfx-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-$("#sfx-cancel").onclick = () => sfxJobId && api(`${sfxRoute}/${sfxJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#sfx-cancel").onclick = () => { if (!sfxJobId) return; try { api(`${sfxRoute}/${encodeURIComponent(safeJobId(sfxJobId))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
 $("#sfx-prompt").onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#sfx-form").requestSubmit(); } };
 function addSound(effect, url) {
   $("#sfx-empty").hidden = true; $("#sfx-results").hidden = false;
@@ -3513,16 +3529,16 @@ $("#sfx-form").onsubmit = async e => {
     const r = await fetch(sfxRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
-    sfxJobId = job.id;
+    sfxJobId = safeJobId(job.id);
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`${sfxRoute}/${job.id}`);
+      job = await api(`${sfxRoute}/${encodeURIComponent(safeJobId(job.id))}`);
       const live = c.node ? job : [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
       const stage = live?.stage && SOUND_STAGES[live.stage];
       sfxProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }
     if (job.status !== "completed") throw new Error(job.error?.message || `The sound effect ${job.status}`);
-    addSound(job, fileUrl(`${sfxRoute}/${job.id}/content`));
+    addSound(job, fileUrl(`${sfxRoute}/${encodeURIComponent(safeJobId(job.id))}/content`));
   } catch (err) { toast(err.message, true); }
   sfxJobId = null; sfxProgress(null); $("#sfx-go").disabled = false; refresh();
 };
@@ -3536,11 +3552,12 @@ function m3dProgress(text, pct) {
   if (text === null) { bar.hidden = true; return; }
   bar.hidden = false; $("#m3d-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
 }
-$("#m3d-cancel").onclick = () => m3dJobId && api(`${m3dRoute}/${m3dJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#m3d-cancel").onclick = () => { if (!m3dJobId) return; try { api(`${m3dRoute}/${encodeURIComponent(safeJobId(m3dJobId))}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)); } catch (e) { toast(e.message, true); } };
 // A finished model: the picture as it was cut out, its numbers, and the GLB.
 function addModel3d(job, route = "/api/play/model3d") {
+  const id = encodeURIComponent(safeJobId(job.id));
   $("#m3d-empty").hidden = true; $("#m3d-results").hidden = false;
-  const input = fileUrl(`${route}/${job.id}/input`), glb = fileUrl(`${route}/${job.id}/content`);
+  const input = fileUrl(`${route}/${id}/input`), glb = fileUrl(`${route}/${id}/content`);
   const rows = [["Faces", job.faces?.toLocaleString()], ["Vertices", job.vertices?.toLocaleString()], ["Size", job.bytes ? fmtSize(job.bytes) : null],
     ["Took", job.seconds_taken ? job.seconds_taken.toFixed(0) + " s" : null], ["Resolution", job.resolution], ["Seed", job.seed],
     ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "birefnet" ? "removed" : job.matte === "background" ? "cut away" : null],
@@ -3565,10 +3582,10 @@ $("#m3d-form").onsubmit = async e => {
     const r = await fetch(m3dRoute, {method: "POST", headers, body: JSON.stringify(body)});
     let job = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(job?.error?.message || r.statusText);
-    m3dJobId = job.id;
+    m3dJobId = safeJobId(job.id);
     while (job.status === "queued" || job.status === "in_progress") {
       await new Promise(ok => setTimeout(ok, 1000));
-      job = await api(`${m3dRoute}/${job.id}`);
+      job = await api(`${m3dRoute}/${encodeURIComponent(safeJobId(job.id))}`);
       const stage = M3D_STAGES[job.stage];
       m3dProgress(job.status === "queued" ? (c.node ? `Waiting for ${c.nodeName}'s GPU` : "Waiting for the GPU") : `${job.progress}%${stage ? ", " + stage.toLowerCase() : c.node ? " on " + c.nodeName : ""}`, job.progress);
     }

@@ -481,7 +481,7 @@ API WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter adapter, WGPUDeviceDescripto
 API WGPUQueue wgpuDeviceGetQueue(WGPUDevice device) {
     pthread_mutex_lock(&queue_lock);
     if (device->queue) {
-        size_t cur = atomic_load(&device->queue->refs);
+        unsigned int cur = atomic_load(&device->queue->refs);
         while (cur > 0) {
             if (atomic_compare_exchange_weak(&device->queue->refs, &cur, cur + 1)) {
                 WGPUQueue existing = device->queue;
@@ -564,9 +564,18 @@ API WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice device, WGPUBufferDescriptor co
 }
 
 API WGPUFuture wgpuBufferMapAsync(WGPUBuffer buffer, WGPUMapMode mode, size_t offset, size_t size, WGPUBufferMapCallbackInfo callbackInfo) {
-    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? buffer->size - offset : size;
+    if ((uint64_t)offset > buffer->size) {
+        return post(EV_MAP, callbackInfo.mode, (void (*)(void))callbackInfo.callback, callbackInfo.userdata1, callbackInfo.userdata2,
+                    WGPUMapAsyncStatus_Error, 0, NULL, dup_of("buffer map offset out of bounds"));
+    }
+    uint64_t avail = buffer->size - (uint64_t)offset;
+    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? avail : (uint64_t)size;
+    if (n > avail) {
+        return post(EV_MAP, callbackInfo.mode, (void (*)(void))callbackInfo.callback, callbackInfo.userdata1, callbackInfo.userdata2,
+                    WGPUMapAsyncStatus_Error, 0, NULL, dup_of("buffer map range out of bounds"));
+    }
     int write = (mode & WGPUMapMode_Write) != 0;
-    int failed = tgw_buffer_map(buffer->device->rs, buffer->rs, write, offset, n);
+    int failed = tgw_buffer_map(buffer->device->rs, buffer->rs, write, (uint64_t)offset, n);
     tell(buffer->device);
     if (!failed) {
         buffer->state = WGPUBufferMapState_Mapped;
@@ -576,29 +585,43 @@ API WGPUFuture wgpuBufferMapAsync(WGPUBuffer buffer, WGPUMapMode mode, size_t of
                 failed ? WGPUMapAsyncStatus_Error : WGPUMapAsyncStatus_Success, 0, NULL, failed ? dup_of("the buffer could not be mapped") : NULL);
 }
 
-static void* mapped_range(WGPUBuffer buffer, size_t offset, size_t size) {
+static void* mapped_range(WGPUBuffer buffer, size_t offset, size_t size, int write) {
     if (buffer->state != WGPUBufferMapState_Mapped) return NULL;
-    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? buffer->size - offset : size;
-    void* p = tgw_buffer_range(buffer->device->rs, buffer->rs, offset, n, buffer->write);
+    if (write && !buffer->write) return NULL;
+    if ((uint64_t)offset > buffer->size) return NULL;
+    uint64_t avail = buffer->size - (uint64_t)offset;
+    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? avail : (uint64_t)size;
+    if (n > avail) return NULL;
+    void* p = tgw_buffer_range(buffer->device->rs, buffer->rs, (uint64_t)offset, n, write);
     tell(buffer->device);
     return p;
 }
 
-API void* wgpuBufferGetMappedRange(WGPUBuffer buffer, size_t offset, size_t size) { return mapped_range(buffer, offset, size); }
-API void const* wgpuBufferGetConstMappedRange(WGPUBuffer buffer, size_t offset, size_t size) { return mapped_range(buffer, offset, size); }
+API void* wgpuBufferGetMappedRange(WGPUBuffer buffer, size_t offset, size_t size) { return mapped_range(buffer, offset, size, 1); }
+API void const* wgpuBufferGetConstMappedRange(WGPUBuffer buffer, size_t offset, size_t size) { return mapped_range(buffer, offset, size, 0); }
 
 API WGPUStatus wgpuBufferReadMappedRange(WGPUBuffer buffer, size_t offset, void* data, size_t size) {
-    void* p = mapped_range(buffer, offset, size);
-    if (!p) return WGPUStatus_Error;
-    memcpy(data, p, size);
-    return WGPUStatus_Success;
+    if (buffer->state != WGPUBufferMapState_Mapped) return WGPUStatus_Error;
+    if ((uint64_t)offset > buffer->size) return WGPUStatus_Error;
+    uint64_t avail = buffer->size - (uint64_t)offset;
+    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? avail : (uint64_t)size;
+    if (n > avail || n > SIZE_MAX) return WGPUStatus_Error;
+    if (n > 0 && !data) return WGPUStatus_Error;
+    int failed = tgw_buffer_read_mapped(buffer->device->rs, buffer->rs, (uint64_t)offset, data, (size_t)n);
+    tell(buffer->device);
+    return failed ? WGPUStatus_Error : WGPUStatus_Success;
 }
 
 API WGPUStatus wgpuBufferWriteMappedRange(WGPUBuffer buffer, size_t offset, void const* data, size_t size) {
-    void* p = mapped_range(buffer, offset, size);
-    if (!p) return WGPUStatus_Error;
-    memcpy(p, data, size);
-    return WGPUStatus_Success;
+    if (buffer->state != WGPUBufferMapState_Mapped || !buffer->write) return WGPUStatus_Error;
+    if ((uint64_t)offset > buffer->size) return WGPUStatus_Error;
+    uint64_t avail = buffer->size - (uint64_t)offset;
+    uint64_t n = size == WGPU_WHOLE_MAP_SIZE ? avail : (uint64_t)size;
+    if (n > avail || n > SIZE_MAX) return WGPUStatus_Error;
+    if (n > 0 && !data) return WGPUStatus_Error;
+    int failed = tgw_buffer_write_mapped(buffer->device->rs, buffer->rs, (uint64_t)offset, data, (size_t)n);
+    tell(buffer->device);
+    return failed ? WGPUStatus_Error : WGPUStatus_Success;
 }
 
 API void wgpuBufferUnmap(WGPUBuffer buffer) {
@@ -743,6 +766,11 @@ API WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice device, WGPUCom
 
 API void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder commandEncoder, WGPUBuffer source, uint64_t sourceOffset, WGPUBuffer destination, uint64_t destinationOffset,
                                               uint64_t size) {
+    if (sourceOffset > source->size) {
+        tgw_encoder_copy(commandEncoder->device->rs, commandEncoder->rs, source->rs, sourceOffset, destination->rs, destinationOffset, UINT64_MAX);
+        tell(commandEncoder->device);
+        return;
+    }
     uint64_t n = size == WGPU_WHOLE_SIZE ? source->size - sourceOffset : size;
     tgw_encoder_copy(commandEncoder->device->rs, commandEncoder->rs, source->rs, sourceOffset, destination->rs, destinationOffset, n);
     tell(commandEncoder->device);

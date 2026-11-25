@@ -864,7 +864,7 @@ pub(super) const ATTEND_ROWS_HEADS: usize = 8;
 /// `sparse_attend`: the scores each the host's `dot` (sixteen running sums, a lane each, added as a tree; its products
 /// exact, a kv row read once for the eight heads) times the scale, their largest, the weights `exp(s - max)` (the
 /// device's own) and their sum in order with the sink's, the rows' sum by the weights rounded to bf16 in order, over the
-/// sum correctly rounded and rounded to bf16. `p[0]` = (dim, heads, len), `p[1]` = (the scale's bits). Up to 640
+/// sum correctly rounded and rounded to bf16. `p[0]` = (dim, heads, len, tokens), `p[1]` = (the scale's bits). Up to 640
 /// positions a token and 512 a row (the host's window and picks: 128 and 512).
 pub(super) const DS_ATTEND_ROWS: &str = concat!(
     exact_fns!(),
@@ -894,6 +894,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let len = p[0].z;
     let g = wg.x;
     let tok = wg.y + wg.z * 65535u;
+    if (tok >= p[0].w) { return; }
     for (var e = t; e < HG * dim; e += 256u) {
         qs[e] = q[(tok * heads + g * HG + e / dim) * dim + e % dim];
     }

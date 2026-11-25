@@ -385,11 +385,7 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
         (Some(_), None) => true,
         _ => false,
     };
-    match normalize_in(text, tools, false) {
-        Ok(out) => Ok(out),
-        Err(_) if has_implicit_thought => normalize_in(text, tools, true),
-        Err(e) => Err(e),
-    }
+    normalize_in(text, tools, has_implicit_thought)
 }
 
 fn normalize_in(text: &str, tools: &[Json], started_in_thought: bool) -> Result<String, String> {

@@ -599,3 +599,97 @@ test('9.2 the 429 of a stream open or a frames wait over the in-flight bound, th
         $h->release();
     }
 });
+
+test('4.14.5 mid-stream DB errors (PDOException and ApiError) are logged and still flush the mandatory end event; Kernel::main catches Throwable from emit without corrupting sent output', function () {
+    // 1. Mid-stream PDOException after frame 1 is delivered.
+    [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 4]]);
+    $k->r->countersMayDrift = true;
+    eq(200, $k->send($ta, 'plugin', [['n' => 1]])['status']);
+    $ctx = $k->r->ctx();
+    $f = $k->facade($plug);
+    $out = '';
+    $sabotaged = false;
+    $cursor = Stream::run($ctx, $f, 0, 4.0, static function (string $chunk) use (&$out, &$sabotaged, $k): bool {
+        $out .= $chunk;
+        if (!$sabotaged && strpos($chunk, "event: frame\n") !== false) {
+            $sabotaged = true;
+            $k->r->ctx()->db->exec('DROP TABLE items');
+        }
+        return true;
+    }, static fn(): bool => false);
+    eq(1, $cursor, 'returned cursor after mid-stream PDOException');
+    ok(str_starts_with($out, Stream::PREAMBLE), 'preamble was emitted');
+    contains("id: 1\nevent: frame\n", $out);
+    ok(str_ends_with($out, aks_end(1)), 'mandatory end event flushed with cursor 1 after PDOException');
+    $lines = array_map(static fn(string $l) => json_decode($l, true), file($k->r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $logged = array_values(array_filter($lines, static fn($j): bool => is_array($j) && ($j['event'] ?? '') === 'internal' && ($j['where'] ?? '') === 'aokie.stream' && ($j['class'] ?? '') === 'PDOException'));
+    ok(count($logged) >= 1, 'PDOException logged via Log::error under aokie.stream');
+
+    // 2. Mid-stream ApiError (database cannot reopen after close) after frame 1 is delivered.
+    [$k2, $a2, $b2, $plug2, $ta2] = aok_pair(['wait' => ['max' => 4]]);
+    $k2->r->countersMayDrift = true;
+    eq(200, $k2->send($ta2, 'plugin', [['n' => 1]])['status']);
+    $ctx2 = $k2->r->ctx();
+    $f2 = $k2->facade($plug2);
+    $out2 = '';
+    $sabotaged2 = false;
+    $cursor2 = Stream::run($ctx2, $f2, 0, 4.0, static function (string $chunk) use (&$out2, &$sabotaged2, $k2): bool {
+        $out2 .= $chunk;
+        if (!$sabotaged2 && strpos($chunk, "event: frame\n") !== false) {
+            $sabotaged2 = true;
+            if (Relay::isMysql()) {
+                $k2->r->configure(['db' => ['dsn' => 'mysql:host=127.0.0.1;port=' . Server::freePort() . ';dbname=none']]);
+            } else {
+                rename($k2->r->data . '/relay.sqlite', $k2->r->data . '/relay.sqlite.away');
+                foreach (['-wal', '-shm'] as $x) {
+                    @rename($k2->r->data . '/relay.sqlite' . $x, $k2->r->data . '/relay.sqlite.away' . $x);
+                }
+                mkdir($k2->r->data . '/relay.sqlite');
+            }
+        }
+        return true;
+    }, static fn(): bool => false);
+    eq(1, $cursor2, 'returned cursor after mid-stream ApiError');
+    ok(str_ends_with($out2, aks_end(1)), 'mandatory end event flushed with cursor 1 after ApiError');
+    $lines2 = array_map(static fn(string $l) => json_decode($l, true), file($k2->r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $logged2 = array_values(array_filter($lines2, static fn($j): bool => is_array($j) && ($j['event'] ?? '') === 'internal' && ($j['where'] ?? '') === 'aokie.stream' && ($j['class'] ?? '') === 'Oaiy\\Relay\\ApiError'));
+    ok(count($logged2) >= 1, 'ApiError logged via Log::error under aokie.stream');
+
+    // 3. Kernel::main() catches an unexpected Throwable from $res->emit() and logs via Log::error without corrupting already-sent SSE output.
+    [$k3, $a3, $b3, $plug3, $ta3] = aok_pair(['wait' => ['max' => 4]]);
+    $script = Tmp::dir('emit-catch') . '/run.php';
+    file_put_contents($script, '<?php
+define("OAIY_RELAY", true);
+require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
+Oaiy\Relay\Paths::setDataDir($argv[1]);
+$_SERVER = [
+    "REQUEST_METHOD" => "GET",
+    "REQUEST_URI" => "/v1/aokie-companion/relay/stream",
+    "HTTP_AUTHORIZATION" => "Bearer " . $argv[2],
+    "HTTP_ACCEPT" => "text/event-stream",
+    "REMOTE_ADDR" => "127.0.0.1",
+];
+Oaiy\Relay\Stream::$sleeper = static function (float $s): void {
+    throw new \RuntimeException("emit-boom");
+};
+Oaiy\Relay\Kernel::main();
+');
+    $p = proc_open(
+        array_merge([PHP_BINARY], Server::phpFlags(), ['-d', 'auto_prepend_file=' . dirname(__DIR__) . '/prepend.php', $script, $k3->r->data, $ta3]),
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        array_merge(getenv(), ['OAIY_TEST_CLOCK' => Tmp::clockFile()])
+    );
+    $stdout = (string)stream_get_contents($pipes[1]);
+    $stderr = (string)stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($p);
+    eq(0, $exit, 'Kernel::main exited cleanly despite Throwable in emit: ' . $stderr);
+    eq(Stream::PREAMBLE, $stdout, 'already-flushed preamble was not corrupted with an error body');
+    eq(0, $k3->r->ctx()->holds->byKind()['stream'], 'stream hold was still released by finally');
+    $lines3 = array_map(static fn(string $l) => json_decode($l, true), file($k3->r->data . '/logs/relay.log', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+    $logged3 = array_values(array_filter($lines3, static fn($j): bool => is_array($j) && ($j['event'] ?? '') === 'internal' && ($j['where'] ?? '') === 'emit' && ($j['message'] ?? '') === 'emit-boom'));
+    ok(count($logged3) >= 1, 'emit Throwable logged via Log::error');
+});

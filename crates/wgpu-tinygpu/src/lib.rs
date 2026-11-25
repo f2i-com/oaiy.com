@@ -653,16 +653,39 @@ fn write_range(conn: &Conn, id: u64, start: u64, data: &[u8]) {
 
 impl BufferInterface for TgBuffer {
     fn map_async(&self, mode: wgpu::MapMode, range: Range<wgpu::BufferAddress>, callback: BufferMapCallback) {
+        let Some(len) = range.end.checked_sub(range.start) else {
+            callback(Err(wgpu::BufferAsyncError));
+            return;
+        };
+        if range.end > self.size {
+            callback(Err(wgpu::BufferAsyncError));
+            return;
+        }
         // (a buffer mapped for writing starts as it is, as WebGPU's does)
-        let data = read_range(&self.mem.conn, self.mem.id, range.start, range.end - range.start);
+        let data = if len == 0 { Vec::new() } else { read_range(&self.mem.conn, self.mem.id, range.start, len) };
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = Some(Mapping { start: range.start, data, write: mode == wgpu::MapMode::Write });
         callback(Ok(()));
     }
     fn get_mapped_range(&self, sub_range: Range<wgpu::BufferAddress>) -> Result<DispatchBufferMappedRange, wgpu::MapRangeError> {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let m = state.as_ref().expect("tinygpu: a range of a buffer that is not mapped");
-        let (a, b) = ((sub_range.start - m.start) as usize, (sub_range.end - m.start) as usize);
-        Ok(DispatchBufferMappedRange::custom(TgMappedRange { data: m.data[a..b].to_vec(), back: m.write.then(|| (Arc::clone(&self.state), a)) }))
+        // Note: wgpu::MapRangeError(pub(crate) String) has no public constructor in wgpu 30, so invalid ranges
+        // fail via an explicit validation panic (caught by webgpu-tinygpu's TgwDevice::guard) rather than underflowing.
+        let a = sub_range
+            .start
+            .checked_sub(m.start)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or_else(|| panic!("tinygpu: mapped range {}..{} starts before mapped offset {}", sub_range.start, sub_range.end, m.start));
+        let b = sub_range
+            .end
+            .checked_sub(m.start)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or_else(|| panic!("tinygpu: mapped range {}..{} ends outside mapped range", sub_range.start, sub_range.end));
+        let slice = m
+            .data
+            .get(a..b)
+            .unwrap_or_else(|| panic!("tinygpu: mapped range {}..{} exceeds mapped range {}..{}", sub_range.start, sub_range.end, m.start, m.start.saturating_add(m.data.len() as u64)));
+        Ok(DispatchBufferMappedRange::custom(TgMappedRange { data: slice.to_vec(), back: m.write.then(|| (Arc::clone(&self.state), a)), dirty: false }))
     }
     fn unmap(&self) {
         if let Some(m) = self.state.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -674,18 +697,26 @@ impl BufferInterface for TgBuffer {
     fn destroy(&self) {}
 }
 
-/// A mapped range's bytes, a copy; written back to the buffer's mapping when dropped, where it is for writing.
+/// A mapped range's bytes, a copy; written back to the buffer's mapping when dropped, where it was written to.
 #[derive(Debug)]
 struct TgMappedRange {
     data: Vec<u8>,
     back: Option<(Arc<Mutex<Option<Mapping>>>, usize)>,
+    dirty: bool,
 }
 
 impl Drop for TgMappedRange {
     fn drop(&mut self) {
+        if !self.dirty {
+            return;
+        }
         if let Some((state, at)) = &self.back {
             if let Some(m) = state.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-                m.data[*at..*at + self.data.len()].copy_from_slice(&self.data);
+                if let Some(end) = at.checked_add(self.data.len()) {
+                    if let Some(dst) = m.data.get_mut(*at..end) {
+                        dst.copy_from_slice(&self.data);
+                    }
+                }
             }
         }
     }
@@ -699,6 +730,7 @@ impl BufferMappedRangeInterface for TgMappedRange {
         &self.data
     }
     unsafe fn write_slice(&mut self) -> wgpu::WriteOnly<'_, [u8]> {
+        self.dirty = true;
         wgpu::WriteOnly::from_mut(&mut self.data[..])
     }
 }
@@ -731,7 +763,11 @@ fn buffer_of(b: &DispatchBuffer) -> &TgBuffer {
 impl CommandEncoderInterface for TgEncoder {
     fn copy_buffer_to_buffer(&self, source: &DispatchBuffer, source_offset: wgpu::BufferAddress, destination: &DispatchBuffer, destination_offset: wgpu::BufferAddress, copy_size: Option<wgpu::BufferAddress>) {
         let (s, d) = (buffer_of(source), buffer_of(destination));
-        let size = copy_size.unwrap_or(s.size - source_offset);
+        let src_avail = s.size.checked_sub(source_offset).unwrap_or_else(|| panic!("tinygpu: copy source offset {source_offset} exceeds buffer size {}", s.size));
+        let dst_avail = d.size.checked_sub(destination_offset).unwrap_or_else(|| panic!("tinygpu: copy destination offset {destination_offset} exceeds buffer size {}", d.size));
+        let size = copy_size.unwrap_or(src_avail);
+        assert!(size <= src_avail, "tinygpu: copy size {size} at source offset {source_offset} exceeds buffer size {}", s.size);
+        assert!(size <= dst_avail, "tinygpu: copy size {size} at destination offset {destination_offset} exceeds buffer size {}", d.size);
         let mut ops = self.ops.lock().unwrap_or_else(|p| p.into_inner());
         ops.bytes.push(2);
         for v in [s.mem.id, source_offset, d.mem.id, destination_offset, size] {
@@ -763,7 +799,9 @@ impl CommandEncoderInterface for TgEncoder {
     }
     fn clear_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, size: Option<wgpu::BufferAddress>) {
         let b = buffer_of(buffer);
-        let size = size.unwrap_or(b.size - offset);
+        let avail = b.size.checked_sub(offset).unwrap_or_else(|| panic!("tinygpu: clear offset {offset} exceeds buffer size {}", b.size));
+        let size = size.unwrap_or(avail);
+        assert!(size <= avail, "tinygpu: clear size {size} at offset {offset} exceeds buffer size {}", b.size);
         let mut ops = self.ops.lock().unwrap_or_else(|p| p.into_inner());
         ops.bytes.push(3);
         for v in [b.mem.id, offset, size] {
@@ -812,17 +850,19 @@ impl ComputePassInterface for TgComputePass {
         self.pipeline = Some((p.program, p.bindings.clone()));
     }
     fn set_bind_group(&mut self, index: u32, bind_group: Option<&DispatchBindGroup>, offsets: &[wgpu::DynamicOffset]) {
+        let idx = index as usize;
+        assert!(idx < self.groups.len(), "tinygpu: bind group index {index} exceeds max_bind_groups ({})", self.groups.len());
         let Some(g) = bind_group.and_then(|g| g.as_custom::<TgBindGroup>()) else {
-            self.groups[index as usize] = None;
+            self.groups[idx] = None;
             return;
         };
         let mut entries = g.entries.clone();
         for (binding, extra) in g.dynamic.iter().zip(offsets) {
             if let Some(e) = entries.get_mut(binding) {
-                e.1 += *extra as u64;
+                e.1 = e.1.checked_add(*extra as u64).unwrap_or_else(|| panic!("tinygpu: dynamic offset overflow at group {index}, binding {binding}"));
             }
         }
-        self.groups[index as usize] = Some(BoundGroup { entries });
+        self.groups[idx] = Some(BoundGroup { entries });
     }
     fn set_immediates(&mut self, _offset: u32, _data: &[u8]) {
         unsupported("immediates")
@@ -846,8 +886,12 @@ impl ComputePassInterface for TgComputePass {
             ops.bytes.extend(v.to_le_bytes());
         }
         for (group, binding) in bindings {
-            let (mem, offset, size) = self.groups[*group as usize]
-                .as_ref()
+            let group_idx = *group as usize;
+            assert!(group_idx < self.groups.len(), "tinygpu: bind group index {group} exceeds max_bind_groups ({})", self.groups.len());
+            let (mem, offset, size) = self
+                .groups
+                .get(group_idx)
+                .and_then(Option::as_ref)
                 .and_then(|g| g.entries.get(binding))
                 .unwrap_or_else(|| panic!("tinygpu: a dispatch with nothing bound at group {group}, binding {binding}"));
             ops.bytes.extend(mem.id.to_le_bytes());

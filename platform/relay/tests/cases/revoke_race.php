@@ -196,6 +196,112 @@ test('4.5 token rotation and roster push for a device revoked after authenticati
     eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM roster WHERE desktop_dev = ?', [$d->id]), 'no roster row written for revoked desktop');
 });
 
+test('4.5 revoke-race siblings: DevicesApi::{meta, patch, revoke, revokeAll} and Pairing::{create, decide(deny), reject, burn} refuse a revoked caller in-tx; Pairing::live hides revoked desktop without mutating pairings.state', function () {
+    $r = Relay::make();
+    $d = $r->desktop('DeskBefore');
+    $ph = $r->phone($d, 'PhoneBefore');
+    $prov = $r->provider('ProvBefore');
+    $ctx = $r->ctx();
+    $authReq = new Request('POST', '/v1/devices/self/meta', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $d->token], '', null);
+    $principal = $ctx->auth->device($authReq);
+
+    // Prepare open and answered ceremonies before the desktop is revoked.
+    $cOpen = OaiyTest\Ceremony::random($r, $d);
+    eq(201, $cOpen->open()['status']);
+    $cAns = OaiyTest\Ceremony::random($r, $d);
+    eq(201, $cAns->open()['status']);
+    eq(202, $cAns->answer()['status']);
+    $cNew = OaiyTest\Ceremony::random($r, $d);
+
+    // Revoke ONLY the desktop (no cascade) after authentication succeeded.
+    Devices::revoke($ctx, $d->id, false);
+
+    $expectRevoked = static function (callable $fn, string $label): void {
+        $err = null;
+        try {
+            $fn();
+        } catch (ApiError $e) {
+            $err = $e;
+        }
+        eq([401, 'revoked'], [$err->status ?? 0, $err->errorCode ?? ''], "$label refused in-tx");
+    };
+
+    // DevicesApi::meta
+    $metaBody = json_encode(['name' => 'DeskAfter']);
+    $metaReq = new Request('POST', '/v1/devices/self/meta', [], ['REMOTE_ADDR' => '127.0.0.1', 'CONTENT_TYPE' => 'application/json'], $metaBody, null);
+    $expectRevoked(fn() => Oaiy\Relay\Handlers\DevicesApi::meta($ctx, $metaReq, $principal, []), 'DevicesApi::meta');
+    eq('DeskBefore', $ctx->db->val('SELECT name FROM devices WHERE id = ?', [$d->id]));
+
+    // DevicesApi::patch
+    $patchBody = json_encode(['name' => 'PhoneAfter']);
+    $patchReq = new Request('POST', '/v1/devices/' . $ph->id, [], ['REMOTE_ADDR' => '127.0.0.1', 'CONTENT_TYPE' => 'application/json'], $patchBody, null);
+    $expectRevoked(fn() => Oaiy\Relay\Handlers\DevicesApi::patch($ctx, $patchReq, $principal, ['', $ph->id]), 'DevicesApi::patch');
+    eq('PhoneBefore', $ctx->db->val('SELECT name FROM devices WHERE id = ?', [$ph->id]));
+
+    // DevicesApi::revoke
+    $revReq = new Request('POST', '/v1/devices/' . $prov->id . '/revoke', [], ['REMOTE_ADDR' => '127.0.0.1'], '', null);
+    $expectRevoked(fn() => Oaiy\Relay\Handlers\DevicesApi::revoke($ctx, $revReq, $principal, ['', $prov->id]), 'DevicesApi::revoke');
+    eq(null, $ctx->db->val('SELECT revoked_at FROM devices WHERE id = ?', [$prov->id]), 'provider was not revoked');
+
+    // DevicesApi::revokeAll
+    $revAllBody = json_encode(['role' => 'phone']);
+    $revAllReq = new Request('POST', '/v1/devices/revoke', [], ['REMOTE_ADDR' => '127.0.0.1', 'CONTENT_TYPE' => 'application/json'], $revAllBody, null);
+    $expectRevoked(fn() => Oaiy\Relay\Handlers\DevicesApi::revokeAll($ctx, $revAllReq, $principal, []), 'DevicesApi::revokeAll');
+    eq(null, $ctx->db->val('SELECT revoked_at FROM devices WHERE id = ?', [$ph->id]), 'phone was not revoked by revoked desktop');
+
+    // Pairing::create
+    $expectRevoked(fn() => Oaiy\Relay\Pairing::create($ctx, $principal, $cNew->createDoc()), 'Pairing::create');
+    eq(null, pair_row($r, $cNew->pid), 'no pairing row created for revoked desktop');
+
+    // Pairing::decide(deny)
+    $expectRevoked(fn() => Oaiy\Relay\Pairing::decide($ctx, $principal, $cAns->pid, ['approve' => false]), 'Pairing::decide(deny)');
+    eq('answered', pair_row($r, $cAns->pid)['state'], 'pairing was not denied by revoked desktop');
+
+    // Pairing::reject
+    $expectRevoked(fn() => Oaiy\Relay\Pairing::reject($ctx, $principal, $cAns->pid), 'Pairing::reject');
+    eq(['answered', 0], [pair_row($r, $cAns->pid)['state'], (int)pair_row($r, $cAns->pid)['rejects']], 'pairing was not rejected by revoked desktop');
+
+    // Pairing::burn
+    $expectRevoked(fn() => Oaiy\Relay\Pairing::burn($ctx, $principal, $cOpen->pid), 'Pairing::burn');
+    eq('open', pair_row($r, $cOpen->pid)['state'], 'pairing was not burned by revoked desktop');
+
+    // Pairing::live() hides rendezvous of a revoked desktop (404) while pairings.state remains unmutated.
+    $why = null;
+    eq(null, Oaiy\Relay\Pairing::live($ctx->db, $cOpen->pid, Relay::T0, false, $why), 'Pairing::live returns null for revoked desktop');
+    eq('desktop_revoked', $why);
+    eq([404, 'not_found'], [$cOpen->get()['status'], pair_code($cOpen->get())], 'GET /v1/pair/{pid} is 404 once desktop is revoked');
+    eq('open', pair_row($r, $cOpen->pid)['state'], 'pairings.state was not mutated by revocation');
+});
+
+test('4.3 Mailbox::purgeInTx locks the mailboxes row before deleting from items (consistent mailboxes -> items lock order)', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $prov = $r->provider();
+    $ctx = $r->ctx();
+    $ctx->mb->post($d->inbox(), 'cmd', 'p1', $prov->id, 60, '{}', null, null, 'body');
+    pairing_record_statements($ctx);
+    $ctx->db->write(static function (Db $db) use ($ctx, $d): void {
+        $ctx->mb->purgeInTx($db, $d->inbox());
+    });
+    $sql = PairingTestRecordingStatement::$log;
+    $lockIdx = null;
+    $delItemsIdx = null;
+    $delMbIdx = null;
+    foreach ($sql as $i => $stmt) {
+        if (stripos($stmt, 'SELECT id FROM mailboxes WHERE id = ?') === 0) {
+            $lockIdx = $i;
+        } elseif (stripos($stmt, 'DELETE FROM items WHERE mailbox = ?') === 0) {
+            $delItemsIdx = $i;
+        } elseif (stripos($stmt, 'DELETE FROM mailboxes WHERE id = ?') === 0) {
+            $delMbIdx = $i;
+        }
+    }
+    ok($lockIdx !== null && $delItemsIdx !== null && $delMbIdx !== null, 'all three statements ran: ' . json_encode($sql));
+    ok($lockIdx < $delItemsIdx && $delItemsIdx < $delMbIdx, 'mailboxes row locked before items deleted: ' . json_encode($sql));
+    eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM items WHERE mailbox = ?', [$d->inbox()]));
+    eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d->inbox()]));
+});
+
 /**
  * Real requests racing a real revocation: eight posters through four servers, the revocation at a random moment among them. However
  * the moments fall, when the revocation has returned nothing of the sender is live in any mailbox and, for a revoked recipient, no

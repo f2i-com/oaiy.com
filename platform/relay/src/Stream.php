@@ -107,8 +107,14 @@ final class Stream
             }
             if ($due) {
                 $lastFetch = Clock::mono();
-                $rows = Party::fetch($ctx, $f->mailbox, $cursor, self::PAGE_FRAMES, self::PAGE_BYTES, Clock::now());
-                $ctx->db->close(); // a waiting request never holds a database connection
+                try {
+                    $rows = Party::fetch($ctx, $f->mailbox, $cursor, self::PAGE_FRAMES, self::PAGE_BYTES, Clock::now());
+                } catch (ApiError | \PDOException $e) {
+                    Log::error($e, 'aokie.stream');
+                    break;
+                } finally {
+                    $ctx->db->close(); // a waiting request never holds a database connection
+                }
                 if (Clock::mono() >= $deadline || Clock::now() > $authEnd) {
                     break; // whatever that read found belongs to the next admission
                 }

@@ -188,6 +188,8 @@ export interface ToolContext {
   vfs: Vfs;
   /** Unwrapped project VFS for internal harness bookkeeping (spill storage under `/.oaiy/spill/`). */
   rawVfs?: Vfs;
+  /** When true (read-only call/SMS sessions), never write oversized outputs to VFS spill files; truncate inline instead. */
+  disableSpill?: boolean;
   gate: NetGate;
   /** Versions of the files read in this conversation: path -> version when read. */
   reads: Map<string, number>;
@@ -2356,7 +2358,7 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
       : await execute(call, ctx, out);
     let isError = false;
     if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(rawContent)) isError = true;
-    const spilled = maybeSpillOutput(ctx.rawVfs ?? ctx.vfs, call.name, call.id, rawContent);
+    const spilled = maybeSpillOutput(ctx.rawVfs ?? ctx.vfs, call.name, call.id, rawContent, { allowWrite: !ctx.disableSpill });
     const result: ToolResult = { id: call.id, name: call.name, content: spilled.text, isError };
     if (spilled.spillPath) result.spillPath = spilled.spillPath;
     if (out.images.length) result.images = out.images;

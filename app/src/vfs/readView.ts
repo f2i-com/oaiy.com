@@ -11,7 +11,13 @@ import { VfsError, normalizePath, type DirEntry, type Stat, type Vfs, type WalkE
 /** The front desk's outreach results: hidden from its calls, texts and tasks. */
 export const isOutreachPath = (key: string): boolean => key === 'outreach' || key.startsWith('outreach/');
 
-export function readView(vfs: Vfs, hidden: (key: string) => boolean = isOutreachPath): Vfs {
+/** Internal agent harness files (e.g. tool output spills under /.oaiy/spill): hidden from calls, texts and tasks. */
+export const isInternalPath = (key: string): boolean => key === '.oaiy' || key.startsWith('.oaiy/');
+
+/** Front desk paths private to the runner: outreach results and internal harness files. */
+export const isFrontDeskPrivatePath = (key: string): boolean => isOutreachPath(key) || isInternalPath(key);
+
+export function readView(vfs: Vfs, hidden: (key: string) => boolean = isFrontDeskPrivatePath): Vfs {
   const key = (path: string) => normalizePath(path);
   const gone = (path: string, what = 'no such file or directory'): never => {
     throw new VfsError('ENOENT', `${what}, '/${key(path)}'`);

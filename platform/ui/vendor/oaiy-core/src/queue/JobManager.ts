@@ -76,6 +76,55 @@ function reachesUntrustedFlow(
   return false;
 }
 
+/**
+ * Collect distinct package IDs referenced by any `pkg:*` custom node reachable
+ * from `graph` (including transitive subflows and macros).
+ */
+function collectReferencedPackageIds(
+  flowId: string | undefined,
+  graph: { nodes?: unknown[] } | undefined,
+  flows: readonly Flow[],
+): string[] {
+  const byId = new Map(flows.map((f) => [f.id, f]));
+  const pkgIds = new Set<string>();
+  const seenFlows = new Set<string>(flowId ? [flowId] : []);
+  const queue: Array<{ nodes?: unknown[] } | undefined> = [graph ?? byId.get(flowId ?? '')?.graph];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || !Array.isArray(current.nodes)) continue;
+    for (const rawNode of current.nodes) {
+      const node = rawNode as { type?: unknown; data?: Record<string, unknown> } | null;
+      if (!node) continue;
+      if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
+        const m = /^pkg:([^:]+)(?::|$)/.exec(node.type);
+        pkgIds.add(m?.[1] || '__unknown_pkg__');
+      }
+      const data = node.data;
+      if (!data) continue;
+      for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+        const ref = data[field];
+        if (typeof ref !== 'string' || !ref || seenFlows.has(ref)) continue;
+        seenFlows.add(ref);
+        const target = byId.get(ref);
+        if (target?.graph) queue.push(target.graph);
+      }
+    }
+  }
+  return Array.from(pkgIds);
+}
+
+function intersectPermissions(sets: Array<readonly string[]>): string[] {
+  if (sets.length === 0) return [];
+  const acc = new Set(sets[0]);
+  for (let i = 1; i < sets.length; i++) {
+    const next = new Set(sets[i]);
+    for (const perm of acc) {
+      if (!next.has(perm)) acc.delete(perm);
+    }
+  }
+  return Array.from(acc);
+}
+
 // Extended module registry interface that includes getAllModules
 // This is implemented by ModuleLoader but not in the base interface
 export interface ExtendedModuleRegistry extends ModuleRegistry {
@@ -158,6 +207,12 @@ export interface JobManagerOptions {
    * whether or not a Worker factory was passed.
    */
   requireScriptExecutor?: boolean;
+  /**
+   * Look up the user-granted permission set for a loaded package ID when a
+   * regular flow embeds `pkg:*` custom nodes. Returning null/undefined treats
+   * the package as unconfirmed (`[]`).
+   */
+  packagePermissionsLookup?: (packageId: string) => readonly string[] | null | undefined;
 }
 
 /**
@@ -189,6 +244,7 @@ export class JobManager {
   private runTrustedFlowsInWorker: boolean | (() => boolean) = false;
   private scriptExecutor: ScriptExecutor | null = null;
   private requireScriptExecutor: boolean = false;
+  private packagePermissionsLookup?: (packageId: string) => readonly string[] | null | undefined;
 
   // Subscribers
   private stateSubscribers: Set<JobStateCallback> = new Set();
@@ -220,7 +276,18 @@ export class JobManager {
     this.runTrustedFlowsInWorker = options.runTrustedFlowsInWorker ?? false;
     this.scriptExecutor = options.scriptExecutor ?? null;
     this.requireScriptExecutor = options.requireScriptExecutor ?? false;
+    this.packagePermissionsLookup = options.packagePermissionsLookup;
     this.config = { ...DEFAULT_CONFIG, ...options.config };
+  }
+
+  /**
+   * Update the package permission lookup callback used when regular flows
+   * reference `pkg:*` custom nodes.
+   */
+  setPackagePermissionsLookup(
+    lookup: ((packageId: string) => readonly string[] | null | undefined) | undefined,
+  ): void {
+    this.packagePermissionsLookup = lookup;
   }
 
   /**
@@ -789,7 +856,8 @@ export class JobManager {
 
       // Set flow context for per-flow database operations + package
       // permission gating. When the job carries a packageId, OR when a non-package
-      // job targets/reaches an untrusted flow (shared link / imported project),
+      // job targets/reaches an untrusted flow (shared link / imported project) OR
+      // embeds any `pkg:*` custom package node (directly or via subflows/macros),
       // route the runtime into hardened mode with least-privilege permissions so
       // UI Run, MacroRunnerModal, API bridge, remote dispatcher, and CLI ALL
       // enforce sandboxing uniformly.
@@ -799,10 +867,36 @@ export class JobManager {
       const untrustedImplicit =
         !job.packageId &&
         (currentProjectIsUntrusted() || reachesUntrustedFlow(job.flowId, job.graph, allKnownFlows));
-      const effectivePackageId = job.packageId ?? (untrustedImplicit ? UNTRUSTED_PACKAGE_ID : null);
-      const effectivePermissions = job.packageId
-        ? (job.grantedPermissions ?? [])
-        : (untrustedImplicit ? [...UNTRUSTED_FLOW_PERMISSIONS] : null);
+      const referencedPkgIds = collectReferencedPackageIds(job.flowId, job.graph, allKnownFlows);
+      const hasPkgNodes = referencedPkgIds.length > 0;
+
+      let effectivePackageId: string | null = job.packageId ?? null;
+      let effectivePermissions: string[] | null = job.packageId ? [...(job.grantedPermissions ?? [])] : null;
+
+      if (hasPkgNodes) {
+        const pkgPermSets = referencedPkgIds.map((pkgId) => {
+          if (job.packageId === pkgId) {
+            return job.grantedPermissions ?? [];
+          }
+          const lookedUp = this.packagePermissionsLookup?.(pkgId);
+          return Array.isArray(lookedUp) ? lookedUp : [];
+        });
+        const pkgIntersection = intersectPermissions(pkgPermSets);
+        if (!effectivePackageId) {
+          effectivePackageId =
+            referencedPkgIds.length === 1
+              ? referencedPkgIds[0]
+              : `pkg-composite:${referencedPkgIds.join(',')}`;
+          effectivePermissions = untrustedImplicit
+            ? intersectPermissions([pkgIntersection, UNTRUSTED_FLOW_PERMISSIONS])
+            : pkgIntersection;
+        } else {
+          effectivePermissions = intersectPermissions([effectivePermissions ?? [], pkgIntersection]);
+        }
+      } else if (untrustedImplicit) {
+        effectivePackageId = UNTRUSTED_PACKAGE_ID;
+        effectivePermissions = [...UNTRUSTED_FLOW_PERMISSIONS];
+      }
 
       logger.debug(
         ` Setting flow context: flowId=${job.flowId}` +
@@ -817,6 +911,13 @@ export class JobManager {
           source: 'Security',
           message:
             'A shared or imported untrusted flow (or one it calls) — running sandboxed: code blocks and saved secrets are disabled.',
+          type: 'info',
+        });
+      } else if (!job.packageId && hasPkgNodes) {
+        this.addJobLog(job.id, {
+          source: 'Security',
+          message:
+            `Flow references custom package node(s) (${referencedPkgIds.join(', ')}) — running sandboxed with the package's granted permissions.`,
           type: 'info',
         });
       }

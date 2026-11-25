@@ -8,6 +8,7 @@
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { mayAskDesktop } from '../../lib/desktopDetection';
 import { absoluteUrl, desktopAccess, desktopCredential, desktopFileBytes } from '../core-service/contractRuntime';
+import { validatePath } from '../core-filesystem/runtime';
 import { NO_MESSAGE, answerIn, answerOf, endedInError, errorIn, holdsChoices, noMessage, turnWithoutText, whyNoAnswer } from './reply';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
@@ -54,6 +55,7 @@ function isAllowedLocalAiPath(pathname: string): boolean {
 }
 
 function localServerBearer(endpoint: string): string | null {
+  if (ctx.currentPackageId && !ctx.hasPermission?.('network:local')) return null;
   // In a page: the desktop's own credential for its own engine routes, as the Service nodes send it. A page whose
   // origin the desktop does not trust (a tab connected to it, a server that trusts tokens alone) was answered 403.
   if (typeof process === 'undefined' || !process.env) return desktopCredential(endpoint, desktopAccess()) ?? null;
@@ -128,28 +130,6 @@ function validateContentLength(content: string | undefined, fieldName: string): 
 }
 
 /**
- * Parse a chunk reference from text
- * Format: __CHUNK_REF:{"path":"...","index":0,"total":5,"startByte":0,"endByte":1000}__
- */
-function parseChunkRef(text: string): {
-  path: string;
-  index: number;
-  total: number;
-  startByte: number;
-  endByte: number;
-} | null {
-  const match = text.match(/__CHUNK_REF:({.*?})__/);
-  if (match) {
-    try {
-      return JSON.parse(match[1]);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-/**
  * Parse a file reference from text (for rejecting large files)
  */
 function parseFileRef(text: string): { path: string; size: number } | null {
@@ -162,24 +142,6 @@ function parseFileRef(text: string): { path: string; size: number } | null {
     }
   }
   return null;
-}
-
-/**
- * Read chunk content from file using Tauri
- */
-async function readChunkContent(chunkRef: {
-  path: string;
-  startByte: number;
-  endByte: number;
-}): Promise<string> {
-  if (!ctx.tauri) {
-    throw new Error('Tauri not available for reading chunks');
-  }
-  return ctx.tauri.invoke<string>('plugin:oaiy-filesystem|read_chunk_content', {
-    path: chunkRef.path,
-    start: chunkRef.startByte,
-    length: chunkRef.endByte - chunkRef.startByte,
-  });
 }
 
 /**
@@ -545,12 +507,37 @@ async function materializeImageInputToPath(value: unknown): Promise<string | nul
   const looksLikePath =
     /^[a-zA-Z]:[\\/]/.test(s) || s.startsWith('/') || s.startsWith('\\\\');
   if (looksLikePath && imageExt.test(s)) {
+    try {
+      validatePath(s, 'AI image input');
+    } catch {
+      return null;
+    }
     return s;
   }
 
   if (s.startsWith('file://')) {
-    return decodeURIComponent(s.replace(/^file:\/\/\/?/, ''));
+    let decoded: string;
+    try {
+      const stripped = /^file:\/\/\/[a-zA-Z]:[\\/]/.test(s)
+        ? s.replace(/^file:\/\/\//, '')
+        : s.replace(/^file:\/\//, '');
+      decoded = decodeURIComponent(stripped);
+    } catch {
+      return null;
+    }
+    if (!imageExt.test(decoded)) return null;
+    try {
+      validatePath(decoded, 'AI image input');
+    } catch {
+      return null;
+    }
+    return decoded;
   }
+
+  const safeImageMimeExt = (mime: string): string => {
+    const raw = (mime.split(';')[0].split('/')[1] || 'png').replace(/\+.*$/, '').toLowerCase().trim();
+    return /^[a-z0-9]{1,8}$/.test(raw) ? raw : 'png';
+  };
 
   // data: URL — decode + write to temp via the filesystem plugin.
   if (s.startsWith('data:image/')) {
@@ -559,7 +546,7 @@ async function materializeImageInputToPath(value: unknown): Promise<string | nul
     if (!match) return null;
     const mime = match[1];
     const base64 = match[2];
-    const mimeExt = (mime.split('/')[1] || 'png').replace(/\+.*$/, '');
+    const mimeExt = safeImageMimeExt(mime);
     const tempDir = await ctx.tauri.invoke<string>(
       'plugin:oaiy-filesystem|get_temp_dir',
     );
@@ -609,7 +596,7 @@ async function materializeImageInputToPath(value: unknown): Promise<string | nul
       }
       const base64 = btoa(bin);
       const mime = blob.type || 'image/png';
-      const mimeExt = (mime.split('/')[1] || 'png').replace(/\+.*$/, '');
+      const mimeExt = safeImageMimeExt(mime);
       const tempDir = await ctx.tauri.invoke<string>(
         'plugin:oaiy-filesystem|get_temp_dir',
       );
@@ -993,7 +980,14 @@ async function chat(
     } catch {
       // Service auto-start not available
     }
-  } else if (!ctx.tauri && isLoopbackEndpoint && Number.isFinite(endpointPort) && endpointPort > 0 && mayAskDesktop()) {
+  } else if (
+    !ctx.tauri &&
+    isLoopbackEndpoint &&
+    Number.isFinite(endpointPort) &&
+    endpointPort > 0 &&
+    mayAskDesktop() &&
+    (!ctx.currentPackageId || (ctx.hasPermission?.('service:start') && ctx.hasPermission?.('network:local')))
+  ) {
     // Browser build (oaiy-web), in a page that may ask the desktop (a tab nobody
     // linked never does): no Tauri, but the OAIY Desktop may own
     // this port. Ask it to start the matching service if it's stopped —
@@ -1074,7 +1068,7 @@ async function chat(
     try {
       ctx.log('info', `[AI] Fetching image from URL: ${url}`);
       // A picture OAIY's engine made, passed on by its URL: read with the desktop's credential.
-      const own = await desktopFileBytes(url, ctx.abortSignal);
+      const own = await desktopFileBytes(url, ctx.abortSignal, ctx);
       if (own) {
         let bin = '';
         for (let i = 0; i < own.bytes.length; i += 0x8000) bin += String.fromCharCode(...own.bytes.subarray(i, i + 0x8000));
@@ -1177,21 +1171,6 @@ async function chat(
   if (chunkRefs && chunkRefs.length > 0) {
     ctx.log('info', `[AI] Processing ${chunkRefs.length} chunk reference(s)...`);
     // For now, just note that chunks exist - RAG handling would go here
-  }
-
-  // Auto-resolve chunk references in prompt
-  const chunkRef = parseChunkRef(finalPrompt);
-  if (chunkRef && ctx.tauri) {
-    ctx.log('info', `[AI] Reading chunk ${chunkRef.index + 1}/${chunkRef.total} from file...`);
-    try {
-      finalPrompt = await readChunkContent(chunkRef);
-      ctx.log('info', `[AI] Loaded chunk content (${finalPrompt.length} chars)`);
-    } catch (error) {
-      ctx.onNodeStatus?.(nodeId, 'error');
-      const errMsg = error instanceof Error ? error.message : 'Unknown error';
-      ctx.log('error', `[AI] Failed to read chunk: ${errMsg}`);
-      throw new Error(`Failed to read file chunk: ${errMsg}`);
-    }
   }
 
   // Check for file reference (large file without chunking - reject)

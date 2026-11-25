@@ -134,6 +134,7 @@ const saveBoolPref = (key: string, val: boolean): void => {
 interface OAIYBuilderProps {
   initialGraph?: WorkflowGraph;
   onGraphChange?: (graph: WorkflowGraph) => void;
+  onMarkUntrusted?: (flowId?: string) => void;
   availableFlows?: Flow[];
   /** Package macros (higher priority than project macros for execution) */
   packageMacros?: Flow[];
@@ -194,6 +195,7 @@ interface OAIYBuilderProps {
 export default function OAIYBuilder({
   initialGraph,
   onGraphChange,
+  onMarkUntrusted,
   availableFlows = [],
   llmEndpoints = [],
   projectConstants = [],
@@ -300,6 +302,7 @@ export default function OAIYBuilder({
     availableFlows,
     initialGraph,
     onGraphChange,
+    onMarkUntrusted,
     projectSettings,
     onUpdateSettings,
   });

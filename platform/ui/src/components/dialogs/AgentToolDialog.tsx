@@ -22,12 +22,14 @@ const USES: Array<{ id: Use; title: string; says: string }> = [
 
 interface Props {
   flow: Flow;
+  /** All flows in the project, so transitive subflow/macro untrusted or pkg:* checks can run. */
+  allFlows?: readonly Flow[];
   onClose: () => void;
   /** Said when something was given or taken back. */
   onDone: (message: string) => void;
 }
 
-export default function AgentToolDialog({ flow, onClose, onDone }: Props) {
+export default function AgentToolDialog({ flow, allFlows, onClose, onDone }: Props) {
   const [use, setUse] = useState<Use>('tool');
   const [name, setName] = useState(toolName(flow.name));
   const [description, setDescription] = useState(flow.description || `Runs the flow "${flow.name}".`);
@@ -60,10 +62,10 @@ export default function AgentToolDialog({ flow, onClose, onDone }: Props) {
     setError(null);
     try {
       if (use === 'tool') {
-        await publishAsTool(flow, { name, description });
+        await publishAsTool(flow, { name, description }, allFlows);
         onDone(`"${toolName(name)}" is one of the agent's tools now.`);
       } else {
-        await publishAsHook(flow, { tool, mode: use });
+        await publishAsHook(flow, { tool, mode: use }, allFlows);
         onDone(`"${flow.name}" runs ${use === 'before' ? 'before' : 'instead of'} the agent's ${tool} now (within a minute).`);
       }
       onClose();

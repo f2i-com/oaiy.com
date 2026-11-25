@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Plug, RotateCcw } from 'lucide-react';
 import { aiProviders, type AiCapability, type AiProviderInput, type AiProviderPublic } from './api';
 import { errorText } from './SetupParts';
@@ -123,12 +123,25 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
   const [models, setModels] = useState<{ id: string; list: string[] } | null>(null);
   /** A provider set up already, its address being changed here (it did not answer at the one it has). */
   const [editing, setEditing] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const reqSeq = useRef(0);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      reqSeq.current += 1;
+    };
+  }, []);
 
   const loadList = useCallback(async () => {
     try {
-      setProviders((await aiProviders.list()).providers);
+      const next = (await aiProviders.list()).providers;
+      if (!mounted.current) return;
+      setProviders(next);
       setListError(null);
     } catch (e) {
+      if (!mounted.current) return;
       setListError(errorText(e));
     }
   }, []);
@@ -151,20 +164,23 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
    */
   const loadModels = useCallback(
     async (p: AiProviderPublic, pickFirst = false) => {
+      const seq = ++reqSeq.current;
       setBusy(true);
       setError(null);
       try {
         const list = await aiProviders.models(p.id);
+        if (!mounted.current || seq !== reqSeq.current) return;
         setModels({ id: p.id, list });
         const on = value?.provider === p.id ? value.model : null;
         const model = pickFirst ? startingModel(list, on, p.model) : on && list.includes(on) ? on : p.model && list.includes(p.model) ? p.model : null;
         if (model) onPick({ provider: p.id, model, name: p.name });
         else if (list.length === 0) setError(`${p.name} lists no models: load or download one there first.`);
       } catch (e) {
+        if (!mounted.current || seq !== reqSeq.current) return;
         setModels(null);
         setError(didNotAnswer(p.name, p.baseUrl, p.allowLocal || looksLocal(p.baseUrl), e));
       } finally {
-        setBusy(false);
+        if (mounted.current && seq === reqSeq.current) setBusy(false);
       }
     },
     [onPick, value],
@@ -179,7 +195,9 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
   }, [providerId]);
 
   const choose = (id: string) => {
+    reqSeq.current += 1;
     setSelected(id);
+    setBusy(false);
     setError(null);
     setModels(null);
     setEditing(null);
@@ -194,42 +212,124 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
    * it was, and the form stays as typed, with why.
    */
   const connectAt = async (id: string, name: string, url: string, keyNow: string) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      setError('Enter a valid http:// or https:// address (it ends in /v1).');
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      setError('Enter an http:// or https:// address.');
+      return;
+    }
+    const local = looksLocal(url);
+    if (parsed.protocol === 'http:' && !local) {
+      setError('Plain http:// is only allowed for servers on this computer or local network; use https:// for remote servers.');
+      return;
+    }
+
+    const seq = ++reqSeq.current;
     setBusy(true);
     setError(null);
     // (what the entry had is kept: its name, model and what else it is used for, pictures or speech, beside chat)
     const existing = (providers ?? []).find((p) => p.id === id);
     const capabilities: AiCapability[] = existing && existing.capabilities.length > 0 ? [...new Set<AiCapability>([...existing.capabilities, 'chat'])] : ['chat'];
-    const local = looksLocal(url) || url.startsWith('http:');
-    try {
-      await aiProviders.upsert({
-        id,
-        name: existing?.name ?? name,
-        ...(existing?.category ? { category: existing.category } : {}),
-        protocol: 'openai',
-        baseUrl: url,
-        ...(existing?.model ? { model: existing.model } : {}),
-        capabilities,
-        enabled: true,
-        allowLocal: local,
-      });
-      if (keyNow) await aiProviders.setKey(id, keyNow);
-    } catch (e) {
-      setError(errorText(e));
-      setBusy(false);
-      return;
-    }
+    const candidate: AiProviderInput = {
+      id,
+      name: existing?.name ?? name,
+      ...(existing?.category ? { category: existing.category } : {}),
+      protocol: 'openai',
+      baseUrl: url,
+      ...(existing?.model ? { model: existing.model } : {}),
+      capabilities,
+      enabled: true,
+      allowLocal: local,
+    };
+
     let list: string[];
-    try {
-      list = await aiProviders.models(id);
-    } catch (e) {
-      // (put back as it was: a new one out, an old one at its old address)
-      await (existing ? aiProviders.upsert(inputOf(existing)) : aiProviders.delete(id)).catch(() => undefined);
-      setError(didNotAnswer(existing?.name ?? name, url, local, e));
-      setBusy(false);
-      return;
+    if (existing?.hasKey && keyNow) {
+      // Probe using a temporary provider id first so a failed probe never clobbers the existing working API key.
+      const probeBase = `${id.slice(0, 52).replace(/-+$/, '') || 'p'}-probe`;
+      const probeId = freeId(probeBase, (providers ?? []).map((p) => p.id));
+      let probeCreated = false;
+      try {
+        try {
+          await aiProviders.upsert({ ...candidate, id: probeId });
+          probeCreated = true;
+          await aiProviders.setKey(probeId, keyNow);
+        } catch (e) {
+          if (mounted.current && seq === reqSeq.current) {
+            setError(errorText(e));
+            setBusy(false);
+          }
+          return;
+        }
+        try {
+          list = await aiProviders.models(probeId);
+        } catch (e) {
+          if (mounted.current && seq === reqSeq.current) {
+            setError(didNotAnswer(existing.name, url, local, e));
+            setBusy(false);
+          }
+          return;
+        }
+      } finally {
+        if (probeCreated) await aiProviders.delete(probeId).catch(() => undefined);
+      }
+      if (!mounted.current || seq !== reqSeq.current) return;
+      let upserted = false;
+      try {
+        await aiProviders.upsert(candidate);
+        upserted = true;
+        await aiProviders.setKey(id, keyNow);
+      } catch (e) {
+        if (upserted) await aiProviders.upsert(inputOf(existing)).catch(() => undefined);
+        if (mounted.current && seq === reqSeq.current) {
+          setError(errorText(e));
+          setBusy(false);
+        }
+        return;
+      }
+    } else {
+      let upserted = false;
+      let keyWritten = false;
+      const rollback = async () => {
+        await (existing ? aiProviders.upsert(inputOf(existing)) : aiProviders.delete(id)).catch(() => undefined);
+        if (existing && keyWritten) await aiProviders.setKey(id, null).catch(() => undefined);
+      };
+      try {
+        await aiProviders.upsert(candidate);
+        upserted = true;
+        if (keyNow) {
+          await aiProviders.setKey(id, keyNow);
+          keyWritten = true;
+        }
+      } catch (e) {
+        if (upserted) await rollback();
+        if (mounted.current && seq === reqSeq.current) {
+          setError(errorText(e));
+          setBusy(false);
+        }
+        return;
+      }
+      try {
+        list = await aiProviders.models(id);
+      } catch (e) {
+        // (put back as it was: a new one out, an old one at its old address)
+        await rollback();
+        if (mounted.current && seq === reqSeq.current) {
+          setError(didNotAnswer(existing?.name ?? name, url, local, e));
+          setBusy(false);
+        }
+        return;
+      }
     }
+
+    if (!mounted.current || seq !== reqSeq.current) return;
     try {
       const saved = (await aiProviders.list()).providers;
+      if (!mounted.current || seq !== reqSeq.current) return;
       setProviders(saved);
       setSelected(id);
       setEditing(null);
@@ -243,9 +343,9 @@ export function AgentProviderPicker({ value, onPick, disabled }: { value: Provid
         else if (list.length === 0) setError(`${p.name} lists no models: load or download one there first.`);
       }
     } catch (e) {
-      setError(errorText(e));
+      if (mounted.current && seq === reqSeq.current) setError(errorText(e));
     } finally {
-      setBusy(false);
+      if (mounted.current && seq === reqSeq.current) setBusy(false);
     }
   };
 

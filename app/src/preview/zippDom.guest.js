@@ -35,13 +35,32 @@ var __Promise = Promise;
 var __Error = Error;
 var __TypeError = TypeError;
 var __Number = Number;
+var __String = String;
+var __Function = Function;
 var __isFinite = isFinite;
-var __mapGet = Map.prototype.get;
-var __mapSet = Map.prototype.set;
-var __mapDel = Map.prototype.delete;
-var __weakMapGet = WeakMap.prototype.get;
-var __weakMapSet = WeakMap.prototype.set;
-var __weakMapHas = WeakMap.prototype.has;
+var __call = Function.prototype.call;
+var __apply = Function.prototype.apply;
+var __hasOwnCall = __call.bind(__hasOwn);
+var __callFn = __call.bind(__call);
+var __applyFn = __call.bind(__apply);
+var __mapGet = __call.bind(Map.prototype.get);
+var __mapSet = __call.bind(Map.prototype.set);
+var __mapDel = __call.bind(Map.prototype.delete);
+var __weakMapGet = __call.bind(WeakMap.prototype.get);
+var __weakMapSet = __call.bind(WeakMap.prototype.set);
+var __weakMapHas = __call.bind(WeakMap.prototype.has);
+var __arrayJoin = __call.bind(Array.prototype.join);
+var __arraySlice = __call.bind(Array.prototype.slice);
+var __arrayIndexOf = __call.bind(Array.prototype.indexOf);
+var __arrayConcat = __call.bind(Array.prototype.concat);
+var __arrayFilter = __call.bind(Array.prototype.filter);
+var __strReplace = __call.bind(String.prototype.replace);
+var __strCharCodeAt = __call.bind(String.prototype.charCodeAt);
+var __regexExec = __call.bind(RegExp.prototype.exec);
+var __dateGetTime = __call.bind(Date.prototype.getTime);
+var __subarray = typeof Uint8Array !== 'undefined' && Uint8Array.prototype.subarray ? __call.bind(Uint8Array.prototype.subarray) : null;
+var __btoa = typeof globalThis.btoa === 'function' ? globalThis.btoa : btoa;
+var __atob = typeof globalThis.atob === 'function' ? globalThis.atob : atob;
 var window = globalThis;
 var self = window;
 var __MAGIC = '\u0000oaiy.agent.page:';
@@ -106,11 +125,11 @@ function __serialize(v) {
 function __host(op, a, b, c) {
   var reply = __jsonParse(__channel('ls.getItem', __MAGIC + __serialize([op, a, b, c])));
   if (reply === null || typeof reply !== 'object') throw new __Error('the preview did not answer');
-  if (__hasOwn.call(reply, 'h') && reply.h) __inlineHandlers(reply.h);
-  if (__hasOwn.call(reply, 'q') && reply.q) __flush();
-  if (__hasOwn.call(reply, 'err') && typeof reply.err === 'string') {
-    var err = new __Error(reply.err.replace(/^\w+: /, ''));
-    var name = /^(\w+): /.exec(reply.err);
+  if (__hasOwnCall(reply, 'h') && reply.h) __inlineHandlers(reply.h);
+  if (__hasOwnCall(reply, 'q') && reply.q) __flush();
+  if (__hasOwnCall(reply, 'err') && typeof reply.err === 'string') {
+    var err = new __Error(__strReplace(reply.err, /^\w+: /, ''));
+    var name = __regexExec(/^(\w+): /, reply.err);
     if (name) err.name = name[1];
     throw err;
   }
@@ -120,14 +139,14 @@ function __host(op, a, b, c) {
 /** Callbacks the frame queued while it was answering (an event a call of ours fired). */
 function __flush() {
   var queued = __jsonParse(__channel('ls.getItem', __MAGIC + '["flush"]'));
-  var list = queued && __hasOwn.call(queued, 'ok') && __isArray(queued.ok) ? queued.ok : [];
+  var list = queued && __hasOwnCall(queued, 'ok') && __isArray(queued.ok) ? queued.ok : [];
   for (var i = 0; i < list.length; i++) __zdom_cb(list[i][0], list[i][1], list[i][2]);
 }
 
 function __cls(name, chain, exposeGlobal) {
   if (__classes[name]) return __classes[name];
   var parentName = chain && chain.length > 1 ? chain[1] : null;
-  var parent = parentName ? __cls(parentName, chain.slice(1), exposeGlobal) : null;
+  var parent = parentName ? __cls(parentName, __arraySlice(chain, 1), exposeGlobal) : null;
   var C = function () {
     throw new __TypeError('Illegal constructor');
   };
@@ -148,20 +167,20 @@ function __isPlain(v) {
 function __encode(v) {
   if (v === undefined) return { $u: 1 };
   if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
-  if (typeof v === 'number') return __isFinite(v) ? v : { $num: String(v) };
-  if (typeof v === 'bigint') return String(v);
+  if (typeof v === 'number') return __isFinite(v) ? v : { $num: __String(v) };
+  if (typeof v === 'bigint') return __String(v);
   if (typeof v === 'function') {
-    var id = __mapGet.call(__fnIds, v);
+    var id = __mapGet(__fnIds, v);
     if (!id) {
       id = __nextFn++;
-      __mapSet.call(__fnIds, v, id);
-      __mapSet.call(__fns, id, v);
+      __mapSet(__fnIds, v, id);
+      __mapSet(__fns, id, v);
     }
     return { $f: id };
   }
-  if (typeof v === 'symbol') return String(v);
+  if (typeof v === 'symbol') return __String(v);
   if (v === window) return { $win: 1 };
-  var wid = __weakMapGet.call(__wrapperIds, v);
+  var wid = __weakMapGet(__wrapperIds, v);
   if (wid !== undefined) return { $h: wid };
   if (__isView && __isView(v)) return { $ta: v.constructor.name, d: __arrayFrom(v) };
   if (v instanceof __ArrayBuffer) {
@@ -169,13 +188,13 @@ function __encode(v) {
     if (bytes.byteLength > 1024) {
       var bin = '';
       for (var bi = 0; bi < bytes.length; bi += 0x8000) {
-        bin += __fromCharCode.apply(null, bytes.subarray(bi, bi + 0x8000));
+        bin += __applyFn(__fromCharCode, null, __subarray ? __subarray(bytes, bi, bi + 0x8000) : bytes.subarray(bi, bi + 0x8000));
       }
-      return { $ab: btoa(bin) };
+      return { $ab: __btoa(bin) };
     }
     return { $ta: 'ArrayBuffer', d: __arrayFrom(bytes) };
   }
-  if (v instanceof __Date) return { $date: v.getTime() };
+  if (v instanceof __Date) return { $date: __dateGetTime(v) };
   if (__isArray(v)) {
     var arr = [];
     for (var ai = 0; ai < v.length; ai++) arr[ai] = __encode(v[ai]);
@@ -204,24 +223,24 @@ function __threeCtor(key, name, chain) {
   return new Proxy(F, {
     construct: function (_t, args) {
       var encoded = [];
-      for (var i = 0; i < args.length; i++) encoded.push(__encode(args[i]));
+      for (var i = 0; i < args.length; i++) encoded[i] = __encode(args[i]);
       return __host('threeNew', key, encoded);
     },
     apply: function (_t, _thisArg, args) {
       var encoded = [];
-      for (var i = 0; i < args.length; i++) encoded.push(__encode(args[i]));
+      for (var i = 0; i < args.length; i++) encoded[i] = __encode(args[i]);
       return __host('threeCall', key, encoded);
     },
     get: function (t, prop) {
       if (prop === 'prototype') return t.prototype;
       if (prop === 'name') return t.name;
       if (typeof prop === 'symbol') return t[prop];
-      if (__hasOwn.call(statics, prop)) return statics[prop];
+      if (__hasOwnCall(statics, prop)) return statics[prop];
       var v = __host('threeStaticGet', key, prop);
       if (v === __METHOD_TOKEN) {
         statics[prop] = function () {
           var encoded = [];
-          for (var i = 0; i < arguments.length; i++) encoded.push(__encode(arguments[i]));
+          for (var i = 0; i < arguments.length; i++) encoded[i] = __encode(arguments[i]);
           return __host('threeStaticCall', key, prop, encoded);
         };
         return statics[prop];
@@ -244,7 +263,7 @@ function __decode(v) {
     for (var i = 0; i < v.length; i++) arr[i] = __decode(v[i]);
     return arr;
   }
-  if (__hasOwn.call(v, '$o') && v.$o && typeof v.$o === 'object' && !__isArray(v.$o)) {
+  if (__hasOwnCall(v, '$o') && v.$o && typeof v.$o === 'object' && !__isArray(v.$o)) {
     var plain = {};
     var okeys = __objKeys(v.$o);
     for (var oi = 0; oi < okeys.length; oi++) {
@@ -254,29 +273,29 @@ function __decode(v) {
     }
     return plain;
   }
-  if (__hasOwn.call(v, '$m') && v.$m === 1) return __METHOD_TOKEN;
-  if (__hasOwn.call(v, '$tc') && v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
-  if (__hasOwn.call(v, '$h') && v.$h !== undefined) return __wrap(v.$h, v.c, v.ng === 1);
-  if (__hasOwn.call(v, '$u') && v.$u) return undefined;
-  if (__hasOwn.call(v, '$win') && v.$win) return window;
-  if (__hasOwn.call(v, '$num') && v.$num !== undefined) return __Number(v.$num);
-  if (__hasOwn.call(v, '$f') && v.$f !== undefined) return __mapGet.call(__fns, v.$f);
-  if (__hasOwn.call(v, '$date') && v.$date !== undefined) return new __Date(v.$date);
-  if (__hasOwn.call(v, '$ab') && v.$ab !== undefined) {
-    var rawBin = atob(v.$ab);
+  if (__hasOwnCall(v, '$m') && v.$m === 1) return __METHOD_TOKEN;
+  if (__hasOwnCall(v, '$tc') && v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
+  if (__hasOwnCall(v, '$h') && v.$h !== undefined) return __wrap(v.$h, v.c, v.ng === 1);
+  if (__hasOwnCall(v, '$u') && v.$u) return undefined;
+  if (__hasOwnCall(v, '$win') && v.$win) return window;
+  if (__hasOwnCall(v, '$num') && v.$num !== undefined) return __Number(v.$num);
+  if (__hasOwnCall(v, '$f') && v.$f !== undefined) return __mapGet(__fns, v.$f);
+  if (__hasOwnCall(v, '$date') && v.$date !== undefined) return new __Date(v.$date);
+  if (__hasOwnCall(v, '$ab') && v.$ab !== undefined) {
+    var rawBin = __atob(v.$ab);
     var abBytes = new __Uint8Array(rawBin.length);
-    for (var ai = 0; ai < rawBin.length; ai++) abBytes[ai] = rawBin.charCodeAt(ai);
+    for (var ai = 0; ai < rawBin.length; ai++) abBytes[ai] = __strCharCodeAt(rawBin, ai);
     return abBytes.buffer;
   }
-  if (__hasOwn.call(v, '$ta') && v.$ta !== undefined) {
+  if (__hasOwnCall(v, '$ta') && v.$ta !== undefined) {
     if (v.$ta === 'ArrayBuffer') return new __Uint8Array(v.d).buffer;
-    var T = (__hasOwn.call(__TYPED, v.$ta) && __TYPED[v.$ta]) || __Uint8Array;
+    var T = (__hasOwnCall(__TYPED, v.$ta) && __TYPED[v.$ta]) || __Uint8Array;
     return new T(v.d);
   }
-  if (__hasOwn.call(v, '$p') && v.$p !== undefined) {
+  if (__hasOwnCall(v, '$p') && v.$p !== undefined) {
     var pid = v.$p;
     return new __Promise(function (resolve, reject) {
-      __mapSet.call(__promises, pid, [resolve, reject]);
+      __mapSet(__promises, pid, [resolve, reject]);
     });
   }
   var out = {};
@@ -295,20 +314,20 @@ var __special = {
     cookie: { get: function () { return __cookies.get(); }, set: function (v) { __cookies.set(v); } },
     defaultView: { get: function () { return window; } },
     location: { get: function () { return location; }, set: function (v) { location.href = v; } },
-    write: { value: function () { __host('write', Array.prototype.join.call(arguments, '')); } },
-    writeln: { value: function () { __host('write', Array.prototype.join.call(arguments, '') + '\n'); } },
+    write: { value: function () { __host('write', __arrayJoin(arguments, '')); } },
+    writeln: { value: function () { __host('write', __arrayJoin(arguments, '') + '\n'); } },
   },
 };
 
 function __wrap(id, chain, noGlobal) {
-  var existing = __mapGet.call(__wrappers, id);
+  var existing = __mapGet(__wrappers, id);
   if (existing) return existing;
   chain = chain || ['Object'];
   var C = __cls(chain[0], chain, noGlobal ? false : true);
   var target = __objCreate(C.prototype);
   var methods = __objCreate(null);
   var extra = __objCreate(null);
-  __mapSet.call(__expando, id, extra);
+  __mapSet(__expando, id, extra);
   var special = __objCreate(null);
   for (var i = chain.length - 1; i >= 0; i--) {
     var s = __special[chain[i]];
@@ -327,14 +346,14 @@ function __wrap(id, chain, noGlobal) {
       }
       if (k === 'then') return undefined;
       if (k === 'constructor') return C;
-      if (__hasOwn.call(extra, k)) return extra[k];
+      if (__hasOwnCall(extra, k)) return extra[k];
       if (special[k]) return special[k].get ? special[k].get() : special[k].value;
       if (methods[k]) return methods[k];
       var value = __host('get', id, k);
       if (value === __METHOD_TOKEN) {
         methods[k] = function () {
           var args = [];
-          for (var i = 0; i < arguments.length; i++) args.push(__encode(arguments[i]));
+          for (var i = 0; i < arguments.length; i++) args[i] = __encode(arguments[i]);
           return __host('call', id, k, args);
         };
         return methods[k];
@@ -348,51 +367,51 @@ function __wrap(id, chain, noGlobal) {
         return true;
       }
       // The page's own data on a DOM node stays here, as itself; non-Node host objects (e.g. Three.js userData/uniforms) forward to the host.
-      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && !__weakMapHas.call(__wrapperIds, v) && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
+      if (__arrayIndexOf(chain, 'Node') >= 0 && v !== null && typeof v === 'object' && !__weakMapHas(__wrapperIds, v) && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
         extra[k] = v;
         return true;
       }
-      if (__hasOwn.call(extra, k)) delete extra[k];
+      if (__hasOwnCall(extra, k)) delete extra[k];
       delete methods[k];
       __host('set', id, k, __encode(v));
       return true;
     },
     has: function (t, k) {
       if (typeof k === 'symbol') return k === Symbol.iterator;
-      if (__hasOwn.call(extra, k) || special[k]) return true;
+      if (__hasOwnCall(extra, k) || special[k]) return true;
       return __host('has', id, k);
     },
     deleteProperty: function (t, k) {
-      if (__hasOwn.call(extra, k)) delete extra[k];
+      if (__hasOwnCall(extra, k)) delete extra[k];
       else __host('del', id, k);
       return true;
     },
     ownKeys: function () {
       var own = __objKeys(extra);
       // A node's keys are its own data; a record's (dataset, a DOMRect, a style) are the browser's.
-      if (chain.indexOf('Node') >= 0) return own;
-      return own.concat(__host('keys', id).filter(function (k) {
-        return own.indexOf(k) < 0;
+      if (__arrayIndexOf(chain, 'Node') >= 0) return own;
+      return __arrayConcat(own, __arrayFilter(__host('keys', id), function (k) {
+        return __arrayIndexOf(own, k) < 0;
       }));
     },
     getOwnPropertyDescriptor: function (t, k) {
-      if (__hasOwn.call(extra, k)) return { value: extra[k], writable: true, enumerable: true, configurable: true };
-      if (chain.indexOf('Node') >= 0 || typeof k === 'symbol') return undefined;
+      if (__hasOwnCall(extra, k)) return { value: extra[k], writable: true, enumerable: true, configurable: true };
+      if (__arrayIndexOf(chain, 'Node') >= 0 || typeof k === 'symbol') return undefined;
       var value = proxy[k];
       return value === undefined ? undefined : { value: value, writable: true, enumerable: true, configurable: true };
     },
   });
-  __mapSet.call(__wrappers, id, proxy);
-  __weakMapSet.call(__wrapperIds, proxy, id);
+  __mapSet(__wrappers, id, proxy);
+  __weakMapSet(__wrapperIds, proxy, id);
   return proxy;
 }
 
 /** A callback from the frame: a listener, timer or observer of the page's. */
 function __zdom_cb(fnId, thisValue, args) {
-  var fn = __mapGet.call(__fns, fnId);
+  var fn = __mapGet(__fns, fnId);
   if (!fn) return { $u: 1 };
   try {
-    return __encode(__watch(fn.apply(__decode(thisValue), __decode(args)), 'in an async callback'));
+    return __encode(__watch(__applyFn(fn, __decode(thisValue), __decode(args)), 'in an async callback'));
   } catch (error) {
     __report(error, 'in a callback');
     return { $u: 1 };
@@ -401,7 +420,7 @@ function __zdom_cb(fnId, thisValue, args) {
 
 /** A promise the page's code left behind (an async handler's, say): its failure is reported, as a browser reports an unhandled rejection. */
 function __watch(value, where) {
-  if (value && typeof value === 'object' && typeof value.then === 'function' && !__weakMapHas.call(__wrapperIds, value)) {
+  if (value && typeof value === 'object' && typeof value.then === 'function' && !__weakMapHas(__wrapperIds, value)) {
     value.then(null, function (error) {
       __report(error, where);
     });
@@ -411,11 +430,11 @@ function __watch(value, where) {
 }
 
 function __zdom_settle(pid, ok, value) {
-  var p = __mapGet.call(__promises, pid);
+  var p = __mapGet(__promises, pid);
   if (!p) return;
-  __mapDel.call(__promises, pid);
+  __mapDel(__promises, pid);
   if (ok) p[0](__decode(value));
-  else p[1](new __Error(String(value)));
+  else p[1](new __Error(__String(value)));
 }
 
 function __report(error, where) {
@@ -430,10 +449,10 @@ function __inlineHandlers(list) {
     var name = list[i][1];
     var code = list[i][2];
     try {
-      var fn = new Function('event', code);
+      var fn = new __Function('event', code);
       el[name] = fn;
     } catch (error) {
-      __host('log', 'error', 'SyntaxError in the ' + name + ' attribute ("' + String(code).slice(0, 80) + '"): ' + error.message);
+      __host('log', 'error', 'SyntaxError in the ' + name + ' attribute ("' + __String(code).slice(0, 80) + '"): ' + error.message);
     }
   }
 }
@@ -448,16 +467,16 @@ function __zdom_run(source, name) {
     __watch((0, eval)(source), 'in ' + name);
     return null;
   } catch (error) {
-    return (error && error.name ? error.name + ': ' + error.message : String(error)) + ' (' + name + ')';
+    return (error && error.name ? error.name + ': ' + error.message : __String(error)) + ' (' + name + ')';
   }
 }
 
 function __format(v) {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
-  if (v && typeof v === 'object' && __weakMapHas.call(__wrapperIds, v)) {
+  if (v && typeof v === 'object' && __weakMapHas(__wrapperIds, v)) {
     try {
-      return '<' + String(v.tagName || v.nodeName || 'object').toLowerCase() + (v.id ? '#' + v.id : '') + '>';
+      return '<' + __String(v.tagName || v.nodeName || 'object').toLowerCase() + (v.id ? '#' + v.id : '') + '>';
     } catch (e) {
       return '[object]';
     }
@@ -466,9 +485,9 @@ function __format(v) {
   if (typeof v === 'function') return 'function ' + (v.name || '');
   try {
     var s = __jsonStringify(v);
-    return s === undefined ? String(v) : s;
+    return s === undefined ? __String(v) : s;
   } catch (e) {
-    return String(v);
+    return __String(v);
   }
 }
 
@@ -476,8 +495,8 @@ var console = (function () {
   var out = function (level) {
     return function () {
       var parts = [];
-      for (var i = 0; i < arguments.length; i++) parts.push(__format(arguments[i]));
-      __host('log', level, parts.join(' '));
+      for (var i = 0; i < arguments.length; i++) parts[i] = __format(arguments[i]);
+      __host('log', level, __arrayJoin(parts, ' '));
     };
   };
   var counts = {};
@@ -495,7 +514,7 @@ var console = (function () {
     groupCollapsed: out('log'),
     groupEnd: function () {},
     assert: function (ok) {
-      if (!ok) out('error').apply(null, ['Assertion failed:'].concat(Array.prototype.slice.call(arguments, 1)));
+      if (!ok) __applyFn(out('error'), null, __arrayConcat(['Assertion failed:'], __arraySlice(arguments, 1)));
     },
     count: function (label) {
       label = label || 'default';
@@ -533,16 +552,16 @@ var document = __host('document');
   var methods = ['addEventListener', 'removeEventListener', 'dispatchEvent', 'getComputedStyle', 'matchMedia', 'scrollTo', 'scrollBy', 'scroll', 'requestAnimationFrame', 'cancelAnimationFrame', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'getSelection', 'requestIdleCallback', 'cancelIdleCallback', 'createImageBitmap'];
   methods.forEach(function (name) {
     window[name] = function () {
-      return __win[name].apply(null, arguments);
+      return __applyFn(__win[name], null, arguments);
     };
   });
   // A string for a timer is code, as in a browser.
   ['setTimeout', 'setInterval'].forEach(function (name) {
     var real = window[name];
     window[name] = function (fn) {
-      var args = Array.prototype.slice.call(arguments);
-      if (typeof fn === 'string') args[0] = new Function(fn);
-      return real.apply(null, args);
+      var args = __arraySlice(arguments);
+      if (typeof fn === 'string') args[0] = new __Function(fn);
+      return __applyFn(real, null, args);
     };
   });
   // Handlers set as window.onload = ... (and friends) go to the real window.
@@ -571,7 +590,7 @@ var frames = window;
   names.forEach(function (name) {
     var C = function () {
       var args = [];
-      for (var i = 0; i < arguments.length; i++) args.push(__encode(arguments[i]));
+      for (var i = 0; i < arguments.length; i++) args[i] = __encode(arguments[i]);
       return __host('new', name, args);
     };
     Object.defineProperty(C, 'name', { value: name });
@@ -731,8 +750,8 @@ var history = (function () {
     },
     scrollRestoration: 'auto',
     pushState: function (state) {
-      entries = entries.slice(0, at + 1);
-      entries.push({ state: state });
+      entries = __arraySlice(entries, 0, at + 1);
+      entries[entries.length] = { state: state };
       at++;
     },
     replaceState: function (state) {
@@ -799,10 +818,10 @@ var crypto = {
   },
 };
 function atob(s) {
-  return __host('atob', String(s));
+  return __host('atob', __String(s));
 }
 function btoa(s) {
-  return __host('btoa', String(s));
+  return __host('btoa', __String(s));
 }
 function structuredClone(v) {
   return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
@@ -831,7 +850,7 @@ function __response(got, url) {
   };
   var text = function () {
     take();
-    return Promise.resolve(got.text !== undefined ? got.text : atob(got.b64));
+    return __Promise.resolve(got.text !== undefined ? got.text : __atob(got.b64));
   };
   return {
     ok: got.status >= 200 && got.status < 300,
@@ -852,11 +871,11 @@ function __response(got, url) {
     },
     arrayBuffer: function () {
       take();
-      var binary = got.text !== undefined ? null : atob(got.b64);
-      if (binary === null) return Promise.resolve(new TextEncoder().encode(got.text).buffer);
-      var bytes = new Uint8Array(binary.length);
-      for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return Promise.resolve(bytes.buffer);
+      var binary = got.text !== undefined ? null : __atob(got.b64);
+      if (binary === null) return __Promise.resolve(new TextEncoder().encode(got.text).buffer);
+      var bytes = new __Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) bytes[i] = __strCharCodeAt(binary, i);
+      return __Promise.resolve(bytes.buffer);
     },
     blob: function () {
       take();
@@ -891,15 +910,15 @@ function XMLHttpRequest() {
   };
   xhr.abort = function () {};
   xhr.addEventListener = function (type, fn) {
-    (listeners[type] = listeners[type] || []).push(fn);
+    var list = listeners[type] || (listeners[type] = []);
+    list[list.length] = fn;
   };
   xhr.removeEventListener = function () {};
   var fire = function (type) {
     var event = { type: type, target: xhr, currentTarget: xhr };
     if (typeof xhr['on' + type] === 'function') xhr['on' + type](event);
-    (listeners[type] || []).forEach(function (fn) {
-      fn.call(xhr, event);
-    });
+    var list = listeners[type] || [];
+    for (var i = 0; i < list.length; i++) __callFn(list[i], xhr, event);
   };
   xhr.send = function () {
     var got;
@@ -915,8 +934,8 @@ function XMLHttpRequest() {
     }
     setTimeout(function () {
       xhr.status = got.status;
-      xhr.responseText = got.text !== undefined ? got.text : atob(got.b64);
-      xhr.response = xhr.responseType === 'json' ? JSON.parse(xhr.responseText) : xhr.responseText;
+      xhr.responseText = got.text !== undefined ? got.text : __atob(got.b64);
+      xhr.response = xhr.responseType === 'json' ? __jsonParse(xhr.responseText) : xhr.responseText;
       xhr.readyState = 4;
       fire('readystatechange');
       fire('load');

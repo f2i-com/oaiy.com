@@ -31,6 +31,9 @@ use super::trust::{PackageTrust, TrustService, TrustState};
 
 /// Cap on an installed plugin, so a runaway archive cannot fill the disk.
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Upper bound on total decompressed bytes read from a `.tar.gz` stream (tar headers,
+/// PAX records, padding, and file payloads combined).
+const MAX_TAR_STREAM_BYTES: u64 = MAX_TOTAL_BYTES + 16 * 1024 * 1024;
 /// Cap on entries, so a zip-bomb-shaped tarball cannot exhaust inodes.
 const MAX_ENTRIES: usize = 20_000;
 
@@ -170,47 +173,65 @@ fn copy_tree(src: &Path, dst: &Path, budget: &mut u64, entries: &mut usize) -> R
     Ok(())
 }
 
-/// Unpack a `.tar.gz` into `dst`, rejecting entries that escape it.
+/// Unpack a `.tar.gz` into `dst`, rejecting entries that escape it or exceed
+/// the decompressed stream byte ceiling.
 fn extract_tar_gz(archive: &Path, dst: &Path) -> Result<(), String> {
+    extract_tar_gz_with_limit(archive, dst, MAX_TAR_STREAM_BYTES)
+}
+
+fn extract_tar_gz_with_limit(archive: &Path, dst: &Path, max_stream_bytes: u64) -> Result<(), String> {
+    use std::io::Read;
     let file = std::fs::File::open(archive)
         .map_err(|e| format!("cannot open {}: {e}", archive.display()))?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let limited = flate2::read::GzDecoder::new(file).take(max_stream_bytes);
+    let mut tar = tar::Archive::new(limited);
     std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
     let mut total: u64 = 0;
     let mut count = 0usize;
-    let entries = tar
-        .entries()
-        .map_err(|e| format!("{} is not a readable tar.gz: {e}", archive.display()))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("corrupt archive entry: {e}"))?;
-        let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
-            return Err("archive entry is not a regular file or directory".into());
+    {
+        let entries = tar
+            .entries()
+            .map_err(|e| format!("{} is not a readable tar.gz: {e}", archive.display()))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| format!("corrupt archive entry: {e}"))?;
+            let kind = entry.header().entry_type();
+            if !kind.is_file() && !kind.is_dir() {
+                return Err("archive entry is not a regular file or directory".into());
+            }
+            let raw_name = {
+                let bytes = entry.path_bytes();
+                std::str::from_utf8(bytes.as_ref())
+                    .map_err(|_| "archive entry name is not valid UTF-8".to_string())?
+                    .to_string()
+            };
+            if !safe_member_name(&raw_name, kind.is_dir()) {
+                return Err(format!("archive entry {raw_name:?} escapes the package or uses an unsafe name"));
+            }
+            let path = entry
+                .path()
+                .map_err(|e| format!("unreadable archive path: {e}"))?
+                .into_owned();
+            if !safe_relative(&path) {
+                return Err(format!("archive entry {:?} escapes the package", path.display()));
+            }
+            count += 1;
+            total = total.saturating_add(entry.size());
+            if count > MAX_ENTRIES || total > MAX_TOTAL_BYTES {
+                return Err("the archive is too large to install".into());
+            }
+            entry
+                .unpack_in(dst)
+                .map_err(|e| format!("cannot unpack {:?}: {e}", path.display()))?;
         }
-        let raw_name = {
-            let bytes = entry.path_bytes();
-            std::str::from_utf8(bytes.as_ref())
-                .map_err(|_| "archive entry name is not valid UTF-8".to_string())?
-                .to_string()
-        };
-        if !safe_member_name(&raw_name, kind.is_dir()) {
-            return Err(format!("archive entry {raw_name:?} escapes the package or uses an unsafe name"));
+    }
+    let limited = tar.into_inner();
+    if limited.limit() == 0 {
+        let mut probe = [0u8; 1];
+        match limited.into_inner().read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) => return Err("the archive exceeds the decompressed size limit".into()),
+            Err(e) => return Err(format!("corrupt archive stream: {e}")),
         }
-        let path = entry
-            .path()
-            .map_err(|e| format!("unreadable archive path: {e}"))?
-            .into_owned();
-        if !safe_relative(&path) {
-            return Err(format!("archive entry {:?} escapes the package", path.display()));
-        }
-        count += 1;
-        total = total.saturating_add(entry.size());
-        if count > MAX_ENTRIES || total > MAX_TOTAL_BYTES {
-            return Err("the archive is too large to install".into());
-        }
-        entry
-            .unpack_in(dst)
-            .map_err(|e| format!("cannot unpack {:?}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -1054,6 +1075,73 @@ mod tests {
         uninstall("demo", &root).unwrap();
         assert!(!root.join("demo").exists());
         assert!(!data.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn extract_tar_gz_aborts_on_decompressed_stream_bomb() {
+        let base = tmp("tar-gz-bomb");
+        let dst = base.join("out");
+
+        // Case 1: Zero-byte file headers exceeding the stream ceiling on an exact 512-byte
+        // boundary (`entry.size()` sum is 0, `tar.entries()` hits EOF cleanly at 4096 bytes,
+        // and the post-loop `limit() == 0` probe must detect remaining compressed bytes).
+        let zero_files_tgz = base.join("zero-files.tar.gz");
+        {
+            let file = std::fs::File::create(&zero_files_tgz).unwrap();
+            let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::best());
+            let mut builder = tar::Builder::new(&mut enc);
+            for i in 0..10 {
+                let mut hdr = tar::Header::new_ustar();
+                hdr.set_entry_type(tar::EntryType::Regular);
+                hdr.set_path(format!("f{i}.txt")).unwrap();
+                hdr.set_size(0);
+                hdr.set_mode(0o644);
+                hdr.set_cksum();
+                builder.append(&hdr, std::io::empty()).unwrap();
+            }
+            builder.finish().unwrap();
+            drop(builder);
+            enc.finish().unwrap();
+        }
+        let err = extract_tar_gz_with_limit(&zero_files_tgz, &dst, 4096).unwrap_err();
+        assert!(
+            err.contains("decompressed size limit"),
+            "expected stream-limit abort on exact boundary, got: {err}"
+        );
+
+        // Case 2: PAX extended header (`EntryType::XHeader`) bomb consumed internally by
+        // `tar::Archive::entries()` before yielding the entry.
+        let pax_tgz = base.join("pax-bomb.tar.gz");
+        {
+            let file = std::fs::File::create(&pax_tgz).unwrap();
+            let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::best());
+            let mut builder = tar::Builder::new(&mut enc);
+            let pax_rec = format!("10000 comment={}\n", "A".repeat(9985));
+            let mut pax_hdr = tar::Header::new_ustar();
+            pax_hdr.set_entry_type(tar::EntryType::XHeader);
+            pax_hdr.set_path("PaxHeaders/f.txt").unwrap();
+            pax_hdr.set_size(pax_rec.len() as u64);
+            pax_hdr.set_mode(0o644);
+            pax_hdr.set_cksum();
+            builder.append(&pax_hdr, pax_rec.as_bytes()).unwrap();
+            let mut file_hdr = tar::Header::new_ustar();
+            file_hdr.set_entry_type(tar::EntryType::Regular);
+            file_hdr.set_path("f.txt").unwrap();
+            file_hdr.set_size(0);
+            file_hdr.set_mode(0o644);
+            file_hdr.set_cksum();
+            builder.append(&file_hdr, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+            drop(builder);
+            enc.finish().unwrap();
+        }
+        let dst2 = base.join("out2");
+        let err2 = extract_tar_gz_with_limit(&pax_tgz, &dst2, 4096).unwrap_err();
+        assert!(
+            err2.contains("decompressed size limit") || err2.contains("corrupt archive"),
+            "expected stream-limit abort on PAX bomb, got: {err2}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

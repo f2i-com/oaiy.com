@@ -79,7 +79,10 @@ pub fn gate(studio: &Studio, req: &Request, port: u16, peer_loopback: bool) -> O
     let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
     let route = req.route();
     let font = FONTS.iter().any(|(path, _)| *path == route);
-    if !local && route != "/" && !font && !key.is_empty() {
+    if !local && route != "/" && !font {
+        if key.is_empty() {
+            return refuse(403, "this control port is for this computer alone");
+        }
         let given = req.query("key");
         let keyed = oaiy_engine::http::key_matches(req.header("authorization"), &key) || given.is_some_and(|g| oaiy_engine::http::same_secret(g.as_bytes(), key.as_bytes()));
         if !keyed {
@@ -681,6 +684,30 @@ mod tests {
         let local = Studio::for_test(&root, config::default_json());
         assert_eq!(gate(&local, &req("/api/config", &[("Host", "evil.example:7860")]), 7860, true).map(|r| r.status), Some(403));
         assert_eq!(gate(&local, &req("/api/config", &[("Host", "localhost:7860")]), 7860, true).map(|r| r.status), None);
+    }
+
+    /// Reached remotely (or by a non-loopback name) when no gateway API key is configured — for instance after
+    /// reverting `ui.host` to loopback and clearing the key before a restart — the control port fails closed with 403.
+    #[test]
+    fn non_local_request_without_gateway_key_is_refused_403() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-admin-nokey-{}", std::process::id()));
+        let req = |path: &str, h: &[(&str, &str)]| Request::new("POST", path, h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new());
+        // Case 1: `ui.host` reverted to loopback and `gateway.api_key` cleared, while a remote peer still connects to
+        // the previously-bound wildcard socket with `Host: 127.0.0.1:7860`.
+        let reverted = Studio::for_test(&root, config::default_json());
+        let refused = gate(&reverted, &req("/api/config", &[("Host", "127.0.0.1:7860")]), 7860, false).expect("must refuse remote peer without key");
+        assert_eq!(refused.status, 403);
+        assert!(refused.body.contains("this control port is for this computer alone"), "{}", refused.body);
+        // Case 2: `ui.host` is `0.0.0.0` with empty `gateway.api_key`: both remote peers and loopback DNS rebinding fail closed.
+        let mut cfg = config::default_json();
+        let mut ui = cfg.get("ui").unwrap().clone();
+        crate::util::set(&mut ui, "host", Json::str("0.0.0.0"));
+        crate::util::set(&mut cfg, "ui", ui);
+        let open_no_key = Studio::for_test(&root, cfg);
+        assert_eq!(gate(&open_no_key, &req("/api/config", &[("Host", "192.168.1.20:7860")]), 7860, false).map(|r| r.status), Some(403));
+        assert_eq!(gate(&open_no_key, &req("/api/config", &[("Host", "evil.example:7860"), ("Origin", "http://evil.example:7860")]), 7860, true).map(|r| r.status), Some(403));
+        // Local loopback client naming loopback still passes with no key.
+        assert_eq!(gate(&reverted, &req("/api/config", &[("Host", "127.0.0.1:7860")]), 7860, true).map(|r| r.status), None);
     }
 
     #[test]

@@ -208,7 +208,7 @@ await check('what the sharing-build words rest on is what the code does: only Sh
   // The polling starts only with a share and sharing on, and the share is remembered; forgetting it only forgets it here.
   assert.match(hook, /if \(!enabled \|\| share === null\) \{[\s\S]{0,160}?return;\s*\}\s*setDispatchState\('idle'\);[\s\S]{0,200}?startBackendDispatcher\(/);
   assert.match(hook, /localStorage\.setItem\(SHARE_KEY/);
-  assert.match(hook, /const forgetShare = \(\) => \{\s*setShare\(null\);\s*writeShareToStorage\(null\);\s*\};/);
+  assert.match(hook, /const forgetShare = \(\) => \{\s*(?:if \(share\?\.hash_edit\) \{\s*setFlowPassword\(share\.hash_edit, null\);\s*\}\s*)?setShare\(null\);\s*writeShareToStorage\(null\);\s*\};/);
   assert.match(src('components/dialogs/ShareFlowDialog.tsx'), /the backend copy is NOT deleted/);
   // Every request to the service goes through one fetch, in apiJson, which refuses when the build has no service or sharing is off.
   const text = src(dispatcher);

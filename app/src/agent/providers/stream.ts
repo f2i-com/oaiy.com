@@ -172,14 +172,19 @@ export function parseToolArgs(raw: string): { input: Record<string, unknown>; pa
   return { input: {}, parseError: `arguments are not valid JSON (${msg})` };
 }
 
+/** Upper bound on streamed block / tool-call indices so malformed or hostile streams cannot cause unbounded growth. */
+const MAX_STREAM_INDEX = 4096;
+
 // ---------------------------------------------------------------------------
 // Anthropic Messages
 // ---------------------------------------------------------------------------
 
 export class AnthropicStream {
-  private blocks: Array<Record<string, unknown> | undefined> = [];
+  private blocks = new Map<number, Record<string, unknown>>();
   private json = new Map<number, string>();
   private finalized = new Set<number>();
+  private nextIndex = 0;
+  private lastIndex = -1;
   private fallbackIdSeq = 0;
   private stopReason: string | null = null;
   private usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
@@ -190,11 +195,28 @@ export class AnthropicStream {
 
   constructor(private readonly sink?: StreamSink) {}
 
+  private allocateIndex(): number | null {
+    while (this.blocks.has(this.nextIndex) && this.nextIndex < MAX_STREAM_INDEX) this.nextIndex++;
+    if (this.nextIndex >= MAX_STREAM_INDEX) return null;
+    return this.nextIndex++;
+  }
+
+  private resolveIndex(raw: unknown, isStart: boolean): number | null {
+    if (raw === undefined || raw === null) {
+      return isStart ? this.allocateIndex() : this.lastIndex >= 0 ? this.lastIndex : null;
+    }
+    if (typeof raw !== 'number' || !Number.isInteger(raw)) return null;
+    if (raw < 0) {
+      return isStart ? this.allocateIndex() : this.lastIndex >= 0 ? this.lastIndex : null;
+    }
+    if (raw >= MAX_STREAM_INDEX) return null;
+    return raw;
+  }
+
   accept(event: SSEEvent): void {
     const payload = parseEvent(event);
     if (!payload) return;
     const type = typeof payload.type === 'string' ? payload.type : event.event;
-    const index = typeof payload.index === 'number' ? payload.index : -1;
     switch (type) {
       case 'message_start': {
         const message = isRecord(payload.message) ? payload.message : {};
@@ -202,10 +224,14 @@ export class AnthropicStream {
         break;
       }
       case 'content_block_start': {
+        const index = this.resolveIndex(payload.index, true);
+        if (index === null) break;
+        this.lastIndex = index;
+        if (index >= this.nextIndex) this.nextIndex = index + 1;
         const block: Record<string, unknown> = isRecord(payload.content_block) ? { ...payload.content_block } : { type: 'unknown' };
         if (block.type === 'tool_use') {
           const rawId = typeof block.id === 'string' ? block.id.trim() : '';
-          const id = rawId || `call_${Date.now().toString(36)}_${++this.fallbackIdSeq}_${index >= 0 ? index : this.blocks.length}`;
+          const id = rawId || `call_${Date.now().toString(36)}_${++this.fallbackIdSeq}_${index}`;
           block.id = id;
           block.input = {};
           this.json.set(index, '');
@@ -215,11 +241,13 @@ export class AnthropicStream {
           block.text = typeof block.text === 'string' ? block.text : '';
           if (block.text) this.sink?.text(block.text as string);
         }
-        this.blocks[index] = block;
+        this.blocks.set(index, block);
         break;
       }
       case 'content_block_delta': {
-        const block = this.blocks[index];
+        const index = this.resolveIndex(payload.index, false);
+        if (index === null) break;
+        const block = this.blocks.get(index);
         const delta = isRecord(payload.delta) ? payload.delta : {};
         if (!block) break;
         if (delta.type === 'text_delta' && typeof delta.text === 'string') {
@@ -237,7 +265,8 @@ export class AnthropicStream {
         break;
       }
       case 'content_block_stop': {
-        this.finalizeToolBlock(index);
+        const index = this.resolveIndex(payload.index, false);
+        if (index !== null) this.finalizeToolBlock(index);
         break;
       }
       case 'message_delta': {
@@ -261,7 +290,7 @@ export class AnthropicStream {
   private finalizeToolBlock(index: number): void {
     if (this.finalized.has(index)) return;
     this.finalized.add(index);
-    const block = this.blocks[index];
+    const block = this.blocks.get(index);
     if (block?.type !== 'tool_use') return;
     const raw = (this.json.get(index) ?? '').trim();
     const parsed = parseToolArgs(raw);
@@ -275,10 +304,11 @@ export class AnthropicStream {
   result(): Record<string, unknown> {
     if (!this.stopped && !this.delta) throw closedEarly();
     for (const index of this.json.keys()) this.finalizeToolBlock(index);
+    const content = [...this.blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, block]) => block);
     return {
       type: 'message',
       role: 'assistant',
-      content: this.blocks.filter((b): b is Record<string, unknown> => b !== undefined),
+      content,
       stop_reason: this.stopReason,
       usage: { ...this.usage },
     };
@@ -310,15 +340,22 @@ export class OpenAIStream {
   private refusal = '';
   /** What the model thought (`reasoning_content`): kept with the reply, as a reply sent whole keeps it. */
   private reasoning = '';
-  private calls: CallInProgress[] = [];
+  private calls = new Map<number, CallInProgress>();
   /** A server's index whose call was followed by another whole call at the same index: where that one went. */
   private moved = new Map<number, number>();
   private finishReason: string | null = null;
   private usage: Record<string, unknown> | null = null;
   private done = false;
+  private nextIndex = 0;
   private lastIndex = -1;
 
   constructor(private readonly sink?: StreamSink) {}
+
+  private allocateCallIndex(): number | null {
+    while (this.calls.has(this.nextIndex) && this.nextIndex < MAX_STREAM_INDEX) this.nextIndex++;
+    if (this.nextIndex >= MAX_STREAM_INDEX) return null;
+    return this.nextIndex++;
+  }
 
   accept(event: SSEEvent): void {
     const payload = parseEvent(event);
@@ -366,27 +403,46 @@ export class OpenAIStream {
   private readCall(raw: Record<string, unknown>): void {
     const id = typeof raw.id === 'string' ? raw.id : '';
     const fn = isRecord(raw.function) ? raw.function : {};
-    // Calls are told apart by `index`. A server that leaves it out sends each
+    const hasRawIndex = raw.index !== undefined && raw.index !== null;
+    let rawIndex: number | null = null;
+    if (hasRawIndex) {
+      if (typeof raw.index !== 'number' || !Number.isInteger(raw.index) || raw.index >= MAX_STREAM_INDEX) return;
+      if (raw.index >= 0) rawIndex = raw.index;
+    }
+    // Calls are told apart by `index`. A server that leaves it out (or sends a negative index) sends each
     // call whole, or continues an existing call by id / the last one: look up by id first.
-    let index = typeof raw.index === 'number' ? (this.moved.get(raw.index) ?? raw.index) : -1;
-    if (index < 0) {
+    let index: number | null = rawIndex !== null ? (this.moved.get(rawIndex) ?? rawIndex) : null;
+    if (index === null) {
       if (id) {
-        const existing = this.calls.findIndex((c) => c?.id === id);
-        index = existing >= 0 ? existing : this.calls.length;
+        for (const [k, c] of this.calls) {
+          if (c.id === id) {
+            index = k;
+            break;
+          }
+        }
+        if (index === null) index = this.allocateCallIndex();
       } else {
-        index = Math.max(this.lastIndex, 0);
+        index = this.lastIndex >= 0 ? this.lastIndex : this.allocateCallIndex();
       }
     }
+    if (index === null || index < 0 || index >= MAX_STREAM_INDEX) return;
     // A call's first fragment (its name, with an id of its own) at an index whose call already has a name and another
     // id: a server that sends each call whole at the same index. A new call, and the index's later fragments are its own
     // (the two were merged into one call, its arguments two objects run together, and neither ran).
-    const there = this.calls[index];
-    if (typeof raw.index === 'number' && id && typeof fn.name === 'string' && fn.name && there?.name && there.id && there.id !== id) {
-      index = this.calls.length;
-      this.moved.set(raw.index, index);
+    const there = this.calls.get(index);
+    if (rawIndex !== null && id && typeof fn.name === 'string' && fn.name && there?.name && there.id && there.id !== id) {
+      const allocated = this.allocateCallIndex();
+      if (allocated === null) return;
+      index = allocated;
+      this.moved.set(rawIndex, index);
     }
+    if (index >= this.nextIndex) this.nextIndex = index + 1;
     this.lastIndex = index;
-    const call = (this.calls[index] ??= { id: '', name: '', args: '', announced: false });
+    let call = this.calls.get(index);
+    if (!call) {
+      call = { id: '', name: '', args: '', announced: false };
+      this.calls.set(index, call);
+    }
     if (id) call.id = id;
     // A name arrives whole, in the call's first fragment; later fragments carry arguments only.
     if (typeof fn.name === 'string' && fn.name && !call.name) call.name = fn.name;
@@ -407,7 +463,10 @@ export class OpenAIStream {
   /** The reply as the non-streamed API returns it. */
   result(): Record<string, unknown> {
     if (!this.done && this.finishReason === null) throw closedEarly();
-    const calls = this.calls.filter((c) => c && c.name);
+    const calls = [...this.calls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, c]) => c)
+      .filter((c) => c.name);
     return {
       choices: [
         {

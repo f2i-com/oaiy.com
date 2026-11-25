@@ -488,6 +488,68 @@ pub unsafe extern "C" fn tgw_buffer_range(d: *mut TgwDevice, b: *mut TgwBuffer, 
     }
 }
 
+/// Copies `size` bytes out of a mapped range into `data` and drops the temporary view immediately; 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn tgw_buffer_read_mapped(d: *mut TgwDevice, b: *mut TgwBuffer, offset: u64, data: *mut c_void, size: usize) -> i32 {
+    let (d, b) = (&*d, &mut *b);
+    let Some(end) = offset.checked_add(size as u64) else {
+        d.report(TGW_VALIDATION, "buffer read range overflow".into());
+        return 1;
+    };
+    if size > 0 && data.is_null() {
+        d.report(TGW_VALIDATION, "buffer read destination is null".into());
+        return 1;
+    }
+    let got = d.guard(|| {
+        b.buffer.slice(offset..end).get_mapped_range().map(|v| {
+            if size > 0 {
+                // SAFETY: caller guarantees `data` points to `size` writable bytes for the duration of the call.
+                let dst = std::slice::from_raw_parts_mut(data as *mut u8, size);
+                dst.copy_from_slice(&v[..size]);
+            }
+        })
+    });
+    match got {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => {
+            d.report(TGW_VALIDATION, e.to_string());
+            1
+        }
+        None => 1,
+    }
+}
+
+/// Copies `size` bytes from `data` into a mapped range and drops the temporary view immediately; 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn tgw_buffer_write_mapped(d: *mut TgwDevice, b: *mut TgwBuffer, offset: u64, data: *const c_void, size: usize) -> i32 {
+    let (d, b) = (&*d, &mut *b);
+    let Some(end) = offset.checked_add(size as u64) else {
+        d.report(TGW_VALIDATION, "buffer write range overflow".into());
+        return 1;
+    };
+    if size > 0 && data.is_null() {
+        d.report(TGW_VALIDATION, "buffer write source is null".into());
+        return 1;
+    }
+    let got = d.guard(|| {
+        b.buffer.slice(offset..end).get_mapped_range_mut().map(|mut v| {
+            if size > 0 {
+                // SAFETY: caller guarantees `data` points to `size` readable bytes for the duration of the call.
+                let src = std::slice::from_raw_parts(data as *const u8, size);
+                v.copy_from_slice(src);
+            }
+        })
+    });
+    match got {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => {
+            d.report(TGW_VALIDATION, e.to_string());
+            1
+        }
+        None => 1,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn tgw_buffer_unmap(b: *mut TgwBuffer) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -631,7 +693,7 @@ pub unsafe extern "C" fn tgw_encoder_create(d: *mut TgwDevice) -> *mut TgwEncode
 pub unsafe extern "C" fn tgw_encoder_copy(d: *mut TgwDevice, e: *mut TgwEncoder, src: *mut TgwBuffer, src_offset: u64, dst: *mut TgwBuffer, dst_offset: u64, size: u64) {
     let d = &*d;
     if let Some(enc) = (*e).0.as_mut() {
-        d.guard(|| enc.copy_buffer_to_buffer(&(*src).buffer, src_offset, &(*dst).buffer, dst_offset, Some(size)));
+        d.guard(|| enc.copy_buffer_to_buffer(&(*src).buffer, src_offset, &(*dst).buffer, dst_offset, (size != u64::MAX).then_some(size)));
     }
 }
 

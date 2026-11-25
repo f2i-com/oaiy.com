@@ -73,7 +73,7 @@ import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder,
 import { normalizePath, type Vfs } from './vfs/vfs';
 import { SESSION_SLASH_COMMANDS, SLASH_COMMANDS } from './ui/chat/mentions';
 import { mountPlanReviewCard, mountQuestionCard } from './ui/chat/questionCard';
-import { isOutreachPath, readView } from './vfs/readView';
+import { isFrontDeskPrivatePath, readView } from './vfs/readView';
 import { mayReloadForIsolation } from './pwa/reloadGuard';
 import { startInstall } from './pwa/install';
 import { installButton } from './ui/installButton';
@@ -1445,8 +1445,8 @@ async function main(): Promise<void> {
     frontDesk = await OpenProject.openFrontDesk();
     frontDesk.onError = notice;
     // The Front desk's files as its calls, texts and flows' tasks see them: the outreach results (one
-    // customer's answers) are the runner's alone.
-    const deskView = readView(frontDesk.vfs, isOutreachPath);
+    // customer's answers) and internal harness spills (/.oaiy/**) are the runner's alone.
+    const deskView = readView(frontDesk.vfs, isFrontDeskPrivatePath);
     const own = (sessions = new Sessions(
       frontDesk,
       // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.

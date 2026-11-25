@@ -280,6 +280,46 @@ describe('hearing a voice', () => {
     root = createRoot(host);
     vi.restoreAllMocks();
   });
+
+  it('revokes the object URL when audio.play() rejects', async () => {
+    routes['POST /api/voice/voices/Front%20desk/try'] = () => ({ body: {} });
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockRejectedValue(new Error('autoplay blocked'));
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockReturnValue(undefined);
+    const revoke = vi.spyOn(URL, 'revokeObjectURL');
+    await mount();
+    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
+    await act(async () => hear.click());
+    await act(async () => {});
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(text()).not.toContain('Speaking…');
+    expect(text()).toContain('Could not speak');
+    act(() => root.unmount());
+    root = createRoot(host);
+    vi.restoreAllMocks();
+  });
+
+  it('does not create or play audio if unmounted while voices.hear is still in flight', async () => {
+    let finishFetch!: (r: Response) => void;
+    fetchMock.mockImplementationOnce(async (url: string, init?: RequestInit) => {
+      const key = `${init?.method ?? 'GET'} ${new URL(url).pathname}`;
+      const answer = routes[key]?.(init) ?? { status: 404, body: {} };
+      return new Response(JSON.stringify(answer.body ?? {}), { status: answer.status ?? 200 });
+    });
+    const playSpy = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
+    const createUrlSpy = vi.spyOn(URL, 'createObjectURL');
+    await mount();
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((r) => (finishFetch = r)));
+    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
+    await act(async () => hear.click());
+    // Unmount before the sample audio finishes generating.
+    act(() => root.unmount());
+    root = createRoot(host);
+    await act(async () => finishFetch(new Response(new Uint8Array([1, 2, 3]), { status: 200 })));
+    await act(async () => {});
+    expect(createUrlSpy).not.toHaveBeenCalled();
+    expect(playSpy).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
 });
 
 describe('where the greeting is set, and a voice’s name', () => {

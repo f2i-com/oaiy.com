@@ -210,6 +210,10 @@ test('the shipped unit and oaiyctl read one source, and the unit sets no OAIY_ s
   const ctlFile = /^env_file=\$\{OAIYCTL_ENV_FILE:-([^}]+)\}$/m.exec(ctl)?.[1];
   assert.ok(unitFile, 'the unit has an EnvironmentFile');
   assert.equal(unitFile, ctlFile, 'the unit and oaiyctl read the same file');
+  const unitServer = /^ExecStart=(\S+)$/m.exec(unit)?.[1];
+  const ctlServer = /^server=\$\{OAIYCTL_SERVER:-([^}]+)\}$/m.exec(ctl)?.[1];
+  assert.ok(unitServer, 'the unit has an ExecStart');
+  assert.equal(unitServer, ctlServer, 'the unit and oaiyctl default to the same server binary');
   assert.doesNotMatch(unit.replace(/^#.*$/gm, ''), /^\s*Environment=OAIY_/m, 'no OAIY_ setting inline in the unit');
   // The unit stops a configuration the server would refuse, and does not restart on it.
   assert.match(unit, /^ExecStartPre=\S*oaiy-server check$/m);
@@ -230,4 +234,35 @@ test('a missing environment file is not an error (the defaults apply)', { skip }
   const r = run(h, ['check']);
   assert.equal(r.status, 0, r.stderr);
   assert.match(h.calls(), /server args: check/);
+});
+
+test('ambient OAIY_DATA_DIR does not leak when invoked directly as the service user', { skip }, () => {
+  const h = harness({ user: 'oaiy', envText: 'OAIY_SERVER_PORT=17972\n' });
+  const r = run(h, ['auth', 'status'], { OAIY_DATA_DIR: '/tmp/ambient-leak' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /no OAIY_DATA_DIR in .*oaiy\.env/);
+  assert.match(h.calls(), /^OAIY_DATA_DIR=$/m, 'ambient OAIY_DATA_DIR was cleared');
+});
+
+test('re-exec through sudo handles script paths containing equals signs safely', { skip }, () => {
+  const h = harness({ user: 'alice', envText: 'OAIY_DATA_DIR=/var/lib/oaiy\n' });
+  const eqDir = path.join(h.dir, 'dir=1');
+  fs.mkdirSync(eqDir);
+  const copy = path.join(eqDir, 'oaiyctl');
+  fs.copyFileSync(script, copy);
+  fs.chmodSync(copy, 0o755);
+  const r = spawnSync(shell, [copy, 'auth', 'status'], {
+    encoding: 'utf8',
+    timeout: 20_000,
+    env: {
+      PATH: `${h.posix(h.bin)}:/usr/bin:/bin`,
+      OAIYCTL_ENV_FILE: h.posix(h.envFile),
+      OAIYCTL_USER: 'oaiy',
+      OAIYCTL_SERVER: h.posix(path.join(h.bin, 'oaiy-server')),
+      OAIYCTL_PROC: h.posix(h.proc),
+    },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(h.calls(), /server args: auth status/);
+  assert.match(h.calls(), /FAKE_USER=oaiy/);
 });

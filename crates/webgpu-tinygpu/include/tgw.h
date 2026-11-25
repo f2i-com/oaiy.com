@@ -88,6 +88,8 @@ void tgw_device_free(TgwDevice* d);
 TgwBuffer* tgw_buffer_create(TgwDevice* d, uint64_t size, uint32_t usage, int mapped_at_creation);
 int tgw_buffer_map(TgwDevice* d, TgwBuffer* b, int write, uint64_t offset, uint64_t size);
 void* tgw_buffer_range(TgwDevice* d, TgwBuffer* b, uint64_t offset, uint64_t size, int write);
+int tgw_buffer_read_mapped(TgwDevice* d, TgwBuffer* b, uint64_t offset, void* data, size_t size);
+int tgw_buffer_write_mapped(TgwDevice* d, TgwBuffer* b, uint64_t offset, const void* data, size_t size);
 void tgw_buffer_unmap(TgwBuffer* b);
 void tgw_buffer_destroy(TgwBuffer* b);
 void tgw_buffer_free(TgwBuffer* b);

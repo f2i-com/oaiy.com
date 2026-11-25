@@ -330,6 +330,28 @@
 
   // --- the page's HTML -----------------------------------------------------------
 
+  const DANGEROUS_HTTP_EQUIV = /^\s*(content-security-policy|refresh)\s*$/i;
+  const isDangerousElement = (node) => {
+    if (!(node instanceof Element)) return false;
+    const tag = node.localName;
+    if (tag === 'base') return true;
+    if (tag === 'meta' && DANGEROUS_HTTP_EQUIV.test(node.getAttribute('http-equiv') || '')) return true;
+    return false;
+  };
+  const stripDangerousTree = (node) => {
+    if (!(node instanceof Node)) return;
+    if (isDangerousElement(node)) {
+      node.remove();
+      return;
+    }
+    if (node instanceof Element || node instanceof DocumentFragment || node instanceof Document) {
+      for (const el of [...node.querySelectorAll('base, meta[http-equiv]')]) {
+        if (isDangerousElement(el)) el.remove();
+      }
+    }
+  };
+  const guestPrevented = new WeakSet();
+
   const URL_ATTRS = { src: ['img', 'source', 'audio', 'video', 'track', 'embed', 'input', 'iframe'], href: ['link', 'image', 'use'], poster: ['video'], data: ['object'] };
   const JS_TYPES = /^(|text\/javascript|application\/javascript|module|text\/ecmascript|application\/ecmascript|text\/jsx?)$/i;
 
@@ -378,7 +400,7 @@
           continue;
         }
       }
-      if (tag === 'base' || (tag === 'meta' && /^(content-security-policy|refresh)$/i.test(el.getAttribute('http-equiv') || ''))) {
+      if (tag === 'base' || (tag === 'meta' && DANGEROUS_HTTP_EQUIV.test(el.getAttribute('http-equiv') || ''))) {
         el.remove();
         continue;
       }
@@ -685,7 +707,8 @@
     'eval', 'Function', 'Object', 'Reflect', 'Proxy',
     'postMessage', 'open', 'close',
     'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker',
-    '__oaiyAgentListening', '__oaiyAgentBridge',
+    'modernScreenshot', 'console', 'localStorage', 'URL', 'WebAssembly',
+    '__oaiyAgentListening', '__oaiyAgentBridge', '__oaiyAgentThree',
   ]);
   /** Only these on* window event handlers may be written or deleted through the host window handle. */
   const ALLOWED_WIN_SET_PROPS = new Set([
@@ -726,7 +749,10 @@
     const desc = Object.getOwnPropertyDescriptor(obj, 'constructor');
     return Boolean(desc && typeof desc.value === 'function' && desc.value.prototype === obj);
   };
-  const isForbiddenHostVal = (val) => val === parentWindow || (window.top && window.top !== window && val === window.top);
+  const isForbiddenHostVal = (val) =>
+    val === parentWindow ||
+    (window.top && window.top !== window && val === window.top) ||
+    (window.opener && val === window.opener);
 
   const OPS = Object.assign(Object.create(null), {
     window: () => {
@@ -763,6 +789,9 @@
       if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return undefined;
       if (obj === window && !ALLOWED_WIN_SET_PROPS.has(String(prop))) return undefined;
       let v = fromGuest(value);
+      if (obj instanceof Element && obj.localName === 'meta' && String(prop).toLowerCase() === 'httpequiv' && DANGEROUS_HTTP_EQUIV.test(String(v ?? ''))) {
+        return undefined;
+      }
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
       if (prop === 'outerHTML') {
@@ -795,16 +824,28 @@
       }
       let list = (args || []).map(fromGuest);
       if (typeof obj[method] !== 'function') throw new TypeError(`${method} is not a function`);
+      if (obj instanceof Event && method === 'preventDefault') guestPrevented.add(obj);
+      if (obj instanceof Document && (method === 'createElement' || method === 'createElementNS')) {
+        const rawTag = String(list[method === 'createElement' ? 0 : 1] ?? '');
+        const localTag = (rawTag.includes(':') ? rawTag.slice(rawTag.lastIndexOf(':') + 1) : rawTag).trim().toLowerCase();
+        if (localTag === 'base') throw new TypeError('<base> is not allowed in the preview');
+      }
       if (method === 'addEventListener' && typeof list[0] === 'string') markListener(obj, list[0].toLowerCase());
       if (method === 'setAttribute' || method === 'setAttributeNS') {
         const at = method === 'setAttribute' ? 0 : 1;
         const name = String(list[at]).toLowerCase();
+        if (obj instanceof Element && obj.localName === 'meta' && (name === 'http-equiv' || name.endsWith(':http-equiv')) && DANGEROUS_HTTP_EQUIV.test(String(list[at + 1] ?? ''))) {
+          return undefined;
+        }
         if (name.startsWith('on')) {
           harvested.push([toGuest(obj), name, String(list[at + 1])]);
           return undefined;
         }
         if (name === 'style') list[at + 1] = cssValue(String(list[at + 1]));
         else if (name === 'srcset' || REF_PROPS.has(name) || name === 'xlink:href') list[at + 1] = refValue(obj, name === 'xlink:href' ? 'href' : name, String(list[at + 1]));
+      }
+      if ((method === 'setAttributeNode' || method === 'setAttributeNodeNS') && obj instanceof Element && obj.localName === 'meta' && list[0] instanceof Attr && list[0].localName === 'http-equiv' && DANGEROUS_HTTP_EQUIV.test(list[0].value || '')) {
+        return null;
       }
       if (obj instanceof CSSStyleDeclaration && method === 'setProperty') list[1] = cssValue(list[1]);
       if (method === 'insertAdjacentHTML') {
@@ -814,8 +855,22 @@
         for (const node of [...obj.childNodes, ...(parent ? parent.childNodes : [])]) if (!before.has(node)) harvest(node);
         return undefined;
       }
+      if (INSERTS.has(method) || method === 'replaceChildren') {
+        if (method === 'appendChild' || method === 'insertBefore' || method === 'replaceChild') {
+          const inserted = list[0];
+          if (isDangerousElement(inserted)) return inserted;
+          stripDangerousTree(inserted);
+        } else {
+          list = list.filter((arg) => {
+            if (isDangerousElement(arg)) return false;
+            stripDangerousTree(arg);
+            return true;
+          });
+        }
+      }
       if (method === 'click' && emitBlobDownload(obj)) return undefined;
       const result = obj[method](...list);
+      if (isForbiddenHostVal(result)) return undefined;
       if (method === 'setHTMLUnsafe') harvest(obj);
       else if (HTML_METHODS.has(method) && result instanceof Node) harvest(result);
       if (INSERTS.has(method)) for (const arg of list) if (arg instanceof HTMLScriptElement) setTimeout(() => runInserted(arg));
@@ -824,7 +879,7 @@
     },
     new(name, args) {
       const ctorName = String(name);
-      if (!ALLOWED_CTORS.has(ctorName) || isBlockedProp(window, ctorName)) throw new TypeError(`${ctorName} is not allowed`);
+      if (!ALLOWED_CTORS.has(ctorName) || (ctorName !== 'URL' && isBlockedProp(window, ctorName))) throw new TypeError(`${ctorName} is not allowed`);
       const C = window[ctorName];
       if (typeof C !== 'function') throw new TypeError(`${ctorName} is not available in the preview`);
       return new C(...(args || []).map(fromGuest));
@@ -1045,27 +1100,30 @@
 
   // --- the page's links ------------------------------------------------------------------
 
-  // After the page's own handlers: a link to another page of the project opens it in the preview.
+  // Capture phase, registered before any guest scripts run: prevents external link navigation and
+  // form submission even if a guest listener calls event.stopPropagation() / stopImmediatePropagation().
   const followLinks = (event) => {
-    if (event.defaultPrevented || event.button !== 0) return;
+    if (!pagePath || event.defaultPrevented || event.button !== 0) return;
     const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
     if (!link) return;
-    if (emitBlobDownload(link, event.isTrusted)) {
-      event.preventDefault();
-      return;
-    }
     const href = link.getAttribute('href') || '';
     if (href.startsWith('#') || href === '') return;
     event.preventDefault();
+    if (emitBlobDownload(link, event.isTrusted)) return;
     if (/^javascript:/i.test(href)) return;
     if (external(href)) {
       note('warn', `A link to ${href} was clicked; the preview stays on this page.`);
       return;
     }
-    post({ type: 'bot:navigate', path: resolve(href, dirOf(pagePath)) });
+    const targetPath = resolve(href, dirOf(pagePath));
+    queueMicrotask(() => {
+      if (!guestPrevented.has(event)) post({ type: 'bot:navigate', path: targetPath });
+    });
   };
   // A form has nowhere to go: its submit is only for the page's own handlers.
   const holdForms = (event) => event.preventDefault();
+  window.addEventListener('click', followLinks, true);
+  window.addEventListener('submit', holdForms, true);
 
   // --- starting ----------------------------------------------------------------------------
 
@@ -1103,8 +1161,6 @@
     document.body.replaceWith(document.adoptNode(parsed.body));
     document.title = parsed.title || pagePath;
     if (!scripts.length && !handlers.length) {
-      window.addEventListener('click', followLinks);
-      window.addEventListener('submit', holdForms);
       setTimeout(report, 300);
       return;
     }
@@ -1170,8 +1226,6 @@
       const failed = enter(() => engine.callFunction('__zdom_run', [code, name]));
       if (typeof failed === 'string') note('error', failed);
     }
-    window.addEventListener('click', followLinks);
-    window.addEventListener('submit', holdForms);
     if (!dead) {
       document.dispatchEvent(new Event('readystatechange'));
       document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));

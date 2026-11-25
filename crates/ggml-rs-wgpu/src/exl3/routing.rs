@@ -250,7 +250,7 @@ pub(crate) const ROUTE_SIGMOID_PICK: &str = r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = p[0].x;
-    let i = id.x;
+    let i = id.x + id.y * (65535u * 256u);
     if (i >= (n + 1u) * p[0].y) { return; }
     let e = i % (n + 1u);
     if (e == n) {
@@ -425,7 +425,8 @@ pub(crate) fn record_route_sigmoid(rec: &mut crate::chain::Recorder<'_>, logits:
     } else {
         let pick = pick.expect("pick scratch for multi-row or wide sigmoid routing");
         let places = (rows * (routed + 1)) as u32;
-        rec.dispatch_wide("moe-route-sigmoid-pick", ROUTE_SIGMOID_PICK, [logits, bias, &d, &d, &d, &d, pick, &drw], &[routed as u32, rows as u32], (places.div_ceil(256), 1, 1));
+        let g = places.div_ceil(256);
+        rec.dispatch_wide("moe-route-sigmoid-pick", ROUTE_SIGMOID_PICK, [logits, bias, &d, &d, &d, &d, pick, &drw], &[routed as u32, rows as u32], (g.min(65535), g.div_ceil(65535).max(1), 1));
         rec.dispatch_wide("moe-route-rank", ROUTE_RANK, [pick, &d, &d, &d, &d, &d, &jd, &drw], &[routed as u32, top_k as u32], (rows as u32, (routed as u32).div_ceil(64), 1));
     }
     rec.dispatch_wide("moe-route-sigmoid-weights", ROUTE_SIGMOID_WEIGHTS, [logits, &jd, &d, &d, &d, &d, &buf(&st.jobs_gu), &buf(&st.w)], &[routed as u32, top_k as u32, scale.to_bits()], (rows as u32, 1, 1));

@@ -91,31 +91,33 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
   } catch {
     throw new Error('The address must start with http:// or https://');
   }
+  const isLocal = provider.type === 'local';
+  const noAuthHeaders = Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== 'authorization'));
   const attempts: Array<() => Promise<{ tokens: number; how: string; guess?: boolean } | null>> = [];
-  const isOllama = provider.serverKind === 'ollama' || /:11434$/.test(origin);
+  const isOllama = isLocal && (provider.serverKind === 'ollama' || /:11434$/.test(origin));
   if (isOllama) {
     attempts.push(async () => {
-      const body = (await getJson(`${origin}/api/ps`, { headers }, signal)) as { models?: Array<Record<string, unknown>> };
+      const body = (await getJson(`${origin}/api/ps`, { headers: noAuthHeaders }, signal)) as { models?: Array<Record<string, unknown>> };
       const loaded = body.models?.find((m) => m.name === model || m.model === model || String(m.name).startsWith(`${model}:`));
       const tokens = num(loaded?.context_length);
       return tokens ? { tokens, how: 'the size Ollama loaded the model with (/api/ps)' } : null;
     });
     attempts.push(async () => {
-      const body = (await getJson(`${origin}/api/show`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }, signal)) as Record<string, unknown>;
+      const body = (await getJson(`${origin}/api/show`, { method: 'POST', headers: { ...noAuthHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }, signal)) as Record<string, unknown>;
       // num_ctx in the model's parameters is what Ollama runs it with; the model's maximum is only a ceiling.
       const params = typeof body.parameters === 'string' ? /num_ctx\s+(\d+)/.exec(body.parameters)?.[1] : undefined;
       if (params) return { tokens: Number(params), how: 'the num_ctx the model is set up with (/api/show)' };
       return null;
     });
   }
-  if (provider.serverKind === 'lmstudio' || /:1234$/.test(origin)) {
+  if (isLocal && (provider.serverKind === 'lmstudio' || /:1234$/.test(origin))) {
     attempts.push(async () => {
       const body = (await getJson(`${origin}/api/v0/models/${encodeURIComponent(model)}`, { headers }, signal)) as Record<string, unknown>;
       const tokens = num(body.loaded_context_length) ?? num(body.max_context_length);
       return tokens ? { tokens, how: 'LM Studio (/api/v0/models)' } : null;
     });
   }
-  if (provider.serverKind === 'oaiy') {
+  if (isLocal && provider.serverKind === 'oaiy') {
     attempts.push(async () => {
       const body = (await getJson(`${origin}/v1/discovery`, { headers }, signal)) as { llm?: { context_tokens?: unknown } };
       const tokens = num(body.llm?.context_tokens);
@@ -124,7 +126,7 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
       return { tokens: OAIY_ENGINE_WINDOW, how: 'OAIY, before the model is loaded', guess: true };
     });
   }
-  // Any OpenAI-compatible server: the models list, then llama.cpp's /props.
+  // Any OpenAI-compatible server: the models list (strictly within the provider's configured base path).
   attempts.push(async () => {
     const body = (await getJson(endpoints.models, { headers }, signal)) as { data?: Array<Record<string, unknown>> };
     const entry = body.data?.find((m) => m.id === model) ?? (body.data?.length === 1 ? body.data[0] : undefined);
@@ -133,14 +135,16 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
     const tokens = num(entry.max_model_len) ?? num(entry.context_length) ?? num(entry.context_window) ?? num(entry.max_context_length) ?? num(meta.n_ctx) ?? num((entry.top_provider as Record<string, unknown> | undefined)?.context_length) ?? num(meta.n_ctx_train);
     return tokens ? { tokens, how: 'the server\'s model list' } : null;
   });
-  attempts.push(async () => {
-    const body = (await getJson(`${origin}/props`, { headers }, signal)) as Record<string, unknown>;
-    const settings = (body.default_generation_settings ?? {}) as Record<string, unknown>;
-    const tokens = num(settings.n_ctx) ?? num(body.n_ctx);
-    return tokens ? { tokens, how: 'llama.cpp (/props)' } : null;
-  });
+  if (isLocal) {
+    attempts.push(async () => {
+      const body = (await getJson(`${origin}/props`, { headers }, signal)) as Record<string, unknown>;
+      const settings = (body.default_generation_settings ?? {}) as Record<string, unknown>;
+      const tokens = num(settings.n_ctx) ?? num(body.n_ctx);
+      return tokens ? { tokens, how: 'llama.cpp (/props)' } : null;
+    });
+  }
   if (isOllama) attempts.push(async () => {
-    const body = (await getJson(`${origin}/api/show`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }, signal)) as { model_info?: Record<string, unknown> };
+    const body = (await getJson(`${origin}/api/show`, { method: 'POST', headers: { ...noAuthHeaders, 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }, signal)) as { model_info?: Record<string, unknown> };
     const key = Object.keys(body.model_info ?? {}).find((k) => k.endsWith('.context_length'));
     // The model's maximum, but Ollama's default load is smaller: capped at its usual default.
     const tokens = key ? num(body.model_info![key]) : null;

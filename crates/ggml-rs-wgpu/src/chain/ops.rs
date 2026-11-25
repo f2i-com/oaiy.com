@@ -248,21 +248,24 @@ impl ChainRecorder for Recorder<'_> {
     fn hc_gates(&mut self, t: &DeviceVec, post: &DeviceVec, rows: usize, rank: usize, writes: usize, streams: usize) {
         assert!(t.len >= rows * (rank + writes) && post.len >= rows * writes.max(1), "chain: a hyper-connection's gates");
         let len = (rows * (rank + writes)) as u32;
+        let g = len.div_ceil(256);
         // nothing read: a dummy at the read bindings (a buffer written may not be bound as read too)
         let d = self.gpu().dummy().clone();
-        self.dispatch_wide("chain-hc-gates", HC_GATES, [&d, &d, &d, &d, &d, &d, buffer(t), buffer(post)], &[rank as u32, writes as u32, streams as u32, rows as u32], (len.div_ceil(256), 1, 1));
+        self.dispatch_wide("chain-hc-gates", HC_GATES, [&d, &d, &d, &d, &d, &d, buffer(t), buffer(post)], &[rank as u32, writes as u32, streams as u32, rows as u32], (g.min(65535), g.div_ceil(65535).max(1), 1));
     }
 
     fn hc_mix(&mut self, logits: &DeviceVec, normed: &DeviceVec, out: &DeviceVec, rows: usize, streams: usize, d: usize) {
         assert!(logits.len >= rows * streams * d && normed.len >= rows * streams * d && out.len >= rows * d, "chain: a hyper-connection's mix");
         let pipeline = self.named("chain-hc-mix", HC_MIX);
-        self.dispatch_kept(&pipeline, buffer(logits), buffer(normed), buffer(out), &[d as u32, streams as u32, rows as u32], (((rows * d) as u32).div_ceil(256), 1, 1));
+        let g = ((rows * d) as u32).div_ceil(256);
+        self.dispatch_kept(&pipeline, buffer(logits), buffer(normed), buffer(out), &[d as u32, streams as u32, rows as u32], (g.min(65535), g.div_ceil(65535).max(1), 1));
     }
 
     fn stream_apply(&mut self, x: &DeviceVec, y: &DeviceVec, post: &DeviceVec, rows: usize, streams: usize, d: usize) {
         assert!(x.len >= rows * streams * d && y.len >= rows * d && post.len >= rows * streams, "chain: a hyper-connection's write-back");
         let pipeline = self.named("chain-stream-apply", STREAM_APPLY);
-        self.dispatch_kept(&pipeline, buffer(post), buffer(y), buffer(x), &[d as u32, streams as u32, rows as u32], (((rows * streams * d) as u32).div_ceil(256), 1, 1));
+        let g = ((rows * streams * d) as u32).div_ceil(256);
+        self.dispatch_kept(&pipeline, buffer(post), buffer(y), buffer(x), &[d as u32, streams as u32, rows as u32], (g.min(65535), g.div_ceil(65535).max(1), 1));
     }
 
     fn moe_rows(&mut self, experts: &dyn ggml_rs::exl3::Experts, x: &DeviceVec, out: &DeviceVec, assign: &[Vec<(usize, f32)>]) {

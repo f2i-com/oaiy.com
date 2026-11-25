@@ -1,6 +1,19 @@
 import { memo, useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { mediaUrlBlocked } from '../../../lib/localMedia';
+
+function isSafeAudioUrl(url: string | undefined): url is string {
+    if (!url || typeof url !== 'string') return false;
+    if (mediaUrlBlocked(url)) return false;
+    const t = url.trim().toLowerCase();
+    return (
+        t.startsWith('http://') ||
+        t.startsWith('https://') ||
+        t.startsWith('blob:') ||
+        t.startsWith('data:audio/')
+    );
+}
 
 type Provider = 'internal' | 'external';
 type ResponseType = 'file_path' | 'url' | 'base64_wav' | 'base64_mp3' | 'binary_wav' | 'binary_mp3';
@@ -173,17 +186,30 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
         { id: 'path', type: 'source', position: Position.Right, color: '!bg-slate-500', size: 'sm', label: 'path' },
     ], []);
 
+    useEffect(() => {
+        return () => {
+            if (audioRef.current) {
+                audioRef.current.pause();
+                audioRef.current.src = '';
+                audioRef.current = null;
+            }
+            setIsPlaying(false);
+        };
+    }, [data.audioPath]);
+
+    const playableAudioUrl = isSafeAudioUrl(data.audioPath) ? data.audioPath : null;
+
     const handlePlayPause = () => {
-        if (!data.audioPath) return;
+        if (!playableAudioUrl) return;
         if (!audioRef.current) {
-            audioRef.current = new Audio(data.audioPath);
+            audioRef.current = new Audio(playableAudioUrl);
             audioRef.current.onended = () => setIsPlaying(false);
         }
         if (isPlaying) {
             audioRef.current.pause();
             setIsPlaying(false);
         } else {
-            audioRef.current.play();
+            void audioRef.current.play().catch(() => setIsPlaying(false));
             setIsPlaying(true);
         }
     };
@@ -320,7 +346,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
                     )}
 
                     {/* ============== SHARED ============== */}
-                    <div className="pt-2 border-t border-slate-700/50">
+                    <div className="pt-2 border-t border-slate-200 dark:border-slate-700/50">
                         <label className={labelClass}>Voice Description (optional)</label>
                         <textarea
                             className={inputClass}
@@ -380,7 +406,7 @@ function TextToSpeechNode({ data }: TextToSpeechNodeProps) {
                         </div>
                     </div>
 
-                    {data.audioPath && (
+                    {playableAudioUrl && (
                         <div className="flex items-center gap-2 px-2 py-1.5 bg-teal-50 dark:bg-teal-900/20 border border-teal-200 dark:border-teal-800/30 rounded">
                             <button
                                 type="button"

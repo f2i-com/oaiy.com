@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Check, Cpu, ExternalLink, Loader2, MessageSquare, Network, Plug, RotateCcw, TriangleAlert, X } from 'lucide-react';
 import { AgentProviderPicker, type ProviderPick } from './AgentProviderPicker';
 import ChatGptConnector from './ChatGptConnector';
@@ -61,15 +61,27 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const saveSeq = useRef(0);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      saveSeq.current += 1;
+    };
+  }, []);
   const onWorker = prefs?.model.source === 'engine' && !!prefs.model.model?.startsWith('engine:llm:node.') ? prefs.model.model : null;
   // (on the engine, whose default language model is a paired computer's, Engines → Other computers: the Agent runs there)
   const paired = onWorker ? null : pairedDefault(prefs);
   const source = picked ?? (onWorker || paired ? 'worker' : prefs?.model.source) ?? 'engine';
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
   const line = localModelLine(rec, catalog);
   const onProvider = prefs?.model.source === 'provider' && prefs.model.provider && prefs.model.model ? prefs.model : null;
   const providerPick: ProviderPick | null = onProvider ? { provider: onProvider.provider!, model: onProvider.model!, name: prefs?.providerName ?? onProvider.provider! } : null;
   /** A provider and model chosen: the Agent's model, unless it is that already. */
   const pickProvider = (p: ProviderPick) => {
+    if (!mounted.current || sourceRef.current !== 'provider') return;
     if (providerPick && providerPick.provider === p.provider && providerPick.model === p.model) return;
     void save({ model: { source: 'provider', provider: p.provider, model: p.model } });
   };
@@ -84,36 +96,42 @@ function AgentModelSection({ onOpenEngines }: { onOpenEngines: () => void }) {
 
   /** `revert`: a choice of the radios alone, put back to what the Agent uses when it could not be saved. */
   const save = async (next: AgentPreferences, revert = false) => {
+    const seq = ++saveSeq.current;
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
       await agentPreferences.set(next);
       await refreshPrefs();
+      if (!mounted.current || seq !== saveSeq.current) return;
       setSaved(true);
     } catch (e) {
+      if (!mounted.current || seq !== saveSeq.current) return;
       setError(`Not saved: ${errorText(e)}`);
       if (revert) setPicked(null);
     } finally {
-      setSaving(false);
+      if (mounted.current && seq === saveSeq.current) setSaving(false);
     }
   };
 
   /** This computer's own language model the engine's default again: the paired computer's is let go of (as "Use this
    *  computer's" does in Engines → Other computers), for the engine's chats and flows as well as the Agent. */
   const takeDefaultBack = async () => {
+    const seq = ++saveSeq.current;
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
       await network.setDefault('llm', null);
       await refreshPrefs();
+      if (!mounted.current || seq !== saveSeq.current) return;
       setSaved(true);
     } catch (e) {
+      if (!mounted.current || seq !== saveSeq.current) return;
       setError(`Not changed: ${errorText(e)}`);
       setPicked(null);
     } finally {
-      setSaving(false);
+      if (mounted.current && seq === saveSeq.current) setSaving(false);
     }
   };
 

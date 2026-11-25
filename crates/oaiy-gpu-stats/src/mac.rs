@@ -34,6 +34,7 @@ extern "C" {
     fn IOServiceGetMatchingService(main_port: u32, matching: CFTypeRef) -> u32;
     fn IORegistryEntryCreateCFProperty(entry: u32, key: CFTypeRef, alloc: CFTypeRef, options: u32) -> CFTypeRef;
     fn IOServiceOpen(service: u32, task: u32, kind: u32, connect: *mut u32) -> i32;
+    fn IOServiceClose(connect: u32) -> i32;
     fn IOConnectCallStructMethod(connect: u32, selector: u32, input: *const c_void, input_size: usize, output: *mut c_void, output_size: *mut usize) -> i32;
     fn IOObjectRelease(object: u32) -> i32;
 }
@@ -108,6 +109,15 @@ struct Smc {
     gpu: Vec<(u32, u32)>,
 }
 
+impl Drop for Smc {
+    fn drop(&mut self) {
+        if self.connect != 0 {
+            // SAFETY: `connect` is an open IOKit user-client connection from `IOServiceOpen`, closed here once (`Smc` is not Clone).
+            unsafe { IOServiceClose(self.connect) };
+        }
+    }
+}
+
 // AppleSMC's one method, and the commands it takes (the struct's `data8`)
 const METHOD: u32 = 2;
 const READ_KEY: u8 = 5;
@@ -141,17 +151,18 @@ impl Smc {
         if smc_service == 0 {
             return None;
         }
-        let mut smc = Smc { connect: 0, gpu: Vec::new() };
+        let mut connect = 0u32;
         // SAFETY: `smc_service` is held here and released once, after the open; `mach_task_self_` is this task's
-        // port, which libSystem sets before any code runs; `smc.connect` is a local the call writes.
+        // port, which libSystem sets before any code runs; `connect` is a local the call writes.
         let opened = unsafe {
-            let opened = IOServiceOpen(smc_service, mach_task_self_, 0, &mut smc.connect);
+            let opened = IOServiceOpen(smc_service, mach_task_self_, 0, &mut connect);
             IOObjectRelease(smc_service);
             opened
         };
-        if opened != 0 {
+        if opened != 0 || connect == 0 {
             return None;
         }
+        let mut smc = Smc { connect, gpu: Vec::new() };
         let count_key = u32::from_be_bytes(*b"#KEY");
         let info = smc.call(count_key, KEY_INFO, 0, 0)?;
         let count = smc.call(count_key, READ_KEY, 0, Self::word(&info[28..]))?;

@@ -394,4 +394,24 @@ describe('a CSV file', () => {
     expect(text()).toContain(`3 contacts, saved as ${saved!.download}.`);
     clickSpy.mockRestore();
   });
+
+  it('commits already-saved changes and prunes deleted facts if a later forgetFact fails', async () => {
+    await mount();
+    await click(row('Liam'));
+    await click(button('Forget: Has a dog called Max'));
+    await click(button('Forget: Books the long mow'));
+    // First forgetFact (index 1: Books the long mow) succeeds; second (index 0: Has a dog called Max) fails.
+    const realForget = api.forgetFact.getMockImplementation()!;
+    api.forgetFact
+      .mockImplementationOnce(realForget)
+      .mockRejectedValueOnce(new Error('disk full'));
+    await click(button('Save changes'));
+    expect(text()).toContain('Not saved');
+    // The already-deleted fact is gone from the list, while the remaining one stays struck for retry.
+    const facts = [...host.querySelectorAll('.fact-list > li')].map((li) => [
+      li.querySelector('.fact-text > span')?.textContent,
+      li.classList.contains('is-removed'),
+    ]);
+    expect(facts).toEqual([['Has a dog called Max', true]]);
+  });
 });

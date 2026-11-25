@@ -40,10 +40,52 @@ export interface ActivePackageFlow {
   flowId: string;
 }
 
+type PackageVerificationLevel = 'unverified' | 'hash_matched' | 'signature_verified';
+
 // Pending package awaiting trust confirmation
 interface PendingPackage {
   path: string;
   manifest: OAIYPackageManifest;
+  verification?: PackageVerificationLevel;
+  isReload?: boolean;
+}
+
+function reloadRequiresTrustReconfirm(
+  prevManifest: OAIYPackageManifest,
+  nextManifest: OAIYPackageManifest,
+  prevVerification: PackageVerificationLevel | undefined,
+  nextVerification: PackageVerificationLevel,
+): boolean {
+  // Trust / signature verification changed (e.g., dropped from signature_verified to unverified)
+  if (prevVerification !== undefined && prevVerification !== nextVerification) {
+    return true;
+  }
+  // Permissions expanded
+  const prevPerms = new Set(prevManifest.permissions ?? []);
+  for (const perm of nextManifest.permissions ?? []) {
+    if (!prevPerms.has(perm)) return true;
+  }
+  // Services added or modified
+  const prevServices = new Set((prevManifest.services ?? []).map((s) => JSON.stringify(s)));
+  for (const svc of nextManifest.services ?? []) {
+    if (!prevServices.has(JSON.stringify(svc))) return true;
+  }
+  // Custom nodes or embedded custom nodes/extensions added or modified
+  const prevNodes = new Set((prevManifest.nodes ?? []).map((n) => JSON.stringify(n)));
+  for (const node of nextManifest.nodes ?? []) {
+    if (!prevNodes.has(JSON.stringify(node))) return true;
+  }
+  const prevEmbedded = prevManifest as OAIYPackageManifestWithEmbedded;
+  const nextEmbedded = nextManifest as OAIYPackageManifestWithEmbedded;
+  const prevEmbeddedNodes = new Set((prevEmbedded.embeddedCustomNodes ?? []).map((n) => JSON.stringify(n)));
+  for (const node of nextEmbedded.embeddedCustomNodes ?? []) {
+    if (!prevEmbeddedNodes.has(JSON.stringify(node))) return true;
+  }
+  const prevEmbeddedExts = new Set((prevEmbedded.embeddedNodeExtensions ?? []).map((e) => JSON.stringify(e)));
+  for (const ext of nextEmbedded.embeddedNodeExtensions ?? []) {
+    if (!prevEmbeddedExts.has(JSON.stringify(ext))) return true;
+  }
+  return false;
 }
 
 // Pending dependencies awaiting resolution
@@ -262,6 +304,8 @@ export function usePackageManager(options: UsePackageManagerOptions) {
 
   // Ref to track if package changed notification is already showing
   const changedPackageRef = useRef<ChangedPackage | null>(null);
+  // Track each loaded package's last verified trust/integrity outcome so hot-reload can detect changes
+  const packageVerificationsRef = useRef<Map<string, PackageVerificationLevel>>(new Map());
 
   // Helper to load a package's flows and add it to loaded packages
   const loadPackageFlows = useCallback(async (
@@ -419,7 +463,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         contentHash: verification.contentHash,
       });
 
-      setPendingPackage({ path: packagePath, manifest: verification.manifest });
+      setPendingPackage({ path: packagePath, manifest: verification.manifest, verification: verification.verification });
     } catch (err) {
       logger.error('Failed to load package', { error: err });
       onShowToast(`Failed to load package: ${err}`, 'error');
@@ -526,8 +570,9 @@ export function usePackageManager(options: UsePackageManagerOptions) {
         }
         const linked = rewriteFlowRefs(created.map((c) => c.flow), ids);
         created.forEach(({ flow, data }, i) => {
-          // Update with additional properties if present: what it is to other flows (a macro) included
-          const updates: Partial<Omit<Flow, 'id' | 'createdAt'>> = {};
+          // Update with additional properties if present: what it is to other flows (a macro) included.
+          // Always mark externally imported JSON flows as untrusted so they execute sandboxed.
+          const updates: Partial<Omit<Flow, 'id' | 'createdAt'>> = { untrusted: true };
           if (linked[i] !== flow) updates.graph = linked[i].graph;
           if (data.description) updates.description = data.description;
           if (data.tags) updates.tags = data.tags;
@@ -536,7 +581,7 @@ export function usePackageManager(options: UsePackageManagerOptions) {
             updates.isMacro = true;
             if (data.macroMetadata) updates.macroMetadata = data.macroMetadata;
           }
-          if (Object.keys(updates).length > 0) updateFlow(flow.id, updates);
+          updateFlow(flow.id, updates);
         });
 
         // Clear any active package flow to ensure we're viewing user flows
@@ -559,6 +604,116 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     }
   }, [handleLoadPackageFromPath, createFlow, updateFlow, onShowToast, getSettings]);
 
+  // Perform the actual unload + reload of a verified package manifest
+  const applyReloadedPackage = useCallback(async (
+    packageId: string,
+    sourcePath: string,
+    manifest: OAIYPackageManifest,
+  ) => {
+    // Unload existing package nodes first (path-based and embedded)
+    await unloadPackageNodes(packageId);
+    await unloadEmbeddedContent(packageId);
+
+    // Reload package nodes FIRST if defined (to get custom node IDs for prefixing)
+    let customNodeIds: string[] = [];
+    const nodeDefinitions: Map<string, NodeDefinition> = new Map();
+    if (manifest.nodes && manifest.nodes.length > 0) {
+      try {
+        const loadedNodes = await loadPackageNodes(packageId, sourcePath, manifest.nodes);
+        customNodeIds = loadedNodes.map(n => n.originalId);
+        // Build nodeDefinitions map for attaching to flow nodes
+        for (const node of loadedNodes) {
+          nodeDefinitions.set(node.prefixedId, node.definition);
+        }
+      } catch (err) {
+        logger.warn('Failed to reload package nodes', { error: err });
+      }
+    }
+
+    // Reload embedded custom nodes and extensions (TypeScript-based)
+    const embeddedManifest = manifest as OAIYPackageManifestWithEmbedded;
+    if (embeddedManifest.embeddedCustomNodes?.length || embeddedManifest.embeddedNodeExtensions?.length) {
+      try {
+        await loadEmbeddedContent(packageId, embeddedManifest);
+        // Add embedded custom node IDs for flow prefixing
+        if (embeddedManifest.embeddedCustomNodes) {
+          for (const node of embeddedManifest.embeddedCustomNodes) {
+            customNodeIds.push(node.id);
+          }
+        }
+      } catch (err) {
+        logger.warn('Failed to reload embedded content', { error: err });
+      }
+    }
+
+    // Re-load all flows from the package (with node type prefixing)
+    const flows: Flow[] = [];
+    for (const flowPath of manifest.flows) {
+      try {
+        const flowContent = await invoke<string>('read_package_flow_content', {
+          packagePath: sourcePath,
+          flowPath: flowPath,
+        });
+        let flowData = JSON.parse(flowContent) as Flow;
+        // Prefix custom node types in the flow and attach definitions
+        if (customNodeIds.length > 0) {
+          flowData = prefixPackageNodeTypes(flowData, packageId, customNodeIds, nodeDefinitions);
+        }
+        flows.push(flowData);
+      } catch (err) {
+        logger.warn(`Failed to reload flow ${flowPath}`, { error: err });
+      }
+    }
+
+    if (flows.length === 0) {
+      throw new Error('No flows found in package');
+    }
+
+    // Re-load macros from package if present (with node type prefixing)
+    const macros: Flow[] = [];
+    if (manifest.macros && manifest.macros.length > 0) {
+      for (const macroPath of manifest.macros) {
+        try {
+          const macroContent = await invoke<string>('read_package_flow_content', {
+            packagePath: sourcePath,
+            flowPath: macroPath,
+          });
+          let macroData = JSON.parse(macroContent) as Flow;
+          // Prefix custom node types in macros too and attach definitions
+          if (customNodeIds.length > 0) {
+            macroData = prefixPackageNodeTypes(macroData, packageId, customNodeIds, nodeDefinitions);
+          }
+          macros.push(macroData);
+        } catch (err) {
+          logger.warn(`Failed to reload macro ${macroPath}`, { error: err });
+        }
+      }
+    }
+
+    // Update the loaded package
+    const updatedPackage: LoadedPackage = {
+      manifest,
+      sourcePath,
+      flows,
+      macros,
+    };
+
+    setLoadedPackages(prev => {
+      const next = new Map(prev);
+      next.set(packageId, updatedPackage);
+      return next;
+    });
+
+    // If we were viewing this package, stay on it but refresh
+    if (activePackageFlow?.packageId === packageId) {
+      // Try to stay on the same flow, or go to first flow
+      const currentFlowStillExists = flows.find(f => f.id === activePackageFlow.flowId);
+      if (!currentFlowStillExists && flows.length > 0) {
+        setActivePackageFlow({ packageId, flowId: flows[0].id });
+      }
+    }
+  }, [activePackageFlow, unloadPackageNodes, loadPackageNodes, unloadEmbeddedContent, loadEmbeddedContent]);
+
   // Handle package trust confirmation - load all flows from the package.
   //
   // The trust dialog returns the EXACT subset of permissions the user
@@ -570,14 +725,29 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     if (!pendingPackage) return;
 
     const trustLevel: 'untrusted' | 'trusted' | 'verified' =
-      grantedPermissions.length > 0 ? 'trusted' : 'untrusted';
+      pendingPackage.verification === 'signature_verified' && grantedPermissions.length > 0
+        ? 'verified'
+        : grantedPermissions.length > 0
+          ? 'trusted'
+          : 'untrusted';
     setPackagePermissions(prev => {
       const next = new Map(prev);
       next.set(pendingPackage.manifest.id, { granted: [...grantedPermissions], trustLevel });
       return next;
     });
+    if (pendingPackage.verification) {
+      packageVerificationsRef.current.set(pendingPackage.manifest.id, pendingPackage.verification);
+    }
 
     try {
+      // If this confirmation came from a hot-reload whose capabilities/trust changed, apply the reload now
+      if (pendingPackage.isReload) {
+        await applyReloadedPackage(pendingPackage.manifest.id, pendingPackage.path, pendingPackage.manifest);
+        setPendingPackage(null);
+        onShowToast(`Reloaded package: ${pendingPackage.manifest.name} v${pendingPackage.manifest.version}`, 'success');
+        return;
+      }
+
       // Check if package is already loaded
       if (loadedPackages.has(pendingPackage.manifest.id)) {
         // Just navigate to it
@@ -622,10 +792,30 @@ export function usePackageManager(options: UsePackageManagerOptions) {
       onShowToast(`Failed to load package: ${err}`, 'error');
       setPendingPackage(null);
     }
-  }, [pendingPackage, loadedPackages, onShowToast, setActiveFlowId, loadPackageFlows]);
+  }, [pendingPackage, loadedPackages, onShowToast, setActiveFlowId, loadPackageFlows, applyReloadedPackage]);
 
-  // Handle dependency package being loaded (from DependencyDialog)
-  const handleDependencyLoaded = useCallback(async (path: string, manifest: OAIYPackageManifest) => {
+  // Handle dependency package being loaded (from DependencyDialog, after verify_package_for_load + TrustDialog)
+  const handleDependencyLoaded = useCallback(async (
+    path: string,
+    manifest: OAIYPackageManifest,
+    grantedPermissions: string[] = [],
+    verification?: PackageVerificationLevel,
+  ) => {
+    const granted = [...grantedPermissions];
+    const trustLevel: 'untrusted' | 'trusted' | 'verified' =
+      verification === 'signature_verified' && granted.length > 0
+        ? 'verified'
+        : granted.length > 0
+          ? 'trusted'
+          : 'untrusted';
+    setPackagePermissions(prev => {
+      const next = new Map(prev);
+      next.set(manifest.id, { granted, trustLevel });
+      return next;
+    });
+    if (verification) {
+      packageVerificationsRef.current.set(manifest.id, verification);
+    }
     // Load the dependency package (don't navigate to it)
     await loadPackageFlows(path, manifest, false);
     onShowToast(`Loaded dependency: ${manifest.name}`, 'success');
@@ -709,127 +899,53 @@ export function usePackageManager(options: UsePackageManagerOptions) {
   const handleReloadPackage = useCallback(async (packageId: string) => {
     const pkg = loadedPackages.get(packageId);
     if (!pkg) {
+      changedPackageRef.current = null;
       setChangedPackage(null);
       return;
     }
 
     try {
-      // Unload existing package nodes first (path-based and embedded)
-      await unloadPackageNodes(packageId);
-      await unloadEmbeddedContent(packageId);
+      // Verify integrity/size/signature BEFORE unloading or reloading anything
+      const verification = await invoke<{
+        manifest: OAIYPackageManifest;
+        size: { withinDefaults: boolean; exceedsHardMax: boolean };
+        verification: PackageVerificationLevel;
+        contentHash: string;
+      } | null>('verify_package_for_load', { packagePath: pkg.sourcePath });
 
-      // Re-read the manifest
-      const manifest = await invoke<OAIYPackageManifest>('read_package', {
-        packagePath: pkg.sourcePath,
-      });
-
-      // Reload package nodes FIRST if defined (to get custom node IDs for prefixing)
-      let customNodeIds: string[] = [];
-      let nodeDefinitions: Map<string, NodeDefinition> = new Map();
-      if (manifest.nodes && manifest.nodes.length > 0) {
-        try {
-          const loadedNodes = await loadPackageNodes(packageId, pkg.sourcePath, manifest.nodes);
-          customNodeIds = loadedNodes.map(n => n.originalId);
-          // Build nodeDefinitions map for attaching to flow nodes
-          for (const node of loadedNodes) {
-            nodeDefinitions.set(node.prefixedId, node.definition);
-          }
-        } catch (err) {
-          logger.warn('Failed to reload package nodes', { error: err });
-        }
+      if (!verification || !verification.manifest) {
+        throw new Error('Package verification failed or is unavailable on reload');
       }
 
-      // Reload embedded custom nodes and extensions (TypeScript-based)
-      const embeddedManifest = manifest as OAIYPackageManifestWithEmbedded;
-      if (embeddedManifest.embeddedCustomNodes?.length || embeddedManifest.embeddedNodeExtensions?.length) {
-        try {
-          await loadEmbeddedContent(packageId, embeddedManifest);
-          // Add embedded custom node IDs for flow prefixing
-          if (embeddedManifest.embeddedCustomNodes) {
-            for (const node of embeddedManifest.embeddedCustomNodes) {
-              customNodeIds.push(node.id);
-            }
-          }
-        } catch (err) {
-          logger.warn('Failed to reload embedded content', { error: err });
-        }
+      const manifest = verification.manifest;
+      const prevVerification = packageVerificationsRef.current.get(packageId);
+
+      // Re-prompt TrustDialog if permissions, services, custom nodes expanded/changed or trust level changed
+      if (reloadRequiresTrustReconfirm(pkg.manifest, manifest, prevVerification, verification.verification)) {
+        changedPackageRef.current = null;
+        setChangedPackage(null);
+        setPendingPackage({
+          path: pkg.sourcePath,
+          manifest,
+          verification: verification.verification,
+          isReload: true,
+        });
+        return;
       }
 
-      // Re-load all flows from the package (with node type prefixing)
-      let flows: Flow[] = [];
-      for (const flowPath of manifest.flows) {
-        try {
-          const flowContent = await invoke<string>('read_package_flow_content', {
-            packagePath: pkg.sourcePath,
-            flowPath: flowPath,
-          });
-          let flowData = JSON.parse(flowContent) as Flow;
-          // Prefix custom node types in the flow and attach definitions
-          if (customNodeIds.length > 0) {
-            flowData = prefixPackageNodeTypes(flowData, packageId, customNodeIds, nodeDefinitions);
-          }
-          flows.push(flowData);
-        } catch (err) {
-          logger.warn(`Failed to reload flow ${flowPath}`, { error: err });
-        }
-      }
+      packageVerificationsRef.current.set(packageId, verification.verification);
+      await applyReloadedPackage(packageId, pkg.sourcePath, manifest);
 
-      if (flows.length === 0) {
-        throw new Error('No flows found in package');
-      }
-
-      // Re-load macros from package if present (with node type prefixing)
-      let macros: Flow[] = [];
-      if (manifest.macros && manifest.macros.length > 0) {
-        for (const macroPath of manifest.macros) {
-          try {
-            const macroContent = await invoke<string>('read_package_flow_content', {
-              packagePath: pkg.sourcePath,
-              flowPath: macroPath,
-            });
-            let macroData = JSON.parse(macroContent) as Flow;
-            // Prefix custom node types in macros too and attach definitions
-            if (customNodeIds.length > 0) {
-              macroData = prefixPackageNodeTypes(macroData, packageId, customNodeIds, nodeDefinitions);
-            }
-            macros.push(macroData);
-          } catch (err) {
-            logger.warn(`Failed to reload macro ${macroPath}`, { error: err });
-          }
-        }
-      }
-
-      // Update the loaded package
-      const updatedPackage: LoadedPackage = {
-        manifest,
-        sourcePath: pkg.sourcePath,
-        flows,
-        macros,
-      };
-
-      setLoadedPackages(prev => {
-        const next = new Map(prev);
-        next.set(packageId, updatedPackage);
-        return next;
-      });
-
-      // If we were viewing this package, stay on it but refresh
-      if (activePackageFlow?.packageId === packageId) {
-        // Try to stay on the same flow, or go to first flow
-        const currentFlowStillExists = flows.find(f => f.id === activePackageFlow.flowId);
-        if (!currentFlowStillExists && flows.length > 0) {
-          setActivePackageFlow({ packageId, flowId: flows[0].id });
-        }
-      }
-
+      changedPackageRef.current = null;
       setChangedPackage(null);
       onShowToast(`Reloaded package: ${manifest.name} v${manifest.version}`, 'success');
     } catch (err) {
       logger.error('Failed to reload package', { error: err });
       onShowToast(`Failed to reload package: ${err}`, 'error');
+      changedPackageRef.current = null;
       setChangedPackage(null);
     }
-  }, [loadedPackages, activePackageFlow, onShowToast, unloadPackageNodes, loadPackageNodes, unloadEmbeddedContent, loadEmbeddedContent]);
+  }, [loadedPackages, onShowToast, applyReloadedPackage]);
 
   // Handle selecting a package flow
   const handleSelectPackageFlow = useCallback((packageId: string, flowId: string) => {

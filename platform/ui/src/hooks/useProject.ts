@@ -1122,16 +1122,31 @@ export function useProject() {
 
   const updateConstant = useCallback((constantId: string, updates: Partial<Omit<ProjectConstant, 'id'>>) => {
     const constant = (project.constants || []).find(c => c.id === constantId);
-    logger.debug(`updateConstant called: ${constantId}`, { isSecret: constant?.isSecret, hasValue: updates.value !== undefined });
+    if (constant) {
+      const prevIsSecret = Boolean(constant.isSecret);
+      const nextIsSecret = updates.isSecret !== undefined ? Boolean(updates.isSecret) : prevIsSecret;
+      const prevKey = constant.key;
+      const nextKey = updates.key !== undefined ? updates.key : prevKey;
+      const nextValue = updates.value !== undefined ? updates.value : constant.value;
 
-    // If updating value of a secret constant, save to secure storage
-    if (constant?.isSecret && updates.value !== undefined) {
-      logger.debug(`Saving secret to keyring: ${constant.key}`);
-      invoke('store_secret', { key: constant.key, value: updates.value })
-        .then(() => logger.debug(`Secret saved successfully: ${constant.key}`))
-        .catch((err) => {
-          logger.error(`Failed to store secret: ${constant.key}`, { error: err });
+      logger.debug(`updateConstant called: ${constantId}`, { prevIsSecret, nextIsSecret, hasValue: updates.value !== undefined });
+
+      // Clear the previous keyring entry when unmarked as secret or renamed to a new key
+      if (prevIsSecret && prevKey && (!nextIsSecret || nextKey !== prevKey)) {
+        invoke('store_secret', { key: prevKey, value: '' }).catch((err) => {
+          logger.error(`Failed to clear old secret: ${prevKey}`, { error: err });
         });
+      }
+
+      // Store under nextKey whenever the constant is secret and value/key/isSecret changed
+      if (nextIsSecret && nextKey && (updates.value !== undefined || !prevIsSecret || nextKey !== prevKey)) {
+        logger.debug(`Saving secret to keyring: ${nextKey}`);
+        invoke('store_secret', { key: nextKey, value: nextValue })
+          .then(() => logger.debug(`Secret saved successfully: ${nextKey}`))
+          .catch((err) => {
+            logger.error(`Failed to store secret: ${nextKey}`, { error: err });
+          });
+      }
     }
 
     setProject((prev) => ({

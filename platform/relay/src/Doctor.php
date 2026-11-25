@@ -420,41 +420,10 @@ final class Doctor
 
     // ------------------------------------------------------------------------------------------------ path helpers
 
-    /** Lexically resolve . and .. and, for a path that does not exist yet, resolve its deepest existing ancestor. */
+    /** Resolve symlinks progressively before collapsing . and .., falling back to lexical normalization past the first missing component. */
     public static function resolveLoose(string $path): string
     {
-        $path = str_replace('\\', '/', $path);
-        $abs = preg_match('#^([A-Za-z]:)?/#', $path) === 1;
-        if (!$abs) {
-            $cwd = getcwd();
-            $path = ($cwd === false ? '' : str_replace('\\', '/', $cwd)) . '/' . $path;
-        }
-        $parts = [];
-        $prefix = '';
-        if (preg_match('#^([A-Za-z]:)#', $path, $m) === 1) {
-            $prefix = $m[1];
-            $path = substr($path, 2);
-        }
-        foreach (explode('/', $path) as $seg) {
-            if ($seg === '' || $seg === '.') {
-                continue;
-            }
-            if ($seg === '..') {
-                array_pop($parts);
-                continue;
-            }
-            $parts[] = $seg;
-        }
-        $rest = [];
-        $cur = $parts;
-        while ($cur) {
-            $real = @realpath($prefix . '/' . implode('/', $cur));
-            if ($real !== false) {
-                return rtrim(str_replace('\\', '/', $real), '/') . ($rest ? '/' . implode('/', $rest) : '');
-            }
-            array_unshift($rest, array_pop($cur)); // $rest stays in path order
-        }
-        return $prefix . '/' . implode('/', $parts);
+        return Fs::resolveLoose($path) ?? '/' . ltrim(str_replace('\\', '/', $path), '/');
     }
 
     /** True when $inner is $outer or lies inside it, also for an $inner that does not exist yet (a fresh install). */

@@ -38,7 +38,8 @@ var<workgroup> sh: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let k = p[0].x;
-    let j = wg.y;
+    let j = wg.y + wg.z * 65535u;
+    if (j >= p[1].w) { return; }
     let m = jobs[2u * j];
     let xr = jobs[2u * j + 1u];
     let i = wg.x * 128u + t;
@@ -76,7 +77,8 @@ var<workgroup> sh: array<f32, 128>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let k = p[0].x;
-    let j = wg.y;
+    let j = wg.y + wg.z * 65535u;
+    if (j >= p[1].w) { return; }
     let m = jobs[2u * j];
     let xr = jobs[2u * j + 1u];
     let i = wg.x * 128u + t;
@@ -135,7 +137,8 @@ fn f16_bits(v: f32) -> u32 {
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let k = p[0].x;
-    let j = wg.y;
+    let j = wg.y + wg.z * 65535u;
+    if (j >= p[1].w) { return; }
     let m = jobs[2u * j];
     let xr = jobs[2u * j + 1u];
     let i = wg.x * 128u + t;
@@ -814,7 +817,8 @@ var<workgroup> sh: array<f32, 128>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     let n = p[0].x;
     let splits = p[0].y;
-    let j = wg.y;
+    let j = wg.y + wg.z * 65535u;
+    if (j >= p[1].w) { return; }
     let m = jobs[2u * j];
     let c = wg.x * 128u + t;
     var v = 0.0;
@@ -877,7 +881,6 @@ pub(crate) fn one_row_kernel(tile_words: usize) -> (&'static str, &'static str) 
 pub(crate) fn skipping_shader(which: &str, tile_words: usize) -> (&'static str, &'static str) {
     // (each kernel's name and source, by kind and tile words: a pipeline is known by its name)
     static SOURCES: std::sync::OnceLock<Mutex<std::collections::HashMap<(String, usize), (&'static str, &'static str)>>> = std::sync::OnceLock::new();
-    const SIGNATURE: &str = "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {";
     let tw = if which == "mm" { tile_words } else { 0 };
     let mut made = SOURCES.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
     let kept = *made.entry((which.to_string(), tw)).or_insert_with(|| {
@@ -890,9 +893,10 @@ pub(crate) fn skipping_shader(which: &str, tile_words: usize) -> (&'static str, 
             assert!(base.contains(at) && base.contains("@compute"), "the one-row kernel's job line");
             base.replacen(at, &format!("{at}{}", check("j")), 1)
         } else {
+            let at = "    if (j >= p[1].w) { return; }";
             let base = chain_shader(which);
-            assert!(base.contains(SIGNATURE), "a group kernel's main");
-            base.replacen(SIGNATURE, &format!("{SIGNATURE}{}", check("wg.y")), 1)
+            assert!(base.contains(at), "a group kernel's job bound");
+            base.replacen(at, &format!("{at}{}", check("j")), 1)
         };
         (name, &*Box::leak(src.replacen("@compute", "var<workgroup> skip_m: u32;\n\n@compute", 1).into_boxed_str()))
     });

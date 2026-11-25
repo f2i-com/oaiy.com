@@ -10,6 +10,8 @@
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
 import { hasValue as hasOutputValue, resolveRefsExpr } from 'oaiy-core/src/value-refs';
+import { parse as acornParse } from 'acorn';
+import { nodeCompileError } from 'oaiy-core/src/node-errors';
 
 /**
  * Escapes special regex characters in a string.
@@ -83,11 +85,43 @@ const CoreFlowControlCompiler: ModuleCompiler = {
         // linked provider's graphs. Missing it does not fail — the node falls
         // through to the operator comparison below with no operands, so every
         // route takes the false branch and half the graph never runs.
-        const expressionSource = typeof data.expression === 'string' && data.expression
+        const expressionSource = typeof data.expression === 'string' && data.expression.trim()
           ? data.expression
-          : (typeof data.expr === 'string' ? data.expr : '');
+          : (typeof data.expr === 'string' && data.expr.trim() ? data.expr : '');
         if (expressionSource) {
           const expr = expressionSource;
+          const wrappedExpr = `(${expr}\n)`;
+          let ast: {
+            body?: Array<{
+              type?: string;
+              expression?: { type?: string; start?: number; end?: number };
+            }>;
+          };
+          try {
+            ast = acornParse(wrappedExpr, {
+              ecmaVersion: 'latest',
+              sourceType: 'script',
+              preserveParens: true,
+              allowAwaitOutsideFunction: true,
+            }) as unknown as typeof ast;
+          } catch (e) {
+            const said = e instanceof Error ? e.message.replace(/\s*\(\d+:\d+\)\s*$/, '') : String(e);
+            throw nodeCompileError(`Condition (${node.id}): invalid expression: ${said}`, node.id, 'condition');
+          }
+          const stmt = ast.body?.length === 1 ? ast.body[0] : null;
+          if (
+            !stmt ||
+            stmt.type !== 'ExpressionStatement' ||
+            stmt.expression?.type !== 'ParenthesizedExpression' ||
+            stmt.expression.start !== 0 ||
+            stmt.expression.end !== wrappedExpr.length
+          ) {
+            throw nodeCompileError(
+              `Condition (${node.id}): expression must be a single JavaScript expression without statement breakout`,
+              node.id,
+              'condition',
+            );
+          }
           // Expose loop_index when condition is inside a loop (matches logic_block behavior)
           let loopIndexDecl = '';
           if (isInLoop && loopStartId && sanitizeId) {
@@ -111,7 +145,8 @@ const CoreFlowControlCompiler: ModuleCompiler = {
     let event = inputs && inputs.event !== undefined ? inputs.event : inputs;
     let app = {};
     try {
-      _cond_result_${sanitizedId} = !!(${expr});
+      _cond_result_${sanitizedId} = !!(${expr}
+);
     } catch(e) {
       console.warn("[Condition] (${node.id}) expression error:", e.message);
       _cond_result_${sanitizedId} = false;

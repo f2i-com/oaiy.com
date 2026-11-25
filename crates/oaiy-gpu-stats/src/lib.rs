@@ -47,7 +47,7 @@ pub(crate) fn busiest(before: &[i64], after: &[i64], seconds: f64) -> Option<i64
     if before.len() != after.len() || after.is_empty() || seconds <= 0.0 {
         return None;
     }
-    let most = before.iter().zip(after).map(|(b, a)| (a - b).max(0)).max()?;
+    let most = before.iter().zip(after).map(|(b, a)| a.saturating_sub(*b).max(0)).max()?;
     Some(((most as f64 * 1e-7 / seconds) * 100.0).round().clamp(0.0, 100.0) as i64)
 }
 
@@ -91,6 +91,8 @@ mod tests {
         assert_eq!(busiest(&[1_000_000, 50, 7], &[4_000_000, 500_050, 7], 0.5), Some(60));
         assert_eq!(busiest(&[0], &[20_000_000], 1.0), Some(100), "never past 100");
         assert_eq!(busiest(&[5], &[3], 1.0), Some(0), "a counter that went back is no time");
+        assert_eq!(busiest(&[i64::MIN], &[i64::MAX], 1.0), Some(100), "counter diff saturates instead of overflowing");
+        assert_eq!(busiest(&[i64::MAX], &[i64::MIN], 1.0), Some(0), "negative counter diff saturates cleanly");
         assert_eq!(busiest(&[1, 2], &[3], 1.0), None, "not the same engines");
         assert_eq!(busiest(&[1], &[3], 0.0), None);
         assert_eq!(busiest(&[], &[], 1.0), None);

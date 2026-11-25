@@ -13,6 +13,7 @@ import {
 } from './api';
 import { visibleText } from './visibleText';
 import { ask } from './ask';
+import { useVisiblePoll } from './useVisiblePoll';
 
 /**
  * Backup and restore: one encrypted file with the person's OAIY setup, made and read back here.
@@ -348,17 +349,24 @@ export function BackupSection() {
     };
   }, []);
 
+  // Monotonic sequence so a stale poll cannot overwrite a newer status or mutation.
+  const statusSeq = useRef(0);
+
   /**
    * Ask for the status. `staged` is a restore the desktop made ready a moment ago: it stays on
    * show, even if this answer was read before the desktop wrote it down or could not be read at
    * all, until a later poll says otherwise.
    */
   const refresh = useCallback(async (staged?: PendingRestore) => {
+    const seq = ++statusSeq.current;
     try {
       const s = await backup.status();
-      if (mounted.current) setStatus(staged && !s.pendingRestore ? { ...s, pendingRestore: staged } : s);
+      if (!mounted.current || seq !== statusSeq.current) return;
+      setStatus(staged && !s.pendingRestore ? { ...s, pendingRestore: staged } : s);
     } catch {
-      if (staged && mounted.current) setStatus((s) => ({ ...(s ?? EMPTY_STATUS), pendingRestore: staged }));
+      if (staged && mounted.current && seq === statusSeq.current) {
+        setStatus((s) => ({ ...(s ?? EMPTY_STATUS), pendingRestore: staged }));
+      }
     }
   }, []);
 
@@ -367,12 +375,8 @@ export function BackupSection() {
   // waits for it.
   const making = creating || !!status?.running;
 
-  // The status: every few seconds, and quickly while a backup is being made.
-  useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => void refresh(), making ? RUNNING_POLL_MS : IDLE_POLL_MS);
-    return () => window.clearInterval(id);
-  }, [refresh, making]);
+  // The status: every few seconds while visible, and quickly while a backup is being made.
+  useVisiblePoll(() => void refresh(), making ? RUNNING_POLL_MS : IDLE_POLL_MS);
 
   const tooShort = length(passphrase) > 0 && length(passphrase) < MIN_PASSPHRASE;
   const mismatch = length(again) > 0 && passphrase !== again;
@@ -436,6 +440,7 @@ export function BackupSection() {
     const keys = keysTicked && preview.keys.inBackup;
     setStaging(true);
     setRestoreError(null);
+    statusSeq.current += 1;
     let staged: PendingRestore | undefined;
     try {
       const made = await withTimeout(
@@ -443,6 +448,7 @@ export function BackupSection() {
         RESTORE_TIMEOUT_MS,
         'That took too long: the restore was not prepared, try again.',
       );
+      statusSeq.current += 1;
       staged = stagedNow(made, classes, preview.classes.filter((c) => ticked.includes(c.id)).map((c) => c.label));
       if (mounted.current) {
         setPreview(null);
@@ -496,8 +502,10 @@ export function BackupSection() {
   const discard = async () => {
     setPendingBusy(true);
     setRestartError(null);
+    statusSeq.current += 1;
     try {
       await backup.discardPending();
+      statusSeq.current += 1;
       if (mounted.current) {
         setStatus((s) => (s ? { ...s, pendingRestore: null } : s));
         setSkipped([]);
@@ -514,9 +522,11 @@ export function BackupSection() {
     if (!(await ask(undoConfirmText(status?.undoKind ?? null)))) return;
     setPendingBusy(true);
     setUndoError(null);
+    statusSeq.current += 1;
     let staged: PendingRestore | undefined;
     try {
       const made = await backup.undo();
+      statusSeq.current += 1;
       staged = stagedNow(made);
       if (mounted.current) setSkipped(made.skipped ?? []);
     } catch (e) {

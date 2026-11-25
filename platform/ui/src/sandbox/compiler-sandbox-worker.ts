@@ -48,8 +48,9 @@ const hostPost = self.postMessage.bind(self);
     'importScripts', 'Request', 'Response', 'Headers', 'Worker', 'SharedWorker',
     // `caches` (CacheStorage) is a secure-context Worker global whose Cache.add()/addAll()
     // perform a REAL network fetch of the given URL — an egress beacon. `postMessage`/`indexedDB`
-    // close host-message forgery + same-origin storage.
-    'postMessage', 'indexedDB', 'caches',
+    // close host-message forgery + same-origin storage; `LockManager`/`locks`/`storage` close
+    // same-origin Web Locks / StorageManager side-channels.
+    'postMessage', 'indexedDB', 'caches', 'LockManager', 'locks', 'storage',
   ];
   // Walk the FULL prototype chain, not just [self, parent]: per WebIDL, [Global] interface
   // members are installed on the interface PROTOTYPE objects, so in a real
@@ -69,15 +70,18 @@ const hostPost = self.postMessage.bind(self);
     t = Object.getPrototypeOf(t) as object | null;
   }
 
-  // Neutralize `navigator.storage` (OPFS / StorageManager — same-origin persistent storage
-  // reachable in a Worker) across the WorkerNavigator prototype chain.
+  // Neutralize `navigator.storage` (OPFS / StorageManager) and `navigator.locks` (Web Locks API)
+  // across the WorkerNavigator prototype chain.
   if (typeof self.navigator === 'object' && self.navigator !== null) {
+    const navProps = ['storage', 'locks'];
     let nav: object | null = self.navigator as object;
     while (nav && nav !== Object.prototype) {
-      try {
-        Object.defineProperty(nav, 'storage', { value: undefined, configurable: false, writable: false });
-      } catch {
-        /* non-configurable already */
+      for (const prop of navProps) {
+        try {
+          Object.defineProperty(nav, prop, { value: undefined, configurable: false, writable: false });
+        } catch {
+          /* non-configurable already */
+        }
       }
       nav = Object.getPrototypeOf(nav) as object | null;
     }

@@ -1435,18 +1435,28 @@ export function openInExplorer(path: string): Promise<void> {
 /**
  * Open an external URL in the system default browser. In the Tauri app this
  * invokes the native `open_url` command; in a plain dev browser (vite :17973)
- * it falls back to window.open so the link works there too.
+ * it falls back to window.open so the link works there too. Only `http:` and
+ * `https:` URLs are permitted, and a Tauri rejection never falls back to
+ * `window.open`.
  */
 export function openExternal(url: string): void {
+  let safeUrl: string;
+  try {
+    const parsed = new URL(url);
+    if (!/^https?:$/i.test(parsed.protocol) || !parsed.host) return;
+    safeUrl = parsed.href;
+  } catch {
+    return;
+  }
   const internals = (
     window as unknown as {
       __TAURI_INTERNALS__?: { invoke: (cmd: string, args: unknown) => Promise<unknown> };
     }
   ).__TAURI_INTERNALS__;
   if (internals?.invoke) {
-    internals.invoke('open_url', { url }).catch(() => window.open(url, '_blank', 'noopener,noreferrer'));
+    void internals.invoke('open_url', { url: safeUrl }).catch(() => undefined);
   } else {
-    window.open(url, '_blank', 'noopener,noreferrer');
+    window.open(safeUrl, '_blank', 'noopener,noreferrer');
   }
 }
 

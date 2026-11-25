@@ -292,11 +292,6 @@ fn kept_age(path: &std::path::Path, modified: std::time::SystemTime) -> Duration
     })
 }
 
-/// Whether `url` is an address at the provider: the account's bearer goes on what is sent to it.
-fn at_provider(url: &str, base_url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok() && url.starts_with(&format!("{}/", base_url.trim_end_matches('/')))
-}
-
 /// Put aside a kept file that can never be sent: it would otherwise wait out its week.
 fn set_aside(path: &std::path::Path) {
     if let Err(why) = super::put_aside(path, "a kept sealed flow result") {
@@ -335,7 +330,7 @@ fn resend_kept_in(dir: &std::path::Path, http: &Client, account: &LinkedAccount,
         if base_url != account.base_url {
             continue;
         }
-        let Some(url) = file["url"].as_str().filter(|url| at_provider(url, base_url)) else {
+        let Some(url) = file["url"].as_str().filter(|url| super::oauth::at_provider(url, base_url)) else {
             set_aside(&path);
             continue;
         };
@@ -507,10 +502,7 @@ type Lane = super::net::LaneClient<Client>;
 static HTTP: Lane = super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<Client, String> {
-    super::net::blocking_builder(super::net::Keep::Between)
-        // A reply that sends this lane somewhere else is an error to report, not
-        // a request to make again, elsewhere, with the credential on it.
-        .redirect(reqwest::redirect::Policy::none())
+    super::creds::client_builder(super::net::Keep::Between)
         .build()
         .map_err(|e| format!("could not build the sealed flow client: {e}"))
 }
@@ -1235,6 +1227,34 @@ mod tests {
         assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma"]);
         assert_eq!(bearers(&b), ["Bearer flk_beta"]);
         assert_eq!((a.connections(), b.connections()), (1, 1));
+    }
+
+    #[test]
+    fn resend_kept_rejects_url_traversing_outside_provider_base_path() {
+        use crate::link::testkit::{Provider, Reply};
+        let dir = crate::secret_file::testing::TempDir::new("sealed-kept-at-provider");
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let base_url = format!("{}/app", server.base);
+        let kept_file = dir.0.join("bad.json");
+        std::fs::write(
+            &kept_file,
+            serde_json::to_vec(&json!({
+                "baseUrl": base_url,
+                "url": format!("{}/app/../other/leak", server.base),
+                "body": {"ok": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut linked = account(base_url);
+        linked.credential = "flk_secret".into();
+
+        let _ = resend_kept_in(&dir.0, &HTTP.get().unwrap(), &linked, Duration::from_secs(2), true);
+        assert!(
+            server.requests().is_empty(),
+            "kept completion with path-traversing URL must not be sent with bearer credential"
+        );
+        assert!(!kept_file.exists(), "invalid kept file should be put aside");
     }
 
     #[test]

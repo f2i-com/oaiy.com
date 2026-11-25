@@ -1096,6 +1096,7 @@ export class Agent {
         if (!path.startsWith('.oaiy/') && path !== '.oaiy') this.onWrite?.(path);
       }),
       rawVfs: options.vfs,
+      disableSpill: options.conversation === true,
       gate: options.gate,
       reads: new Map(),
       readSpans: new Map<string, ReadSpanRecord>(),
@@ -1254,6 +1255,7 @@ export class Agent {
       const out = await hook.run({ name: call.name, input: call.input }, signal);
       return { id: call.id, name: call.name, content: `[Your flow "${hook.flowName}" ran instead of ${call.name}.]\n${out}`, isError: false };
     } catch (error) {
+      if (signal?.aborted) throw error;
       return { id: call.id, name: call.name, content: `Error: your flow "${hook.flowName}", which runs instead of ${call.name}, failed: ${(error as Error).message}`, isError: true };
     }
   }
@@ -3209,17 +3211,28 @@ ${personInstructionsText(own)}` : ''}`;
             const hooks = allowed ? this.hooksFor(call.name) : {};
             let flowNote = '';
             let stopped: ToolResult | null = null;
-            if (hooks.before) {
+            // Plan Mode guard: block mutating / code-execution / session tools before running any before hooks.
+            if (this.planModeActive && isToolBlockedInPlanMode(call.name, call.input, sessionToolNames)) {
+              stopped = { id: call.id, name: call.name, content: planModeBlockedMessage(call.name), isError: true };
+            }
+            if (!stopped && hooks.before) {
               try {
                 const verdict = beforeVerdict(await hooks.before.run({ name: call.name, input: call.input }, signal));
+                if (signal?.aborted) throw signal.reason ?? new AIProviderError('cancelled', 'Stopped.');
                 if (verdict.stop) stopped = { id: call.id, name: call.name, content: `Error: your flow "${hooks.before.flowName}", which runs before ${call.name}, stopped this call: ${verdict.stop}`, isError: true };
                 if (verdict.input) call = { ...call, input: { ...call.input, ...verdict.input } };
                 flowNote = `[Your flow "${hooks.before.flowName}" ran before ${call.name}${verdict.input ? ` and changed ${Object.keys(verdict.input).join(', ')}` : ''}${verdict.note ? `: ${verdict.note.replace(/[.!?]+$/, '')}` : ''}.]`;
               } catch (error) {
-                flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
+                if (signal?.aborted) throw error;
+                stopped = {
+                  id: call.id,
+                  name: call.name,
+                  content: `Error: your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call did not run.`,
+                  isError: true,
+                };
               }
             }
-            // Plan Mode guard: block mutating / code-execution / session tools until user approves via exit_plan_mode.
+            // Re-check Plan Mode in case a before hook mutated arguments into a blocked form.
             if (!stopped && this.planModeActive && isToolBlockedInPlanMode(call.name, call.input, sessionToolNames)) {
               stopped = { id: call.id, name: call.name, content: planModeBlockedMessage(call.name), isError: true };
             }

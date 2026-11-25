@@ -271,8 +271,11 @@ export async function listModels(
   provider: Pick<ProviderConfig, 'type' | 'apiKey' | 'baseUrl' | 'orgId' | 'serverKind'>,
   options: ListModelsOptions = {},
 ): Promise<ModelInfo[]> {
+  const endpoints = providerEndpoints(provider);
+  // Ollama's /api/tags is at the origin root, outside the configured API base path: only probe for local servers, and never send Authorization headers.
+  if (provider.type !== 'local') delete endpoints.ollamaTags;
   return listFrom(
-    { type: provider.type, serverKind: provider.serverKind, endpoints: providerEndpoints(provider), headers: providerHeaders(provider) },
+    { type: provider.type, serverKind: provider.serverKind, endpoints, headers: providerHeaders(provider), tagsHeaders: {} },
     options,
   );
 }

@@ -620,7 +620,7 @@ fn run_parts<'a>(b: &'a WgpuBackend, steps: &[ProgramStep<'_>], reads: &[(usize,
             }
             ProgramStep::AttendRows { q, kv, idxs, tokens, heads, dim, len, scale, .. } => {
                 let sink = norm_weights[i].as_ref().expect("its sink");
-                let words = [*dim as u32, *heads as u32, *len as u32, 0, scale.to_bits()];
+                let words = [*dim as u32, *heads as u32, *len as u32, *tokens as u32, scale.to_bits()];
                 let grid = ((heads / attend::ATTEND_ROWS_HEADS) as u32, (*tokens as u32).min(65535), (*tokens as u32).div_ceil(65535));
                 rec.dispatch_wide("ds-attend-rows", attend::DS_ATTEND_ROWS, [&buf(v(*q)), &buf(v(*kv)), &buf(v(*idxs)), &dummy, &dummy, &buf(sink), &buf(v(i)), &drw], &words, grid);
             }

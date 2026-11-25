@@ -14,7 +14,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let writes = p[0].y;
     let streams = f32(p[0].z);
     let width = rank + writes;
-    let i = id.x;
+    let i = id.x + id.y * (65535u * 256u);
     if (i >= width * p[0].w) { return; }
     let r = i / width;
     let c = i % width;
@@ -35,7 +35,7 @@ pub(in crate::chain) const HC_MIX: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let d = p[0].x;
     let streams = p[0].y;
-    let i = id.x;
+    let i = id.x + id.y * (65535u * 256u);
     if (i >= d * p[0].z) { return; }
     let r = i / d;
     let j = i % d;
@@ -55,7 +55,7 @@ pub(in crate::chain) const STREAM_APPLY: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let d = p[0].x;
     let streams = p[0].y;
-    let i = id.x;
+    let i = id.x + id.y * (65535u * 256u);
     if (i >= d * streams * p[0].z) { return; }
     let r = i / (d * streams);
     let s = (i / d) % streams;

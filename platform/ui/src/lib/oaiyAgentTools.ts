@@ -64,13 +64,57 @@ export const AGENT_TOOLS: Array<{ name: string; does: string }> = [
   { name: 'flow_run', does: 'runs a flow' },
 ];
 
+/**
+ * Whether `flow` is untrusted, reaches an untrusted subflow/macro, or contains
+ * (directly or transitively) any `pkg:*` custom package node. Such flows must
+ * never be published to the OAIY Desktop agent as a tool/hook or exposed for
+ * remote runs.
+ */
+export function isUntrustedOrPkgFlow(flow: Flow, allFlows?: readonly Flow[]): boolean {
+  if (!flow) return true;
+  if ((flow as { untrusted?: unknown }).untrusted === true) return true;
+  const byId = new Map((allFlows ?? []).map((f) => [f.id, f]));
+  const seen = new Set<string>(flow.id ? [flow.id] : []);
+  const queue: Array<Flow['graph'] | undefined> = [flow.graph];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || !Array.isArray(current.nodes)) continue;
+    for (const rawNode of current.nodes) {
+      const node = rawNode as { type?: unknown; data?: Record<string, unknown> } | null;
+      if (!node) continue;
+      if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
+        return true;
+      }
+      const data = node.data;
+      if (!data) continue;
+      for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+        const ref = data[field];
+        if (typeof ref !== 'string' || !ref || seen.has(ref)) continue;
+        seen.add(ref);
+        const target = byId.get(ref);
+        if (!target) continue;
+        if ((target as { untrusted?: unknown }).untrusted === true) return true;
+        if (target.graph) queue.push(target.graph);
+      }
+    }
+  }
+  return false;
+}
+
 /** Where the desktop keeps a flow that stands in front of a tool. */
 export function hookFlowId(flow: Flow): string {
   return `hook-${flow.id.replace(/[^A-Za-z0-9_-]+/g, '-')}`.slice(0, 96);
 }
 
 /** Store `flow` on the desktop in front of one of the agent's tools (again: it is updated). */
-export async function publishAsHook(flow: Flow, hook: { tool: string; mode: 'before' | 'instead' }): Promise<void> {
+export async function publishAsHook(
+  flow: Flow,
+  hook: { tool: string; mode: 'before' | 'instead' },
+  allFlows?: readonly Flow[],
+): Promise<void> {
+  if (isUntrustedOrPkgFlow(flow, allFlows)) {
+    throw new Error('Untrusted flows or flows containing package nodes cannot be published as agent hooks.');
+  }
   const desktop = oaiyDesktop();
   if (!desktop) throw new Error("Flows stand in front of the agent's tools in the OAIY app.");
   const tool = hook.tool.trim();
@@ -115,7 +159,10 @@ export async function withdrawHook(flow: Flow): Promise<void> {
 }
 
 /** Store `flow` on the desktop as a tool for the agent (again: the tool is updated). */
-export async function publishAsTool(flow: Flow, tool: AgentTool): Promise<void> {
+export async function publishAsTool(flow: Flow, tool: AgentTool, allFlows?: readonly Flow[]): Promise<void> {
+  if (isUntrustedOrPkgFlow(flow, allFlows)) {
+    throw new Error('Untrusted flows or flows containing package nodes cannot be published as agent tools.');
+  }
   const desktop = oaiyDesktop();
   if (!desktop) throw new Error('Flows become tools for the agent in the OAIY app.');
   const body = {

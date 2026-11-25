@@ -188,14 +188,22 @@ interface UseWorkflowOptions {
   availableFlows?: Flow[];
   initialGraph?: WorkflowGraph;
   onGraphChange?: (graph: WorkflowGraph) => void;
+  /** Called when an external JSON workflow file is loaded onto the canvas so the active flow can be marked untrusted. */
+  onMarkUntrusted?: (flowId?: string) => void;
   projectSettings?: ProjectSettings;
   onUpdateSettings?: (updates: Partial<ProjectSettings>) => void;
 }
 
 export function useWorkflow(options: UseWorkflowOptions = {}) {
-  const { availableFlows = [], initialGraph, onGraphChange, projectSettings, flowId } = options;
+  const { availableFlows = [], initialGraph, onGraphChange, onMarkUntrusted, projectSettings, flowId } = options;
   const flowIdRef = useRef(flowId);
   flowIdRef.current = flowId;
+  const onMarkUntrustedRef = useRef(onMarkUntrusted);
+  onMarkUntrustedRef.current = onMarkUntrusted;
+  const loadedUntrustedRef = useRef(false);
+  useEffect(() => {
+    loadedUntrustedRef.current = false;
+  }, [flowId]);
 
   // Store project settings in a ref for use in save logic
   const projectSettingsRef = useRef(projectSettings);
@@ -1135,7 +1143,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     // A synthetic package context engages Web Worker isolation + the permission gate,
     // granting only benign capabilities so a malicious logic_block can't run arbitrary JS /
     // steal API keys in this origin. The user's own flows (no marker) stay trusted/unchanged.
-    if (runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
+    if (loadedUntrustedRef.current || runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
       runtime.setFlowContext(flowIdRef.current || 'imported-flow', UNTRUSTED_PACKAGE_ID);
       runtime.setPackagePermissions(UNTRUSTED_FLOW_PERMISSIONS);
       addLog({
@@ -1402,6 +1410,9 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
         const { nodes: loadedNodes, edges: loadedEdges } = workflowToReactFlow(parsed);
 
         if (isMountedRef.current) {
+          // Mark the active flow untrusted because it was loaded from an external JSON file
+          loadedUntrustedRef.current = true;
+          onMarkUntrustedRef.current?.(flowIdRef.current);
           // Batch node and edge updates to prevent flicker during flow loading
           flushSync(() => {
             setNodes(loadedNodes);
@@ -1443,6 +1454,7 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
 
   // Clear workflow (new)
   const newWorkflow = useCallback(() => {
+    loadedUntrustedRef.current = false;
     // Batch node and edge updates to prevent flicker
     flushSync(() => {
       setNodes([]);

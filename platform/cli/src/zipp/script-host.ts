@@ -61,6 +61,12 @@ export const SCRIPT_WATCHDOG_GRACE_MS = 1500;
 export const SCRIPT_INSTANCE_RETAINED_BUDGET_BYTES = 48 * 1024 * 1024;
 /** Jobs one worker may serve before it is recycled regardless of measurement. */
 export const SCRIPT_INSTANCE_MAX_JOBS = 5000;
+/** Max consecutive early worker deaths before `keepWarm` stops auto-respawning (next job spawns lazily). */
+export const SCRIPT_RESPAWN_MAX_FAILURES = 5;
+/** Base delay (ms) before an early-death `keepWarm` respawn; doubles on each consecutive failure. */
+export const SCRIPT_RESPAWN_BASE_BACKOFF_MS = 100;
+/** Upper bound on early-death `keepWarm` respawn backoff (ms). */
+export const SCRIPT_RESPAWN_MAX_BACKOFF_MS = 2000;
 
 export interface ScriptHostOptions {
   /**
@@ -68,6 +74,10 @@ export interface ScriptHostOptions {
    * one warm (`--serve`). Off, the replacement is spawned by the next job.
    */
   keepWarm?: boolean;
+  /** Override max consecutive early-death auto-respawns (default: `SCRIPT_RESPAWN_MAX_FAILURES`). */
+  maxRespawnFailures?: number;
+  /** Override base early-death respawn backoff in ms (default: `SCRIPT_RESPAWN_BASE_BACKOFF_MS`). */
+  respawnBackoffMs?: number;
 }
 
 /** Why a worker was retired, for the stderr log. */
@@ -103,14 +113,21 @@ export class ScriptHost {
 
   private worker: Worker | null = null;
   private ready: Promise<ScriptEngineIdentity> | null = null;
+  private workerReady = false;
   private pending: Pending | null = null;
   private seq = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private consecutiveEarlyDeaths = 0;
+  private respawnTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly keepWarm: boolean;
+  private readonly maxRespawnFailures: number;
+  private readonly respawnBackoffMs: number;
 
   constructor(private readonly artifact: ZippArtifact, opts: ScriptHostOptions = {}) {
     this.keepWarm = opts.keepWarm === true;
+    this.maxRespawnFailures = Math.max(1, Math.trunc(opts.maxRespawnFailures ?? SCRIPT_RESPAWN_MAX_FAILURES));
+    this.respawnBackoffMs = Math.max(0, Math.trunc(opts.respawnBackoffMs ?? SCRIPT_RESPAWN_BASE_BACKOFF_MS));
     this.engine = identityFromBuild(artifact);
   }
 
@@ -134,9 +151,17 @@ export class ScriptHost {
   /** Terminate the worker and refuse further work. Resolves when the thread has exited. */
   async shutdown(): Promise<void> {
     this.closed = true;
+    this.clearRespawnTimer();
     const worker = this.worker;
     this.retire('shutdown');
     if (worker) await worker.terminate().catch(() => undefined);
+  }
+
+  private clearRespawnTimer(): void {
+    if (this.respawnTimer) {
+      clearTimeout(this.respawnTimer);
+      this.respawnTimer = null;
+    }
   }
 
   private async runChecked(input: unknown): Promise<ScriptResponse | ScriptRefusal> {
@@ -184,13 +209,13 @@ export class ScriptHost {
       worker.postMessage({ type: 'job', seq, job, profile });
     });
     // Credited to the worker that ran it: a death handler may already have
-    // spawned the replacement (count reset), which ran nothing.
+    // cleared or replaced it.
     if (this.worker === worker) this.jobsOnInstance += 1;
 
     const retire = outcome.retire ?? this.recyclePolicy(outcome);
-    if (retire) {
-      // Only the worker this job ran on: a death handler may already have
-      // replaced it, and the replacement is not the one at fault.
+    if (retire && retire !== 'death') {
+      // Only the worker this job ran on: a death handler already retired it and
+      // scheduled (or suppressed, after repeated early deaths) any respawn.
       if (this.worker === worker) this.retire(retire);
       if (this.keepWarm && !this.closed) void this.ensureWorker().catch(() => undefined);
     }
@@ -208,6 +233,7 @@ export class ScriptHost {
   }
 
   private ensureWorker(): Promise<ScriptEngineIdentity> {
+    this.clearRespawnTimer();
     if (this.ready) return this.ready;
     const { identity } = this.artifact;
     const worker = new Worker(this.artifact.scriptWorkerEntry, {
@@ -220,6 +246,7 @@ export class ScriptHost {
     worker.stdout.pipe(process.stderr, { end: false });
     worker.stderr.pipe(process.stderr, { end: false });
     this.worker = worker;
+    this.workerReady = false;
     this.instance += 1;
     this.jobsOnInstance = 0;
 
@@ -228,6 +255,7 @@ export class ScriptHost {
         const message = raw as { type?: unknown } | null;
         if (!message || typeof message !== 'object') return;
         if (message.type === 'ready') {
+          if (this.worker === worker) this.workerReady = true;
           const { engine } = message as { engine?: ScriptEngineIdentity };
           if (engine && engine.name === 'zipp') this.engine = engine;
           resolve(this.engine);
@@ -256,6 +284,7 @@ export class ScriptHost {
     if (!pending || this.worker !== worker || pending.seq !== message.seq) return;
     clearTimeout(pending.timer);
     this.pending = null;
+    this.consecutiveEarlyDeaths = 0;
     const result: ScriptJobResult = message.result && typeof message.result === 'object' && message.result.id === pending.jobId
       ? message.result
       : { id: pending.jobId, ok: false, errorKind: 'host', error: 'The script worker replied without a result for the job' };
@@ -265,8 +294,10 @@ export class ScriptHost {
   /** The worker died on its own (a top-level throw, an out-of-memory kill, an exit the host did not ask for). */
   private onDeath(worker: Worker, what: string): void {
     if (this.worker !== worker) return; // already retired by the host: expected
+    const earlyDeath = !this.workerReady || this.jobsOnInstance === 0;
     this.worker = null;
     this.ready = null;
+    this.workerReady = false;
     const pending = this.pending;
     if (pending) {
       clearTimeout(pending.timer);
@@ -276,15 +307,43 @@ export class ScriptHost {
         retire: 'death',
       });
     }
-    if (this.keepWarm && !this.closed) void this.ensureWorker().catch(() => undefined);
+    if (earlyDeath) {
+      this.consecutiveEarlyDeaths += 1;
+    } else {
+      this.consecutiveEarlyDeaths = 0;
+    }
+    if (!this.keepWarm || this.closed) return;
+    if (!earlyDeath) {
+      void this.ensureWorker().catch(() => undefined);
+      return;
+    }
+    if (this.consecutiveEarlyDeaths >= this.maxRespawnFailures) {
+      process.stderr.write(
+        `oaiy script: stopping keepWarm auto-respawn after ${this.consecutiveEarlyDeaths} consecutive early worker deaths; next job will retry lazily\n`,
+      );
+      return;
+    }
+    const delayMs = Math.min(
+      this.respawnBackoffMs * 2 ** (this.consecutiveEarlyDeaths - 1),
+      SCRIPT_RESPAWN_MAX_BACKOFF_MS,
+    );
+    this.clearRespawnTimer();
+    this.respawnTimer = setTimeout(() => {
+      this.respawnTimer = null;
+      if (!this.closed && !this.worker && !this.ready) {
+        void this.ensureWorker().catch(() => undefined);
+      }
+    }, delayMs);
   }
 
   /** Terminate the current worker. Its `exit` is then expected and ignored. */
   private retire(reason: RetireReason): void {
+    this.clearRespawnTimer();
     const worker = this.worker;
     if (!worker) return;
     this.worker = null;
     this.ready = null;
+    this.workerReady = false;
     const pending = this.pending;
     if (pending) {
       // Only a shutdown can find a job in flight here; a watchdog or a death

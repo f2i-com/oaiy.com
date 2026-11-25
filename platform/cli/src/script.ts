@@ -121,13 +121,14 @@ export async function serveScript(input: Readable, output: Writable): Promise<nu
 
   const { loadZippArtifact, EngineUnavailableError } = await import('./zipp/artifact');
   const { ScriptHost } = await import('./zipp/script-host');
-  let host: InstanceType<typeof ScriptHost>;
+  let host: InstanceType<typeof ScriptHost> | undefined;
   try {
     host = new ScriptHost(await loadZippArtifact(), { keepWarm: true });
     // The worker is up and has reported the engine before the first line is
     // read, so a first-line ping has an identity to answer with.
     await host.warm();
   } catch (e) {
+    await host?.shutdown();
     if (e instanceof EngineUnavailableError) {
       write(errorLine(null, 'engine_unavailable', e.message));
       return 1;

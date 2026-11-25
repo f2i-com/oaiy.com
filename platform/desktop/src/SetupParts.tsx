@@ -15,6 +15,7 @@ import {
   type ServiceSnapshot,
 } from './api';
 import { chosenModel, groupModels, modelName, recommendedModel, type StepState } from './setupFlow';
+import { useVisiblePoll } from './useVisiblePoll';
 
 /**
  * The setup wizard's shared parts: its frame (the step list, the pane, Back /
@@ -31,23 +32,39 @@ export function usePoll<T>(load: () => Promise<T>, ms: number, enabled = true): 
   const [error, setError] = useState<string | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
+  const mountedRef = useRef(true);
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+  const seqRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      seqRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) seqRef.current += 1;
+  }, [enabled]);
+
   const refresh = useCallback(async () => {
+    if (!enabledRef.current) return;
+    const seq = ++seqRef.current;
     try {
-      setValue(await loadRef.current());
+      const next = await loadRef.current();
+      if (!mountedRef.current || !enabledRef.current || seq !== seqRef.current) return;
+      setValue(next);
       setError(null);
     } catch (e) {
+      if (!mountedRef.current || !enabledRef.current || seq !== seqRef.current) return;
       // (said as the person reads it: "the desktop is busy", not "500: the desktop is busy")
       setError(errorText(e));
     }
   }, []);
-  useEffect(() => {
-    if (!enabled) return;
-    void refresh();
-    const id = window.setInterval(() => {
-      if (!document.hidden) void refresh();
-    }, ms);
-    return () => window.clearInterval(id);
-  }, [enabled, ms, refresh]);
+
+  useVisiblePoll(() => void refresh(), ms, enabled);
   return [value, refresh, error];
 }
 

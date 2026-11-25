@@ -8,7 +8,17 @@ const api = vi.hoisted(() => ({
   NOT_ANSWERING: 'OAIY isn’t answering. It may still be starting, or it has stopped.',
 }));
 vi.mock('./api', () => api);
-vi.mock('./useVisiblePoll', () => ({ useVisiblePoll: () => {} }));
+vi.mock('./useVisiblePoll', async () => {
+  const { useEffect } = await import('react');
+  return {
+    useVisiblePoll: (tick: () => void) => {
+      useEffect(() => {
+        tick();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+    },
+  };
+});
 import EngineWorkersPanel from './EngineWorkersPanel';
 
 let container: HTMLDivElement;

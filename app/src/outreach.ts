@@ -21,7 +21,7 @@ import type { Desktop, DesktopEvent } from './desktop/bridge';
 import { NOT_ALLOWED, callsBack, isAllowed, isBlocked, retryAfter, type Screening } from './callbacks';
 import { displayNumber, samePerson, toE164 } from './phoneNumbers';
 import type { PhoneLine } from './phoneLine';
-import type { Vfs } from './vfs/vfs';
+import { normalizePath, type Vfs } from './vfs/vfs';
 import { NO_IDENTITY, type Identity } from './identity';
 
 export type OutreachKind = 'call' | 'text';
@@ -285,6 +285,22 @@ const IN_DOUBT = /outcome is unknown|completion is unknown/i;
 const MAY_HAVE_GONE = 'The phone never said the text went: it may have, so it was not sent again.';
 
 // ---- words ----------------------------------------------------------------------
+
+/** Normalize a campaign resultsPath strictly under /outreach/, falling back to /outreach/<slug>.md. */
+export function safeResultsPath(raw: unknown, id: string): string {
+  const fallback = `/outreach/${slugify(id)}.md`;
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  try {
+    const normalized = normalizePath(raw.trim());
+    if (!normalized.startsWith('outreach/') || normalized.length <= 'outreach/'.length) return fallback;
+    const withMd = /\.md$/i.test(normalized) ? normalized : `${normalized}/results.md`;
+    const stem = withMd.replace(/\.md$/i, '');
+    if (!stem.startsWith('outreach/') || stem.length <= 'outreach/'.length || stem.endsWith('/')) return fallback;
+    return `/${withMd}`;
+  } catch {
+    return fallback;
+  }
+}
 
 /** A short name as a folder: "Confirm Friday bookings" → "confirm-friday-bookings". */
 export function slugify(name: string): string {
@@ -887,6 +903,15 @@ export class Outreach {
     if (!c) return `No outreach ${id}.`;
     if (c.state === 'done' || c.state === 'stopped') return `"${c.name}" has finished already.`;
     const now = this.now();
+    if (this.unstarted(c)) {
+      c.state = 'stopped';
+      c.pausedWhy = why;
+      c.waitingFor = '';
+      c.endedAt = now;
+      await this.save(c);
+      this.changed();
+      return `Stopped "${c.name}".`;
+    }
     for (const p of c.people) {
       if (FINAL.has(p.state) || p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call' || p.state === 'ended') continue;
       this.settlePerson(c, p, p.state === 'awaiting_reply' || p.state === 'sending' ? 'no_reply' : 'stopped', now, false);
@@ -924,6 +949,7 @@ export class Outreach {
 
   /** What has waited too long: a dial never heard to end, a result that never came, a reply past its deadline. */
   private async overdue(c: Campaign, now: number): Promise<void> {
+    if (this.unstarted(c)) return;
     let touched = false;
     for (const p of c.people) {
       const a = p.attempt;
@@ -1246,7 +1272,10 @@ export class Outreach {
 
   /** Find the person a desktop event is about: by a dial's call or operation id, or a text's message id. */
   private byAttempt(match: (a: Attempt) => boolean): { c: Campaign; p: Person } | null {
-    for (const c of this.campaigns) for (const p of c.people) if (p.attempt && match(p.attempt)) return { c, p };
+    for (const c of this.campaigns) {
+      if (this.unstarted(c)) continue;
+      for (const p of c.people) if (p.attempt && match(p.attempt)) return { c, p };
+    }
     return null;
   }
 
@@ -1451,7 +1480,15 @@ export class Outreach {
   /** Everyone is done (or it was stopped with no call going on): the results, and the report once. */
   private async finishIfDone(c: Campaign, now: number, force = false): Promise<void> {
     if (c.endedAt && c.report.text) return;
-    if (this.unstarted(c) && !force) return;
+    if (this.unstarted(c)) {
+      if (!force) return;
+      c.state = 'stopped';
+      c.endedAt = now;
+      c.waitingFor = '';
+      await this.save(c);
+      this.changed();
+      return;
+    }
     const live = c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call' || p.state === 'ended');
     const allDone = c.people.every((p) => FINAL.has(p.state));
     if (!(allDone || (force && !live) || (c.state === 'stopped' && !live))) return;
@@ -1474,17 +1511,17 @@ export class Outreach {
     let hit = this.byAttempt((a) => a.callId === callId || a.voiceCallId === callId);
     if (!hit && number) {
       for (const c of this.campaigns) {
-        if (c.kind !== 'call') continue;
+        if (c.kind !== 'call' || this.unstarted(c)) continue;
         const p = c.people.find((x) => ringing(x) && samePerson(x.number, number));
         if (p) {
           hit = { c, p };
-          p.attempt!.voiceCallId = callId;
+          if (p.attempt) p.attempt.voiceCallId = callId;
           break;
         }
       }
     }
     if (hit) {
-      hit.p.attempt!.bound = true;
+      if (hit.p.attempt) hit.p.attempt.bound = true;
       hit.p.state = hit.p.state === 'dialling' || hit.p.state === 'ringing' ? 'on_call' : hit.p.state;
       void this.save(hit.c);
       this.changed();
@@ -1740,7 +1777,8 @@ export class Outreach {
     clearTimeout(this.writes.get(c.id));
     this.writes.delete(c.id);
     const vfs = this.deps.files();
-    const stem = c.resultsPath.replace(/\.md$/i, '');
+    const safePath = safeResultsPath(c.resultsPath, c.id);
+    const stem = safePath.replace(/\.md$/i, '');
     try {
       vfs.writeFile(`${stem}.md`, resultsMarkdown(c), { parents: true });
       vfs.writeFile(`${stem}.csv`, resultsCsv(c), { parents: true });

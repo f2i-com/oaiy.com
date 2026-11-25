@@ -338,8 +338,10 @@ curl -s http://127.0.0.1:17972/api/health                    # "version" is the 
 ```
 
 The first time, point the unit at the link instead of `/usr/local/bin`
-(`sudo systemctl edit oaiy-server`, then `ExecStart=` on one line to clear it and
-`ExecStart=/opt/oaiy-server/current/oaiy-server` on the next). To go back:
+(`sudo systemctl edit oaiy-server`, then `ExecStart=` and `ExecStartPre=` to clear them, followed by
+`ExecStart=/opt/oaiy-server/current/oaiy-server` and `ExecStartPre=/opt/oaiy-server/current/oaiy-server check`;
+also symlink `/usr/local/bin/oaiy-server` to `/opt/oaiy-server/current/oaiy-server` or set
+`OAIYCTL_SERVER=/opt/oaiy-server/current/oaiy-server` so `oaiyctl` runs the same binary). To go back:
 `sudo ln -sfn /opt/oaiy-server/<the old version> /opt/oaiy-server/current && sudo systemctl restart oaiy-server`.
 `SHA256SUMS.txt` is the release's own list; `latest.json` and the `.sig` files are in it too.
 The data (`/var/lib/oaiy`) is not in the version directory and is untouched. Restarting stops

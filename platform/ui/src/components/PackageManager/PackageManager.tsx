@@ -62,10 +62,11 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
 
   // Pagination
   const totalPages = Math.ceil(filteredPackages.length / ITEMS_PER_PAGE);
+  const safePage = totalPages > 0 ? Math.min(currentPage, totalPages) : 1;
   const paginatedPackages = useMemo(() => {
-    const start = (currentPage - 1) * ITEMS_PER_PAGE;
+    const start = (safePage - 1) * ITEMS_PER_PAGE;
     return filteredPackages.slice(start, start + ITEMS_PER_PAGE);
-  }, [filteredPackages, currentPage]);
+  }, [filteredPackages, safePage]);
 
   // Handle file picker for installing a package
   const handleBrowsePackage = useCallback(async () => {
@@ -276,7 +277,10 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
               placeholder="Search packages"
               aria-label="Search packages by name, ID, or description"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setCurrentPage(1);
+              }}
               className="w-full pl-8 pr-3 py-1.5 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
             />
           </div>
@@ -354,6 +358,13 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
               Click "Install" to add a .oaiy package
             </p>
           </div>
+        ) : filteredPackages.length === 0 ? (
+          <div className="text-center py-8 text-content-secondary text-sm">
+            <p>No packages match "{searchQuery.trim()}"</p>
+            <p className="text-xs text-content-secondary mt-1">
+              Try a different search term
+            </p>
+          </div>
         ) : (
           <>
             {/* Package list */}
@@ -375,8 +386,8 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
               <div className="flex items-center justify-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
+                  disabled={safePage === 1}
                   aria-label="Previous page"
                   className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -398,14 +409,14 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                   aria-current="page"
                   className="text-xs text-content-secondary"
                 >
-                  {currentPage} / {totalPages}
+                  {safePage} / {totalPages}
                 </span>
                 <button
                   type="button"
                   onClick={() =>
-                    setCurrentPage((p) => Math.min(totalPages, p + 1))
+                    setCurrentPage(Math.min(totalPages, safePage + 1))
                   }
-                  disabled={currentPage === totalPages}
+                  disabled={safePage === totalPages}
                   aria-label="Next page"
                   className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >

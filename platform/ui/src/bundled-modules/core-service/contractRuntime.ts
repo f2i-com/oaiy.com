@@ -91,6 +91,29 @@ export function absoluteUrl(url: string, desktop: Desktop = desktopAccess()): st
   return url.startsWith('/') ? `${desktop.origin}${url}` : url;
 }
 
+/** Strictly desktop file-serving paths that `desktopFileBytes` may read. */
+const DESKTOP_FILE_PATH_RE =
+  /^(?:\/files\/|\/api\/files\/|\/api\/ai\/engine\/gateway\/files\/|\/api\/network\/nodes\/[A-Za-z0-9]{1,64}\/gateway\/files\/)/;
+
+function hasEncodedOrBackslashTraversal(url: string, u: URL): boolean {
+  const hostIdx = url.indexOf(u.host);
+  const rawPath = hostIdx >= 0 ? url.slice(hostIdx + u.host.length).split(/[?#]/)[0] : '';
+  return /%2e|%2f|%5c|\\/i.test(u.pathname) || /%2e|%2f|%5c|\\/i.test(rawPath);
+}
+
+function packageLacksLocalNetwork(ctx?: RuntimeContext): boolean {
+  return Boolean(ctx?.currentPackageId) && !(typeof ctx?.hasPermission === 'function' && ctx.hasPermission('network:local'));
+}
+
+function stripAuthorizationHeader(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === 'authorization') continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 /** The desktop's credential, when `url` is one of its engine routes. */
 export function desktopCredential(url: string, desktop: Desktop): string | null | undefined {
   let u: URL;
@@ -104,9 +127,7 @@ export function desktopCredential(url: string, desktop: Desktop): string | null 
   if (u.origin !== desktopOrigin) return undefined;
   // Reject percent-encoded dot/slash/backslash sequences and raw backslashes so encoded
   // path traversal can never smuggle desktop credentials onto arbitrary desktop routes.
-  const hostIdx = url.indexOf(u.host);
-  const rawPath = hostIdx >= 0 ? url.slice(hostIdx + u.host.length).split(/[?#]/)[0] : '';
-  if (/%2e|%2f|%5c|\\/i.test(u.pathname) || /%2e|%2f|%5c|\\/i.test(rawPath)) {
+  if (hasEncodedOrBackslashTraversal(url, u)) {
     return undefined;
   }
   const matchesRoute =
@@ -131,19 +152,25 @@ async function send(ctx: RuntimeContext, url: string, method: string, headers: R
   const desktop = desktopAccess();
   const credential = desktopCredential(url, desktop);
   if (credential !== undefined) {
-    // OAIY's own engine: straight to the desktop (no browser-side timeout,
-    // no local-network prompt for OAIY itself), with its credential.
-    const h: Record<string, string> = { ...headers };
-    if (credential) h.Authorization = `Bearer ${credential}`;
-    return (await fetch(url, {
+    const lacksLocal = packageLacksLocalNetwork(ctx);
+    if (lacksLocal && !ctx.secureFetch) {
+      throw new Error(`Package '${ctx.currentPackageId}' lacks required permission 'network:local'`);
+    }
+    const effectiveCredential = lacksLocal ? null : credential;
+    const h: Record<string, string> = effectiveCredential ? stripAuthorizationHeader(headers) : { ...headers };
+    if (effectiveCredential) h.Authorization = `Bearer ${effectiveCredential}`;
+    const init: RequestInit = {
       method,
       headers: h,
       body: body as BodyInit | undefined,
       signal: ctx.abortSignal,
-    })) as unknown as Reply;
+    };
+    const resp = ctx.secureFetch ? await ctx.secureFetch(url, init) : await fetch(url, init);
+    return resp as unknown as Reply;
   }
   if (body instanceof Uint8Array) throw new Error(`${url}: a recording can only be sent to OAIY Voice`);
-  return (await ctx.fetch(url, { method, headers, body, signal: ctx.abortSignal })) as unknown as Reply;
+  const doFetch = ctx.secureFetch ?? ctx.fetch;
+  return (await doFetch(url, { method, headers, body, signal: ctx.abortSignal })) as unknown as Reply;
 }
 
 async function failure(reply: Reply, what: string): Promise<Error> {
@@ -181,9 +208,15 @@ export async function listOaiyServices(ctx: RuntimeContext): Promise<CustomServi
   if (listed && Date.now() - listed.at < 30_000) return listed.services;
   const desktop = desktopAccess();
   const url = `${desktop.origin}/api/ai/engine/services`;
+  const lacksLocal = packageLacksLocalNetwork(ctx);
+  if (lacksLocal && !ctx.secureFetch) {
+    throw new Error(`Package '${ctx.currentPackageId}' lacks required permission 'network:local'`);
+  }
   const headers: Record<string, string> = {};
-  if (desktop.token) headers.Authorization = `Bearer ${desktop.token}`;
-  const reply = await fetch(url, { headers, signal: ctx.abortSignal });
+  if (!lacksLocal && desktop.token) headers.Authorization = `Bearer ${desktop.token}`;
+  const reply = ctx.secureFetch
+    ? await ctx.secureFetch(url, { headers, signal: ctx.abortSignal })
+    : await fetch(url, { headers, signal: ctx.abortSignal });
   if (!reply.ok) throw new Error(`OAIY Desktop did not list its engine's services (HTTP ${reply.status})`);
   const body = (await reply.json()) as { services?: CustomService[] };
   const services = (body.services ?? []).map((s) => ({ ...s, group: s.group ?? 'engine', headers: s.headers ?? '{}' }) as CustomService);
@@ -256,15 +289,35 @@ function reference(value: unknown): string | null {
 
 /** A node value's bytes: a data:, blob: or http(s) URL, or a file path. */
 /**
- * A file on the desktop's own routes (a picture OAIY's engine made, by the URL a
- * flow passes on in place of its bytes), read with the desktop's credential; null
- * for any other URL, which the caller reads as it would anyway.
+ * A file on the desktop's own file-serving routes (e.g. `/files/`, `/api/files/`,
+ * `/api/ai/engine/gateway/files/`), read with the desktop's credential when
+ * permitted; null for any other URL, which the caller reads via normal fetch.
  */
-export async function desktopFileBytes(url: string, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mime: string } | null> {
+export async function desktopFileBytes(
+  url: string,
+  signal?: AbortSignal,
+  ctx?: RuntimeContext,
+): Promise<{ bytes: Uint8Array; mime: string } | null> {
   const desktop = desktopAccess();
-  const credential = desktopCredential(url, desktop);
-  if (credential === undefined) return null;
-  const r = await fetch(url, { headers: credential ? { Authorization: `Bearer ${credential}` } : {}, signal });
+  let u: URL;
+  let desktopOrigin: string;
+  try {
+    u = new URL(url);
+    desktopOrigin = new URL(desktop.origin).origin;
+  } catch {
+    return null;
+  }
+  if (u.origin !== desktopOrigin) return null;
+  if (hasEncodedOrBackslashTraversal(url, u)) return null;
+  if (!DESKTOP_FILE_PATH_RE.test(u.pathname)) return null;
+
+  const lacksLocal = packageLacksLocalNetwork(ctx);
+  if (lacksLocal && !ctx?.secureFetch) {
+    throw new Error(`Package '${ctx?.currentPackageId}' lacks required permission 'network:local'`);
+  }
+  const headers: Record<string, string> = !lacksLocal && desktop.token ? { Authorization: `Bearer ${desktop.token}` } : {};
+  const init: RequestInit = { method: 'GET', headers, signal };
+  const r = ctx?.secureFetch ? await ctx.secureFetch(url, init) : await fetch(url, init);
   if (!r.ok) throw new Error(`could not read ${url}: HTTP ${r.status}`);
   return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(url) };
 }
@@ -284,9 +337,10 @@ export async function valueBytes(ctx: RuntimeContext, value: unknown): Promise<{
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
   }
   if (/^https?:\/\//.test(ref)) {
-    const own = await desktopFileBytes(ref, ctx.abortSignal);
+    const own = await desktopFileBytes(ref, ctx.abortSignal, ctx);
     if (own) return own;
-    const r = (await ctx.fetch(ref, { signal: ctx.abortSignal })) as unknown as Reply;
+    const doFetch = ctx.secureFetch ?? ctx.fetch;
+    const r = (await doFetch(ref, { signal: ctx.abortSignal })) as unknown as Reply;
     if (!r.ok) throw new Error(`could not read ${ref}: HTTP ${r.status}`);
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
   }

@@ -135,6 +135,8 @@ interface JobQueueProviderProps {
   onReloadMacros?: () => Promise<void>;
   /** Callback to recompile packages via API */
   onRecompilePackages?: () => Promise<{ success: boolean; output?: string; error?: string }>;
+  /** Look up granted permissions for a loaded package ID (used when regular flows embed `pkg:*` nodes) */
+  getPackagePermissions?: (packageId: string) => readonly string[] | null | undefined;
 }
 
 // The database handler and the JobManager assembly now live in the shared,
@@ -159,12 +161,14 @@ export function JobQueueProvider({
   onClearCache,
   onReloadMacros,
   onRecompilePackages,
+  getPackagePermissions,
 }: JobQueueProviderProps) {
   // Use refs to always access current values in the network permission handler
   // This prevents stale closures from capturing initial prop values
   const projectSettingsRef = useRef(projectSettings);
   const onUpdateSettingsRef = useRef(onUpdateSettings);
   const onLocalNetworkPermissionRef = useRef(onLocalNetworkPermission);
+  const getPackagePermissionsRef = useRef(getPackagePermissions);
 
   // Keep refs in sync with props
   useEffect(() => {
@@ -178,6 +182,10 @@ export function JobQueueProvider({
   useEffect(() => {
     onLocalNetworkPermissionRef.current = onLocalNetworkPermission;
   }, [onLocalNetworkPermission]);
+
+  useEffect(() => {
+    getPackagePermissionsRef.current = getPackagePermissions;
+  }, [getPackagePermissions]);
 
   // Project constants flattened to key→value (including rehydrated secret
   // values) for the runtime's getConstant. Only non-empty values are included
@@ -212,7 +220,14 @@ export function JobQueueProvider({
   const [jobManager] = useState(() => {
     // Create handler that uses refs to access current values
     const networkPermissionHandler = async (request: LocalNetworkPermissionRequest): Promise<LocalNetworkPermissionResponse> => {
-      if (isOwnDesktop(request.hostPort)) return { allowed: true, remember: false };
+      // Do NOT auto-approve OAIY Desktop's loopback address for untrusted/packaged
+      // jobs unless `network:local` was explicitly granted for that package.
+      const isPackagedOrUntrusted = Boolean(request.packageId);
+      const canAutoApproveOwnDesktop =
+        isOwnDesktop(request.hostPort) &&
+        (!isPackagedOrUntrusted ||
+          (request.packageId !== '__untrusted_imported__' && request.hasLocalNetworkPermission === true));
+      if (canAutoApproveOwnDesktop) return { allowed: true, remember: false };
       const permissionCallback = onLocalNetworkPermissionRef.current;
       if (!permissionCallback) {
         // No permission handler - deny by default
@@ -252,6 +267,7 @@ export function JobQueueProvider({
       // Trusted flows go to the same Worker while the Zipp toggle is on. A
       // function, for the same reason: consulted per job, not frozen here.
       runTrustedFlowsInWorker: zippSandboxEnabled,
+      packagePermissionsLookup: (packageId) => getPackagePermissionsRef.current?.(packageId) ?? null,
     });
   });
 
