@@ -193,7 +193,7 @@ fn is_hf_host(url: &str) -> bool {
 /// The SSRF guard, so an untrusted catalog/template download URL can't drive OAIY Desktop
 /// into internal services on the user's (possibly cloud/corporate) machine.
 fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -203,19 +203,42 @@ fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+                || o[0] >= 240 // 240.0.0.0/4 reserved
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return true;
             }
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return is_disallowed_ip(IpAddr::V4(v4));
             }
-            let seg0 = v6.segments()[0];
-            (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            let segs = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96 (embedded IPv4 in low 32 bits)
+            if segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::from(((segs[6] as u32) << 16) | (segs[7] as u32));
+                return is_disallowed_ip(IpAddr::V4(v4));
+            }
+            // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215)
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+                return true;
+            }
+            // 6to4 2002::/16 (embedded IPv4 in bits 16..48)
+            if segs[0] == 0x2002 {
+                let v4 = Ipv4Addr::from(((segs[1] as u32) << 16) | (segs[2] as u32));
+                return is_disallowed_ip(IpAddr::V4(v4));
+            }
+            // Teredo 2001:0000::/32 (tunneled IPv4)
+            if segs[0] == 0x2001 && segs[1] == 0x0000 {
+                return true;
+            }
+            (segs[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (segs[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (segs[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
         }
     }
 }
@@ -317,6 +340,62 @@ async fn pin_download_host(url: &str) -> Result<Option<(String, Vec<std::net::So
     let port = parsed.port_or_known_default().unwrap_or(443);
     let addrs = checked_addrs(&host, port).await?;
     Ok(Some((host, addrs)))
+}
+
+/// Validate `subdir` and create every missing directory component strictly inside `models_dir`.
+///
+/// Walking existing ancestor components and canonicalizing each prefix BEFORE creating any
+/// directory ensures a pre-existing symlink or Windows directory junction inside `models_dir`
+/// can never cause directory creation outside `models_dir`.
+fn ensure_dest_dir_within_root(models_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(models_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let canon_root = std::fs::canonicalize(models_dir)
+        .map_err(|e| format!("cannot resolve models dir: {e}"))?;
+    let Some(s) = subdir.filter(|s| !s.is_empty()) else {
+        return Ok(models_dir.to_path_buf());
+    };
+    // Reject any traversal/absolute/drive-prefix component — more
+    // robust than the old `contains("..") || is_absolute()` check,
+    // which missed a Windows drive-relative prefix like `C:foo`
+    // (is_absolute() is false for it). Mirrors delete_model.
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for c in Path::new(s).components() {
+        match c {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("invalid subdir".into());
+            }
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+        }
+    }
+    let mut cur = models_dir.to_path_buf();
+    for part in parts {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(_) => {
+                let canon_cur = std::fs::canonicalize(&cur)
+                    .map_err(|_| "path escapes models dir".to_string())?;
+                if !canon_cur.starts_with(&canon_root) {
+                    return Err("path escapes models dir".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(ce) => return Err(format!("mkdir failed: {ce}")),
+                }
+                let canon_cur = std::fs::canonicalize(&cur)
+                    .map_err(|_| "path escapes models dir".to_string())?;
+                if !canon_cur.starts_with(&canon_root) {
+                    return Err("path escapes models dir".into());
+                }
+            }
+            Err(e) => return Err(format!("mkdir failed: {e}")),
+        }
+    }
+    Ok(cur)
 }
 
 /// SSRF guard for a model-download URL: require https + reject a host that IS (or resolves to)
@@ -684,32 +763,11 @@ impl Downloads {
             }
         }
 
-        let dest_dir = match subdir {
-            Some(s) if !s.is_empty() => {
-                // Reject any traversal/absolute/drive-prefix component — more
-                // robust than the old `contains("..") || is_absolute()` check,
-                // which missed a Windows drive-relative prefix like `C:foo`
-                // (is_absolute() is false for it). Mirrors delete_model.
-                use std::path::Component;
-                if Path::new(s).components().any(|c| {
-                    matches!(
-                        c,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                }) {
-                    return Err("invalid subdir".into());
-                }
-                self.models_dir.join(s)
-            }
-            _ => self.models_dir.clone(),
-        };
-        std::fs::create_dir_all(&dest_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+        let dest_dir = ensure_dest_dir_within_root(&self.models_dir, subdir)?;
         let dest = dest_dir.join(&chosen_filename);
         // Defense-in-depth: ensure the resolved destination still lives under
         // the models dir, resolving symlinks/junctions (a pre-existing link
         // inside models_dir could otherwise redirect the write outside it).
-        // Mirrors delete_model: canonicalize the (now-created) dest dir + root,
-        // with a lexical fallback if canonicalization isn't possible.
         match (
             std::fs::canonicalize(&dest_dir),
             std::fs::canonicalize(&self.models_dir),
@@ -2032,13 +2090,32 @@ mod tests {
             "fc00::1", // unique-local
             "fe80::1", // link-local
             "::ffff:127.0.0.1", // v4-mapped loopback
+            "::127.0.0.1", // v4-compatible loopback
+            "::169.254.169.254", // v4-compatible metadata
+            "64:ff9b::127.0.0.1", // NAT64 loopback
+            "64:ff9b::169.254.169.254", // NAT64 metadata
+            "64:ff9b:1::1.1.1.1", // NAT64 local-use RFC 8215
+            "2002:7f00:0001::", // 6to4 loopback
+            "2002:a9fe:a9fe::", // 6to4 metadata
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+            "224.0.0.1", // IPv4 multicast
+            "ff02::1", // IPv6 multicast
+            "198.18.0.1", // IPv4 benchmarking
+            "198.19.255.254", // IPv4 benchmarking
+            "240.0.0.1", // IPv4 reserved
         ] {
             assert!(
                 is_disallowed_ip(ip.parse::<IpAddr>().unwrap()),
                 "{ip} should be disallowed"
             );
         }
-        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "64:ff9b::1.1.1.1",
+            "2002:0101:0101::",
+        ] {
             assert!(
                 !is_disallowed_ip(ip.parse::<IpAddr>().unwrap()),
                 "{ip} should be allowed"
@@ -2413,5 +2490,51 @@ mod tests {
         assert!(s.exited, "TransferGuard must mark exited on early error return");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_escape_inside_models_dir_is_rejected_before_creating_directories() {
+        let base = std::env::temp_dir().join(format!(
+            "oaiy-dl-symlink-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let models_dir = base.join("models");
+        let outside_dir = base.join("outside");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let link = models_dir.join("escape");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(&outside_dir, &link).is_err() {
+                // Unprivileged Windows users can create NTFS directory junctions via mklink /J.
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(&outside_dir)
+                    .status()
+                    .expect("mklink /J");
+                assert!(status.success(), "failed to create test junction");
+            }
+        }
+
+        let err = ensure_dest_dir_within_root(&models_dir, Some("escape/nested/sub"))
+            .expect_err("symlink/junction escaping models_dir must be rejected");
+        assert!(err.contains("escapes"), "{err}");
+        assert!(
+            !outside_dir.join("nested").exists(),
+            "must NOT create directories outside models_dir before rejecting symlink escape"
+        );
+
+        // Legitimate nested subdir inside models_dir succeeds.
+        let ok_dir = ensure_dest_dir_within_root(&models_dir, Some("org/model")).unwrap();
+        assert!(ok_dir.is_dir());
+
+        // Remove junction/symlink before cleaning up base.
+        let _ = std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

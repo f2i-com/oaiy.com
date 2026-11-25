@@ -115,17 +115,41 @@ impl GgufGemma {
     /// Rows `ids` of a matrix (the embedding's), each dequantized alone.
     fn rows(&self, hf: &str, ids: &[u32]) -> Result<Vec<f32>> {
         let t = self.info(hf).ok_or_else(|| err(format!("{hf}: not in the GGUF")))?;
-        let (width, rows) = (t.shape[0] as usize, t.shape.get(1).copied().unwrap_or(1) as usize);
-        let row_bytes = t.nbytes() as usize / rows;
+        let (width, rows, row_bytes) = validate_gguf_matrix_rows(hf, &t.shape, t.nbytes())?;
         let bytes = self.file.tensor_bytes(t).map_err(err)?;
-        let mut out = vec![0f32; ids.len() * width];
+        let out_len = ids.len().checked_mul(width).ok_or_else(|| err(format!("{hf}: output length overflow")))?;
+        let mut out = vec![0f32; out_len];
         for (o, &id) in out.chunks_exact_mut(width).zip(ids) {
-            let at = id as usize * row_bytes;
-            let row = bytes.get(at..at + row_bytes).ok_or_else(|| err(format!("{hf}: no row {id}")))?;
+            let row = gguf_row_slice(hf, &bytes, rows, row_bytes, id)?;
             ggml_quants::dequantize(t.dtype, row, o).map_err(err)?;
         }
         Ok(out)
     }
+}
+
+fn validate_gguf_matrix_rows(hf: &str, shape: &[u64], nbytes: u64) -> Result<(usize, usize, usize)> {
+    let &width_u64 = shape.first().ok_or_else(|| err(format!("{hf}: empty tensor shape")))?;
+    let rows_u64 = shape.get(1).copied().unwrap_or(1);
+    let width = usize::try_from(width_u64).map_err(|_| err(format!("{hf}: width overflow")))?;
+    let rows = usize::try_from(rows_u64).map_err(|_| err(format!("{hf}: rows overflow")))?;
+    if width == 0 || rows == 0 {
+        return Err(err(format!("{hf}: invalid matrix shape [{width}, {rows}]")));
+    }
+    let total_bytes = usize::try_from(nbytes).map_err(|_| err(format!("{hf}: byte size overflow")))?;
+    if total_bytes % rows != 0 {
+        return Err(err(format!("{hf}: byte size {total_bytes} not divisible by {rows} rows")));
+    }
+    Ok((width, rows, total_bytes / rows))
+}
+
+fn gguf_row_slice<'a>(hf: &str, bytes: &'a [u8], rows: usize, row_bytes: usize, id: u32) -> Result<&'a [u8]> {
+    let row_idx = id as usize;
+    if row_idx >= rows {
+        return Err(err(format!("{hf}: no row {id}")));
+    }
+    let at = row_idx.checked_mul(row_bytes).ok_or_else(|| err(format!("{hf}: row {id} offset overflow")))?;
+    let end = at.checked_add(row_bytes).ok_or_else(|| err(format!("{hf}: row {id} end overflow")))?;
+    bytes.get(at..end).ok_or_else(|| err(format!("{hf}: no row {id}")))
 }
 
 impl Gemma {
@@ -937,5 +961,21 @@ mod tests {
         let norm = g.values("model.layers.0.input_layernorm.weight")?;
         eprintln!("layer 0's input norm: mean {:.3}", norm.iter().sum::<f32>() / norm.len() as f32);
         Ok(())
+    }
+
+    #[test]
+    fn gguf_matrix_rows_rejects_empty_zero_indivisible_and_oob() {
+        assert!(validate_gguf_matrix_rows("e", &[], 0).is_err(), "empty shape must fail");
+        assert!(validate_gguf_matrix_rows("e", &[0, 4], 0).is_err(), "zero width must fail");
+        assert!(validate_gguf_matrix_rows("e", &[4, 0], 16).is_err(), "zero rows must fail");
+        assert!(validate_gguf_matrix_rows("e", &[4, 3], 10).is_err(), "indivisible nbytes must fail");
+
+        let (width, rows, row_bytes) = validate_gguf_matrix_rows("e", &[4, 2], 16).unwrap();
+        assert_eq!((width, rows, row_bytes), (4, 2, 8));
+        let bytes = [1u8; 16];
+        assert_eq!(gguf_row_slice("e", &bytes, rows, row_bytes, 1).unwrap().len(), 8);
+        assert!(gguf_row_slice("e", &bytes, rows, row_bytes, 2).is_err(), "oob row id must fail");
+        assert!(gguf_row_slice("e", &bytes[..12], rows, row_bytes, 1).is_err(), "truncated buffer must fail");
+        assert!(gguf_row_slice("e", &bytes, usize::MAX, usize::MAX, 2).is_err(), "offset overflow must fail");
     }
 }

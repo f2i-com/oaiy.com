@@ -449,9 +449,10 @@ export function usePackageNodes() {
   const loadEmbeddedCustomNodes = useCallback(async (
     packageId: string,
     customNodes: EmbeddedCustomNode[]
-  ): Promise<{ loaded: number; failed: number }> => {
+  ): Promise<{ loaded: number; failed: number; loadedIds: string[] }> => {
     let loaded = 0;
     let failed = 0;
+    const loadedIds: string[] = [];
     const loadedNodeInfos: PackageNodeInfo[] = [];
 
     packageLogger.debug(` Compiling ${customNodes.length} embedded custom nodes for ${packageId}`);
@@ -461,6 +462,7 @@ export function usePackageNodes() {
 
       if (result.success) {
         loaded++;
+        loadedIds.push(node.id);
 
         // Register with UI registry - use custom UI if available, otherwise GenericNode
         const fullNodeType = `pkg:${packageId}:${node.id}`;
@@ -525,7 +527,7 @@ export function usePackageNodes() {
     }
 
     packageLogger.debug(` Embedded custom nodes: ${loaded} loaded, ${failed} failed`);
-    return { loaded, failed };
+    return { loaded, failed, loadedIds };
   }, []);
 
   /**
@@ -562,9 +564,9 @@ export function usePackageNodes() {
   const loadEmbeddedContent = useCallback(async (
     packageId: string,
     manifest: OAIYPackageManifestWithEmbedded
-  ): Promise<{ customNodes: { loaded: number; failed: number }; extensions: { loaded: number; failed: number } }> => {
+  ): Promise<{ customNodes: { loaded: number; failed: number; loadedIds: string[] }; extensions: { loaded: number; failed: number } }> => {
     const results = {
-      customNodes: { loaded: 0, failed: 0 },
+      customNodes: { loaded: 0, failed: 0, loadedIds: [] as string[] },
       extensions: { loaded: 0, failed: 0 },
     };
 
@@ -596,7 +598,7 @@ export function usePackageNodes() {
       clearCachedUI(fullType);
       registeredNodeIds.current.delete(fullType);
     }
-    unregisterCustomNodes(packageId);
+    await unregisterCustomNodes(packageId);
 
     // Unregister extensions
     unregisterPackageExtensions(packageId);

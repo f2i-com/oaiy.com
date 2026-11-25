@@ -286,21 +286,44 @@
   max-width: 520px;
   flex-direction: column;
   gap: 3px;
-  border: 1px dashed var(--strong-border);
+  border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-solid);
-  padding: 10px 12px;
+  box-shadow: var(--shadow-card);
+  padding: 11px 13px;
+  transition: border-color 0.14s, background 0.14s, box-shadow 0.14s;
 }
 .setup-offer-card strong { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13.5px; }
 .setup-offer-card small { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .setup-offer-card small.setup-mono { color: var(--faint); font-size: 11.5px; }
+.setup-offer > .card-warn,
+.download-plan > .card-warn,
+.setup-req-body > .card-warn {
+  border: 1px solid color-mix(in srgb, var(--amber) 32%, var(--border));
+  border-left: 3px solid var(--amber);
+  border-radius: var(--r-sm);
+  background: var(--amber-soft);
+  padding: 7px 10px;
+}
 .setup-retry { flex-wrap: wrap; margin: 0; }
 .setup-offer-action { display: flex; flex-wrap: wrap; gap: 8px; }
 /* The models to choose from when nothing is chosen in Engines: one card each, the chosen one marked. */
-.setup-model-list { display: flex; max-width: 560px; flex-direction: column; gap: 6px; }
+.setup-model-list { display: flex; max-width: 560px; flex-direction: column; gap: 7px; }
 .setup-model-option { flex-direction: row; align-items: flex-start; gap: 10px; max-width: none; cursor: pointer; }
-.setup-model-option > input[type='radio'] { flex: none; width: 15px; height: 15px; margin: 2px 0 0; cursor: pointer; }
-.setup-model-option.is-selected { border-style: solid; border-color: color-mix(in srgb, var(--primary) 55%, var(--strong-border)); }
+.setup-model-option:hover:not(:has(> input:disabled)) {
+  border-color: var(--strong-border);
+  background: var(--surface-raised);
+}
+.setup-model-option > input[type='radio'] { flex: none; width: 15px; height: 15px; margin: 2px 0 0; cursor: pointer; accent-color: var(--primary-btn); }
+.setup-model-option.is-selected {
+  border-color: color-mix(in srgb, var(--primary) 62%, var(--strong-border));
+  background: color-mix(in srgb, var(--primary) 7%, var(--surface-solid));
+  box-shadow: var(--shadow-card), 0 0 0 1px color-mix(in srgb, var(--primary) 24%, transparent);
+}
+:root[data-theme='light'] .setup-model-option.is-selected {
+  background: color-mix(in srgb, var(--primary) 5%, var(--surface-raised));
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--primary) 16%, transparent);
+}
 .setup-model-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
 .setup-model-text strong { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .setup-model-text strong .badge { margin-left: 0; }

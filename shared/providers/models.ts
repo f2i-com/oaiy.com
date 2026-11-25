@@ -184,8 +184,8 @@ async function getJson(
     if (resp.type === 'opaqueredirect' || (resp.status >= 300 && resp.status < 400)) {
       void resp.body?.cancel().catch(() => {});
       throw new ProviderConnectionError(
-        'http',
-        'The provider answered with a redirect. It is not followed: a request goes only to the address the provider was saved with.',
+        'redirect',
+        describeConnectionError('redirect', { ...context, url }),
         resp.status >= 300 && resp.status < 400 ? resp.status : undefined,
       );
     }
@@ -203,6 +203,12 @@ async function getJson(
     }
   } catch (err) {
     if (err instanceof ProviderConnectionError) throw err;
+    const errName = err && typeof err === 'object' && 'name' in err ? (err as { name?: unknown }).name : undefined;
+    if (errName === 'RedirectRefused') {
+      const msg = err instanceof Error && err.message ? err.message : describeConnectionError('redirect', { ...context, url });
+      throw new ProviderConnectionError('redirect', msg);
+    }
+    if (errName === 'BudgetExhausted') throw err;
     if (options.signal?.aborted) throw new ProviderConnectionError('cancelled', describeConnectionError('cancelled', { ...context, url }));
     if (timedOut) throw new ProviderConnectionError('timeout', describeConnectionError('timeout', { ...context, url }));
     // fetch says only "Failed to fetch" for a server that is down and for a
@@ -274,15 +280,23 @@ async function listFrom(target: ListTarget, options: ListModelsOptions): Promise
     return sortModels(models);
   } catch (err) {
     const first = err instanceof ProviderConnectionError ? err : null;
-    const isRedirect = first?.kind === 'http' && (first.status === undefined || (first.status >= 300 && first.status < 400));
-    const retryable = first && !isRedirect && !['cancelled', 'mixed-content', 'auth'].includes(first.kind);
+    const errName = err && typeof err === 'object' && 'name' in err ? (err as { name?: unknown }).name : undefined;
+    const isRedirect =
+      first?.kind === 'redirect' ||
+      errName === 'RedirectRefused' ||
+      (first?.kind === 'http' && (first.status === undefined || (first.status >= 300 && first.status < 400)));
+    const isBudget = errName === 'BudgetExhausted';
+    const retryable = first && !isRedirect && !isBudget && !['cancelled', 'mixed-content', 'auth'].includes(first.kind);
     if (!endpoints.ollamaTags || !retryable) throw err;
     try {
       const body = await getJson(endpoints.ollamaTags, target.tagsHeaders ?? headers, context, options);
       const models = readOllamaTags(body);
       if (!models) throw first;
       return sortModels(models);
-    } catch {
+    } catch (fallbackErr) {
+      const fb = fallbackErr instanceof ProviderConnectionError ? fallbackErr : null;
+      const fbName = fallbackErr && typeof fallbackErr === 'object' && 'name' in fallbackErr ? (fallbackErr as { name?: unknown }).name : undefined;
+      if (fb?.kind === 'redirect' || fbName === 'RedirectRefused' || fbName === 'BudgetExhausted') throw fallbackErr;
       throw first;
     }
   }

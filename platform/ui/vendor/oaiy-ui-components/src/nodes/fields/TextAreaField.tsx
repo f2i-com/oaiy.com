@@ -36,7 +36,7 @@ export const TextAreaField: React.FC<TextAreaFieldProps> = ({
     <div className={`flex flex-col gap-1 ${className}`}>
       <label htmlFor={id} className="text-xs font-medium text-[rgb(var(--color-text-secondary))]">
         {label}
-        {required && <span className="text-red-500 dark:text-red-400 ml-1">*</span>}
+        {required && <span className="text-[rgb(var(--signal-danger-ink))] ml-1">*</span>}
       </label>
       <textarea
         id={id}
@@ -45,10 +45,10 @@ export const TextAreaField: React.FC<TextAreaFieldProps> = ({
         placeholder={placeholder}
         disabled={disabled}
         rows={rows}
-        className="w-full px-2 py-1.5 text-xs bg-[rgb(var(--color-bg-elevated))] border border-[rgb(var(--color-border-primary))] rounded text-[rgb(var(--color-text-primary))] placeholder-[rgb(var(--color-text-muted))] focus:outline-none focus:border-[rgb(var(--accent-primary))] disabled:opacity-50 disabled:cursor-not-allowed resize-y min-h-[60px]"
+        className="w-full px-2.5 py-1.5 text-xs bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-ctl)] text-[rgb(var(--color-text-primary))] placeholder-[rgb(var(--color-text-muted))] focus:outline-none focus:border-[rgb(var(--accent-primary))] focus:ring-2 focus:ring-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50 disabled:cursor-not-allowed resize-y min-h-[60px] transition-colors"
       />
       {description && (
-        <p className="text-[10px] text-[rgb(var(--color-text-muted))]">{description}</p>
+        <p className="text-[10px] text-[rgb(var(--color-text-faint))]">{description}</p>
       )}
     </div>
   );

@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import { Check, CircleDashed, Cpu, Download, ExternalLink, FolderSearch, Loader2, Mic, Network, Play, RotateCcw, SkipForward, TriangleAlert } from 'lucide-react';
 import ChatGptConnector from './ChatGptConnector';
 import {
@@ -819,12 +819,34 @@ export function EngineModelCard({
 
 /** Or an AI source instead of the engines: ChatGPT, a provider's API key, or a local model server. */
 export function AiSourceChoice({ onNavigate }: { onNavigate: (v: 'providers' | 'services') => void }) {
+  const choices = ['codex', 'api', 'local'] as const;
   const [choice, setChoice] = useState<'codex' | 'api' | 'local'>('codex');
+  const onChoiceKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const i = choices.indexOf(choice);
+    if (i < 0) return;
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (i + 1) % choices.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + choices.length) % choices.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = choices.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    setChoice(choices[nextIdx]);
+    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+  };
   return (
     <div className="setup-source">
-      <div className="seg-tabs" role="tablist" aria-label="Choose an AI source">
-        {(['codex', 'api', 'local'] as const).map((c) => (
-          <button type="button" role="tab" key={c} aria-selected={choice === c} className={choice === c ? 'active' : undefined} onClick={() => setChoice(c)}>
+      <div className="seg-tabs" role="tablist" aria-label="Choose an AI source" onKeyDown={onChoiceKey}>
+        {choices.map((c) => (
+          <button
+            type="button"
+            role="tab"
+            key={c}
+            aria-selected={choice === c}
+            tabIndex={choice === c ? 0 : -1}
+            className={choice === c ? 'active' : undefined}
+            onClick={() => setChoice(c)}
+          >
             <span>{c === 'codex' ? 'ChatGPT' : c === 'api' ? 'Provider API key' : 'Local model server'}</span>
           </button>
         ))}

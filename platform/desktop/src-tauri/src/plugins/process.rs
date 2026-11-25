@@ -49,6 +49,28 @@ use crate::services::runner::LogBuffer;
 /// transfers off the call's `ready` says nothing of it, so a plugin that offers the tool because of this still never puts it on the wire.
 pub const HOST_FEATURES: [&str; 2] = ["eventAck", "ringPlan"];
 
+/// RAII guard for the in-flight plugin request counter so a panic inside a request handler
+/// still releases its slot cleanly.
+struct AnsweringGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl AnsweringGuard {
+    fn try_acquire(counter: &Arc<std::sync::atomic::AtomicUsize>, limit: usize) -> Option<Self> {
+        let guard = Self(Arc::clone(counter));
+        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= limit {
+            drop(guard);
+            None
+        } else {
+            Some(guard)
+        }
+    }
+}
+
+impl Drop for AnsweringGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A failed plugin call, in the terms a caller can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
@@ -411,8 +433,7 @@ impl PluginProcess {
                             let requests = requests.clone();
                             let tx_for_replies = tx_for_replies.clone();
                             // (a plugin asking more at once than this is told it is busy, not given a thread for each)
-                            if answering.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_PLUGIN_REQUESTS {
-                                answering.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(guard) = AnsweringGuard::try_acquire(&answering, MAX_PLUGIN_REQUESTS) else {
                                 let reply = error_line(&id, rpc::METHOD_NOT_FOUND, "too many requests at once: try again when one is answered", Some("busy"));
                                 if let Ok(guard) = tx_for_replies.lock() {
                                     if let Some(tx) = guard.as_ref() {
@@ -420,9 +441,9 @@ impl PluginProcess {
                                     }
                                 }
                                 continue;
-                            }
-                            let answering = answering.clone();
+                            };
                             thread::spawn(move || {
+                                let _guard = guard;
                                 let reply = match requests(&method, params) {
                                     Ok(v) => result_line(&id, v),
                                     Err((typed, msg)) => error_line(
@@ -437,7 +458,6 @@ impl PluginProcess {
                                         let _ = tx.try_send(reply);
                                     }
                                 }
-                                answering.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
                         RpcMessage::NonProtocol(text) => {
@@ -807,6 +827,26 @@ mod tests {
         let cut = capped(long);
         assert!(cut.ends_with("… (cut)"));
         assert!(cut.len() <= rpc::MAX_LOG_BYTES + "… (cut)".len());
+    }
+
+    #[test]
+    fn answering_guard_releases_slot_on_panic_and_enforces_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let g1 = AnsweringGuard::try_acquire(&counter, 2).expect("slot 1");
+        let g2 = AnsweringGuard::try_acquire(&counter, 2).expect("slot 2");
+        assert!(AnsweringGuard::try_acquire(&counter, 2).is_none(), "limit enforced");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        drop(g2);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = g1;
+            panic!("simulated plugin handler panic");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "panic must release answering slot");
     }
 
     const ALLOWED: &[&str] = &["aokie.call.incoming"];

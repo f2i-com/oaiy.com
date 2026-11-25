@@ -112,7 +112,14 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     } else {
         vec![(0, 0, 1, 1, h.width, h.height)]
     };
-    let need: usize = passes.iter().map(|p| p.5 * (1 + h.row_bytes(p.4))).sum();
+    let need: usize = passes
+        .iter()
+        .try_fold(0usize, |acc, p| {
+            let row = 1usize.checked_add(h.row_bytes(p.4))?;
+            let pass_bytes = p.5.checked_mul(row)?;
+            acc.checked_add(pass_bytes)
+        })
+        .ok_or_else(|| bad("image byte size overflow"))?;
     let raw = inflate::zlib_decompress(&idat, need)?;
     if raw.len() < need {
         return Err(bad("image data is truncated"));
@@ -245,5 +252,53 @@ fn to_rgb(h: &Header, s: &[u16], palette: &[[u8; 3]], mut put: impl FnMut(usize,
                 put(i, [hi(p[0]), hi(p[1]), hi(p[2])]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + body.len());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&[0u8; 4]); // CRC ignored by decoder
+        out
+    }
+
+    #[test]
+    fn tiny_8000x8000_rgba16_png_fails_cleanly_without_eager_preallocation() {
+        // Valid 8000x8000 16-bit RGBA header (64M pixels = MAX_PIXELS, ~512 MiB raw scanlines)
+        // with a tiny valid zlib payload producing just 1 byte.
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&8000u32.to_be_bytes());
+        ihdr.extend_from_slice(&8000u32.to_be_bytes());
+        ihdr.push(16); // bit depth
+        ihdr.push(6); // RGBA
+        ihdr.push(0); // compression
+        ihdr.push(0); // filter
+        ihdr.push(0); // interlace
+
+        // Valid zlib stream decompressing to b"x" (1 byte), Adler-32 of [0x78]: a=121 (0x0079), b=121 (0x0079)
+        let tiny_zlib = [0x78u8, 0x01, 0x01, 0x01, 0x00, 0xfe, 0xff, b'x', 0x00, 0x79, 0x00, 0x79];
+        // Verify zlib_decompress itself does not pre-allocate 256 MiB for a huge limit.
+        let decompressed = inflate::zlib_decompress(&tiny_zlib, 512_008_000).unwrap();
+        assert_eq!(decompressed, b"x");
+        assert!(
+            decompressed.capacity() <= (1 << 20),
+            "expected lazy bounded capacity, got {}",
+            decompressed.capacity()
+        );
+
+        let mut png = Vec::new();
+        png.extend_from_slice(SIGNATURE);
+        png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        png.extend_from_slice(&chunk(b"IDAT", &tiny_zlib));
+        png.extend_from_slice(&chunk(b"IEND", &[]));
+
+        let err = decode(&png).expect_err("truncated 8000x8000 RGBA16 PNG must fail cleanly");
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 }

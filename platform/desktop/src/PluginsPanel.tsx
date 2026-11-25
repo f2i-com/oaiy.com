@@ -550,8 +550,8 @@ function PluginCard({
             <Loader2 size={14} className="spin" /> Working…
           </button>
         ) : running ? (
-          <button className="btn btn-secondary" onClick={onStop}>
-            <Square size={14} /> Stop
+          <button className="btn btn-warn" onClick={onStop}>
+            <Square size={12} aria-hidden="true" /> Stop
           </button>
         ) : (
           <button
@@ -625,7 +625,7 @@ function PluginCatalog({ onInstall }: { onInstall: (path: string) => void }) {
   }, []);
   return (
     <div className="empty-state plugin-catalog">
-      <Plug size={22} style={{ opacity: 0.5 }} />
+      <Plug size={22} aria-hidden="true" />
       <p>No plugins installed yet.</p>
       <p className="form-hint">Plugins bring devices and services to OAIY, such as your business phone and its calendar.{catalog && catalog.length > 0 ? ' These are the ones OAIY knows:' : ''}</p>
       {catalog && catalog.length > 0 && (

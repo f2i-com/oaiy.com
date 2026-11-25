@@ -17,7 +17,9 @@ const MEDIA: Record<string, [MediaKind, string]> = {
 };
 
 function ext(path: string): string {
-  return path.slice(path.lastIndexOf('.') + 1).toLowerCase();
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  const dot = path.lastIndexOf('.');
+  return dot > slash + 1 ? path.slice(dot + 1).toLowerCase() : '';
 }
 
 export function mediaKind(path: string): MediaKind | null {

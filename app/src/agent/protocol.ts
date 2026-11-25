@@ -139,6 +139,8 @@ export interface RequestOptions {
   varied?: boolean;
   /** Strip Anthropic thinking / redacted_thinking blocks when replaying turns (used on signature-error fallback or after prefix pruning). */
   stripAnthropicThinking?: boolean;
+  /** Called when a broken SSE stream falls back to a non-streaming JSON request so callers can discard partial streamed state. */
+  onFallback?: () => void;
 }
 
 function anthropicMessages(turns: Turn[], stripThinking = false): unknown[] {
@@ -439,6 +441,7 @@ async function postStreamed(
     return await postProviderStream(provider, url, body, { signal: options.signal, timeoutMs: options.timeoutMs, onEvent });
   } catch (error) {
     if (!(error instanceof AIProviderError) || !error.streamFault) throw error;
+    options.onFallback?.();
     const whole: Record<string, unknown> = { ...body, stream: false };
     // (it goes with a stream only: OpenAI refuses it without one)
     delete whole.stream_options;
@@ -470,7 +473,7 @@ export async function sendTurn(
     };
     const stream = new AnthropicStream(options.sink);
     const outcome = await postStreamed(provider, url, body, options, (event) => stream.accept(event));
-    return decodeAnthropic(outcome.streamed ? stream.result() : outcome.data, stream.parseErrors);
+    return decodeAnthropic(outcome.streamed ? stream.result() : outcome.data, outcome.streamed ? stream.parseErrors : undefined);
   }
   const includeReasoning = /deepseek/i.test(url) || /deepseek[-_]?(?:r1|reasoner)/i.test(model);
   const body: Record<string, unknown> = {

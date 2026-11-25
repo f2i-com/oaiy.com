@@ -875,12 +875,17 @@ const MAX_VIDEO_MS = 60 * 60_000;
 const POLL_MS = 2000;
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
+    const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason);
-    }, { once: true });
+      reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 

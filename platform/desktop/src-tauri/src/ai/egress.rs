@@ -33,6 +33,7 @@ const ENGINE_WAIT: Duration = Duration::from_secs(15 * 60);
 /// `downloads::is_disallowed_ip`): loopback, RFC1918 private, link-local incl.
 /// 169.254.169.254 metadata, CGNAT 100.64/10, unspecified, unique-local v6, etc.
 fn is_disallowed_ip(ip: IpAddr) -> bool {
+    use std::net::Ipv4Addr;
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -42,19 +43,42 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xc0) == 0x40) // 100.64.0.0/10 CGNAT
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+                || o[0] >= 240 // 240.0.0.0/4 reserved
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return true;
             }
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return is_disallowed_ip(IpAddr::V4(v4));
             }
-            let seg0 = v6.segments()[0];
-            (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            let segs = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96 (embedded IPv4 in low 32 bits)
+            if segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::from(((segs[6] as u32) << 16) | (segs[7] as u32));
+                return is_disallowed_ip(IpAddr::V4(v4));
+            }
+            // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215)
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+                return true;
+            }
+            // 6to4 2002::/16 (embedded IPv4 in bits 16..48)
+            if segs[0] == 0x2002 {
+                let v4 = Ipv4Addr::from(((segs[1] as u32) << 16) | (segs[2] as u32));
+                return is_disallowed_ip(IpAddr::V4(v4));
+            }
+            // Teredo 2001:0000::/32 (tunneled IPv4)
+            if segs[0] == 0x2001 && segs[1] == 0x0000 {
+                return true;
+            }
+            (segs[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (segs[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (segs[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
         }
     }
 }
@@ -63,13 +87,44 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
 /// metadata (169.254.169.254) and any link-local, which a loopback dev server
 /// never legitimately uses.
 fn is_link_local_or_metadata(ip: IpAddr) -> bool {
+    use std::net::Ipv4Addr;
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            if !v6.is_loopback() && !v6.is_unspecified() {
+                if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                    return v4.is_link_local();
+                }
+            }
+            let segs = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96
+            if segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let v4 = Ipv4Addr::from(((segs[6] as u32) << 16) | (segs[7] as u32));
                 return v4.is_link_local();
             }
-            (v6.segments()[0] & 0xffc0) == 0xfe80
+            // NAT64 local-use prefix 64:ff9b:1::/48 (check all RFC 6052 prefix embeddings)
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+                let o = v6.octets();
+                let candidates = [
+                    Ipv4Addr::new(o[6], o[7], o[9], o[10]),
+                    Ipv4Addr::new(o[7], o[9], o[10], o[11]),
+                    Ipv4Addr::new(o[9], o[10], o[11], o[12]),
+                    Ipv4Addr::new(o[12], o[13], o[14], o[15]),
+                ];
+                return candidates.into_iter().any(|v4| v4.is_link_local());
+            }
+            // 6to4 2002::/16
+            if segs[0] == 0x2002 {
+                let v4 = Ipv4Addr::from(((segs[1] as u32) << 16) | (segs[2] as u32));
+                return v4.is_link_local();
+            }
+            // Teredo 2001:0000::/32 (server IPv4 in segs[2..4], XORed client IPv4 in segs[6..8])
+            if segs[0] == 0x2001 && segs[1] == 0x0000 {
+                let server_v4 = Ipv4Addr::from(((segs[2] as u32) << 16) | (segs[3] as u32));
+                let client_v4 = Ipv4Addr::from(!(((segs[6] as u32) << 16) | (segs[7] as u32)));
+                return server_v4.is_link_local() || client_v4.is_link_local();
+            }
+            (segs[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -112,14 +167,16 @@ pub fn check_base_url_syntax(base_url: &str, allow_local: bool) -> Result<(), St
     }
     let url = reqwest::Url::parse(base_url).map_err(|_| "provider base URL is invalid".to_string())?;
     check_scheme_and_creds(&url, allow_local)?;
-    // A bare-IP base URL is still checked syntactically for the obvious internal
-    // literals, so an obviously-bad config fails fast even offline.
-    if let Some(host) = url.host_str() {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if ip_blocked(ip, allow_local) {
-                return Err(format!("provider URL points at a disallowed address ({ip})"));
-            }
+    // A bare-IP base URL (including bracketed IPv6 literals like `[::1]` or `[fe80::1]`)
+    // is checked syntactically via parsed `url.host()`, so obviously-bad configs fail fast offline.
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) if ip_blocked(IpAddr::V4(ip), allow_local) => {
+            return Err(format!("provider URL points at a disallowed address ({ip})"));
         }
+        Some(url::Host::Ipv6(ip)) if ip_blocked(IpAddr::V6(ip), allow_local) => {
+            return Err(format!("provider URL points at a disallowed address ({ip})"));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -348,5 +405,42 @@ mod tests {
         let (host, addrs) = t.pinned.as_ref().expect("a name is held to what it resolved to");
         assert_eq!(host, "localhost");
         assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
+    }
+
+    #[test]
+    fn syntax_check_and_blocklist_catch_bracketed_ipv6_and_transition_ranges() {
+        // Bracketed IPv6 literals must be caught offline at config time.
+        assert!(check_base_url_syntax("https://[::1]:8080", false).is_err());
+        assert!(check_base_url_syntax("http://[::1]:8080", true).is_ok());
+        assert!(check_base_url_syntax("http://[fe80::1]/", true).is_err());
+        assert!(check_base_url_syntax("https://[fe80::1]/", false).is_err());
+        assert!(check_base_url_syntax("http://[::169.254.169.254]/", true).is_err());
+        assert!(check_base_url_syntax("http://[::ffff:169.254.169.254]/", true).is_err());
+        assert!(check_base_url_syntax("http://[64:ff9b::169.254.169.254]/", true).is_err());
+        assert!(check_base_url_syntax("http://[64:ff9b:1::169.254.169.254]/", true).is_err());
+        assert!(check_base_url_syntax("http://[2002:a9fe:a9fe::]/", true).is_err());
+        // Teredo encoding XORed client IPv4 169.254.169.254 -> !0xa9fea9fe = 0x56015601
+        assert!(check_base_url_syntax("http://[2001:0000:0101:0101:0000:0000:5601:5601]/", true).is_err());
+
+        for ip in [
+            "::127.0.0.1",
+            "::169.254.169.254",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b:1::1.1.1.1",
+            "2002:7f00:0001::",
+            "2002:0a00:0001::",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+            "224.0.0.1",
+            "ff02::1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "240.0.0.1",
+        ] {
+            assert!(is_disallowed_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be disallowed");
+        }
+        for ip in ["1.1.1.1", "2606:4700:4700::1111", "64:ff9b::1.1.1.1", "2002:0101:0101::"] {
+            assert!(!is_disallowed_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be allowed");
+        }
     }
 }

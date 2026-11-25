@@ -19,7 +19,7 @@ vi.mock('../../src/sandbox/runner', async (importOriginal) => ({
 import { Agent, sentCodeError } from '../../src/agent/agent';
 import { TOOLS, runTool } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
-import { PACKAGE_NAME, buildPackage } from '../../src/sandbox/pystd/package';
+import { installPythonPackage } from '../../src/sandbox/pystd/package';
 import { Vfs } from '../../src/vfs/vfs';
 import { OPENAI, fakeProvider } from './fakeProvider';
 
@@ -60,8 +60,7 @@ function zipp(): Promise<ZippGlue> {
   glue ??= (async () => {
     const g = (await load(new URL('zipp_wasm.js', ZIPP).href)) as ZippGlue;
     g.initSync({ module: fs.readFileSync(new URL('zipp_wasm_bg.wasm', ZIPP)) });
-    const info = JSON.parse(g.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
-    if (!info.installed.some((p) => p.name === PACKAGE_NAME)) g.addPythonPackage(await buildPackage(info.engineAbi), null);
+    await installPythonPackage(g);
     return g;
   })();
   return glue;
@@ -173,7 +172,7 @@ const codeRun = (vfs: Vfs, input: Record<string, unknown>) => report(vfs, 'code_
 // ---------------------------------------------------------------------------------------------------------------------
 
 describe.skipIf(!HAVE_ZIPP)("code_run's Python, on Zipp's engine, handed the project as code_run hands it", () => {
-  it('has no exec, eval or compile, nor importlib.util or runpy, and code_run says what to do instead', async () => {
+  it('has no exec, eval or compile, nor runpy, and code_run says what to do instead', async () => {
     sandbox.answer = onZipp;
     const vfs = project();
     // Nanbeige's script, as it ran in the user's run
@@ -181,7 +180,7 @@ describe.skipIf(!HAVE_ZIPP)("code_run's Python, on Zipp's engine, handed the pro
     expect(sent.ok).toBe(false);
     expect(sent.stderr).toMatch(/^NameError: name 'exec' is not defined \(__main__\.py:8\)\nTraceback \(most recent call last\):\n {2}File "__main__\.py", line 8, in <module>/);
     expect(sent.hint).toBe(
-      "exec, eval and compile do not exist in this sandbox's Python (nor do importlib.util and runpy), so a script cannot run another file's code from its text. " +
+      "exec, eval and compile do not exist in this sandbox's Python (nor does runpy), so a script cannot run another file's code from its text. " +
         "Import the module instead: code given as text runs at the project's root, where a project file imports by its path (from apps.snake import main loads /apps/snake/main.py; changing sys.path does not change where imports are found). " +
         "Or write the test as a file beside the module, named test_*.py (/apps/snake/test_main.py, which can import main), and run it with code_run's file: its test_ functions run as pytest runs them.",
     );
@@ -190,15 +189,13 @@ describe.skipIf(!HAVE_ZIPP)("code_run's Python, on Zipp's engine, handed the pro
       expect(said.stderr, name).toContain(`NameError: name '${name}' is not defined (__main__.py:1)`);
       expect(said.hint, name).toMatch(/^exec, eval and compile do not exist in this sandbox's Python/);
     }
-    for (const module of ['importlib.util', 'runpy']) {
-      expect((await codeRun(vfs, { code: `import ${module}` })).stderr, module).toContain(`ModuleNotFoundError: No module named '${module}'`);
-    }
+    expect((await codeRun(vfs, { code: 'import runpy' })).stderr, 'runpy').toContain("ModuleNotFoundError: No module named 'runpy'");
     // called in a file of the project, not in the code sent: that file and its line
     vfs.writeFile('/apps/snake/rules.py', 'def score(expr):\n    return eval(expr)\n');
     const inFile = await codeRun(vfs, { code: 'from apps.snake import rules\nrules.score("1 + 2")' });
     expect(inFile.stderr).toContain("NameError: name 'eval' is not defined (apps/snake/rules.py:2)");
     expect(inFile.hint).toBe(
-      "exec, eval and compile do not exist in this sandbox's Python (nor do importlib.util and runpy), and apps/snake/rules.py calls eval on its line 2: write that part without it. " +
+      "exec, eval and compile do not exist in this sandbox's Python (nor does runpy), and apps/snake/rules.py calls eval on its line 2: write that part without it. " +
         "To load another file's code, import it as a module: code given as text runs at the project's root, where a project file imports by its path (from apps.snake import rules loads /apps/snake/rules.py; changing sys.path does not change where imports are found). " +
         "Or write the test as a file beside the module, named test_*.py (/apps/snake/test_rules.py, which can import rules), and run it with code_run's file: its test_ functions run as pytest runs them.",
     );
@@ -208,7 +205,7 @@ describe.skipIf(!HAVE_ZIPP)("code_run's Python, on Zipp's engine, handed the pro
     sandbox.answer = onZipp;
     const vfs = project();
     const description = TOOLS.find((t) => t.name === 'code_run')!.description;
-    expect(description).toContain('no pip, and no exec, eval, compile, importlib.util or runpy');
+    expect(description).toContain('no pip, and no exec, eval, compile or runpy');
     expect(description).toContain('Python `code` runs at the project root, where a project module imports by its path (from apps.game import main loads /apps/game/main.py; sys.path changes nothing)');
     expect(description).toContain('a script run with `file` imports the modules beside it by name, and one named test_*.py runs its test_ functions as pytest does');
     expect(description).not.toContain('no csv module');
@@ -239,7 +236,7 @@ describe('what a run that reached for exec, eval or compile is told', () => {
     sandbox.answer = shellFailedWith("NameError: name 'exec' is not defined (__main__.py:1)\nTraceback (most recent call last):\n  File \"__main__.py\", line 1, in <module>\n    exec(open('apps/snake/main.py').read())");
     const shell = await report(vfs, 'sandbox_shell', { command: `python -c "exec(open('apps/snake/main.py').read())"` });
     expect(shell.hint).toBe(
-      "exec, eval and compile do not exist in this sandbox's Python (nor do importlib.util and runpy), so a script cannot run another file's code from its text. " +
+      "exec, eval and compile do not exist in this sandbox's Python (nor does runpy), so a script cannot run another file's code from its text. " +
         "Import the module instead: python FILE imports the modules beside FILE by name, and python -c imports those of the working folder (cd /apps/snake, then import main); from the project's root a project file imports by its path (from apps.snake import main). " +
         'A file named test_*.py run with python runs its test_ functions as pytest runs them.',
     );

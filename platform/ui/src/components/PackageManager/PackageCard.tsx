@@ -2,6 +2,7 @@
  * PackageCard - Individual package display card
  */
 
+import { Loader2, Package, Trash2 } from 'lucide-react';
 import type { PackageInfo } from '../../hooks/usePackages';
 
 interface PackageCardProps {
@@ -23,11 +24,11 @@ export function PackageCard({
   const getStatusColor = () => {
     switch (pkg.status) {
       case 'running':
-        return 'bg-green-500';
+        return 'bg-signal-green';
       case 'error':
-        return 'bg-red-500';
+        return 'bg-signal-danger';
       case 'updating':
-        return 'bg-yellow-500';
+        return 'bg-signal-amber';
       default:
         return 'bg-content-faint';
     }
@@ -37,75 +38,48 @@ export function PackageCard({
   const getTrustBadge = () => {
     switch (pkg.trustLevel) {
       case 'trusted':
-        return (
-          <span className="px-1.5 py-0.5 text-xs bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-400 rounded">
-            Trusted
-          </span>
-        );
+        return <span className="oaiy-pill ok">Trusted</span>;
       case 'verified':
-        return (
-          <span className="px-1.5 py-0.5 text-xs bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 rounded">
-            Verified
-          </span>
-        );
+        return <span className="oaiy-pill info">Verified</span>;
       case 'blocked':
-        return (
-          <span className="px-1.5 py-0.5 text-xs bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400 rounded">
-            Blocked
-          </span>
-        );
+        return <span className="oaiy-pill err">Blocked</span>;
       default:
-        return (
-          <span className="px-1.5 py-0.5 text-xs bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400 rounded">
-            Untrusted
-          </span>
-        );
+        return <span className="oaiy-pill warn">Untrusted</span>;
     }
   };
 
   return (
-    <div className="p-3 bg-surface-tertiary/60 rounded-lg border border-edge-primary hover:border-edge-strong transition-colors">
+    <div className="p-3 bg-surface-tertiary/60 rounded-[var(--r-ctl)] border border-edge-primary hover:border-edge-strong transition-colors">
       <div className="flex items-start justify-between gap-3">
         {/* Package icon and info */}
         <div className="flex items-start gap-3 flex-1 min-w-0">
           {/* Icon */}
-          <div className="w-10 h-10 rounded-lg bg-accent/15 flex items-center justify-center flex-shrink-0">
-            <svg
-              className="w-5 h-5 text-accent"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-              />
-            </svg>
+          <div className="w-10 h-10 rounded-[var(--r-ctl)] bg-accent/15 flex items-center justify-center shrink-0 text-accent">
+            <Package size={18} aria-hidden="true" />
           </div>
 
           {/* Info */}
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <h3 className="text-sm font-medium text-content-primary truncate">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="m-0 text-sm font-semibold text-content-primary truncate">
                 {pkg.name}
               </h3>
-              <span className="text-xs text-content-secondary">v{pkg.version}</span>
+              <span className="font-mono text-xs text-content-faint">v{pkg.version}</span>
               {getTrustBadge()}
               {/* Status indicator */}
-              <div
-                className={`w-2 h-2 rounded-full ${getStatusColor()}`}
+              <span
+                className={`inline-block w-2 h-2 rounded-full ${getStatusColor()}`}
                 title={pkg.status}
+                aria-label={`Status: ${pkg.status}`}
               />
             </div>
             {pkg.description && (
-              <p className="text-xs text-content-secondary truncate mt-0.5">
+              <p className="m-0 text-xs text-content-secondary truncate mt-0.5">
                 {pkg.description}
               </p>
             )}
             {pkg.author && (
-              <p className="text-xs text-content-secondary truncate mt-0.5">
+              <p className="m-0 text-xs text-content-faint truncate mt-0.5">
                 by {pkg.author}
               </p>
             )}
@@ -113,28 +87,10 @@ export function PackageCard({
         </div>
 
         {/* Actions */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 shrink-0">
           {installing ? (
-            <div className="px-3 py-1.5">
-              <svg
-                className="w-4 h-4 text-accent animate-spin"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <circle
-                  className="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  strokeWidth="4"
-                />
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                />
-              </svg>
+            <div className="px-2 py-1" role="status" aria-label="Installing package">
+              <Loader2 size={16} className="text-accent animate-spin" aria-hidden="true" />
             </div>
           ) : (
             <>
@@ -143,7 +99,7 @@ export function PackageCard({
                 type="button"
                 onClick={onOpen}
                 disabled={disabled || pkg.trustLevel === 'blocked'}
-                className="px-2.5 py-1.5 text-xs font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="btn btn-primary btn-sm"
                 title="Open package"
               >
                 Open
@@ -155,22 +111,10 @@ export function PackageCard({
                 onClick={onUninstall}
                 disabled={disabled || pkg.status === 'running'}
                 aria-label="Uninstall package"
-                className="p-1.5 text-content-secondary hover:text-red-600 dark:hover:text-red-400 hover:bg-red-500/10 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="oaiy-icon-btn sm hover:text-signal-danger-ink hover:bg-signal-danger/10 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="Uninstall package"
               >
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                  />
-                </svg>
+                <Trash2 size={14} aria-hidden="true" />
               </button>
             </>
           )}

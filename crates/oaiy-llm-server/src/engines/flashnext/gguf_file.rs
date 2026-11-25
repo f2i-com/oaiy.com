@@ -14,6 +14,23 @@ use std::{fs::File, path::Path, sync::Arc};
 
 pub(crate) const ARCH: &str = "qwen4exp";
 
+fn pad_hyper_up(up: &[f32], width: usize, rank: usize, writes: usize, name: &str) -> Result<Vec<f32>> {
+    if rank == 0 {
+        return Err(bad(format!("{name}_up.weight has zero rank")));
+    }
+    if up.len() % rank != 0 || up.len() / rank != width {
+        return Err(bad(format!("{name}_up.weight has {} values, not [{width}, {rank}]", up.len())));
+    }
+    let cols = rank.checked_add(writes).ok_or_else(|| bad(format!("{name}: padded rank overflow")))?;
+    let total = width.checked_mul(cols).ok_or_else(|| bad(format!("{name}: padded size overflow")))?;
+    let mut padded = Vec::with_capacity(total);
+    for row in up.chunks_exact(rank) {
+        padded.extend_from_slice(row);
+        padded.extend(std::iter::repeat_n(0.0, writes));
+    }
+    Ok(padded)
+}
+
 /// Whether `path` is a Qwen3.8-Flash-Next GGUF (its first shard).
 pub fn detect(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "gguf") && GgufFile::open_streaming(path).is_ok_and(|g| g.architecture().is_ok_and(|a| a == ARCH))
@@ -208,17 +225,16 @@ pub(crate) fn load(path: &Path, backends: Vec<Arc<dyn Backend>>, quant: QuantMak
     // lays one out: the write logits ride along the down projection, the up projection ignores them
     let hyper = |device: usize, p: &str, site: bool| -> Result<HyperMix> {
         let rank = src.info(&format!("{p}_down.weight"))?.shape.get(1).copied().unwrap_or(0) as usize;
+        if rank == 0 {
+            return Err(bad(format!("{p}_down.weight has zero rank")));
+        }
         let writes = if site { cfg.streams } else { 0 };
         let mut down = src.values(&format!("{p}_down.weight"), &[rank, width])?;
         if site {
             down.extend(src.values(&format!("{p}_inject.weight"), &[cfg.streams, width])?);
         }
         let up = src.values(&format!("{p}_up.weight"), &[width, rank])?;
-        let mut padded = Vec::with_capacity(width * (rank + writes));
-        for row in up.chunks_exact(rank) {
-            padded.extend_from_slice(row);
-            padded.extend(std::iter::repeat_n(0.0, writes));
-        }
+        let padded = pad_hyper_up(&up, width, rank, writes, p)?;
         Ok(HyperMix {
             norm: tensor(device, &format!("{p}_norm.weight"), &[width])?,
             down: backends[device].to_device(Tensor::from_vec(halves(down), vec![rank + writes, width])),
@@ -607,5 +623,13 @@ mod tests {
         eprintln!("unquantized tensors: the least cosine {worst_same:.6}; quantized ones against EXL3's: the least {least:.4}");
         assert!(least > 0.8, "a quantized matrix is not its EXL3 one: cosine {least}");
         Ok(())
+    }
+
+    #[test]
+    fn pad_hyper_up_rejects_zero_rank_and_misaligned_length() {
+        assert!(super::pad_hyper_up(&[1.0, 2.0], 2, 0, 1, "blk.0.hyper").is_err(), "zero rank must fail");
+        assert!(super::pad_hyper_up(&[1.0, 2.0, 3.0], 2, 2, 1, "blk.0.hyper").is_err(), "misaligned len must fail");
+        assert!(super::pad_hyper_up(&[1.0, 2.0, 3.0, 4.0], 3, 2, 1, "blk.0.hyper").is_err(), "width mismatch must fail");
+        assert_eq!(super::pad_hyper_up(&[1.0, 2.0, 3.0, 4.0], 2, 2, 1, "blk.0.hyper").unwrap(), vec![1.0, 2.0, 0.0, 3.0, 4.0, 0.0]);
     }
 }

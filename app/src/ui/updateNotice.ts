@@ -6,6 +6,7 @@
 import { agreeToLeave, leaveGuardBlocks } from '../pwa/leaveGuard';
 import type { UpdateController } from '../pwa/update';
 import { h } from './dom';
+import { icon } from './icons';
 import { confirmAction } from './modal';
 
 /** How long the button stays as "Reloading…" before it can be pressed again (the reload normally comes at once). */
@@ -62,7 +63,7 @@ export function showUpdateNotice(update: UpdateController): void {
           asking = false;
         });
     });
-    const later = h('button.update-later', { type: 'button', title: 'Not now', 'aria-label': 'Not now' }, '×');
+    const later = h('button.update-later', { type: 'button', title: 'Not now', 'aria-label': 'Not now' }, icon('x'));
     later.addEventListener('click', () => {
       dismissed = true;
       remove();

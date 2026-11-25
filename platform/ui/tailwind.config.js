@@ -19,7 +19,7 @@ export default {
     screens: {
       xs: '480px',   // phone portrait
       sm: '640px',
-      md: '760px',   // matches the shell's own 760 rule
+      md: '700px',   // matches the shell's own 700px narrow rule
       lg: '960px',   // matches the shell's 960 rule
       xl: '1240px',  // matches the shell's rail-collapse rule
       '2xl': '1536px',

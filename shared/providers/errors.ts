@@ -20,6 +20,7 @@ export type ConnectionErrorKind =
   | 'not-found'
   | 'server'
   | 'http'
+  | 'redirect'
   | 'network'
   | 'mixed-content'
   | 'invalid-response'
@@ -174,6 +175,8 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
       return `${who} had an error of its own (${status ?? 'server error'}). Try again in a moment.${detail}`;
     case 'http':
       return `${who} answered with an error (${status ?? 'unknown status'}).${detail}`;
+    case 'redirect':
+      return 'The provider answered with a redirect. It is not followed: a request goes only to the address the provider was saved with.';
     case 'mixed-content':
       return `This page is served over HTTPS, and browsers block it from calling a plain http:// address that is not on this computer (${hostOf(context.url)}). For a server on this computer use http://localhost or http://127.0.0.1; for one elsewhere, put it behind HTTPS.`;
     case 'network': {

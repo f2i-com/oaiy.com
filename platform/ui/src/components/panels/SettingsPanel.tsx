@@ -13,7 +13,7 @@
  * under a second name; it is only Services now.
  */
 import { useState, useCallback } from 'react';
-import { Download, KeyRound, Lock, Palette, Server, ShieldCheck, SlidersHorizontal, Tag, Trash2, Upload } from 'lucide-react';
+import { Download, Eye, EyeOff, KeyRound, Lock, Palette, Server, ShieldCheck, SlidersHorizontal, Tag, Trash2, Upload } from 'lucide-react';
 import type { ProjectConstant, ProjectSettings } from 'oaiy-core';
 import { useServices } from '../../hooks/useServices';
 import { AppearanceTab, SecurityTab, ServicesTab } from './settings';
@@ -99,6 +99,15 @@ export default function SettingsPanel({
   const [newApiKeyName, setNewApiKeyName] = useState('');
   const [newApiKeyKey, setNewApiKeyKey] = useState('');
   const [newApiKeyValue, setNewApiKeyValue] = useState('');
+  const [revealedKeys, setRevealedKeys] = useState<Set<string>>(() => new Set());
+  const toggleRevealKey = useCallback((id: string) => {
+    setRevealedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   // How many of the desktop's services run: a count beside Services.
   const { runningCount } = useServices({ autoRefresh: page === 'services', refreshInterval: 3000 });
@@ -317,15 +326,26 @@ export default function SettingsPanel({
                       <span className="oaiy-row-meta font-mono">{constant.key}</span>
                     </div>
                     <input
-                      type="password"
+                      type={revealedKeys.has(constant.id) ? 'text' : 'password'}
                       value={constant.value}
                       onChange={(e) => onUpdateConstant(constant.id, { value: e.target.value })}
                       className="oaiy-input mono inline"
                       placeholder={`Enter ${constant.key}…`}
                       aria-label={`${constant.name} value`}
                     />
+                    <button
+                      type="button"
+                      onClick={() => toggleRevealKey(constant.id)}
+                      className="oaiy-icon-btn"
+                      title={revealedKeys.has(constant.id) ? `Hide ${constant.name}` : `Show ${constant.name}`}
+                      aria-label={revealedKeys.has(constant.id) ? `Hide ${constant.name}` : `Show ${constant.name}`}
+                      aria-pressed={revealedKeys.has(constant.id)}
+                    >
+                      {revealedKeys.has(constant.id) ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
                     {onDeleteConstant && (
                       <button
+                        type="button"
                         onClick={async () => {
                           const ok = await confirm({
                             title: 'Delete API key?',
@@ -393,6 +413,25 @@ export default function SettingsPanel({
                       placeholder="Value"
                       aria-label={`${constant.name} value`}
                     />
+                    {onDeleteConstant && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const ok = await confirm({
+                            title: 'Delete constant?',
+                            message: `"${constant.name}" (${constant.key}) will be removed from this project. Any node that reads {{${constant.key}}} will no longer resolve it.`,
+                            variant: 'danger',
+                            confirmLabel: 'Delete constant',
+                          });
+                          if (ok) onDeleteConstant(constant.id);
+                        }}
+                        className="oaiy-icon-btn"
+                        title={`Delete ${constant.name}`}
+                        aria-label={`Delete ${constant.name}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>

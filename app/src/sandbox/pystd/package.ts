@@ -65,7 +65,7 @@ async function sha256(bytes: Uint8Array): Promise<string> {
 }
 
 /** The package archive, for an engine with this ABI. */
-export async function buildPackage(engineAbi: string): Promise<Uint8Array> {
+export async function buildPackage(engineAbi: string, exclude?: ReadonlySet<string>): Promise<Uint8Array> {
   const encoder = new TextEncoder();
   const parts: Uint8Array[] = [];
   const manifest = ['zipp-python-package 1', `name ${PACKAGE_NAME}`, 'version 1', `engine-abi ${engineAbi}`, 'kernels 0'];
@@ -77,7 +77,10 @@ export async function buildPackage(engineAbi: string): Promise<Uint8Array> {
     return `${at} ${bytes.byteLength} ${await sha256(bytes)}`;
   };
   manifest.push(`runtime runtime.js ${await add(encoder.encode(RUNTIME))}`);
-  for (const m of packageModules()) manifest.push(`module ${m.name} ${m.name}.py ${await add(encoder.encode(m.source))} ${importsField(m.source)}`);
+  for (const m of packageModules()) {
+    if (exclude?.has(m.name)) continue;
+    manifest.push(`module ${m.name} ${m.name}.py ${await add(encoder.encode(m.source))} ${importsField(m.source)}`);
+  }
   manifest.push('end');
   const head = encoder.encode(`${manifest.join('\n')}\n`);
   const out = new Uint8Array(head.byteLength + offset);
@@ -88,4 +91,32 @@ export async function buildPackage(engineAbi: string): Promise<Uint8Array> {
     at += p.byteLength;
   }
   return out;
+}
+
+const ALREADY_PROVIDED_RE = /module [`'"]([A-Za-z0-9_.]+)[`'"] of package [`'"][^`'"]+[`'"] is provided by the engine or another package already/;
+
+/**
+ * Install OAIY's Python package into a Zipp WASM glue instance once.
+ * If a newer Zipp release already provides one of the shimmed modules natively,
+ * exclude that module and retry so upgrades never break Python execution.
+ */
+export async function installPythonPackage(glue: {
+  addPythonPackage: (archive: Uint8Array, kernels: unknown) => string;
+  pythonPackages: () => string;
+}): Promise<void> {
+  const info = JSON.parse(glue.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
+  if (info.installed.some((p) => p.name === PACKAGE_NAME)) return;
+  const modules = packageModules();
+  const excluded = new Set<string>();
+  for (let attempt = 0; attempt <= modules.length; attempt++) {
+    try {
+      glue.addPythonPackage(await buildPackage(info.engineAbi, excluded), null);
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const match = ALREADY_PROVIDED_RE.exec(msg);
+      if (!match || excluded.has(match[1])) throw error;
+      excluded.add(match[1]);
+    }
+  }
 }

@@ -115,7 +115,7 @@ export default function MoreMenu({ label, items }: { label: string; items: MoreI
         createPortal(
           <div
             ref={menu}
-            className="more-menu"
+            className={place ? 'more-menu is-placed' : 'more-menu'}
             role="menu"
             aria-label={label}
             // (measured where it is first, then put in its place: not seen in the corner meanwhile)

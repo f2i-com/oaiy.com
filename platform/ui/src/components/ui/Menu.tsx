@@ -46,17 +46,26 @@ export default function Menu({ open, onClose, anchor, at, align = 'end', label, 
 
   useEffect(() => {
     if (!open) return;
+    const prevFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const items = () => Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('button:not([disabled])') ?? []);
     const raf = requestAnimationFrame(() => items()[0]?.focus());
+    const restoreFocus = () => {
+      if (anchor && anchor.isConnected) {
+        anchor.focus();
+      } else if (prevFocused && prevFocused.isConnected) {
+        prevFocused.focus();
+      }
+    };
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node) && !(anchor && anchor.contains(e.target as Node))) onClose();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); anchor?.focus(); return; }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); restoreFocus(); return; }
       if (e.key === 'Tab') { onClose(); return; }
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
         const list = items();
+        if (list.length === 0) return;
         const i = list.indexOf(document.activeElement as HTMLButtonElement);
         const next = e.key === 'ArrowDown' ? (i + 1) % list.length : (i - 1 + list.length) % list.length;
         list[next]?.focus();

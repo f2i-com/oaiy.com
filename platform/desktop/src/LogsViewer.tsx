@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { X } from 'lucide-react';
 import type { LogLine } from './api';
 
 /**
@@ -92,8 +93,8 @@ export default function LogsViewer({ load, title, onClose }: Props) {
       <div className="logs-header">
         <span className="logs-title">{title}</span>
         {onClose && (
-          <button className="logs-close" onClick={onClose} aria-label="close logs">
-            ✕
+          <button type="button" className="logs-close" onClick={onClose} aria-label="close logs">
+            <X size={13} aria-hidden="true" />
           </button>
         )}
       </div>

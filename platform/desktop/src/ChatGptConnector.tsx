@@ -179,7 +179,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
       )}
 
       {connected && (
-        <p style={{ fontSize: 12.5, opacity: 0.75, margin: 0 }}>
+        <p className="chatgpt-account">
           {status?.email ?? 'Account connected'}
           {status?.planType ? ` · ${status.planType}` : ''}
         </p>
@@ -189,7 +189,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
       {statusError && <p role="alert" className="form-hint">Could not check Codex. <button className="btn-tiny" onClick={() => void refresh()}>Retry status</button></p>}
       {!status && !statusError && <p role="status" className="form-hint">Checking Codex availability…</p>}
       {login && (
-        <div className="datadir-note">
+        <div className="datadir-note datadir-row">
           <span>
             {login.userCode ? (
               <>
@@ -199,7 +199,7 @@ export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
               'Finish the sign-in in your browser.'
             )}
           </span>
-          <span style={{ display: 'flex', gap: 6 }}>
+          <span className="banner-actions">
             {login.userCode && (
               <button
                 className="btn-tiny"

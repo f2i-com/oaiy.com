@@ -43,6 +43,7 @@ var __TypeError = TypeError;
 var __Number = Number;
 var __String = String;
 var __Function = Function;
+var __eval = eval;
 var __isFinite = isFinite;
 var __call = Function.prototype.call;
 var __apply = Function.prototype.apply;
@@ -498,7 +499,7 @@ function __zdom_inline_entry(token, list) {
 function __zdom_run_entry(token, source, name) {
   __assertToken(token);
   try {
-    __watch((0, eval)(source), 'in ' + name);
+    __watch((0, __eval)(source), 'in ' + name);
     return null;
   } catch (error) {
     return (error && error.name ? error.name + ': ' + error.message : __String(error)) + ' (' + name + ')';

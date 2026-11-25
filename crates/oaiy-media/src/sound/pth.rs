@@ -99,6 +99,7 @@ struct Entry {
 const MAX_CD_BYTES: u64 = 64 << 20;
 const MAX_PICKLE_BYTES: u64 = 64 << 20;
 const MAX_PICKLE_NODES: usize = 2_000_000;
+const MAX_PICKLE_CLONE_BYTES: usize = 128 << 20;
 const MAX_PICKLE_DEPTH: usize = 128;
 
 pub struct Pth {
@@ -313,20 +314,43 @@ fn charge_node(budget: &mut usize) -> Result<()> {
     Ok(())
 }
 
-fn clone_budgeted(v: &Value, budget: &mut usize) -> Result<Value> {
+fn charge_bytes(budget: &mut usize, n: usize) -> Result<()> {
+    if n > *budget {
+        return Err(bad("pickle exceeds byte budget"));
+    }
+    *budget -= n;
+    Ok(())
+}
+
+fn clone_budgeted(v: &Value, nodes: &mut usize, bytes: &mut usize) -> Result<Value> {
     let mut work = vec![(v, 0usize)];
     while let Some((cur, depth)) = work.pop() {
         if depth > MAX_PICKLE_DEPTH {
             return Err(bad("pickle nesting too deep"));
         }
-        charge_node(budget)?;
+        charge_node(nodes)?;
         match cur {
+            Value::Str(s) | Value::Global(s) => {
+                charge_bytes(bytes, s.len())?;
+            }
+            Value::Storage { key, .. } => {
+                charge_bytes(bytes, key.len())?;
+            }
+            Value::Tensor { storage, shape, stride, .. } => {
+                let extra = shape
+                    .len()
+                    .saturating_add(stride.len())
+                    .saturating_mul(std::mem::size_of::<usize>());
+                charge_bytes(bytes, storage.len().saturating_add(extra))?;
+            }
             Value::List(xs) | Value::Tuple(xs) => {
+                charge_bytes(bytes, xs.len().saturating_mul(std::mem::size_of::<Value>()))?;
                 for x in xs {
                     work.push((x, depth + 1));
                 }
             }
             Value::Dict(pairs) => {
+                charge_bytes(bytes, pairs.len().saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
                 for (k, val) in pairs {
                     work.push((k, depth + 1));
                     work.push((val, depth + 1));
@@ -359,6 +383,7 @@ fn unpickle(b: &[u8]) -> Result<Value> {
     let mut stack: Vec<(Value, usize)> = Vec::new();
     let mut memo: HashMap<u32, (Value, usize)> = HashMap::new();
     let mut budget = MAX_PICKLE_NODES;
+    let mut byte_budget = MAX_PICKLE_CLONE_BYTES;
     let mut i: usize = 0;
     let take = |i: &mut usize, n: usize| -> Result<&[u8]> {
         let end = i.checked_add(n).ok_or_else(|| bad("truncated pickle"))?;
@@ -402,36 +427,44 @@ fn unpickle(b: &[u8]) -> Result<Value> {
             b'G' => { let v = take(&mut i, 8)?; stack.push((Value::Float(f64::from_be_bytes(v.try_into().unwrap())), 0)); }
             b'X' => {
                 let n = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()) as usize;
-                stack.push((Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()), 0));
+                let raw = take(&mut i, n)?;
+                charge_bytes(&mut byte_budget, raw.len())?;
+                let s = String::from_utf8_lossy(raw).into_owned();
+                charge_bytes(&mut byte_budget, s.len().saturating_sub(raw.len()))?;
+                stack.push((Value::Str(s), 0));
             }
             0x8c => {
                 let n = take(&mut i, 1)?[0] as usize;
-                stack.push((Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()), 0));
+                let raw = take(&mut i, n)?;
+                charge_bytes(&mut byte_budget, raw.len())?;
+                let s = String::from_utf8_lossy(raw).into_owned();
+                charge_bytes(&mut byte_budget, s.len().saturating_sub(raw.len()))?;
+                stack.push((Value::Str(s), 0));
             }
             b'q' => {
                 let k = take(&mut i, 1)?[0] as u32;
                 let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
+                memo.insert(k, (clone_budgeted(top, &mut budget, &mut byte_budget)?, *depth));
             }
             b'r' => {
                 let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
                 let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
+                memo.insert(k, (clone_budgeted(top, &mut budget, &mut byte_budget)?, *depth));
             }
             0x94 => {
                 let k = memo.len() as u32;
                 let (top, depth) = stack.last().ok_or_else(|| bad("empty stack"))?;
-                memo.insert(k, (clone_budgeted(top, &mut budget)?, *depth));
+                memo.insert(k, (clone_budgeted(top, &mut budget, &mut byte_budget)?, *depth));
             }
             b'h' => {
                 let k = take(&mut i, 1)?[0] as u32;
                 let (val, depth) = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
-                stack.push((clone_budgeted(val, &mut budget)?, *depth));
+                stack.push((clone_budgeted(val, &mut budget, &mut byte_budget)?, *depth));
             }
             b'j' => {
                 let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
                 let (val, depth) = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
-                stack.push((clone_budgeted(val, &mut budget)?, *depth));
+                stack.push((clone_budgeted(val, &mut budget, &mut byte_budget)?, *depth));
             }
             b't' => {
                 let items = pop_mark(&mut stack)?;
@@ -531,6 +564,7 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                 let Value::Tuple(t) = &pid else { return Err(bad("bad persistent id")) };
                 match t.as_slice() {
                     [Value::Str(kind), Value::Global(storage), Value::Str(key), ..] if kind == "storage" => {
+                        charge_bytes(&mut byte_budget, key.len())?;
                         stack.push((Value::Storage { key: key.clone(), dtype: storage_dtype(storage)? }, 0));
                     }
                     _ => return Err(bad("unsupported persistent id")),
@@ -561,6 +595,7 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                             if shape.len() != stride.len() {
                                 return Err(bad("tensor shape/stride length mismatch"));
                             }
+                            charge_bytes(&mut byte_budget, key.len())?;
                             Value::Tensor {
                                 storage: key.clone(),
                                 dtype: *dtype,
@@ -645,6 +680,25 @@ mod tests {
         at_limit.resize(at_limit.len() + MAX_PICKLE_DEPTH, 0x85);
         at_limit.push(b'.');
         assert!(unpickle(&at_limit).is_ok(), "nesting at MAX_PICKLE_DEPTH should succeed");
+    }
+
+    #[test]
+    fn pickle_rejects_memo_string_clone_oom_bomb() {
+        // Store a 1 MiB string in memo slot 0, then clone it 200 times via BINGET (h 0) into a tuple.
+        // Total node count is tiny (~210 << MAX_PICKLE_NODES), but total cloned bytes (~201 MiB)
+        // exceeds MAX_PICKLE_CLONE_BYTES (128 MiB) and must fail cleanly before OOMing.
+        let payload_len: u32 = 1 << 20;
+        let mut bomb = Vec::with_capacity(payload_len as usize + 512);
+        bomb.extend_from_slice(&[0x80, 2, b'(', b'X']);
+        bomb.extend_from_slice(&payload_len.to_le_bytes());
+        bomb.resize(bomb.len() + payload_len as usize, b'a');
+        bomb.extend_from_slice(&[b'q', 0]);
+        for _ in 0..200 {
+            bomb.extend_from_slice(&[b'h', 0]);
+        }
+        bomb.extend_from_slice(&[b't', b'.']);
+        let err = unpickle(&bomb).expect_err("memo string clone bomb must fail");
+        assert!(err.to_string().contains("byte budget"), "{err}");
     }
 
     #[test]

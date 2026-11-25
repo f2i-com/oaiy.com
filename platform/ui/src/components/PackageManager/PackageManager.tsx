@@ -4,7 +4,8 @@
  * Lists installed packages, allows opening, installing, and uninstalling.
  */
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useRef } from 'react';
+import { ChevronDown, ChevronLeft, ChevronRight, Loader2, Package, Plus, Search, X } from 'lucide-react';
 import { usePackages, type PackageInstallLimits } from '../../hooks/usePackages';
 import { open } from '@tauri-apps/plugin-dialog';
 import { PackageCard } from './PackageCard';
@@ -40,6 +41,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
   const [expanded, setExpanded] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const confirm = useConfirmDialog();
 
   // Trust dialog state
@@ -200,81 +202,46 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
   const header = (
     <button
       type="button"
-      className="flex items-center justify-between w-full px-3 py-2 text-left hover:bg-surface-tertiary rounded-lg transition-colors"
+      className="flex items-center justify-between w-full px-3 py-2 text-left hover:bg-surface-tertiary rounded-[var(--r-card)] transition-colors"
       onClick={() => setExpanded(!expanded)}
       disabled={disabled}
       aria-expanded={expanded}
     >
       <div className="flex items-center gap-2">
-        <svg
-          className="w-4 h-4 text-accent"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={2}
-            d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-          />
-        </svg>
-        <span className="text-sm font-medium text-content-primary">Packages</span>
+        <Package size={15} className="text-accent shrink-0" aria-hidden="true" />
+        <span className="text-[13px] font-semibold text-content-primary">Packages</span>
         {installedCount > 0 && (
-          <span className="px-1.5 py-0.5 text-xs font-medium bg-accent/15 text-accent rounded">
-            {installedCount}
-          </span>
+          <span className="oaiy-pill accent">{installedCount}</span>
         )}
       </div>
-      <svg
-        className={`w-4 h-4 text-content-secondary transition-transform ${
-          expanded ? 'rotate-180' : ''
-        }`}
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M19 9l-7 7-7-7"
-        />
-      </svg>
+      <ChevronDown
+        size={15}
+        className={`text-content-faint transition-transform ${expanded ? 'rotate-180' : ''}`}
+        aria-hidden="true"
+      />
     </button>
   );
 
   if (!expanded) {
     return (
-      <div className="bg-surface-secondary rounded-xl border border-edge-primary">
+      <div className="bg-surface-secondary rounded-[var(--r-card)] border border-edge-primary">
         {header}
       </div>
     );
   }
 
   return (
-    <div className="bg-surface-secondary rounded-xl border border-edge-primary">
+    <div className="bg-surface-secondary rounded-[var(--r-card)] border border-edge-primary">
       {header}
 
       <div className="px-3 pb-3 space-y-3">
         {/* Search and Add */}
-        <div className="flex gap-2">
-          <div className="relative flex-1">
-            <svg
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-content-secondary"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-              />
-            </svg>
+        <div className="flex items-center gap-2">
+          <div className="oaiy-search flex-1">
+            <Search size={14} />
             <input
-              type="text"
+              ref={searchInputRef}
+              type="search"
               placeholder="Search packages"
               aria-label="Search packages by name, ID, or description"
               value={searchQuery}
@@ -282,89 +249,64 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                 setSearchQuery(e.target.value);
                 setCurrentPage(1);
               }}
-              className="w-full pl-8 pr-3 py-1.5 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
+              onKeyDown={(e) => {
+                if (e.key === 'Escape' && searchQuery) {
+                  e.stopPropagation();
+                  setSearchQuery('');
+                  setCurrentPage(1);
+                }
+              }}
+              className="oaiy-input oaiy-input-sm"
             />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  setCurrentPage(1);
+                  searchInputRef.current?.focus();
+                }}
+                aria-label="Clear search"
+              >
+                <X size={13} />
+              </button>
+            )}
           </div>
           <button
             type="button"
             onClick={handleBrowsePackage}
             disabled={disabled}
             aria-label="Install package"
-            className="px-3 py-1.5 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+            className="btn btn-primary btn-sm"
           >
-            <svg
-              className="w-4 h-4"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 4v16m8-8H4"
-              />
-            </svg>
+            <Plus size={14} aria-hidden="true" />
             Install
           </button>
         </div>
 
         {/* Error display */}
         {error && (
-          <div className="oaiy-banner err">
+          <div className="oaiy-banner">
             <span className="flex-1">{error}</span>
           </div>
         )}
 
         {/* Loading state */}
         {loading ? (
-          <div className="flex items-center justify-center py-8">
-            <svg
-              className="w-6 h-6 text-accent animate-spin"
-              fill="none"
-              viewBox="0 0 24 24"
-            >
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="4"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-              />
-            </svg>
+          <div className="flex items-center justify-center py-8" role="status" aria-label="Loading packages">
+            <Loader2 size={20} className="text-accent animate-spin" aria-hidden="true" />
           </div>
         ) : packages.length === 0 ? (
-          <div className="text-center py-8 text-content-secondary text-sm">
-            <svg
-              className="w-12 h-12 mx-auto mb-3 text-content-faint"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.5}
-                d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-              />
-            </svg>
-            <p>No packages installed</p>
-            <p className="text-xs text-content-secondary mt-1">
-              Click "Install" to add a .oaiy package
-            </p>
+          <div className="oaiy-empty bare py-6">
+            <Package size={24} aria-hidden="true" />
+            <p className="oaiy-empty-title">No packages installed</p>
+            <p className="oaiy-empty-text">Click Install to add a .oaiy package.</p>
           </div>
         ) : filteredPackages.length === 0 ? (
-          <div className="text-center py-8 text-content-secondary text-sm">
-            <p>No packages match "{searchQuery.trim()}"</p>
-            <p className="text-xs text-content-secondary mt-1">
-              Try a different search term
-            </p>
+          <div className="oaiy-empty bare py-6">
+            <Search size={20} aria-hidden="true" />
+            <p className="oaiy-empty-title">No packages match &ldquo;{searchQuery.trim()}&rdquo;</p>
+            <p className="oaiy-empty-text">Try a different search term.</p>
           </div>
         ) : (
           <>
@@ -390,25 +332,13 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                   onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
                   disabled={safePage === 1}
                   aria-label="Previous page"
-                  className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="oaiy-icon-btn sm disabled:opacity-40 disabled:cursor-not-allowed"
                 >
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M15 19l-7-7 7-7"
-                    />
-                  </svg>
+                  <ChevronLeft size={15} aria-hidden="true" />
                 </button>
                 <span
                   aria-current="page"
-                  className="text-xs text-content-secondary"
+                  className="font-mono text-xs text-content-faint"
                 >
                   {safePage} / {totalPages}
                 </span>
@@ -419,21 +349,9 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                   }
                   disabled={safePage === totalPages}
                   aria-label="Next page"
-                  className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="oaiy-icon-btn sm disabled:opacity-40 disabled:cursor-not-allowed"
                 >
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M9 5l7 7-7 7"
-                    />
-                  </svg>
+                  <ChevronRight size={15} aria-hidden="true" />
                 </button>
               </div>
             )}

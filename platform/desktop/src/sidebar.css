@@ -72,7 +72,7 @@
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 2px 4px 8px;
+  padding: 2px 4px 16px;
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
   /* (a window so short that they scroll: the last row fades into Settings, so there is plainly more) */
@@ -125,12 +125,19 @@
 .sidebar nav button:focus-visible,
 .sidebar .settings:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 
-/* The page that is open: a tinted row, its icon in the primary colour, and a short bar at its edge. */
+/* The page that is open: crisp border + inset highlight in Prism Lab, framed paper tab with hard offset in Paper Circuit. */
 .sidebar nav button.active,
 .sidebar .settings.active {
   background: var(--primary-soft);
   color: var(--text);
   font-weight: 620;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 28%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+:root[data-theme='light'] .sidebar nav button.active,
+:root[data-theme='light'] .sidebar .settings.active {
+  background: var(--surface-raised);
+  color: var(--primary-text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 34%, var(--border)), 2px 2px 0 rgba(36, 87, 230, 0.11);
 }
 .sidebar nav button.active > svg,
 .sidebar .settings.active > svg { color: var(--primary); }
@@ -186,20 +193,24 @@
   padding: 0;
   transform: translateY(-50%);
 }
-.sidebar nav .nav-toggle > svg { width: 15px; height: 15px; transition: transform 0.16s ease; }
+.sidebar nav .nav-toggle > svg { width: 15px; height: 15px; transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .sidebar nav .nav-toggle:hover { background: var(--surface-raised); color: var(--text); }
 .sidebar nav .nav-sub:not(.is-expanded) .nav-toggle > svg { transform: rotate(-90deg); }
 /* Open, with one of its pages on: the page is marked, its entry only brightens. */
-.sidebar nav .nav-sub.is-expanded .nav-parent.active { background: transparent; color: var(--text); font-weight: 620; }
+.sidebar nav .nav-sub.is-expanded .nav-parent.active { background: transparent; color: var(--text); font-weight: 620; box-shadow: none; }
 .sidebar nav .nav-sub.is-expanded .nav-parent.active::before { display: none; }
 
 .sidebar nav .nav-children {
   display: none;
   flex-direction: column;
   gap: 1px;
-  margin: 0 0 4px 18px;
-  border-left: 1px solid var(--border);
+  margin: 2px 0 4px 18px;
+  border-left: 1.5px solid color-mix(in srgb, var(--primary) 22%, var(--border));
   padding-left: 8px;
+  transition: border-color 0.16s ease;
+}
+.sidebar nav .nav-sub.has-active .nav-children {
+  border-left-color: color-mix(in srgb, var(--primary) 45%, var(--border));
 }
 .sidebar nav .nav-sub.is-expanded .nav-children { display: flex; }
 .sidebar nav .nav-children > .nav-child { min-height: 30px; gap: 9px; padding: 0 9px; font-size: 12.5px; }
@@ -230,8 +241,7 @@
 
 /* ---- whether OAIY is answering, then Settings: fixed at the bottom ----------------- */
 
-/* A dot and a word or two ("Running", "Not answering"), a row like the sections' but quieter: it is a state, and
-   opens Services. The hairline that closes the sections is above it. */
+/* A tinted status pill ("Running", "Not answering") above Settings, opening Services. */
 .sidebar .api-status {
   position: relative;
   display: flex;
@@ -239,23 +249,23 @@
   min-height: 30px;
   flex: none;
   align-items: center;
-  gap: 10px;
-  margin-top: 6px;
-  border: 0;
+  gap: 9px;
+  margin: 10px 0 4px;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: transparent;
-  color: var(--faint);
+  background: var(--surface-soft);
+  color: var(--muted);
   padding: 0 10px;
   font-size: 12px;
-  font-weight: 520;
+  font-weight: 560;
   text-align: left;
-  transition: background 0.12s, color 0.12s;
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
 }
 .sidebar .api-status::after {
   position: absolute;
-  top: -4px;
-  right: 6px;
-  left: 6px;
+  top: -7px;
+  right: 4px;
+  left: 4px;
   height: 1px;
   background: var(--border);
   content: '';
@@ -271,10 +281,33 @@
   box-shadow: 0 0 0 3px var(--green-soft);
 }
 .sidebar .api-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar .api-status:hover { background: var(--surface-soft); color: var(--text); }
+.sidebar .api-status.is-up {
+  border-color: color-mix(in srgb, var(--green) 26%, var(--border));
+  background: color-mix(in srgb, var(--green-soft) 68%, transparent);
+  color: var(--text);
+}
+.sidebar .api-status.is-up:hover {
+  border-color: color-mix(in srgb, var(--green) 48%, var(--border));
+  background: var(--green-soft);
+}
+.sidebar .api-status:hover { background: var(--surface-raised); color: var(--text); }
 .sidebar .api-status:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
-.sidebar .api-status.is-down { color: var(--danger); font-weight: 620; }
+.sidebar .api-status.is-down {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 620;
+}
+.sidebar .api-status.is-down:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+}
 .sidebar .api-status.is-down > i { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.sidebar .api-status.is-pending {
+  border-color: color-mix(in srgb, var(--primary) 26%, var(--border));
+  background: var(--primary-soft);
+  color: var(--primary-text);
+}
 .sidebar .api-status.is-pending > i {
   background: var(--primary);
   box-shadow: 0 0 0 3px var(--primary-soft);
@@ -309,7 +342,7 @@
     .sidebar nav button > span,
     .sidebar .api-status > span,
     .sidebar .settings > span { display: none; }
-    .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 8px; }
+    .sidebar nav { width: 54px; align-items: center; margin: 0 -6px; padding: 2px 6px 16px; }
     .sidebar .settings { width: 42px; }
     /* (the dot alone: "OAIY is running" is its name and its tooltip) */
     .sidebar .api-status { width: 42px; min-height: 30px; justify-content: center; padding: 0; }

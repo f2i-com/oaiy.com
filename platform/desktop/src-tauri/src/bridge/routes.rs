@@ -962,16 +962,25 @@ async fn finish_run(
             )
         }
     };
-    // Only the worker holding the claim finishes the run: anyone who could write runs could finish any, this
-    // desktop's own in the middle of running it, with an answer of their own.
+    // Only the worker holding the claim finishes the run: verify `claimed_by` and finish atomically
+    // under the SAME ledger lock so a worker claiming the run in between cannot have it hijacked.
     let worker = body.worker.clone().unwrap_or_else(|| "oaiy-desktop".into());
-    let holder = { st.ledger.lock().ok().and_then(|l| l.get(&id)).and_then(|r| r.claimed_by) };
-    if let Some(holder) = holder.filter(|h| *h != worker) {
-        return bridge_error(StatusCode::CONFLICT, "invalid_request", format!("run {id} is claimed by {holder}, not {worker}: only its claimer finishes it"));
-    }
     // (on a blocking thread, as reserving is: finishing writes the journal and syncs it)
     let ledger = st.ledger.clone();
-    let finished = tokio::task::spawn_blocking(move || ledger.lock().map(|mut l| l.finish(&id, status, body.output, body.error)).map_err(|_| ())).await;
+    let finished = tokio::task::spawn_blocking(move || {
+        ledger
+            .lock()
+            .map(|mut l| {
+                if let Some(holder) = l.get(&id).and_then(|r| r.claimed_by).filter(|h| *h != worker) {
+                    return Err(format!(
+                        "run {id} is claimed by {holder}, not {worker}: only its claimer finishes it"
+                    ));
+                }
+                l.finish(&id, status, body.output, body.error)
+            })
+            .map_err(|_| ())
+    })
+    .await;
     let Ok(Ok(finished)) = finished else {
         return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "run ledger lock poisoned".into());
     };
@@ -3380,6 +3389,69 @@ done
             // 5. In-process Desk call from dashboard principal CAN use oaiy-agent.
             let (s, b) = read(create_run(State(st.clone()), axum::http::HeaderMap::new(), None, Some(axum::Extension(dash_desk)), Some(axum::Extension(in_proc_info)), Json(agent_body("k8"))).await).await;
             assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+
+        #[tokio::test]
+        async fn finish_run_rechecks_claim_holder_atomically_under_lock() {
+            let (_sb, st) = release_state("finish-toctou", Publishers::default());
+            let run_id = reserve(&st, "toctou-1", "greeting", None, json!({ "n": 1 }));
+
+            // Hold the ledger lock while spawning a finish_run request from `worker-b` for a
+            // currently-Queued run, then claim the run as `worker-a` before releasing the lock.
+            let guard = st.ledger.lock().unwrap();
+            let st_clone = st.clone();
+            let id_clone = run_id.clone();
+            let finish_b = tokio::spawn(async move {
+                read(
+                    finish_run(
+                        State(st_clone),
+                        Path(id_clone),
+                        Json(FinishBody {
+                            status: "succeeded".into(),
+                            output: Some(json!({ "hijacked": true })),
+                            error: None,
+                            worker: Some("worker-b".into()),
+                        }),
+                    )
+                    .await,
+                )
+                .await
+            });
+            // Let finish_b reach the ledger lock wait, then claim under the held lock.
+            tokio::task::yield_now().await;
+            let mut guard = guard;
+            let claimed = guard.claim(&run_id, crate::bridge::ledger::Runtime::Browser, "worker-a");
+            assert!(matches!(claimed, crate::bridge::ledger::ClaimOutcome::Claimed(_)));
+            drop(guard);
+
+            let (status, body) = finish_b.await.unwrap();
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap_or("").contains("worker-a"),
+                "conflict must report actual claim holder: {body}"
+            );
+
+            // Run must still be Running under worker-a, and worker-a can finish it cleanly.
+            let rec = st.ledger.lock().unwrap().get(&run_id).unwrap();
+            assert_eq!(rec.status, RunStatus::Running);
+            assert_eq!(rec.claimed_by.as_deref(), Some("worker-a"));
+
+            let (status, body) = read(
+                finish_run(
+                    State(st.clone()),
+                    Path(run_id.clone()),
+                    Json(FinishBody {
+                        status: "succeeded".into(),
+                        output: Some(json!({ "ok": true })),
+                        error: None,
+                        worker: Some("worker-a".into()),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(st.ledger.lock().unwrap().get(&run_id).unwrap().status, RunStatus::Succeeded);
         }
     }
 }

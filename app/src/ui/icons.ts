@@ -90,6 +90,10 @@ const ICONS: Record<string, { shapes: Shape[]; fill?: boolean }> = {
   plus: { shapes: [['line', 12, 5, 12, 19], ['line', 5, 12, 19, 12]] },
   wrap: { shapes: [['line', 3, 6, 21, 6], ['path', 'M3 12h15a3 3 0 1 1 0 6h-4'], ['polyline', '16 16 14 18 16 20'], ['line', 3, 18, 10, 18]] },
   undo: { shapes: [['path', 'M3 7v6h6'], ['path', 'M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13']] },
+  'panel-left': { shapes: [['rect', 3, 3, 18, 18, 2], ['line', 9, 3, 9, 21]] },
+  download: { shapes: [['path', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'], ['polyline', '7 10 12 15 17 10'], ['line', 12, 15, 12, 3]] },
+  upload: { shapes: [['path', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'], ['polyline', '17 8 12 3 7 8'], ['line', 12, 3, 12, 15]] },
+  play: { shapes: [['polygon', '6 4 20 12 6 20 6 4']], fill: true },
 };
 
 const NS = 'http://www.w3.org/2000/svg';

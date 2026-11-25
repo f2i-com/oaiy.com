@@ -118,6 +118,55 @@ describe('listing models', () => {
       (e) => e.name === 'ProviderConnectionError' && e.kind === 'network',
     );
   });
+
+  it('local servers never fall back to /api/tags when /models redirects or hits RedirectRefused / BudgetExhausted', async () => {
+    const tags = { models: [{ name: 'llama3:8b' }] };
+
+    // Direct HTTP 302 on /v1/models
+    const httpRedirect = fakeFetch({
+      'http://localhost:11434/v1/models': new Response(null, { status: 302, headers: { location: 'https://evil.example/' } }),
+      'http://localhost:11434/api/tags': tags,
+    });
+    await assert.rejects(
+      M.listModels({ type: 'local', serverKind: 'ollama', apiKey: '', baseUrl: 'http://localhost:11434' }, { fetchImpl: httpRedirect.impl, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && e.kind === 'redirect',
+    );
+    assert.deepEqual(httpRedirect.calls.map((c) => c.url), ['http://localhost:11434/v1/models'], 'must not probe /api/tags after 302');
+
+    // RedirectRefused thrown by a guarded fetch implementation
+    const redirectErr = Object.assign(new Error('The provider answered with a redirect.'), { name: 'RedirectRefused' });
+    const guardedRedirect = fakeFetch({
+      'http://localhost:11434/v1/models': redirectErr,
+      'http://localhost:11434/api/tags': tags,
+    });
+    await assert.rejects(
+      M.listRecordModels({ dialect: 'openai', baseUrl: 'http://localhost:11434/v1', auth: 'bearer', kind: 'local-server', preset: 'local-server', serverKind: 'ollama' }, '', { fetchImpl: guardedRedirect.impl, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && e.kind === 'redirect',
+    );
+    assert.deepEqual(guardedRedirect.calls.map((c) => c.url), ['http://localhost:11434/v1/models'], 'must not probe /api/tags after RedirectRefused');
+
+    // BudgetExhausted thrown by a guarded fetch implementation
+    const budgetErr = Object.assign(new Error('Budget exhausted'), { name: 'BudgetExhausted' });
+    const guardedBudget = fakeFetch({
+      'http://localhost:11434/v1/models': budgetErr,
+      'http://localhost:11434/api/tags': tags,
+    });
+    await assert.rejects(
+      M.listRecordModels({ dialect: 'openai', baseUrl: 'http://localhost:11434/v1', auth: 'bearer', kind: 'local-server', preset: 'local-server', serverKind: 'ollama' }, '', { fetchImpl: guardedBudget.impl, page: PAGE }),
+      (e) => e === budgetErr && e.name === 'BudgetExhausted',
+    );
+    assert.deepEqual(guardedBudget.calls.map((c) => c.url), ['http://localhost:11434/v1/models'], 'must not probe /api/tags after BudgetExhausted');
+
+    // Redirect on the /api/tags fallback itself surfaces as redirect, not masked as 404
+    const fallbackRedirect = fakeFetch({
+      'http://localhost:11434/v1/models': json({}, 404),
+      'http://localhost:11434/api/tags': new Response(null, { status: 307, headers: { location: 'https://evil.example/' } }),
+    });
+    await assert.rejects(
+      M.listModels({ type: 'local', serverKind: 'ollama', apiKey: '', baseUrl: 'http://localhost:11434' }, { fetchImpl: fallbackRedirect.impl, page: PAGE }),
+      (e) => e.name === 'ProviderConnectionError' && e.kind === 'redirect',
+    );
+  });
 });
 
 describe('the same walk for a record and its key', () => {

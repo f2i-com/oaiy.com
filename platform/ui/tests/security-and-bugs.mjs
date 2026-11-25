@@ -57,8 +57,10 @@ export default function Dialog({ children }) { return createElement('div', { 'da
 const aliases = {
   name: 'oaiy-test-aliases',
   setup(build) {
-    build.onResolve({ filter: /^\.\/Dialog$/ }, (a) => (
-      a.importer.endsWith('RunWorkflowModal.tsx') ? { path: 'dialog-ui', namespace: 'stub' } : null
+    build.onResolve({ filter: /^(?:\.\/|\.\.\/ui\/)Dialog$/ }, (a) => (
+      a.importer.endsWith('RunWorkflowModal.tsx') || a.importer.endsWith('TrustDialog.tsx')
+        ? { path: 'dialog-ui', namespace: 'stub' }
+        : null
     ));
     build.onLoad({ filter: /^dialog-ui$/, namespace: 'stub' }, () => ({ contents: dialogUiStub, loader: 'js', resolveDir: UI }));
     build.onResolve({ filter: /^oaiy-ui-components$/ }, () => ({ path: 'oaiy-ui-components', namespace: 'stub' }));
@@ -133,6 +135,8 @@ export { normalizeSql } from './src/tauri-shim/sql.ts';
 export { PermissionRequestQueue } from './src/lib/permissionQueue.ts';
 export { default as RunWorkflowModal } from './src/components/ui/RunWorkflowModal.tsx';
 export { QuickConnectPopup } from './src/components/OAIYBuilder/QuickConnectPopup.tsx';
+export { TrustDialog } from './src/components/PackageManager/TrustDialog.tsx';
+export { parseConnectorConfig, ConnectorConfigError } from './src/connector-module/config.ts';
 export { forgetPageHost } from '@oaiy/shared/capabilities/host';
 export { createElement } from 'react';
 export { renderToStaticMarkup } from 'react-dom/server';
@@ -2495,6 +2499,333 @@ await check('35. Wave-4: core-ai extractVideoFrames guards, contractRuntime cach
   assert.ok(audioSrc.includes('redactMediaToken(audioUrl)'), 'core-audio must redact media token in TTS Media URL log');
   const regSrc = fs.readFileSync(path.join(UI, 'src/services/customNodeRegistry.ts'), 'utf8');
   assert.ok(regSrc.includes('moduleLoader.unloadModule(moduleId)'), 'customNodeRegistry.unregisterPackageNodes must unload ModuleLoader modules');
+});
+
+// ---------------------------------------------------------------------------
+// Wave-5 Security, AST Sandbox, Core & UI/UX Regressions
+// ---------------------------------------------------------------------------
+
+await check('36. Wave-5: detectSandboxEscape blocks destructured/aliased/computed constructor, ClassExpression, TaggedTemplate & sequence arrows', () => {
+  // ObjectPattern destructuring (static Identifier, string literal, computed literal, template, params, assignment)
+  const blockedPatterns = [
+    'const { constructor: F } = () => {};',
+    'const { "constructor": F } = () => {};',
+    'const { ["constructor"]: F } = () => {};',
+    'const { [`constructor`]: F } = () => {};',
+    'const { [(0, "constructor")]: F } = () => {};',
+    'function leak({ constructor: F }) { return F; }',
+    'const leak = ({ ["constructor"]: F }) => F;',
+    'let F; ({ constructor: F } = () => {});',
+    'let F; ([{ ["constructor"]: F }] = [() => {}]);',
+    'const { __proto__: P } = {};',
+    // SequenceExpression & ClassExpression & aliased MemberExpression
+    'const x = (0, () => {}).constructor("return this")();',
+    'const x = (0, a.constructor).constructor("return this")();',
+    'const x = (class {}).constructor("return this")();',
+    'const f = () => {}; const x = f.constructor("return this")();',
+    'const c = ({}).constructor; const x = c.constructor;',
+    'const x = obj["constructor"];',
+    'const x = obj[`constructor`];',
+    'const x = obj[(0, "constructor")];',
+    'const x = obj.__proto__;',
+    // TaggedTemplateExpression
+    'const x = (function(){ return this; })``;',
+    'const x = (0, function(){ return this; })``;',
+    'const x = (() => 1)``;',
+    'const x = Function`return this`;',
+    'const x = eval`1`;',
+    // SequenceExpression arrow body returning this
+    'const x = () => (0, this);',
+    'const x = () => (foo(), bar(), this);',
+  ];
+  for (const code of blockedPatterns) {
+    assert.ok(M.detectSandboxEscape(code), `expected sandbox escape detection for: ${code}`);
+  }
+  // Specific labels preserved for chain/tagged/arrow patterns
+  assert.equal(M.detectSandboxEscape('const x = (class {}).constructor("return this")();'), 'constructor.constructor chain');
+  assert.equal(M.detectSandboxEscape('const x = (0, () => {}).constructor("return this")();'), 'constructor.constructor chain');
+  assert.equal(M.detectSandboxEscape('const x = (function(){ return this; })``;'), '(function(){return this})()');
+  assert.equal(M.detectSandboxEscape('const x = () => (0, this);'), '() => this arrow');
+
+  // Legitimate workflow code remains permitted
+  assert.equal(
+    M.detectSandboxEscape('const { name, count } = input; let total = count / 2; const fn = (a, b) => a + b; return await Foo.run(name, fn(total, 1));'),
+    null,
+  );
+});
+
+await check('37. Wave-5: executeSubflow refuses cross-package pkg:* nodes even when currentPackageId is already set', async () => {
+  const mkRuntime = async (registry) => {
+    const rt = new M.OAIYRuntime({ useWorkerForUntrusted: false });
+    rt.setFlowContext('flow-a', 'pkgA');
+    rt.setPackagePermissions(['network']);
+    if (registry) rt.setModuleRegistry(registry);
+    await rt.registerDynamicModule({
+      manifest: { id: 'core-flow-control', name: 'Subflow', version: '1.0.0', nodes: [] },
+      runtime: M.SubflowRuntime,
+    });
+    return rt;
+  };
+
+  // Direct cross-package node inside a subflow with no flow.packageId
+  const rt1 = await mkRuntime();
+  rt1.setAvailableFlows([
+    {
+      id: 'sneaky-sub',
+      name: 'Sneaky',
+      createdAt: '',
+      updatedAt: '',
+      graph: { nodes: [{ id: 'n1', type: 'pkg:pkgB:steal', position: { x: 0, y: 0 }, data: {} }], edges: [] },
+    },
+    {
+      id: 'wrapper-sub',
+      name: 'Wrapper',
+      createdAt: '',
+      updatedAt: '',
+      graph: { nodes: [{ id: 's1', type: 'subflow', position: { x: 0, y: 0 }, data: { flowId: 'sneaky-sub' } }], edges: [] },
+    },
+  ]);
+  await assert.rejects(
+    () => rt1.executeScript('return await Subflow.execute("sneaky-sub", {});'),
+    /cross-package node/,
+    'direct cross-package pkg:pkgB:* node must be rejected under pkgA',
+  );
+  await assert.rejects(
+    () => rt1.executeScript('return await Subflow.execute("wrapper-sub", {});'),
+    /cross-package node/,
+    'nested cross-package pkg:pkgB:* node must be rejected under pkgA',
+  );
+
+  // Authoritative packageId mismatch via moduleRegistry even if node prefix spoofs pkgA
+  const spoofReg = {
+    getNodeDefinition: () => ({ id: 'pkg:pkgA:spoof', name: 'Spoof', inputs: [], outputs: [{ id: 'out', name: 'out', type: 'string' }], compiler: {} }),
+    getModuleForNode: () => ({
+      path: 'package:pkgB/nodes',
+      compiler: { name: 'PkgB', getNodeTypes: () => ['pkg:pkgA:spoof'], compileNode: (_t, c) => `let ${c.outputVar} = 1;` },
+      manifest: { id: 'pkgB' },
+    }),
+    getCompiler: () => ({ name: 'PkgB', getNodeTypes: () => ['pkg:pkgA:spoof'], compileNode: (_t, c) => `let ${c.outputVar} = 1;` }),
+    getAllNodeDefinitions: () => [],
+    getAllModules: () => [],
+  };
+  const rt2 = await mkRuntime(spoofReg);
+  rt2.setAvailableFlows([
+    {
+      id: 'spoof-sub',
+      name: 'SpoofSub',
+      createdAt: '',
+      updatedAt: '',
+      graph: { nodes: [{ id: 'n1', type: 'pkg:pkgA:spoof', position: { x: 0, y: 0 }, data: {} }], edges: [] },
+    },
+  ]);
+  await assert.rejects(
+    () => rt2.executeScript('return await Subflow.execute("spoof-sub", {});'),
+    /cross-package node/,
+    'authoritative module path mismatch must be rejected',
+  );
+
+  // Same-package node (pkgA calling pkg:pkgA:own) stays allowed
+  const ownReg = {
+    getNodeDefinition: () => ({ id: 'pkg:pkgA:own', name: 'Own', inputs: [], outputs: [{ id: 'out', name: 'out', type: 'string' }], compiler: {} }),
+    getModuleForNode: () => ({
+      path: 'package:pkgA/nodes',
+      compiler: { name: 'PkgA', getNodeTypes: () => ['pkg:pkgA:own'], compileNode: (_t, c) => `let ${c.outputVar} = "ok-from-pkgA";` },
+      manifest: { id: 'pkgA' },
+    }),
+    getCompiler: () => ({ name: 'PkgA', getNodeTypes: () => ['pkg:pkgA:own'], compileNode: (_t, c) => `let ${c.outputVar} = "ok-from-pkgA";` }),
+    getAllNodeDefinitions: () => [],
+    getAllModules: () => [],
+  };
+  const rt3 = await mkRuntime(ownReg);
+  rt3.setAvailableFlows([
+    {
+      id: 'own-sub',
+      name: 'OwnSub',
+      packageId: 'pkgA',
+      createdAt: '',
+      updatedAt: '',
+      graph: { nodes: [{ id: 'n1', type: 'pkg:pkgA:own', position: { x: 0, y: 0 }, data: {} }], edges: [] },
+    },
+  ]);
+  await rt3.executeScript('return await Subflow.execute("own-sub", {});');
+});
+
+await check('38. Wave-5: registerImportedServices strips {{apiKeyRaw}} + bodyTemplate placeholders; reloadRequiresTrustReconfirm & unload await', () => {
+  const prevCustom = store.get('oaiy.customServices');
+  store.delete('oaiy.customServices');
+  try {
+    const res = M.registerImportedServices({
+      services: [
+        {
+          id: 'wave5-raw-placeholder-svc',
+          name: 'Wave5 Svc',
+          endpoint: 'https://api.example.com/v1/run',
+          method: 'POST',
+          headers: JSON.stringify({
+            'X-Raw': 'Token {{apiKeyRaw}}',
+            'X-Spaced': 'Token {{ apiKeyRaw }}',
+            'X-Keep': 'ok',
+          }),
+          bodyTemplate: '{"k1":"{{apiKey}}","k2":"{{ apiKeyRaw }}","q":{{input}}}',
+          responseType: 'json',
+          responsePath: 'out',
+        },
+      ],
+    });
+    assert.equal(res.added, 1);
+    const saved = M.listAllServices().find((s) => s.id === 'wave5-raw-placeholder-svc');
+    assert.ok(saved);
+    assert.deepEqual(JSON.parse(saved.headers), { 'X-Keep': 'ok' }, '{{apiKeyRaw}} headers must be stripped');
+    assert.equal(/apiKey/i.test(saved.bodyTemplate), false, `bodyTemplate leaked apiKey placeholder: ${saved.bodyTemplate}`);
+    assert.ok(saved.bodyTemplate.includes('{{input}}'), 'legitimate {{input}} placeholder must be preserved');
+  } finally {
+    if (prevCustom === undefined) store.delete('oaiy.customServices');
+    else store.set('oaiy.customServices', prevCustom);
+  }
+
+  // reloadRequiresTrustReconfirm fails closed when prevContentHash was set and nextContentHash is missing/empty
+  const baseManifest = { id: 'com.demo', name: 'Demo', version: '1.0.0', entryFlow: 'main.json', flows: ['main.json'], permissions: [] };
+  assert.equal(M.reloadRequiresTrustReconfirm(baseManifest, baseManifest, 'signature_verified', 'signature_verified', 'hash-a', ''), true);
+  assert.equal(M.reloadRequiresTrustReconfirm(baseManifest, baseManifest, 'signature_verified', 'signature_verified', 'hash-a', undefined), true);
+  assert.equal(M.reloadRequiresTrustReconfirm(baseManifest, baseManifest, 'signature_verified', 'signature_verified', 'hash-a', 'hash-a'), false);
+
+  // Structural checks for async unloadModule await, loadedIds filtering, and packagePermissions cleanup
+  const regSrc = fs.readFileSync(path.join(UI, 'src/services/customNodeRegistry.ts'), 'utf8');
+  assert.match(regSrc, /export async function unregisterPackageNodes\(/);
+  assert.ok(regSrc.includes('await moduleLoader.unloadModule(moduleId)'));
+  const pkgNodesSrc = fs.readFileSync(path.join(UI, 'src/hooks/usePackageNodes.ts'), 'utf8');
+  assert.ok(pkgNodesSrc.includes('await unregisterCustomNodes(packageId)'));
+  const pkgMgrSrc = fs.readFileSync(path.join(UI, 'src/hooks/usePackageManager.ts'), 'utf8');
+  assert.ok(pkgMgrSrc.includes('embeddedResults?.customNodes?.loadedIds'));
+  assert.match(pkgMgrSrc, /handleClosePackage[\s\S]*?setPackagePermissions/);
+});
+
+await check('39. Wave-5: escapeString hostile objects, template-compiler U+2028/U+2029/__proto__, and connector-module ConnectorConfigError guards', () => {
+  // Hostile objects must not throw TypeError in escapeString
+  const hostile = { toString: 123, valueOf: 456 };
+  assert.equal(typeof M.escapeString(hostile), 'string');
+  assert.ok(M.escapeString(hostile).includes('toString'));
+  const nullProto = Object.create(null);
+  nullProto.k = 'v';
+  assert.equal(typeof M.escapeString(nullProto), 'string');
+  const circularNull = Object.create(null);
+  circularNull.self = circularNull;
+  assert.equal(M.escapeString(circularNull), '');
+
+  // createTemplateCompiler escapes U+2028/U+2029 and neutralizes __proto__ keys for non-string props/data/defaults
+  const protoPayload = JSON.parse('{"__proto__":{"polluted":true},"s":"a\\u2028b\\u2029c"}');
+  const tplDef = {
+    id: 'w5_tpl',
+    name: 'W5 Tpl',
+    inputs: [],
+    outputs: [{ id: 'out', name: 'out', type: 'any' }],
+    properties: [{ id: 'defObj', name: 'defObj', type: 'json', default: protoPayload }],
+    compiler: { template: '{{outputVar}} = [{{props.obj}}, {{data.obj}}, {{props.defObj}}];' },
+  };
+  const compiler = M.createTemplateCompiler('w5', new Map([['w5_tpl', tplDef]]));
+  const generated = compiler.compileNode('w5_tpl', {
+    node: { id: 'n1', type: 'w5_tpl', data: { obj: protoPayload } },
+    inputs: new Map(),
+    outputVar: 'node_n1_out',
+    sanitizedId: 'n1',
+    skipVarDeclaration: false,
+    escapeString: M.escapeString,
+    sanitizeId: (s) => s.replace(/[^a-zA-Z0-9_]/g, '_'),
+    isInLoop: false,
+  });
+  assert.ok(generated);
+  assert.equal(generated.includes('\u2028') || generated.includes('\u2029'), false, 'raw U+2028/U+2029 must be escaped in compiled output');
+  const evaluated = new Function(`let workflow_context = {}; ${generated}\nreturn node_n1_out;`)();
+  assert.equal(({}).polluted, undefined, 'Object.prototype must not be polluted');
+  assert.equal(evaluated[0].s, 'a\u2028b\u2029c');
+  assert.equal(Object.getPrototypeOf(evaluated[0]), Object.prototype, 'object literal prototype must not be reparented by __proto__');
+  assert.deepEqual(Object.getOwnPropertyDescriptor(evaluated[0], '__proto__')?.value, { polluted: true });
+
+  // parseConnectorConfig throws ConnectorConfigError (never raw Error/TypeError) for invalid listResult/filters/limit/fields
+  const baseCfg = (nodeOverride) => ({
+    baseUrl: 'https://api.example.com',
+    credential: 'MY_TOKEN',
+    nodes: [{ nodeType: 'list_items', operation: 'listRecords', path: '/items', ...nodeOverride }],
+  });
+  const badConfigs = [
+    baseCfg({ listResult: 'not-an-object' }),
+    baseCfg({ listResult: null }),
+    baseCfg({ filters: 'not-an-object' }),
+    baseCfg({ filters: null }),
+    baseCfg({ filters: { field: 'f', opKey: 'o', fieldKey: 'fk', valueKey: 'vk', ops: [] } }),
+    baseCfg({ filters: { field: 'f', opKey: 'o', fieldKey: 'fk', valueKey: 'vk', ops: [null] } }),
+    baseCfg({ limit: 'not-an-object' }),
+    baseCfg({ limit: { field: 'l', param: 'limit', default: 0, max: 10 } }),
+    baseCfg({ recordField: 'rec' }),
+    { baseUrl: 'https://api.example.com', credential: 'T', nodes: [{ nodeType: 'get_item', operation: 'getRecord', path: '/items/:id', listResult: { items: 'x' } }] },
+    { baseUrl: 'https://api.example.com', credential: 'T', nodes: [{ nodeType: 'get_item', operation: 'getRecord', path: '/items/:id', filters: { field: 'f', opKey: 'o', fieldKey: 'fk', valueKey: 'vk', ops: [{ op: '=', param: 'eq' }] } }] },
+    { baseUrl: 'https://api.example.com', credential: 'T', nodes: [{ nodeType: 'get_item', operation: 'getRecord', path: '/items/:id', limit: { field: 'l', param: 'limit', default: 10, max: 50 } }] },
+  ];
+  for (const cfg of badConfigs) {
+    assert.throws(
+      () => M.parseConnectorConfig(cfg),
+      (err) => err instanceof M.ConnectorConfigError,
+      `expected ConnectorConfigError for ${JSON.stringify(cfg.nodes[0])}`,
+    );
+  }
+});
+
+await check('40. Wave-5: UI/UX fixes — QuickConnectPopup truncation, TrustDialog badges/icons, UnknownNode L/R handles, OutputNode & FlowsSidebar', () => {
+  // QuickConnectPopup shows truncation footer when > 15 matches
+  const twentyNodes = Array.from({ length: 20 }, (_, i) => ({
+    category: 'Utility',
+    definition: { id: `n_${i}`, name: `Node ${i}`, color: 'blue', icon: 'box' },
+  }));
+  const qcHtml = M.renderToStaticMarkup(
+    M.createElement(M.QuickConnectPopup, {
+      state: { isVisible: true, position: { x: 100, y: 100 }, searchQuery: '' },
+      handlePosition: null,
+      compatibleNodes: twentyNodes,
+      onNodeSelect() {},
+      onClose() {},
+      onSearchChange() {},
+    }),
+  );
+  assert.ok(qcHtml.includes('Showing 15 of 20 — refine search'), `expected truncation footer, got: ${qcHtml.slice(-200)}`);
+
+  // TrustDialog verification badge states + High risk pill + zero musical-note SVG
+  const sampleManifest = {
+    id: 'com.test.pkg',
+    name: 'Test Pkg',
+    version: '1.0.0',
+    entryFlow: 'main.json',
+    flows: ['main.json'],
+    permissions: ['network:local', 'constants:read'],
+  };
+  const verifiedHtml = M.renderToStaticMarkup(
+    M.createElement(M.TrustDialog, { manifest: sampleManifest, verification: 'signature_verified', onConfirm() {}, onCancel() {} }),
+  );
+  assert.ok(verifiedHtml.includes('>Verified<'), 'signature_verified must render Verified badge');
+  assert.ok(verifiedHtml.includes('High risk'), 'high-risk permission must render High risk pill');
+  const hashHtml = M.renderToStaticMarkup(
+    M.createElement(M.TrustDialog, { manifest: sampleManifest, verification: 'hash_matched', onConfirm() {}, onCancel() {} }),
+  );
+  assert.ok(hashHtml.includes('Hash verified'), 'hash_matched must render Hash verified badge');
+  const trustSrc = fs.readFileSync(path.join(UI, 'src/components/PackageManager/TrustDialog.tsx'), 'utf8');
+  assert.equal(trustSrc.includes('M9 19V6l12-3v13'), false, 'musical-note SVG path must be removed from TrustDialog');
+
+  // UnknownNode uses Left/Right handles
+  const unkSrc = fs.readFileSync(path.join(UI, 'src/components/OAIYBuilder/UnknownNode.tsx'), 'utf8');
+  assert.ok(unkSrc.includes('Position.Left') && unkSrc.includes('Position.Right'));
+  assert.equal(unkSrc.includes('Position.Top') || unkSrc.includes('Position.Bottom'), false);
+
+  // Vendor OutputNode has zero raw file:// synthesis and checks _collapsed/_status/selected in arePropsEqual
+  const vendorOutSrc = fs.readFileSync(path.join(UI, 'vendor/oaiy-ui-components/src/nodes/OutputNode.tsx'), 'utf8');
+  assert.equal(vendorOutSrc.includes('file://${'), false, 'vendor OutputNode must not synthesize raw file:// URLs');
+  assert.ok(vendorOutSrc.includes('prevProps.selected !== nextProps.selected'));
+  assert.ok(vendorOutSrc.includes('prevProps.data._collapsed !== nextProps.data._collapsed'));
+  assert.ok(vendorOutSrc.includes('prevProps.data._status !== nextProps.data._status'));
+
+  // FlowsSidebar scrim has aria-hidden, sibling buttons (oaiy-flow-select), and dot instead of Running pill
+  const flowsSrc = fs.readFileSync(path.join(UI, 'src/components/panels/FlowsSidebar.tsx'), 'utf8');
+  assert.ok(flowsSrc.includes('className="oaiy-rail-scrim" aria-hidden="true"'));
+  assert.ok(flowsSrc.includes('className="oaiy-flow-select"'));
+  assert.ok(flowsSrc.includes('oaiy-node-status-dot'));
 });
 
 finish();

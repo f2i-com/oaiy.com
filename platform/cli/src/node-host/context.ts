@@ -41,30 +41,75 @@ const stripLead = (s: string) => s.replace(/^[/\\]+/, '');
  * trailing separator (so a sibling dir sharing the name prefix can't match).
  */
 /**
- * Resolve the deepest existing ancestor of `target` with `fs.realpathSync` and ensure the
- * resolved real path stays inside `allowedRoots` (closing symlink escapes under confinement).
+ * Resolve `p` against the real path of its deepest existing ancestor so non-existent
+ * paths inside a symlinked root (e.g. macOS `/var` -> `/private/var`) compare consistently.
  */
-function assertNoSymlinkEscape(target: string, allowedRoots: string[]): void {
-  const realRoots = allowedRoots.map((r) => {
+function resolveRealBase(p: string): string {
+  let cur = path.resolve(p);
+  const tail: string[] = [];
+  while (true) {
     try {
-      return fs.realpathSync(r);
-    } catch {
-      return path.resolve(r);
+      const real = fs.realpathSync(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        const parent = path.dirname(cur);
+        if (parent === cur) return path.resolve(p);
+        tail.push(path.basename(cur));
+        cur = parent;
+        continue;
+      }
+      return path.resolve(p);
     }
-  });
+  }
+}
+
+/**
+ * Resolve the deepest existing ancestor (and any dangling symlinks along the path) of
+ * `target` and ensure the resolved real target stays inside `allowedRoots` (closing both
+ * live and dangling symlink escapes under confinement). Returns the symlink-resolved path.
+ */
+function assertNoSymlinkEscape(target: string, allowedRoots: string[], depth = 0): string {
+  if (depth > 16) {
+    throw new Error(`symlink target escapes the server fs sandbox (nesting limit): ${target}`);
+  }
+  const realRoots = allowedRoots.map(resolveRealBase);
   let probe = path.resolve(target);
+  const tail: string[] = [];
   while (true) {
     try {
       const real = fs.realpathSync(probe);
-      if (realRoots.some((root) => real === root || real.startsWith(root + path.sep))) {
-        return;
+      const resolved = tail.length ? path.join(real, ...tail.reverse()) : real;
+      if (realRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep))) {
+        return resolved;
       }
       throw new Error(`symlink target escapes the server fs sandbox: ${target}`);
     } catch (e) {
       const code = (e as NodeJS.ErrnoException)?.code;
       if (code === 'ENOENT' || code === 'ENOTDIR') {
+        // Handle dangling symlinks: realpathSync throws ENOENT when the symlink's target
+        // does not exist yet, which would otherwise walk up to the parent dir and let an
+        // output write create a file outside allowedRoots.
+        try {
+          const lst = fs.lstatSync(probe);
+          if (lst.isSymbolicLink()) {
+            const linkDest = fs.readlinkSync(probe);
+            const resolvedLink = path.resolve(path.dirname(probe), linkDest);
+            const reattached = tail.length ? path.join(resolvedLink, ...tail.reverse()) : resolvedLink;
+            return assertNoSymlinkEscape(reattached, allowedRoots, depth + 1);
+          }
+        } catch (lstatErr) {
+          const lcode = (lstatErr as NodeJS.ErrnoException)?.code;
+          if (lcode !== 'ENOENT' && lcode !== 'ENOTDIR') {
+            throw lstatErr;
+          }
+        }
         const parent = path.dirname(probe);
-        if (parent === probe) return;
+        if (parent === probe) {
+          throw new Error(`symlink target escapes the server fs sandbox: ${target}`);
+        }
+        tail.push(path.basename(probe));
         probe = parent;
         continue;
       }
@@ -84,8 +129,9 @@ export function within(root: string, rel: string): string {
   // every stored API key. get_secret/store_secret read it DIRECTLY (not via this), so app-level
   // secret access is unaffected; desktop / `oaiy run` (not confined) is unchanged.
   if (confineEnabled()) {
-    assertNoSymlinkEscape(real, [base]);
+    const resolvedReal = assertNoSymlinkEscape(real, [base]);
     refuseSecretStore(real);
+    refuseSecretStore(resolvedReal);
   }
   return real;
 }
@@ -113,7 +159,7 @@ export function isSecretStore(real: string, secret: string = SECRETS_FILE, platf
     const named = platform === 'win32' ? resolved.split(/[\\/]/).map((part) => part.replace(/[. ]+$/, '')).join('\\') : resolved;
     return fold ? named.toLowerCase() : named;
   };
-  return norm(real) === norm(secret);
+  return norm(real) === norm(secret) || norm(resolveRealBase(real)) === norm(resolveRealBase(secret));
 }
 
 /**
@@ -157,7 +203,8 @@ export function confineAbsolute(p: string): string {
   // an allowed root, so block it here too — same reason as `within`.
   refuseSecretStore(real);
   if (ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + path.sep))) {
-    assertNoSymlinkEscape(real, ALLOWED_ROOTS);
+    const resolvedReal = assertNoSymlinkEscape(real, ALLOWED_ROOTS);
+    refuseSecretStore(resolvedReal);
     return real;
   }
   throw new Error(`absolute path is outside the server fs sandbox: ${p}`);

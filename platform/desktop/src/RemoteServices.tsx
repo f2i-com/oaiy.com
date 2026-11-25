@@ -137,7 +137,7 @@ export default function RemoteServices() {
               </button>
             ) : (
               <button
-                className="btn btn-secondary btn-tiny"
+                className="btn-tiny btn-secondary"
                 disabled={busy !== null || !svc.installed || !n.online || !listed}
                 title={!n.online ? `${n.name} is offline: it can be chosen once it answers again` : undefined}
                 onClick={() => void use(svc.id, n.nodeId)}

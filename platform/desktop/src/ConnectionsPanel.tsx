@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Cloud, Link2, Radio, RefreshCw, ShieldCheck, TriangleAlert, X } from 'lucide-react';
+import { Check, Cloud, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
 import {
   companion,
   link as linkApi,
@@ -16,6 +16,7 @@ import { ask } from './ask';
 import { accessName, pairingFrom, pairingGrants } from './pairingWords';
 import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
+import LoadError from './LoadError';
 import './connectionSettings.css';
 
 /**
@@ -150,7 +151,7 @@ function LinkedAccount({ account, onDisconnect, disconnecting }: { account: Link
           {node && !node.approved && (
             <small className={node.status === 'revoked' ? 'link-line is-error' : 'link-line'}>
               Storage node: {node.status === 'revoked' ? 'revoked' : 'waiting for you to approve it on the provider’s site'}{' '}
-              <code style={{ letterSpacing: '0.04em' }}>{groupFingerprint(node.fingerprint)}</code>
+              <code className="fingerprint-code">{groupFingerprint(node.fingerprint)}</code>
             </small>
           )}
           {/* Events for the account (the phone's calls and texts) are
@@ -185,7 +186,7 @@ function LinkedAccount({ account, onDisconnect, disconnecting }: { account: Link
             )}
             {node?.approved && (
               <small className="link-line">
-                Storage node: approved <code style={{ letterSpacing: '0.04em' }}>{groupFingerprint(node.fingerprint)}</code>
+                Storage node: approved <code className="fingerprint-code">{groupFingerprint(node.fingerprint)}</code>
               </small>
             )}
             {account.relaySupported && !account.relayError && (account.relayNotUsed ? (
@@ -496,19 +497,12 @@ export default function ConnectionsPanel() {
 
   return (
     <div className="panel is-form connection-settings">
-      {error && (
-        <div className="banner banner-err banner-dismissable" role="alert">
-          <span>{error}</span>
-          <button className="banner-dismiss" onClick={() => setError(null)} aria-label="Dismiss">
-            ×
-          </button>
-        </div>
-      )}
+      {error && <LoadError error={error} onRetry={refresh} />}
       {actionError && (
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>{actionError}</span>
-          <button className="banner-dismiss" onClick={() => setActionError(null)} aria-label="Dismiss">
-            ×
+          <button type="button" className="banner-dismiss" onClick={() => setActionError(null)} aria-label="Dismiss">
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -624,20 +618,24 @@ export default function ConnectionsPanel() {
           </p>
         )}
 
-        {(accountError ?? statusError) && (
+        {accountError ? (
           <div className="banner banner-err" role="alert">
-            {accountError ?? statusError}
+            <span>{accountError}</span>
           </div>
-        )}
+        ) : statusError ? (
+          <LoadError error={statusError} onRetry={refreshAccount} />
+        ) : null}
         {/* A stored file of the link that could not be used. Not "not linked": the file is there and was left
             as it was, and this says why it is not in use, so a desktop that looks unlinked is not mistaken for
             one nobody linked. Linking again puts the file aside (it is kept as account.json.corrupt). */}
         {account?.linkError && account.linkError.kind !== 'copiesLeft' && account.linkError.message !== (accountError ?? statusError) && (
-          <div className="banner banner-err" role="alert" data-link-error>
-            <strong>{account.linkError.kind === 'notForgotten' ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
-            <span>{account.linkError.message}</span>
+          <div className="banner banner-err banner-stack" role="alert" data-link-error>
+            <span>
+              <strong>{account.linkError.kind === 'notForgotten' ? 'The link could not be changed.' : 'The stored link could not be used.'}</strong>{' '}
+              {account.linkError.message}
+            </span>
             {account.linkError.kind === 'unusable' && (
-              <div style={{ marginTop: 6, fontSize: 12.5 }}>
+              <div className="banner-sub">
                 Nothing was deleted. Link again below to start a new one; the old file is kept beside it.
               </div>
             )}
@@ -649,9 +647,11 @@ export default function ConnectionsPanel() {
             nothing to read again or to link again, and what is left is to let go of the copy and press the button.
             It stays until the copies are gone, and the button takes the copies only: a link made since is left alone. */}
         {account?.linkError?.kind === 'copiesLeft' && (
-          <div className="banner banner-err" role="alert" data-copies-left>
-            <strong>A copy of the old key is still on this computer.</strong> <span>{account.linkError.message}</span>
-            <div style={{ marginTop: 8 }}>
+          <div className="banner banner-err banner-stack" role="alert" data-copies-left>
+            <span>
+              <strong>A copy of the old key is still on this computer.</strong> {account.linkError.message}
+            </span>
+            <div className="banner-actions-row">
               <button className="btn-tiny" onClick={() => void removeCopies()} disabled={removingCopies}>
                 {removingCopies ? 'Removing…' : 'Remove copies'}
               </button>
@@ -660,21 +660,12 @@ export default function ConnectionsPanel() {
         )}
 
         {account?.attempt.phase === 'awaitingBrowser' && (
-          <div className="banner banner-pending">
+          <div className="banner banner-pending banner-stack">
             <strong>Waiting for you to approve this in your browser</strong>
             {/* The launcher can silently do nothing, and the user may simply
                 change their mind. Both need a way forward that isn't waiting
                 out the five-minute timeout. */}
-            <div
-              style={{
-                marginTop: 8,
-                fontSize: 12.5,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10,
-                flexWrap: 'wrap',
-              }}
-            >
+            <div className="banner-row">
               <span>
                 No tab opened?{' '}
                 {/* (in the OS's browser: a target=_blank link does nothing in the app's window) */}
@@ -697,26 +688,30 @@ export default function ConnectionsPanel() {
         )}
         {account?.attempt.phase === 'exchanging' && (
           <div className="banner banner-pending">
-            Finishing the link
+            <span>Finishing the link</span>
           </div>
         )}
         {account?.attempt.phase === 'cancelled' && !account.linked && (
           <div className="banner banner-pending">
-            <strong>Linking cancelled.</strong>{' '}
-            {/* Cancelling closes the local port the provider redirects back to.
-                An approval page still open in the browser now leads nowhere, and
-                approving it gives a bare ERR_CONNECTION_REFUSED that looks like
-                a broken app rather than a cancelled attempt. */}
-            If an approval page is still open in your browser, close it — approving
-            there can no longer reach this app. Start again here when you&rsquo;re ready.
+            <span>
+              <strong>Linking cancelled.</strong>{' '}
+              {/* Cancelling closes the local port the provider redirects back to.
+                  An approval page still open in the browser now leads nowhere, and
+                  approving it gives a bare ERR_CONNECTION_REFUSED that looks like
+                  a broken app rather than a cancelled attempt. */}
+              If an approval page is still open in your browser, close it — approving
+              there can no longer reach this app. Start again here when you&rsquo;re ready.
+            </span>
           </div>
         )}
         {account?.attempt.phase === 'failed' && !account.linked && (
           <div className="banner banner-err" role="alert">
-            <span>{account.attempt.message}</span>{' '}
-            <button className="btn-tiny" onClick={() => void cancelLink()}>
-              Dismiss
-            </button>
+            <span>{account.attempt.message}</span>
+            <span className="banner-actions">
+              <button className="btn-tiny" onClick={() => void cancelLink()}>
+                Dismiss
+              </button>
+            </span>
           </div>
         )}
 
@@ -728,7 +723,7 @@ export default function ConnectionsPanel() {
             <code> connectors</code> folder in your data directory to add one.
           </p>
         ) : (
-          <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void startLink(e)}>
+          <form className="dl-form dl-form-spaced" onSubmit={(e) => void startLink(e)}>
             <label className="form-row">
               <span>Provider</span>
               {/* Populated from the host, never hardcoded — adding a descriptor
@@ -761,7 +756,7 @@ export default function ConnectionsPanel() {
               const c = account?.available.find((x) => x.id === accountForm.connectorId);
               return c?.scopes.length ? (
                 // (in words; as the provider writes them, in the line's tooltip)
-                <p className="form-hint" style={{ margin: '2px 0 0' }} title={`As the provider writes it: ${c.scopes.join(', ')}`}>
+                <p className="form-hint form-hint-tight" title={`As the provider writes it: ${c.scopes.join(', ')}`}>
                   It will ask to use {listWords(scopeWords(c.scopes))}.
                 </p>
               ) : null;
@@ -813,14 +808,11 @@ export default function ConnectionsPanel() {
 
         {relayError && (
           <div className="banner banner-err" role="alert">
-            {relayError}
+            <span>{relayError}</span>
           </div>
         )}
 
-        {relayReadError && <div className="banner banner-err" role="alert">
-          <span>Couldn’t check the Companion relay.</span>
-          <button type="button" className="btn-tiny" onClick={() => void refreshRelay()}><RefreshCw size={13} />Try again</button>
-        </div>}
+        {relayReadError && <LoadError error="Couldn’t check the Companion relay." onRetry={refreshRelay} />}
         {relay?.configured ? (
           <ul className="pairing-list">
             <li>

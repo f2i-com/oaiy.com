@@ -264,15 +264,62 @@ impl Runner {
     }
 }
 
+/// Cap retained bytes per child output line so huge `\r`-only progress bars or newline-free output
+/// cannot grow memory unboundedly.
+pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Read a single `\n`-terminated line into `buf`, keeping at most `max_bytes` bytes and discarding
+/// any overflow bytes until `\n` or EOF. Returns total bytes consumed across the line (`0` on EOF).
+pub(crate) fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    if buf.capacity() > max_bytes {
+        buf.shrink_to(max_bytes);
+    }
+    let mut total = 0usize;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            if buf.capacity() > max_bytes {
+                buf.shrink_to(max_bytes);
+            }
+            return Ok(total);
+        }
+        let (chunk, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (&available[..=pos], true),
+            None => (available, false),
+        };
+        let take = chunk.len();
+        if buf.len() < max_bytes {
+            let keep = (max_bytes - buf.len()).min(take);
+            buf.extend_from_slice(&chunk[..keep]);
+        }
+        reader.consume(take);
+        total = total.saturating_add(take);
+        if done {
+            if buf.capacity() > max_bytes {
+                buf.shrink_to(max_bytes);
+            }
+            return Ok(total);
+        }
+    }
+}
+
 /// Every line a child writes, to its end: a line that is not UTF-8 (a progress bar's bytes, another code page) read
 /// as near as it can be rather than ending the reading, which left the pipe to fill and the child blocked on its next
-/// write. A line is kept to its first 4,000 characters.
+/// write. A line is kept to its first 4,000 characters and bounded in memory even without newlines.
 pub(crate) fn each_line(from: impl std::io::Read, mut each: impl FnMut(String)) {
     let mut reader = BufReader::new(from);
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        match read_bounded_line(&mut reader, &mut buf, MAX_LINE_BYTES) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
                 while matches!(buf.last(), Some(b'\n' | b'\r')) {
@@ -557,5 +604,30 @@ mod tests {
             .find_map(|l| l.text.trim().strip_prefix("overlap is "))
             .map(str::to_owned);
         assert_eq!(value.as_deref(), Some("the-steps-own"), "the child should hold the step's own value, and only that");
+    }
+
+    #[test]
+    fn bounded_line_reader_caps_memory_and_recovers_on_next_newline() {
+        // 512 KiB of `\r`-separated progress text with no `\n`, then a newline and a normal second line.
+        let mut input = b"progress\r".repeat(60_000); // ~540 KiB
+        input.extend_from_slice(b"\nsecond line\r\n");
+
+        let mut reader = BufReader::new(std::io::Cursor::new(&input));
+        let mut buf = Vec::new();
+        let n1 = read_bounded_line(&mut reader, &mut buf, MAX_LINE_BYTES).unwrap();
+        assert!(n1 > 500_000, "all overflow bytes up to newline must be consumed");
+        assert_eq!(buf.len(), MAX_LINE_BYTES, "retained bytes must be capped at MAX_LINE_BYTES");
+        assert!(buf.capacity() <= MAX_LINE_BYTES, "buffer capacity must stay bounded");
+
+        let n2 = read_bounded_line(&mut reader, &mut buf, MAX_LINE_BYTES).unwrap();
+        assert_eq!(n2, b"second line\r\n".len());
+        assert_eq!(&buf, b"second line\r\n");
+        assert_eq!(read_bounded_line(&mut reader, &mut buf, MAX_LINE_BYTES).unwrap(), 0);
+
+        let mut lines = Vec::new();
+        each_line(std::io::Cursor::new(&input), |l| lines.push(l));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), 4000);
+        assert_eq!(lines[1], "second line");
     }
 }

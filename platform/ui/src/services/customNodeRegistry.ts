@@ -346,7 +346,7 @@ export async function compileAndRegisterCustomNode(
 /**
  * Unregister all nodes for a package
  */
-export function unregisterPackageNodes(packageId: string): void {
+export async function unregisterPackageNodes(packageId: string): Promise<void> {
   const nodeTypes = packageNodes.get(packageId) || [];
 
   for (const nodeType of nodeTypes) {
@@ -356,17 +356,19 @@ export function unregisterPackageNodes(packageId: string): void {
   }
 
   const moduleIds = packageModuleIds.get(packageId) || [];
-  if (moduleIds.length > 0) {
-    const moduleLoader = getModuleLoader();
-    for (const moduleId of moduleIds) {
-      void moduleLoader.unloadModule(moduleId);
-      logger.debug(`Unloaded from ModuleLoader: ${moduleId}`);
-    }
-    packageModuleIds.delete(packageId);
-  }
-
+  packageModuleIds.delete(packageId);
   packageNodes.delete(packageId);
   registryVersion++;
+
+  if (moduleIds.length > 0) {
+    const moduleLoader = getModuleLoader();
+    await Promise.all(
+      moduleIds.map(async (moduleId) => {
+        await moduleLoader.unloadModule(moduleId);
+        logger.debug(`Unloaded from ModuleLoader: ${moduleId}`);
+      }),
+    );
+  }
 }
 
 /**

@@ -191,7 +191,7 @@ export default function ModelsPanel({ onOpenEngines }: { onOpenEngines?: () => v
         <div className="banner banner-err banner-dismissable">
           <span>⚠ {actionError}</span>
           <button type="button" className="banner-dismiss" aria-label="Dismiss error" onClick={() => setActionError(null)}>
-            ×
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}

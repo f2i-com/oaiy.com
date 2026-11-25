@@ -52,6 +52,8 @@ export type { PlanReviewDecision, PlanReviewRequest } from './planMode';
 export type AgentEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
+  /** Stream faulted mid-flight and fell back to a non-streaming request: clear partial streamed text/thought/draft. */
+  | { type: 'stream_reset' }
   /** How far the model has thought (OAIY's engine): tokens so far, the most it may (null: no limit), and whether it is done. */
   | { type: 'thinking_count'; used: number; budget: number | null; done: boolean }
   /** What the model is about to be sent for its next step, to show: the system prompt, the conversation as sent, the tools' names. */
@@ -246,7 +248,7 @@ const KEEP_IMAGE_TURNS_FOUND = 8;
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice, generate_music and generate_sound_effect, when they are among your tools, make pictures, short videos (talking ones too), speech, music and sound effects with the user's media service and save them in the project; media_compose lays sound effects and music under clips. remove_background (when it is among your tools) cuts a picture's subject out onto a transparent background, for sprites, icons and product shots, and upscale_image makes a picture two or four times larger with its detail restored. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
 /** How to make a 3D model: only when the 3D model tool is there. */
-const MODEL3D_GUIDE = `- generate_3d_model makes a 3D model (a GLB mesh) of one object from a picture of it: a 3D asset for a game, a scene or a product page. Make the picture first with generate_image: the object alone, the whole of it in view and centred, on a plain background (the service may remove any background, as generate_3d_model says), in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects; look at it with view_image and make it again if it is off. Then make the model from it with generate_3d_model, and look at it before using it: preview_screenshot with the model's path shows it from four sides in one image (yaw and pitch show it from any other angle); make it again, from a better picture, if it is off. To use it, put it in a SoftN app's assets/ folder and show it with a Scene3D (the app guide has the syntax); a web page cannot show 3D.
+const MODEL3D_GUIDE = `- generate_3d_model makes a 3D model (a GLB mesh) of one object from a picture of it: a 3D asset for a game, a scene or a product page. Make the picture first with generate_image: the object alone, the whole of it in view and centred, on a plain background (the service may remove any background, as generate_3d_model says), in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects; look at it with view_image and make it again if it is off. Then make the model from it with generate_3d_model, and look at it before using it: preview_screenshot with the model's path shows it from four sides in one image (yaw and pitch show it from any other angle); make it again, from a better picture, if it is off. To use it, put it in a SoftN app's assets/ folder and show it with a Scene3D (the app guide has the syntax), or render it in an interactive web page using the bundled offline Three.js with GLTFLoader/GLTFExporter (the web guide has the syntax).
 `;
 /** How to make a video with a story: from a script, shot by shot. */
 const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. What the user asked for comes first: everything their request says (the story and what happens in it, the characters and how they look, what they say, the places, how many scenes or how long, the style, what to do or avoid) goes into the script as they said it. The rules below only fill in what the request leaves open, and never override it. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
@@ -355,7 +357,7 @@ const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
   ['video', /\b(videos?|clips?|films?|movies?|animat\w*|sitcoms?|episodes?|trailers?|cartoons?|vlogs?|commercials?)\b/i],
   ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?|3-?d[ -]?(?:models?|assets?|objects?|props?|meshe?s?|prints?|characters?)|in 3-?d|three-dimensional|meshe?s?|glb|gltf)\b/i],
   ['app', /\b(apps?|softn|vue(?:\.js)?|react(?:js|\.js| components?| websites?)|full[- ]?stack|sqlite|dashboard|calculator|games?|to-?do list)\b/i],
-  ['web', /\b(websites?|web ?sites?|web ?pages?|landing pages?|home ?pages?|html|css|responsive)\b/i],
+  ['web', /\b(websites?|web ?sites?|web ?pages?|landing pages?|home ?pages?|html|css|responsive|three\.?js|webgl|3d\s+scene|shaders?|glb\s+viewer)\b/i],
   ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
 ];
 
@@ -791,7 +793,14 @@ export function wellFormed(turns: Turn[]): Turn[] {
     }
     const last = out[out.length - 1];
     if (turn.role === 'user' && last?.role === 'user') {
-      out[out.length - 1] = { ...last, text: `${last.text}\n\n${turn.text}`, images: [...(last.images ?? []), ...(turn.images ?? [])], summary: last.summary || turn.summary, ...(last.fresh || turn.fresh ? { fresh: true } : {}) };
+      out[out.length - 1] = {
+        ...last,
+        text: `${last.text}\n\n${turn.text}`,
+        images: [...(last.images ?? []), ...(turn.images ?? [])],
+        automatic: last.automatic && turn.automatic ? true : undefined,
+        summary: last.summary || turn.summary,
+        ...(last.fresh || turn.fresh ? { fresh: true } : {}),
+      };
       continue;
     }
     out.push(turn);
@@ -856,7 +865,7 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
     const turn = out[i];
     if (!hasImages(turn)) continue;
     if (++seen <= keep) continue;
-    if (turn.role === 'user') out[i] = { role: 'user', text: `${turn.text}\n[${turn.images!.length} image(s) shown earlier, no longer attached; look again with view_image if needed]` };
+    if (turn.role === 'user') out[i] = { ...turn, images: undefined, text: `${turn.text}\n[${turn.images!.length} image(s) shown earlier, no longer attached; look again with view_image if needed]` };
     else if (turn.role === 'tool') out[i] = { role: 'tool', results: turn.results.map((r) => (r.images?.length ? { ...r, images: undefined, content: `${r.content}\n[image no longer attached; call view_image again to see it]` } : r)) };
   }
   return out;
@@ -899,9 +908,16 @@ const MIN_KEPT_MESSAGE = 1000;
  * message too big for the room on its own; the conversation's shape never
  * changes.
  */
-function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[] {
+export function trimmed(allTurns: Turn[], keepImages: number, maxChars: number, trimmedToolIds?: Set<string>): Turn[] {
   const turns = withoutOldImages(allTurns, keepImages);
   if (estimateChars(turns) <= maxChars) return turns;
+  const origToolContent = trimmedToolIds ? new Map<string, string>() : null;
+  if (origToolContent) {
+    for (const t of turns) {
+      if (t.role !== 'tool') continue;
+      for (const r of t.results) origToolContent.set(r.id, r.content);
+    }
+  }
   const cutoff = turns.length - KEEP_RECENT_TURNS;
   const request = requestIndex(turns);
   const shrink = (limit: number) =>
@@ -937,6 +953,14 @@ function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[]
     const turn = out[at] as Extract<Turn, { role: 'user' }>;
     // (the marker's own words counted too)
     out[at] = { ...turn, text: headAndTail(turn.text, Math.max(MIN_KEPT_MESSAGE, turn.text.length - over - 200), "to fit the model's context") };
+  }
+  if (trimmedToolIds && origToolContent) {
+    for (const t of out) {
+      if (t.role !== 'tool') continue;
+      for (const r of t.results) {
+        if (origToolContent.get(r.id) !== r.content) trimmedToolIds.add(r.id);
+      }
+    }
   }
   return out;
 }
@@ -1013,6 +1037,8 @@ export class Agent {
   /** Non-destructive Stage-1 pruned tool contents (keeps saved `this.turns` verbatim for UI replay). */
   private prunedToolContents = new WeakMap<ToolResult, string>();
   private prunedToolCount = 0;
+  /** Tool call IDs whose content was cut by `trimmed()` on the latest prompt send (prevents false read_file dedup stubs). */
+  private trimmedToolCallIds = new Set<string>();
   /** Guides loaded during this session (monotonically retained even if older tool outputs are pruned). */
   private persistentGuides = new Set<GuideTopic>();
   /** Memoized `usable` tool list keyed on VFS revision + guides + media/session state. */
@@ -1053,6 +1079,8 @@ export class Agent {
       }
     }
     this.toolContext.readSpans?.clear();
+    this.trimmedToolCallIds.clear();
+    this.prunedToolCount = 0;
     return { checkpoint, ...outcome };
   }
 
@@ -1084,6 +1112,9 @@ export class Agent {
     this.planModeEntered = restored.entered;
     this.planModeNotified = restored.entered;
     this.pendingPlanNotice = null;
+    this.prunedToolContents = new WeakMap();
+    this.prunedToolCount = 0;
+    this.trimmedToolCallIds.clear();
     if (this.turns.length > 0 && !this.options.conversation) {
       this.workspaceInstructions.seedBaseline(this.options.vfs);
     }
@@ -1101,6 +1132,7 @@ export class Agent {
       reads: new Map(),
       readSpans: new Map<string, ReadSpanRecord>(),
       isToolResultActive: (callId: string) => {
+        if (this.trimmedToolCallIds.has(callId)) return false;
         const start = viewStart(this.turns);
         for (let i = start; i < this.turns.length; i++) {
           const t = this.turns[i]!;
@@ -1143,6 +1175,7 @@ export class Agent {
     this.pendingPlanNotice = null;
     this.prunedToolContents = new WeakMap();
     this.prunedToolCount = 0;
+    this.trimmedToolCallIds.clear();
     this.persistentGuides.clear();
     this.usableCache = null;
     this.checkpoints = [];
@@ -1267,6 +1300,7 @@ export class Agent {
       const content = await tool.run(call.input, signal);
       return { id: call.id, name: call.name, content, isError: false, ...(didStartCalls(tool, call.input, content) ? { startedCalls: true } : {}) };
     } catch (error) {
+      if (signal?.aborted) throw error;
       return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
     }
   }
@@ -1436,7 +1470,29 @@ export class Agent {
       includePlanExit ? '1' : '0',
       [...guides].sort().join(','),
       media
-        ? `${media.baseUrl}|${media.discovered?.origin ?? ''}|${media.imageModel ?? ''}|${media.videoModel ?? ''}|${media.speechModel ?? ''}|${media.musicModel ?? ''}|${media.soundModel ?? ''}|${media.model3dModel ?? ''}|${media.imageModels.length}|${media.videoModels.length}|${media.speechModels?.length ?? 0}|${media.musicModels?.length ?? 0}|${media.soundModels?.length ?? 0}|${media.model3dModels?.length ?? 0}|${media.backgroundModels?.length ?? 0}|${media.upscaleModels?.length ?? 0}|${media.voices?.length ?? 0}`
+        ? [
+            media.enabled ? '1' : '0',
+            media.baseUrl,
+            media.discovered?.origin ?? '',
+            media.endpoints?.background ?? '',
+            media.endpoints?.upscale ?? '',
+            media.imageModel ?? '',
+            media.videoModel ?? '',
+            media.speechModel ?? '',
+            media.musicModel ?? '',
+            media.soundModel ?? '',
+            media.model3dModel ?? '',
+            media.imageModels.map((m) => `${m.id}:${m.edits ?? ''}:${m.maxReferences ?? ''}:${m.sizeStep ?? ''}:${m.defaultSize ?? ''}:${m.negativePrompt ?? ''}`).join(','),
+            media.videoModels.map((m) => `${m.id}:${m.lipSync ?? ''}:${m.startImage ?? ''}:${m.maxSeconds ?? ''}:${m.fps ?? ''}:${m.maxSide ?? ''}`).join(','),
+            (media.speechModels ?? []).map((m) => `${m.id}:${m.engine ?? ''}:${m.license ?? ''}:${m.describedVoices ?? ''}:${m.savedVoices ?? ''}`).join(','),
+            (media.musicModels ?? []).map((m) => `${m.id}:${m.maxSeconds ?? ''}`).join(','),
+            (media.soundModels ?? []).map((m) => `${m.id}:${m.maxSeconds ?? ''}`).join(','),
+            (media.model3dModels ?? []).map((m) => `${m.id}:${m.ready ?? ''}:${m.removesBackground ?? ''}:${m.upscales ?? ''}:${m.faces ?? ''}:${(m.resolutions ?? []).join('/')}`).join(','),
+            (media.backgroundModels ?? []).map((m) => m.id).join(','),
+            (media.upscaleModels ?? []).map((m) => `${m.id}:${m.maxPixels ?? ''}:${(m.scales ?? []).join('/')}`).join(','),
+            (media.openaiVoices ?? []).join(','),
+            (media.voices ?? []).map((v) => `${v.name}:${v.description ?? ''}`).join(','),
+          ].join('|')
         : 'none',
       sessionTools.map((t) => t.spec.name).join(','),
     ].join('\0');
@@ -1504,17 +1560,21 @@ export class Agent {
 
   /** A use_tool call as the call of the tool it names (its arguments a JSON text too: some models write them so). */
   private unwrapped(call: ToolCall): ToolCall {
+    if (call.parseError) return call;
     const name = typeof call.input.name === 'string' ? call.input.name.trim() : '';
     let args: unknown = call.input.arguments;
-    if (typeof args === 'string') {
+    let parseError: string | undefined;
+    if (typeof args === 'string' && args.trim()) {
       try {
-        args = JSON.parse(args);
-      } catch {
-        /* the tool says what is missing */
+        const parsed = JSON.parse(args);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed;
+        else parseError = 'arguments must be a JSON object';
+      } catch (error) {
+        parseError = `invalid JSON in arguments: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
     const input = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
-    return { ...call, name: name || 'use_tool', input };
+    return { ...call, name: name || 'use_tool', input, ...(parseError ? { parseError } : {}) };
   }
 
   /** Guides read so far: the parent's, those read with a request, and those read since (their note in a result). */
@@ -1675,7 +1735,7 @@ ${personInstructionsText(own)}` : ''}`;
 
   private async delegateTasks(call: ToolCall, tasks: ReturnType<typeof readTasks>, provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
     const settings = () => this.options.subAgents?.() ?? { contextTokens: 32_000, parallel: provider.type === 'local' ? 1 : 3 };
-    const queue = queueFor(`${provider.id}|${provider.modelId}`, () => settings().parallel);
+    const queue = queueFor(`${provider.id}|${provider.modelId}`, settings().parallel);
     const setStep = (step: number | undefined, status: 'active' | 'done') => {
       if (!step || !this.plan || !this.plan.items[step - 1] || this.plan.items[step - 1].status === 'done') return;
       this.plan = { ...this.plan, items: this.plan.items.map((item, i) => (i === step - 1 ? { ...item, status } : item)) };
@@ -2214,6 +2274,8 @@ ${personInstructionsText(own)}` : ''}`;
     this.turns.splice(start + keepFrom, 0, note);
     // Earlier read_file results are now summarized out of view — allow fresh full reads if requested again.
     this.toolContext.readSpans?.clear();
+    this.trimmedToolCallIds.clear();
+    this.prunedToolCount = 0;
     // (the instructions now quote the request, if it was among the turns summarized: counted with them)
     const after = this.estimate(this.view()) + this.budget(provider).fixed;
     emit({ type: 'compact', turns: old.length, before, after, how });
@@ -2335,7 +2397,9 @@ ${personInstructionsText(own)}` : ''}`;
     // (each kind of failure below has a bound of its own; this one ends a step that meets several)
     for (let attempt = 0; attempt < 10; attempt++) {
       const b = this.budget(provider);
-      const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
+      const nextTrimmed = new Set<string>();
+      const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken, nextTrimmed));
+      this.trimmedToolCallIds = nextTrimmed;
       this.streamed = '';
       try {
         const finish = this.options.finish;
@@ -2345,6 +2409,7 @@ ${personInstructionsText(own)}` : ''}`;
         const tools = finish && this.finishing ? this.usable.filter((t) => t.name === finish.tool || (t.name === 'view_image' && this.looksMissing().length > 0)) : this.listed;
         if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
         let thought = false;
+        let drafted = false;
         const varied = this.varyNext;
         const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
         const reqStartMs = nowMs();
@@ -2361,6 +2426,12 @@ ${personInstructionsText(own)}` : ''}`;
           varied,
           stripAnthropicThinking,
           ...this.thinking(b.reply),
+          onFallback: () => {
+            if (this.streamed || thought || drafted) emit({ type: 'stream_reset' });
+            this.streamed = '';
+            thought = false;
+            drafted = false;
+          },
           sink: {
             text: (delta) => {
               markFirstToken();
@@ -2375,14 +2446,17 @@ ${personInstructionsText(own)}` : ''}`;
             thinkingCount: (used, budget, done) => emit({ type: 'thinking_count', used, budget, done }),
             toolStart: (index, _id, name) => {
               markFirstToken();
+              drafted = true;
               emit({ type: 'tool_start', index, name });
             },
             toolArgs: (index, delta) => {
               markFirstToken();
+              drafted = true;
               emit({ type: 'tool_draft', text: delta, start: false, index });
             },
             draft: (text, start) => {
               markFirstToken();
+              drafted = true;
               emit({ type: 'tool_draft', text, start });
             },
             // (a local model reading its prompt: said as that, not as thinking)
@@ -3158,6 +3232,7 @@ ${personInstructionsText(own)}` : ''}`;
           }
           this.turns.push({ role: 'tool', results });
           if (++cutOff >= CUT_OFF_STOP) {
+            emitDeliverables();
             emit({ type: 'error', message: `The model's reply was cut off at its output limit in the middle of a tool call ${cutOff} times in a row, so the run stopped. Ask for a smaller step (a large file written in parts), or say "continue" to let it try again.` });
             return;
           }
@@ -3208,6 +3283,21 @@ ${personInstructionsText(own)}` : ''}`;
             emit({ type: 'tool_call', call });
             const finding = call.name === 'find_tools' && this.discovering;
             const allowed = finding || this.usable.some((t) => t.name === call.name);
+            if (call.parseError) {
+              return {
+                call,
+                result: {
+                  id: call.id,
+                  name: call.name,
+                  content: `Error: the tool call's arguments could not be read: ${call.parseError}`,
+                  isError: true,
+                },
+                allowed,
+                stopped: true,
+                scriptCheck: false,
+                usedInsteadHook: false,
+              };
+            }
             const hooks = allowed ? this.hooksFor(call.name) : {};
             let flowNote = '';
             let stopped: ToolResult | null = null;

@@ -9,7 +9,7 @@ import { NOT_ANSWERING } from './api';
  * rather than "the plugins could not be read: OAIY isn't answering".
  */
 export function loadErrorText(error: string, what?: string): string {
-  if (error === NOT_ANSWERING || !what) return error;
+  if (!what || error === NOT_ANSWERING) return error;
   return `${what} could not be read: ${error}`;
 }
 

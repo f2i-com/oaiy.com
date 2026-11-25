@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FolderOpen, Trash2 } from 'lucide-react';
+import { FolderOpen, Trash2, X } from 'lucide-react';
 import { useVisiblePoll } from './useVisiblePoll';
 import { peek, put } from './useCached';
 import {
@@ -161,7 +161,7 @@ export default function PythonPanel() {
             aria-label="Dismiss error"
             onClick={() => setActionError(null)}
           >
-            ×
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -300,7 +300,7 @@ export default function PythonPanel() {
             </div>
             <div className="row-actions">
               <button
-                className="btn btn-ghost"
+                className="btn-tiny"
                 onClick={() =>
                   openInExplorer(v.path).catch((e) =>
                     setActionError(e instanceof Error ? e.message : String(e)),
@@ -311,7 +311,7 @@ export default function PythonPanel() {
                 <FolderOpen size={13} /> Open
               </button>
               <button
-                className="btn btn-danger"
+                className="btn-tiny btn-danger"
                 onClick={() => {
                   let msg = `Delete venv ${v.name}? This removes ${formatBytes(v.sizeBytes)} from disk.`;
                   if (v.boundServices.length > 0) {
@@ -348,7 +348,7 @@ export default function PythonPanel() {
                     : `Venv ${snapshot.currentJob.target} set up`}
             </h3>
             <button
-              className="btn btn-ghost"
+              className="btn-tiny"
               onClick={() => setShowLogs((s) => !s)}
             >
               {showLogs ? 'Hide logs' : 'Show logs'}

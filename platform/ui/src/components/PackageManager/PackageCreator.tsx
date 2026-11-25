@@ -6,7 +6,7 @@
  */
 
 import { useState, useCallback, useMemo } from 'react';
-import { Package } from 'lucide-react';
+import { Loader2, Package } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import type { Flow } from 'oaiy-core';
@@ -231,131 +231,117 @@ export function PackageCreator({
       case 'metadata':
         return (
           <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-content-primary mb-1">
-                Package ID *
-              </label>
+            <label className="oaiy-field">
+              <span>Package ID *</span>
               <input
                 type="text"
                 value={packageId}
                 onChange={(e) => setPackageId(e.target.value)}
                 placeholder="com.example.my-package"
-                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
+                className="oaiy-input mono"
               />
-              <p className="mt-1 text-xs text-content-secondary">
-                Unique identifier (reverse domain style)
-              </p>
-            </div>
+              <span className="oaiy-help faint">Unique identifier (reverse domain style)</span>
+            </label>
 
-            <div>
-              <label className="block text-sm font-medium text-content-primary mb-1">
-                Package Name *
-              </label>
+            <label className="oaiy-field">
+              <span>Package Name *</span>
               <input
                 type="text"
                 value={packageName}
                 onChange={(e) => setPackageName(e.target.value)}
                 placeholder="My Awesome Package"
-                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
+                className="oaiy-input"
               />
-            </div>
+            </label>
 
-            <div>
-              <label className="block text-sm font-medium text-content-primary mb-1">
-                Version *
-              </label>
+            <label className="oaiy-field">
+              <span>Version *</span>
               <input
                 type="text"
                 value={version}
                 onChange={(e) => setVersion(e.target.value)}
                 placeholder="1.0.0"
-                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
+                className="oaiy-input mono"
               />
-            </div>
+            </label>
 
-            <div>
-              <label className="block text-sm font-medium text-content-primary mb-1">
-                Description
-              </label>
+            <label className="oaiy-field">
+              <span>Description</span>
               <textarea
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What does this package do?"
                 rows={3}
-                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50 resize-none"
+                className="oaiy-textarea resize-none"
               />
-            </div>
+            </label>
 
-            <div>
-              <label className="block text-sm font-medium text-content-primary mb-1">
-                Author
-              </label>
+            <label className="oaiy-field">
+              <span>Author</span>
               <input
                 type="text"
                 value={author}
                 onChange={(e) => setAuthor(e.target.value)}
                 placeholder="Your name"
-                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
+                className="oaiy-input"
               />
-            </div>
+            </label>
           </div>
         );
 
       case 'content':
         return (
-          <div className="space-y-6">
+          <div className="space-y-5">
             {/* Flows selection */}
             <div>
-              <h3 className="text-sm font-medium text-content-primary mb-2">
-                Include Flows
-              </h3>
+              <h3 className="oaiy-label mb-2">Include Flows</h3>
               <div className="space-y-2 max-h-48 overflow-y-auto">
-                {flows.map((flow) => (
-                  <label
-                    key={flow.id}
-                    className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                      selectedFlows.has(flow.id)
-                        ? 'bg-accent/10 border-accent/40'
-                        : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedFlows.has(flow.id)}
-                      onChange={() => toggleFlow(flow.id)}
-                      className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-content-primary truncate">
-                        {flow.name}
-                      </p>
-                      {flow.description && (
-                        <p className="text-xs text-content-secondary truncate">
-                          {flow.description}
-                        </p>
+                {flows.map((flow) => {
+                  const selected = selectedFlows.has(flow.id);
+                  const isEntry = entryFlowId === flow.id;
+                  return (
+                    <div
+                      key={flow.id}
+                      className={`flex items-center gap-3 p-2.5 rounded-[var(--r-ctl)] border transition-colors ${
+                        selected
+                          ? 'bg-accent/10 border-accent/40'
+                          : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
+                      }`}
+                    >
+                      <label className="flex flex-1 min-w-0 items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleFlow(flow.id)}
+                          className="w-4 h-4 shrink-0"
+                        />
+                        <span className="flex-1 min-w-0">
+                          <span className="block text-[13px] font-semibold text-content-primary truncate">
+                            {flow.name}
+                          </span>
+                          {flow.description && (
+                            <span className="block text-xs text-content-faint truncate">
+                              {flow.description}
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                      {selected && (
+                        <button
+                          type="button"
+                          onClick={() => setEntryFlowId(flow.id)}
+                          className={isEntry ? 'btn btn-primary btn-sm' : 'btn btn-secondary btn-sm'}
+                          aria-pressed={isEntry}
+                        >
+                          {isEntry ? 'Entry' : 'Set as Entry'}
+                        </button>
                       )}
                     </div>
-                    {selectedFlows.has(flow.id) && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          setEntryFlowId(flow.id);
-                        }}
-                        className={`px-2 py-1 text-xs rounded transition-colors ${
-                          entryFlowId === flow.id
-                            ? 'bg-accent text-white'
-                            : 'bg-surface-tertiary text-content-secondary hover:text-content-primary border border-edge-primary'
-                        }`}
-                      >
-                        {entryFlowId === flow.id ? 'Entry' : 'Set as Entry'}
-                      </button>
-                    )}
-                  </label>
-                ))}
+                  );
+                })}
               </div>
               {selectedFlows.size > 0 && !entryFlowId && (
-                <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                <p className="mt-2 text-xs text-signal-amber">
                   Please select an entry flow
                 </p>
               )}
@@ -364,14 +350,12 @@ export function PackageCreator({
             {/* Services selection */}
             {services.length > 0 && (
               <div>
-                <h3 className="text-sm font-medium text-content-primary mb-2">
-                  Include Services (optional)
-                </h3>
+                <h3 className="oaiy-label mb-2">Include Services (optional)</h3>
                 <div className="space-y-2 max-h-32 overflow-y-auto">
                   {services.map((service) => (
                     <label
                       key={service.id}
-                      className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                      className={`flex items-center gap-3 p-2.5 rounded-[var(--r-ctl)] border cursor-pointer transition-colors ${
                         selectedServices.has(service.id)
                           ? 'bg-accent/10 border-accent/40'
                           : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
@@ -381,14 +365,14 @@ export function PackageCreator({
                         type="checkbox"
                         checked={selectedServices.has(service.id)}
                         onChange={() => toggleService(service.id)}
-                        className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
+                        className="w-4 h-4 shrink-0"
                       />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-content-primary truncate">
+                      <span className="flex-1 min-w-0">
+                        <span className="block text-[13px] font-semibold text-content-primary truncate">
                           {service.name}
-                        </p>
-                        <p className="text-xs text-content-secondary truncate">{service.id}</p>
-                      </div>
+                        </span>
+                        <span className="block font-mono text-xs text-content-faint truncate">{service.id}</span>
+                      </span>
                     </label>
                   ))}
                 </div>
@@ -400,7 +384,7 @@ export function PackageCreator({
       case 'permissions':
         return (
           <div className="space-y-4">
-            <p className="text-sm text-content-secondary">
+            <p className="oaiy-help">
               Select the permissions your package requires. Users will be asked
               to grant these when installing.
             </p>
@@ -409,7 +393,7 @@ export function PackageCreator({
               {PERMISSION_OPTIONS.map((perm) => (
                 <label
                   key={perm.id}
-                  className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                  className={`flex items-center gap-3 p-2.5 rounded-[var(--r-ctl)] border cursor-pointer transition-colors ${
                     permissions.has(perm.id)
                       ? 'bg-accent/10 border-accent/40'
                       : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
@@ -419,14 +403,14 @@ export function PackageCreator({
                     type="checkbox"
                     checked={permissions.has(perm.id)}
                     onChange={() => togglePermission(perm.id)}
-                    className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
+                    className="w-4 h-4 shrink-0"
                   />
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-content-primary">
+                  <span className="flex-1">
+                    <span className="block text-[13px] font-semibold text-content-primary">
                       {perm.label}
-                    </p>
-                    <p className="text-xs text-content-secondary">{perm.description}</p>
-                  </div>
+                    </span>
+                    <span className="block text-xs text-content-faint">{perm.description}</span>
+                  </span>
                 </label>
               ))}
             </div>
@@ -436,23 +420,23 @@ export function PackageCreator({
       case 'review':
         return (
           <div className="space-y-4">
-            <div className="p-4 bg-surface-tertiary/60 border border-edge-primary rounded-lg space-y-3">
+            <div className="p-4 bg-surface-tertiary/60 border border-edge-primary rounded-[var(--r-ctl)] space-y-3">
               <div>
-                <p className="text-xs text-content-secondary">Package</p>
-                <p className="text-sm font-medium text-content-primary">
+                <p className="oaiy-label m-0">Package</p>
+                <p className="m-0 mt-0.5 text-[13px] font-semibold text-content-primary">
                   {packageName}
                 </p>
-                <p className="text-xs text-content-secondary">
+                <p className="m-0 font-mono text-xs text-content-faint">
                   {packageId} v{version}
                 </p>
               </div>
 
               <div>
-                <p className="text-xs text-content-secondary">Flows</p>
-                <p className="text-sm text-content-primary">
+                <p className="oaiy-label m-0">Flows</p>
+                <p className="m-0 mt-0.5 text-[13px] text-content-primary">
                   {selectedFlows.size} flow(s) included
                 </p>
-                <p className="text-xs text-content-secondary">
+                <p className="m-0 text-xs text-content-faint">
                   Entry:{' '}
                   {flows.find((f) => f.id === entryFlowId)?.name ?? entryFlowId}
                 </p>
@@ -460,25 +444,29 @@ export function PackageCreator({
 
               {selectedServices.size > 0 && (
                 <div>
-                  <p className="text-xs text-content-secondary">Services</p>
-                  <p className="text-sm text-content-primary">
+                  <p className="oaiy-label m-0">Services</p>
+                  <p className="m-0 mt-0.5 text-[13px] text-content-primary">
                     {selectedServices.size} service(s) included
                   </p>
                 </div>
               )}
 
               <div>
-                <p className="text-xs text-content-secondary">Permissions</p>
-                <p className="text-sm text-content-primary">
-                  {permissions.size === 0
-                    ? 'None required'
-                    : Array.from(permissions).join(', ')}
-                </p>
+                <p className="oaiy-label m-0">Permissions</p>
+                {permissions.size === 0 ? (
+                  <p className="m-0 mt-1 text-[13px] text-content-secondary">None required</p>
+                ) : (
+                  <div className="mt-1.5 flex flex-wrap gap-1.5">
+                    {Array.from(permissions).map((perm) => (
+                      <span key={perm} className="oaiy-pill accent">{perm}</span>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
             {error && (
-              <div className="oaiy-banner err">
+              <div className="oaiy-banner">
                 <span className="flex-1">{error}</span>
               </div>
             )}
@@ -489,7 +477,7 @@ export function PackageCreator({
 
   // Step indicator
   const stepIndicator = (
-    <div className="flex items-center justify-center gap-2 mb-5">
+    <div className="flex items-center justify-center gap-2 mb-4" aria-label={`Step ${currentStepIndex + 1} of ${STEPS.length}`}>
       {STEPS.map((s, idx) => (
         <div
           key={s}
@@ -536,30 +524,9 @@ export function PackageCreator({
               type="button"
               onClick={handleCreate}
               disabled={creating}
-              className="btn btn-primary flex items-center gap-2"
+              className="btn btn-primary"
             >
-              {creating && (
-                <svg
-                  className="w-4 h-4 animate-spin"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
-                  <path
-                    className="opacity-75"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                  />
-                </svg>
-              )}
+              {creating && <Loader2 size={14} className="animate-spin" aria-hidden="true" />}
               {creating ? 'Creating…' : 'Create Package'}
             </button>
           ) : (

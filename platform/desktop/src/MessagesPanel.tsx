@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Bot, Check, Inbox, Phone, Search, Trash2, Undo2, UserRound, X } from 'lucide-react';
 import { isNotFound, messages as api, type CallerMessage } from './api';
 import { numberKey, readableNumber, saidWhen } from './contactsModel';
 import { useToast } from './Toasts';
+import LoadError from './LoadError';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
@@ -175,12 +176,34 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
     );
   }
 
+  const onFilterKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const i = FILTERS.findIndex(([id]) => id === filter);
+    if (i < 0) return;
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (i + 1) % FILTERS.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + FILTERS.length) % FILTERS.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = FILTERS.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    setFilter(FILTERS[nextIdx][0]);
+    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+  };
+
   return (
     <div className="panel messages-page">
       <div className="messages-toolbar">
-        <div className="seg-tabs" role="tablist" aria-label="Which messages">
+        <div className="seg-tabs" role="tablist" aria-label="Which messages" onKeyDown={onFilterKey}>
           {FILTERS.map(([id, label]) => (
-            <button type="button" role="tab" key={id} aria-selected={filter === id} className={filter === id ? 'active' : undefined} onClick={() => setFilter(id)}>
+            <button
+              type="button"
+              role="tab"
+              key={id}
+              aria-selected={filter === id}
+              tabIndex={filter === id ? 0 : -1}
+              className={filter === id ? 'active' : undefined}
+              onClick={() => setFilter(id)}
+            >
               {label}
               {id === 'open' && fresh > 0 && (
                 <em className="nav-count" title={`${fresh} new`} aria-label={`${fresh} new`}>
@@ -192,7 +215,24 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
         </div>
         <label className="messages-search">
           <Search size={14} aria-hidden />
-          <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search names, numbers and words" aria-label="Search messages" />
+          <input
+            type="search"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && q) {
+                e.preventDefault();
+                setQ('');
+              }
+            }}
+            placeholder="Search names, numbers and words"
+            aria-label="Search messages"
+          />
+          {q && (
+            <button type="button" className="run-search-clear" aria-label="Clear search" title="Clear search" onClick={() => setQ('')}>
+              <X size={12} aria-hidden="true" />
+            </button>
+          )}
         </label>
       </div>
 
@@ -201,7 +241,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
           {notice}
         </p>
       )}
-      {error && <p className="form-error" role="alert">Could not read the messages: {error}</p>}
+      {error && <LoadError error={`Could not read the messages: ${error}`} onRetry={load} />}
       {list === null && !error && <p className="form-hint">Loading…</p>}
       {list !== null && shown.length === 0 && (
         <div className="messages-empty">

@@ -20,9 +20,45 @@ interface Session {
   browser: any;
   context: any;
   page: any;
+  abortController: AbortController;
 }
 
 const sessions = new Map<string, Session>();
+/** Count of `createSession` calls currently launching before insertion into `sessions` (closes TOCTOU race). */
+let inFlightSessions = 0;
+
+/** Maximum post-navigation settle delay permitted by `goto` (`options.settleMs`). */
+export const MAX_SETTLE_MS = 30_000;
+
+/** Clamp `options.settleMs` to a sane finite range `[0, MAX_SETTLE_MS]`. */
+export function clampSettleMs(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.trunc(n), MAX_SETTLE_MS);
+}
+
+function sleepCancellable(ms: number, signals: Array<AbortSignal | undefined>): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  const active = signals.filter((s): s is AbortSignal => Boolean(s));
+  if (active.some((s) => s.aborted)) {
+    return Promise.reject(new Error('[browser] settle wait aborted'));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      for (const s of active) s.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error('[browser] settle wait aborted'));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    for (const s of active) s.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 /** SSRF guard active for browser navigation — on under worker confinement, off when the
  *  operator opts into local-network access (mirrors http_request's allowLocal). Without it a
@@ -38,6 +74,11 @@ async function getChromium(): Promise<any> {
     chromiumLauncher = (pw as any).chromium;
   }
   return chromiumLauncher;
+}
+
+/** Test-only hook to inject a mock Playwright chromium launcher (pass `null` to reset). */
+export function _setChromiumLauncherForTest(launcher: any): void {
+  chromiumLauncher = launcher;
 }
 
 function sess(id: string): Session {
@@ -70,21 +111,28 @@ export async function createSession(args: Any): Promise<Any> {
   // driving a forEach of createSession) can't spawn unbounded browser processes and
   // exhaust the host. Configurable via OAIY_BROWSER_MAX_SESSIONS.
   const maxSessions = Math.max(1, Math.trunc(Number(process.env.OAIY_BROWSER_MAX_SESSIONS) || 16));
-  if (sessions.size >= maxSessions) {
+  const activeCount = sessions.size + inFlightSessions;
+  if (activeCount >= maxSessions) {
     throw new Error(
-      `[browser] too many open sessions (${sessions.size}/${maxSessions}); close some first`,
+      `[browser] too many open sessions (${activeCount}/${maxSessions}); close some first`,
     );
   }
-  const chromium = await getChromium();
-  // On a server we always run headless regardless of the requested mode.
-  // OAIY_BROWSER_CHANNEL=chrome (or msedge): the browser installed on this computer, where Playwright's own Chromium
-  // is not (`npx playwright install chromium` installs it).
-  const channel = process.env.OAIY_BROWSER_CHANNEL?.trim() || undefined;
-  const browser = await chromium.launch({ headless: config.headless !== false, ...(channel ? { channel } : {}) });
+  // Increment synchronously BEFORE any await so concurrent createSession calls cannot
+  // race past maxSessions while Playwright is loading/launching Chromium.
+  inFlightSessions++;
+  let browser: any = null;
+  let registered = false;
 
-  // If anything after launch throws, close the browser so we don't leak a
-  // Chromium process for every failed createSession.
+  // If anything during or after launch throws, close the browser so we don't leak a
+  // Chromium process for every failed createSession, and always release the in-flight slot.
   try {
+    const chromium = await getChromium();
+    // On a server we always run headless regardless of the requested mode.
+    // OAIY_BROWSER_CHANNEL=chrome (or msedge): the browser installed on this computer, where Playwright's own Chromium
+    // is not (`npx playwright install chromium` installs it).
+    const channel = process.env.OAIY_BROWSER_CHANNEL?.trim() || undefined;
+    browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
+
     const ctxOpts: Any = {};
     // Worker mode: don't let attacker page JS auto-save downloads into Chromium's temp dir
     // (outside the sandbox roots) and fill the host disk — there's no download consumer anyway.
@@ -166,16 +214,26 @@ export async function createSession(args: Any): Promise<Any> {
     }
     const page = await context.newPage();
     const id = `pw-${randomUUID()}`;
-    sessions.set(id, { browser, context, page });
+    const abortController = new AbortController();
+    if (typeof page?.once === 'function') {
+      page.once('close', () => abortController.abort(new Error('[browser] page closed')));
+    }
+    sessions.set(id, { browser, context, page, abortController });
+    registered = true;
     return { id, mode: 'chromium', createdAt: new Date().toISOString() };
   } catch (e) {
-    await browser.close().catch(() => {});
+    if (!registered && browser) {
+      await browser.close().catch(() => {});
+    }
     throw e;
+  } finally {
+    inFlightSessions--;
   }
 }
 
 export async function goto(args: Any): Promise<Any> {
-  const { page } = sess(args.sessionId);
+  const session = sess(args.sessionId);
+  const { page } = session;
   // Reject a navigation to a non-http(s) or internal/loopback/metadata URL up front (clean
   // error); the per-request route guard installed at createSession also covers redirects +
   // sub-resources. Only under worker confinement (operator can opt out with OAIY_HTTP_ALLOW_LOCAL).
@@ -185,7 +243,16 @@ export async function goto(args: Any): Promise<Any> {
     waitUntil: options.waitUntil ?? 'load',
     timeout: options.timeoutMs ?? 30000,
   });
-  if (options.settleMs > 0) await new Promise((r) => setTimeout(r, options.settleMs));
+  const settleMs = clampSettleMs(options.settleMs);
+  if (settleMs > 0) {
+    const callerSignal =
+      options.signal instanceof AbortSignal
+        ? options.signal
+        : args.signal instanceof AbortSignal
+          ? args.signal
+          : undefined;
+    await sleepCancellable(settleMs, [session.abortController.signal, callerSignal]);
+  }
   let title = '';
   try {
     title = await page.title();
@@ -326,6 +393,8 @@ export async function setCookies(args: Any): Promise<null> {
 export async function close(args: Any): Promise<null> {
   const s = sessions.get(args.sessionId);
   if (s) {
+    sessions.delete(args.sessionId);
+    s.abortController.abort(new Error('[browser] session closed'));
     try {
       await s.context.close();
     } catch {
@@ -336,7 +405,6 @@ export async function close(args: Any): Promise<null> {
     } catch {
       /* ignore */
     }
-    sessions.delete(args.sessionId);
   }
   return null;
 }

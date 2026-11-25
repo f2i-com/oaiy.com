@@ -6,7 +6,7 @@ and looked at now on `setup.status {refresh: true}`. No Docker, card or system_p
 """
 from __future__ import annotations
 
-import importlib.util, io, json, os, pathlib, socket, sys, tempfile, threading, time, unittest, zipfile
+import importlib.util, io, json, os, pathlib, socket, stat, sys, tempfile, threading, time, unittest, zipfile
 from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -73,6 +73,7 @@ class Counted:
 
 
 class DockerEngine(unittest.TestCase):
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX not supported on this platform")
     def test_an_answering_engine_is_running_with_its_image(self):
         e = FakeEngine({"/_ping": 200, f"/images/{plugin.IMAGE}/json": 200})
         with mock.patch.object(plugin, "docker_socket", return_value=e.path), \
@@ -82,6 +83,7 @@ class DockerEngine(unittest.TestCase):
         self.assertEqual((d["running"], d["image"], d["stalled"]), (True, True, False))
         self.assertEqual(e.asked, ["/_ping", f"/images/{plugin.IMAGE}/json"])
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX not supported on this platform")
     def test_an_engine_without_the_image(self):
         e = FakeEngine({"/_ping": 200})
         with mock.patch.object(plugin, "docker_socket", return_value=e.path):
@@ -89,6 +91,7 @@ class DockerEngine(unittest.TestCase):
         e.close()
         self.assertEqual((d["running"], d["image"]), (True, False))
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX not supported on this platform")
     def test_an_engine_that_takes_the_call_and_says_nothing_is_said_so_in_a_second_and_a_half(self):
         e = FakeEngine(silent=True)
         began = time.monotonic()
@@ -99,6 +102,7 @@ class DockerEngine(unittest.TestCase):
         self.assertEqual((d["running"], d["image"], d["stalled"]), (False, False, True))
         self.assertLess(took, 2.0)
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX not supported on this platform")
     def test_no_engine_is_said_at_once(self):
         began = time.monotonic()
         with mock.patch.object(plugin, "docker_socket", return_value=os.path.join(DATA, "no-such.sock")):
@@ -288,13 +292,17 @@ class Commands(unittest.TestCase):
 
 
 class TinyGpuVerification(unittest.TestCase):
-    def make_zip(self, entries: dict[str, bytes]) -> pathlib.Path:
+    def make_zip(self, entries: dict[str, bytes], modes: dict[str, int] | None = None, compress: int = zipfile.ZIP_STORED) -> pathlib.Path:
         tmp = pathlib.Path(tempfile.mkdtemp(prefix="egpu-zip-"))
         zpath = tmp / "TinyGPU.zip"
-        with zipfile.ZipFile(zpath, "w") as z:
+        modes = modes or {}
+        with zipfile.ZipFile(zpath, "w", compression=compress) as z:
             for name, content in entries.items():
                 zi = zipfile.ZipInfo("placeholder")
                 zi.filename = name
+                zi.compress_type = compress
+                if name in modes:
+                    zi.external_attr = modes[name] << 16
                 z.writestr(zi, content)
         return zpath
 
@@ -314,18 +322,83 @@ class TinyGpuVerification(unittest.TestCase):
                 with self.assertRaises(RuntimeError, msg=f"should reject {list(bad_entries)}"):
                     plugin.verify_tinygpu_zip(z)
 
-    def test_verify_tinygpu_app_rejects_adhoc_or_failed_gatekeeper_and_accepts_notarized(self):
+    def test_zip_rejects_symlinks_anywhere_before_extraction(self):
+        symlink_mode = stat.S_IFLNK | 0o777
+        # Symlink in a non-executable path (zip-slip staging vector before ditto runs)
+        z_res = self.make_zip(
+            {
+                "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin",
+                "TinyGPU.app/Contents/Resources/escape": b"/Applications",
+            },
+            modes={"TinyGPU.app/Contents/Resources/escape": symlink_mode},
+        )
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            plugin.verify_tinygpu_zip(z_res)
+
+        # Ensure install_tinygpu_app rejects it before invoking ditto
+        apps_dir = pathlib.Path(tempfile.mkdtemp(prefix="egpu-sym-apps-"))
+        with mock.patch.object(plugin, "quiet", side_effect=AssertionError("must not invoke ditto on symlink zip")):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                plugin.install_tinygpu_app(z_res, apps_dir / "TinyGPU.app")
+
+        # Symlink on the executable itself and on a directory entry
+        z_exe = self.make_zip(
+            {"TinyGPU.app/Contents/MacOS/TinyGPU": b"/bin/sh"},
+            modes={"TinyGPU.app/Contents/MacOS/TinyGPU": symlink_mode},
+        )
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            plugin.verify_tinygpu_zip(z_exe)
+
+        z_dir = self.make_zip(
+            {
+                "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin",
+                "TinyGPU.app/Contents/Frameworks/": b"/tmp",
+            },
+            modes={"TinyGPU.app/Contents/Frameworks/": symlink_mode},
+        )
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            plugin.verify_tinygpu_zip(z_dir)
+
+    def test_zip_enforces_entry_count_and_uncompressed_size_caps(self):
+        entries = {"TinyGPU.app/Contents/MacOS/TinyGPU": b"bin"}
+        for i in range(6):
+            entries[f"TinyGPU.app/Contents/Resources/f{i}.txt"] = b"ok"
+        z_many = self.make_zip(entries)
+        with mock.patch.object(plugin, "TINYGPU_MAX_ZIP_ENTRIES", 5):
+            with self.assertRaisesRegex(RuntimeError, "too many entries"):
+                plugin.verify_tinygpu_zip(z_many)
+
+        # Compressed zip bomb exceeding uncompressed cap
+        z_big = self.make_zip(
+            {
+                "TinyGPU.app/Contents/MacOS/TinyGPU": b"bin",
+                "TinyGPU.app/Contents/Resources/blob.bin": b"\x00" * 4096,
+            },
+            compress=zipfile.ZIP_DEFLATED,
+        )
+        with mock.patch.object(plugin, "TINYGPU_MAX_ZIP_UNCOMPRESSED_BYTES", 2048):
+            with self.assertRaisesRegex(RuntimeError, "uncompressed size exceeds limit"):
+                plugin.verify_tinygpu_zip(z_big)
+
+        # Within both caps succeeds
+        with mock.patch.object(plugin, "TINYGPU_MAX_ZIP_ENTRIES", 10), \
+             mock.patch.object(plugin, "TINYGPU_MAX_ZIP_UNCOMPRESSED_BYTES", 8192):
+            plugin.verify_tinygpu_zip(z_big)
+
+    def test_verify_tinygpu_app_rejects_adhoc_wrong_identifier_or_failed_gatekeeper_and_accepts_notarized(self):
         root = pathlib.Path(tempfile.mkdtemp(prefix="egpu-app-"))
         app = root / "TinyGPU.app"
         prog = app / "Contents" / "MacOS" / "TinyGPU"
         prog.parent.mkdir(parents=True)
         prog.write_bytes(b"bin")
+        seen_dvv = []
 
-        def run_with(verify_rc=0, dv_stderr="TeamIdentifier=A1B2C3D4E5\n", spctl_rc=0):
+        def run_with(verify_rc=0, dv_stderr="Identifier=org.tinygrad.tinygpu\nTeamIdentifier=A1B2C3D4E5\n", spctl_rc=0):
             def fake_quiet(argv, timeout, env=None):
                 if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
                     return plugin.subprocess.CompletedProcess(argv, verify_rc, "", "bad sig" if verify_rc else "")
-                if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
+                if argv[0] == "/usr/bin/codesign" and "-dvv" in argv:
+                    seen_dvv.append(argv)
                     return plugin.subprocess.CompletedProcess(argv, 0, "", dv_stderr)
                 if argv[0] == "/usr/sbin/spctl":
                     return plugin.subprocess.CompletedProcess(argv, spctl_rc, "", "rejected" if spctl_rc else "accepted")
@@ -334,12 +407,17 @@ class TinyGpuVerification(unittest.TestCase):
                 return plugin.verify_tinygpu_app(app)
 
         self.assertEqual(run_with(), "A1B2C3D4E5")
+        self.assertTrue(seen_dvv, "must query signing metadata with codesign -dvv")
         with self.assertRaises(RuntimeError):
             run_with(verify_rc=1)
         with self.assertRaises(RuntimeError):
-            run_with(dv_stderr="TeamIdentifier=not set\n")
+            run_with(dv_stderr="Identifier=org.tinygrad.tinygpu\nTeamIdentifier=not set\n")
         with self.assertRaises(RuntimeError):
             run_with(dv_stderr="Identifier=org.tinygrad.tinygpu\n")
+        with self.assertRaisesRegex(RuntimeError, "Identifier"):
+            run_with(dv_stderr="TeamIdentifier=A1B2C3D4E5\n")
+        with self.assertRaisesRegex(RuntimeError, "Identifier"):
+            run_with(dv_stderr="Identifier=com.evil.otherapp\nTeamIdentifier=A1B2C3D4E5\n")
         with self.assertRaises(RuntimeError):
             run_with(spctl_rc=3)
 
@@ -358,8 +436,8 @@ class TinyGpuVerification(unittest.TestCase):
                     return plugin.subprocess.CompletedProcess(argv, 0, "", "")
                 if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
                     return plugin.subprocess.CompletedProcess(argv, 0, "", "")
-                if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
-                    return plugin.subprocess.CompletedProcess(argv, 0, "", "TeamIdentifier=A1B2C3D4E5\n")
+                if argv[0] == "/usr/bin/codesign" and "-dvv" in argv:
+                    return plugin.subprocess.CompletedProcess(argv, 0, "", "Identifier=org.tinygrad.tinygpu\nTeamIdentifier=A1B2C3D4E5\n")
                 if argv[0] == "/usr/sbin/spctl":
                     return plugin.subprocess.CompletedProcess(argv, spctl_rc, "", "rejected" if spctl_rc else "accepted")
                 raise AssertionError(f"unexpected command: {argv}")
@@ -386,8 +464,8 @@ class TinyGpuVerification(unittest.TestCase):
         def fail_spctl(argv, timeout, env=None):
             if argv[0] == "/usr/bin/codesign" and "--verify" in argv:
                 return plugin.subprocess.CompletedProcess(argv, 0, "", "")
-            if argv[0] == "/usr/bin/codesign" and "-dv" in argv:
-                return plugin.subprocess.CompletedProcess(argv, 0, "", "TeamIdentifier=not set\n")
+            if argv[0] == "/usr/bin/codesign" and "-dvv" in argv:
+                return plugin.subprocess.CompletedProcess(argv, 0, "", "Identifier=org.tinygrad.tinygpu\nTeamIdentifier=not set\n")
             return plugin.subprocess.CompletedProcess(argv, 3, "", "rejected")
 
         with mock.patch.object(plugin, "TINYGPU_APP", dest), \

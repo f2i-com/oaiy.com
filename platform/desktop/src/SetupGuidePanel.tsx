@@ -196,7 +196,7 @@ export function waitingForTrust(plugins: PluginRecord[] | null | undefined): Plu
 /** One setup check: done, or what is missing and the way to it. */
 function CheckRow({ step: s, action, onNavigate, alarm }: { step: ReturnType<typeof deriveSetupSteps>[number]; action?: ReactNode; onNavigate: (target: StepTarget) => void; alarm?: boolean }) {
   return (
-    <li className={s.done ? 'setup-step is-done' : 'setup-step'}>
+    <li className={s.done ? 'setup-step is-done' : alarm ? 'setup-step is-alarm' : 'setup-step'}>
       <span className="setup-mark" aria-hidden>
         {s.done ? <Check size={14} /> : alarm ? <TriangleAlert size={14} /> : <CircleDashed size={14} />}
       </span>

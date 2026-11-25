@@ -169,8 +169,8 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
     h('option', { value: 'au' }, 'Australian numbers only'),
     h('option', { value: 'pattern' }, 'Numbers matching a pattern…'),
   ) as HTMLSelectElement;
-  const pattern = h('input', { placeholder: 'A regular expression the caller id must match, e.g. ^\\+?61' }) as HTMLInputElement;
-  const blocked = h('textarea', { placeholder: 'One number a line: never answered (any format: 0400 000 000, +61400000000)' }) as HTMLTextAreaElement;
+  const pattern = h('input', { 'aria-label': 'Caller ID regular expression', placeholder: 'A regular expression the caller id must match, e.g. ^\\+?61' }) as HTMLInputElement;
+  const blocked = h('textarea.blocked', { placeholder: 'One number a line: never answered (any format: 0400 000 000, +61400000000)' }) as HTMLTextAreaElement;
   const rejectPrivate = h('input', { type: 'checkbox' }) as HTMLInputElement;
   // While the person tries the receptionist out: the few numbers it deals with, and what happens to everyone else.
   const allowed = h('textarea', { placeholder: 'One number a line: yours, and whoever helps you try it (any format)' }) as HTMLTextAreaElement;

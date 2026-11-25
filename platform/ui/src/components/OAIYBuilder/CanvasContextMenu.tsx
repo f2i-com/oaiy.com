@@ -5,13 +5,14 @@
  * Provides quick access to copy/paste, grouping, and layout operations.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, type ReactNode } from 'react';
 import { ClipboardPaste, Copy, FoldVertical, Group, LayoutGrid, Redo2, Rows3, Undo2, UnfoldVertical, Ungroup } from 'lucide-react';
 import { shortcut } from '../../lib/keys';
+import Menu from '../ui/Menu';
 import type { Node } from '@xyflow/react';
 
 /** One item: the editor's menu row, with its shortcut at the end. */
-function Item({ icon, label, shortcut, onClick, disabled = false }: {
+function Item({ icon, label, shortcut: keyHint, onClick, disabled = false }: {
   icon: ReactNode;
   label: string;
   shortcut?: string;
@@ -24,13 +25,11 @@ function Item({ icon, label, shortcut, onClick, disabled = false }: {
       role="menuitem"
       onClick={onClick}
       disabled={disabled}
-      className="items-center disabled:opacity-40"
-      // The menu's rows set their cursor; a disabled one says so.
-      style={disabled ? { cursor: 'not-allowed' } : undefined}
+      className="items-center"
     >
       {icon}
       <span>{label}</span>
-      {shortcut && <small className="ml-auto pl-3 font-mono">{shortcut}</small>}
+      {keyHint && <small className="ml-auto pl-3 font-mono">{keyHint}</small>}
     </button>
   );
 }
@@ -99,119 +98,36 @@ export function CanvasContextMenu({
     } else {
       onPaste();
     }
-    onClose();
-  }, [position, onPaste, onClose, screenToFlowPosition]);
-
-  const handleCopy = useCallback(() => {
-    onCopy();
-    onClose();
-  }, [onCopy, onClose]);
-
-  const handleGroup = useCallback(() => {
-    onGroupSelected();
-    onClose();
-  }, [onGroupSelected, onClose]);
-
-  const handleUngroup = useCallback(() => {
-    onUngroupSelected();
-    onClose();
-  }, [onUngroupSelected, onClose]);
-
-  const handleLayoutHorizontal = useCallback(() => {
-    onAutoLayoutHorizontal();
-    onClose();
-  }, [onAutoLayoutHorizontal, onClose]);
-
-  const handleLayoutVertical = useCallback(() => {
-    onAutoLayoutVertical();
-    onClose();
-  }, [onAutoLayoutVertical, onClose]);
-
-  const handleCollapse = useCallback(() => {
-    onCollapseAll();
-    onClose();
-  }, [onCollapseAll, onClose]);
-
-  const handleExpand = useCallback(() => {
-    onExpandAll();
-    onClose();
-  }, [onExpandAll, onClose]);
-
-  const menuRef = useRef<HTMLDivElement>(null);
-  // At the pointer, moved in where it would run off the window (a right click near its right or bottom edge)
-  const [at, setAt] = useState(position);
-  useLayoutEffect(() => {
-    const menu = menuRef.current;
-    if (!menu) return;
-    const { width, height } = menu.getBoundingClientRect();
-    const margin = 8;
-    setAt({
-      x: Math.max(margin, Math.min(position.x, window.innerWidth - width - margin)),
-      y: Math.max(margin, Math.min(position.y, window.innerHeight - height - margin)),
-    });
-  }, [position]);
-
-  // Close the menu when Escape is pressed.
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
-  // Focus the first enabled menu item on mount.
-  useEffect(() => {
-    const firstEnabled = menuRef.current?.querySelector<HTMLButtonElement>(
-      'button:not([disabled])'
-    );
-    firstEnabled?.focus();
-  }, []);
+  }, [position, onPaste, screenToFlowPosition]);
 
   return (
-    <>
-      {/* Backdrop to close menu when clicking outside */}
-      <div className="fixed inset-0 z-40" onClick={onClose} />
+    <Menu open at={position} onClose={onClose} label="Canvas">
+      {/* Undo/Redo Section */}
+      {onUndo && <Item icon={<Undo2 size={14} />} label="Undo" shortcut={shortcut('Z')} onClick={onUndo} disabled={!canUndo} />}
+      {onRedo && <Item icon={<Redo2 size={14} />} label="Redo" shortcut={shortcut('Z', { shift: true })} onClick={onRedo} disabled={!canRedo} />}
+      {(onUndo || onRedo) && <hr />}
 
-      {/* Context Menu: the editor's menu, at the pointer. */}
-      <div
-        ref={menuRef}
-        role="menu"
-        aria-orientation="vertical"
-        aria-label="Canvas"
-        className="oaiy-menu"
-        style={{ left: at.x, top: at.y }}
-      >
-        {/* Undo/Redo Section */}
-        {onUndo && <Item icon={<Undo2 size={14} />} label="Undo" shortcut={shortcut('Z')} onClick={() => { onUndo(); onClose(); }} disabled={!canUndo} />}
-        {onRedo && <Item icon={<Redo2 size={14} />} label="Redo" shortcut={shortcut('Z', { shift: true })} onClick={() => { onRedo(); onClose(); }} disabled={!canRedo} />}
-        {(onUndo || onRedo) && <hr />}
+      {/* Copy/Paste Section */}
+      <Item icon={<Copy size={14} />} label="Copy" shortcut={shortcut('C')} onClick={onCopy} disabled={!hasSelectedNodes} />
+      <Item icon={<ClipboardPaste size={14} />} label="Paste" shortcut={shortcut('V')} onClick={handlePaste} disabled={!hasClipboard} />
 
-        {/* Copy/Paste Section */}
-        <Item icon={<Copy size={14} />} label="Copy" shortcut={shortcut('C')} onClick={handleCopy} disabled={!hasSelectedNodes} />
-        <Item icon={<ClipboardPaste size={14} />} label="Paste" shortcut={shortcut('V')} onClick={handlePaste} disabled={!hasClipboard} />
+      <hr />
 
-        <hr />
+      {/* Group Section */}
+      <Item icon={<Group size={14} />} label="Group the selection" shortcut={shortcut('G')} onClick={onGroupSelected} disabled={!canGroup} />
+      <Item icon={<Ungroup size={14} />} label="Ungroup" onClick={onUngroupSelected} disabled={!canUngroup} />
 
-        {/* Group Section */}
-        <Item icon={<Group size={14} />} label="Group the selection" shortcut={shortcut('G')} onClick={handleGroup} disabled={!canGroup} />
-        <Item icon={<Ungroup size={14} />} label="Ungroup" onClick={handleUngroup} disabled={!canUngroup} />
+      <hr />
 
-        <hr />
+      {/* Layout Section */}
+      <Item icon={<LayoutGrid size={14} />} label="Lay out left to right" onClick={onAutoLayoutHorizontal} />
+      <Item icon={<Rows3 size={14} />} label="Lay out top to bottom" onClick={onAutoLayoutVertical} />
 
-        {/* Layout Section */}
-        <Item icon={<LayoutGrid size={14} />} label="Lay out left to right" onClick={handleLayoutHorizontal} />
-        <Item icon={<Rows3 size={14} />} label="Lay out top to bottom" onClick={handleLayoutVertical} />
+      <hr />
 
-        <hr />
-
-        {/* Collapse/Expand Section */}
-        {/* (in the toolbar's words: Compact, Expand) */}
-        <Item icon={<FoldVertical size={14} />} label="Make every node compact" onClick={handleCollapse} />
-        <Item icon={<UnfoldVertical size={14} />} label="Expand every node" onClick={handleExpand} />
-      </div>
-    </>
+      {/* Collapse/Expand Section */}
+      <Item icon={<FoldVertical size={14} />} label="Make every node compact" onClick={onCollapseAll} />
+      <Item icon={<UnfoldVertical size={14} />} label="Expand every node" onClick={onExpandAll} />
+    </Menu>
   );
 }

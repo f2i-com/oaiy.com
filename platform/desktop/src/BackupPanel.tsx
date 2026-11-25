@@ -182,7 +182,7 @@ export function BackupLine({ onOpenSettings }: { onOpenSettings: () => void }) {
   };
   if (line.nudge) {
     return (
-      <div className="datadir-note datadir-row" role="status" data-kind={line.kind} style={{ marginTop: 8 }}>
+      <div className="datadir-note datadir-row backup-note-spaced" role="status" data-kind={line.kind}>
         <span>{line.text}</span>
         <button className="btn-tiny" onClick={open}>
           <Archive size={13} /> {label}
@@ -191,7 +191,7 @@ export function BackupLine({ onOpenSettings }: { onOpenSettings: () => void }) {
     );
   }
   return (
-    <div className="overview-status" role="status" data-kind={line.kind} style={{ marginTop: 8 }}>
+    <div className="overview-status backup-note-spaced" role="status" data-kind={line.kind}>
       <Archive size={14} aria-hidden />
       <strong>{line.kind === 'pending' ? 'Backup' : line.text}</strong>
       {line.kind === 'pending' && <small>{line.text}</small>}
@@ -222,7 +222,7 @@ function OpenButton({ path, onError }: { path: string; onError: (message: string
 /** A short list of plain sentences. */
 function Sentences({ items }: { items: string[] }) {
   return (
-    <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+    <ul className="backup-list">
       {items.map((t, i) => (
         <li key={i}>{visibleText(t)}</li>
       ))}
@@ -567,47 +567,47 @@ export function BackupSection() {
 
       {/* ---------- a restore waits for a restart ---------- */}
       {pending && (
-        <div className="banner banner-pending" role="status" aria-label="Restore ready">
-          <p style={{ margin: 0 }}>
+        <div className="banner banner-pending banner-stack" role="status" aria-label="Restore ready">
+          <p className="backup-line">
             {pending.kind === 'undo'
               ? `An undo is ready (${pending.files} file${pending.files === 1 ? '' : 's'}). Restart OAIY to finish undoing the last restore.`
               : `A restore is ready (${pending.files} file${pending.files === 1 ? '' : 's'}). Restart OAIY to finish restoring.`}
           </p>
           {pending.expired ? (
-            <p role="alert" style={{ margin: '6px 0 0' }}>
+            <p role="alert" className="banner-sub">
               Prepared {agoWords(pending.stagedAt)}: that is more than a day, so it will be discarded, not applied, at the
               next start. Cancel it and prepare it again if you still want it.
             </p>
           ) : (
-            <p style={{ margin: '6px 0 0' }}>
+            <p className="banner-sub">
               Prepared {agoWords(pending.stagedAt)}; it is discarded, not applied, at the next start after{' '}
               {formatTimestamp(pending.expiresAt)}.
             </p>
           )}
           {pending.kind !== 'undo' && (
-            <p style={{ margin: '6px 0 0' }}>
+            <p className="banner-sub">
               {(pending.classes ?? []).length > 0
                 ? `You ticked: ${(pending.classLabels ?? pending.classes ?? []).join(', ')}.`
                 : 'Only your data is brought back: nothing that can run or change settings was ticked.'}
             </p>
           )}
           {skipped.length > 0 && (
-            <div style={{ margin: '6px 0 0' }}>
+            <div className="banner-sub">
               Left out of it:
               <Sentences items={skipped} />
             </div>
           )}
           {pending.agentStorage && (
-            <p style={{ margin: '6px 0 0' }}>
+            <p className="banner-sub">
               Your Agent’s conversations and projects are put back when the Agent opens after the restart.
             </p>
           )}
           {restartError && (
-            <p role="alert" style={{ margin: '6px 0 0' }}>
+            <p role="alert" className="banner-sub">
               {restartError}
             </p>
           )}
-          <div className="form-actions" style={{ marginTop: 8 }}>
+          <div className="form-actions backup-actions">
             <button className="btn btn-primary" disabled={restarting || pendingBusy || pending.expired} onClick={() => void restart()}>
               {pending.kind === 'undo' ? 'Restart to finish the undo' : 'Restart to finish restoring'}
             </button>
@@ -621,10 +621,12 @@ export function BackupSection() {
       {/* ---------- how the last restore went ---------- */}
       {/* The reason is the desktop's own words: it says whether everything was put back, or which files were not. */}
       {last && !last.ok && (
-        <div className="banner banner-err" role="alert">
-          {last.kind === 'undo'
-            ? `The undo did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`
-            : `The restore did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`}
+        <div className="banner banner-err banner-stack" role="alert">
+          <span>
+            {last.kind === 'undo'
+              ? `The undo did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`
+              : `The restore did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`}
+          </span>
           {(last.notes ?? []).length > 0 && <Sentences items={last.notes} />}
         </div>
       )}
@@ -676,6 +678,7 @@ export function BackupSection() {
             type="password"
             autoComplete="new-password"
             aria-label="Backup passphrase"
+            aria-invalid={tooShort || undefined}
             ref={passphraseRef}
             value={passphrase}
             onChange={(e) => setPassphrase(e.target.value)}
@@ -688,14 +691,23 @@ export function BackupSection() {
             type="password"
             autoComplete="new-password"
             aria-label="Backup passphrase again"
+            aria-invalid={mismatch || undefined}
             value={again}
             onChange={(e) => setAgain(e.target.value)}
             disabled={making}
           />
         </label>
-        {tooShort && <p className="form-hint">Use at least {MIN_PASSPHRASE} characters.</p>}
-        {mismatch && <p className="form-hint">The two passphrases are not the same.</p>}
-        <div className="banner banner-pending" role="note">
+        {tooShort && (
+          <p className="form-error" role="alert">
+            Use at least {MIN_PASSPHRASE} characters.
+          </p>
+        )}
+        {mismatch && (
+          <p className="form-error" role="alert">
+            The two passphrases are not the same.
+          </p>
+        )}
+        <div className="banner banner-warn" role="note">
           <span>
             <strong>If you lose the passphrase, the backup is lost.</strong> Nobody, including OAIY, can open it without
             it and nobody can reset it. The passphrase is not stored anywhere.
@@ -729,8 +741,8 @@ export function BackupSection() {
 
       {making && (
         <div role="status" aria-live="polite">
-          <div className="progress-bar" role="progressbar" aria-label="Backup progress" style={{ margin: '8px 0' }}>
-            <div className="progress-fill progress-indet" style={{ width: '40%' }} />
+          <div className="progress-bar backup-progress" role="progressbar" aria-label="Backup progress">
+            <div className="progress-fill progress-indet backup-progress-fill" />
           </div>
           <span className="form-hint">{status?.running?.label ?? 'Starting…'}</span>
         </div>
@@ -741,27 +753,27 @@ export function BackupSection() {
         </div>
       )}
       {result && (
-        <div className="banner banner-pending" role="status" aria-label="Backup created">
+        <div className="banner banner-ok banner-stack" role="status" aria-label="Backup created">
           <strong>Backup created.</strong>
-          <div className="settings-value" style={{ marginTop: 6 }}>
+          <div className="settings-value banner-sub">
             <code className="path-code">{result.path}</code>
             <OpenButton path={result.path} onError={setCreateError} />
           </div>
-          <p style={{ margin: '6px 0 0' }}>
+          <p className="banner-sub">
             {formatBytes(result.size)} · {result.counts.files} file{result.counts.files === 1 ? '' : 's'}
             {result.counts.agentProjects + result.counts.agentConversations > 0 &&
               ` · the Agent: ${result.counts.agentProjects} project${result.counts.agentProjects === 1 ? '' : 's'}, ${result.counts.agentConversations} conversation${result.counts.agentConversations === 1 ? '' : 's'}`}
           </p>
           {result.verified && (
-            <p style={{ margin: '6px 0 0' }}>Verified: the file was decrypted and every item checked after writing.</p>
+            <p className="banner-sub">Verified: the file was decrypted and every item checked after writing.</p>
           )}
           {result.includesKeys && (
-            <p style={{ margin: '6px 0 0' }}>
+            <p className="banner-sub">
               This backup includes your API provider keys: treat it as carefully as the keys.
             </p>
           )}
           {result.partial.length > 0 && (
-            <div style={{ marginTop: 6 }}>
+            <div className="banner-sub">
               <strong>Not everything was included:</strong>
               <Sentences items={result.partial} />
             </div>
@@ -812,7 +824,7 @@ export function BackupSection() {
             {preview.totalFiles} file{preview.totalFiles === 1 ? '' : 's'}, {formatBytes(preview.totalBytes)}
             {preview.includesKeys && ' · includes API provider keys'}
           </div>
-          <div className="settings-grid" style={{ marginTop: 8 }}>
+          <div className="settings-grid backup-block">
             {preview.categories.map((c) => (
               <div className="settings-row" key={c.id}>
                 <span className="settings-label">{c.label}</span>
@@ -823,26 +835,26 @@ export function BackupSection() {
             ))}
           </div>
           {preview.lacks.length > 0 && (
-            <div style={{ marginTop: 8 }}>
+            <div className="backup-block">
               This backup does not have: {preview.lacks.join(', ')}.
             </div>
           )}
           {preview.partial.length > 0 && (
-            <div style={{ marginTop: 8 }}>
+            <div className="backup-block">
               <strong>Warnings from when it was made:</strong>
               <Sentences items={preview.partial} />
             </div>
           )}
           {preview.excluded.length > 0 && (
-            <details style={{ marginTop: 8 }}>
+            <details className="backup-block">
               <summary>Left out on purpose ({preview.excluded.length})</summary>
               <Sentences items={preview.excluded.map((x) => `${x.pattern}: ${x.reason}`)} />
             </details>
           )}
           {preview.notRestored.length > 0 && (
-            <details style={{ marginTop: 8 }}>
+            <details className="backup-block">
               <summary>Not restored ({preview.notRestored.length})</summary>
-              <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
+              <ul className="backup-scroll-list">
                 {preview.notRestored.map((n, i) => (
                   <li key={`${n.name}-${i}`}>
                     <code className="path-code">{visibleText(n.name)}</code>: {visibleText(n.why)}
@@ -852,22 +864,22 @@ export function BackupSection() {
             </details>
           )}
           {preview.redo.length > 0 && (
-            <div style={{ marginTop: 8 }}>
+            <div className="backup-block">
               <strong>After restoring you will need to:</strong>
               <Sentences items={preview.redo} />
             </div>
           )}
           {preview.notes.length > 0 && (
-            <div style={{ marginTop: 8 }}>
+            <div className="backup-block">
               <strong>Notes:</strong>
               <Sentences items={preview.notes} />
             </div>
           )}
 
           {/* What can run or reconfigure things: every item by name, each kind brought back only if ticked. */}
-          <div className="banner banner-pending" role="group" aria-label="What can run or change settings" style={{ marginTop: 12 }}>
+          <div className="banner banner-pending banner-stack backup-block-lg" role="group" aria-label="What can run or change settings">
             <strong>What can run or change settings</strong>
-            <p style={{ margin: '6px 0 0' }}>
+            <p className="banner-sub">
               These can run programs, send messages, point OAIY at other servers, or change what OAIY and the Agent are
               allowed to do. Nothing here is brought back unless you tick it, so tick only what you recognise as yours.
               A backup someone else made can hold things you do not want.
@@ -877,7 +889,7 @@ export function BackupSection() {
               .map((c) => {
                 const items = preview.items.filter((i) => i.class === c.id);
                 return (
-                  <div key={c.id} style={{ marginTop: 10 }}>
+                  <div key={c.id} className="backup-block-lg">
                     <label className="form-row form-row-inline">
                       <input
                         type="checkbox"
@@ -890,15 +902,15 @@ export function BackupSection() {
                         <strong>{c.label}</strong> ({c.count})
                       </span>
                     </label>
-                    <p className="form-hint" style={{ margin: '2px 0 0 24px' }}>
+                    <p className="form-hint backup-indent">
                       {c.description}
                     </p>
                     {items.length > 0 && (
-                      <details open style={{ margin: '4px 0 0 24px' }}>
+                      <details open className="backup-indent">
                         <summary>
                           The {items.length} item{items.length === 1 ? '' : 's'}
                         </summary>
-                        <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
+                        <ul className="backup-scroll-list">
                           {items.map((i, n) => (
                             <li key={`${i.name}-${n}`}>
                               <code className="path-code">{visibleText(i.name)}</code> — {visibleText(i.title)}: {visibleText(i.what)}
@@ -910,19 +922,19 @@ export function BackupSection() {
                   </div>
                 );
               })}
-            {preview.classes.every((c) => c.count === 0) && <p style={{ margin: '6px 0 0' }}>This backup holds nothing of that kind.</p>}
-            <div className="form-actions" style={{ marginTop: 10 }}>
+            {preview.classes.every((c) => c.count === 0) && <p className="banner-sub">This backup holds nothing of that kind.</p>}
+            <div className="form-actions backup-block-lg">
               <button className="btn btn-secondary" disabled={staging} onClick={selectAll}>
                 Select all of my own backup
               </button>
             </div>
             {ticked.length === 0 && (
-              <p style={{ margin: '6px 0 0' }}>
+              <p className="banner-sub">
                 Nothing is ticked, so only what carries no words and does nothing comes back (opening hours, the steps between the times offered, and numbers not to be contacted). Everything listed above stays behind until you tick it.
               </p>
             )}
             {preview.keys.inBackup && (
-              <div style={{ marginTop: 10 }}>
+              <div className="backup-block-lg">
                 <label className="form-row form-row-inline">
                   <input
                     type="checkbox"
@@ -933,14 +945,14 @@ export function BackupSection() {
                   />
                   <span>Bring back the API keys that are in this backup</span>
                 </label>
-                <p className="form-hint" style={{ margin: '2px 0 0 24px' }}>
+                <p className="form-hint backup-indent">
                   The keys come back only when this is ticked, and only for the provider lists you tick above (OAIY’s AI
                   providers and the Agent’s settings). Otherwise those come back without keys.
                 </p>
               </div>
             )}
           </div>
-          <div className="form-actions" style={{ marginTop: 10 }}>
+          <div className="form-actions backup-block-lg">
             <button className="btn btn-primary" disabled={staging} onClick={() => void stage()}>
               Prepare restore
             </button>

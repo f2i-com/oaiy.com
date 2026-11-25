@@ -65,11 +65,15 @@ export function reloadRequiresTrustReconfirm(
   }
   const prevEmbedded = prevManifest as OAIYPackageManifestWithEmbedded;
   const nextEmbedded = nextManifest as OAIYPackageManifestWithEmbedded;
-  // Content hash changed: always re-prompt for non-signature-verified packages OR
-  // packages declaring custom nodes, services, macros, or embedded code.
-  const contentHashChanged =
-    Boolean(nextContentHash) &&
-    (prevContentHash === undefined || prevContentHash !== nextContentHash);
+  // Content hash changed: fail closed if a previously-recorded contentHash disappears
+  // on reload, and always re-prompt for non-signature-verified packages OR packages
+  // declaring custom nodes, services, macros, or embedded code.
+  if (prevContentHash && !nextContentHash) {
+    return true;
+  }
+  const contentHashChanged = prevContentHash !== undefined
+    ? (!nextContentHash || prevContentHash !== nextContentHash)
+    : Boolean(nextContentHash);
   if (contentHashChanged) {
     const declaresActiveComponents =
       (prevManifest.nodes?.length ?? 0) > 0 ||
@@ -140,9 +144,12 @@ interface UsePackageManagerOptions {
   updateFlow: (id: string, updates: Partial<Omit<Flow, 'id' | 'createdAt'>>) => void;
   getSettings: () => ProjectSettings;
   loadPackageNodes: (packageId: string, packagePath: string, nodes: PackageNodeModule[]) => Promise<Array<{ originalId: string; prefixedId: string; definition: NodeDefinition }>>;
-  unloadPackageNodes: (packageId: string) => void;
-  loadEmbeddedContent: (packageId: string, manifest: OAIYPackageManifestWithEmbedded) => Promise<unknown>;
-  unloadEmbeddedContent: (packageId: string) => void;
+  unloadPackageNodes: (packageId: string) => void | Promise<void>;
+  loadEmbeddedContent: (packageId: string, manifest: OAIYPackageManifestWithEmbedded) => Promise<{
+    customNodes?: { loaded: number; failed: number; loadedIds?: string[] };
+    extensions?: { loaded: number; failed: number };
+  } | unknown>;
+  unloadEmbeddedContent: (packageId: string) => void | Promise<void>;
 }
 
 /**
@@ -365,13 +372,15 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     const embeddedManifest = manifest as OAIYPackageManifestWithEmbedded;
     if (embeddedManifest.embeddedCustomNodes?.length || embeddedManifest.embeddedNodeExtensions?.length) {
       try {
-        const embeddedResults = await loadEmbeddedContent(manifest.id, embeddedManifest);
+        const embeddedResults = await loadEmbeddedContent(manifest.id, embeddedManifest) as {
+          customNodes?: { loadedIds?: string[] };
+        } | undefined;
         logger.debug(`Loaded embedded content for package ${manifest.id}`, { results: embeddedResults });
 
-        // Add embedded custom node IDs for flow prefixing
-        if (embeddedManifest.embeddedCustomNodes) {
-          for (const node of embeddedManifest.embeddedCustomNodes) {
-            customNodeIds.push(node.id);
+        // Only add embedded custom node IDs whose compilation & registration succeeded
+        if (embeddedResults?.customNodes?.loadedIds?.length) {
+          for (const id of embeddedResults.customNodes.loadedIds) {
+            customNodeIds.push(id);
           }
         }
       } catch (err) {
@@ -671,11 +680,13 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     const embeddedManifest = manifest as OAIYPackageManifestWithEmbedded;
     if (embeddedManifest.embeddedCustomNodes?.length || embeddedManifest.embeddedNodeExtensions?.length) {
       try {
-        await loadEmbeddedContent(packageId, embeddedManifest);
-        // Add embedded custom node IDs for flow prefixing
-        if (embeddedManifest.embeddedCustomNodes) {
-          for (const node of embeddedManifest.embeddedCustomNodes) {
-            customNodeIds.push(node.id);
+        const embeddedResults = await loadEmbeddedContent(packageId, embeddedManifest) as {
+          customNodes?: { loadedIds?: string[] };
+        } | undefined;
+        // Only add embedded custom node IDs whose compilation & registration succeeded
+        if (embeddedResults?.customNodes?.loadedIds?.length) {
+          for (const id of embeddedResults.customNodes.loadedIds) {
+            customNodeIds.push(id);
           }
         }
       } catch (err) {
@@ -917,10 +928,16 @@ export function usePackageManager(options: UsePackageManagerOptions) {
     if (!pkg) return;
 
     // Unload package nodes (path-based and embedded)
-    unloadPackageNodes(packageId);
-    unloadEmbeddedContent(packageId);
+    void unloadPackageNodes(packageId);
+    void unloadEmbeddedContent(packageId);
     packageVerificationsRef.current.delete(packageId);
     packageContentHashesRef.current.delete(packageId);
+    setPackagePermissions(prev => {
+      if (!prev.has(packageId)) return prev;
+      const next = new Map(prev);
+      next.delete(packageId);
+      return next;
+    });
 
     // Remove from loaded packages
     setLoadedPackages(prev => {

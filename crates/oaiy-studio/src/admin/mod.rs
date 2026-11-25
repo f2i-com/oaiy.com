@@ -826,5 +826,19 @@ mod tests {
         assert!(PAGE.contains("trustedMediaOrigin"), "ui.html must restrict key/media origins");
         assert!(PAGE.contains("[\\x00-\\x1f\\x7f]"), "ui.html must reject ASCII control chars in media/file URLs");
         assert!(PAGE.contains("\"/api/play/node/\" + encodeURIComponent(node) + \"/\""), "ui.html must scope peer image URLs to the peer node route");
+        assert!(!PAGE.contains("`/api/jobs/${j.id}`"), "ui.html must encode and validate job IDs on delete");
+        assert!(PAGE.contains("`/api/jobs/${encodeURIComponent(safeJobId(j.id))}`"), "ui.html must use safeJobId for viewer delete");
+        assert!(!PAGE.contains("data-job=\"${j.id}\""), "ui.html must escape job IDs in gallery data attributes");
+    }
+
+    #[test]
+    fn ui_wave5_accessibility_and_polish_contracts() {
+        assert!(PAGE.contains(".msg.assistant .body code"), "inline code inside assistant bubbles must have distinct contrast");
+        assert!(PAGE.contains(".strip .t-gpu { background: var(--go); color: var(--on-accent); }"), "GPU strip segment must use accessible on-accent text");
+        assert!(!PAGE.contains(".dl-cnt { opacity:"), "category counts must not drop contrast via opacity");
+        assert!(PAGE.contains(r#"id="toasts" aria-live="polite""#), "toasts region must use polite aria-live");
+        for id in ["gallery-search", "viewer-prev", "viewer-next", "log-search", "log-level", "log-copy", "log-clear", "log-jump"] {
+            assert!(PAGE.contains(&format!(r#"id="{id}""#)), "ui.html missing expected control #{id}");
+        }
     }
 }

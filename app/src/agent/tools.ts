@@ -272,6 +272,10 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
   const where = media.discovered ? `OAIY at ${media.discovered.origin}` : new URL(media.baseUrl).host;
   const tools: ToolSpec[] = [];
   const ids = (list: Array<{ id: string }>) => (list.length ? { enum: list.map((m) => m.id) } : {});
+  const optionalModel = (list: Array<{ id: string }> | undefined, kind: string) =>
+    (list?.length ?? 0) > 1 || !media!.discovered
+      ? { model: { type: 'string', description: `Optional ${kind} model id (defaults to the configured model)`, ...ids(list ?? []) } }
+      : {};
   if (ready.image) {
     tools.push({
       name: 'generate_image',
@@ -369,6 +373,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
         properties: {
           text: { type: 'string', description: 'What to say' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/line-1.mp3' },
+          ...optionalModel(media.speechModels, 'speech'),
           voice: { type: 'string', description: 'A saved voice or an OpenAI voice name' },
           voice_description: { type: 'string', description: 'A voice described in words, or how to say the line' },
           language: str,
@@ -411,6 +416,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           instrumental: { type: 'boolean' },
           seconds: { type: 'number', description: 'Length in seconds' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/theme.mp3' },
+          ...optionalModel(media.musicModels, 'music'),
           seed: int,
         },
       },
@@ -430,6 +436,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           description: { type: 'string', description: 'What makes the sound, where, and how it sounds' },
           seconds: { type: 'number', description: 'Length in seconds, up to 30 (default 10)' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/rain.wav' },
+          ...optionalModel(media.soundModels, 'sound effect'),
           seed: int,
         },
       },
@@ -455,6 +462,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
         properties: {
           image: { type: 'string', description: 'Project path of the picture of the object alone (png, jpg or webp)' },
           path: { type: 'string', description: 'Where to save the model, e.g. assets/models/lamp.glb (always .glb)' },
+          ...optionalModel(media.model3dModels, '3D'),
           faces: { ...int, minimum: 1000, maximum: 2_000_000, description: 'Triangles in the mesh (default 200000); fewer for a small or far-off object, e.g. 20000' },
           resolution: { ...int, enum: [1024, 1536], description: '1536 for finer detail, and slower (default 1024)' },
           seed: int,
@@ -788,7 +796,7 @@ export const TOOLS: ToolSpec[] = [
     description:
       'Run JavaScript or Python on the Zipp VM, sandboxed in a Worker, to compute, transform data or answer with code. Paths are project-relative ("/" is the root). ' +
       'JavaScript: Node-style require("fs"|"path"), fs.readFileSync/writeFileSync/readdirSync/statSync, fs.walkSync, fs.grepSync, global fetch(), process.argv; top-level await works; the last expression\'s value is returned as `result`. ' +
-      'Python 3 subset (math, json, re, csv, collections, itertools, dataclasses, statistics, fractions, hashlib; no pip, and no exec, eval, compile, importlib.util or runpy): open() sees the project files matched by `files` (default: the project\'s files up to 2 MiB each, 16 MiB in all) and files it writes are saved back. ' +
+      'Python 3 subset (math, json, re, csv, collections, itertools, dataclasses, statistics, fractions, hashlib; no pip, and no exec, eval, compile or runpy): open() sees the project files matched by `files` (default: the project\'s files up to 2 MiB each, 16 MiB in all) and files it writes are saved back. ' +
       'Python `code` runs at the project root, where a project module imports by its path (from apps.game import main loads /apps/game/main.py; sys.path changes nothing); a script run with `file` imports the modules beside it by name, and one named test_*.py runs its test_ functions as pytest does. ' +
       'Network requests go through the /internet gate and only reach sites that allow cross-origin requests from a browser.',
     parameters: {
@@ -911,7 +919,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'page_check',
     description:
       'Check a web page (an .html file of the project, with its CSS, images and JavaScript) in the live preview, which switches to show it: it renders the page, runs its scripts and returns script errors and files that did not load. ' +
-      'The page\'s JavaScript runs on the Zipp VM against the page\'s real DOM, so classic browser JavaScript works (DOM, events, timers, canvas, localStorage, fetch of the project\'s own files); ES module import/export, JSX and the internet (CDN scripts, fonts, images) do not. Errors inside async code other than handlers may go unreported. Run it after every change to a page. ' +
+      'The page\'s JavaScript runs on the Zipp VM against the page\'s real DOM, so classic browser JavaScript works (DOM, events, timers, canvas, localStorage, fetch of the project\'s own files) and bundled offline Three.js <script type="module"> imports (three, three/addons/...) work; arbitrary ES module imports between files, JSX, and the internet (other CDN scripts, web fonts, remote images) do not. Errors inside async code other than handlers may go unreported. Run it after every change to a page. ' +
       'A SoftN app\'s pages (its index.html, pages/*.html) are the app\'s, not web pages: softn_check checks them.',
     parameters: { type: 'object', properties: { path: { ...str, description: 'The page, e.g. "site/index.html" (a folder means its index.html); optional when the project has one page' } } },
   },
@@ -986,7 +994,7 @@ export const SENT_CODE_FILE = /^(?:__main__\.py|__oaiy_main__\.py|<stdin>|<strin
 
 /**
  * What code_run or sandbox_shell says of Python that reached for exec, eval or compile (`stderr`: its errors), or null.
- * The sandbox's Python (Zipp's) has none of them, nor importlib.util or runpy: Nanbeige 4.3 33B, loading a snake game's
+ * The sandbox's Python (Zipp's) has none of them, nor runpy: Nanbeige 4.3 33B, loading a snake game's
  * main.py to test it, sent code_run a script that exec'd its text six times over, told each time to fix "the file the
  * error points to". `source`: the code or command that ran, for the module it was after (a quoted path to a .py file).
  * What it says to do instead was tried on Zipp's engine (sentCode.test.ts): code given as text runs at the project root,
@@ -1012,7 +1020,7 @@ export function execHint(stderr: string, source: string, tool: 'code_run' | 'san
     ? `code given as text runs at the project's root, where a project file imports by its path (${byPath} loads ${file}; changing sys.path does not change where imports are found). Or write the test as a file beside the module, named test_*.py (${beside}, which can import ${name}), and run it with code_run's file: its test_ functions run as pytest runs them.`
     : `python FILE imports the modules beside FILE by name, and python -c imports those of the working folder (${dir ? `cd /${dir}, then ` : ''}import ${name}); from the project's root a project file imports by its path (${byPath}). A file named test_*.py run with python runs its test_ functions as pytest runs them.`;
   const why = inFile ? `, and ${where} calls ${called} on its line ${line}: write that part without it. To load another file's code, import it as a module:` : `, so a script cannot run another file's code from its text. Import the module instead:`;
-  return `exec, eval and compile do not exist in this sandbox's Python (nor do importlib.util and runpy)${why} ${how}`;
+  return `exec, eval and compile do not exist in this sandbox's Python (nor does runpy)${why} ${how}`;
 }
 
 /**
@@ -1187,6 +1195,16 @@ function occurrenceLines(text: string, needle: string, limit = 10): number[] {
   return lines;
 }
 
+const MAX_READ_SPANS = 512;
+
+function invalidateReadSpans(ctx: ToolContext, key: string): void {
+  if (!ctx.readSpans?.size) return;
+  const prefix = `${key}\0`;
+  for (const spanKey of [...ctx.readSpans.keys()]) {
+    if (spanKey.startsWith(prefix)) ctx.readSpans.delete(spanKey);
+  }
+}
+
 function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
   const seen = ctx.reads.get(key);
   if (seen === undefined) throw new Error(`read /${key} before you ${what} it`);
@@ -1253,16 +1271,26 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         if (ctx.isToolResultActive && !ctx.isToolResultActive(prev.callId)) return null;
         if (prev.consecutiveStubs >= 1) return null;
         prev.consecutiveStubs++;
+        // Refresh LRU position on hit.
+        ctx.readSpans.delete(spanKey);
+        ctx.readSpans.set(spanKey, prev);
         return `[/${key} (${prev.summary}) is unchanged since you read it earlier in this conversation. Reuse that content above, or call read_file with force: true to re-read it in full.]`;
       };
       const recordSpan = (spanKey: string, summary: string, bodyChars: number) => {
-        ctx.readSpans?.set(spanKey, {
+        if (!ctx.readSpans) return;
+        ctx.readSpans.delete(spanKey);
+        ctx.readSpans.set(spanKey, {
           version: currentVersion,
           callId: call.id,
           consecutiveStubs: 0,
           summary,
           bodyChars,
         });
+        while (ctx.readSpans.size > MAX_READ_SPANS) {
+          const oldest = ctx.readSpans.keys().next().value;
+          if (oldest === undefined) break;
+          ctx.readSpans.delete(oldest);
+        }
       };
       if (typeof input.char_start === 'number') {
         const start = Math.max(0, Math.floor(input.char_start));
@@ -1406,6 +1434,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       // (it knows all it wrote: a mark of a part read before, of a file deleted since, is gone with it)
       ctx.reads.set(key, vfs.version(`/${key}`));
       ctx.reads.delete(`${key}#partial`);
+      invalidateReadSpans(ctx, key);
       return `wrote /${key} (${content.split('\n').length} lines)`;
     }
     case 'append_file': {
@@ -1419,6 +1448,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${key}`, gap + content, { parents: true, append: true });
       if (!before) ctx.reads.delete(`${key}#partial`);
       if (fresh || !before) ctx.reads.set(key, vfs.version(`/${key}`));
+      invalidateReadSpans(ctx, key);
       const lines = (before + gap + content).split('\n').length;
       return `appended ${content.split('\n').length} lines to /${key} (now ${lines.toLocaleString()} lines)`;
     }
@@ -1452,10 +1482,15 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const next = input.replace_all === true ? text.split(oldText).join(newText) : text.replace(oldText, () => newText);
       vfs.writeFile(`/${key}`, next);
       ctx.reads.set(key, vfs.version(`/${key}`));
+      invalidateReadSpans(ctx, key);
       return `edited /${key} (${count} replacement${count === 1 ? '' : 's'})`;
     }
     case 'apply_patch': {
       const outcome = applyPatchToVfs(need(input, 'patch'), vfs, ctx.reads);
+      for (const file of outcome.files) {
+        invalidateReadSpans(ctx, file.path);
+        if (file.moveTo) invalidateReadSpans(ctx, file.moveTo);
+      }
       return outcome.summary;
     }
     case 'delete_file': {
@@ -1463,6 +1498,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.remove(`/${key}`, true);
       ctx.reads.delete(key);
       ctx.reads.delete(`${key}#partial`);
+      invalidateReadSpans(ctx, key);
       return `deleted /${key}`;
     }
     case 'grep': {
@@ -1925,6 +1961,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       ctx.progress?.(`speaking${named ? ` as ${named}` : ''}…`);
       const result = await generateSpeech(media, {
         input: words,
+        model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined,
         voice,
         instructions: typeof input.voice_description === 'string' && input.voice_description.trim() ? input.voice_description.trim() : undefined,
         language: typeof input.language === 'string' ? input.language : undefined,
@@ -1999,6 +2036,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         lyrics,
         instrumental,
         seconds: typeof input.seconds === 'number' ? input.seconds : undefined,
+        model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined,
         seed: typeof input.seed === 'number' ? input.seed : undefined,
         format,
       }, (message) => ctx.progress?.(message), ctx.signal);
@@ -2021,6 +2059,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const result = await generateSoundEffect(media, {
         prompt: description,
         seconds,
+        model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined,
         seed: typeof input.seed === 'number' ? input.seed : undefined,
         format,
       }, (message) => ctx.progress?.(message), ctx.signal);
@@ -2066,6 +2105,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         image,
         faces,
         resolution,
+        model: typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined,
         seed: typeof input.seed === 'number' ? input.seed : undefined,
       }, (message) => ctx.progress?.(message), ctx.signal);
       vfs.writeFile(`/${path}`, result.glb, { parents: true });
@@ -2367,6 +2407,7 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
     if (out.review.length) result.review = out.review;
     return result;
   } catch (error) {
+    if (ctx.signal?.aborted) throw error;
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);
     return { id: call.id, name: call.name, content: message.startsWith('Error') ? message : `Error: ${message}`, isError: true };
   }

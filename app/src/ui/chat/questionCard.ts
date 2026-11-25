@@ -5,6 +5,7 @@
 import type { UserQuestionAnswer, UserQuestionItem, UserQuestionResult } from '../../agent/askUser';
 import type { PlanReviewDecision, PlanReviewRequest } from '../../agent/planMode';
 import { h } from '../dom';
+import { icon } from '../icons';
 import { renderMarkdown } from '../markdown';
 
 /**
@@ -42,15 +43,31 @@ export function mountQuestionCard(
       block.append(h('div', { class: 'ask-q-text' }, q.question));
 
       if (q.options?.length) {
-        const optsEl = h('div', { class: 'ask-options' });
+        const optsEl = h('div', { class: 'ask-options', 'data-multi': q.multiSelect ? 'true' : 'false' });
         const buttons: HTMLButtonElement[] = [];
         for (const opt of q.options) {
           const isRec = /\(recommended\)/i.test(opt.label);
+          const cleanLabel = isRec ? opt.label.replace(/\s*\(recommended\)\s*$/i, '').trim() || opt.label : opt.label;
+          const mark = h(
+            'span',
+            { class: `ask-opt-mark ${q.multiSelect ? 'multi' : 'single'}`, 'aria-hidden': 'true' },
+            ...(q.multiSelect ? [icon('check')] : []),
+          );
           const btn = h(
             'button',
             { type: 'button', class: `ask-opt${isRec ? ' recommended' : ''}`, 'aria-pressed': 'false' },
-            h('span', { class: 'ask-opt-label' }, opt.label),
-            ...(opt.description ? [h('span', { class: 'ask-opt-desc' }, opt.description)] : []),
+            mark,
+            h(
+              'span',
+              { class: 'ask-opt-content' },
+              h(
+                'span',
+                { class: 'ask-opt-head' },
+                h('span', { class: 'ask-opt-label' }, cleanLabel),
+                ...(isRec ? [h('span', { class: 'ask-opt-rec' }, 'Recommended')] : []),
+              ),
+              ...(opt.description ? [h('span', { class: 'ask-opt-desc' }, opt.description)] : []),
+            ),
           ) as HTMLButtonElement;
           btn.onclick = () => {
             if (q.multiSelect) {

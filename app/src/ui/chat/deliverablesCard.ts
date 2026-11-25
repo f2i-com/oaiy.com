@@ -35,7 +35,9 @@ export function renderDeliverablesCard(
   const list = h('div.deliverables-list');
   for (const file of files) {
     const badge = KIND_BADGE[file.kind];
-    const name = file.path.split('/').pop() || file.path;
+    const slash = file.path.lastIndexOf('/');
+    const dir = slash >= 0 ? file.path.slice(0, slash + 1) : '';
+    const name = slash >= 0 ? file.path.slice(slash + 1) : file.path;
     const kind = fileIcon(name, false, false);
     const hasDiff = file.hunks.length > 0;
     const stats = h('span.deliverable-stats');
@@ -105,7 +107,12 @@ export function renderDeliverablesCard(
         icon('chevron-right', 'deliverable-caret'),
         h('span.deliverable-badge', { class: `kind-${file.kind}`, title: badge.title }, badge.label),
         h('span.deliverable-icon', { class: `tone-${kind.tone}` }, icon(kind.icon)),
-        h('span.deliverable-path', { title: `/${file.path}` }, file.path),
+        h(
+          'span.deliverable-path',
+          { title: `/${file.path}` },
+          ...(dir ? [h('span.deliverable-dir', dir)] : []),
+          h('span.deliverable-name', name),
+        ),
         stats,
         actions,
       ),

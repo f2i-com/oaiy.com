@@ -34,7 +34,27 @@ interface Form {
   models: Array<{ id: string; label?: string }>;
 }
 
+const THEME_KEY = 'oaiy-providers-theme';
+
+function isDarkTheme(): boolean {
+  const pinned = document.documentElement.dataset.theme;
+  if (pinned === 'dark') return true;
+  if (pinned === 'light') return false;
+  return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
+function applySavedTheme(): void {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+  } catch {
+    // storage unavailable
+  }
+}
+
 export function mountManage(root: HTMLElement, ctx: Context): void {
+  applySavedTheme();
+
   // A page that finds itself in a frame draws no form at all.
   if (window.top !== window) {
     fill(root, h('main', { class: 'page' }, h('h1', { text: 'Providers' }), h('p', { text: 'Providers are managed in their own tab, where the address bar shows whose page this is.' }), h('a', { class: 'button', text: 'Open Providers', attrs: { href: location.href, target: '_blank', rel: 'noopener' } })));
@@ -44,6 +64,24 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
   const presets = loadPresets();
   // This page is the holder's own, and no app can read its DOM: a provider's words may be shown (as text, scrubbed of the key).
   const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed', onModels: (record, ids) => ctx.store.rememberModels(record.id, ids) });
+
+  const themeToggle = h('button', { class: 'button quiet theme-toggle', attrs: { type: 'button' } });
+  const syncThemeButton = (): void => {
+    const dark = isDarkTheme();
+    themeToggle.textContent = dark ? 'Light theme' : 'Dark theme';
+    themeToggle.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  };
+  syncThemeButton();
+  themeToggle.addEventListener('click', () => {
+    const next = isDarkTheme() ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch {
+      // ignore
+    }
+    syncThemeButton();
+  });
 
   const listBox = h('section', { class: 'card', attrs: { 'aria-label': 'Your providers' } });
   const formBox = h('section', { class: 'card', attrs: { 'aria-label': 'Add or change a provider' } });
@@ -55,7 +93,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     h(
       'main',
       { class: 'page' },
-      h('h1', { text: 'Providers' }),
+      h('div', { class: 'page-head' }, h('h1', { text: 'Providers' }), themeToggle),
       h('p', { class: 'lead', text: KEYS_LEAD }),
       noticeBox,
       listBox,
@@ -94,21 +132,49 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
         const record = records.get(s.id);
         if (!record) return null;
         const result = h('p', { class: 'result', attrs: { role: 'status' } });
-        const check = h('button', { class: 'button', text: 'Check', on: { click: () => void runCheck(record, result, check) } });
-        const remove = h('button', { class: 'button danger', text: 'Remove' });
-        remove.addEventListener('click', () => {
+        const check = h('button', { class: 'button', text: 'Check', attrs: { type: 'button' }, on: { click: () => void runCheck(record, result, check) } });
+        const remove = h('button', { class: 'button danger', text: 'Remove', attrs: { type: 'button' } });
+        const cancelRemove = h('button', { class: 'button quiet', text: 'Cancel', attrs: { type: 'button' }, hidden: true });
+        const removeGroup = h('span', { class: 'confirm-group' }, remove, cancelRemove);
+        const disarmRemove = (): void => {
+          delete remove.dataset.sure;
+          remove.textContent = 'Remove';
+          remove.classList.remove('armed');
+          cancelRemove.hidden = true;
+        };
+        cancelRemove.addEventListener('click', () => {
+          disarmRemove();
+          remove.focus();
+        });
+        removeGroup.addEventListener('focusout', (e) => {
+          if (remove.dataset.sure === '1' && !removeGroup.contains(e.relatedTarget as Node | null)) disarmRemove();
+        });
+        remove.addEventListener('click', () => void (async () => {
           if (remove.dataset.sure !== '1') {
             remove.dataset.sure = '1';
             remove.textContent = 'Really remove?';
+            remove.classList.add('armed');
+            cancelRemove.hidden = false;
             return;
           }
-          void ctx.store.remove(s.id);
-        });
+          remove.disabled = true;
+          cancelRemove.disabled = true;
+          try {
+            await ctx.store.remove(s.id);
+          } catch (e) {
+            disarmRemove();
+            result.textContent = `Could not remove: ${e instanceof Error ? e.message : 'storage failed'}.`;
+            result.className = 'result bad';
+          } finally {
+            remove.disabled = false;
+            cancelRemove.disabled = false;
+          }
+        })());
         return h(
           'li',
           { class: 'row' },
           h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), result),
-          h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', on: { click: () => openForm(record) } }), remove),
+          h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', attrs: { type: 'button' }, on: { click: () => openForm(record) } }), removeGroup),
         );
       })
       .filter((el): el is HTMLLIElement => el !== null);
@@ -118,6 +184,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
   async function runCheck(record: ProviderRecord, out: HTMLElement, button: HTMLButtonElement): Promise<void> {
     button.disabled = true;
     out.textContent = 'Checking…';
+    out.className = 'result';
     try {
       const result = await tester(() => ctx.store.key(record.id)).test(record);
       out.textContent = describe(result);
@@ -135,7 +202,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       (record?.kind === 'local-server' ? presets.find((p) => p.id === 'local-server') : undefined) ??
       presets.find((p) => p.id === 'custom')!;
     form = { preset: chosen, editing: record, serverKind: record?.serverKind ?? chosen.serverKinds?.[0]?.id, models: [] };
-    drawForm();
+    drawForm(true);
   }
 
   function drawIdleForm(): void {
@@ -143,11 +210,11 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       formBox,
       h('h2', { text: 'Add a provider' }),
       h('p', { class: 'fine', text: 'Choose where it is.' }),
-      h('div', { class: 'grid' }, ...presets.map((p) => h('button', { class: 'tile', on: { click: () => openForm(null, p) } }, h('strong', { text: p.label }), h('span', { class: 'fine', text: KIND_LABEL[p.kind] })))),
+      h('div', { class: 'grid' }, ...presets.map((p) => h('button', { class: 'tile', attrs: { type: 'button' }, on: { click: () => openForm(null, p) } }, h('strong', { text: p.label }), h('span', { class: 'fine', text: KIND_LABEL[p.kind] })))),
     );
   }
 
-  function drawForm(): void {
+  function drawForm(focusName = false): void {
     if (!form) return drawIdleForm();
     const state = form;
     const { preset, editing } = state;
@@ -157,9 +224,17 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
 
     const name = h('input', { attrs: { type: 'text', autocomplete: 'off', maxlength: '80' }, value: editing?.name ?? String(start?.name ?? '') });
     const address = h('input', { attrs: { type: 'url', autocomplete: 'off', spellcheck: 'false', placeholder: 'https://…' }, value: editing?.baseUrl ?? String(start?.baseUrl ?? '') });
-    const key = h('input', { attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: editing ? 'Stored on this device. Leave empty to keep it.' : effectiveKind === 'local-server' ? 'Usually empty' : 'Paste the key' } });
-    const modelText = h('input', { attrs: { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'or type a model name' }, value: editing?.model ?? '' });
-    const modelSelect = h('select', { attrs: { 'aria-label': 'Model' } });
+    const key = h('input', { id: 'provider-api-key', attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: editing ? 'Stored on this device. Leave empty to keep it.' : effectiveKind === 'local-server' ? 'Usually empty' : 'Paste the key' } });
+    const revealKey = h('button', { class: 'button quiet reveal-btn', text: 'Show', attrs: { type: 'button', 'aria-pressed': 'false', 'aria-label': 'Show API key' } });
+    revealKey.addEventListener('click', () => {
+      const showing = key.type === 'text';
+      key.type = showing ? 'password' : 'text';
+      revealKey.textContent = showing ? 'Show' : 'Hide';
+      revealKey.setAttribute('aria-pressed', String(!showing));
+      revealKey.setAttribute('aria-label', showing ? 'Show API key' : 'Hide API key');
+    });
+    const modelText = h('input', { attrs: { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'or type a model name', 'aria-label': 'Custom model id' }, value: editing?.model ?? '' });
+    const modelSelect = h('select', { id: 'provider-model-select', attrs: { 'aria-label': 'Model' } });
     // What the holder bounds for this provider (volume, not cost): the largest request, and a cap on the length of a chat reply.
     const maxBody = h('input', { attrs: { type: 'number', min: '1', max: '32768', step: '1', placeholder: '1024 (the default)' }, value: editing?.limits?.maxBodyBytes ? String(Math.round(editing.limits.maxBodyBytes / 1024)) : '' });
     const maxTokens = h('input', { attrs: { type: 'number', min: '1', max: '1000000', step: '1', placeholder: 'No cap' }, value: editing?.limits?.maxOutputTokens ? String(editing.limits.maxOutputTokens) : '' });
@@ -274,11 +349,79 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       }
     })());
 
-    const clearKey = editing
-      ? h('button', { class: 'button danger', text: 'Remove the stored key', on: { click: () => void ctx.store.setKey(editing.id, '').then(() => (result.textContent = 'The key was removed.')) } })
-      : null;
+    let clearKeyGroup: HTMLElement | null = null;
+    if (editing) {
+      const clearKey = h('button', { class: 'button danger', text: 'Remove the stored key', attrs: { type: 'button' } });
+      const cancelClearKey = h('button', { class: 'button quiet', text: 'Cancel', attrs: { type: 'button' }, hidden: true });
+      const group = h('span', { class: 'confirm-group' }, clearKey, cancelClearKey);
+      const disarmClearKey = (): void => {
+        delete clearKey.dataset.sure;
+        clearKey.textContent = 'Remove the stored key';
+        clearKey.classList.remove('armed');
+        cancelClearKey.hidden = true;
+      };
+      cancelClearKey.addEventListener('click', () => {
+        disarmClearKey();
+        clearKey.focus();
+      });
+      group.addEventListener('focusout', (e) => {
+        if (clearKey.dataset.sure === '1' && !group.contains(e.relatedTarget as Node | null)) disarmClearKey();
+      });
+      clearKey.addEventListener('click', () => void (async () => {
+        if (clearKey.dataset.sure !== '1') {
+          clearKey.dataset.sure = '1';
+          clearKey.textContent = 'Really remove key?';
+          clearKey.classList.add('armed');
+          cancelClearKey.hidden = false;
+          return;
+        }
+        clearKey.disabled = true;
+        cancelClearKey.disabled = true;
+        try {
+          await ctx.store.setKey(editing.id, '');
+          result.textContent = 'Key removed.';
+          result.className = 'result ok';
+        } catch (e) {
+          result.textContent = `Could not remove key: ${e instanceof Error ? e.message : 'storage failed'}.`;
+          result.className = 'result bad';
+        } finally {
+          disarmClearKey();
+          clearKey.disabled = false;
+          cancelClearKey.disabled = false;
+        }
+      })());
+      clearKeyGroup = group;
+    }
 
     const field = (label: string, control: HTMLElement, hint?: string): HTMLElement => h('label', { class: 'field' }, h('span', { text: label }), control, hint ? h('span', { class: 'fine', text: hint }) : null);
+
+    const apiKeyField = h(
+      'div',
+      { class: 'field' },
+      h('label', { class: 'field-label', text: 'API key', attrs: { for: 'provider-api-key' } }),
+      h('div', { class: 'input-row' }, key, revealKey),
+      preset.keyHint ? h('span', { class: 'fine', text: preset.keyHint }) : null,
+    );
+
+    const modelField = h(
+      'div',
+      { class: 'field' },
+      h('label', { class: 'field-label', text: 'Model', attrs: { for: 'provider-model-select' } }),
+      modelSelect,
+      modelText,
+    );
+
+    const volumeLimits = h(
+      'details',
+      { class: 'advanced', attrs: editing ? { open: '' } : {} },
+      h('summary', { text: 'Volume limits (optional)' }),
+      h(
+        'div',
+        { class: 'advanced-body' },
+        field('Largest request (KiB)', maxBody, 'A request larger than this is not sent. Chat needs little; raise it for images or audio.'),
+        field('Cap on a reply (tokens)', maxTokens, 'When set, the holder puts this in every chat request, so an app cannot ask for a longer reply.'),
+      ),
+    );
 
     fill(
       formBox,
@@ -288,17 +431,21 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       field('Name', name),
       serverSelect ? field('Which server', serverSelect) : null,
       field('Address', address, preset.editableBase || effectiveKind === 'local-server' ? 'The API address, ending in its version (for example /v1).' : 'Change this only if you know why: the key is sent to this address.'),
-      field('API key', key, preset.keyHint),
-      preset.keyUrl ? h('a', { class: 'fine', text: 'Where to get a key', attrs: { href: preset.keyUrl, target: '_blank', rel: 'noopener noreferrer' } }) : null,
+      apiKeyField,
+      preset.keyUrl ? h('a', { class: 'fine key-link', text: 'Where to get a key', attrs: { href: preset.keyUrl, target: '_blank', rel: 'noopener noreferrer' } }) : null,
       ...extras.map((x) => field(x.headerName, x.input)),
-      field('Model', modelSelect),
-      modelText,
-      field('Largest request (KiB)', maxBody, 'A request larger than this is not sent. Chat needs little; raise it for images or audio.'),
-      field('Cap on a reply (tokens)', maxTokens, 'When set, the holder puts this in every chat request, so an app cannot ask for a longer reply.'),
+      modelField,
+      volumeLimits,
       result,
       problems,
-      h('div', { class: 'actions' }, check, save, clearKey, h('button', { class: 'button', text: 'Cancel', on: { click: () => { form = null; drawIdleForm(); } } })),
+      h('div', { class: 'actions' }, check, save, clearKeyGroup, h('button', { class: 'button', text: 'Cancel', attrs: { type: 'button' }, on: { click: () => { form = null; drawIdleForm(); } } })),
     );
+
+    if (focusName) {
+      const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      formBox.scrollIntoView?.({ behavior: reduced ? 'auto' : 'smooth', block: 'nearest' });
+      name.focus();
+    }
   }
 
   // --- Apps and their budgets ---------------------------------------------------
@@ -311,10 +458,10 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     const rows = await Promise.all(
       [...appNames(ctx.apps), MODAL_APP].map(async (app) => {
         const usage = await ctx.budget.usage(app);
-        const limit = h('input', { attrs: { type: 'number', min: '0', max: '100000', step: '1', 'aria-label': `Requests an hour for ${app}` }, value: String(usage.limit) });
-        const bytesLimit = h('input', { attrs: { type: 'number', min: '0', max: '4096', step: '1', 'aria-label': `MiB an hour for ${app}` }, value: String(Math.round(usage.byteLimit / 1024 / 1024)) });
+        const limit = h('input', { class: 'budget-input', attrs: { type: 'number', min: '0', max: '100000', step: '1', 'aria-label': `Requests an hour for ${app}` }, value: String(usage.limit) });
+        const bytesLimit = h('input', { class: 'budget-input', attrs: { type: 'number', min: '0', max: '4096', step: '1', 'aria-label': `MiB an hour for ${app}` }, value: String(Math.round(usage.byteLimit / 1024 / 1024)) });
         const status = h('span', { class: 'fine', attrs: { role: 'status' } });
-        const set = h('button', { class: 'button', text: 'Set' });
+        const set = h('button', { class: 'button', text: 'Set', attrs: { type: 'button' } });
         const origin =
           app === MODAL_APP
             ? 'the Test and Load models buttons of the embedded modal'
@@ -335,10 +482,12 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
           const nextLimit = rawLimit === '' ? NaN : Number(rawLimit);
           const nextMib = rawMib === '' ? NaN : Number(rawMib);
           if (!Number.isFinite(nextLimit) || nextLimit < 0 || !Number.isInteger(nextLimit) || nextLimit > 100_000) {
+            status.className = 'problems';
             status.textContent = 'The most requests an hour is a whole number from 0 to 100000.';
             return;
           }
           if (!Number.isFinite(nextMib) || nextMib < 0 || nextMib > 4096) {
+            status.className = 'problems';
             status.textContent = 'The most MiB an hour is a number from 0 to 4096.';
             return;
           }
@@ -349,16 +498,27 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
             .then(
               (updated) => {
                 renderUsage(updated);
+                status.className = 'fine good';
                 status.textContent = 'Saved.';
               },
-              (e: unknown) => (status.textContent = e instanceof Error ? e.message : 'Not saved.'),
+              (e: unknown) => {
+                status.className = 'problems';
+                status.textContent = e instanceof Error ? e.message : 'Not saved.';
+              },
             );
         });
         return h(
           'li',
           { class: 'row' },
           h('div', { class: 'grow' }, h('strong', { text: app }), usageLine, h('br'), worstLine),
-          h('div', { class: 'actions' }, limit, h('span', { class: 'fine', text: 'requests' }), bytesLimit, h('span', { class: 'fine', text: 'MiB' }), set, status),
+          h(
+            'div',
+            { class: 'budget-controls' },
+            h('label', { class: 'budget-field' }, limit, h('span', { text: 'requests' })),
+            h('label', { class: 'budget-field' }, bytesLimit, h('span', { text: 'MiB' })),
+            set,
+            status,
+          ),
         );
       }),
     );

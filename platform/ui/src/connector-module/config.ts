@@ -161,9 +161,12 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
     // ignoring it would leave the graph reading `undefined`.
     if (entry.listResult !== undefined) {
       if (operation !== 'listRecords') {
-        throw new Error(`${where}: "listResult" only applies to listRecords (this is ${operation}).`);
+        throw new ConnectorConfigError(`${where}: "listResult" only applies to listRecords (this is ${operation}).`);
       }
-      const lr = entry.listResult as Record<string, unknown>;
+      if (!isRecord(entry.listResult)) {
+        throw new ConnectorConfigError(`${where}: "listResult" must be an object (got ${describe(entry.listResult)}).`);
+      }
+      const lr = entry.listResult;
       spec.listResult = {
         items: requireString(lr.items, 'listResult.items', where),
         ...(lr.count !== undefined ? { count: requireString(lr.count, 'listResult.count', where) } : {}),
@@ -173,12 +176,15 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
     }
     if (entry.filters !== undefined) {
       if (operation !== 'listRecords') {
-        throw new Error(`${where}: "filters" only applies to listRecords (this is ${operation}).`);
+        throw new ConnectorConfigError(`${where}: "filters" only applies to listRecords (this is ${operation}).`);
       }
-      const f = entry.filters as Record<string, unknown>;
+      if (!isRecord(entry.filters)) {
+        throw new ConnectorConfigError(`${where}: "filters" must be an object (got ${describe(entry.filters)}).`);
+      }
+      const f = entry.filters;
       const ops = Array.isArray(f.ops) ? f.ops : [];
       if (ops.length === 0) {
-        throw new Error(
+        throw new ConnectorConfigError(
           `${where}: "filters" describes no comparisons, so every filtered listing would be refused.`,
         );
       }
@@ -188,22 +194,29 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
         fieldKey: requireString(f.fieldKey, 'filters.fieldKey', where),
         valueKey: requireString(f.valueKey, 'filters.valueKey', where),
         ops: ops.map((o, i) => {
-          const row = (o ?? {}) as Record<string, unknown>;
+          if (!isRecord(o)) {
+            throw new ConnectorConfigError(
+              `${where}: "filters.ops[${i}]" must be an object (got ${describe(o)}).`,
+            );
+          }
           return {
-            op: requireString(row.op, `filters.ops[${i}].op`, where),
-            param: requireString(row.param, `filters.ops[${i}].param`, where),
+            op: requireString(o.op, `filters.ops[${i}].op`, where),
+            param: requireString(o.param, `filters.ops[${i}].param`, where),
           };
         }),
       };
     }
     if (entry.limit !== undefined) {
       if (operation !== 'listRecords') {
-        throw new Error(`${where}: "limit" only applies to listRecords (this is ${operation}).`);
+        throw new ConnectorConfigError(`${where}: "limit" only applies to listRecords (this is ${operation}).`);
       }
-      const l = (entry.limit ?? {}) as Record<string, unknown>;
+      if (!isRecord(entry.limit)) {
+        throw new ConnectorConfigError(`${where}: "limit" must be an object (got ${describe(entry.limit)}).`);
+      }
+      const l = entry.limit;
       const count = (value: unknown, name: string): number => {
         if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
-          throw new Error(`${where}: "limit.${name}" must be a whole number of rows.`);
+          throw new ConnectorConfigError(`${where}: "limit.${name}" must be a whole number of rows.`);
         }
         return value;
       };
@@ -217,7 +230,7 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
     for (const name of ['recordField', 'replyField', 'runField'] as const) {
       if (entry[name] === undefined) continue;
       if (operation !== 'createRecord' && operation !== 'updateRecord') {
-        throw new Error(`${where}: "${name}" only applies to createRecord / updateRecord (this is ${operation}).`);
+        throw new ConnectorConfigError(`${where}: "${name}" only applies to createRecord / updateRecord (this is ${operation}).`);
       }
       spec[name] = requireString(entry[name], name, where);
     }

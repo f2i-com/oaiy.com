@@ -27,7 +27,24 @@ export function escapeString(str: unknown): string {
   // Always coerce to string before JSON.stringify(...).slice(1, -1): passing a non-string
   // (e.g. an array or object from untrusted flow JSON) would strip '['/']' or '{'/'}' instead
   // of surrounding quotes, allowing crafted values to break out of generated JS string literals.
-  const s = typeof str === 'string' ? str : String(str ?? '');
+  // Also guard against hostile objects ({ toString: 123, valueOf: 456 } or Object.create(null))
+  // whose String() coercion throws a TypeError.
+  let s: string;
+  if (typeof str === 'string') {
+    s = str;
+  } else if (str === null || str === undefined) {
+    s = '';
+  } else {
+    try {
+      s = String(str);
+    } catch {
+      try {
+        s = JSON.stringify(str) ?? '';
+      } catch {
+        s = '';
+      }
+    }
+  }
   // Use JSON.stringify and strip the surrounding quotes for comprehensive escaping
   const jsonEscaped = JSON.stringify(s);
   // Remove the surrounding quotes that JSON.stringify adds. U+2028 and U+2029 are escaped too: JSON leaves them as

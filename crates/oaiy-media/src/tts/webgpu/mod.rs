@@ -49,13 +49,48 @@ struct Table {
 impl Table {
     fn load(store: &mut Store, key: &str) -> Result<Self> {
         let t = store.tensor_f32(key, &Device::Cpu)?;
-        let width = t.dims2()?.1;
-        Ok(Self { values: t.flatten_all()?.to_vec1::<f32>()?, width })
+        let (rows, width) = t.dims2()?;
+        let values = t.flatten_all()?.to_vec1::<f32>()?;
+        if width == 0 || rows.checked_mul(width) != Some(values.len()) {
+            return Err(err(format!("{key}: invalid table shape [{rows}, {width}] for {} values", values.len())));
+        }
+        Ok(Self { values, width })
     }
 
-    fn row(&self, id: u32) -> &[f32] {
-        &self.values[id as usize * self.width..(id as usize + 1) * self.width]
+    fn rows(&self) -> usize {
+        if self.width == 0 { 0 } else { self.values.len() / self.width }
     }
+
+    fn row(&self, id: u32) -> Result<&[f32]> {
+        if self.width == 0 {
+            return Err(err("table has zero width"));
+        }
+        let start = (id as usize)
+            .checked_mul(self.width)
+            .ok_or_else(|| err(format!("table row {id} offset overflow")))?;
+        let end = start
+            .checked_add(self.width)
+            .ok_or_else(|| err(format!("table row {id} end overflow")))?;
+        self.values
+            .get(start..end)
+            .ok_or_else(|| err(format!("table row {id} out of bounds (rows={})", self.rows())))
+    }
+}
+
+fn config_usize(c: &Json, k: &str) -> Result<usize> {
+    let raw = c
+        .get(k)
+        .and_then(Json::as_i64)
+        .ok_or_else(|| err(format!("config lacks {k}")))?;
+    usize::try_from(raw).map_err(|_| err(format!("config {k} must be non-negative (got {raw})")))
+}
+
+fn parse_language_id(raw: i64, codec_rows: usize) -> Result<u32> {
+    let idx = usize::try_from(raw).map_err(|_| err(format!("speech: invalid negative language id {raw}")))?;
+    if idx >= codec_rows {
+        return Err(err(format!("speech: language id {idx} out of bounds (codec rows={codec_rows})")));
+    }
+    u32::try_from(idx).map_err(|_| err(format!("speech: language id {idx} exceeds u32")))
 }
 
 /// Why [`WgpuTalker::frames_with`] stopped.
@@ -130,7 +165,7 @@ impl WgpuTalker {
         let gpu = WgpuBackend::nth(device, None).map_err(err)?;
         let tc = config.get("talker_config").ok_or_else(|| err("config lacks talker_config"))?;
         let cp = tc.get("code_predictor_config").ok_or_else(|| err("config lacks code_predictor_config"))?;
-        let int = |c: &Json, k: &str| c.get(k).and_then(Json::as_i64).map(|v| v as usize).ok_or_else(|| err(format!("config lacks {k}")));
+        let int = config_usize;
         let theta = |c: &Json| c.get("rope_theta").and_then(Json::as_f64).unwrap_or(1e6);
         if int(tc, "num_code_groups")? != 16 {
             candle_core::bail!("this talker's codebooks are not Qwen3-TTS 12 Hz's 16");
@@ -199,8 +234,12 @@ impl WgpuTalker {
     }
 
     /// C(ids): codec embedding rows (on the host).
-    fn codec(&self, ids: &[u32]) -> Vec<f32> {
-        ids.iter().flat_map(|&i| self.codec_embedding.row(i).iter().copied()).collect()
+    fn codec(&self, ids: &[u32]) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(ids.len().saturating_mul(self.codec_embedding.width));
+        for &i in ids {
+            out.extend_from_slice(self.codec_embedding.row(i)?);
+        }
+        Ok(out)
     }
 
     /// `auto` (None) or a language the model knows (english, chinese, ...).
@@ -210,10 +249,11 @@ impl WgpuTalker {
             return Ok(None);
         }
         let ids = self.config.get("talker_config").and_then(|t| t.get("codec_language_id"));
-        ids.and_then(|m| m.get(&language))
+        let raw = ids
+            .and_then(|m| m.get(&language))
             .and_then(Json::as_i64)
-            .map(|v| Some(v as u32))
-            .ok_or_else(|| err(format!("speech: unknown language {language}; use auto or one of the model's languages")))
+            .ok_or_else(|| err(format!("speech: unknown language {language}; use auto or one of the model's languages")))?;
+        parse_language_id(raw, self.codec_embedding.rows()).map(Some)
     }
 
     /// [`oaiy_tts::talker::Talker::prefill`]'s rows (`[n, hidden]`).
@@ -233,31 +273,30 @@ impl WgpuTalker {
         };
         let specials = self.text(&[TTS_PAD, TTS_BOS, TTS_EOS])?;
         let (pad, bos, eos) = (&specials[..h], &specials[h..2 * h], &specials[2 * h..]);
-        let codec = self.codec(&prefix);
+        let codec = self.codec(&prefix)?;
         for (i, c) in codec.chunks(h).enumerate() {
             let t = if i + 1 < prefix.len() { pad } else { bos };
             rows.extend(t.iter().zip(c).map(|(a, b)| a + b));
         }
         let mut words = self.text(text_ids)?;
         words.extend_from_slice(eos);
-        let pads = self.codec(&vec![CODEC_PAD; text_ids.len() + 1]);
+        let pads = self.codec(&vec![CODEC_PAD; text_ids.len() + 1])?;
         rows.extend(words.iter().zip(&pads).map(|(a, b)| a + b));
-        rows.extend(pad.iter().zip(self.codec(&[CODEC_BOS])).map(|(a, b)| a + b));
+        rows.extend(pad.iter().zip(self.codec(&[CODEC_BOS])?).map(|(a, b)| a + b));
         Ok(rows)
     }
 
     /// S(frames): each frame's 16 codec embeddings summed (`[n, hidden]`, on the host).
-    fn frames_embedding(&self, frames: &[[u32; 16]]) -> Vec<f32> {
-        frames
-            .iter()
-            .flat_map(|f| {
-                let mut e = self.codec_embedding.row(f[0]).to_vec();
-                for (i, t) in self.predictor_embeddings.iter().enumerate() {
-                    e.iter_mut().zip(t.row(f[i + 1])).for_each(|(a, b)| *a += b);
-                }
-                e
-            })
-            .collect()
+    fn frames_embedding(&self, frames: &[[u32; 16]]) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(frames.len().saturating_mul(self.codec_embedding.width));
+        for f in frames {
+            let mut e = self.codec_embedding.row(f[0])?.to_vec();
+            for (i, t) in self.predictor_embeddings.iter().enumerate() {
+                e.iter_mut().zip(t.row(f[i + 1])?).for_each(|(a, b)| *a += b);
+            }
+            out.extend(e);
+        }
+        Ok(out)
     }
 
     /// [`oaiy_tts::talker::Talker::prefill_clone`]'s rows, and the text that outlasts the clip's frames (`[n, hidden]`
@@ -274,9 +313,9 @@ impl WgpuTalker {
         };
         let specials = self.text(&[TTS_PAD, TTS_BOS, TTS_EOS])?;
         let (pad, bos, eos) = (specials[..h].to_vec(), specials[h..2 * h].to_vec(), specials[2 * h..].to_vec());
-        let mut codec_side = self.codec(&prefix);
+        let mut codec_side = self.codec(&prefix)?;
         codec_side.extend_from_slice(&voice.speaker);
-        codec_side.extend(self.codec(&[CODEC_PAD]));
+        codec_side.extend(self.codec(&[CODEC_PAD])?);
         let n = codec_side.len() / h;
         for (i, c) in codec_side.chunks(h).enumerate() {
             let t = if i + 1 < n { &pad } else { &bos };
@@ -286,8 +325,8 @@ impl WgpuTalker {
         all_ids.extend_from_slice(text_ids);
         let mut text = self.text(&all_ids)?;
         text.extend_from_slice(&eos);
-        let mut codec = self.codec(&[CODEC_BOS]);
-        codec.extend(self.frames_embedding(&voice.ref_codes));
+        let mut codec = self.codec(&[CODEC_BOS])?;
+        codec.extend(self.frames_embedding(&voice.ref_codes)?);
         let (lt, lc) = (text.len() / h, codec.len() / h);
         let trailing = if lt > lc {
             rows.extend(text[..lc * h].iter().zip(&codec).map(|(a, b)| a + b));
@@ -353,7 +392,7 @@ impl WgpuTalker {
         }
         let (two, one) = (io.iter().find(|v| v.rows == 2).expect("made above"), io.iter().find(|v| v.rows == 1).expect("made above"));
         let mut x0 = hidden.to_vec();
-        x0.extend_from_slice(self.codec_embedding.row(c0));
+        x0.extend_from_slice(self.codec_embedding.row(c0)?);
         g.upload(&two.x, &x0);
         g.upload(&dev.draws, &[f32::from_bits(draw)]);
         let temperature = if s.greedy || !s.sub_temperature.is_finite() || s.sub_temperature <= 0.0 { 0.0 } else { s.sub_temperature as f32 };
@@ -489,13 +528,13 @@ impl WgpuTalker {
                 let mut frame = [0u32; 16];
                 frame[0] = c0;
                 let mut x = hidden.clone();
-                x.extend_from_slice(self.codec_embedding.row(c0));
+                x.extend_from_slice(self.codec_embedding.row(c0)?);
                 let sub_greedy = s.greedy || !s.sub_temperature.is_finite() || s.sub_temperature <= 0.0;
                 for i in 0..15 {
                     let l = predictor_step(self, kept, &x, i)?;
                     let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, sub_greedy, &mut rng);
                     frame[i + 1] = code;
-                    x = self.predictor_embeddings[i].row(code).to_vec();
+                    x = self.predictor_embeddings[i].row(code)?.to_vec();
                 }
                 frame
             } else {
@@ -511,7 +550,7 @@ impl WgpuTalker {
                 break;
             }
             // the next input: the frame's embeddings summed, plus the text's
-            let mut e = self.frames_embedding(&[frame]);
+            let mut e = self.frames_embedding(&[frame])?;
             let text = match &trailing {
                 Some(t) if step < trailing_len => &t[step * h..(step + 1) * h],
                 _ => &pad[..],
@@ -529,6 +568,27 @@ impl WgpuTalker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_row_and_config_reject_oob_and_negative_values() {
+        let t = Table { values: vec![1.0, 2.0, 3.0, 4.0], width: 2 };
+        assert_eq!(t.row(0).unwrap(), &[1.0, 2.0]);
+        assert_eq!(t.row(1).unwrap(), &[3.0, 4.0]);
+        assert!(t.row(2).is_err(), "oob row must return Err");
+        assert!(t.row(u32::MAX).is_err(), "overflow row must return Err");
+
+        let zero_w = Table { values: vec![], width: 0 };
+        assert!(zero_w.row(0).is_err(), "zero-width table must return Err");
+
+        assert_eq!(parse_language_id(1, 2).unwrap(), 1);
+        assert!(parse_language_id(-1, 100).is_err(), "negative language id must fail");
+        assert!(parse_language_id(100, 100).is_err(), "language id == rows must fail");
+
+        let cfg = Json::parse(br#"{"ok": 16, "neg": -4}"#).unwrap();
+        assert_eq!(config_usize(&cfg, "ok").unwrap(), 16);
+        assert!(config_usize(&cfg, "neg").is_err(), "negative config int must fail");
+        assert!(config_usize(&cfg, "missing").is_err(), "missing config int must fail");
+    }
 
     /// The talker's decoder's states for a prefill on WebGPU against Candle's (`--ignored --nocapture`, `webgpu cuda`),
     /// and the first logits' best codes.

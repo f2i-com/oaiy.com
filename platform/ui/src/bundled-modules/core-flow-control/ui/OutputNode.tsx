@@ -61,6 +61,7 @@ interface OutputNodeData {
   outputValue?: unknown;
   /** The last run did not finish (it failed, or was stopped): whatever it shows is not that run's result. */
   _stale?: boolean;
+  _status?: 'running' | 'completed' | 'error' | 'stopped';
   _collapsed?: boolean;
   onLabelChange?: (value: string) => void;
   onCollapsedChange?: (value: boolean) => void;
@@ -224,7 +225,7 @@ function OutputNode({ data }: OutputNodeProps) {
   );
 
   const inputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'result', type: 'target', position: Position.Left, color: '!bg-blue-500', size: 'lg' },
+    { id: 'result', type: 'target', position: Position.Left, color: 'port-any', size: 'lg' },
   ], []);
 
   const resizeHandles = (
@@ -257,6 +258,7 @@ function OutputNode({ data }: OutputNodeProps) {
       icon={OutputIcon}
       width={size.width}
       collapsedWidth={140}
+      status={data._status}
       isCollapsed={data._collapsed}
       onCollapsedChange={handleCollapsedChange}
       collapsedPreview={collapsedPreview}

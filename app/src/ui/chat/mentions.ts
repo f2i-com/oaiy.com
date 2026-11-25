@@ -5,6 +5,7 @@
  */
 import type { Vfs } from '../../vfs/vfs';
 import { clear, h } from '../dom';
+import { fileIcon, icon } from '../icons';
 
 export interface ActiveAtToken {
   prefix: string;
@@ -260,6 +261,8 @@ export function attachComposerAutocomplete(
     if (mode.kind === 'file') {
       popup.append(h('div', { class: 'mention-head' }, 'Files in project'));
       mode.items.forEach((item, i) => {
+        const base = item.path.split('/').pop() || item.path;
+        const fi = fileIcon(base, item.kind === 'directory');
         const row = h(
           'button',
           {
@@ -269,7 +272,7 @@ export function attachComposerAutocomplete(
             role: 'option',
             'aria-selected': i === activeIndex ? 'true' : 'false',
           },
-          h('span', { class: `mention-kind ${item.kind}` }, item.kind === 'directory' ? 'DIR' : 'FILE'),
+          h('span', { class: `mention-icon tone-${fi.tone}`, 'aria-hidden': 'true' }, icon(fi.icon)),
           h('span', { class: 'mention-path' }, item.kind === 'directory' ? `${item.path}/` : item.path),
         ) as HTMLButtonElement;
         row.onmousedown = (e) => {

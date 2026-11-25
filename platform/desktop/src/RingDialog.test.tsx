@@ -363,4 +363,45 @@ describe('the ring dialog', () => {
     expect(host.querySelector('.ring-dialog')).toBeNull();
     expect(api.active).not.toHaveBeenCalled();
   });
+
+  it('puts the dialog away on window Escape or backdrop click without stealing focus or touching Enter/Space', async () => {
+    const outside = document.createElement('input');
+    document.body.appendChild(outside);
+    outside.focus();
+    try {
+      serve({});
+      await mount();
+      expect(document.activeElement).toBe(outside);
+      // Enter/Space while focused outside must not dismiss or decline.
+      await act(async () => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+      });
+      expect(host.querySelector('.ring-dialog')).not.toBeNull();
+      expect(api.respond).not.toHaveBeenCalled();
+      // Window-level Escape puts the dialog away even while focus stays outside.
+      await act(async () => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      });
+      await settle();
+      expect(host.querySelector('.ring-dialog')).toBeNull();
+      expect(api.respond).not.toHaveBeenCalled();
+
+      // Backdrop click on a subsequent ring puts it away without calling respond.
+      serve({ id: 'assist_backdrop' });
+      await act(async () => {
+        vi.advanceTimersByTime(POLL_MS + 10);
+      });
+      await settle();
+      expect(host.querySelector('.ring-dialog')).not.toBeNull();
+      await act(async () => {
+        host.querySelector<HTMLDivElement>('.ring-overlay')!.click();
+      });
+      await settle();
+      expect(host.querySelector('.ring-dialog')).toBeNull();
+      expect(api.respond).not.toHaveBeenCalled();
+    } finally {
+      outside.remove();
+    }
+  });
 });

@@ -37,7 +37,7 @@ socket with a short wait: Docker Desktop open with its engine not answering held
 """
 from __future__ import annotations
 
-import collections, errno, hashlib, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
+import collections, errno, hashlib, json, os, pathlib, re, shutil, socket, stat, subprocess, sys, tempfile, threading, time, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 CARD = pathlib.Path(__file__).resolve().parent
@@ -491,8 +491,13 @@ def start(name: str, work) -> dict:
     return {"started": True, "job": job.view()}
 
 
+TINYGPU_MAX_ZIP_ENTRIES = 10_000
+TINYGPU_MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+TINYGPU_BUNDLE_ID = "org.tinygrad.tinygpu"
+
+
 def verify_tinygpu_zip(zipped: pathlib.Path):
-    """Verify `zipped` is a valid archive whose entries stay strictly inside `TinyGPU.app/`."""
+    """Verify `zipped` is a valid archive whose entries stay strictly inside `TinyGPU.app/` with no symlinks or zip bombs."""
     try:
         z = zipfile.ZipFile(zipped, "r")
     except (zipfile.BadZipFile, OSError) as e:
@@ -501,7 +506,10 @@ def verify_tinygpu_zip(zipped: pathlib.Path):
         infos = z.infolist()
         if not infos:
             raise RuntimeError("TinyGPU.zip is empty")
+        if len(infos) > TINYGPU_MAX_ZIP_ENTRIES:
+            raise RuntimeError(f"TinyGPU.zip contains too many entries ({len(infos)} > {TINYGPU_MAX_ZIP_ENTRIES})")
         has_program = False
+        total_uncompressed = 0
         for info in infos:
             name = info.filename
             if not name or "\\" in name or "\x00" in name or name.startswith("/"):
@@ -514,10 +522,16 @@ def verify_tinygpu_zip(zipped: pathlib.Path):
                 raise RuntimeError(f"TinyGPU.zip contains a path traversal entry: {name!r}")
             if parts[0] != "TinyGPU.app":
                 raise RuntimeError(f"TinyGPU.zip contains an unexpected top-level entry: {name!r}")
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise RuntimeError(f"TinyGPU.zip contains a symlink entry: {name!r}")
+            if info.file_size < 0:
+                raise RuntimeError(f"TinyGPU.zip contains an entry with invalid size: {name!r}")
+            total_uncompressed += info.file_size
+            if total_uncompressed > TINYGPU_MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise RuntimeError(
+                    f"TinyGPU.zip uncompressed size exceeds limit ({total_uncompressed} > {TINYGPU_MAX_ZIP_UNCOMPRESSED_BYTES})"
+                )
             if trimmed == "TinyGPU.app/Contents/MacOS/TinyGPU" and not info.is_dir():
-                is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
-                if is_symlink:
-                    raise RuntimeError("TinyGPU.zip's executable is a symlink")
                 has_program = True
         if not has_program:
             raise RuntimeError("TinyGPU.zip does not contain TinyGPU.app/Contents/MacOS/TinyGPU")
@@ -560,10 +574,14 @@ def verify_tinygpu_app(app: pathlib.Path) -> str:
     signed = quiet(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], 60)
     if signed.returncode != 0:
         raise RuntimeError(f"TinyGPU.app's signature does not check out: {(signed.stderr or signed.stdout).strip()}")
-    info = quiet(["/usr/bin/codesign", "-dv", str(app)], 30)
+    info = quiet(["/usr/bin/codesign", "-dvv", str(app)], 30)
     if info.returncode != 0:
         raise RuntimeError(f"TinyGPU.app's signing identity could not be read: {(info.stderr or info.stdout).strip()}")
     combined = f"{info.stderr}\n{info.stdout}"
+    ident_match = re.search(r"^Identifier=(.+)$", combined, re.MULTILINE)
+    ident = ident_match.group(1).strip() if ident_match else ""
+    if ident != TINYGPU_BUNDLE_ID:
+        raise RuntimeError(f"TinyGPU.app has unexpected bundle Identifier (expected {TINYGPU_BUNDLE_ID}, got {ident or 'none'})")
     team_match = re.search(r"^TeamIdentifier=(.+)$", combined, re.MULTILINE)
     team = team_match.group(1).strip() if team_match else ""
     if not team or team.lower() == "not set" or not re.fullmatch(r"[A-Z0-9]{10}", team):

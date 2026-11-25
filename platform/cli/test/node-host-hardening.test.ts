@@ -3,7 +3,9 @@
  * lexer-aware placeholder normalization (P2-6). Run via `npm test`.
  */
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -278,7 +280,8 @@ async function main(): Promise<void> {
       'fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24',
       'out.mp4',
     ]);
-    const outIdx = benignArgs.indexOf('out.mp4');
+    const expectedBenignOut = path.resolve(tmpRoot, 'out.mp4');
+    const outIdx = benignArgs.indexOf(expectedBenignOut);
     check(
       'benign filtergraph passes confined arg check and guards output with -protocol_whitelist file,pipe',
       benignArgs.includes('fps=1/2,scale=640:480,drawtext=text=hello:fontsize=24') &&
@@ -425,7 +428,8 @@ async function main(): Promise<void> {
         err = e instanceof Error ? e.message : String(e);
       }
       const outToken = raw[raw.length - 1];
-      const outPos = built ? built.lastIndexOf(outToken) : -1;
+      const expectedOut = outToken === '-' ? '-' : path.resolve(tmpRoot, outToken);
+      const outPos = built ? built.lastIndexOf(expectedOut) : -1;
       check(
         `Wave-4 allows legitimate OAIY workflow: ${label}`,
         built !== null &&
@@ -470,6 +474,397 @@ async function main(): Promise<void> {
       () => ffmpeg.runCommand({ command: 'ffprobe', args: [paddedMpd] }),
       /DASH\/MPD/i,
     );
+
+    // -----------------------------------------------------------------------
+    // 1b-w5. Wave-5 FFmpeg/ffprobe, core.ts, and browser.ts hardening regressions
+    // -----------------------------------------------------------------------
+    // [P0] Comma-option protocol wrappers containing `=` MUST be rejected on inputs & outputs,
+    // including when preceded by `-no<bool>`, `:stream_spec` booleans, or unknown flags.
+    for (const [label, badArgs] of [
+      ['http,a=b:// SSRF output', ['-i', dummyMp4, 'http,a=b://169.254.169.254/upload']],
+      ['http,a=b:// SSRF input', ['-i', 'http,a=b://169.254.169.254/latest', 'out.mp4']],
+      ['tcp,timeout=5:// SSRF output', ['-i', dummyMp4, 'tcp,timeout=5://127.0.0.1:6379']],
+      ['tcp,timeout=5:// SSRF input', ['-i', 'tcp,timeout=5://127.0.0.1:6379', 'out.mp4']],
+      ['chained -nohide_banner + http,a=b://', ['-i', dummyMp4, '-nohide_banner', 'http,a=b://169.254.169.254/upload']],
+      ['chained -bitexact:v + tcp,timeout=5://', ['-i', dummyMp4, '-bitexact:v', 'tcp,timeout=5://127.0.0.1:6379']],
+      ['chained unknown flag + http,a=b://', ['-i', dummyMp4, '-unknown_future_flag', 'http,a=b://169.254.169.254/upload']],
+      ['chained unknown flag + http,a=b:// + -y', ['-i', dummyMp4, '-unknown_future_flag', 'http,a=b://169.254.169.254/upload', '-y']],
+      ['single-char scheme comma wrapper a,b=c://', ['-i', dummyMp4, 'a,b=c://169.254.169.254/upload']],
+    ] as Array<[string, string[]]>) {
+      await expectThrows(
+        `Wave-5 rejects ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: badArgs }),
+        /disallowed protocol\/URI scheme/i,
+      );
+    }
+
+    // Filtergraph with comma before colon (`hflip,scale=640:480`) MUST still work under confinement!
+    const hflipArgs = ffmpeg.buildRunCommandArgs('ffmpeg', ['-i', dummyMp4, '-vf', 'hflip,scale=640:480', 'hflip.mp4']);
+    const hflipOut = path.resolve(tmpRoot, 'hflip.mp4');
+    const hflipIdx = hflipArgs.indexOf(hflipOut);
+    check(
+      'Wave-5 preserves legitimate -vf hflip,scale=640:480 filtergraph',
+      hflipArgs.includes('hflip,scale=640:480') &&
+        hflipIdx >= 2 &&
+        hflipArgs[hflipIdx - 2] === '-protocol_whitelist' &&
+        hflipArgs[hflipIdx - 1] === 'file,pipe',
+      `args=${JSON.stringify(hflipArgs)}`,
+    );
+
+    // [P0] `-no<bool>`, `:stream_spec` booleans, new 0-arg flags, and unknown flags before positional output
+    // MUST NOT swallow the output or omit `-protocol_whitelist file,pipe`.
+    for (const flagBeforeOut of [
+      '-nohide_banner',
+      '-noy',
+      '-non',
+      '-nore',
+      '-nobenchmark',
+      '-noauto_conversion_filters',
+      '-noprint_graphs',
+      '-auto_conversion_filters',
+      '-print_graphs',
+      '-bitexact:v',
+      '-nobitexact:v',
+      '-autorotate:v',
+      '-autoscale:v',
+      '-fix_sub_duration:s',
+      '-unknown_future_bool',
+    ]) {
+      const built = ffmpeg.buildRunCommandArgs('ffmpeg', ['-i', dummyMp4, flagBeforeOut, 'guarded-out.mp4']);
+      const expected = path.resolve(tmpRoot, 'guarded-out.mp4');
+      const pos = built.lastIndexOf(expected);
+      check(
+        `Wave-5 ${flagBeforeOut} before output preserves -protocol_whitelist file,pipe`,
+        pos >= 2 && built[pos - 2] === '-protocol_whitelist' && built[pos - 1] === 'file,pipe',
+        `built=${JSON.stringify(built)}`,
+      );
+    }
+
+    // [P1] Block file-writing flags: `-print_graphs_file`, `ffprobe -o`, `ffprobe -output_file` (with/without `:spec`).
+    for (const [cmd, badArgs] of [
+      ['ffmpeg', ['-i', dummyMp4, '-print_graphs_file', 'graph.txt', 'out.mp4']],
+      ['ffmpeg', ['-i', dummyMp4, '-print_graphs_file:v', 'graph.txt', 'out.mp4']],
+      ['ffmpeg', ['-i', dummyMp4, '-o', 'out.txt', 'out.mp4']],
+      ['ffmpeg', ['-i', dummyMp4, '-output_file', 'out.txt', 'out.mp4']],
+      ['ffprobe', ['-o', '/oaiy/existing.db', dummyMp4]],
+      ['ffprobe', ['-o:v', '/oaiy/existing.db', dummyMp4]],
+      ['ffprobe', ['-output_file', '/oaiy/existing.db', dummyMp4]],
+      ['ffprobe', ['-output_file:0', '/oaiy/existing.db', dummyMp4]],
+      ['ffprobe', ['-print_graphs_file', '/oaiy/graph.txt', dummyMp4]],
+    ] as Array<['ffmpeg' | 'ffprobe', string[]]>) {
+      await expectThrows(
+        `Wave-5 refuses ${cmd} ${badArgs.join(' ')}`,
+        () => ffmpeg.runCommand({ command: cmd, args: badArgs }),
+        /not allowed in server mode/i,
+      );
+    }
+
+    // [P1] Bare relative positional outputs confined to TMP_ROOT; path traversal, secret store, and symlink escapes refused.
+    for (const [label, badOut, errPat] of [
+      ['relative upward traversal ../escape.mp4', '../escape.mp4', /upward \(\.\.\) path/i],
+      ['nested upward traversal sub/../../escape.mp4', 'sub/../../escape.mp4', /upward \(\.\.\) path/i],
+      ['virtual secret store /oaiy/secrets.json', '/oaiy/secrets.json', /secret store is not allowed/i],
+    ] as Array<[string, string, RegExp]>) {
+      await expectThrows(
+        `Wave-5 refuses positional output ${label}`,
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, badOut] }),
+        errPat,
+      );
+    }
+
+    // Directory symlink (junction on Windows, dir symlink on POSIX) escaping ALLOWED_ROOTS MUST be refused on relative output.
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-cli-outside-'));
+    try {
+      const escapeLinkDir = path.join(tmpRoot, 'escape-dir-link');
+      const dataLinkDir = path.join(tmpRoot, 'data-dir-link');
+      const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
+      fs.symlinkSync(outsideDir, escapeLinkDir, dirLinkType);
+      fs.symlinkSync(dataRoot, dataLinkDir, dirLinkType);
+
+      await expectThrows(
+        'Wave-5 refuses relative positional output through escaping directory symlink',
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, 'escape-dir-link/pwn.mp4'] }),
+        /symlink target escapes the server fs sandbox/i,
+      );
+      await expectThrows(
+        'Wave-5 refuses relative positional output after unknown flag through escaping directory symlink',
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, '-unknown_opt', 'escape-dir-link/pwn.mp4', '-y'] }),
+        /symlink target escapes the server fs sandbox/i,
+      );
+      await expectThrows(
+        'Wave-5 refuses relative positional output pointing to secret store via directory symlink',
+        () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, 'data-dir-link/secrets.json'] }),
+        /secret store is not allowed/i,
+      );
+
+      // Test dangling file symlink escape where OS permits unprivileged file symlinks.
+      const danglingLink = path.join(tmpRoot, 'dangling-out.mp4');
+      let createdFileSymlink = false;
+      try {
+        fs.symlinkSync(path.join(outsideDir, 'new-escaped.mp4'), danglingLink, 'file');
+        createdFileSymlink = true;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException)?.code !== 'EPERM') throw e;
+      }
+      if (createdFileSymlink) {
+        await expectThrows(
+          'Wave-5 refuses relative positional output through dangling file symlink',
+          () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, 'dangling-out.mp4'] }),
+          /symlink target escapes the server fs sandbox/i,
+        );
+      }
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+
+    // [P1] >256 KiB padded `.mpd` manifest refused (1 MiB INSPECT_PROBE_BYTES) + excessive `-probesize`/`-formatprobesize`/`-analyzeduration` refused.
+    const bigPaddedMpd = path.join(tmpRoot, 'padded-320k.mpd');
+    fs.writeFileSync(
+      bigPaddedMpd,
+      `<?xml version="1.0"?>\n<!-- ${'B'.repeat(320 * 1024)} -->\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>\n`,
+    );
+    await expectThrows(
+      'Wave-5 ffmpeg rejects >256 KiB (320 KiB) comment-padded .mpd manifest',
+      () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', bigPaddedMpd, 'out.mp4'] }),
+      /DASH\/MPD/i,
+    );
+    await expectThrows(
+      'Wave-5 ffprobe rejects >256 KiB (320 KiB) comment-padded .mpd manifest',
+      () => ffmpeg.runCommand({ command: 'ffprobe', args: [bigPaddedMpd] }),
+      /DASH\/MPD/i,
+    );
+    for (const [cmd, badArgs] of [
+      ['ffmpeg', ['-probesize', '5000000', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-probesize', '2M', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-probesize:v', '2097152', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-probesize', '0x200000', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-formatprobesize', '2097152', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-formatprobesize', '2MiB', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-analyzeduration', '999999999999', '-i', dummyMp4, 'out.mp4']],
+      ['ffmpeg', ['-analyzeduration', 'bad', '-i', dummyMp4, 'out.mp4']],
+      ['ffprobe', ['-probesize', '5000000', dummyMp4]],
+      ['ffprobe', ['-formatprobesize', '2M', dummyMp4]],
+      ['ffprobe', ['-analyzeduration', '999999999999', dummyMp4]],
+    ] as Array<['ffmpeg' | 'ffprobe', string[]]>) {
+      await expectThrows(
+        `Wave-5 rejects excessive probe option ${cmd} ${badArgs.join(' ')}`,
+        () => ffmpeg.runCommand({ command: cmd, args: badArgs }),
+        /not allowed in server mode/i,
+      );
+    }
+    const okProbeBuilt = ffmpeg.buildRunCommandArgs('ffmpeg', [
+      '-probesize',
+      '524288',
+      '-formatprobesize',
+      '1M',
+      '-analyzeduration',
+      '5000000',
+      '-i',
+      dummyMp4,
+      'probe-ok.mp4',
+    ]);
+    check(
+      'Wave-5 allows bounded -probesize / -formatprobesize / -analyzeduration within 1 MiB cap',
+      okProbeBuilt.includes('524288') && okProbeBuilt.includes('1M') && okProbeBuilt.includes('5000000'),
+      `built=${JSON.stringify(okProbeBuilt)}`,
+    );
+
+    // [P2] core.ts: calculateFileChunks OOM & NaN/invalid guards + http_request AbortListener cleanup.
+    const { invoke } = await import('../src/node-host/core');
+    const chunkFile = path.join(tmpRoot, 'chunk-sample.bin');
+    fs.writeFileSync(chunkFile, Buffer.alloc(150_000, 0x61));
+
+    for (const [label, chunkArgs, errPat] of [
+      ['NaN chunkSize', { path: chunkFile, chunkSize: Number.NaN }, /chunkSize must be a finite positive/i],
+      ['string NaN chunkSize', { path: chunkFile, chunkSize: 'not-a-number' }, /chunkSize must be a finite positive/i],
+      ['zero chunkSize', { path: chunkFile, chunkSize: 0 }, /chunkSize must be a finite positive/i],
+      ['negative chunkSize', { path: chunkFile, chunkSize: -100 }, /chunkSize must be a finite positive/i],
+      ['Infinity chunkSize', { path: chunkFile, chunkSize: Number.POSITIVE_INFINITY }, /chunkSize must be a finite positive/i],
+      ['NaN overlap', { path: chunkFile, chunkSize: 1024, overlap: Number.NaN }, /overlap must be a non-negative finite/i],
+      ['negative overlap', { path: chunkFile, chunkSize: 1024, overlap: -1 }, /overlap must be a non-negative finite/i],
+      ['Infinity overlap', { path: chunkFile, chunkSize: 1024, overlap: Number.POSITIVE_INFINITY }, /overlap must be a non-negative finite/i],
+      ['overlap >= chunkSize', { path: chunkFile, chunkSize: 100, overlap: 100 }, /overlap .* must be less than chunkSize/i],
+      ['OOM >100k chunks', { path: chunkFile, chunkSize: 1, overlap: 0 }, /max 100000|maximum chunk count/i],
+    ] as Array<[string, Record<string, unknown>, RegExp]>) {
+      await expectThrows(
+        `Wave-5 calculateFileChunks rejects ${label}`,
+        () => invoke('plugin:oaiy-filesystem|calculate_file_chunks', chunkArgs),
+        errPat,
+      );
+    }
+    const validChunks = await invoke<Array<{ start: number; length: number; index: number; total: number }>>(
+      'plugin:oaiy-filesystem|calculate_file_chunks',
+      { path: chunkFile, chunkSize: 60_000, overlap: 10_000 },
+    );
+    check(
+      'Wave-5 calculateFileChunks computes valid overlapping chunks cleanly',
+      validChunks.length === 3 &&
+        validChunks[0].start === 0 &&
+        validChunks[0].length === 60_000 &&
+        validChunks[1].start === 50_000 &&
+        validChunks[2].start === 100_000 &&
+        validChunks[2].length === 50_000,
+      `chunks=${JSON.stringify(validChunks)}`,
+    );
+
+    // Verify http_request cleans up its AbortSignal listener in finally (both success and error paths).
+    const testServer = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+    });
+    await new Promise<void>((resolve) => testServer.listen(0, '127.0.0.1', resolve));
+    const srvAddr = testServer.address();
+    const srvPort = typeof srvAddr === 'object' && srvAddr ? srvAddr.port : 0;
+    const prevAllowLocal = process.env.OAIY_HTTP_ALLOW_LOCAL;
+    try {
+      process.env.OAIY_HTTP_ALLOW_LOCAL = '1';
+      const sharedAc = new AbortController();
+      for (let k = 0; k < 5; k++) {
+        const res = await invoke<{ status: number; body: string }>('http_request', {
+          url: `http://127.0.0.1:${srvPort}/`,
+          method: 'GET',
+          signal: sharedAc.signal,
+        });
+        assert.equal(res.status, 200);
+      }
+      const listenersAfterOk = getEventListeners(sharedAc.signal, 'abort').length;
+      check(
+        'Wave-5 http_request removes AbortSignal listener after successful requests',
+        listenersAfterOk === 0,
+        `leakedListeners=${listenersAfterOk}`,
+      );
+      // Error path (disallowed SSRF target when allow_local off) must also remove listener.
+      delete process.env.OAIY_HTTP_ALLOW_LOCAL;
+      await expectThrows(
+        'Wave-5 http_request rejects loopback under confinement',
+        () =>
+          invoke('http_request', {
+            url: `http://127.0.0.1:${srvPort}/`,
+            method: 'GET',
+            signal: sharedAc.signal,
+          }),
+        /blocked|refused|failed/i,
+      );
+      const listenersAfterErr = getEventListeners(sharedAc.signal, 'abort').length;
+      check(
+        'Wave-5 http_request removes AbortSignal listener after rejected request',
+        listenersAfterErr === 0,
+        `leakedListeners=${listenersAfterErr}`,
+      );
+    } finally {
+      if (prevAllowLocal === undefined) delete process.env.OAIY_HTTP_ALLOW_LOCAL;
+      else process.env.OAIY_HTTP_ALLOW_LOCAL = prevAllowLocal;
+      await new Promise<void>((resolve) => testServer.close(() => resolve()));
+    }
+
+    // [P2] browser.ts: maxSessions TOCTOU race, unconditional headless: true, and clamped cancellable settleMs.
+    const browserMod = await import('../src/node-host/browser');
+    check(
+      'Wave-5 clampSettleMs bounds invalid/negative/huge values to [0, 30_000]',
+      browserMod.clampSettleMs(undefined) === 0 &&
+        browserMod.clampSettleMs(Number.NaN) === 0 &&
+        browserMod.clampSettleMs(Number.POSITIVE_INFINITY) === 0 &&
+        browserMod.clampSettleMs(-50) === 0 &&
+        browserMod.clampSettleMs(250) === 250 &&
+        browserMod.clampSettleMs(999_999_999) === browserMod.MAX_SETTLE_MS,
+    );
+
+    const launchCalls: Array<Record<string, unknown>> = [];
+    const mockLauncher = {
+      async launch(opts: Record<string, unknown>) {
+        launchCalls.push(opts);
+        // Artificial delay simulates slow Chromium startup so concurrent createSession calls overlap.
+        await new Promise((r) => setTimeout(r, 40));
+        return {
+          async newContext() {
+            return {
+              async route() {},
+              async routeWebSocket() {},
+              async addCookies() {},
+              async newPage() {
+                return {
+                  once() {},
+                  async goto() {
+                    return { status: () => 200 };
+                  },
+                  async title() {
+                    return 'Mock';
+                  },
+                  url() {
+                    return 'https://8.8.8.8/';
+                  },
+                };
+              },
+              async close() {},
+            };
+          },
+          async close() {},
+        };
+      },
+    };
+    const prevMaxSessions = process.env.OAIY_BROWSER_MAX_SESSIONS;
+    browserMod._setChromiumLauncherForTest(mockLauncher);
+    try {
+      process.env.OAIY_BROWSER_MAX_SESSIONS = '1';
+      // Race 3 concurrent createSession({ config: { headless: false } }) calls against maxSessions=1.
+      const raced = await Promise.allSettled([
+        browserMod.createSession({ config: { headless: false } }),
+        browserMod.createSession({ config: { headless: false } }),
+        browserMod.createSession({ config: { headless: false } }),
+      ]);
+      const fulfilled = raced.filter((r): r is PromiseFulfilledResult<{ id: string }> => r.status === 'fulfilled');
+      const rejected = raced.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      check(
+        'Wave-5 browser createSession prevents maxSessions TOCTOU race across concurrent launches',
+        fulfilled.length === 1 &&
+          rejected.length === 2 &&
+          rejected.every((r) => /too many open sessions/i.test(String(r.reason))),
+        `fulfilled=${fulfilled.length} rejected=${rejected.length}`,
+      );
+      check(
+        'Wave-5 browser createSession enforces headless: true even when config.headless === false',
+        launchCalls.length === 1 && launchCalls[0].headless === true,
+        `launchCalls=${JSON.stringify(launchCalls)}`,
+      );
+
+      // Verify unbounded settleMs is cancelled immediately when session is closed or AbortSignal fires.
+      const sessionId = fulfilled[0].value.id;
+      const gotoAc = new AbortController();
+      const t0 = Date.now();
+      const gotoPromise = browserMod.goto({
+        sessionId,
+        url: 'https://8.8.8.8/',
+        options: { settleMs: 600_000, signal: gotoAc.signal },
+      });
+      setTimeout(() => gotoAc.abort(), 30);
+      await expectThrows(
+        'Wave-5 browser goto settleMs cancels promptly on AbortSignal',
+        () => gotoPromise,
+        /settle wait aborted/i,
+      );
+      check('Wave-5 browser goto AbortSignal cancel completes in <2s', Date.now() - t0 < 2000, `elapsed=${Date.now() - t0}ms`);
+
+      const t1 = Date.now();
+      const gotoClosePromise = browserMod.goto({
+        sessionId,
+        url: 'https://8.8.8.8/',
+        options: { settleMs: 600_000 },
+      });
+      setTimeout(() => {
+        void browserMod.close({ sessionId });
+      }, 30);
+      await expectThrows(
+        'Wave-5 browser goto settleMs cancels promptly when session closes',
+        () => gotoClosePromise,
+        /settle wait aborted/i,
+      );
+      check('Wave-5 browser goto close() cancel completes in <2s', Date.now() - t1 < 2000, `elapsed=${Date.now() - t1}ms`);
+    } finally {
+      await browserMod.closeAll();
+      browserMod._setChromiumLauncherForTest(null);
+      if (prevMaxSessions === undefined) delete process.env.OAIY_BROWSER_MAX_SESSIONS;
+      else process.env.OAIY_BROWSER_MAX_SESSIONS = prevMaxSessions;
+    }
 
     // -----------------------------------------------------------------------
     // 1c. ScriptHost early-death respawn cap & backoff (P1 #7)

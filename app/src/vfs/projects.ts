@@ -290,6 +290,7 @@ export class OpenProject {
   private pending = new Map<string, VfsChange>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> = Promise.resolve();
+  private metaQueue: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | null = null;
   private closed = false;
   /** Errors writing behind, for the UI. */
@@ -450,8 +451,20 @@ export class OpenProject {
       }
     }
     this.meta = { ...this.meta, updated: Date.now() };
-    await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta)).catch(() => {});
+    await this.writeMeta(true);
     return failed;
+  }
+
+  /** Serialize concurrent `project.json` writes so `write()` and `setMeta()` never collide on OPFS writable locks. */
+  private writeMeta(swallowError: boolean): Promise<void> {
+    const run = async () => {
+      const payload = JSON.stringify(this.meta);
+      if (swallowError) await writeBytes(this.dir, 'project.json', payload).catch(() => {});
+      else await writeBytes(this.dir, 'project.json', payload);
+    };
+    const next = this.metaQueue.then(run, run);
+    this.metaQueue = next.catch(() => {});
+    return next;
   }
 
   /** Its record changed (whose instructions its conversation takes, whether the business's tools are here): kept at once. */
@@ -459,7 +472,7 @@ export class OpenProject {
     const next: ProjectMeta = { ...this.meta, ...change };
     for (const key of Object.keys(change) as Array<keyof typeof change>) if (change[key] === undefined) delete next[key];
     this.meta = next;
-    await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta));
+    await this.writeMeta(false);
   }
 
   async loadChat(): Promise<Turn[]> {
@@ -583,6 +596,7 @@ export class OpenProject {
     this.unsubscribe?.();
     this.unsubscribe = null;
     await this.flush();
+    await this.metaQueue;
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);

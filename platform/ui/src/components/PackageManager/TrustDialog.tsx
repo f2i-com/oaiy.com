@@ -3,12 +3,36 @@
  */
 
 import { useState, useCallback, useRef } from 'react';
-import { Check, Info, Package, ShieldCheck } from 'lucide-react';
+import {
+  Bell,
+  Check,
+  Clipboard,
+  Code,
+  Compass,
+  Eye,
+  FileText,
+  Folder,
+  Globe,
+  Image,
+  Info,
+  KeyRound,
+  LayoutGrid,
+  Mic,
+  Package,
+  Server,
+  ShieldCheck,
+  Terminal,
+  Video,
+  Wifi,
+} from 'lucide-react';
 import type { OAIYPackageManifest, PackagePermission } from 'oaiy-core';
 import Dialog from '../ui/Dialog';
 
+export type PackageVerificationLevel = 'unverified' | 'hash_matched' | 'signature_verified';
+
 interface TrustDialogProps {
   manifest: OAIYPackageManifest;
+  verification?: PackageVerificationLevel;
   onConfirm: (grantedPermissions: PackagePermission[]) => void;
   onCancel: () => void;
 }
@@ -21,247 +45,88 @@ const PERMISSION_INFO: Record<
   filesystem: {
     label: 'File System Access',
     description: 'Read and write files on your computer',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
-        />
-      </svg>
-    ),
+    icon: <Folder size={18} aria-hidden="true" />,
   },
   'filesystem:read': {
     label: 'Read-Only File Access',
     description: 'Read files on your computer (no write access)',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-        />
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"
-        />
-      </svg>
-    ),
+    icon: <Eye size={18} aria-hidden="true" />,
   },
   network: {
     label: 'Network Access',
     description: 'Make network requests to external services',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"
-        />
-      </svg>
-    ),
+    icon: <Globe size={18} aria-hidden="true" />,
   },
   clipboard: {
     label: 'Clipboard Access',
     description: 'Read from and write to your clipboard',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
-        />
-      </svg>
-    ),
+    icon: <Clipboard size={18} aria-hidden="true" />,
   },
   notifications: {
     label: 'Notifications',
     description: 'Show system notifications',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
-        />
-      </svg>
-    ),
+    icon: <Bell size={18} aria-hidden="true" />,
   },
   camera: {
     label: 'Camera Access',
     description: 'Access your camera for video capture',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
-        />
-      </svg>
-    ),
+    icon: <Video size={18} aria-hidden="true" />,
   },
   microphone: {
     label: 'Microphone Access',
     description: 'Access your microphone for audio recording',
-    icon: (
-      <svg
-        className="w-5 h-5"
-        fill="none"
-        stroke="currentColor"
-        viewBox="0 0 24 24"
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={2}
-          d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-        />
-      </svg>
-    ),
+    icon: <Mic size={18} aria-hidden="true" />,
   },
-  // Newer capabilities (May-2026 hardening): network:local, terminal,
-  // browser, service:start, code:execute, ui:custom, secrets:read,
-  // constants:read, process:execute. Each renders as a generic icon —
-  // TrustDialog is the last UI surface that displays the package's
-  // request, so the labels here matter more than the artwork.
   'process:execute': {
     label: 'Execute OS Commands',
     description:
       'Run arbitrary shell commands on your machine (cp, rm, custom scripts, etc.). Far more powerful than read/write file access.',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    ),
+    icon: <Terminal size={18} aria-hidden="true" />,
   },
   'network:local': {
     label: 'Local Network Access',
     description: 'Talk to localhost / private-network services (e.g. Ollama, ComfyUI)',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-      </svg>
-    ),
+    icon: <Wifi size={18} aria-hidden="true" />,
   },
   terminal: {
     label: 'Terminal Automation',
     description: 'Spawn shells, send keystrokes, screenshot terminal windows',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    ),
+    icon: <Terminal size={18} aria-hidden="true" />,
   },
   browser: {
     label: 'Browser Automation',
     description: 'Drive headless / native browsers, navigate URLs, evaluate scripts',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z M3 12h18M12 3a9 9 0 010 18" />
-      </svg>
-    ),
+    icon: <Compass size={18} aria-hidden="true" />,
   },
   'service:start': {
     label: 'Start Subprocess Services',
     description: 'Launch the package’s bundled services (Python servers, etc.)',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M5 12h14M12 5l7 7-7 7" />
-      </svg>
-    ),
+    icon: <Server size={18} aria-hidden="true" />,
   },
   'code:execute': {
     label: 'Execute Custom JavaScript',
     description: 'Run logic-block / condition-expression code defined by the package',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
-      </svg>
-    ),
+    icon: <Code size={18} aria-hidden="true" />,
   },
   'ui:custom': {
     label: 'Render Custom UI Components',
     description: 'Show the package’s own React components inside OAIY',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-      </svg>
-    ),
+    icon: <LayoutGrid size={18} aria-hidden="true" />,
   },
   'secrets:read': {
     label: 'Read Secrets',
     description: 'Read user-stored API keys / tokens (OS keychain entries)',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-      </svg>
-    ),
+    icon: <KeyRound size={18} aria-hidden="true" />,
   },
   'constants:read': {
     label: 'Read Project Constants',
     description: 'Read non-secret project constants (model names, endpoints, etc.)',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-      </svg>
-    ),
+    icon: <FileText size={18} aria-hidden="true" />,
   },
   diffusion: {
     label: 'Local Diffusion Models',
     description: 'Load and run local image/video diffusion models on your GPU',
-    icon: (
-      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-          d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    ),
+    icon: <Image size={18} aria-hidden="true" />,
   },
 };
 
@@ -283,8 +148,15 @@ const HIGH_RISK_PERMISSIONS: ReadonlySet<string> = new Set([
   'microphone',
 ]);
 
-export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps) {
+export function TrustDialog({ manifest, verification, onConfirm, onCancel }: TrustDialogProps) {
   const requestedPermissions = manifest.permissions ?? [];
+
+  const verificationBadge =
+    verification === 'signature_verified'
+      ? { className: 'oaiy-pill ok dot', label: 'Verified' }
+      : verification === 'hash_matched'
+        ? { className: 'oaiy-pill info dot', label: 'Hash verified' }
+        : { className: 'oaiy-pill warn dot', label: 'Unverified' };
 
   // Low-risk requested permissions start granted; high-risk ones start UNCHECKED.
   const [grantedPermissions, setGrantedPermissions] = useState<
@@ -357,7 +229,7 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
               {manifest.author && <> · {manifest.author}</>}
             </p>
           </div>
-          <span className="oaiy-pill warn dot">Unverified</span>
+          <span className={verificationBadge.className}>{verificationBadge.label}</span>
         </div>
         {manifest.description && (
           <p className="m-0 mt-2.5 text-[12.5px] leading-relaxed text-content-secondary">{manifest.description}</p>
@@ -377,6 +249,7 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
           requestedPermissions.map((permission) => {
             const info = PERMISSION_INFO[permission];
             const granted = grantedPermissions.has(permission);
+            const isHighRisk = HIGH_RISK_PERMISSIONS.has(permission);
 
             return (
               <button
@@ -397,11 +270,14 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
                     granted ? 'bg-accent/15 text-accent' : 'bg-surface-tertiary text-content-faint'
                   }`}
                 >
-                  {info?.icon ?? <Check size={18} />}
+                  {info?.icon ?? <Check size={18} aria-hidden="true" />}
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className={`block text-[13px] font-semibold ${granted ? 'text-content-primary' : 'text-content-secondary'}`}>
-                    {info?.label ?? permission}
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <span className={`text-[13px] font-semibold ${granted ? 'text-content-primary' : 'text-content-secondary'}`}>
+                      {info?.label ?? permission}
+                    </span>
+                    {isHighRisk && <span className="oaiy-pill warn">High risk</span>}
                   </span>
                   <span id={`perm-desc-${permission}`} className="block text-[12px] leading-snug text-content-faint">
                     {info?.description ?? 'Unknown permission'}

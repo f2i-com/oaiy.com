@@ -71,21 +71,53 @@ export function movedGateway(known: string | null | undefined, gateway: string |
   return to && from && to !== from && loopback(to) && loopback(from) ? { from, to } : null;
 }
 
+const MEDIA_ENDPOINT_KEYS = ['images', 'edits', 'videos', 'speech', 'voices', 'music', 'sound', 'model3d', 'background', 'upscale'] as const;
+
 /**
  * What the page keeps of OAIY moved from `from` to `to` (an origin each): the OAIY it found, the media service's address
- * and the chat providers at it, each keeping its path (`/v1`). Whether anything moved.
+ * and discovered endpoints, and the chat providers at it, each keeping its path (`/v1`). Whether anything moved.
  */
 export function moveOaiy(media: MediaSettings, providers: ProviderConfig[], from: string, to: string): { media: MediaSettings; changed: boolean } {
-  const moved = (url: string): string => (originOr(url) === from ? `${to}${url.slice(from.length)}` : url);
+  const fromOrigin = originOr(from);
+  const toOrigin = originOr(to);
+  if (!fromOrigin || !toOrigin || fromOrigin === toOrigin) return { media, changed: false };
+  const moved = (url: string): string => {
+    if (originOr(url) !== fromOrigin) return url;
+    const trimmed = url.trim();
+    const raw = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+    const parsed = new URL(raw);
+    const path = parsed.pathname === '/' && !trimmed.endsWith('/') ? '' : parsed.pathname;
+    return `${toOrigin}${path}${parsed.search}${parsed.hash}`;
+  };
   let changed = false;
   for (const p of providers) {
-    if (!p.baseUrl || originOr(p.baseUrl) !== from) continue;
+    if (!p.baseUrl || originOr(p.baseUrl) !== fromOrigin) continue;
     p.baseUrl = moved(p.baseUrl);
     changed = true;
   }
+  let nextEndpoints = media.endpoints;
+  let endpointsChanged = false;
+  if (media.endpoints) {
+    const updated: NonNullable<MediaSettings['endpoints']> = { ...media.endpoints };
+    for (const key of MEDIA_ENDPOINT_KEYS) {
+      const current = updated[key];
+      if (!current) continue;
+      const rewritten = moved(current);
+      if (rewritten !== current) {
+        updated[key] = rewritten;
+        endpointsChanged = true;
+      }
+    }
+    if (endpointsChanged) nextEndpoints = updated;
+  }
   let next = media;
-  if (media.discovered?.origin === from || (media.baseUrl && originOr(media.baseUrl) === from)) {
-    next = { ...media, baseUrl: media.baseUrl ? moved(media.baseUrl) : media.baseUrl, ...(media.discovered ? { discovered: { ...media.discovered, origin: media.discovered.origin === from ? to : media.discovered.origin } } : {}) };
+  if (media.discovered?.origin === fromOrigin || (media.baseUrl && originOr(media.baseUrl) === fromOrigin) || endpointsChanged) {
+    next = {
+      ...media,
+      baseUrl: media.baseUrl ? moved(media.baseUrl) : media.baseUrl,
+      ...(nextEndpoints ? { endpoints: nextEndpoints } : {}),
+      ...(media.discovered ? { discovered: { ...media.discovered, origin: media.discovered.origin === fromOrigin ? toOrigin : media.discovered.origin } } : {}),
+    };
     changed = true;
   }
   return { media: next, changed };

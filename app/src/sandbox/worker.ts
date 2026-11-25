@@ -10,7 +10,7 @@
  * guest cannot outwait.
  */
 import { blockingCall } from './channel';
-import { buildPackage } from './pystd/package';
+import { installPythonPackage } from './pystd/package';
 import type { ConsoleLine, FromWorker, GuestSources, RunRequest, RunResult, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -132,8 +132,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   let packageError: string | undefined;
   if (request.lang === 'python' && glue.addPythonPackage && glue.pythonPackages) {
     try {
-      const info = JSON.parse(glue.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
-      if (!info.installed.some((p) => p.name === 'oaiy-stdlib')) glue.addPythonPackage(await buildPackage(info.engineAbi), null);
+      await installPythonPackage({ addPythonPackage: glue.addPythonPackage, pythonPackages: glue.pythonPackages });
     } catch (error) {
       packageError = errorText(error);
     }

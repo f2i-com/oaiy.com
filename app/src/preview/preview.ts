@@ -353,10 +353,10 @@ function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export class Preview {
   readonly element = h('section.preview');
   private readonly status = h('span.preview-status', '');
-  private readonly picker = h('select.preview-app', { title: 'What to show: a SoftN app, a web page or a 3D model of the project' });
-  private readonly sizePicker = h('select.preview-size', { title: 'The size of the screen the page is shown on' });
-  private readonly sizeWidth = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Width in CSS pixels' }) as HTMLInputElement;
-  private readonly sizeHeight = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Height in CSS pixels' }) as HTMLInputElement;
+  private readonly picker = h('select.preview-app', { title: 'What to show: a SoftN app, a web page or a 3D model of the project', 'aria-label': 'Preview target' });
+  private readonly sizePicker = h('select.preview-size', { title: 'The size of the screen the page is shown on', 'aria-label': 'Preview viewport size' });
+  private readonly sizeWidth = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Width in CSS pixels', 'aria-label': 'Viewport width in pixels' }) as HTMLInputElement;
+  private readonly sizeHeight = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Height in CSS pixels', 'aria-label': 'Viewport height in pixels' }) as HTMLInputElement;
   private readonly sizeCustom = h('span.preview-size-custom', this.sizeWidth, '×', this.sizeHeight);
   /** Beside the size picker: how far a chosen size is shrunk; or, under "Fit pane", that the pane is phone-sized, with the Laptop size offered. */
   private readonly sizeNoteText = h('span.preview-size-note', '');
@@ -752,7 +752,13 @@ export class Preview {
 
   private showMessage(text: string): void {
     clear(this.stage);
-    this.stage.append(h('div.empty', text));
+    this.stage.append(
+      h(
+        'div.empty.preview-empty',
+        h('span.preview-empty-icon', { 'aria-hidden': 'true' }, icon('globe')),
+        h('p', text),
+      ),
+    );
   }
 
   private setStatus(text: string, kind: 'ok' | 'busy' | 'error' = 'busy', title = ''): void {

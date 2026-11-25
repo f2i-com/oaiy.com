@@ -242,10 +242,11 @@ const JobOutputViewer = memo(function JobOutputViewer({ result, graph }: { resul
             />
           </div>
         )}
-        <div className="grid grid-cols-6 gap-1">
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(56px,1fr))] gap-1.5">
           {imageUrls.slice(0, 12).map((url, index) => (
             <button
               key={index}
+              type="button"
               onClick={() => setSelectedImageIndex(index)}
               aria-label={`Show picture ${index + 1}`}
               className={`relative aspect-square overflow-hidden rounded-[var(--r-sm)] border ${
@@ -253,7 +254,7 @@ const JobOutputViewer = memo(function JobOutputViewer({ result, graph }: { resul
               }`}
             >
               {imageErrors.has(index) ? (
-                <div className="grid h-full w-full place-items-center bg-surface-tertiary text-[9px] text-content-faint">Error</div>
+                <div className="grid h-full w-full place-items-center bg-surface-tertiary text-[11px] text-content-faint">Error</div>
               ) : isSafeUrl(url) ? (
                 <img
                   src={url}
@@ -399,9 +400,10 @@ const JobItem = memo(function JobItem({ job, onAbort, onNavigate, showAbort, isE
 
   return (
     <li className="px-4 py-3">
-      <div className="flex min-w-0 items-center gap-3">
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+        <div className="flex min-w-[140px] flex-1 flex-col gap-0.5">
           <button
+            type="button"
             onClick={onNavigate}
             className="min-w-0 truncate text-left text-[13px] font-semibold text-content-primary hover:text-accent"
             title={`Open ${job.flowName || 'this flow'} on the canvas`}
@@ -418,25 +420,27 @@ const JobItem = memo(function JobItem({ job, onAbort, onNavigate, showAbort, isE
             )}
           </span>
         </div>
-        <StatusBadge status={job.status} />
-        {showAbort && active && (
-          <button onClick={onAbort} className="btn btn-danger btn-sm">
-            <Square size={11} />
-            {job.status === 'running' ? 'Stop' : 'Cancel'}
-          </button>
-        )}
-        {hasOutput && onToggleExpand && (
-          <button onClick={onToggleExpand} className="btn btn-sm" aria-expanded={!!isExpanded}>
-            <ChevronDown size={13} className={isExpanded ? 'rotate-180 transition-transform' : 'transition-transform'} />
-            {isExpanded ? 'Hide output' : 'Output'}
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge status={job.status} />
+          {showAbort && active && (
+            <button type="button" onClick={onAbort} className="btn btn-danger btn-sm">
+              <Square size={11} />
+              {job.status === 'running' ? 'Stop' : 'Cancel'}
+            </button>
+          )}
+          {hasOutput && onToggleExpand && (
+            <button type="button" onClick={onToggleExpand} className="btn btn-sm" aria-expanded={!!isExpanded}>
+              <ChevronDown size={13} className={isExpanded ? 'rotate-180 transition-transform' : 'transition-transform'} />
+              {isExpanded ? 'Hide output' : 'Output'}
+            </button>
+          )}
+        </div>
       </div>
 
       {job.status === 'failed' && job.error && (
-        <div className="oaiy-banner mt-2">
+        <div className="oaiy-banner mt-2 text-[11px]">
           {/* (said in words: a service's JSON answer by its message, and "Error: " none times; Copy has it whole) */}
-          <span className="min-w-0 flex-1 break-words" title={job.error}>{readableError(job.error)}</span>
+          <span className="min-w-0 flex-1 break-words text-[11px]" title={job.error}>{readableError(job.error)}</span>
           <CopyLink text={job.error} label="Copy" className="shrink-0" />
         </div>
       )}

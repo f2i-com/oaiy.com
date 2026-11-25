@@ -414,4 +414,31 @@ describe('a CSV file', () => {
     ]);
     expect(facts).toEqual([['Has a dog called Max', true]]);
   });
+
+  it('Escape nudges the savebar when dirty, and closes + restores focus to the trigger when clean', async () => {
+    await mount();
+    const liam = row('Liam');
+    await click(liam);
+    expect(heading()).toBe('Liam');
+
+    // Make the contact dirty: Escape should nudge the savebar and keep the editor open.
+    const nameInput = host.querySelector<HTMLInputElement>('.contact-name input')!;
+    await act(async () => type(nameInput, 'Liam B'));
+    await settle();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    await settle();
+    expect(host.querySelector('.contacts-side')).not.toBeNull();
+    expect(bar()?.classList.contains('is-nudged')).toBe(true);
+
+    // Discard changes so the contact is clean: Escape closes and restores focus to the opened row.
+    await click(button('Discard'));
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    await settle();
+    expect(host.querySelector('.contacts-side')).toBeNull();
+    expect(document.activeElement).toBe(liam);
+  });
 });

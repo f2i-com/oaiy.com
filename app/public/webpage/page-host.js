@@ -166,37 +166,146 @@
     return null;
   };
 
+  /** Mask string literals, template text, and comments with spaces (preserving newlines) for safe module-syntax scanning. */
+  const maskJsLiteralsAndComments = (code) => {
+    const out = [];
+    const n = code.length;
+    let i = 0;
+    const tplBraceStack = [];
+    while (i < n) {
+      const ch = code[i];
+      const next = i + 1 < n ? code[i + 1] : '';
+      // Line comment
+      if (ch === '/' && next === '/') {
+        out.push('  ');
+        i += 2;
+        while (i < n && code[i] !== '\n') { out.push(' '); i++; }
+        continue;
+      }
+      // Block comment
+      if (ch === '/' && next === '*') {
+        out.push('  ');
+        i += 2;
+        while (i < n && !(code[i] === '*' && code[i + 1] === '/')) {
+          out.push(code[i] === '\n' ? '\n' : ' ');
+          i++;
+        }
+        if (i < n) { out.push('  '); i += 2; }
+        continue;
+      }
+      // Single or double quoted string
+      if (ch === "'" || ch === '"') {
+        const quote = ch;
+        out.push(quote);
+        i++;
+        while (i < n && code[i] !== quote) {
+          if (code[i] === '\\' && i + 1 < n) {
+            out.push(' ');
+            out.push(code[i + 1] === '\n' ? '\n' : ' ');
+            i += 2;
+            continue;
+          }
+          out.push(code[i] === '\n' ? '\n' : ' ');
+          i++;
+        }
+        if (i < n) { out.push(quote); i++; }
+        continue;
+      }
+      // Template literal start or continuation after `${...}`
+      if (ch === '`' || (ch === '}' && tplBraceStack.length && tplBraceStack[tplBraceStack.length - 1] === 0)) {
+        if (ch === '}') tplBraceStack.pop();
+        out.push(ch === '`' ? '`' : '}');
+        i++;
+        while (i < n) {
+          const c = code[i];
+          if (c === '\\' && i + 1 < n) {
+            out.push(' ');
+            out.push(code[i + 1] === '\n' ? '\n' : ' ');
+            i += 2;
+            continue;
+          }
+          if (c === '`') { out.push('`'); i++; break; }
+          if (c === '$' && code[i + 1] === '{') {
+            out.push('${');
+            i += 2;
+            tplBraceStack.push(0);
+            break;
+          }
+          out.push(c === '\n' ? '\n' : ' ');
+          i++;
+        }
+        continue;
+      }
+      if (tplBraceStack.length) {
+        if (ch === '{') tplBraceStack[tplBraceStack.length - 1]++;
+        else if (ch === '}') tplBraceStack[tplBraceStack.length - 1]--;
+      }
+      out.push(ch);
+      i++;
+    }
+    return out.join('');
+  };
+
+  /** True if code contains a real top-level/statement static `import` or `export` outside comments/strings. */
+  const hasStaticModuleSyntax = (code) => {
+    const masked = maskJsLiteralsAndComments(code);
+    return /(?<=^|[;{}])\s*(?:import\b(?=\s*(?:[*{'"]|[A-Za-z_$]))|export\b(?=\s*(?:[*{'"]|[A-Za-z_$])))/m.test(masked);
+  };
+
   /** Rewrite ES module imports for bundled Three.js modules into `__zdom_import(...)` calls inside Zipp. */
   const rewriteThreeModule = (code, importMap) => {
+    const masked = maskJsLiteralsAndComments(code);
     let rewritten = false;
     let modIdx = 0;
-    const importRe = /^([ \t]*)import\s+([^;]*?)\s+from\s+['"]([^'"]+)['"]\s*;?/gm;
-    const out = code.replace(importRe, (full, indent, clause, rawSpec) => {
+    const importRe = /(?<=^|[;{}])([ \t]*)import\b(?=\s*(?:[*{'"]|[A-Za-z_$]))([^;]*?)from\s*(['"])([^'"]+)\3\s*;?/gm;
+    let out = '';
+    let lastIndex = 0;
+    let match;
+    while ((match = importRe.exec(masked)) !== null) {
+      const start = match.index;
+      const end = importRe.lastIndex;
+      const indent = match[1];
+      // Extract the real specifier & clause from the unmasked source at the exact same offsets.
+      const realSlice = code.slice(start + indent.length, end);
+      const specMatch = /^import\b\s*([\s\S]*?)from\s*(['"])([^'"]+)\2\s*;?$/.exec(realSlice);
+      if (!specMatch) continue;
+      const clause = specMatch[1];
+      const rawSpec = specMatch[3];
       const canonical = resolveThreeModule(rawSpec, importMap);
-      if (!canonical) return full;
-      rewritten = true;
-      const specLit = JSON.stringify(canonical);
+      if (!canonical) continue;
+      const specLit = nativeJsonStringify(canonical);
       const trimmed = clause.trim();
-      const nsMatch = /^\*\s+as\s+([A-Za-z_$][\w$]*)$/.exec(trimmed);
-      if (nsMatch) return `${indent}const ${nsMatch[1]} = __zdom_import(${specLit});`;
-      const namedOnly = /^\{([\s\S]*)\}$/.exec(trimmed);
-      if (namedOnly) {
-        const bindings = namedOnly[1].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
-        return `${indent}const {${bindings}} = __zdom_import(${specLit});`;
+      let replacement = null;
+      const nsMatch = /^\*\s*as\s+([A-Za-z_$][\w$]*)$/.exec(trimmed);
+      if (nsMatch) {
+        replacement = `${indent}const ${nsMatch[1]} = __zdom_import(${specLit});`;
+      } else {
+        const namedOnly = /^\{([\s\S]*)\}$/.exec(trimmed);
+        if (namedOnly) {
+          const bindings = namedOnly[1].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
+          replacement = `${indent}const {${bindings}} = __zdom_import(${specLit});`;
+        } else {
+          const defAndNamed = /^([A-Za-z_$][\w$]*)\s*,\s*\{([\s\S]*)\}$/.exec(trimmed);
+          if (defAndNamed) {
+            const tmp = `__threeMod_${++modIdx}`;
+            const bindings = defAndNamed[2].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
+            replacement = `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defAndNamed[1]} = ${tmp}.default || ${tmp}; const {${bindings}} = ${tmp};`;
+          } else {
+            const defOnly = /^([A-Za-z_$][\w$]*)$/.exec(trimmed);
+            if (defOnly) {
+              const tmp = `__threeMod_${++modIdx}`;
+              replacement = `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defOnly[1]} = ${tmp}.default || ${tmp};`;
+            }
+          }
+        }
       }
-      const defAndNamed = /^([A-Za-z_$][\w$]*)\s*,\s*\{([\s\S]*)\}$/.exec(trimmed);
-      if (defAndNamed) {
-        const tmp = `__threeMod_${++modIdx}`;
-        const bindings = defAndNamed[2].replace(/\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g, '$1: $2');
-        return `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defAndNamed[1]} = ${tmp}.default || ${tmp}; const {${bindings}} = ${tmp};`;
+      if (replacement !== null) {
+        out += code.slice(lastIndex, start) + replacement;
+        lastIndex = end;
+        rewritten = true;
       }
-      const defOnly = /^([A-Za-z_$][\w$]*)$/.exec(trimmed);
-      if (defOnly) {
-        const tmp = `__threeMod_${++modIdx}`;
-        return `${indent}const ${tmp} = __zdom_import(${specLit}); const ${defOnly[1]} = ${tmp}.default || ${tmp};`;
-      }
-      return full;
-    });
+    }
+    out += code.slice(lastIndex);
     return { code: out, rewritten };
   };
 
@@ -340,11 +449,60 @@
     if (!url) {
       const type = mimeOf(path);
       const body = type === 'text/css' ? rewriteCss(textOf(path), dirOf(path)) : files[path];
-      url = URL.createObjectURL(new Blob([body], { type }));
+      url = nativeCreateObjectURL(new nativeBlob([body], { type }));
       blobs.set(path, url);
     }
     return url;
   };
+  const resolveVfsRef = (rawUrl) => {
+    if (!rawUrl || /^(?:blob|data):/i.test(rawUrl)) return null;
+    if (!external(rawUrl)) return rawUrl;
+    if (frameHref) {
+      try {
+        const parsed = new nativeURL(rawUrl);
+        if (parsed.origin === frameHref.origin) {
+          return parsed.pathname.startsWith(frameDirPath)
+            ? parsed.pathname.slice(frameDirPath.length)
+            : parsed.pathname;
+        }
+      } catch {
+        /* ignore unparseable URL */
+      }
+    }
+    return null;
+  };
+  /** Resolve Three.js loader URLs (TextureLoader, ImageLoader, CubeTextureLoader, GLTFLoader) to VFS blob URLs for offline CSP. */
+  const threeUrlModifier = (url) => {
+    const raw = String(url ?? '');
+    if (!raw || /^(?:blob|data):/i.test(raw)) return raw;
+    const vfsRef = resolveVfsRef(raw);
+    if (vfsRef !== null) {
+      const path = resolve(vfsRef, dirOf(pagePath));
+      const blobUrl = path === null ? null : urlFor(path);
+      if (blobUrl) return blobUrl;
+      if (path !== null && !missing.has(path)) {
+        missing.add(path);
+        note('warn', `Missing file: ${raw} (Three.js loader), which would be /${path}.`);
+      }
+      return 'data:,';
+    }
+    if (external(raw)) {
+      if (!missing.has(raw)) {
+        missing.add(raw);
+        note('warn', `Not loaded: ${raw} (Three.js loader). The preview is offline, so only the project's own files load; put a copy in the project and link to it.`);
+      }
+      return 'data:,';
+    }
+    return raw;
+  };
+  if (
+    threeHost &&
+    threeHost.THREE &&
+    threeHost.THREE.DefaultLoadingManager &&
+    typeof threeHost.THREE.DefaultLoadingManager.setURLModifier === 'function'
+  ) {
+    threeHost.THREE.DefaultLoadingManager.setURLModifier(threeUrlModifier);
+  }
   const missing = new Set();
   const note = (level, text) => {
     if (level === 'error') nativeConsole.error(text);
@@ -432,7 +590,7 @@
   const guestPrevented = new WeakSet();
 
   const URL_ATTRS = { src: ['img', 'source', 'audio', 'video', 'track', 'embed', 'input', 'iframe'], href: ['link', 'image', 'use'], poster: ['video'], data: ['object'] };
-  const JS_TYPES = /^(|text\/javascript|application\/javascript|module|text\/ecmascript|application\/ecmascript|text\/jsx?)$/i;
+  const JS_TYPES = /^(|text\/javascript|application\/javascript|module|text\/ecmascript|application\/ecmascript|text\/jsx?|text\/babel)$/i;
 
   /**
    * Makes what the page's markup holds safe and loadable, under `root`:
@@ -505,7 +663,7 @@
           } else if (isResourceRel) {
             el.setAttribute(attr.name, rewriteRef(attr.value, base, `<link ${name}>`));
           }
-        } else if ((URL_ATTRS[name] && URL_ATTRS[name].includes(tag)) || (name === 'xlink:href' && tag === 'image')) {
+        } else if ((URL_ATTRS[name] && URL_ATTRS[name].includes(tag)) || (name === 'xlink:href' && (tag === 'image' || tag === 'use'))) {
           el.setAttribute(attr.name, rewriteRef(attr.value, base, `<${tag} ${name}>`));
         }
       }
@@ -765,19 +923,29 @@
    * elements/attributes (recursing into <template>.content), and harvest on* handlers
    * BEFORE anything enters the live DOM.
    */
+  const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
   const sanitizeHtmlFragment = (rawHtml, contextEl) => {
     const html = String(rawHtml ?? '');
     const frag = document.createDocumentFragment();
     if (contextEl instanceof SVGElement && contextEl.localName.toLowerCase() !== 'foreignobject') {
-      const parsed = new nativeDOMParser().parseFromString(
-        `<svg xmlns="http://www.w3.org/2000/svg">${html}</svg>`,
-        'image/svg+xml',
-      );
-      const svgRoot = parsed.documentElement;
-      if (svgRoot && svgRoot.localName.toLowerCase() === 'svg' && !parsed.querySelector('parsererror')) {
-        stripDangerousTree(svgRoot);
+      const tpl = document.createElement('template');
+      tpl.innerHTML = `<svg>${html}</svg>`;
+      stripDangerousTree(tpl.content);
+      const svgRoot = tpl.content.firstElementChild;
+      if (svgRoot && svgRoot.localName.toLowerCase() === 'svg') {
         harvest(svgRoot);
         while (svgRoot.firstChild) frag.appendChild(document.adoptNode(svgRoot.firstChild));
+        return frag;
+      }
+    }
+    if (contextEl instanceof Element && contextEl.namespaceURI === MATHML_NS) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = `<math>${html}</math>`;
+      stripDangerousTree(tpl.content);
+      const mathRoot = tpl.content.firstElementChild;
+      if (mathRoot && mathRoot.localName.toLowerCase() === 'math') {
+        harvest(mathRoot);
+        while (mathRoot.firstChild) frag.appendChild(document.adoptNode(mathRoot.firstChild));
         return frag;
       }
     }
@@ -835,7 +1003,8 @@
   ]);
   /** A <script> the page's code added (to load a library, say): it runs on Zipp, then fires load or error. */
   const runInserted = (el) => {
-    if (dead || !el.isConnected || !JS_TYPES.test((el.getAttribute('type') || '').trim())) return;
+    const scriptType = (el.getAttribute('type') || '').trim();
+    if (dead || !el.isConnected || !JS_TYPES.test(scriptType)) return;
     const src = el.getAttribute('src');
     let code = el.textContent;
     let name = 'an inserted script';
@@ -848,6 +1017,11 @@
       }
       code = textOf(path);
       name = path;
+    }
+    if (/jsx|babel/i.test(scriptType)) {
+      note('error', `${name}: JSX (type="text/babel") needs a compiler, which the preview does not have. Write plain JavaScript.`);
+      if (src) el.dispatchEvent(new nativeEvent('error'));
+      return;
     }
     const failed = enter(() => engine.callFunction('__zdom_run', [zdomToken, code, name]));
     if (typeof failed === 'string') note('error', failed);
@@ -1033,6 +1207,7 @@
     return out;
   };
 
+  const linkRelLists = new WeakSet();
   const OPS = nativeObjectAssign(nativeObjectCreate(null), {
     window: () => {
       if (!facadeBooting || windowIssued) throw new TypeError('window is not allowed');
@@ -1045,6 +1220,14 @@
       if (isBlockedProp(obj, prop)) return undefined;
       const val = obj[prop];
       if (isForbiddenHostVal(val)) return undefined;
+      if (
+        prop === 'relList' &&
+        obj instanceof Element &&
+        obj.localName.toLowerCase() === 'link' &&
+        val instanceof DOMTokenList
+      ) {
+        linkRelLists.add(val);
+      }
       if (val && typeof val === 'object' && prop === 'uniforms' && obj && obj.isMaterial) {
         handleObjects.add(val);
         for (const k of nativeObjectKeys(val)) {
@@ -1097,10 +1280,17 @@
           return undefined;
         }
       }
+      if (obj instanceof DOMTokenList && linkRelLists.has(obj) && prop === 'value') {
+        if (DANGEROUS_LINK_REL.test(String(v ?? ''))) return undefined;
+      }
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
+      if (prop === 'textContent' && (obj instanceof HTMLStyleElement || (typeof SVGStyleElement !== 'undefined' && obj instanceof SVGStyleElement))) {
+        obj.textContent = rewriteCss(String(v ?? ''), dirOf(pagePath));
+        return undefined;
+      }
       if (prop === 'innerHTML' && (obj instanceof Element || (typeof ShadowRoot !== 'undefined' && obj instanceof ShadowRoot))) {
-        if (obj instanceof HTMLStyleElement) {
+        if (obj instanceof HTMLStyleElement || (typeof SVGStyleElement !== 'undefined' && obj instanceof SVGStyleElement)) {
           obj.textContent = rewriteCss(String(v ?? ''), dirOf(pagePath));
           return undefined;
         }
@@ -1218,7 +1408,7 @@
         if (attrName === 'rel' && DANGEROUS_LINK_REL.test(attrVal)) return null;
         if ((attrName === 'href' || attrName === 'src') && external(attrVal.trim())) return null;
       }
-      if (obj instanceof DOMTokenList && (method === 'add' || method === 'replace' || method === 'toggle')) {
+      if (obj instanceof DOMTokenList && linkRelLists.has(obj) && (method === 'add' || method === 'replace' || method === 'toggle')) {
         if (list.some((tok) => typeof tok === 'string' && DANGEROUS_LINK_REL.test(tok))) return undefined;
       }
       if (obj instanceof CSSStyleDeclaration && method === 'setProperty') list[1] = cssValue(list[1]);
@@ -1246,8 +1436,8 @@
       if (method === 'setHTMLUnsafe') {
         if (obj instanceof Element || (typeof ShadowRoot !== 'undefined' && obj instanceof ShadowRoot)) {
           const frag = sanitizeHtmlFragment(list[0], obj instanceof Element ? obj : obj.host);
-          obj.replaceChildren(frag);
-          if (method === 'setHTMLUnsafe') harvest(obj);
+          if (obj instanceof HTMLTemplateElement) obj.content.replaceChildren(frag);
+          else obj.replaceChildren(frag);
           return undefined;
         }
         throw new TypeError('setHTMLUnsafe is not allowed on this object');
@@ -1295,8 +1485,7 @@
       }
       const result = obj[method](...list);
       if (isForbiddenHostVal(result)) return undefined;
-      if (method === 'setHTMLUnsafe') harvest(obj);
-      else if (HTML_METHODS.has(method) && result instanceof Node) {
+      if (HTML_METHODS.has(method) && result instanceof Node) {
         stripDangerousTree(result);
         harvest(result);
       }
@@ -1473,7 +1662,11 @@
         if (opts.preserveDrawingBuffer === undefined) opts.preserveDrawingBuffer = true;
         list[0] = opts;
       }
-      return new C(...list);
+      const instance = new C(...list);
+      if (key === 'three:LoadingManager' && instance && typeof instance.setURLModifier === 'function') {
+        instance.setURLModifier(threeUrlModifier);
+      }
+      return instance;
     },
     threeCall(key, args) {
       const fn = threeCallables.get(String(key));
@@ -1669,10 +1862,10 @@
         note('error', `${name}: JSX (type="text/babel") needs a compiler, which the preview does not have. Write plain JavaScript.`);
         continue;
       }
-      if (script.module && /^\s*(import|export)\b/m.test(code)) {
+      if (script.module && hasStaticModuleSyntax(code)) {
         const transformed = rewriteThreeModule(code, importMap);
-        if (transformed.rewritten && !/^\s*(import|export)\b/m.test(transformed.code)) {
-          code = /\bawait\b/.test(transformed.code)
+        if (transformed.rewritten && !hasStaticModuleSyntax(transformed.code)) {
+          code = /\bawait\b/.test(maskJsLiteralsAndComments(transformed.code))
             ? `(async function () {\n${transformed.code}\n})().catch(function(__e){ console.error('Uncaught ' + (__e && __e.stack ? __e.stack : String(__e))); });`
             : `(function () {\n${transformed.code}\n})();`;
         } else {

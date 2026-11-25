@@ -13,6 +13,7 @@ import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { HERE, IN_WINDOW, KEPT_HERE } from './where';
 import { clear, h } from './dom';
+import { icon } from './icons';
 import { confirmAction } from './modal';
 import { findOaiyTitle, oaiyFoundWords, oaiyStateOf, pairedTabWords } from './linkWords';
 
@@ -136,7 +137,7 @@ export function serviceWords(service: string, version: string): string {
 export function thinkSetting(agent: AgentSettings): HTMLElement {
   const kept = agent.thinkTokens > 0 ? agent.thinkTokens : DEFAULT_AGENT_SETTINGS.thinkTokens;
   const inRange = (v: number) => Number.isInteger(v) && v >= THINK_TOKENS_MIN && v <= THINK_TOKENS_MAX;
-  const tokens = h('input.think-tokens', { type: 'number', min: THINK_TOKENS_MIN, max: THINK_TOKENS_MAX, step: 256, value: kept, style: 'width: 96px', 'aria-label': 'The most tokens of thinking before each step' }) as HTMLInputElement;
+  const tokens = h('input.think-tokens.num-input-sm', { type: 'number', min: THINK_TOKENS_MIN, max: THINK_TOKENS_MAX, step: 256, value: kept, 'aria-label': 'The most tokens of thinking before each step' }) as HTMLInputElement;
   const unlimited = h('input', { type: 'checkbox', checked: agent.thinkTokens === 0 }) as HTMLInputElement;
   const sync = () => {
     tokens.disabled = unlimited.checked;
@@ -190,12 +191,14 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     const added = new Set<string>();
 
     // (named by its heading, as a screen reader says it when it opens)
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = h('dialog.settings', { 'aria-labelledby': 'settings-title' });
     const list = h('div.provider-list');
     const form = h('div.provider-form');
     const close = (result: SettingsResult | null) => {
       dialog.close();
       dialog.remove();
+      if (previouslyFocused?.isConnected) previouslyFocused.focus();
       resolve(result);
     };
 
@@ -331,7 +334,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           else if (editing === p) say(note, `Could not list models yet: ${(error as Error).message}`, true);
         }
       };
-      const fetchModels = h('button', { onclick: () => void loadModels(false) }, 'List models');
+      const fetchModels = h('button', { type: 'button', onclick: () => void loadModels(false) }, 'List models');
       fillModels(modelCache.get(cacheKey(p)));
       // A provider that was saved is one the Agent already talks to: its models are listed as its form opens. One
       // just added is asked nothing until List models (or Test, or Detect) is pressed: adding a provider asked this
@@ -349,7 +352,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         p.contextTokens = Number.isFinite(v) && v >= 1024 ? Math.floor(v) : undefined;
         showWindow();
       } }) as HTMLInputElement;
-      const detect = h('button', { title: 'Ask the server how big the model\'s context window is', onclick: async () => {
+      const detect = h('button', { type: 'button', title: 'Ask the server how big the model\'s context window is', onclick: async () => {
         if (!p.modelId) {
           windowNote.textContent = 'Choose a model first.';
           return;
@@ -372,12 +375,12 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         } else windowNote.textContent = `The server does not say; ${formatTokens(contextWindow(p).tokens)} is assumed. Type the size if you know it.`;
       } }, 'Detect');
       showWindow();
-      const test = h('button', { onclick: async () => {
+      const test = h('button', { type: 'button', onclick: async () => {
         say(note, 'Testing…');
         const result = await testProvider(p);
         say(note, result.ok ? (result.replied ? `Works: ${p.modelId} answered.` : 'The server answers; choose a model to finish.') : result.message, !result.ok);
       } }, 'Test');
-      const remove = h('button.danger', { onclick: () => {
+      const remove = h('button.danger', { type: 'button', onclick: () => {
         const at = providers.indexOf(p);
         providers = providers.filter((x) => x !== p);
         if (activeId === p.id) activeId = providers[0]?.id ?? null;
@@ -456,7 +459,7 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       // dialog was drawn (Find OAIY, Forget OAIY and a saved change draw it again).
       const oaiyState = oaiyStateOf({ own: looksOnLoad(pageHost()), desktop: context.pairedDesktop ?? null, discovered: media.discovered?.origin, withKey: !!media.apiKey, typed: media.baseUrl });
       const pairedWords = pairedTabWords(oaiyState);
-      const find = h('button', { title: findOaiyTitle(oaiyState), onclick: async () => {
+      const find = h('button', { type: 'button', title: findOaiyTitle(oaiyState), onclick: async () => {
         say(note, 'Looking for OAIY…');
         let where = OAIY_ORIGIN;
         try {
@@ -483,14 +486,14 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
           `Found ${serviceWords(found.service, found.version)}: ${they[0]} can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ` ${they[1]} in the AI providers too, for chat.` : ''}`;
       } }, 'Find OAIY');
       // Shown while an OAIY is found: this page asks it at that address each time it opens, with the key below (if there is one).
-      const forget = h('button', { title: 'Forget the OAIY that was found: its address, what it said and the key. This page stops asking it when it opens (once you press Save).', onclick: () => {
+      const forget = h('button', { type: 'button', title: 'Forget the OAIY that was found: its address, what it said and the key. This page stops asking it when it opens (once you press Save).', onclick: () => {
         const was = media.discovered?.origin;
         const chatToo = !!was && providers.some((p) => addressOf(p.baseUrl ?? '', was));
         media = forgetOaiy(media);
         renderMedia();
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `Forgotten${was ? ` (${was})` : ''}. Press Save to keep that: this page then asks nothing of it.${chatToo ? ' Its chat provider is still in the list above; remove it there too if you do not want it.' : ''}`;
       } }, 'Forget OAIY');
-      const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
+      const listButton = h('button', { type: 'button', title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
           say(note, 'Give the address first.', true);
           return;
@@ -557,55 +560,61 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         ? [h('p.agent-elsewhere', `The Agent runs on ${context.agentElsewhere}, as chosen in OAIY's Settings → Agent: change it there. The providers below are this page's own; the Agent uses them when it runs on OAIY's engine.`)]
         : [];
     dialog.append(
-      h('h2', { id: 'settings-title' }, IN_WINDOW ? 'Agent settings' : 'Settings'),
-      h('strong.settings-section', IN_WINDOW ? "The Agent's own AI providers" : 'AI providers'),
-      ...chosenInOaiy,
-      h('p.muted', `Keys are stored encrypted ${KEPT_HERE} and sent only to their own provider. Sandboxed code never sees them.`),
-      h('div.settings-grid', list, form),
       h(
-        'div.agent-settings',
-        h('strong', 'Agent'),
-        // The person's own instructions, for their own conversations (never the phone's).
-        h('label.agent-instructions', h('span', 'Your instructions'), (() => {
-          const input = h('textarea', {
-            rows: 4,
-            maxlength: INSTRUCTIONS_MAX,
-            spellcheck: true,
-            placeholder: 'How you like the Agent to work: what to call you, which language to answer in, how much to explain…',
-            oninput: () => {
-              agent.instructions = input.value;
-            },
-          }) as HTMLTextAreaElement;
-          input.value = agent.instructions ?? '';
-          return input;
-        })()),
-        h('p.muted', "For your own conversations with the Agent (your projects, the Front desk, Set up OAIY), after OAIY's own instructions: yours win where they differ on how to work or write. A project can use its own instead (Instructions, beside Thinking, or in the project menu). The phone's calls, texts and flows' tasks never get them."),
-        // How long the model may think before each step, where it thinks: it stops there and acts.
-        thinkSetting(agent),
-        // What it does by itself, in a sentence; the two numbers behind it are for someone tuning a small model, and
-        // closed until asked for (as a provider's context size and agents are, above).
-        h('p.muted', 'A long conversation is shortened by itself: older turns are summarized, recent ones stay word for word.'),
-        h('details.provider-advanced',
-          h('summary', 'Advanced'),
-          h('label', 'Shorten the conversation at ', (() => {
-            const input = h('input', { type: 'number', min: 40, max: 95, step: 5, value: Math.round(agent.compactAt * 100), oninput: () => {
-              const v = Number(input.value);
-              if (v >= 40 && v <= 95) agent.compactAt = v / 100;
-            } }) as HTMLInputElement;
-            return input;
-          })(), '% of what the model can read at once'),
-          h('label', 'Give each sub-agent ', (() => {
-            const input = h('input', { type: 'number', min: 4096, step: 4096, value: agent.subAgentTokens, oninput: () => {
-              const v = Number(input.value);
-              if (v >= 4096) agent.subAgentTokens = Math.floor(v);
-            } }) as HTMLInputElement;
-            input.style.width = '96px';
-            return input;
-          })(), ' tokens to read (at most what the model can)'),
-        ),
+        'div.settings-head',
+        h('h2', { id: 'settings-title' }, IN_WINDOW ? 'Agent settings' : 'Settings'),
+        h('button.settings-close', { type: 'button', title: 'Close settings', 'aria-label': 'Close settings', onclick: () => void leave() }, icon('x')),
       ),
-      mediaSection,
-      h('div.dialog-buttons', h('button', { onclick: () => void leave() }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),
+      h(
+        'div.settings-body',
+        h('strong.settings-section', IN_WINDOW ? "The Agent's own AI providers" : 'AI providers'),
+        ...chosenInOaiy,
+        h('p.muted', `Keys are stored encrypted ${KEPT_HERE} and sent only to their own provider. Sandboxed code never sees them.`),
+        h('div.settings-grid', list, form),
+        h(
+          'div.agent-settings',
+          h('strong', 'Agent'),
+          // The person's own instructions, for their own conversations (never the phone's).
+          h('label.agent-instructions', h('span', 'Your instructions'), (() => {
+            const input = h('textarea', {
+              rows: 4,
+              maxlength: INSTRUCTIONS_MAX,
+              spellcheck: true,
+              placeholder: 'How you like the Agent to work: what to call you, which language to answer in, how much to explain…',
+              oninput: () => {
+                agent.instructions = input.value;
+              },
+            }) as HTMLTextAreaElement;
+            input.value = agent.instructions ?? '';
+            return input;
+          })()),
+          h('p.muted', "For your own conversations with the Agent (your projects, the Front desk, Set up OAIY), after OAIY's own instructions: yours win where they differ on how to work or write. A project can use its own instead (Instructions, beside Thinking, or in the project menu). The phone's calls, texts and flows' tasks never get them."),
+          // How long the model may think before each step, where it thinks: it stops there and acts.
+          thinkSetting(agent),
+          // What it does by itself, in a sentence; the two numbers behind it are for someone tuning a small model, and
+          // closed until asked for (as a provider's context size and agents are, above).
+          h('p.muted', 'A long conversation is shortened by itself: older turns are summarized, recent ones stay word for word.'),
+          h('details.provider-advanced',
+            h('summary', 'Advanced'),
+            h('label', 'Shorten the conversation at ', (() => {
+              const input = h('input', { type: 'number', min: 40, max: 95, step: 5, value: Math.round(agent.compactAt * 100), oninput: () => {
+                const v = Number(input.value);
+                if (v >= 40 && v <= 95) agent.compactAt = v / 100;
+              } }) as HTMLInputElement;
+              return input;
+            })(), '% of what the model can read at once'),
+            h('label', 'Give each sub-agent ', (() => {
+              const input = h('input.num-input-sm', { type: 'number', min: 4096, step: 4096, value: agent.subAgentTokens, oninput: () => {
+                const v = Number(input.value);
+                if (v >= 4096) agent.subAgentTokens = Math.floor(v);
+              } }) as HTMLInputElement;
+              return input;
+            })(), ' tokens to read (at most what the model can)'),
+          ),
+        ),
+        mediaSection,
+      ),
+      h('div.dialog-buttons', h('button', { type: 'button', onclick: () => void leave() }, 'Cancel'), h('button.primary', { type: 'button', onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),
     );
     // (closed without saving, Escape or Cancel: asked first where something was changed, a key just typed among it)
     let startedAs = '';
@@ -620,6 +629,9 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
     // (as the form shows it, once drawn)
     startedAs = JSON.stringify({ providers, activeId, agent, media });
     dialog.showModal();
+    dialog.addEventListener('click', (e) => {
+      if (e.target === dialog) void leave();
+    });
     dialog.addEventListener('cancel', (e) => {
       e.preventDefault();
       void leave();

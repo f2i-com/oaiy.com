@@ -173,23 +173,32 @@ struct Transport {
 /// Starts an app-server for a `CODEX_HOME`.
 type Connect = Arc<dyn Fn(&Path) -> Result<Transport, CodexError> + Send + Sync>;
 
-/// Read Codex's stderr to its end, its lines kept for the log (cut to a few hundred characters each): kept from filling.
-fn drain_stderr(stderr: std::process::ChildStderr) {
+/// Read Codex's stderr to its end, its lines kept for the log (cut to a few hundred characters each)
+/// with per-line memory bounded even if the child emits huge `\r`-only progress bars without newlines.
+fn drain_stderr_from(stderr: impl Read, mut emit: impl FnMut(&str)) {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        match crate::services::runner::read_bounded_line(
+            &mut reader,
+            &mut line,
+            crate::services::runner::MAX_LINE_BYTES,
+        ) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
                 let text = String::from_utf8_lossy(&line);
                 let text = text.trim_end();
                 if !text.is_empty() {
-                    log::debug!("codex: {}", text.chars().take(400).collect::<String>());
+                    let short: String = text.chars().take(400).collect();
+                    emit(&short);
                 }
             }
         }
     }
+}
+
+fn drain_stderr(stderr: std::process::ChildStderr) {
+    drain_stderr_from(stderr, |msg| log::debug!("codex: {msg}"));
 }
 
 /// What the person is told when Codex is not on this computer at all: said for them, not as the system's
@@ -2456,5 +2465,16 @@ mod tests {
         assert_eq!(answered(&call), "You said: Hello?");
         assert!(agent.status().available);
         assert_eq!(fake.state.lock().unwrap().connects, 2);
+    }
+
+    #[test]
+    fn drain_stderr_bounds_huge_lines_and_keeps_following_lines() {
+        let mut payload = b"spin\r".repeat(50_000); // ~250 KiB single line
+        payload.extend_from_slice(b"\nafter huge line\n");
+        let mut emitted = Vec::new();
+        drain_stderr_from(std::io::Cursor::new(payload), |s| emitted.push(s.to_string()));
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].chars().count(), 400);
+        assert_eq!(emitted[1], "after huge line");
     }
 }

@@ -47,6 +47,8 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const [rawSql, setRawSql] = useState('');
   const [showRawQuery, setShowRawQuery] = useState(false);
+  const [inspectedCell, setInspectedCell] = useState<{ column: string; rowIndex: number; text: string; isJson: boolean } | null>(null);
+  const sqlTextareaRef = useRef<HTMLTextAreaElement>(null);
   const confirm = useConfirmDialog();
 
   // Flow database browser state (when no activeFlowId)
@@ -111,6 +113,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     setViewingRawResult(false);
     setSelectedCollection(name);
     setSelectedRows(new Set());
+    setInspectedCell(null);
     try {
       const flowId = activeFlowId || selectedFlowDb?.flowId;
       const pkgId = packageId || selectedFlowDb?.packageId;
@@ -596,23 +599,39 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
                   </span>
                 </label>
               </div>
-              <div className="flex gap-2">
-                <input
-                  type="text"
+              <div className="flex flex-col gap-1.5 sm:flex-row sm:items-end">
+                <textarea
+                  ref={sqlTextareaRef}
                   value={rawSql}
-                  onChange={(e) => setRawSql(e.target.value)}
-                  placeholder={developerMode ? 'Any SQL (developer mode)' : 'SELECT … (read-only unless developer mode is on)'}
-                  className="oaiy-input mono flex-1"
-                  onKeyDown={(e) => e.key === 'Enter' && executeRawSql()}
+                  onChange={(e) => {
+                    setRawSql(e.target.value);
+                    const el = e.currentTarget;
+                    el.style.height = 'auto';
+                    el.style.height = `${Math.min(180, Math.max(54, el.scrollHeight))}px`;
+                  }}
+                  placeholder={developerMode ? 'Any SQL (developer mode)…' : 'SELECT * FROM documents LIMIT 50 (read-only unless developer mode is on)'}
+                  rows={2}
+                  spellCheck={false}
+                  className="oaiy-textarea font-mono min-h-[54px] max-h-[180px] flex-1 resize-y text-[12px]"
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                      e.preventDefault();
+                      void executeRawSql();
+                    }
+                  }}
                   aria-label="SQL query"
                 />
-                <button
-                  onClick={executeRawSql}
-                  disabled={loading || !rawSql.trim()}
-                  className={destructive ? 'btn btn-danger' : 'btn btn-primary'}
-                >
-                  {destructive ? 'Run (changes data)' : 'Run'}
-                </button>
+                <div className="flex flex-col items-end gap-1">
+                  <button
+                    type="button"
+                    onClick={executeRawSql}
+                    disabled={loading || !rawSql.trim()}
+                    className={destructive ? 'btn btn-danger' : 'btn btn-primary'}
+                  >
+                    {destructive ? 'Run (changes data)' : 'Run'}
+                  </button>
+                  <span className="font-mono text-[10px] text-content-faint">Ctrl/⌘+Enter</span>
+                </div>
               </div>
             </div>
           )}
@@ -683,16 +702,25 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
                             )}
                           </td>
                         )}
-                        {columns.map(col => (
-                          <td
-                            key={col}
-                            title={formatValue(row[col])}
-                            // (numbers line up on the right, as in a spreadsheet; the id is the faint bookkeeping it is)
-                            className={typeof row[col] === 'number' ? 'text-right tabular-nums' : col.startsWith('_') ? 'text-content-faint' : undefined}
-                          >
-                            {formatValue(row[col])}
-                          </td>
-                        ))}
+                        {columns.map(col => {
+                          const raw = row[col];
+                          const display = formatValue(raw);
+                          const isInspecting = inspectedCell?.rowIndex === i && inspectedCell?.column === col;
+                          return (
+                            <td
+                              key={col}
+                              title={display ? `${display}\n\nClick to inspect` : undefined}
+                              // (numbers line up on the right, as in a spreadsheet; the id is the faint bookkeeping it is)
+                              className={`${typeof raw === 'number' ? 'text-right tabular-nums' : col.startsWith('_') ? 'text-content-faint' : ''}${display ? ' cursor-pointer' : ''}${isInspecting ? ' bg-accent/15' : ''}`}
+                              onClick={() => {
+                                if (!display) return;
+                                setInspectedCell(formatCellForInspector(col, i, raw));
+                              }}
+                            >
+                              {display}
+                            </td>
+                          );
+                        })}
                         {canMutateRows && (
                           <td>
                             {rowId !== null && (
@@ -714,10 +742,59 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
               </table>
             )}
           </div>
+
+          {/* Click-to-inspect cell drawer */}
+          {inspectedCell && (
+            <div
+              role="region"
+              aria-label={`Inspecting ${inspectedCell.column} in row ${inspectedCell.rowIndex + 1}`}
+              className="flex flex-col gap-2 border-t border-edge-primary bg-surface-tertiary/70 px-4 py-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="oaiy-pill accent">{inspectedCell.column}</span>
+                  <span className="font-mono text-[11px] text-content-faint">
+                    Row {inspectedCell.rowIndex + 1} · {inspectedCell.text.length.toLocaleString()} chars
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <CopyLink text={inspectedCell.text} label="Copy value" />
+                  <button
+                    type="button"
+                    onClick={() => setInspectedCell(null)}
+                    className="oaiy-icon-btn sm"
+                    aria-label="Close cell inspector"
+                    title="Close inspector"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
+              <pre
+                className={`m-0 max-h-48 overflow-auto rounded-[var(--r-sm)] border border-edge-primary bg-surface-secondary p-2.5 text-[12px] leading-relaxed text-content-primary whitespace-pre-wrap break-words ${inspectedCell.isJson ? 'font-mono' : 'font-sans'}`}
+              >
+                {inspectedCell.text}
+              </pre>
+            </div>
+          )}
         </Card>
       </div>
     </SectionPage>
   );
+}
+
+function formatCellForInspector(column: string, rowIndex: number, value: unknown): { column: string; rowIndex: number; text: string; isJson: boolean } {
+  if (value !== null && typeof value === 'object') {
+    return { column, rowIndex, text: JSON.stringify(value, null, 2), isJson: true };
+  }
+  const str = formatValue(value);
+  const trimmed = str.trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return { column, rowIndex, text: JSON.stringify(JSON.parse(trimmed), null, 2), isJson: true };
+    } catch { /* fall back to raw string */ }
+  }
+  return { column, rowIndex, text: str, isJson: false };
 }
 
 function formatValue(value: unknown): string {

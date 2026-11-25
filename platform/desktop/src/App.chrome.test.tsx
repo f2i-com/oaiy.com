@@ -295,4 +295,19 @@ describe('the dashboard’s frame while OAIY is not answering', () => {
       rects.mockRestore();
     }
   });
+
+  it('supports Home and End keyboard navigation on SectionTabs', async () => {
+    await go('engines');
+    const tablist = host.querySelector<HTMLDivElement>('.topbar [role=tablist]')!;
+    const tabs = () => Array.from(tablist.querySelectorAll<HTMLButtonElement>('[role=tab]'));
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+
+    await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })));
+    await settle();
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['false', 'false', 'true']);
+
+    await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })));
+    await settle();
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+  });
 });

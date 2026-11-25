@@ -568,7 +568,7 @@ export function StorageSettings() {
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>⚠ {error}</span>
           <button type="button" className="banner-dismiss" aria-label="Dismiss error" onClick={() => setError(null)}>
-            ×
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -609,11 +609,13 @@ export function StorageSettings() {
             )}
 
             {cfg.restartRequired && (
-              <div className="banner banner-pending">
-                Pending: <code className="path-code">{cfg.configuredDir ?? cfg.defaultDir}</code>
-                <br />
-                Restart OAIY to start using the new folder.
-                <div className="form-actions" style={{ marginTop: 8 }}>
+              <div className="banner banner-pending banner-stack">
+                <span>
+                  Pending: <code className="path-code">{cfg.configuredDir ?? cfg.defaultDir}</code>
+                  <br />
+                  Restart OAIY to start using the new folder.
+                </span>
+                <div className="form-actions banner-actions-row">
                   <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={() => void restartNow()}>
                     Restart now
                   </button>
@@ -647,7 +649,7 @@ export function StorageSettings() {
         />
 
         {plan?.canMigrate && !skipped ? (
-          <div className="banner banner-pending">
+          <div className="banner banner-pending banner-stack">
             {mig?.running ? (
               <>
                 <strong>
@@ -655,8 +657,7 @@ export function StorageSettings() {
                   new folder…
                 </strong>
                 <div
-                  className="progress-bar"
-                  style={{ margin: '8px 0' }}
+                  className="progress-bar banner-progress"
                   role="progressbar"
                   aria-label="Data migration progress"
                   aria-valuemin={0}
@@ -692,7 +693,7 @@ export function StorageSettings() {
             ) : (
               <>
                 <strong>Bring your data to the new folder?</strong>
-                <p className="form-hint" style={{ margin: '6px 0' }}>
+                <p className="form-hint banner-sub">
                   {plan.fileCount} file{plan.fileCount === 1 ? '' : 's'} · {formatBytes(plan.totalBytes)} in{' '}
                   {plan.subdirs.join(', ')}. Python and the services’ own Python folders are not moved: install them again in
                   the new place, one click each on Services.
@@ -748,12 +749,14 @@ export function StorageSettings() {
             </div>
 
             {cfg.modelsRestartRequired && (
-              <div className="banner banner-pending">
-                Pending:{' '}
-                <code className="path-code">{cfg.modelsConfiguredDir ?? cfg.modelsDefaultDir}</code>
-                <br />
-                Restart OAIY to start saving models there.
-                <div className="form-actions" style={{ marginTop: 8 }}>
+              <div className="banner banner-pending banner-stack">
+                <span>
+                  Pending:{' '}
+                  <code className="path-code">{cfg.modelsConfiguredDir ?? cfg.modelsDefaultDir}</code>
+                  <br />
+                  Restart OAIY to start saving models there.
+                </span>
+                <div className="form-actions banner-actions-row">
                   <button className="btn btn-primary" disabled={!!mig?.running} title={mig?.running ? 'Wait for the copy or move to finish' : undefined} onClick={() => void restartNow()}>
                     Restart now
                   </button>

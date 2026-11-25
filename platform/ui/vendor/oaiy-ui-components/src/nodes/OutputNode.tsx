@@ -12,10 +12,30 @@ export interface OutputNodeProps {
     data: Record<string, unknown> & {
         __definition?: NodeDefinition;
         result?: unknown;
+        outputValue?: unknown;
         label?: string;
         _updateKey?: number;
+        _collapsed?: boolean;
+        _status?: 'running' | 'completed' | 'error' | 'stopped';
+        onCollapsedChange?: (collapsed: boolean) => void;
     };
     selected?: boolean;
+}
+
+/** Allow only safe browser-loadable media URLs (never synthesize raw file:// URIs). */
+function safeMediaSrc(raw: string): string | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    if (
+        trimmed.startsWith('data:') ||
+        trimmed.startsWith('blob:') ||
+        trimmed.startsWith('https://') ||
+        trimmed.startsWith('http://') ||
+        trimmed.startsWith('/')
+    ) {
+        return trimmed;
+    }
+    return null;
 }
 
 // Helper to detect if a value is an audio file path
@@ -82,17 +102,16 @@ function isVideoPath(value: unknown): string | null {
 // OutputNode Component
 // ============================================
 
-// Custom comparison for memo - detect changes in result and _updateKey
+// Custom comparison for memo - detect changes in result, status, collapse, selection, and _updateKey
 const arePropsEqual = (prevProps: OutputNodeProps, nextProps: OutputNodeProps): boolean => {
-    // Always re-render if id changes
     if (prevProps.id !== nextProps.id) return false;
-    // Re-render if result changes
+    if (prevProps.selected !== nextProps.selected) return false;
     if (prevProps.data.result !== nextProps.data.result) return false;
-    // Re-render if _updateKey changes (forced update)
+    if (prevProps.data.outputValue !== nextProps.data.outputValue) return false;
     if (prevProps.data._updateKey !== nextProps.data._updateKey) return false;
-    // Re-render if label changes
+    if (prevProps.data._collapsed !== nextProps.data._collapsed) return false;
+    if (prevProps.data._status !== nextProps.data._status) return false;
     if (prevProps.data.label !== nextProps.data.label) return false;
-    // Otherwise, consider props equal
     return true;
 };
 
@@ -102,13 +121,16 @@ export const OutputNode: React.FC<OutputNodeProps> = memo(({ id: _id, data }) =>
     const [isPlaying, setIsPlaying] = useState(false);
 
     // Get the result value (could be from input connection or stored)
-    const resultValue = data.result;
+    const resultValue = data.outputValue !== undefined ? data.outputValue : data.result;
     const label = (data.label as string) || 'Output';
 
     // Detect media types
     const audioPath = isAudioPath(resultValue);
     const imagePath = isImagePath(resultValue);
     const videoPath = isVideoPath(resultValue);
+    const safeAudioSrc = audioPath ? safeMediaSrc(audioPath) : null;
+    const safeImageSrc = imagePath ? safeMediaSrc(imagePath) : null;
+    const safeVideoSrc = videoPath ? safeMediaSrc(videoPath) : null;
 
     // Handle play/pause
     const togglePlay = () => {
@@ -116,7 +138,7 @@ export const OutputNode: React.FC<OutputNodeProps> = memo(({ id: _id, data }) =>
         if (isPlaying) {
             audioRef.current.pause();
         } else {
-            audioRef.current.play();
+            void audioRef.current.play();
         }
         setIsPlaying(!isPlaying);
     };
@@ -129,14 +151,14 @@ export const OutputNode: React.FC<OutputNodeProps> = memo(({ id: _id, data }) =>
         const handleEnded = () => setIsPlaying(false);
         audio.addEventListener('ended', handleEnded);
         return () => audio.removeEventListener('ended', handleEnded);
-    }, [audioPath]);
+    }, [safeAudioSrc]);
 
     // Default definition fallback
     const inputHandles: HandleConfig[] = [{
         id: 'result',
         type: 'target',
         position: Position.Left,
-        color: '!bg-gray-400',
+        color: 'port-any',
         size: 'sm',
         label: 'Result',
     }];
@@ -164,72 +186,93 @@ export const OutputNode: React.FC<OutputNodeProps> = memo(({ id: _id, data }) =>
                 </svg>
             }
             width={definition?.ui?.width || 220}
+            status={data._status}
+            isCollapsed={data._collapsed}
+            onCollapsedChange={data.onCollapsedChange}
             inputHandles={inputHandles}
             outputHandles={[]}
         >
             <div className="flex flex-col gap-2">
                 {/* Audio Player */}
                 {audioPath && (
-                    <div className="bg-slate-200/50 dark:bg-slate-800/50 rounded-lg p-2">
-                        <div className="flex items-center gap-2 mb-2">
-                            <button
-                                onClick={togglePlay}
-                                className="w-8 h-8 rounded-full bg-emerald-500 hover:bg-emerald-400 flex items-center justify-center transition-colors"
-                            >
-                                {isPlaying ? (
-                                    <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
-                                        <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                                    </svg>
-                                ) : (
-                                    <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
-                                        <path d="M8 5v14l11-7z" />
-                                    </svg>
-                                )}
-                            </button>
-                            <span className="text-xs text-slate-600 dark:text-slate-400 truncate flex-1">
+                    <div className="bg-[rgb(var(--color-bg-tertiary))] rounded-[var(--r-sm)] p-2">
+                        <div className="flex items-center gap-2">
+                            {safeAudioSrc && (
+                                <button
+                                    type="button"
+                                    onClick={togglePlay}
+                                    aria-label={isPlaying ? 'Pause audio' : 'Play audio'}
+                                    className="w-8 h-8 rounded-full bg-emerald-600 hover:bg-emerald-500 flex items-center justify-center transition-colors shrink-0"
+                                >
+                                    {isPlaying ? (
+                                        <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
+                                        </svg>
+                                    ) : (
+                                        <svg className="w-4 h-4 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M8 5v14l11-7z" />
+                                        </svg>
+                                    )}
+                                </button>
+                            )}
+                            <span className="text-xs text-[rgb(var(--color-text-secondary))] truncate flex-1">
                                 {audioPath.split(/[\\/]/).pop()}
                             </span>
                         </div>
-                        <audio
-                            ref={audioRef}
-                            src={`file://${audioPath.replace(/\\/g, '/')}`}
-                            className="hidden"
-                        />
+                        {safeAudioSrc && (
+                            <audio
+                                ref={audioRef}
+                                src={safeAudioSrc}
+                                className="hidden"
+                            />
+                        )}
                     </div>
                 )}
 
                 {/* Image Preview */}
                 {imagePath && (
-                    <div className="bg-slate-200/50 dark:bg-slate-800/50 rounded-lg overflow-hidden">
-                        <img
-                            src={imagePath.startsWith('data:') ? imagePath : `file://${imagePath.replace(/\\/g, '/')}`}
-                            alt="Result"
-                            className="w-full h-20 object-contain"
-                        />
+                    <div className="bg-[rgb(var(--color-bg-tertiary))] rounded-[var(--r-sm)] overflow-hidden p-1">
+                        {safeImageSrc ? (
+                            <img
+                                src={safeImageSrc}
+                                alt="Result"
+                                className="w-full h-20 object-contain"
+                            />
+                        ) : (
+                            <span className="block truncate px-1 py-1 text-xs text-[rgb(var(--color-text-secondary))]">
+                                {imagePath.split(/[\\/]/).pop()}
+                            </span>
+                        )}
                     </div>
                 )}
 
                 {/* Video Preview */}
                 {videoPath && (
-                    <div className="bg-slate-200/50 dark:bg-slate-800/50 rounded-lg overflow-hidden">
-                        <video
-                            src={`file://${videoPath.replace(/\\/g, '/')}`}
-                            controls
-                            className="w-full h-20"
-                        />
+                    <div className="bg-[rgb(var(--color-bg-tertiary))] rounded-[var(--r-sm)] overflow-hidden p-1">
+                        {safeVideoSrc ? (
+                            <video
+                                src={safeVideoSrc}
+                                controls
+                                className="w-full h-20"
+                            />
+                        ) : (
+                            <span className="block truncate px-1 py-1 text-xs text-[rgb(var(--color-text-secondary))]">
+                                {videoPath.split(/[\\/]/).pop()}
+                            </span>
+                        )}
                     </div>
                 )}
 
                 {/* Text Result (if not media) */}
                 {!audioPath && !imagePath && !videoPath && resultValue !== undefined && (
-                    <div className="p-2 bg-slate-200/50 dark:bg-slate-800/50 rounded text-xs text-slate-600 dark:text-slate-300 max-h-20 overflow-y-auto font-mono">
+                    <div className="p-2 bg-[rgb(var(--color-bg-tertiary))] rounded-[var(--r-sm)] text-xs text-[rgb(var(--color-text-primary))] max-h-20 overflow-y-auto font-mono">
                         {formatResult(resultValue)}
                     </div>
                 )}
 
                 {/* Empty state */}
                 {resultValue === undefined && (
-                    <div className="text-xs text-slate-500 dark:text-slate-400 text-center py-2">
+                    <div className="text-xs text-[rgb(var(--color-text-faint))] text-center py-2">
                         Connect a result
                     </div>
                 )}

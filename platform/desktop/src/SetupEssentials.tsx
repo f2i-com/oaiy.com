@@ -168,7 +168,7 @@ export function YourAiStep({
               {recommended && <span className="badge badge-pending">Recommended</span>}
               {ready && (
                 <span className="badge badge-ok">
-                  <Check size={11} strokeWidth={2.6} /> Ready
+                  <Check size={11} strokeWidth={2.6} aria-hidden="true" /> Ready
                 </span>
               )}
             </span>

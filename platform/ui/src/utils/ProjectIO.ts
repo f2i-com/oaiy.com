@@ -528,7 +528,8 @@ export const exportProjectToFile = (project: OAIYProject): void => {
 const RESERVED_IMPORTED_SERVICE_PREFIX = /^(engine|voice|companion):/i;
 const VALID_IMPORTED_SERVICE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const IMPORTED_CREDENTIAL_HEADER_KEY = /auth|cookie|key|token|secret|passw/i;
-const IMPORTED_API_KEY_PLACEHOLDER = /\{\{\s*apiKey\s*\}\}/i;
+const IMPORTED_API_KEY_PLACEHOLDER = /\{\{\s*apiKey(?:Raw)?\s*\}\}/i;
+const IMPORTED_API_KEY_PLACEHOLDER_GLOBAL = /\{\{\s*apiKey(?:Raw)?\s*\}\}/gi;
 
 function isValidHttpServiceUrl(raw: unknown): raw is string {
   if (typeof raw !== 'string' || !raw.trim()) return false;
@@ -556,6 +557,11 @@ function sanitizeImportedServiceHeaders(rawHeaders: unknown): string {
   } catch {
     return '{}';
   }
+}
+
+function sanitizeImportedServiceBodyTemplate(rawBody: unknown): string {
+  if (typeof rawBody !== 'string') return '';
+  return rawBody.replace(IMPORTED_API_KEY_PLACEHOLDER_GLOBAL, '');
 }
 
 /**
@@ -627,6 +633,7 @@ export function registerImportedServices(
     saveService({
       ...rest,
       headers: sanitizeImportedServiceHeaders(svc.headers),
+      bodyTemplate: sanitizeImportedServiceBodyTemplate(svc.bodyTemplate),
       isBuiltIn: false,
     });
     existingIds.add(id);

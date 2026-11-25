@@ -130,6 +130,7 @@ export default function OAIYApp() {
     deleteConstant,
     incrementResetCounter,
     saveAsMacro,
+    createMacroFlow,
     hasMacroBeenModified,
     saveMacroChanges,
     revertMacroToOriginal,
@@ -1072,6 +1073,7 @@ export default function OAIYApp() {
                  so showing it just errored — gate on isBuiltIn. */
               onRevertMacro={activeFlow.isMacro && activeFlow.isBuiltIn ? () => handleRevertMacro(activeFlow.id) : undefined}
               onRunMacro={activeFlow.isMacro ? () => setMacroRunnerFlow(activeFlow) : undefined}
+              onCreateMacro={!activeFlow.isMacro ? createMacroFlow : undefined}
               active={section === 'workflows'}
               onShowToast={addToast}
               onLoadPackage={handleLoadPackage}
@@ -1329,6 +1331,7 @@ export default function OAIYApp() {
       {pendingPackage && !pendingDependencies && (
         <TrustDialog
           manifest={pendingPackage.manifest}
+          verification={pendingPackage.verification}
           onConfirm={handlePackageTrustConfirm}
           onCancel={() => setPendingPackage(null)}
         />

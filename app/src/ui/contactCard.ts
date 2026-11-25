@@ -31,10 +31,15 @@ export interface ContactCardData {
 let open: { card: HTMLElement; anchor: HTMLElement; close: () => void } | null = null;
 
 /** The card's contents. */
-export function contactCardBody(data: ContactCardData): HTMLElement[] {
+export function contactCardBody(data: ContactCardData, onClose?: () => void): HTMLElement[] {
   const by = data.name && data.nameBy === 'owner' ? 'named by you' : data.name && data.nameBy === 'agent' ? 'named by the receptionist' : '';
   const out: HTMLElement[] = [
-    h('div.contact-head', h('span.contact-avatar', { 'aria-hidden': 'true' }, icon('user')), h('div.contact-who', h('strong.contact-name', data.name || formatNumber(data.number)), h('span.contact-number', [data.name ? formatNumber(data.number) : '', by].filter(Boolean).join(' · ')))),
+    h(
+      'div.contact-head',
+      h('span.contact-avatar', { 'aria-hidden': 'true' }, icon('user')),
+      h('div.contact-who', h('strong.contact-name', data.name || formatNumber(data.number)), h('span.contact-number', [data.name ? formatNumber(data.number) : '', by].filter(Boolean).join(' · '))),
+      ...(onClose ? [h('button.contact-pop-close', { type: 'button', title: 'Close contact', 'aria-label': 'Close contact', onclick: onClose }, icon('x'))] : []),
+    ),
   ];
   if (data.why) out.push(h('p.contact-note', data.why));
   if (data.none) out.push(h('p.contact-empty', 'No contact for them yet: they get one when they call or text, or when you add them in Contacts.'));
@@ -69,7 +74,12 @@ export function showContactCard(host: HTMLElement, anchor: HTMLElement, load: ()
     open.close();
     if (same) return;
   }
-  const card = h('div.contact-pop', { role: 'dialog', 'aria-label': 'Contact', tabindex: '-1' }, h('p.contact-empty', 'Reading the contact…'));
+  const closeAndFocus = () => {
+    close();
+    anchor.focus();
+  };
+  const makeCloseBtn = () => h('button.contact-pop-close', { type: 'button', title: 'Close contact', 'aria-label': 'Close contact', onclick: closeAndFocus }, icon('x'));
+  const card = h('div.contact-pop', { role: 'dialog', 'aria-label': 'Contact', tabindex: '-1' }, h('div.contact-head', h('p.contact-empty', 'Reading the contact…'), makeCloseBtn()));
   const away = (e: Event) => {
     if (!card.contains(e.target as Node) && !anchor.contains(e.target as Node)) close();
   };
@@ -78,8 +88,7 @@ export function showContactCard(host: HTMLElement, anchor: HTMLElement, load: ()
       // (this Escape is the card's: it does not also stop the agent or close what is under it)
       e.preventDefault();
       e.stopPropagation();
-      close();
-      anchor.focus();
+      closeAndFocus();
     }
   };
   const close = () => {
@@ -100,12 +109,12 @@ export function showContactCard(host: HTMLElement, anchor: HTMLElement, load: ()
     (data) => {
       if (!card.isConnected) return;
       clear(card);
-      card.append(...contactCardBody(data));
+      card.append(...contactCardBody(data, closeAndFocus));
     },
     (error: unknown) => {
       if (!card.isConnected) return;
       clear(card);
-      card.append(h('p.contact-note', `The contact could not be read: ${(error as Error).message}`));
+      card.append(h('div.contact-head', h('p.contact-note', `The contact could not be read: ${(error as Error).message}`), makeCloseBtn()));
     },
   );
 }

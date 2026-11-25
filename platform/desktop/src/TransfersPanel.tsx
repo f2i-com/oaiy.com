@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Loader2, TriangleAlert } from 'lucide-react';
 import { companion, isNotFound, ring, type CompanionApproved, type RingFeatures, type RingPreview, type RingSettings } from './api';
+import LoadError from './LoadError';
 import { useUnsaved } from './unsavedChanges';
 import { openSetup } from './useSetupState';
 import { useVisiblePoll } from './useVisiblePoll';
@@ -130,17 +131,23 @@ export default function TransfersPanel() {
     ring.preview().then(setPreview, () => setPreview(null));
   }, []);
 
+  const loadDevices = useCallback(
+    () =>
+      companion.status('aokie').then(
+        (s) => {
+          setDevices(s.approvedMobiles ?? []);
+          setDevicesError(null);
+        },
+        (e) => setDevicesError(errText(e)),
+      ),
+    [],
+  );
+
   // The devices that may take a call: the Companions approved for the phone. And what a caller would get now, which changes as the owner
   // comes and goes and as the phone plugin calls.
   // And, while nothing is being changed here, the settings as saved: a paired program may change them too.
   useVisiblePoll(() => {
-    companion.status('aokie').then(
-      (s) => {
-        setDevices(s.approvedMobiles ?? []);
-        setDevicesError(null);
-      },
-      (e) => setDevicesError(errText(e)),
-    );
+    void loadDevices();
     look();
     if (saved) void load();
   }, 20_000);
@@ -239,12 +246,7 @@ export default function TransfersPanel() {
     return (
       <div className="panel is-form transfers-page">
         {error ? (
-          <>
-            <p className="form-error" role="alert">Could not read the settings: {error}</p>
-            <button type="button" className="button secondary" onClick={() => void load()}>
-              Try again
-            </button>
-          </>
+          <LoadError error={`Could not read the settings: ${error}`} onRetry={() => load()} />
         ) : (
           <p className="form-hint">Loading…</p>
         )}
@@ -273,7 +275,7 @@ export default function TransfersPanel() {
         <h3 className="section-title">Calls to you</h3>
         {/* The one decision first: may the receptionist ring me. Its line under it says what a caller would get. */}
         <label className="switch-row">
-          <input type="checkbox" className="switch" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
+          <input type="checkbox" role="switch" className="switch" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
           <span>
             <strong>Transfer calls to me</strong>
             <small data-testid={on === saved!.enabled && on && preview?.enabled && !nothingRings && preview.text ? 'what-would-ring' : undefined}>{outcome}</small>
@@ -292,7 +294,7 @@ export default function TransfersPanel() {
           </div>
         </details>
         <label className="switch-row">
-          <input type="checkbox" className="switch" checked={on || current.takeMessages} disabled={on} onChange={(e) => patch({ takeMessages: e.target.checked })} />
+          <input type="checkbox" role="switch" className="switch" checked={on || current.takeMessages} disabled={on} onChange={(e) => patch({ takeMessages: e.target.checked })} />
           <span>
             <strong>Take messages</strong>
             <small>
@@ -420,7 +422,7 @@ export default function TransfersPanel() {
         <div className="transfers-two">
         <div className="transfers-quiet">
         <label className="switch-row">
-          <input type="checkbox" className="switch" checked={current.quietHours.enabled} onChange={(e) => patchQuiet({ enabled: e.target.checked })} />
+          <input type="checkbox" role="switch" className="switch" checked={current.quietHours.enabled} onChange={(e) => patchQuiet({ enabled: e.target.checked })} />
           <span>
             <strong>Do not ring me during quiet hours</strong>
             <small>The receptionist takes a message instead. By this computer’s clock.</small>
@@ -447,11 +449,11 @@ export default function TransfersPanel() {
               ))}
             </div>
             <label className="switch-row">
-              <input type="checkbox" className="switch" checked={current.quietHours.allowVip} onChange={(e) => patchQuiet({ allowVip: e.target.checked })} />
+              <input type="checkbox" role="switch" className="switch" checked={current.quietHours.allowVip} onChange={(e) => patchQuiet({ allowVip: e.target.checked })} />
               <span><strong>Still ring me for my VIPs</strong></span>
             </label>
             <label className="switch-row">
-              <input type="checkbox" className="switch" checked={current.quietHours.allowUrgent} onChange={(e) => patchQuiet({ allowUrgent: e.target.checked })} />
+              <input type="checkbox" role="switch" className="switch" checked={current.quietHours.allowUrgent} onChange={(e) => patchQuiet({ allowUrgent: e.target.checked })} />
               <span><strong>Still ring me when it is urgent</strong><small>Only for the urgent phrases above.</small></span>
             </label>
           </>
@@ -494,9 +496,7 @@ export default function TransfersPanel() {
           cannot take its own calls.
         </p>
         {devicesError && devices === null ? (
-          <p className="form-error" role="alert">
-            Could not read the approved Companions: {devicesError}
-          </p>
+          <LoadError error={`Could not read the approved Companions: ${devicesError}`} onRetry={loadDevices} />
         ) : devices === null ? (
           <p className="form-hint">Looking…</p>
         ) : devices.length === 0 ? (

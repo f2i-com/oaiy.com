@@ -414,12 +414,12 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
     const hasPromptNode = data.comfyPrimaryPromptNodeId !== null || (hasEmbeddedWorkflow && data.workflowInputs?.promptNodeId);
     const showPromptInput = !isComfyUI || !hasWorkflow || hasPromptNode;
     if (showPromptInput) {
-      handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: '!bg-blue-500', label: 'prompt', labelColor: 'text-blue-700 dark:text-blue-400', size: 'lg' });
+      handles.push({ id: 'prompt', type: 'target', position: Position.Left, color: 'port-text', label: 'prompt', size: 'lg' });
     }
 
     // API key input for cloud providers
     if (!isLocal) {
-      handles.push({ id: 'apiKey', type: 'target', position: Position.Left, color: '!bg-yellow-500', label: 'api key', labelColor: 'text-yellow-700 dark:text-yellow-400', size: 'sm' });
+      handles.push({ id: 'apiKey', type: 'target', position: Position.Left, color: 'port-text', label: 'api key', size: 'sm' });
     }
 
     // Dynamic image inputs
@@ -433,9 +433,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           id: `image_${index}`,
           type: 'target',
           position: Position.Left,
-          color: config.allowBypass ? '!bg-purple-400' : '!bg-purple-500',
+          color: 'port-image',
           label: `${label.toLowerCase()}${bypassIndicator}`,
-          labelColor: config.allowBypass ? 'text-purple-700 dark:text-purple-300' : 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       });
@@ -449,9 +448,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           id: `image_${index}`,
           type: 'target',
           position: Position.Left,
-          color: '!bg-purple-500',
+          color: 'port-image',
           label: label.toLowerCase(),
-          labelColor: 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       });
@@ -461,9 +459,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
         id: 'image_0',
         type: 'target',
         position: Position.Left,
-        color: '!bg-purple-500',
+        color: 'port-image',
         label: 'image',
-        labelColor: 'text-purple-700 dark:text-purple-400',
         size: 'md',
       });
     } else if (effectiveImageInputCount > 0) {
@@ -473,9 +470,8 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
           id: `image_${i}`,
           type: 'target',
           position: Position.Left,
-          color: '!bg-purple-500',
+          color: 'port-image',
           label: effectiveImageInputCount === 1 ? 'image' : `image ${i + 1}`,
-          labelColor: 'text-purple-700 dark:text-purple-400',
           size: 'md',
         });
       }
@@ -483,7 +479,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
 
     // Body input for custom API
     if (isCustom) {
-      handles.push({ id: 'body', type: 'target', position: Position.Left, color: '!bg-orange-500', label: 'body', labelColor: 'text-orange-700 dark:text-orange-400', size: 'md' });
+      handles.push({ id: 'body', type: 'target', position: Position.Left, color: 'port-data', label: 'body', size: 'md' });
     }
 
     return handles;
@@ -491,7 +487,7 @@ function ImageGenNode({ data }: ImageGenNodeProps) {
 
   // Output handles using HandleConfig
   const outputHandles = useMemo<HandleConfig[]>(() => [
-    { id: 'image', type: 'source', position: Position.Right, color: '!bg-green-500', size: 'lg' },
+    { id: 'image', type: 'source', position: Position.Right, color: 'port-image', size: 'lg' },
   ], []);
 
   return (

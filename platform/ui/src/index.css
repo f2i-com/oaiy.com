@@ -50,38 +50,6 @@
   transition: background 0.12s, border-color 0.12s;
 }
 .oaiy-sections-new:hover { border-color: rgb(var(--accent-primary)); background: rgb(var(--accent-primary) / 0.2); }
-.oaiy-sections-tabs {
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid rgb(var(--color-border-primary));
-  border-radius: 8px;
-  background: rgb(var(--color-bg-primary) / 0.6);
-}
-.oaiy-sections-tabs > button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 22px;
-  padding: 0 9px;
-  border-radius: 6px;
-  color: rgb(var(--color-text-secondary));
-  font-size: 12px;
-  font-weight: 600;
-  transition: background 0.14s, color 0.14s;
-}
-.oaiy-sections-tabs > button > svg { flex: none; color: rgb(var(--color-text-faint)); transition: color 0.14s; }
-.oaiy-sections-tabs > button:hover { color: rgb(var(--color-text-primary)); background: rgb(var(--color-bg-tertiary) / 0.7); }
-.oaiy-sections-tabs > button:hover > svg { color: rgb(var(--color-text-primary)); }
-/* The open one as the dashboard's tabs mark it: a tint, its words at full strength, its icon in the accent. */
-.oaiy-sections-tabs > button.active { color: rgb(var(--color-text-primary)); background: rgb(var(--accent-primary) / 0.14); }
-.oaiy-sections-tabs > button.active > svg { color: rgb(var(--accent-primary)); }
-/* Narrow: the tabs keep their icons, and say their names in their titles. */
-@media (max-width: 900px) {
-  .oaiy-sections-tabs > button > span { display: none; }
-}
 
 /* Configure dark mode variant for class-based switching */
 @variant dark (&:where(.dark, .dark *));
@@ -153,6 +121,7 @@
      Node kinds, edge classes and status chrome key off these. */
   --signal-cyan: 53 212 232;
   --signal-magenta: 231 107 243;
+  --signal-magenta-ink: 231 107 243;
   --signal-green: 69 214 162;
   --signal-amber: 242 184 75;
   --signal-danger: 255 110 120;
@@ -236,6 +205,7 @@
 
   --signal-cyan: 22 117 185;
   --signal-magenta: 239 94 76;
+  --signal-magenta-ink: 184 44 30;
   --signal-green: 33 132 80;
   --signal-amber: 156 106 8;
   --signal-danger: 233 75 60;
@@ -288,6 +258,7 @@
 
   --signal-cyan: 53 212 232;
   --signal-magenta: 231 107 243;
+  --signal-magenta-ink: 231 107 243;
   --signal-green: 69 214 162;
   --signal-amber: 242 184 75;
   --signal-danger: 255 110 120;
@@ -653,6 +624,11 @@ select:focus-visible,
   color: rgb(var(--accent-primary));
 }
 
+:root:not(.light) .list-item-active,
+:root:not(.light) .list-item-active:hover {
+  color: rgb(var(--accent-hover));
+}
+
 /* ============================================
    TRANSITIONS & ANIMATIONS
    ============================================ */
@@ -968,13 +944,13 @@ select:focus-visible,
   place-items: center;
   margin-top: 3px;
   border-radius: 999px;
-  background: rgb(245 158 11);
-  color: rgb(23 23 23);
+  background: rgb(var(--signal-amber));
+  color: rgb(var(--color-bg-primary));
 }
 .oaiy-node-warn svg { width: 11px; height: 11px; }
 .oaiy-node-notice {
   margin: 0 10px 6px;
-  border-left: 2px solid rgb(245 158 11);
+  border-left: 2px solid rgb(var(--signal-amber));
   padding: 2px 0 2px 7px;
   color: rgb(var(--signal-amber));
   font-size: 11px;
@@ -983,7 +959,7 @@ select:focus-visible,
 .oaiy-node-notice.expanded {
   margin: 0;
   border: 1px solid rgb(var(--signal-amber) / 0.4);
-  border-left: 2px solid rgb(245 158 11);
+  border-left: 2px solid rgb(var(--signal-amber));
   border-radius: var(--r-sm);
   background: rgb(var(--signal-amber) / 0.08);
   padding: 6px 8px;
@@ -1854,6 +1830,7 @@ select,
   font-style: normal;
   font-weight: 700;
 }
+:root:not(.light) .oaiy-nav button > em { color: rgb(var(--accent-hover)); }
 .oaiy-nav button > .oaiy-tab-count { margin-left: auto; }
 
 .oaiy-fill { flex: 1; }
@@ -1909,6 +1886,8 @@ select,
 .oaiy-engine-get button { padding: 0; border: 0; background: none; font: inherit; font-weight: 600; color: rgb(var(--accent-primary)); cursor: pointer; }
 .oaiy-engine-get button:hover { text-decoration: underline; }
 .oaiy-engine-get button:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
+:root:not(.light) .oaiy-engine-get a,
+:root:not(.light) .oaiy-engine-get button { color: rgb(var(--accent-hover)); }
 
 .oaiy-trust {
   display: flex;
@@ -2007,14 +1986,20 @@ select,
 .oaiy-prop-name:focus { border-color: rgb(var(--accent-primary)); background: rgb(var(--color-bg-tertiary) / 0.6); box-shadow: none; }
 .oaiy-prop-name:focus::placeholder { color: rgb(var(--color-text-faint)); }
 .oaiy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
   flex: none;
   border: 1px solid rgb(var(--color-border-primary));
   border-radius: 999px;
   background: rgb(var(--color-bg-tertiary) / 0.7);
   color: rgb(var(--color-text-secondary));
-  padding: 2px 8px;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+  padding: 0 8px;
+  font-family: var(--font-body);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0;
   font-style: normal;
   white-space: nowrap;
 }
@@ -2135,7 +2120,7 @@ select,
   height: 100%;
   min-width: 0;
   min-height: 0;
-  background: rgb(var(--color-bg-canvas));
+  background-color: rgb(var(--color-bg-canvas));
 }
 /* Ambient prism wash over the canvas — the prototype's .canvas::before. */
 .oaiy-canvas-wrap::before {
@@ -2337,6 +2322,15 @@ select,
   .oaiy-nav { gap: 8px; }
   .oaiy-nav button {
     min-height: 44px;
+  }
+  .oaiy-tool,
+  .oaiy-flow-item,
+  .oaiy-node-item,
+  .oaiy-quiet-tabs > button {
+    min-height: 44px;
+  }
+  .oaiy-tool {
+    min-width: 44px;
   }
   /* The status dot stays 8px -- it is a readout, not a control surface. Only
      the box around it grows, so nothing reflows. */
@@ -2726,6 +2720,7 @@ select,
 .oaiy-pill.err { --tone: var(--signal-danger-ink); }
 .oaiy-pill.warn { --tone: var(--signal-amber); }
 .oaiy-pill.accent { --tone: var(--accent-primary); }
+:root:not(.light) .oaiy-pill.accent { color: rgb(var(--accent-hover)); }
 .oaiy-pill.info { --tone: var(--signal-cyan); }
 .oaiy-pill.live::before { animation: pulse 1.3s ease-in-out infinite; }
 
@@ -2821,11 +2816,6 @@ select,
 :root:not(.light) .oaiy-seg > button[aria-selected='true'] { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.26); }
 .oaiy-seg > button:focus-visible { outline-offset: -2px; }
 
-/* The editor's sections in OAIY's window: the same segmented control. */
-.oaiy-sections-tabs { border-radius: calc(var(--r-ctl) + 2px); background: rgb(var(--color-bg-canvas)); padding: 3px; }
-.oaiy-sections-tabs > button { height: 26px; border-radius: var(--r-sm); padding: 0 11px; }
-:root.light .oaiy-sections-tabs > button.active { background: rgb(var(--accent-primary) / 0.1); }
-:root:not(.light) .oaiy-sections-tabs > button.active { box-shadow: inset 0 0 0 1px rgb(var(--accent-primary) / 0.26); }
 .oaiy-sections-new { height: 28px; border-radius: var(--r-ctl); padding: 0 11px; }
 
 /* ---------- a section as a page ---------- */
@@ -2856,43 +2846,43 @@ select,
 .oaiy-page-head {
   display: flex;
   width: 100%;
-  max-width: 1080px;
+  max-width: 1400px;
   flex: none;
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
   padding: 18px 26px 14px;
 }
-.oaiy-page-titles { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.oaiy-page-titles { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
 .oaiy-kicker {
   color: rgb(var(--accent-hover));
-  font-size: 10px;
+  font-size: 10.5px;
   font-weight: 720;
   letter-spacing: 0.13em;
-  line-height: 1.3;
+  line-height: 14px;
   text-transform: uppercase;
 }
 .oaiy-page-titles h2 {
   margin: 0;
   color: rgb(var(--color-text-primary));
-  font-size: 19px;
-  font-weight: 640;
-  letter-spacing: -0.02em;
-  line-height: 1.25;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 22px;
 }
 .oaiy-page-titles p {
   margin: 0;
   color: rgb(var(--color-text-secondary));
-  font-size: 12.5px;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 18px;
 }
 .oaiy-page-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .oaiy-page-body {
   display: flex;
   width: 100%;
-  max-width: 1080px;
+  max-width: 1400px;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
   padding: 0 26px 30px;
 }
 .oaiy-page-main.fill .oaiy-page-body { min-height: 0; max-width: none; flex: 1 1 auto; padding-bottom: 18px; }
@@ -3035,6 +3025,7 @@ button.oaiy-row:hover { background: rgb(var(--color-bg-tertiary) / 0.6); }
 .oaiy-row.on,
 button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-row.on .oaiy-row-title { color: rgb(var(--accent-primary)); }
+:root:not(.light) .oaiy-row.on .oaiy-row-title { color: rgb(var(--accent-hover)); }
 .oaiy-row-title.mono { font-family: var(--font-mono); font-size: 12px; font-weight: 500; }
 .oaiy-row-main.wide { min-width: 140px; }
 
@@ -3159,7 +3150,6 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-node-item:focus-visible,
 .oaiy-subnav > button:focus-visible,
 .oaiy-seg > button:focus-visible,
-.oaiy-sections-tabs > button:focus-visible,
 .oaiy-cat > button:focus-visible,
 button.oaiy-row:focus-visible,
 .oaiy-tool:focus-visible {
@@ -3177,7 +3167,7 @@ button.oaiy-row:focus-visible,
   min-width: 220px;
   max-width: 320px;
   /* (kept inside the window: a tall menu scrolls rather than running off it) */
-  max-height: calc(100vh - 16px);
+  max-height: calc(100dvh - 16px);
   overflow-y: auto;
   flex-direction: column;
   gap: 1px;
@@ -3244,9 +3234,10 @@ button.oaiy-row:focus-visible,
   min-width: 0;
   height: 32px;
   align-items: center;
-  gap: 9px;
+  gap: 4px;
   border: 1px solid transparent;
   border-radius: 8px;
+  background: transparent;
   color: rgb(var(--color-text-secondary));
   padding: 0 4px 0 10px;
   font-size: 13px;
@@ -3254,10 +3245,35 @@ button.oaiy-row:focus-visible,
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
 }
-.oaiy-flow-item > svg { width: 15px; height: 15px; flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
-.oaiy-flow-item > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oaiy-flow-item.split { padding: 0 4px 0 0; gap: 2px; cursor: default; }
+.oaiy-flow-select {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  min-height: 100%;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  padding: 0 2px 0 10px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.oaiy-flow-select:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px rgb(var(--accent-primary) / 0.65);
+}
+.oaiy-flow-item > svg,
+.oaiy-flow-select > svg { width: 15px; height: 15px; flex: none; color: rgb(var(--color-text-faint)); transition: color 0.12s; }
+.oaiy-flow-item > span,
+.oaiy-flow-select > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-flow-item:hover { background: rgb(var(--color-bg-tertiary) / 0.7); color: rgb(var(--color-text-primary)); }
-.oaiy-flow-item:hover > svg { color: rgb(var(--color-text-primary)); }
+.oaiy-flow-item:hover > svg,
+.oaiy-flow-item:hover .oaiy-flow-select > svg { color: rgb(var(--color-text-primary)); }
 .oaiy-flow-item.active { background: rgb(var(--accent-primary) / 0.14); color: rgb(var(--color-text-primary)); font-weight: 600; }
 :root.light .oaiy-flow-item.active { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-flow-item.active::before {
@@ -3270,9 +3286,12 @@ button.oaiy-row:focus-visible,
   background: rgb(var(--accent-primary));
   content: '';
 }
-.oaiy-flow-item.active > svg { color: rgb(var(--accent-primary)); }
-.oaiy-flow-item.macro > svg { color: rgb(var(--signal-magenta)); }
-.oaiy-flow-item.local > svg { color: rgb(var(--signal-green)); }
+.oaiy-flow-item.active > svg,
+.oaiy-flow-item.active .oaiy-flow-select > svg { color: rgb(var(--accent-primary)); }
+.oaiy-flow-item.macro > svg,
+.oaiy-flow-item.macro .oaiy-flow-select > svg { color: rgb(var(--signal-magenta-ink)); }
+.oaiy-flow-item.local > svg,
+.oaiy-flow-item.local .oaiy-flow-select > svg { color: rgb(var(--signal-green)); }
 .oaiy-flow-item:focus-visible { outline: 2px solid rgb(var(--accent-primary)); outline-offset: -2px; }
 .oaiy-flow-item .oaiy-flow-more {
   display: grid;
@@ -3288,17 +3307,27 @@ button.oaiy-row:focus-visible,
   cursor: pointer;
 }
 .oaiy-flow-item:hover .oaiy-flow-more,
+.oaiy-flow-item:focus-within .oaiy-flow-more,
 .oaiy-flow-item.active .oaiy-flow-more,
 .oaiy-flow-item .oaiy-flow-more:focus-visible { opacity: 1; }
 .oaiy-flow-item .oaiy-flow-more:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
+.oaiy-flow-running-dot {
+  --tone: var(--accent-primary);
+  margin-right: 2px;
+  animation: pulse 1.3s ease-in-out infinite;
+}
 .oaiy-flow-rename { height: 32px; }
 /* A flow's name over its description, and what the rail shows beside them. */
 .oaiy-flow-item.has-desc { height: auto; min-height: 32px; padding-top: 5px; padding-bottom: 5px; }
-.oaiy-flow-item > .oaiy-flow-text { display: flex; flex-direction: column; gap: 1px; }
+.oaiy-flow-item.split.has-desc { padding-top: 0; padding-bottom: 0; }
+.oaiy-flow-item.split.has-desc .oaiy-flow-select { padding-top: 5px; padding-bottom: 5px; }
+.oaiy-flow-item > .oaiy-flow-text,
+.oaiy-flow-select > .oaiy-flow-text { display: flex; flex-direction: column; gap: 1px; }
 .oaiy-flow-text > span,
 .oaiy-flow-text > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-flow-text > small { color: rgb(var(--color-text-faint)); font-size: 11px; font-weight: 400; line-height: 1.35; }
-.oaiy-flow-item > .oaiy-flow-shared { flex: none; color: rgb(var(--signal-green)); }
+.oaiy-flow-item > .oaiy-flow-shared,
+.oaiy-flow-select > .oaiy-flow-shared { flex: none; color: rgb(var(--signal-green)); }
 .oaiy-flow-item.example > svg { color: rgb(var(--signal-amber)); }
 .oaiy-flow-item .oaiy-flow-add { display: inline-flex; flex: none; align-items: center; gap: 3px; border-radius: var(--r-sm); color: rgb(var(--accent-hover)); padding: 2px 6px; font-size: 11.5px; font-weight: 600; transition: background 0.12s; }
 .oaiy-flow-item:hover .oaiy-flow-add { background: rgb(var(--accent-primary) / 0.12); }
@@ -3320,15 +3349,18 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-sort-btn:hover { background: rgb(var(--color-bg-tertiary)); color: rgb(var(--color-text-primary)); }
 .oaiy-sort-btn:focus-visible { outline: 2px solid rgb(var(--accent-primary)); outline-offset: 1px; }
-/* The tags to browse by, under the search. */
-.oaiy-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+/* The tags to browse by, under the search: compact single scrollable row. */
+.oaiy-tags { display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+.oaiy-tags::-webkit-scrollbar { display: none; }
 .oaiy-tags > button {
+  flex: none;
   border: 1px solid rgb(var(--color-border-primary));
   border-radius: 999px;
   background: transparent;
   color: rgb(var(--color-text-secondary));
   padding: 1px 9px;
   font-size: 11px;
+  white-space: nowrap;
   cursor: pointer;
   transition: border-color 0.12s, color 0.12s, background 0.12s;
 }
@@ -3399,7 +3431,7 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-rail-scrim { display: none; }
 @media (width <= 700px) {
-  .oaiy-rail-scrim { position: fixed; z-index: 40; inset: 0; display: block; background: rgb(0 0 0 / 0.5); }
+  .oaiy-rail-scrim { position: fixed; z-index: 48; inset: 0; display: block; background: rgb(0 0 0 / 0.5); }
 }
 
 /* A small icon button, inside a row or a banner. */
@@ -3472,23 +3504,6 @@ button.oaiy-row:focus-visible,
 .oaiy-side-split > section + section { border-top: 1px solid rgb(var(--color-border-primary)); }
 .oaiy-side-split > section.log { height: 36%; min-height: 150px; flex: none; }
 .oaiy-side-split > section.log.alone { height: auto; flex: 1 1 auto; }
-.oaiy-side-bar {
-  display: flex;
-  min-height: 36px;
-  flex: none;
-  align-items: center;
-  gap: 8px;
-  border: 0;
-  border-top: 1px solid rgb(var(--color-border-primary));
-  background: transparent;
-  color: rgb(var(--color-text-secondary));
-  padding: 0 12px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.oaiy-side-bar:hover { background: rgb(var(--color-bg-tertiary) / 0.6); color: rgb(var(--color-text-primary)); }
-.oaiy-side-bar small { margin-left: auto; color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 
 /* The builder: the canvas between its side panels. */
 .oaiy-builder { position: relative; display: flex; width: 100%; height: 100%; min-width: 0; overflow: hidden; }
@@ -3504,11 +3519,8 @@ button.oaiy-row:focus-visible,
   width: min(300px, 88%);
   box-shadow: var(--shadow-lg);
 }
-.oaiy-builder.narrow .oaiy-side.left { left: 0; }
+.oaiy-builder.narrow .oaiy-side.left { left: 0; padding-bottom: 70px; }
 .oaiy-builder.narrow .oaiy-side.right { right: 0; }
-/* The toolbar lies over the panel's foot (below): the panel ends above it, so its last
-   field and the palette's hint are not under the toolbar. */
-.oaiy-builder.narrow .oaiy-side { padding-bottom: 70px; }
 
 /* A builder under about a 1500px window's width: the palette lies over the canvas's left edge (the inspector stays
    docked), and the zoom buttons and the toolbar keep to the canvas seen beside it (OAIYBuilder's PALETTE_WIDTH). */
@@ -3526,10 +3538,11 @@ button.oaiy-row:focus-visible,
 /* The zoom buttons where the toolbar would lie over them (OAIYBuilder's liftControls): above it. */
 .lift-controls .react-flow__panel.bottom.left { margin-bottom: 76px; }
 
-/* A narrow builder with a panel open over the canvas: the toolbar moves to
-   the side left clear, and stays above the panel so it can close it. */
+/* A narrow builder with a panel open over the canvas: when the palette is open
+   the toolbar tucks to the clear right edge; when the right drawer is open the
+   toolbar hides behind it so drawer fields and logs are never blocked. */
 .oaiy-builder.narrow.left-open .oaiy-toolbar { right: 10px; left: auto; z-index: 45; transform: none; }
-.oaiy-builder.narrow.right-open .oaiy-toolbar { left: 58px; z-index: 45; transform: none; }
+.oaiy-builder.narrow.right-open .oaiy-toolbar { z-index: 15; opacity: 0; pointer-events: none; }
 
 /* A tight canvas: the toolbar keeps its icons and says its words in titles. */
 .oaiy-toolbar.tight .oaiy-tool > span { display: none; }
@@ -3585,7 +3598,7 @@ button.oaiy-row:focus-visible,
 }
 .oaiy-cat > button > small { color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 10px; }
 .oaiy-cat > button:hover { color: rgb(var(--color-text-primary)); }
-.oaiy-cat.pkg > button { color: rgb(var(--signal-magenta)); }
+.oaiy-cat.pkg > button { color: rgb(var(--signal-magenta-ink)); }
 .oaiy-cat > ul { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0 8px 4px; list-style: none; }
 /* A node to add: a compact row, the kind's icon a tinted tile (as on its card), its name over one line of what it does. */
 .oaiy-node-item {
@@ -3623,7 +3636,7 @@ button.oaiy-row:focus-visible,
 .oaiy-node-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
 .oaiy-node-text strong { overflow: hidden; color: rgb(var(--color-text-primary)); font-size: 12.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .oaiy-node-text small { overflow: hidden; color: rgb(var(--color-text-faint)); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
-.oaiy-node-tag { flex: none; border-radius: 4px; background: rgb(var(--signal-magenta) / 0.14); color: rgb(var(--signal-magenta)); padding: 0 4px; font-family: var(--font-mono); font-size: 9px; }
+.oaiy-node-tag { flex: none; border-radius: 4px; background: rgb(var(--signal-magenta) / 0.14); color: rgb(var(--signal-magenta-ink)); padding: 0 4px; font-family: var(--font-mono); font-size: 9px; }
 .oaiy-popover {
   position: fixed;
   z-index: 9998;
@@ -3689,6 +3702,58 @@ button.oaiy-row:focus-visible,
 .oaiy-log-line.error > span:last-child { color: rgb(var(--signal-danger-ink)); }
 .oaiy-log-line.success > span:last-child,
 .oaiy-log-line.output > span:last-child { color: rgb(var(--signal-green)); }
+.oaiy-log-source {
+  display: inline-block;
+  max-width: 112px;
+  margin-right: 6px;
+  overflow: hidden;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 4px;
+  background: rgb(var(--color-bg-tertiary));
+  color: rgb(var(--color-text-faint));
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+.oaiy-log-bar {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  padding: 6px 10px;
+}
+.oaiy-log-filters { display: flex; flex: none; align-items: center; gap: 4px; }
+.oaiy-log-filters > button { cursor: pointer; transition: border-color 0.12s, background 0.12s, color 0.12s; }
+.oaiy-log-filters > button:hover { border-color: rgb(var(--color-border-strong)); color: rgb(var(--color-text-primary)); }
+.oaiy-log-search { min-width: 110px; flex: 1 1 120px; }
+.oaiy-log-search > .oaiy-input { height: 24px; font-size: 11.5px; }
+.oaiy-log-jump {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid rgb(var(--accent-primary) / 0.45);
+  border-radius: 999px;
+  background: rgb(var(--color-bg-secondary) / 0.96);
+  box-shadow: var(--shadow-md);
+  color: rgb(var(--accent-hover));
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.oaiy-log-jump:hover { border-color: rgb(var(--accent-primary)); background: rgb(var(--color-bg-tertiary)); }
+:root.light .oaiy-log-jump { color: rgb(var(--accent-primary)); }
 .oaiy-log-cursor { display: inline-block; width: 6px; height: 12px; margin-left: 2px; background: rgb(var(--signal-green)); vertical-align: middle; animation: blink 1s step-end infinite; }
 
 /* ---------- the canvas: toolbar, controls, minimap, empty state ---------- */
@@ -3699,6 +3764,9 @@ button.oaiy-row:focus-visible,
   bottom: 16px;
   left: 50%;
   display: flex;
+  max-width: calc(100% - 16px);
+  overflow-x: auto;
+  scrollbar-width: none;
   align-items: center;
   gap: 2px;
   transform: translateX(-50%);
@@ -3710,6 +3778,7 @@ button.oaiy-row:focus-visible,
   padding: 4px;
   backdrop-filter: blur(14px);
 }
+.oaiy-toolbar::-webkit-scrollbar { display: none; }
 .oaiy-toolbar > .sep { width: 1px; height: 20px; margin: 0 4px; background: rgb(var(--color-border-primary)); }
 /* A tool: the dashboard's tabs' voice, its icon faint until hovered; one that is on, tinted with its icon in the accent. */
 .oaiy-tool {
@@ -3968,6 +4037,8 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
   font-weight: 600;
   text-decoration: none;
 }
+:root:not(.light) .oaiy-download-all,
+:root:not(.light) .oaiy-download-more summary { color: rgb(var(--accent-hover)); }
 .oaiy-download-all:hover,
 .oaiy-download-more summary:hover { text-decoration: underline; }
 .oaiy-download-more ul { display: flex; margin: 6px 0 0; padding: 0; flex-direction: column; gap: 4px; list-style: none; }
@@ -4721,10 +4792,6 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
    label 10.5 px on a 14 px line, a page's heading 21 px on 28, its description 13 px on 18. */
 .oaiy-title > span { margin-bottom: 6px; line-height: 14px; }
 .oaiy-title h1, .oaiy-title input.oaiy-name, .oaiy-title .oaiy-name-flow { line-height: 24px; }
-.oaiy-page-titles { gap: 6px; }
-.oaiy-kicker { line-height: 14px; }
-.oaiy-page-titles h2 { font-size: 21px; line-height: 28px; }
-.oaiy-page-titles p { font-size: 13px; line-height: 18px; }
 .oaiy-dialog-titles { gap: 6px; }
 /* A dialog here and in the Agent: the same corner, title and line (they were 11 px, 15 px and 12.5 px here against
    the Agent's 12, 17 and 13; both are now 12, 16 and 13, and their buttons 34 px tall). */
@@ -4739,7 +4806,7 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
 /* ---------- one small-type scale for the editor's own chrome ----------
    Its small capitals (where the page is, a page's kicker, a field's name, a pill, a group's head) are 10.5 px, and a
    count beside one is 10 px. They were 9, 9.5, 10 and 10.5 by turns, and one count came out at 7.6. */
-.oaiy-title > span, .oaiy-kicker, .oaiy-rail-group-head, .oaiy-pill, .oaiy-cat > button > span { font-size: 10.5px; }
+.oaiy-title > span, .oaiy-rail-group-head, .oaiy-pill, .oaiy-cat > button > span { font-size: 10.5px; }
 .oaiy-rail-group-head small, .oaiy-tab-count, .oaiy-tool > em, .oaiy-nav button > em, .oaiy-log-line > .oaiy-pill { font-size: 10px; }
 
 /* Properties: what the chosen node does, under its name: its own line, then the help that stood on its card. */
@@ -4768,17 +4835,12 @@ body:has(.oaiy-dock) .oaiy-toasts { bottom: 142px; }
    2 px between them and 2 px round them inside a 1 px border (30 px in all), 12.5 px words at weight 600. */
 .oaiy-seg { gap: 2px; padding: 2px; }
 .oaiy-seg > button { height: 24px; gap: 7px; border-radius: var(--r-sm); padding: 0 11px; font-size: 12.5px; font-weight: 600; }
-/* A chip: 20 px high, 11 px words in the body's face, a full pill (they were the mono face at 10 to 10.5 px). */
-.oaiy-pill, .oaiy-chip { height: 20px; padding: 0 8px; font-family: var(--font-body); font-size: 11px; line-height: 1; letter-spacing: 0; }
+/* A pill: 20 px high, 11 px words in the body's face, a full pill (`.oaiy-chip` sets its own measures above). */
+.oaiy-pill { height: 20px; padding: 0 8px; font-family: var(--font-body); font-size: 11px; line-height: 1; letter-spacing: 0; }
 .oaiy-log-line > .oaiy-pill { height: 16px; padding: 0 5px; font-size: 10px; }
-/* A page's name inside the editor: 16 px at weight 650 on a 22 px line, the window's own title size (at 21 px it
-   stood larger than the "Flows" above it); what is on a card 13 px, a hint 12.5 px. */
-.oaiy-page-titles h2 { font-size: 16px; font-weight: 650; line-height: 22px; letter-spacing: -0.01em; }
 .oaiy-card-text { font-size: 13px; }
 .oaiy-help { font-size: 12.5px; }
 .oaiy-input, .oaiy-select, .oaiy-textarea { font-size: 13px; }
-.oaiy-page-body { gap: 16px; }
-.oaiy-page-head, .oaiy-page-body { max-width: 1400px; }
 .oaiy-page.has-nav .oaiy-page-head, .oaiy-page.has-nav .oaiy-page-body { max-width: 920px; }
 :root.light .oaiy-input, :root.light .oaiy-select, :root.light .oaiy-textarea { border-color: rgb(var(--color-border-strong)); background: #fff; }
 /* On a phone a page's head stacks: its name and its line take the width, and its buttons go under them (side by

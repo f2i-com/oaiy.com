@@ -170,10 +170,10 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
   // If no definition, render a placeholder
   if (!definition) {
     return (
-      <div className="p-4 bg-red-100 dark:bg-red-900/50 border border-red-500 rounded-lg text-red-900 dark:text-white text-xs">
-        <p>Node definition not found</p>
-        <p className="text-slate-500 dark:text-slate-400">ID: {id}</p>
-        <p className="text-slate-500 dark:text-slate-400">Type: {nodeType || 'unknown'}</p>
+      <div className="p-3 bg-[rgb(var(--signal-danger)/0.1)] border border-[rgb(var(--signal-danger)/0.5)] rounded-[var(--r-card)] text-[rgb(var(--signal-danger-ink))] text-xs">
+        <p className="font-semibold">Node definition not found</p>
+        <p className="text-[rgb(var(--color-text-faint))] font-mono">ID: {id}</p>
+        <p className="text-[rgb(var(--color-text-faint))] font-mono">Type: {nodeType || 'unknown'}</p>
       </div>
     );
   }
@@ -262,7 +262,7 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
 
         {/* Preview Image */}
         {definition.ui?.showPreview && data.previewImageUrl && (
-          <div className="w-full aspect-video bg-slate-200 dark:bg-slate-800 rounded overflow-hidden">
+          <div className="w-full aspect-video bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-sm)] overflow-hidden">
             <img
               src={data.previewImageUrl as string}
               alt="Preview"
@@ -273,17 +273,17 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
 
         {/* Streaming Content */}
         {data.isStreaming && data.streamContent && (
-          <div className="p-2 bg-slate-200 dark:bg-slate-800 rounded text-xs text-slate-700 dark:text-slate-300 max-h-32 overflow-y-auto">
+          <div className="p-2 bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-sm)] text-xs text-[rgb(var(--color-text-primary))] max-h-32 overflow-y-auto">
             {data.streamContent}
           </div>
         )}
 
         {/* Audio Preview */}
         {data.previewAudioUrl && (
-          <div className="w-full bg-slate-200/50 dark:bg-slate-800/50 rounded p-2">
+          <div className="w-full bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-sm)] p-2">
             <audio
               controls
-              className="w-full h-8 dark:[filter:invert(1)_hue-rotate(180deg)]"
+              className="w-full h-8"
               src={data.previewAudioUrl as string}
             >
               Your browser does not support audio playback.
@@ -305,10 +305,10 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
         {/* Advanced Properties (collapsible) (only if not hidden) */}
         {data.showBodyProperties !== false && visibleAdvancedCount > 0 && (
           <details className="mt-2">
-            <summary className="text-xs text-slate-500 dark:text-slate-400 cursor-pointer hover:text-slate-700 dark:hover:text-slate-300">
+            <summary className="text-xs text-[rgb(var(--color-text-faint))] cursor-pointer hover:text-[rgb(var(--color-text-primary))] transition-colors">
               Advanced options ({visibleAdvancedCount})
             </summary>
-            <div className="flex flex-col gap-3 mt-2 pl-2 border-l border-slate-300 dark:border-slate-700">
+            <div className="flex flex-col gap-3 mt-2 pl-2.5 border-l border-[rgb(var(--color-border-primary))]">
               {advancedProperties.map((prop) => (
                 <PropertyField
                   key={prop.id}

@@ -260,10 +260,10 @@ export const PropertyField: React.FC<PropertyFieldProps> = ({
             value={String(value ?? property.default ?? '#000000')}
             onChange={(e) => onChange(e.target.value)}
             disabled={property.disabled}
-            className="w-full h-8 bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded cursor-pointer disabled:opacity-50"
+            className="w-full h-8 bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-ctl)] cursor-pointer focus:outline-none focus:border-[rgb(var(--accent-primary))] focus:ring-2 focus:ring-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50 transition-colors"
           />
           {property.description && (
-            <p className="text-[10px] text-[rgb(var(--color-text-muted))]">{property.description}</p>
+            <p className="text-[10px] text-[rgb(var(--color-text-faint))]">{property.description}</p>
           )}
         </div>
       );
@@ -392,7 +392,7 @@ const FilePickerField: React.FC<FilePickerFieldProps> = ({
           type="button"
           onClick={handlePick}
           disabled={property.disabled}
-          className="px-2 py-1 text-xs rounded border border-[rgb(var(--color-border-primary))] bg-[rgb(var(--color-bg-tertiary))] hover:bg-[rgb(var(--color-bg-tertiary))] disabled:opacity-50"
+          className="px-2.5 py-1 text-xs rounded-[var(--r-ctl)] border border-[rgb(var(--color-border-primary))] bg-[rgb(var(--color-bg-tertiary))] text-[rgb(var(--color-text-primary))] hover:bg-[rgb(var(--color-bg-elevated))] hover:border-[rgb(var(--color-border-strong))] focus:outline-none focus:border-[rgb(var(--accent-primary))] focus:ring-2 focus:ring-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50 transition-colors"
         >
           {currentValue ? 'Change…' : 'Browse…'}
         </button>
@@ -400,14 +400,15 @@ const FilePickerField: React.FC<FilePickerFieldProps> = ({
           className="flex-1 text-xs truncate text-[rgb(var(--color-text-secondary))]"
           title={currentValue || 'No file selected'}
         >
-          {fileName || <span className="italic text-slate-500">No file selected</span>}
+          {fileName || <span className="italic text-[rgb(var(--color-text-faint))]">No file selected</span>}
         </span>
         {currentValue && (
           <button
             type="button"
             onClick={() => onChange('')}
-            className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
+            className="grid h-6 w-6 place-items-center rounded-[var(--r-sm)] text-xs text-[rgb(var(--color-text-faint))] hover:bg-[rgb(var(--color-bg-tertiary))] hover:text-[rgb(var(--color-text-primary))] focus:outline-none focus:ring-2 focus:ring-[rgb(var(--accent-primary)/0.3)] transition-colors"
             title="Clear"
+            aria-label={`Clear ${property.name}`}
           >
             ✕
           </button>
@@ -427,7 +428,7 @@ const FilePickerField: React.FC<FilePickerFieldProps> = ({
         className="hidden"
       />
       {property.description && (
-        <p className="text-[10px] text-slate-500 dark:text-slate-400">{property.description}</p>
+        <p className="text-[10px] text-[rgb(var(--color-text-faint))]">{property.description}</p>
       )}
     </div>
   );

@@ -744,21 +744,37 @@ function staticMemberPropName(prop: EstreeNode | null | undefined, computed: boo
   if (!computed && prop.type === 'Identifier' && typeof prop.name === 'string') {
     return prop.name;
   }
-  if (computed && prop.type === 'Literal' && typeof prop.value === 'string') {
-    return prop.value;
+  if (!computed) return null;
+  const unwrapped = unwrapChainOrSequence(prop);
+  if (!unwrapped) return null;
+  if (unwrapped.type === 'Literal' && typeof unwrapped.value === 'string') {
+    return unwrapped.value;
   }
   if (
-    computed &&
-    prop.type === 'TemplateLiteral' &&
-    Array.isArray(prop.expressions) &&
-    prop.expressions.length === 0 &&
-    Array.isArray(prop.quasis) &&
-    prop.quasis.length === 1
+    unwrapped.type === 'TemplateLiteral' &&
+    Array.isArray(unwrapped.expressions) &&
+    unwrapped.expressions.length === 0 &&
+    Array.isArray(unwrapped.quasis) &&
+    unwrapped.quasis.length === 1
   ) {
-    const cooked = (prop.quasis[0] as { value?: { cooked?: unknown } })?.value?.cooked;
+    const cooked = (unwrapped.quasis[0] as { value?: { cooked?: unknown } })?.value?.cooked;
     return typeof cooked === 'string' ? cooked : null;
   }
   return null;
+}
+
+function staticPatternKeyName(key: EstreeNode | null | undefined, computed: boolean): string | null {
+  if (!key) return null;
+  if (!computed) {
+    if (key.type === 'Identifier' && typeof key.name === 'string') {
+      return key.name;
+    }
+    if (key.type === 'Literal' && typeof key.value === 'string') {
+      return key.value;
+    }
+    return null;
+  }
+  return staticMemberPropName(key, true);
 }
 
 function unwrapChainOrSequence(node: EstreeNode | null | undefined): EstreeNode | null {
@@ -867,6 +883,9 @@ export function detectSandboxEscape(script: string): string | null {
               const hit = walkPattern(prop.argument as EstreeNode);
               if (hit) return hit;
             } else if (prop.type === 'Property') {
+              const keyName = staticPatternKeyName(prop.key as EstreeNode, Boolean(prop.computed));
+              if (keyName === 'constructor') return 'constructor access';
+              if (keyName === '__proto__') return '__proto__ access';
               if (prop.computed) {
                 const hit = walkExpr(prop.key as EstreeNode);
                 if (hit) return hit;
@@ -906,11 +925,22 @@ export function detectSandboxEscape(script: string): string | null {
         return null;
       }
 
+      case 'AssignmentExpression': {
+        const leftHit = walkPattern(node.left as EstreeNode);
+        if (leftHit) return leftHit;
+        return walkExpr(node.right as EstreeNode);
+      }
+
+      case 'ObjectPattern':
+      case 'ArrayPattern':
+      case 'AssignmentPattern':
+      case 'RestElement':
+        return walkPattern(node);
+
       case 'MemberExpression': {
         const propName = staticMemberPropName(node.property as EstreeNode, Boolean(node.computed));
         if (propName === 'constructor') {
-          const rawObj = node.object as EstreeNode | undefined;
-          const obj = rawObj?.type === 'ChainExpression' ? (rawObj.expression as EstreeNode) : rawObj;
+          const obj = unwrapChainOrSequence(node.object as EstreeNode | undefined);
           if (
             obj &&
             obj.type === 'MemberExpression' &&
@@ -918,9 +948,18 @@ export function detectSandboxEscape(script: string): string | null {
           ) {
             return 'constructor.constructor chain';
           }
-          if (obj && (obj.type === 'FunctionExpression' || obj.type === 'ArrowFunctionExpression')) {
+          if (
+            obj &&
+            (obj.type === 'FunctionExpression' ||
+              obj.type === 'ArrowFunctionExpression' ||
+              obj.type === 'ClassExpression')
+          ) {
             return 'constructor.constructor chain';
           }
+          return 'constructor access';
+        }
+        if (propName === '__proto__') {
+          return '__proto__ access';
         }
         const objHit = walkExpr(node.object as EstreeNode);
         if (objHit) return objHit;
@@ -955,9 +994,27 @@ export function detectSandboxEscape(script: string): string | null {
         return null;
       }
 
+      case 'TaggedTemplateExpression': {
+        const tag = unwrapChainOrSequence(node.tag as EstreeNode);
+        if (tag?.type === 'Identifier') {
+          if (tag.name === 'Function') return 'Function constructor';
+          if (tag.name === 'eval') return 'eval()';
+        }
+        if (tag?.type === 'FunctionExpression' && blockReturnsThis(tag.body as EstreeNode)) {
+          return '(function(){return this})()';
+        }
+        if (tag?.type === 'FunctionExpression' || tag?.type === 'ArrowFunctionExpression') {
+          return 'tagged function template';
+        }
+        const tagHit = walkExpr(node.tag as EstreeNode);
+        if (tagHit) return tagHit;
+        return walkExpr(node.quasi as EstreeNode);
+      }
+
       case 'ArrowFunctionExpression': {
-        const arrowBody = node.body as EstreeNode | undefined;
-        if (arrowBody?.type === 'ThisExpression' || blockReturnsThis(arrowBody)) {
+        const rawBody = node.body as EstreeNode | undefined;
+        const unwrappedBody = unwrapChainOrSequence(rawBody);
+        if (unwrappedBody?.type === 'ThisExpression' || blockReturnsThis(rawBody)) {
           return '() => this arrow';
         }
         if (Array.isArray(node.params)) {
@@ -966,7 +1023,7 @@ export function detectSandboxEscape(script: string): string | null {
             if (hit) return hit;
           }
         }
-        return walkExpr(arrowBody);
+        return walkExpr(rawBody);
       }
 
       case 'FunctionDeclaration':
@@ -2516,9 +2573,31 @@ export class OAIYRuntime {
       throw new Error(`Subflow not found: ${flowId}`);
     }
 
-    const hasPkgNode =
-      Array.isArray(flow.graph?.nodes) &&
-      flow.graph.nodes.some((n) => typeof n?.type === 'string' && n.type.startsWith('pkg:'));
+    // Collect all nodes across the subflow and any statically referenced nested subflows/macros
+    // so both trusted and package contexts fail closed against hidden cross-package `pkg:*` nodes.
+    const seenFlows = new Set<string>([flow.id]);
+    const graphsToCheck: Array<WorkflowGraph | undefined> = [flow.graph];
+    const pkgNodeTypes: string[] = [];
+    while (graphsToCheck.length > 0) {
+      const g = graphsToCheck.shift();
+      if (!g || !Array.isArray(g.nodes)) continue;
+      for (const node of g.nodes) {
+        if (!node) continue;
+        if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
+          pkgNodeTypes.push(node.type);
+        }
+        const data = (node.data ?? {}) as Record<string, unknown>;
+        for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+          const ref = data[field];
+          if (typeof ref !== 'string' || !ref || seenFlows.has(ref)) continue;
+          seenFlows.add(ref);
+          const nested = this.findFlowOrMacro(ref);
+          if (nested?.graph) graphsToCheck.push(nested.graph);
+        }
+      }
+    }
+
+    const hasPkgNode = pkgNodeTypes.length > 0;
 
     if (!this.currentPackageId) {
       if (
@@ -2530,10 +2609,30 @@ export class OAIYRuntime {
           `Refusing to execute untrusted or package subflow '${flowId}' from a trusted workflow context`,
         );
       }
-    } else if (flow.packageId && flow.packageId !== this.currentPackageId) {
-      throw new Error(
-        `Refusing to execute subflow '${flowId}' owned by package '${flow.packageId}' from package '${this.currentPackageId}'`,
-      );
+    } else {
+      if (flow.packageId && flow.packageId !== this.currentPackageId) {
+        throw new Error(
+          `Refusing to execute subflow '${flowId}' owned by package '${flow.packageId}' from package '${this.currentPackageId}'`,
+        );
+      }
+      for (const nodeType of pkgNodeTypes) {
+        const prefixMatch = /^pkg:([^:]+):(.+)$/.exec(nodeType);
+        const prefixPkgId = prefixMatch?.[1] ?? '';
+        const mod = this.moduleRegistry?.getModuleForNode?.(nodeType) as { path?: unknown } | undefined;
+        const pathMatch = typeof mod?.path === 'string'
+          ? /^(?:package|custom-node):([^:/]+)\//.exec(mod.path)
+          : null;
+        const authoritativePkgId = pathMatch?.[1] || prefixPkgId || '__unknown_pkg__';
+        if (
+          !prefixPkgId ||
+          prefixPkgId !== this.currentPackageId ||
+          authoritativePkgId !== this.currentPackageId
+        ) {
+          throw new Error(
+            `Refusing to execute subflow '${flowId}' containing cross-package node '${nodeType}' (owned by '${authoritativePkgId}') under package '${this.currentPackageId}'`,
+          );
+        }
+      }
     }
 
     this.assertCodeExecuteAllowedForGraph(flow.graph);

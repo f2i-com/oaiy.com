@@ -23,6 +23,7 @@ import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import { ask } from './ask';
 import ChatGptConnector from './ChatGptConnector';
+import LoadError from './LoadError';
 import './connectionSettings.css';
 
 /**
@@ -338,22 +339,7 @@ export default function AiProvidersPanel() {
 
   return (
     <div className="panel is-form provider-settings">
-      {loadError && (
-        <div className="banner banner-err banner-dismissable" role="alert">
-          <span>Couldn't reach the AI gateway: {loadError}</span>
-          {/* (with nothing loaded yet, dismissing asks again: else the page would wait on "Loading providers…" for good) */}
-          <button
-            className="banner-dismiss"
-            onClick={() => {
-              setLoadError(null);
-              if (providers === null) void refresh();
-            }}
-            aria-label="Dismiss"
-          >
-            ×
-          </button>
-        </div>
-      )}
+      {loadError && <LoadError error={`Couldn't reach the AI gateway: ${loadError}`} onRetry={refresh} />}
 
       {storeProblem && (
         <div className="banner banner-err" role="alert">
@@ -369,7 +355,7 @@ export default function AiProvidersPanel() {
             aria-label="Dismiss error"
             onClick={() => setActionError(null)}
           >
-            ×
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}

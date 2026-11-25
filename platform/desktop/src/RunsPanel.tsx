@@ -695,8 +695,8 @@ export default function RunsPanel({ onOpenEditor }: { onOpenEditor?: (flowId: st
         )}
 
         {data === null ? (
-          <div className="empty-state empty-state-sm">
-            <Loader2 size={16} className="spin" aria-hidden />
+          <div className={error ? 'empty-state empty-state-sm' : 'empty-state empty-state-sm is-loading'}>
+            {!error && <Loader2 size={16} className="spin" aria-hidden />}
             <p>{error ? 'Run history could not be read yet.' : 'Loading runs…'}</p>
           </div>
         ) : visible.length === 0 ? (

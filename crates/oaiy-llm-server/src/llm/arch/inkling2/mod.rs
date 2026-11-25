@@ -123,6 +123,13 @@ impl Inkling2Config {
         if !self.log_scale_alpha.is_finite() || self.log_scale_alpha < 0.0 {
             return bad("invalid log_scale_alpha");
         }
+        if self.head_counts.len() != self.n_phys_layers
+            || self.kv_head_counts.len() != self.n_phys_layers
+            || self.head_dims.len() != self.n_phys_layers
+            || self.is_swa.len() != self.n_phys_layers
+        {
+            return bad("per-layer attention metadata length mismatch");
+        }
         for i in 0..self.n_phys_layers {
             if self.kv_head_counts[i] == 0
                 || self.head_counts[i] == 0
@@ -174,6 +181,12 @@ impl Inkling2Config {
                         _ => None,
                     };
                     if let Some(v) = v {
+                        if v.len() != len {
+                            return Err(LlamaError::Config(format!(
+                                "{key} array length {} does not match expected {len}",
+                                v.len()
+                            )));
+                        }
                         return Ok(v);
                     }
                 }
@@ -1257,5 +1270,52 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(diff_soft > 1e-3, "spliced vision embeddings had no effect");
+    }
+
+    #[test]
+    fn config_validate_rejects_per_layer_head_count_length_mismatch() {
+        let base = Inkling2Config {
+            arch: Architecture::Inkling2,
+            hidden: 16,
+            n_phys_layers: 4,
+            vocab_size_padded: 24,
+            vocab_size_unpadded: 20,
+            context_length: 64,
+            head_counts: vec![2; 4],
+            kv_head_counts: vec![1; 4],
+            head_dims: vec![8; 4],
+            is_swa: vec![false; 4],
+            sliding_window: 8,
+            d_rel: 4,
+            rel_extent: 8,
+            qk_clip: 22.627_417,
+            rel_clip: 8.0,
+            log_scale_floor: 4,
+            log_scale_alpha: 0.1,
+            rms_eps: 1e-6,
+            conv_kernel: 4,
+            attn_res_block_size: 2,
+            n_experts: 4,
+            n_experts_used: 2,
+            ff_dim: 8,
+            route_scale: 2.0,
+            situ_beta: 4.0,
+            situ_linear_beta: 25.0,
+            final_logit_softcap: 30.0,
+            loop_cfg: None,
+        };
+        assert!(base.validate().is_ok());
+
+        let mut short_heads = base.clone();
+        short_heads.head_counts.pop();
+        assert!(short_heads.validate().is_err(), "short head_counts must fail validate without panicking");
+
+        let mut short_kv = base.clone();
+        short_kv.kv_head_counts.pop();
+        assert!(short_kv.validate().is_err(), "short kv_head_counts must fail validate without panicking");
+
+        let mut short_dims = base.clone();
+        short_dims.head_dims.pop();
+        assert!(short_dims.validate().is_err(), "short head_dims must fail validate without panicking");
     }
 }

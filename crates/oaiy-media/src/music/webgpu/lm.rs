@@ -362,12 +362,53 @@ pub struct WgpuDepth {
     positions: Vec<f32>,
 }
 
+const MAX_DEPTH_LAYERS: usize = 256;
+const MAX_DEPTH_INTERMEDIATE: usize = 1 << 20;
+
+fn parse_depth_config(config: &oaiy_engine::json::Json) -> Result<(usize, usize, usize)> {
+    let int = |k: &str, d: usize, min: usize, max: usize| -> Result<usize> {
+        match config.get(k) {
+            None => Ok(d),
+            Some(v) => {
+                let raw = v.as_i64().ok_or_else(|| err(format!("depth config {k} must be an integer")))?;
+                let n = usize::try_from(raw).map_err(|_| err(format!("depth config {k} must be non-negative (got {raw})")))?;
+                if n < min || n > max {
+                    return Err(err(format!("depth config {k}={n} out of range ({min}..={max})")));
+                }
+                Ok(n)
+            }
+        }
+    };
+    let count = int("num_layers", 4, 1, MAX_DEPTH_LAYERS)?;
+    let heads = int("num_attention_heads", 16, 1, HIDDEN)?;
+    if HIDDEN % heads != 0 {
+        return Err(err(format!("depth config num_attention_heads={heads} does not divide HIDDEN ({HIDDEN})")));
+    }
+    let ff = int("intermediate_size", 6144, 1, MAX_DEPTH_INTERMEDIATE)?;
+    Ok((count, heads, ff))
+}
+
+fn audio_row_slice(audio: &[f32], code: u32, index: usize) -> Result<&[f32]> {
+    if index == 0 || index >= CODEBOOKS {
+        return Err(err(format!("depth codebook index {index} out of range (1..{CODEBOOKS})")));
+    }
+    if code as usize >= AUDIO_VOCAB {
+        return Err(err(format!("depth audio code {code} out of range (0..{AUDIO_VOCAB})")));
+    }
+    let id = (index - 1)
+        .checked_mul(AUDIO_VOCAB)
+        .and_then(|base| base.checked_add(code as usize))
+        .ok_or_else(|| err("depth audio row index overflow"))?;
+    let start = id.checked_mul(HIDDEN).ok_or_else(|| err("depth audio row offset overflow"))?;
+    let end = start.checked_add(HIDDEN).ok_or_else(|| err("depth audio row end overflow"))?;
+    audio.get(start..end).ok_or_else(|| err(format!("depth audio row {id} out of bounds")))
+}
+
 impl WgpuDepth {
     /// The `rvq_depth_decoder` folder onto `gpu`.
     pub fn load(dir: &Path, gpu: &WgpuBackend) -> Result<Self> {
         let config = crate::music::acoustic::read_config(&dir.join("config.json"))?;
-        let int = |k: &str, d: usize| config.get(k).and_then(oaiy_engine::json::Json::as_i64).map_or(d, |v| v as usize);
-        let (count, heads, ff) = (int("num_layers", 4), int("num_attention_heads", 16), int("intermediate_size", 6144));
+        let (count, heads, ff) = parse_depth_config(&config)?;
         let mut store = Store::open(&dir.join("diffusion_pytorch_model.safetensors"), 0)?;
         let s = &mut store;
         let bytes = |s: &mut Store, k: &str| -> Result<Vec<u8>> { s.bf16_bytes(k)?.ok_or_else(|| err(format!("{k}: not BF16"))) };
@@ -389,31 +430,40 @@ impl WgpuDepth {
             });
         }
         let heads_out = (0..CODEBOOKS - 1).map(|i| Mat::f16(gpu, &f32s(s, &format!("audio_heads.{i}.weight"))?, AUDIO_VOCAB, HIDDEN, "audio_heads")).collect::<Result<_>>()?;
+        let audio = f32s(s, "audio_embeddings.weight")?;
+        let need_audio = (CODEBOOKS - 1) * AUDIO_VOCAB * HIDDEN;
+        if audio.len() < need_audio {
+            return Err(err(format!("audio_embeddings.weight has {} values, need at least {need_audio}", audio.len())));
+        }
+        let positions = f32s(s, "pos_embedding.weight")?;
+        let need_pos = CODEBOOKS * HIDDEN;
+        if positions.len() < need_pos {
+            return Err(err(format!("pos_embedding.weight has {} values, need at least {need_pos}", positions.len())));
+        }
         Ok(Self {
             decoder: Decoder { layers, norm: upload(gpu, &f32s(s, "norm.weight")?), heads, kv_heads: heads, head_dim: HIDDEN / heads, ff, eps: 1e-6, rope: false },
             projection: Mat::f16(gpu, &f32s(s, "projection.weight")?, HIDDEN, HIDDEN, "projection")?,
             heads_out,
-            audio: f32s(s, "audio_embeddings.weight")?,
-            positions: f32s(s, "pos_embedding.weight")?,
+            audio,
+            positions,
         })
     }
 
     /// Codebook `index`'s (1..7) input row for `code`.
-    fn audio_row(&self, code: u32, index: usize) -> &[f32] {
-        let id = code as usize + (index - 1) * AUDIO_VOCAB;
-        &self.audio[id * HIDDEN..(id + 1) * HIDDEN]
+    fn audio_row(&self, code: u32, index: usize) -> Result<&[f32]> {
+        audio_row_slice(&self.audio, code, index)
     }
 
     /// The feedback input for a finished frame: every codebook's input row summed, scaled by 8^-1/2.
-    fn feedback(&self, semantic: &[f32], residual: &[u32]) -> Vec<f32> {
+    fn feedback(&self, semantic: &[f32], residual: &[u32]) -> Result<Vec<f32>> {
         let mut sum = semantic.to_vec();
         for (i, &c) in residual.iter().enumerate() {
-            for (a, b) in sum.iter_mut().zip(self.audio_row(c, i + 1)) {
+            for (a, b) in sum.iter_mut().zip(self.audio_row(c, i + 1)?) {
                 *a += b;
             }
         }
         let scale = (CODEBOOKS as f64).powf(-0.5) as f32;
-        sum.iter().map(|v| v * scale).collect()
+        Ok(sum.iter().map(|v| v * scale).collect())
     }
 
     /// A frame's seven residual codes from the language model's states `last` (`[2, HIDDEN]`: the conditional row's,
@@ -442,7 +492,7 @@ impl WgpuDepth {
                 (2, x)
             } else {
                 // position `index`: the last code's input row projected, both rows the same
-                let (e, pe, x) = (upload(gpu, self.audio_row(codes[index - 1], index - 1)), gpu.vec(h), gpu.vec(2 * h));
+                let (e, pe, x) = (upload(gpu, self.audio_row(codes[index - 1], index - 1)?), gpu.vec(h), gpu.vec(2 * h));
                 self.projection.run(r, &e, &pe, 1);
                 r.copy(&pe, 0, &x, 0, h);
                 r.copy(&pe, 0, &x, h, h);
@@ -518,7 +568,7 @@ pub fn generate(lm: &mut WgpuMusicLm, depth: &WgpuDepth, ids: &[Vec<u32>; 2], ma
                 break;
             }
         }
-        let feedback = depth.feedback(lm.code_row(semantic), &codes[1..]);
+        let feedback = depth.feedback(lm.code_row(semantic), &codes[1..])?;
         let x = upload(&g, &feedback.repeat(2));
         let table = upload(&g, &lm.table(caches[0].len, 1, 2));
         let out = g.vec(2 * h);
@@ -657,7 +707,7 @@ mod golden {
                 let hidden = [&state[..h], &depth_hidden[..]].concat();
                 worst = worst.max(relative(&hidden, &reference_hidden[(f - 1) * 8 * h..f * 8 * h]));
             }
-            let feedback = depth.feedback(lm.code_row(want[0]), &want[1..]);
+            let feedback = depth.feedback(lm.code_row(want[0]), &want[1..])?;
             let (x, out) = (upload(&gpu, &feedback.repeat(2)), gpu.vec(2 * h));
             let table = upload(&gpu, &lm.table(caches[0].len, 1, 2));
             let mut rec = gpu.begin();
@@ -671,5 +721,34 @@ mod golden {
             started.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+
+    #[test]
+    fn depth_config_and_audio_row_reject_invalid_bounds() {
+        use oaiy_engine::json::Json;
+
+        let defaults = Json::parse(b"{}").unwrap();
+        assert_eq!(parse_depth_config(&defaults).unwrap(), (4, 16, 6144));
+
+        for bad_cfg in [
+            r#"{"num_layers": -1}"#,
+            r#"{"num_layers": 0}"#,
+            r#"{"num_layers": 999999}"#,
+            r#"{"num_attention_heads": 0}"#,
+            r#"{"num_attention_heads": -4}"#,
+            r#"{"num_attention_heads": 3}"#,
+            r#"{"intermediate_size": -10}"#,
+            r#"{"intermediate_size": 0}"#,
+        ] {
+            let j = Json::parse(bad_cfg.as_bytes()).unwrap();
+            assert!(parse_depth_config(&j).is_err(), "{bad_cfg} must fail");
+        }
+
+        let small_audio = vec![0.0f32; HIDDEN * 2];
+        assert!(audio_row_slice(&small_audio, 0, 0).is_err(), "index 0 must fail");
+        assert!(audio_row_slice(&small_audio, 0, CODEBOOKS).is_err(), "index >= CODEBOOKS must fail");
+        assert!(audio_row_slice(&small_audio, AUDIO_VOCAB as u32, 1).is_err(), "code >= AUDIO_VOCAB must fail");
+        assert!(audio_row_slice(&small_audio, 2, 1).is_err(), "truncated audio buffer must fail");
+        assert_eq!(audio_row_slice(&small_audio, 1, 1).unwrap().len(), HIDDEN);
     }
 }

@@ -414,6 +414,7 @@ export function DependencyDialog({
       {pendingTrust && (
         <TrustDialog
           manifest={pendingTrust.manifest}
+          verification={pendingTrust.verification}
           onConfirm={(perms) => { void handleDependencyTrustConfirm(perms); }}
           onCancel={handleDependencyTrustCancel}
         />

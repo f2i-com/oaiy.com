@@ -444,17 +444,16 @@ fn day_summary(date: NaiveDate, settings: &Settings, appointments: &[Appointment
         .filter_map(|sp| Some((parse_time(&sp.open)?, parse_time(&sp.close)?)))
         .collect();
     let open = spans.iter().map(|(a, b)| say_range(*a, *b)).collect::<Vec<_>>().join(" and ");
-    // Booked: what holds time that day, clipped to the opening spans.
+    // Booked: what holds time that day, clipped to the opening spans (intersecting full
+    // NaiveDateTime intervals so cross-midnight appointments count on both start and next day).
     let mut taken = Vec::new();
     for a in appointments.iter().filter(|a| a.status.holds_time()) {
         let (Some(start), Some(end)) = (a.starts(), a.ends()) else { continue };
-        if start.date() != date {
-            continue;
-        }
         for (o, c) in &spans {
-            let (from, to) = (start.time().max(*o), end.time().min(*c));
+            let from = start.max(date.and_time(*o));
+            let to = end.min(date.and_time(*c));
             if from < to {
-                taken.push((from, to));
+                taken.push((from.time(), to.time()));
             }
         }
     }
@@ -1167,6 +1166,54 @@ mod tests {
         assert!(cal.list(NaiveDate::from_ymd_opt(2026, 10, 3), None).is_empty());
         cal.remove(&a.id).unwrap();
         assert!(cal.remove(&a.id).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn day_summary_reflects_cross_midnight_appointment_on_both_start_and_next_day() {
+        let (cal, dir) = calendar();
+        let mut s = cal.settings();
+        s.notice_minutes = 0;
+        // Mon 28 Sep: open 21:00..23:59; Tue 29 Sep: open 00:00..06:00.
+        s.hours[0] = vec![Span { open: "21:00".into(), close: "23:59".into() }];
+        s.hours[1] = vec![Span { open: "00:00".into(), close: "06:00".into() }];
+        cal.set_settings(s.clone()).unwrap();
+
+        // Cross-midnight booking: Mon 23:00 -> Tue 01:00 (120 min).
+        cal.create(NewAppointment {
+            service: "Night shift".into(),
+            start: "2026-09-28T23:00".into(),
+            minutes: Some(120),
+            name: "Sam".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let appts = cal.list(None, None);
+        let mon = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+        let free = cal.free(mon, 2, 30, at("2026-09-28T20:00"));
+
+        let mon_summary = day_summary(mon, &s, &appts, &free[0].times, 30, "Night shift");
+        assert!(
+            mon_summary.contains("booked 11 pm to 11:59 pm"),
+            "start day must show evening portion booked: {mon_summary}"
+        );
+        assert!(
+            !mon_summary.contains("free all day"),
+            "start day must not claim free all day: {mon_summary}"
+        );
+
+        let tue_summary = day_summary(tue, &s, &appts, &free[1].times, 30, "Night shift");
+        assert!(
+            tue_summary.contains("booked 12 am to 1 am"),
+            "next day must show after-midnight portion booked: {tue_summary}"
+        );
+        assert!(
+            !tue_summary.contains("free all day"),
+            "next day must not claim free all day: {tue_summary}"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

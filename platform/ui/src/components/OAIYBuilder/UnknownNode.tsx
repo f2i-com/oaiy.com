@@ -13,12 +13,12 @@ function UnknownNode({ id, data }: NodeProps) {
   const label = typeof (data as { label?: unknown })?.label === 'string' ? ((data as { label: string }).label).trim() : '';
   return (
     <>
-      <Handle type="target" position={Position.Top} />
+      <Handle type="target" position={Position.Left} />
       <div className="oaiy-unknown-node" title={type ? `A ${type} node: this editor has none of that kind` : undefined}>
         {label && <strong>{label}</strong>}
         {type && <code>{type}</code>}
       </div>
-      <Handle type="source" position={Position.Bottom} />
+      <Handle type="source" position={Position.Right} />
     </>
   );
 }

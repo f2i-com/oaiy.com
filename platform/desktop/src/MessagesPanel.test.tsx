@@ -270,4 +270,29 @@ describe('Messages', () => {
     await mount();
     expect(text()).toContain('does not keep messages yet');
   });
+
+  it('supports keyboard tablist navigation and offers LoadError retry on read failure', async () => {
+    api.list.mockRejectedValueOnce(new Error('bridge offline'));
+    await mount();
+    const alert = host.querySelector('.load-error[role="alert"]')!;
+    expect(alert.textContent).toContain('Could not read the messages: bridge offline');
+
+    api.list.mockResolvedValue({ messages: stored, total: stored.length, unread: 1 });
+    await act(async () => alert.querySelector<HTMLButtonElement>('button')!.click());
+    await settle();
+    expect(host.querySelector('.load-error')).toBeNull();
+
+    const tablist = host.querySelector<HTMLDivElement>('[role="tablist"]')!;
+    const tabs = () => [...tablist.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+    await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })));
+    await settle();
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['false', 'true', 'false']);
+    await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })));
+    await settle();
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['false', 'false', 'true']);
+    await act(async () => tablist.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true })));
+    await settle();
+    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+  });
 });

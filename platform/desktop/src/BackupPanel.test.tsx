@@ -250,7 +250,9 @@ describe('making a backup: the passphrase rules', () => {
     await mount();
     await typeBoth('elevenchars');
     expect(buttonWith('Create backup')!.disabled).toBe(true);
-    expect(text()).toContain('Use at least 12 characters');
+    expect(input('Backup passphrase').getAttribute('aria-invalid')).toBe('true');
+    expect(host.querySelector('.form-error[role="alert"]')?.textContent).toContain('Use at least 12 characters');
+    expect(host.querySelector('.banner-warn[role="note"]')?.textContent).toContain('lose the passphrase');
     await click(buttonWith('Create backup'));
     expect(h.create).not.toHaveBeenCalled();
   });
@@ -259,7 +261,8 @@ describe('making a backup: the passphrase rules', () => {
     await mount();
     await typeBoth(PASS, PASS2);
     expect(buttonWith('Create backup')!.disabled).toBe(true);
-    expect(text()).toContain('The two passphrases are not the same');
+    expect(input('Backup passphrase again').getAttribute('aria-invalid')).toBe('true');
+    expect(host.querySelector('.form-error[role="alert"]')?.textContent).toContain('The two passphrases are not the same');
     await click(buttonWith('Create backup'));
     expect(h.create).not.toHaveBeenCalled();
   });
@@ -390,6 +393,7 @@ describe('making a backup', () => {
     await flush();
     expect(host.querySelector('[role="progressbar"]')).toBeNull();
     expect(text()).toContain('Backup created');
+    expect(host.querySelector('.banner-ok[aria-label="Backup created"]')).not.toBeNull();
   });
 });
 

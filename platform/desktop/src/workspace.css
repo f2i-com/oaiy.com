@@ -25,7 +25,7 @@
 .banner { flex-wrap: wrap; line-height: 1.5; }
 .banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
 .btn, .icon-button { min-height: 34px; }
-.btn-tiny { min-height: 28px; }
+.btn-tiny, .btn.btn-tiny { min-height: 28px; }
 /* A plugin screen fills the page down to the dock, and scrolls inside itself.
    The page around it does not scroll too, so there is one scrollbar. Below
    320px of room the page scrolls again rather than squash it. */
@@ -87,7 +87,6 @@ input, select, textarea { max-width: 100%; }
 }
 @media (max-width: 480px) {
   :root { --page-pad-t: 16px; --page-pad-x: 10px; --page-pad-b: 24px; }
-  .seg-tabs > button > span { display: none; }
 }
 
 /* Settings → Backup: when the last backup was made, at the top of the section. */
@@ -97,12 +96,6 @@ input, select, textarea { max-width: 100%; }
 /* Today gives the selected model room for its name. The remaining tiles read
    as a short agenda, with the same order at desktop and phone widths. */
 .today-section, .computer-section { container-type: inline-size; }
-.today-section .section-title, .computer-section .section-title {
-  font-size: 18px;
-  line-height: 1.3;
-  letter-spacing: -.035em;
-}
-.today-section .section-title::before, .computer-section .section-title::before { display: none; }
 .today-section .section-title-row { justify-content: space-between; }
 .today-section time { color: var(--muted); font-size: var(--text-hint); }
 .today-section .today-grid {
@@ -119,11 +112,18 @@ input, select, textarea { max-width: 100%; }
   min-height: 155px;
   gap: 18px 10px;
   padding: clamp(16px, 3cqi, 26px);
-  border: 1px solid #59539d;
-  border-radius: 12px;
-  background: linear-gradient(118deg, #232545, #343161 66%, #464577);
-  color: #fff;
-  box-shadow: none;
+  border: 1px solid var(--hero-border);
+  border-radius: calc(var(--r-card) + 2px);
+  background: var(--hero-bg);
+  color: var(--hero-title);
+  box-shadow: var(--hero-shadow);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+.today-section .today-grid > .overview-tile:hover {
+  border-color: var(--hero-border-hover);
+  background: var(--hero-bg);
+  box-shadow: var(--hero-shadow-hover);
+  transform: translateY(-2px);
 }
 .today-grid > .overview-tile::before {
   content: '';
@@ -131,7 +131,7 @@ input, select, textarea { max-width: 100%; }
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background-image: radial-gradient(circle at 1px 1px, #d7ceff55 1px, transparent 1.5px);
+  background-image: radial-gradient(circle at 1px 1px, var(--hero-dot) 1px, transparent 1.5px);
   background-size: 12px 12px;
   mask-image: linear-gradient(108deg, transparent 35%, #000 155%);
 }
@@ -141,57 +141,122 @@ input, select, textarea { max-width: 100%; }
   height: 37px;
   margin: 0;
   padding: 8px;
-  border: 1px solid #ffffff30;
+  border: 1px solid var(--hero-icon-border);
   border-radius: 10px;
-  background: #ffffff0f;
-  color: #ebe8ff;
+  background: var(--hero-icon-bg);
+  color: var(--hero-icon-color);
+  transition: border-color 0.16s ease, color 0.16s ease;
+}
+.today-section .today-grid > .overview-tile:hover > svg {
+  border-color: var(--hero-border-hover);
+  color: var(--hero-icon-color);
 }
 .today-section .today-grid > .overview-tile > strong {
   grid-area: state;
   justify-self: end;
   align-self: start;
   max-width: 100%;
-  border: 1px solid #ffffff36;
+  border: 1px solid var(--hero-icon-border);
   border-radius: 20px;
-  padding: 4px 9px;
-  color: #f1efff;
+  background: var(--hero-icon-bg);
+  padding: 4px 10px;
+  color: var(--hero-sub);
   font-size: 12px;
-  font-weight: 570;
+  font-weight: 600;
   white-space: normal;
   overflow-wrap: anywhere;
 }
-.today-section .today-grid > .overview-tile > strong.ok { color: #bdffdd; background: #24634e77; }
-.today-section .today-grid > .overview-tile > strong.warn { color: #ffe9a6; background: #614b3077; }
+.today-section .today-grid > .overview-tile > strong.ok {
+  border-color: var(--hero-ok-border);
+  background: var(--hero-ok-bg);
+  color: var(--hero-ok-text);
+}
+.today-section .today-grid > .overview-tile > strong.warn {
+  border-color: var(--hero-warn-border);
+  background: var(--hero-warn-bg);
+  color: var(--hero-warn-text);
+}
 .today-section .today-grid > .overview-tile > small {
   grid-area: name;
   align-self: end;
-  color: #fff;
+  color: var(--hero-title);
   font-size: clamp(21px, 2.8cqi, 33px);
-  font-weight: 610;
+  font-weight: 620;
   line-height: 1.16;
-  letter-spacing: -.04em;
+  letter-spacing: -0.035em;
 }
-.today-activity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.today-activity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .today-activity > .overview-tile {
+  position: relative;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-content: center;
   align-items: center;
   column-gap: 12px;
   row-gap: 3px;
-  padding: 12px 14px;
+  padding: 13px 26px 13px 14px;
   background: var(--surface-solid);
-  box-shadow: none;
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
 }
 .today-activity > .overview-tile:last-child:nth-child(odd), .today-grid > .overview-tile:only-child { grid-column: 1 / -1; }
 .today-activity > .overview-tile > svg { grid-row: span 2; margin: 0; color: var(--primary-text); }
 .today-activity > .overview-tile strong { white-space: normal; font-size: 15px; }
 .today-activity > .overview-tile small { grid-column: 2; font-size: 12px; }
-.computer-section .overview-tile { box-shadow: none; background: var(--surface-soft); }
+.computer-section .overview-tile {
+  position: relative;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+.computer-section .overview-tile.is-alarm {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border));
+  background: var(--danger-soft);
+}
+.computer-section .overview-tile.is-alarm > svg { color: var(--danger); }
+.computer-section .overview-tile.is-alarm:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 15%, var(--surface-solid));
+  box-shadow: var(--shadow-node);
+  transform: translateY(-1px);
+}
+.computer-section .overview-tile.is-alarm:hover > svg { color: var(--danger); }
 .computer-section .overview-tile strong { font-variant-numeric: tabular-nums; }
-.computer-section .overview-tile:hover, .today-activity .overview-tile:hover {
+.computer-section .overview-tile:not(.overview-tile-static):not(.is-alarm):hover,
+.today-activity > .overview-tile:not(.overview-tile-static):not(.is-alarm):hover {
   background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  box-shadow: var(--shadow-node);
+  transform: translateY(-1px);
+}
+:root[data-theme='light'] .computer-section .overview-tile:not(.overview-tile-static):not(.is-alarm):hover,
+:root[data-theme='light'] .today-activity > .overview-tile:not(.overview-tile-static):not(.is-alarm):hover {
+  background: var(--surface-raised);
+  box-shadow: 3px 3px 0 rgba(36, 87, 230, 0.12);
+}
+.computer-section .overview-tile:not(.overview-tile-static)::after,
+.today-activity > .overview-tile:not(.overview-tile-static)::after {
+  content: '';
+  position: absolute;
+  top: 13px;
+  right: 13px;
+  width: 6px;
+  height: 6px;
+  border-top: 1.5px solid var(--faint);
+  border-right: 1.5px solid var(--faint);
+  opacity: 0;
+  transform: rotate(45deg) translate(-2px, 2px);
+  transition: opacity 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+  pointer-events: none;
+}
+.computer-section .overview-tile:not(.overview-tile-static):hover::after,
+.today-activity > .overview-tile:not(.overview-tile-static):hover::after {
+  opacity: 1;
   border-color: var(--primary-text);
+  transform: rotate(45deg);
+}
+.computer-section .overview-tile.is-alarm:hover::after {
+  border-color: var(--danger);
 }
 @container (max-width: 620px) {
   .today-section .today-grid { grid-template-columns: minmax(0, 1fr); }
@@ -200,4 +265,7 @@ input, select, textarea { max-width: 100%; }
   .today-activity > .overview-tile > svg { grid-row: auto; }
   .today-activity > .overview-tile small { grid-column: 1; }
   .computer-section .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 400px) {
+  .computer-section .overview-grid { grid-template-columns: minmax(0, 1fr); }
 }

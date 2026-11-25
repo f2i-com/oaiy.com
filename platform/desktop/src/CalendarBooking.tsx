@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Ban, CalendarPlus, Check, ChevronLeft, ChevronRight, CircleCheck, MessageSquare, Pencil, Phone, Trash2, Undo2, X } from 'lucide-react';
 import { calendar, type Appointment, type AppointmentStatus, type CalendarSettings } from './api';
 import {
@@ -110,6 +110,44 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
   const closed = (d: string) => (settings.hours[weekdayOf(parseYmd(d))] ?? []).length === 0;
   // The time aimed for (a slot clicked) is not free: say so, and that the nearest was picked.
   const missed = !!aim.current && !!time && aim.current !== time && !times.includes(aim.current);
+  const enabledDays = days.filter((d) => d >= today);
+  const selectedDayInWeek = enabledDays.includes(date) ? date : enabledDays[0];
+
+  const onDayKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!enabledDays.length) return;
+    const buttons = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]:not(:disabled)')];
+    const currentIdx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const activeDayIdx = currentIdx >= 0 ? currentIdx : Math.max(0, enabledDays.indexOf(date));
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') nextIdx = (activeDayIdx + 1) % enabledDays.length;
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') nextIdx = (activeDayIdx - 1 + enabledDays.length) % enabledDays.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = enabledDays.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    const nextDay = enabledDays[nextIdx];
+    onPick(nextDay, null);
+    buttons[nextIdx]?.focus();
+  };
+
+  const onTimeKey = (groupTimesList: string[]) => (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!groupTimesList.length) return;
+    const buttons = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]:not(:disabled)')];
+    const currentIdx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const activeIdx = currentIdx >= 0 ? currentIdx : Math.max(0, groupTimesList.indexOf(time ?? ''));
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') nextIdx = (activeIdx + 1) % groupTimesList.length;
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') nextIdx = (activeIdx - 1 + groupTimesList.length) % groupTimesList.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = groupTimesList.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    const nextTime = groupTimesList[nextIdx];
+    aim.current = nextTime;
+    setOther(false);
+    onPick(date, nextTime);
+    buttons[nextIdx]?.focus();
+  };
 
   return (
     <div className="cal-picker">
@@ -117,7 +155,7 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
         <button type="button" className="icon-button" aria-label="The week before" disabled={week <= thisWeek} onClick={() => setWeek(ymd(addDays(parseYmd(week), -7)))}>
           <ChevronLeft size={15} />
         </button>
-        <div className="cal-daychips" role="radiogroup" aria-label="Day">
+        <div className="cal-daychips" role="radiogroup" aria-label="Day" onKeyDown={onDayKey}>
           {days.map((d) => {
             const past = d < today;
             const n = free?.[d]?.length ?? 0;
@@ -129,6 +167,7 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
                 key={d}
                 role="radio"
                 aria-checked={d === date}
+                tabIndex={!past && d === selectedDayInWeek ? 0 : -1}
                 className={`cal-daychip${d === date ? ' is-on' : ''}${past || closed(d) ? ' is-off' : ''}${d === today ? ' is-today' : ''}`}
                 disabled={past}
                 onClick={() => onPick(d, null)}
@@ -155,30 +194,34 @@ export function SlotPicker({ settings, service, minutes, date, time, wanted, cur
         ) : times.length === 0 ? (
           <p className="form-hint">{closed(date) ? `Closed on ${DAY_NAMES[weekdayOf(parseYmd(date))]}s.` : date < today ? 'That day is past.' : 'Nothing free that day for this.'} Pick another day, or another time below.</p>
         ) : (
-          groups.map((g) => (
-            <div key={g.part} className="cal-time-group">
-              <span>{g.label}</span>
-              <div role="radiogroup" aria-label={`${g.label} times`}>
-                {g.times.map((t) => (
-                  <button
-                    type="button"
-                    key={t}
-                    role="radio"
-                    aria-checked={!other && t === time}
-                    className={`cal-chip${!other && t === time ? ' is-on' : ''}`}
-                    onClick={() => {
-                      aim.current = t;
-                      setOther(false);
-                      onPick(date, t);
-                    }}
-                  >
-                    {sayTime(t)}
-                    {current && current.date === date && current.time === t ? <em> now</em> : null}
-                  </button>
-                ))}
+          groups.map((g) => {
+            const groupHasSelected = !other && !!time && g.times.includes(time);
+            return (
+              <div key={g.part} className="cal-time-group">
+                <span>{g.label}</span>
+                <div role="radiogroup" aria-label={`${g.label} times`} onKeyDown={onTimeKey(g.times)}>
+                  {g.times.map((t, idx) => (
+                    <button
+                      type="button"
+                      key={t}
+                      role="radio"
+                      aria-checked={!other && t === time}
+                      tabIndex={(groupHasSelected ? t === time : idx === 0) ? 0 : -1}
+                      className={`cal-chip${!other && t === time ? ' is-on' : ''}`}
+                      onClick={() => {
+                        aim.current = t;
+                        setOther(false);
+                        onPick(date, t);
+                      }}
+                    >
+                      {sayTime(t)}
+                      {current && current.date === date && current.time === t ? <em> now</em> : null}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
         {missed && !other && <p className="form-hint">{sayTime(aim.current!)} is not free for this; the nearest free time is picked.</p>}
       </div>
@@ -234,6 +277,7 @@ export function BookingForm({
   wanted,
   appointment,
   submitLabel,
+  onDirty,
   onSubmit,
   onCancel,
 }: {
@@ -243,12 +287,14 @@ export function BookingForm({
   /** The appointment being changed (none for a new one). */
   appointment?: Appointment;
   submitLabel: string;
+  onDirty?: (dirty: boolean) => void;
   /** `confirm`: a request changed and confirmed in one go. */
   onSubmit: (v: BookingValues, confirm: boolean) => Promise<void>;
   onCancel: () => void;
 }) {
   const services = settings.services;
-  const [service, setService] = useState(initial.service ?? services[0]?.name ?? '');
+  const initService = initial.service ?? services[0]?.name ?? '';
+  const [service, setService] = useState(initService);
   const [date, setDate] = useState(initial.date);
   const [time, setTime] = useState<string | null>(initial.time ?? null);
   const [name, setName] = useState(initial.name ?? '');
@@ -260,6 +306,20 @@ export function BookingForm({
   const minutes = appointment && appointment.service === service ? appointment.minutes : chosen?.minutes;
   const current = appointment ? { date: dateOf(appointment.start), time: timeOf(appointment.start) } : undefined;
   const end = time && minutes ? endOf({ start: `${date}T${time}`, minutes }) : null;
+
+  const dirty =
+    service !== initService ||
+    date !== initial.date ||
+    (!!appointment && time !== null && time !== (initial.time ?? null)) ||
+    name !== (initial.name ?? '') ||
+    phone !== (initial.phone ?? '') ||
+    notes !== (initial.notes ?? '');
+  const onDirtyRef = useRef(onDirty);
+  onDirtyRef.current = onDirty;
+  useEffect(() => {
+    onDirtyRef.current?.(dirty);
+  }, [dirty]);
+  useEffect(() => () => onDirtyRef.current?.(false), []);
 
   const submit = async (confirm: boolean) => {
     if (!time) return;

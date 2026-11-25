@@ -514,6 +514,27 @@ export function useProject() {
     return newFlow;
   }, []);
 
+  /** Add a newly created user macro flow without switching away from the active flow. */
+  const createMacroFlow = useCallback((macroFlow: Flow): Flow => {
+    const now = new Date().toISOString();
+    const tags = macroFlow.tags?.includes('user-created')
+      ? macroFlow.tags
+      : [...(macroFlow.tags || []), 'user-created'];
+    const ready: Flow = {
+      ...macroFlow,
+      isMacro: true,
+      tags,
+      createdAt: macroFlow.createdAt || now,
+      updatedAt: now,
+    };
+    setProject((prev) => ({
+      ...prev,
+      updatedAt: now,
+      flows: [...prev.flows, ready],
+    }));
+    return ready;
+  }, []);
+
   /** Put a flow made elsewhere (an example) in the project under its own id, and open it; one there already is opened. */
   const addFlow = useCallback((flow: Flow) => {
     setProject((prev) => (prev.flows.some((f) => f.id === flow.id)
@@ -1379,6 +1400,7 @@ export function useProject() {
 
     // Macro operations
     saveAsMacro,
+    createMacroFlow,
     unmakeMacro,
     getMacros,
     hasMacroBeenModified,

@@ -33,7 +33,8 @@ const spec = {
   '.cm-panels': { backgroundColor: 'var(--panel)', color: 'var(--text)', fontFamily: 'var(--sans)' },
   '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--border)' },
   '.cm-panels.cm-panels-bottom': { borderTop: '1px solid var(--border)' },
-  '.cm-textfield': { backgroundColor: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: '6px', color: 'var(--text)' },
+  '.cm-textfield': { backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', borderRadius: '6px', color: 'var(--text)' },
+  '.cm-textfield:focus': { outline: 'none', borderColor: 'var(--accent)', boxShadow: 'var(--ring)' },
   '.cm-button': { backgroundImage: 'none', backgroundColor: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: '6px', color: 'var(--text)' },
 };
 

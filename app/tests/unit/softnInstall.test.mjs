@@ -50,6 +50,6 @@ it('keeps the working preview after a missing asset, a bridge failure or an extr
     expect(ensure.status, ensure.stderr).toBe(0);
     expect(snapshot()['bot-bridge.js']).toBe(working['bot-bridge.js']);
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

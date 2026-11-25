@@ -20,6 +20,7 @@ import {
   CanvasSource,
   Input,
   Mp4OutputFormat,
+  OggOutputFormat,
   Output,
   QUALITY_HIGH,
   WebMOutputFormat,
@@ -41,7 +42,11 @@ const MAX_SECONDS = 30 * 60;
 const MAX_FRAMES_OUT = 300;
 const SAMPLE_RATE = 48_000;
 
-export const extOf = (name: string) => name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+export const extOf = (name: string) => {
+  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  const dot = name.lastIndexOf('.');
+  return dot > slash + 1 ? name.slice(dot + 1).toLowerCase() : '';
+};
 const isImage = (name: string) => extOf(name) in IMAGE_MIME;
 const round = (n: number, places = 3) => Math.round(n * 10 ** places) / 10 ** places;
 
@@ -261,32 +266,43 @@ interface PlacedClip {
 async function loadClips(specs: ClipSpec[]): Promise<PlacedClip[]> {
   const clips: PlacedClip[] = [];
   let offset = 0;
-  for (const spec of specs) {
-    if (isImage(spec.name)) {
-      const image = await createImageBitmap(new Blob([spec.bytes as BlobPart], { type: IMAGE_MIME[extOf(spec.name)] }));
-      const length = spec.duration && spec.duration > 0 ? spec.duration : 3;
-      clips.push({ spec, offset, length, sourceStart: 0, image, width: image.width, height: image.height });
-      offset += length;
-      continue;
+  try {
+    for (const spec of specs) {
+      if (isImage(spec.name)) {
+        const image = await createImageBitmap(new Blob([spec.bytes as BlobPart], { type: IMAGE_MIME[extOf(spec.name)] }));
+        const length = spec.duration && spec.duration > 0 ? spec.duration : 3;
+        clips.push({ spec, offset, length, sourceStart: 0, image, width: image.width, height: image.height });
+        offset += length;
+        continue;
+      }
+      const input = openInput(spec.bytes);
+      let kept = false;
+      try {
+        await readable(input, spec.name);
+        const video = await input.getPrimaryVideoTrack();
+        if (!video) throw new EditError(`${spec.name} has no video: put sound in audio, not clips`);
+        const first = await video.getFirstTimestamp();
+        const full = (await video.computeDuration()) - first;
+        const sourceStart = Math.max(0, Math.min(spec.start ?? 0, full));
+        const sourceEnd = Math.max(sourceStart, Math.min(spec.end ?? full, full));
+        const length = sourceEnd - sourceStart;
+        if (length <= 0) throw new EditError(`${spec.name}: the part from ${sourceStart} s to ${sourceEnd} s is empty`);
+        const facts = await videoFacts(video);
+        clips.push({ spec, offset, length, sourceStart: first + sourceStart, input, video, audio: await input.getPrimaryAudioTrack(), width: facts.width, height: facts.height, fps: facts.fps });
+        kept = true;
+        offset += length;
+      } finally {
+        if (!kept) input.dispose();
+      }
     }
-    const input = openInput(spec.bytes);
-    await readable(input, spec.name);
-    const video = await input.getPrimaryVideoTrack();
-    if (!video) {
-      input.dispose();
-      throw new EditError(`${spec.name} has no video: put sound in audio, not clips`);
+    return clips;
+  } catch (error) {
+    for (const c of clips) {
+      c.input?.dispose();
+      c.image?.close();
     }
-    const first = await video.getFirstTimestamp();
-    const full = (await video.computeDuration()) - first;
-    const sourceStart = Math.max(0, Math.min(spec.start ?? 0, full));
-    const sourceEnd = Math.max(sourceStart, Math.min(spec.end ?? full, full));
-    const length = sourceEnd - sourceStart;
-    if (length <= 0) throw new EditError(`${spec.name}: the part from ${sourceStart} s to ${sourceEnd} s is empty`);
-    const facts = await videoFacts(video);
-    clips.push({ spec, offset, length, sourceStart: first + sourceStart, input, video, audio: await input.getPrimaryAudioTrack(), width: facts.width, height: facts.height, fps: facts.fps });
-    offset += length;
+    throw error;
   }
-  return clips;
 }
 
 /** Decode a whole sound file (or a video's sound) to an AudioBuffer. */
@@ -334,27 +350,46 @@ async function joinBuffers(ctx: BaseAudioContext, track: InputAudioTrack, start:
   return { buffer: joined, lead: Math.max(0, start - (firstAt ?? start)) };
 }
 
-/** Merge overlapping [start, end) intervals. */
-function merged(intervals: Array<[number, number]>): Array<[number, number]> {
+/** Merge overlapping [start, end) intervals, plus those separated by at most `gap` seconds. */
+export function mergeIntervals(intervals: Array<[number, number]>, gap = 0): Array<[number, number]> {
   const sorted = intervals.slice().sort((a, b) => a[0] - b[0]);
   const out: Array<[number, number]> = [];
   for (const [s, e] of sorted) {
     const last = out[out.length - 1];
-    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    if (last && s <= last[1] + gap) last[1] = Math.max(last[1], e);
     else out.push([s, e]);
   }
   return out;
 }
 
+/** Clamp/scale fade-in and fade-out durations so `inEnd <= outStart` and gain never jumps mid-fade. */
+export function computeFadeTimes(from: number, to: number, fadeIn = 0, fadeOut = 0): { inEnd: number; outStart: number } {
+  const dur = Math.max(0, to - from);
+  let fIn = Math.max(0, fadeIn);
+  let fOut = Math.max(0, fadeOut);
+  if (fIn + fOut > dur && fIn + fOut > 0) {
+    const scale = dur / (fIn + fOut);
+    fIn *= scale;
+    fOut *= scale;
+  }
+  return { inEnd: from + fIn, outStart: Math.max(from + fIn, to - fOut) };
+}
+
 /** Fade a gain in at `from` and out before `to`. */
-function fades(gain: AudioParam, level: number, from: number, to: number, fadeIn = 0, fadeOut = 0): void {
-  if (fadeIn > 0) {
+export function fades(gain: AudioParam, level: number, from: number, to: number, fadeIn = 0, fadeOut = 0): void {
+  if (to <= from) {
     gain.setValueAtTime(0, from);
-    gain.linearRampToValueAtTime(level, from + Math.min(fadeIn, (to - from) / 2));
-  } else gain.setValueAtTime(level, from);
-  if (fadeOut > 0) {
-    const s = Math.max(from, to - fadeOut);
-    gain.setValueAtTime(level, s);
+    return;
+  }
+  const { inEnd, outStart } = computeFadeTimes(from, to, fadeIn, fadeOut);
+  if (inEnd > from) {
+    gain.setValueAtTime(0, from);
+    gain.linearRampToValueAtTime(level, inEnd);
+  } else {
+    gain.setValueAtTime(level, from);
+  }
+  if (outStart < to) {
+    if (inEnd <= from || outStart > inEnd) gain.setValueAtTime(level, outStart);
     gain.linearRampToValueAtTime(0, to);
   }
 }
@@ -405,15 +440,21 @@ async function mixSound(clips: PlacedClip[], specs: AudioSpec[], total: number, 
     voices.push({ duck, from: at, to: until, ducks: track.duck });
   }
   // Ducking: while a voice that ducks plays, every other sound drops to its level (ramps of a fifth of a second).
+  // Merge intervals separated by <= 2 * RAMP (0.4 s) so closely spaced speech stays smoothly ducked without ramp collisions.
   const RAMP = 0.2;
   for (const voice of voices) {
     const others = voices.filter((o) => o !== voice && o.ducks !== undefined && o.ducks < 1 && o.to > voice.from && o.from < voice.to);
-    const intervals = merged(others.map((o) => [o.from, o.to] as [number, number]));
+    const intervals = mergeIntervals(others.map((o) => [o.from, o.to] as [number, number]), 2 * RAMP);
     const level = Math.min(...others.map((o) => o.ducks!), 1);
     voice.duck.gain.setValueAtTime(1, 0);
     for (const [s, e] of intervals) {
-      voice.duck.gain.setValueAtTime(1, Math.max(0, s - RAMP));
-      voice.duck.gain.linearRampToValueAtTime(level, s);
+      const rampStart = Math.max(0, s - RAMP);
+      if (rampStart < s) {
+        voice.duck.gain.setValueAtTime(1, rampStart);
+        voice.duck.gain.linearRampToValueAtTime(level, s);
+      } else {
+        voice.duck.gain.setValueAtTime(level, s);
+      }
       voice.duck.gain.setValueAtTime(level, e);
       voice.duck.gain.linearRampToValueAtTime(1, e + RAMP);
     }
@@ -536,7 +577,12 @@ export async function compose(spec: ComposeSpec, onProgress: (message: string) =
       const codec = spec.output === 'm4a' ? await getFirstEncodableAudioCodec(['aac', 'opus'], { numberOfChannels: 2, sampleRate: SAMPLE_RATE }) : await getFirstEncodableAudioCodec(['opus'], { numberOfChannels: 2, sampleRate: SAMPLE_RATE });
       if (!codec) throw new EditError(`this browser cannot encode ${spec.output} audio; write .wav`);
       const target = new BufferTarget();
-      const output = new Output({ format: spec.output === 'm4a' ? new Mp4OutputFormat({ fastStart: 'in-memory' }) : new WebMOutputFormat(), target });
+      const outputFormat = spec.output === 'm4a'
+        ? new Mp4OutputFormat({ fastStart: 'in-memory' })
+        : spec.output === 'ogg'
+          ? new OggOutputFormat()
+          : new WebMOutputFormat();
+      const output = new Output({ format: outputFormat, target });
       const source = new AudioBufferSource({ codec, bitrate: QUALITY_HIGH });
       output.addAudioTrack(source);
       await output.start();

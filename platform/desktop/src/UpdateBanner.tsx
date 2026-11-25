@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowUpCircle } from 'lucide-react';
+import { ArrowUpCircle, X } from 'lucide-react';
 import { useUpdateStatus } from './useUpdateStatus';
 
 /**
@@ -43,23 +43,26 @@ export default function UpdateBanner({ onOpenSettings }: { onOpenSettings: () =>
   return (
     <div className="banner banner-pending banner-dismissable update-banner" role="status">
       <span>
-        <ArrowUpCircle size={13} />{' '}
-        {ready ? `OAIY ${version} is downloaded and ready to install.` : `OAIY ${version} is available.`}{' '}
-        <button className="btn-tiny" onClick={onOpenSettings}>
+        <ArrowUpCircle size={13} aria-hidden="true" />{' '}
+        {ready ? `OAIY ${version} is downloaded and ready to install.` : `OAIY ${version} is available.`}
+      </span>
+      <span className="banner-actions">
+        <button type="button" className="btn-tiny" onClick={onOpenSettings}>
           {ready ? 'Open Settings to restart' : 'See what is new'}
         </button>
+        <button
+          type="button"
+          className="banner-dismiss"
+          aria-label="Dismiss until the next version"
+          title="Dismiss until the next version"
+          onClick={() => {
+            dismissVersion(version);
+            setDismissed(version);
+          }}
+        >
+          <X size={13} aria-hidden="true" />
+        </button>
       </span>
-      <button
-        className="banner-dismiss"
-        aria-label="Dismiss until the next version"
-        title="Dismiss until the next version"
-        onClick={() => {
-          dismissVersion(version);
-          setDismissed(version);
-        }}
-      >
-        ×
-      </button>
     </div>
   );
 }

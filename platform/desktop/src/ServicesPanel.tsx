@@ -1,4 +1,4 @@
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RemoteServices from './RemoteServices';
 import { useVisiblePoll } from './useVisiblePoll';
 import {
@@ -12,7 +12,7 @@ import {
   type ServiceStatus,
   type ServiceTemplateInput,
 } from './api';
-import { Download, FolderOpen, PackageMinus, Plus, RotateCw, Trash2, Upload } from 'lucide-react';
+import { Download, FolderOpen, PackageMinus, Plus, RotateCw, Square, Trash2, Upload, X } from 'lucide-react';
 import LogsViewer from './LogsViewer';
 import MoreMenu, { type MoreItem } from './MoreMenu';
 import { useToast } from './Toasts';
@@ -217,7 +217,7 @@ export default function ServicesPanel() {
             aria-label="Dismiss error"
             onClick={() => setActionError(null)}
           >
-            ×
+            <X size={13} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -318,7 +318,7 @@ export default function ServicesPanel() {
                 ref={importInputRef}
                 type="file"
                 accept="application/json,.json"
-                style={{ display: 'none' }}
+                className="is-hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) void importPackage(f);
@@ -533,16 +533,6 @@ interface CardProps {
   onDelete: () => void;
 }
 
-/** Shared flex-row layout for the rows inside a service card (GPU, start with the app). */
-const CARD_ROW_STYLE: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-  marginTop: 8,
-  flexWrap: 'wrap',
-  fontSize: '0.9em',
-};
-
 // The GPU list is machine-global — fetch it once and cache so every card's picker shares it
 // (avoids one nvidia-smi per card).
 //
@@ -599,7 +589,7 @@ function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostar
     setOn(autostart);
   }, [autostart]);
   return (
-    <div style={CARD_ROW_STYLE}>
+    <div className="service-card-row">
       {/* Wrapping the input in the <label> associates the two, so the checkbox
           has an accessible name. */}
       <label className="service-autostart">
@@ -657,14 +647,15 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
   // user can switch back to Auto to clear it.
   const pinnedMissing = currentGpu != null && !gpus.some((g) => g.index === currentGpu);
   return (
-    <div style={CARD_ROW_STYLE}>
+    <div className="service-card-row">
       {/* Wrapping the control in the <label> associates the two, so the select
           has an accessible name (a bare sibling <label> named nothing). */}
-      <label style={{ opacity: 0.8 }} htmlFor={`gpu-${serviceId}`}>
+      <label className="service-gpu-label" htmlFor={`gpu-${serviceId}`}>
         GPU
       </label>
       <select
         id={`gpu-${serviceId}`}
+        className="service-gpu-select"
         value={value}
         disabled={pending}
         onChange={async (e) => {
@@ -685,7 +676,6 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
             setPending(false);
           }
         }}
-        style={{ flex: 1, minWidth: 150 }}
       >
         <option value="">Auto (default placement)</option>
         {gpus.map((g) => (
@@ -697,7 +687,7 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
           <option value={String(currentGpu)}>GPU {currentGpu} (unavailable)</option>
         )}
       </select>
-      <span style={{ opacity: 0.6, fontSize: '0.85em' }}>applies on next start</span>
+      <span className="form-hint">applies on next start</span>
       {error && <span className="service-error">⚠ {error}</span>}
     </div>
   );
@@ -795,7 +785,9 @@ function ServiceCard({
           {/* Start / Stop — only meaningful once installed (you can't start what isn't
               installed). */}
           {service.status === 'running' || service.status === 'starting' ? (
-            <button onClick={onStop} disabled={pending} className="btn btn-warn">Stop</button>
+            <button onClick={onStop} disabled={pending} className="btn btn-warn">
+              <Square size={12} aria-hidden="true" /> Stop
+            </button>
           ) : (service.installed || !service.installable) && service.status !== 'installing' ? (
             // Show Start once installed; ALSO for non-installable custom services
             // (install:none) whose run.command we can't verify on disk — otherwise the card

@@ -207,7 +207,8 @@ describe('[P1-2 & P1-3] webpage preview sandbox primordial capture, host window 
     expect(host).toContain('ALLOWED_CTORS');
     expect(host).toContain('if (!ALLOWED_CTORS.has(ctorName)');
     expect(host).toContain("obj instanceof Document && (method === 'write' || method === 'writeln' || method === 'open')");
-    expect(host).toContain("if (method === 'setHTMLUnsafe') harvest(obj);");
+    expect(host).toContain("if (method === 'setHTMLUnsafe')");
+    expect(host).toContain('sanitizeHtmlFragment(list[0]');
   });
 });
 

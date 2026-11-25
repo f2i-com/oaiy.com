@@ -141,6 +141,26 @@
   --shell-bg: radial-gradient(circle at 72% -5%, rgba(91, 80, 240, 0.13), transparent 32%),
     var(--shell);
 
+  /* Today hero language model card — Prism Lab (dark). */
+  --hero-bg: radial-gradient(circle at 88% 14%, rgba(124, 114, 255, 0.28), transparent 46%),
+    linear-gradient(125deg, #1b1f3b 0%, #2a2856 58%, #3c3a6e 100%);
+  --hero-border: rgba(148, 140, 255, 0.38);
+  --hero-border-hover: rgba(176, 170, 255, 0.72);
+  --hero-dot: rgba(215, 206, 255, 0.34);
+  --hero-icon-bg: rgba(255, 255, 255, 0.08);
+  --hero-icon-border: rgba(255, 255, 255, 0.2);
+  --hero-icon-color: #ebe8ff;
+  --hero-title: #ffffff;
+  --hero-sub: #e6e3ff;
+  --hero-ok-bg: rgba(36, 99, 78, 0.56);
+  --hero-ok-border: rgba(69, 214, 162, 0.45);
+  --hero-ok-text: #bdffdd;
+  --hero-warn-bg: rgba(97, 75, 48, 0.58);
+  --hero-warn-border: rgba(242, 184, 75, 0.48);
+  --hero-warn-text: #ffe9a6;
+  --hero-shadow: 0 12px 30px rgba(7, 10, 18, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  --hero-shadow-hover: 0 16px 36px rgba(17, 14, 48, 0.48), 0 0 0 1px rgba(148, 140, 255, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+
   color-scheme: dark;
   accent-color: var(--primary);
 }
@@ -197,6 +217,26 @@
 
   --shell-bg: radial-gradient(circle at 72% -5%, rgba(36, 87, 230, 0.06), transparent 32%),
     var(--shell);
+
+  /* Today hero language model card — Paper Circuit (warm light blueprint). */
+  --hero-bg: radial-gradient(circle at 90% 10%, rgba(36, 87, 230, 0.09), transparent 44%),
+    linear-gradient(128deg, #fffefa 0%, #f7f8ff 56%, #eef3ff 100%);
+  --hero-border: rgba(36, 87, 230, 0.28);
+  --hero-border-hover: rgba(36, 87, 230, 0.62);
+  --hero-dot: rgba(36, 87, 230, 0.16);
+  --hero-icon-bg: rgba(36, 87, 230, 0.08);
+  --hero-icon-border: rgba(36, 87, 230, 0.22);
+  --hero-icon-color: #2457e6;
+  --hero-title: #171717;
+  --hero-sub: #3b4a6b;
+  --hero-ok-bg: rgba(28, 118, 70, 0.11);
+  --hero-ok-border: rgba(28, 118, 70, 0.34);
+  --hero-ok-text: #155c36;
+  --hero-warn-bg: rgba(245, 181, 44, 0.16);
+  --hero-warn-border: rgba(143, 97, 0, 0.34);
+  --hero-warn-text: #7a5200;
+  --hero-shadow: 3px 3px 0 rgba(36, 87, 230, 0.14);
+  --hero-shadow-hover: 4px 4px 0 rgba(36, 87, 230, 0.22);
 
   color-scheme: light;
 }
@@ -415,11 +455,11 @@ kbd {
 /* Where the line is short of room, only the open tab keeps its word; the others are their icons (each named, and
    with its name as its tooltip). The pages of a section whose menu the narrow sidebar folds away (`.is-folded`: the
    AI Receptionist's six) are many, so theirs do at every width they show at. */
-.topbar .seg-tabs.is-folded > button:not(.active) > span { display: none; }
-.topbar .seg-tabs.is-folded > button:not(.active) { padding: 0 9px; }
+.topbar .seg-tabs.is-folded > button:has(> svg):not(.active) > span { display: none; }
+.topbar .seg-tabs.is-folded > button:has(> svg):not(.active) { padding: 0 9px; }
 @media (max-width: 900px) {
-  .topbar .seg-tabs > button:not(.active) > span { display: none; }
-  .topbar .seg-tabs > button:not(.active) { padding: 0 9px; }
+  .topbar .seg-tabs > button:has(> svg):not(.active) > span { display: none; }
+  .topbar .seg-tabs > button:has(> svg):not(.active) { padding: 0 9px; }
 }
 .seg-tabs {
   display: inline-flex;
@@ -430,7 +470,12 @@ kbd {
   border: 1px solid var(--border);
   border-radius: calc(var(--r-ctl) + 2px);
   background: var(--canvas);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16);
   padding: 3px;
+}
+:root[data-theme='light'] .seg-tabs {
+  background: var(--surface-soft);
+  box-shadow: inset 0 1px 2px rgba(50, 42, 30, 0.06);
 }
 .seg-tabs > button {
   display: inline-flex;
@@ -445,17 +490,23 @@ kbd {
   font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
-  transition: background 0.14s, color 0.14s;
+  transition: background 0.14s, color 0.14s, box-shadow 0.14s;
 }
 .seg-tabs > button > svg { flex: none; color: var(--faint); transition: color 0.14s; }
 .seg-tabs > button:hover { background: var(--surface-soft); color: var(--text); }
 .seg-tabs > button:hover > svg { color: var(--text); }
-/* The open one as the sidebar marks the open page: a tint, its words at full strength, its icon in the accent. */
-.seg-tabs > button.active { background: var(--primary-soft); color: var(--text); }
-.seg-tabs > button.active > svg { color: var(--primary); }
-:root:not([data-theme='light']) .seg-tabs > button.active {
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 26%, transparent);
+/* The open one: elevated pill on the recessed track, matching both themes. */
+.seg-tabs > button.active {
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface-raised));
+  color: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24), inset 0 0 0 1px color-mix(in srgb, var(--primary) 34%, transparent);
 }
+:root[data-theme='light'] .seg-tabs > button.active {
+  background: var(--surface-raised);
+  color: var(--primary-text);
+  box-shadow: 0 1px 2px rgba(50, 42, 30, 0.09), inset 0 0 0 1px color-mix(in srgb, var(--primary) 26%, var(--border));
+}
+.seg-tabs > button.active > svg { color: var(--primary); }
 .seg-tabs > button:focus-visible { outline-offset: -2px; }
 
 .icon-button {
@@ -537,27 +588,29 @@ kbd {
   padding: 16px 18px 18px;
 }
 
-/* A card's heading: the size of the words under it, set apart by weight and its short accent rule (no glow: one
-   glowing mark a card read as busy beside the sidebar's quiet ones). */
+/* A card's heading: unified across every page, anchored by a crisp accent bar
+   (or its leading icon when present). */
 .section-title {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   margin: 0;
   color: var(--text);
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: 0;
+  font-size: 14.5px;
+  font-weight: 660;
+  letter-spacing: -0.015em;
   line-height: 1.35;
 }
 .section-title::before {
   flex: none;
-  width: 12px;
-  height: 2px;
+  width: 3px;
+  height: 14px;
   border-radius: 2px;
   background: var(--primary);
   content: '';
 }
+.section-title:has(> svg)::before { display: none; }
+.section-title > svg { flex: none; color: var(--primary-text); }
 .section-count {
   color: var(--faint);
   font-family: var(--font-mono);
@@ -664,7 +717,7 @@ kbd {
   background: transparent;
   color: var(--muted);
 }
-.btn-ghost:disabled { border-color: var(--border); background: transparent; }
+.btn-ghost:not(.btn-danger):disabled { border-color: var(--border); background: transparent; }
 .btn-ghost:hover:not(:disabled) {
   border-color: var(--strong-border);
   background: var(--surface-soft);
@@ -739,6 +792,25 @@ kbd {
 .btn-tiny.btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
 .btn-tiny.btn-primary:disabled,
 :root[data-theme='light'] .btn-tiny.btn-primary:disabled { border-color: color-mix(in srgb, var(--primary) 30%, var(--border)); background: var(--primary-soft); color: var(--primary-text); filter: none; opacity: 0.7; }
+/* A tiny secondary keeps full text strength and a crisp border without inflating to full button height. */
+.btn-tiny.btn-secondary {
+  border-color: var(--strong-border);
+  background: var(--surface-soft);
+  color: var(--text);
+}
+.btn-tiny.btn-secondary:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--text);
+}
+/* Safeguard if .btn and .btn-tiny are ever paired: compact size wins. */
+.btn.btn-tiny {
+  height: 28px;
+  min-height: 28px;
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  font-size: 12px;
+}
 
 .row-actions,
 .service-actions,
@@ -772,6 +844,12 @@ kbd {
   background: var(--surface-solid);
   box-shadow: var(--shadow);
   padding: 4px;
+  transform-origin: top right;
+}
+.more-menu.is-placed { animation: menu-in 0.14s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: none; }
 }
 .more-menu > button {
   display: flex;
@@ -869,6 +947,8 @@ code {
   white-space: nowrap;
 }
 .badge > svg { flex: none; }
+/* A badge carrying its own icon (e.g. a checkmark) does not draw a duplicate LED dot. */
+.badge:has(> svg)::before { display: none; }
 .badge-ok::before,
 .badge-err::before,
 .badge-pending::before {
@@ -912,6 +992,13 @@ code {
   color: var(--muted);
 }
 
+/* Companion encoders / idle capability tags (e.g. Vision projector). */
+.badge-idle {
+  border-color: color-mix(in srgb, var(--cyan) 34%, var(--border));
+  background: var(--cyan-soft);
+  color: var(--cyan);
+}
+
 /* The 8px lead-in is for badges trailing inline text; inside a flex row the
    container's own gap already spaces them. */
 .service-name .badge,
@@ -931,6 +1018,9 @@ code {
 /* One line (or a few) about the page, above its cards: a hairline in its colour on its own tint, the words in its
    colour. Plain (no kind) it is a quiet note on the page's surface. */
 .banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-soft);
@@ -938,16 +1028,31 @@ code {
   font-size: 12.5px;
   line-height: 1.5;
 }
+.banner-stack,
+.banner:has(> p, > ul, > .progress-bar, > .form-actions, > .settings-value, > .banner-sub, > .banner-row, > .backup-block) {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
 .banner-err {
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
   background: var(--danger-soft);
   color: var(--danger);
+}
+.banner-warn {
+  border-color: color-mix(in srgb, var(--amber) 34%, var(--border));
+  background: var(--amber-soft);
+  color: var(--amber);
 }
 .banner-pending {
   border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
   background: var(--primary-soft);
   color: var(--primary-text);
 }
+.banner-sub { margin-top: 2px; font-size: 12.5px; }
+.banner-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 2px; font-size: 12.5px; }
+.banner-actions-row { margin-top: 4px; }
+.banner-progress { margin: 4px 0; }
 /* (in the dark theme the violet on its own tint is about 4:1: mixed toward the text, the banner and its close mark read) */
 :root:not([data-theme='light']) .banner-pending { color: color-mix(in srgb, var(--primary) 68%, var(--text)); }
 .banner-pending .path-code { color: inherit; }
@@ -1121,10 +1226,26 @@ code {
 /* Cards are not buttons: they stay put under the pointer (their buttons react instead). */
 
 .service-card-stopped { --node: var(--strong-border); }
-.service-card-running { --node: var(--green); }
-.service-card-errored { --node: var(--danger); }
+.service-card-running {
+  --node: var(--green);
+  border-color: color-mix(in srgb, var(--green) 24%, var(--border));
+  border-left-color: var(--green);
+}
+.service-card-errored {
+  --node: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border));
+  border-left-color: var(--danger);
+}
 .service-card-installing,
-.service-card-starting { --node: var(--primary); }
+.service-card-starting {
+  --node: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
+  border-left-color: var(--primary);
+}
+:root[data-theme='light'] .service-card-running { background: color-mix(in srgb, var(--green-soft) 36%, var(--surface-raised)); }
+:root[data-theme='light'] .service-card-errored { background: color-mix(in srgb, var(--danger-soft) 55%, var(--surface-raised)); }
+:root[data-theme='light'] .service-card-installing,
+:root[data-theme='light'] .service-card-starting { background: color-mix(in srgb, var(--primary-soft) 38%, var(--surface-raised)); }
 
 :root:not([data-theme='light']) .service-card-running,
 :root:not([data-theme='light']) .service-card-errored,
@@ -1132,6 +1253,32 @@ code {
 :root:not([data-theme='light']) .service-card-starting {
   box-shadow: var(--shadow-node), -12px 0 26px -20px var(--node);
 }
+
+.service-card-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12.5px;
+}
+.service-gpu-label { color: var(--muted); font-size: 12.5px; font-weight: 560; }
+.service-gpu-select { flex: 1; min-width: 150px; }
+.is-hidden { display: none; }
+.chatgpt-account { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.fingerprint-code { letter-spacing: 0.04em; }
+.dl-form-spaced { margin-top: 12px; }
+.form-hint-tight { margin: 2px 0 0; }
+.backup-note-spaced { margin-top: 8px; }
+.backup-line { margin: 0; }
+.backup-block { margin-top: 8px; }
+.backup-block-lg { margin-top: 10px; }
+.backup-indent { margin: 4px 0 0 24px; }
+.backup-list { margin: 6px 0 0; padding-left: 18px; }
+.backup-scroll-list { margin: 4px 0 0; padding-left: 18px; max-height: 220px; overflow-y: auto; }
+.backup-actions { margin-top: 8px; }
+.backup-progress { margin: 8px 0; }
+.backup-progress-fill { width: 40%; }
 
 .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .service-info { flex: 1; min-width: 0; }
@@ -1277,8 +1424,8 @@ code {
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-soft);
-  padding: 0 7px 0 9px;
-  height: var(--h-control-sm);
+  padding: 0 7px 0 10px;
+  height: var(--h-control);
   color: var(--muted);
   transition: border-color 0.14s, box-shadow 0.14s, background 0.14s, color 0.14s;
 }
@@ -1292,7 +1439,7 @@ code {
   color: var(--text);
 }
 .model-search-wrap input.model-search {
-  width: 165px;
+  width: 175px;
   min-width: 120px;
   height: 100%;
   border: 0;
@@ -1302,7 +1449,7 @@ code {
   color: var(--text);
   padding: 0;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
   outline: none;
 }
 .model-search-wrap input.model-search:hover,
@@ -1398,6 +1545,9 @@ textarea:hover:not(:disabled):not(:focus) { border-color: color-mix(in srgb, var
 input:focus,
 select:focus,
 textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+input[aria-invalid='true'],
+select[aria-invalid='true'],
+textarea[aria-invalid='true'] { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 /* A field draws its own ring (above): the page's focus outline is for everything else, a box to tick among them. */
 input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']):focus-visible,
 select:focus-visible,
@@ -1549,6 +1699,11 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 }
 .setup-step .setup-mark { display: flex; margin-top: 1px; color: var(--muted); }
 .setup-step.is-done .setup-mark { color: var(--green); }
+.setup-step.is-alarm {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+  background: var(--danger-soft);
+}
+.setup-step.is-alarm .setup-mark { color: var(--danger); }
 /* Done rows recede rather than disappear — the list should still read as a
    whole so the user can see how far they have come. They recede by their
    frame and their title's weight, not by fading: faded, their words fell
@@ -1578,8 +1733,13 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   border: 1px solid var(--border);
   border-radius: calc(var(--r-ctl) + 2px);
   background: var(--canvas);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16);
   padding: 3px;
   margin-left: auto;
+}
+:root[data-theme='light'] .seg {
+  background: var(--surface-soft);
+  box-shadow: inset 0 1px 2px rgba(50, 42, 30, 0.06);
 }
 .seg > button {
   height: 26px;
@@ -1591,12 +1751,20 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
-  transition: background 0.14s, color 0.14s;
+  transition: background 0.14s, color 0.14s, box-shadow 0.14s;
 }
 .seg > button:hover { background: var(--surface-soft); color: var(--text); }
 /* (as a section's open tab) */
-.seg > button.active { background: var(--primary-soft); color: var(--text); }
-:root:not([data-theme='light']) .seg > button.active { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 26%, transparent); }
+.seg > button.active {
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface-raised));
+  color: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24), inset 0 0 0 1px color-mix(in srgb, var(--primary) 34%, transparent);
+}
+:root[data-theme='light'] .seg > button.active {
+  background: var(--surface-raised);
+  color: var(--primary-text);
+  box-shadow: 0 1px 2px rgba(50, 42, 30, 0.09), inset 0 0 0 1px color-mix(in srgb, var(--primary) 26%, var(--border));
+}
 .seg > button:focus-visible { outline-offset: -2px; }
 
 .run-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; overflow-anchor: none; }
@@ -1861,13 +2029,18 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   text-transform: uppercase;
 }
 .logs-close {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--faint);
-  padding: 0 4px;
-  font-size: 14px;
+  padding: 0;
+  transition: background 0.12s, color 0.12s;
 }
-.logs-close:hover { color: var(--danger); }
+.logs-close:hover { background: var(--danger-soft); color: var(--danger); }
 
 .logs-body {
   max-height: 240px;
@@ -1909,10 +2082,13 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   top: calc(var(--topbar-h) + 10px);
   right: 20px;
   display: flex;
-  max-width: 380px;
+  max-width: min(380px, calc(100vw - 24px));
   flex-direction: column;
   gap: 10px;
   pointer-events: none;
+}
+@media (max-width: 480px) {
+  .toast-stack { right: 12px; }
 }
 /* While a page in a webview is open (it covers everything under the header), a notice is one line in the header's
    own row, in what is left between the tabs and the buttons: the newest alone, its words cut with an ellipsis where
@@ -1920,8 +2096,9 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 /* (All the room the row has left, so a message is cut only when the window itself is too narrow for it: it was
    held to 460 px, and lost its end with 350 px of the row empty beside it.) */
 .toast-stack.is-in-header { position: static; z-index: auto; min-width: 0; max-width: 100%; flex-direction: row; }
-.toast-stack.is-in-header > .toast { min-width: 0; height: 32px; align-items: center; gap: 6px; box-shadow: none; padding: 0 5px 0 11px; }
+.toast-stack.is-in-header > .toast { min-width: 0; height: 32px; align-items: center; gap: 7px; box-shadow: none; padding: 0 5px 0 10px; }
 .toast-stack.is-in-header > .toast:not(:last-child) { display: none; }
+.toast-stack.is-in-header .toast-icon { margin-top: 0; }
 .toast-stack.is-in-header .toast-content { display: flex; min-width: 0; align-items: baseline; gap: 8px; overflow: hidden; white-space: nowrap; }
 .toast-stack.is-in-header .toast-title { overflow: hidden; flex: 0 1 auto; text-overflow: ellipsis; }
 .toast-stack.is-in-header .toast-body { overflow: hidden; min-width: 0; flex: 1 1 0; margin: 0; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
@@ -1936,9 +2113,15 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   border-radius: var(--r-card);
   background: var(--surface-solid);
   box-shadow: var(--shadow);
-  padding: 11px 12px 12px 14px;
+  padding: 11px 12px 12px 13px;
   pointer-events: auto;
   animation: toast-in 0.24s cubic-bezier(0.2, 0.9, 0.2, 1);
+}
+.toast-icon {
+  display: inline-flex;
+  flex: none;
+  margin-top: 2px;
+  color: var(--node);
 }
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(-12px) scale(0.98); }
@@ -2509,7 +2692,8 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .flow-run-text p { margin: 0; color: var(--text); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
 /* A computer's shared flows: two to a row where there is room. */
 .flow-run-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); align-items: start; gap: 10px; }
-.flow-worker.is-offline .flow-run-card { opacity: 0.72; }
+.flow-worker.is-offline .flow-run-card { border-style: dashed; background: transparent; }
+.flow-worker.is-offline .flow-run-head { color: var(--muted); }
 .card-warn.is-quiet { color: var(--muted); }
 .flow-run-asked { flex: 1 1 120px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .flow-run-json {
@@ -2583,7 +2767,7 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
   background: var(--surface-raised);
   color: #fff;
 }
-.network-role.is-chosen .network-role-check { border-color: var(--primary); background: var(--primary); }
+.network-role.is-chosen .network-role-check { border-color: var(--primary-btn); background: var(--primary-btn); }
 .network-both-ways { display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: 12.5px; cursor: pointer; }
 .network-both-ways input { flex: none; width: auto; height: auto; margin-top: 2px; accent-color: var(--primary); }
 .network-both-ways small { color: var(--faint); }
@@ -2617,13 +2801,42 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 .network-way-auto { display: inline-flex; align-items: center; gap: 4px; color: var(--primary-text); border-color: color-mix(in srgb, var(--primary) 32%, var(--border)); }
 
 /* What getting a model takes: to download, here already (used where it is), its files. */
-.download-plan { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.download-plan {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-solid);
+  padding: 9px 12px;
+}
 .download-plan-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--text); font-size: 12.5px; }
 .download-plan-line > svg { color: var(--primary); }
 .download-plan-have { display: inline-flex; align-items: center; gap: 4px; color: var(--green); font-size: 12px; }
-.download-plan-parts summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
-.download-plan-parts ul { display: flex; flex-direction: column; gap: 3px; margin: 6px 0 0; padding: 0; list-style: none; }
-.download-plan-parts li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; font-size: 11.5px; color: var(--muted); }
+.download-plan-parts summary { cursor: pointer; color: var(--muted); font-size: 11.5px; font-weight: 600; }
+.download-plan-parts summary:hover { color: var(--text); }
+.download-plan-parts ul {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 7px 0 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--canvas);
+  list-style: none;
+}
+.download-plan-parts li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.download-plan-parts li + li { border-top: 1px solid var(--border); }
 .download-plan-parts li code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: transparent; padding: 0; color: var(--text); font-family: var(--font-mono); font-size: 11px; }
 .download-plan-status { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .download-plan-parts li.is-elsewhere .download-plan-status, .download-plan-parts li.is-here .download-plan-status, .download-plan-parts li.is-network .download-plan-status { color: var(--green); }
@@ -2654,8 +2867,16 @@ input.is-mono { font-family: var(--font-mono); font-size: 12px; }
 
 /* A tile that counts something wrong (a service that gave up and needs Repair): the danger colour at its edge, and
    a line under its figure saying what. */
-.overview-tile.is-alarm { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.overview-tile.is-alarm {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border));
+  background: var(--danger-soft);
+}
 .overview-tile.is-alarm > svg { color: var(--danger); }
+.overview-tile.is-alarm:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 15%, var(--surface-solid));
+}
+.overview-tile.is-alarm:hover > svg { color: var(--danger); }
 .overview-tile .tile-alarm { display: block; color: var(--danger); font-style: normal; font-weight: 600; }
 /* OAIY is not answering: the notice at the top says so, once; the figures under it are old or not there, so they
    stand back rather than each say it again. */

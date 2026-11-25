@@ -12,6 +12,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext, NodeDefinition } from './module-types';
+import { escapeValue } from './compiler/utils.js';
 
 /**
  * Creates a template-based compiler for a set of node definitions
@@ -73,7 +74,7 @@ export function createTemplateCompiler(
                 // Wrap in quotes - escapeString returns content without quotes
                 return `"${ctx.escapeString(value)}"`;
               }
-              return JSON.stringify(value) ?? 'null';
+              return escapeValue(value);
             }
             // Check for default value in property definition
             const propDef = definition.properties?.find(p => p.id === key);
@@ -81,7 +82,7 @@ export function createTemplateCompiler(
               if (typeof propDef.default === 'string') {
                 return `"${ctx.escapeString(propDef.default)}"`;
               }
-              return JSON.stringify(propDef.default) ?? 'null';
+              return escapeValue(propDef.default);
             }
             return '""';
           }
@@ -96,7 +97,7 @@ export function createTemplateCompiler(
                 // Wrap in quotes - escapeString returns content without quotes
                 return `"${ctx.escapeString(value)}"`;
               }
-              return JSON.stringify(value) ?? 'null';
+              return escapeValue(value);
             }
             return 'null';
           }

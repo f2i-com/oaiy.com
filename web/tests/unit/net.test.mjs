@@ -65,6 +65,51 @@ describe('the guard on the holder\'s own calls', () => {
     assert.equal(r3.error.kind, 'timeout');
     assert.equal(timeoutChat.calls.length, 2, 'models + chat only, no no-cors probe on timeout');
   });
+
+  it('local-server tester never falls back to /api/tags on RedirectRefused or BudgetExhausted', async () => {
+    const localRec = {
+      id: 'p_local',
+      v: 1,
+      name: 'Local Ollama',
+      dialect: 'openai',
+      baseUrl: 'http://localhost:11434/v1',
+      auth: 'bearer',
+      caps: ['chat'],
+      kind: 'local-server',
+      preset: 'local-server',
+      serverKind: 'ollama',
+      via: 'broker',
+    };
+
+    // Even when /api/tags would succeed, a redirect on /v1/models must stop immediately and return redirect.
+    const redirLocal = stubFetch((c) => {
+      if (c.url.endsWith('/v1/models')) return new Response(null, { status: 302, headers: { location: 'https://evil.example/' } });
+      return jsonResponse({ models: [{ name: 'llama3:8b' }] });
+    });
+    const tRedir = M.tester.createTester({ fetchImpl: redirLocal.impl, page: PAGE, key: async () => '' });
+    const rRedir = await tRedir.models(localRec);
+    assert.equal(rRedir.ok, false);
+    assert.equal(rRedir.error.kind, 'redirect');
+    assert.deepEqual(redirLocal.calls.map((c) => c.url), ['http://localhost:11434/v1/models'], 'must not fall back to /api/tags on redirect');
+
+    // When the budget is already exhausted on /v1/models, take() must not be called again for /api/tags.
+    let takeCalls = 0;
+    const budgetLocal = stubFetch(() => jsonResponse({ models: [{ name: 'llama3:8b' }] }));
+    const tBudget = M.tester.createTester({
+      fetchImpl: budgetLocal.impl,
+      page: PAGE,
+      key: async () => '',
+      take: async () => {
+        takeCalls++;
+        return { ok: false, reason: 'requests', limit: 5, byteLimit: 1024, retryAfterMs: 1000 };
+      },
+    });
+    const rBudget = await tBudget.models(localRec);
+    assert.equal(rBudget.ok, false);
+    assert.equal(rBudget.error.kind, 'budget');
+    assert.equal(takeCalls, 1, 'budget checked once, no /api/tags fallback');
+    assert.equal(budgetLocal.calls.length, 0, 'no network call when budget is exhausted');
+  });
 });
 
 describe('why a call failed', () => {

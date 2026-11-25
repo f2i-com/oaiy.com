@@ -83,14 +83,14 @@ export const SelectField: React.FC<SelectFieldProps> = ({
     <div className={`flex flex-col gap-1 ${className}`}>
       <label htmlFor={id} className="text-xs font-medium text-[rgb(var(--color-text-secondary))]">
         {label}
-        {required && <span className="text-red-500 dark:text-red-400 ml-1">*</span>}
+        {required && <span className="text-[rgb(var(--signal-danger-ink))] ml-1">*</span>}
       </label>
       <select
         id={id}
         value={value !== undefined ? String(value) : ''}
         onChange={handleChange}
         disabled={disabled}
-        className="w-full px-2 py-1.5 text-xs bg-[rgb(var(--color-bg-elevated))] border border-[rgb(var(--color-border-primary))] rounded text-[rgb(var(--color-text-primary))] focus:outline-none focus:border-[rgb(var(--accent-primary))] disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full px-2.5 py-1.5 text-xs bg-[rgb(var(--color-bg-tertiary))] border border-[rgb(var(--color-border-primary))] rounded-[var(--r-ctl)] text-[rgb(var(--color-text-primary))] focus:outline-none focus:border-[rgb(var(--accent-primary))] focus:ring-2 focus:ring-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
         {placeholder && (
           <option value="" className="bg-[rgb(var(--color-bg-elevated))] text-[rgb(var(--color-text-primary))]">
@@ -115,7 +115,7 @@ export const SelectField: React.FC<SelectFieldProps> = ({
         ))}
       </select>
       {description && (
-        <p className="text-[10px] text-[rgb(var(--color-text-muted))]">{description}</p>
+        <p className="text-[10px] text-[rgb(var(--color-text-faint))]">{description}</p>
       )}
     </div>
   );

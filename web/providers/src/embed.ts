@@ -15,6 +15,12 @@ import { describe } from './ui';
 import { keyText } from './words';
 
 export function mountEmbed(root: HTMLElement, ctx: Context): void {
+  try {
+    const saved = localStorage.getItem('oaiy-providers-theme');
+    if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+  } catch {
+    // storage unavailable
+  }
   // The modal is a frame of the holder's own origin, so an app cannot read what it shows: a provider's words may be shown (as text, scrubbed).
   // The modal's buttons call the provider too, and a page cannot press them, but a hostile page can draw over them: they count against an
   // hour of their own (the `modal` app), which the owner sets on the Providers page.
@@ -44,6 +50,7 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
         load.addEventListener('click', () => void (async () => {
           load.disabled = true;
           status.textContent = 'Loading…';
+          status.className = 'result';
           const found = await tester(() => ctx.store.key(record.id)).models(record);
           load.disabled = false;
           if (!found.ok || !found.models) {
@@ -52,11 +59,16 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
             return;
           }
           status.textContent = '';
+          status.className = 'result';
           fill(select, ...found.models.map((m) => h('option', { text: m.label ?? m.id, attrs: { value: m.id, ...(m.id === record.model ? { selected: 'selected' } : {}) } })));
         })());
         const use = h('button', { class: 'button primary', text: 'Use this model' });
         use.addEventListener('click', () => void (async () => {
-          if (!select.value) return void (status.textContent = 'Choose a model first.');
+          if (!select.value) {
+            status.textContent = 'Choose a model first.';
+            status.className = 'result bad';
+            return;
+          }
           await ctx.store.setModel(record.id, select.value);
           status.textContent = `Now using ${select.value}.`;
           status.className = 'result good';
@@ -65,6 +77,7 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
         test.addEventListener('click', () => void (async () => {
           test.disabled = true;
           status.textContent = 'Testing…';
+          status.className = 'result';
           const latest = (await ctx.store.get(record.id)) ?? record;
           const outcome = await tester(() => ctx.store.key(record.id)).test(latest);
           test.disabled = false;

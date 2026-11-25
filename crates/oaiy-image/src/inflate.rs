@@ -350,7 +350,8 @@ pub fn zlib_decompress(src: &[u8], limit: usize) -> Result<Vec<u8>> {
     if flg & 0x20 != 0 {
         return Err(Error::Unsupported("zlib preset dictionary".into()));
     }
-    let mut out = Vec::with_capacity(limit.min(1 << 28));
+    let init_cap = src.len().saturating_mul(4).min(limit).min(1 << 20);
+    let mut out = Vec::with_capacity(init_cap);
     if let End::Stream(used) = inflate(&src[2..], &mut out, limit)? {
         if let Some(t) = src.get(2 + used..2 + used + 4) {
             if adler32(&out) != u32::from_be_bytes([t[0], t[1], t[2], t[3]]) {

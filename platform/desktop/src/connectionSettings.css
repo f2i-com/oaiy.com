@@ -9,15 +9,6 @@
 @container connections (min-width: 48rem) {
   .connection-settings > :is(.connection-account, .companion-relay) { grid-column: span 1; }
 }
-.connection-settings .section-title,
-.provider-settings .section-title {
-  font-size: 16px;
-  letter-spacing: -.025em;
-}
-.connection-settings .section-title::before,
-.provider-settings .section-title::before { content: none; }
-.connection-settings .section-title > svg,
-.provider-settings .section-title > svg { flex: none; color: var(--primary-text); }
 .connection-settings .connection-requests { border-color: color-mix(in srgb, var(--amber) 50%, var(--border)); }
 .connection-settings .connection-requests .section-title > svg { color: var(--amber); }
 .connection-settings .connection-account .pairing-list li,
@@ -75,8 +66,6 @@
 .provider-empty > svg { flex: none; color: var(--primary-text); }
 .provider-empty p { margin: 4px 0 0; color: var(--muted); line-height: 1.5; }
 .provider-editor .form-row-inline small { display: block; color: var(--muted); line-height: 1.5; }
-.settings-endpoint .section-title::before { content: none; }
-.settings-endpoint .section-title > svg { color: var(--primary-text); }
 .settings-endpoint .api-address {
   justify-content: space-between;
   padding: 7px 9px 7px 14px;

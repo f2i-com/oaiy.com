@@ -110,6 +110,18 @@ export default function RingDialog({ on = true, onShowing }: { on?: boolean; onS
     setError(null);
   }, [shownId]);
 
+  // Escape puts the dialog away even while focus stays where the owner was typing (never steals focus, never touches Enter/Space).
+  useEffect(() => {
+    if (!on || !shownId) return;
+    const onEscape = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      e.preventDefault();
+      setPutAway((ids) => [...ids.slice(-20), shownId]);
+    };
+    window.addEventListener('keydown', onEscape);
+    return () => window.removeEventListener('keydown', onEscape);
+  }, [on, shownId]);
+
   const act = async (action: RingAction) => {
     if (!shown) return;
     const id = shown.id;
@@ -190,7 +202,12 @@ export default function RingDialog({ on = true, onShowing }: { on?: boolean; onS
   return (
     <>
     {noticeStack}
-    <div className="ring-overlay">
+    <div
+      className="ring-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) putAwayShown();
+      }}
+    >
       <div ref={dialog} className="ring-dialog" role="alertdialog" aria-modal="true" aria-labelledby="ring-title" aria-describedby="ring-who" onKeyDown={keys}>
         <h2 id="ring-title">
           <Phone size={16} aria-hidden /> A caller wants to speak to you
@@ -213,14 +230,16 @@ export default function RingDialog({ on = true, onShowing }: { on?: boolean; onS
           <div className="ring-bar" aria-hidden>
             <i style={{ width: `${Math.min(100, (left / total) * 100)}%` }} />
           </div>
-          <span aria-label={`${left} seconds left`}>{left}s</span>
+          <span className="ring-countdown" aria-label={`${left} seconds left`}>
+            <span>{left}s</span>
+          </span>
         </div>
         <p className="ring-note">Answer on your Companion. This computer cannot take the call.</p>
         <div className="ring-actions">
-          <button type="button" className="button secondary" disabled={busy?.ring === shown.id || shown.stopping || shown.taken} onClick={() => void act('decline')}>
-            <PhoneOff size={14} /> Decline and take a message
+          <button type="button" className="button danger" disabled={busy?.ring === shown.id || shown.stopping || shown.taken} onClick={() => void act('decline')}>
+            <PhoneOff size={14} aria-hidden /> Decline and take a message
           </button>
-          <button type="button" className="button secondary" onClick={putAwayShown}>
+          <button type="button" className="button btn-ghost" onClick={putAwayShown}>
             Not now
           </button>
         </div>

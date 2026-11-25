@@ -1,5 +1,5 @@
 import { useCallback, useRef, useMemo, useState, useEffect, useLayoutEffect } from 'react';
-import { ChevronsDownUp, ChevronsUpDown, LayoutGrid, Layers, Loader2, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
+import { ChevronsDownUp, ChevronsUpDown, Copy, Group, LayoutGrid, Layers, Loader2, Map as MapIcon, Package as PackageIcon, Play, Plus, Redo2, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, Trash2, Undo2, X } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -35,8 +35,10 @@ import { useEdgeScrolling } from '../hooks/useEdgeScrolling';
 import { useNodeGrouping } from '../hooks/useNodeGrouping';
 import { QuickConnectPopup } from './OAIYBuilder/QuickConnectPopup';
 import type { PackageNodeInfo } from '../hooks/usePackageNodes';
-import type { NodeType, WorkflowGraph, Flow, LLMEndpoint, ProjectConstant, ProjectSettings, ComfyUIAnalysis, OAIYPackageManifest } from 'oaiy-core';
+import type { NodeType, WorkflowGraph, GraphNode, GraphEdge, Flow, LLMEndpoint, ProjectConstant, ProjectSettings, ComfyUIAnalysis, OAIYPackageManifest } from 'oaiy-core';
+import { analyzeSelection, convertSelectionToMacro, type SelectionAnalysis } from 'oaiy-core/src/macro/selection-analyzer';
 import RunWorkflowModal, { hasInputNodes } from './ui/RunWorkflowModal';
+import ConvertToMacroDialog, { type MacroConversionOptions } from './dialogs/ConvertToMacroDialog';
 import ComfyUIWorkflowDialog, { type ComfyUIWorkflowConfig } from 'oaiy-core/modules/core-image/ui/ComfyUIWorkflowDialog';
 import { ServiceStartupDialog } from './PackageManager/ServiceStartupDialog';
 import { CanvasContextMenu } from './OAIYBuilder/CanvasContextMenu';
@@ -49,8 +51,9 @@ import UnknownNode from './OAIYBuilder/UnknownNode';
 // Render-invariant literals hoisted to module scope so they keep a stable
 // identity across renders (none close over render state). Recreating these
 // inline forced ReactFlow + Background + MiniMap to treat every render as a
-// prop change.
-const CANVAS_STYLE = { backgroundColor: 'rgb(var(--bg-primary))' } as const;
+// prop change. Keep transparent so .oaiy-canvas-wrap::before's ambient prism
+// wash shows cleanly behind the dot grid.
+const CANVAS_STYLE = { backgroundColor: 'transparent' } as const;
 const DEFAULT_EDGE_OPTIONS = {
   type: 'selectable',
   deletable: true,
@@ -61,9 +64,9 @@ const CONNECTION_LINE_STYLE = { stroke: 'rgb(var(--accent-primary))', strokeWidt
 const PRO_OPTIONS = { hideAttribution: true } as const;
 // A small map, so it leaves the toolbar its room at the canvas's foot.
 const MINIMAP_STYLE = { width: 168, height: 112 } as const;
-// The canvas's dots in the dashboard's --dot (the background tint's tertiary was all but the paper's own colour: no
-// grid on the light canvas at all).
-const BACKGROUND_STYLE = { backgroundColor: 'rgb(var(--bg-primary))', color: 'rgb(var(--dot))' } as const;
+// The canvas's dots in the dashboard's --dot over a transparent layer so the
+// parent .oaiy-canvas-wrap background and ::before radial wash remain visible.
+const BACKGROUND_STYLE = { backgroundColor: 'transparent', color: 'rgb(var(--dot))' } as const;
 
 // Shared (non-per-node) dependencies that get spread into every node's data
 // object. Used as the per-id data cache's invalidation key — if any of these
@@ -78,21 +81,98 @@ interface NodeDataSharedKey {
   handleOpenComfyWorkflowDialog: (nodeId: string, analysis: ComfyUIAnalysis, fileName: string) => void;
 }
 
+// Color swatch palette matching nodeSwatches.ts for consistent MiniMap rendering
+const SWATCH_HEX: Record<string, string> = {
+  amber: '#f59e0b',
+  blue: '#3b82f6',
+  cyan: '#06b6d4',
+  emerald: '#10b981',
+  gray: '#64748b',
+  green: '#22c55e',
+  indigo: '#6366f1',
+  orange: '#f97316',
+  pink: '#ec4899',
+  purple: '#a855f7',
+  red: '#ef4444',
+  slate: '#64748b',
+  teal: '#14b8a6',
+  violet: '#8b5cf6',
+};
+
+const humanizeNodeType = (type: string | undefined): string => {
+  if (!type) return 'Node';
+  const cleaned = type.startsWith('pkg:') ? type.split(':').slice(2).join(':') || type : type;
+  return cleaned
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+};
+
 const miniMapNodeColor = (node: Node): string => {
+  const data = node.data as { __definition?: { color?: string }; color?: string } | undefined;
+  const rawColor = data?.__definition?.color || (node.type === 'group' ? data?.color : undefined);
+  if (typeof rawColor === 'string' && rawColor) {
+    const base = rawColor.toLowerCase().split('-')[0];
+    if (SWATCH_HEX[base]) return SWATCH_HEX[base];
+  }
+  if (node.type?.startsWith('pkg:')) return '#d946ef';
   switch (node.type) {
-    case 'input_text': return '#22c55e';
-    case 'input_file': return '#84cc16';
-    case 'ai_llm': return '#a855f7';
-    case 'logic_block': return '#3b82f6';
-    case 'browser_request': return '#06b6d4';
-    case 'memory': return '#06b6d4';
-    case 'template': return '#f59e0b';
-    case 'image_gen': return '#ec4899';
-    case 'image_view': return '#6366f1';
-    case 'image_save': return '#14b8a6';
-    case 'image_combiner': return '#ec4899';
-    case 'output': return '#10b981';
-    default: return '#64748b';
+    case 'input_text': return SWATCH_HEX.green;
+    case 'input_file':
+    case 'input_folder': return '#84cc16';
+    case 'input_video': return SWATCH_HEX.blue;
+    case 'input_audio': return SWATCH_HEX.violet;
+    case 'ai_llm':
+    case 'agent_task':
+    case 'service_call': return SWATCH_HEX.purple;
+    case 'logic_block':
+    case 'condition':
+    case 'loop_start':
+    case 'loop_end':
+    case 'subflow': return SWATCH_HEX.indigo;
+    case 'browser_request':
+    case 'browser_session':
+    case 'browser_extract':
+    case 'browser_control':
+    case 'memory':
+    case 'database': return SWATCH_HEX.cyan;
+    case 'template':
+    case 'text_chunker':
+    case 'text_split':
+    case 'regex_extract':
+    case 'json_parse': return SWATCH_HEX.amber;
+    case 'image_gen':
+    case 'image_combiner':
+    case 'image_resize':
+    case 'image_upscale':
+    case 'background_removal': return SWATCH_HEX.pink;
+    case 'image_view': return SWATCH_HEX.indigo;
+    case 'image_save':
+    case 'file_read':
+    case 'file_write':
+    case 'file_list':
+    case 'terminal_session':
+    case 'terminal_run': return SWATCH_HEX.teal;
+    case 'video_gen':
+    case 'video_append':
+    case 'video_pip':
+    case 'video_frame_extractor':
+    case 'video_avatar':
+    case 'video_save': return SWATCH_HEX.blue;
+    case 'text_to_speech':
+    case 'speech_to_text':
+    case 'music_gen':
+    case 'sound_effect':
+    case 'audio_mixer':
+    case 'audio_append':
+    case 'audio_save': return SWATCH_HEX.violet;
+    case 'model_3d': return SWATCH_HEX.orange;
+    case 'macro':
+    case 'macro_input':
+    case 'macro_output': return '#d946ef';
+    case 'output': return SWATCH_HEX.emerald;
+    default: return SWATCH_HEX.slate;
   }
 };
 
@@ -155,6 +235,8 @@ interface OAIYBuilderProps {
   onRevertMacro?: () => void;
   /** Run macro callback - opens the macro runner modal */
   onRunMacro?: () => void;
+  /** Create a new reusable macro flow from selected nodes */
+  onCreateMacro?: (flow: Flow) => void;
   /**
    * False while another section of the editor (Data, Queue, Settings…) is
    * showing over the canvas: it stays mounted, but keys meant for that page
@@ -208,6 +290,7 @@ export default function OAIYBuilder({
   onSaveMacro,
   onRevertMacro,
   onRunMacro,
+  onCreateMacro,
   active = true,
   onShowToast,
   packageMode,
@@ -497,11 +580,11 @@ export default function OAIYBuilder({
     setBuilderWidth(w);
     if (w > 0) {
       const wide = w >= COMPACT_WIDTH;
-      // An empty flow's first step is a node, so it opens with the palette; one with nodes (an example added, a flow
-      // opened) opens with the canvas to see it by (beside the flows rail and the inspector, the palette left it about
-      // 530 pixels in OAIY's window, an example a thumbnail). The palette is a click away on the toolbar.
+      const isNarrow = w < NARROW_WIDTH;
+      // An empty flow's first step is a node, so it opens with the palette on wide/medium
+      // viewports; on narrow/mobile viewports keep the canvas unobstructed until Nodes is tapped.
       const empty = nodes.length === 0;
-      setPaletteOpen(empty);
+      setPaletteOpen(empty && !isNarrow);
       setPropsOpen(wide && loadBoolPref('oaiy.ui.propertiesVisible', true));
       setLogOpen(wide && loadBoolPref('oaiy.ui.logPanelVisible', true));
     }
@@ -1188,6 +1271,102 @@ export default function OAIYBuilder({
     setComfyWorkflowDialogState(null);
   }, []);
 
+  // Multi-select batch actions: duplicate & convert selection to a macro
+  const [macroAnalysis, setMacroAnalysis] = useState<SelectionAnalysis | null>(null);
+
+  const handleDuplicateSelected = useCallback(() => {
+    if (copySelected()) {
+      pasteClipboard();
+    } else {
+      onShowToast?.('Could not duplicate selection', 'error');
+    }
+  }, [copySelected, pasteClipboard, onShowToast]);
+
+  const handleOpenMakeMacro = useCallback(() => {
+    if (selectedNodes.length < 2) return;
+    const graphNodes: GraphNode[] = nodes.map((n) => ({
+      id: n.id,
+      type: (n.type || 'default') as NodeType,
+      position: n.position,
+      data: n.data as Record<string, unknown>,
+    }));
+    const graphEdges: GraphEdge[] = edges.map((e) => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle ?? undefined,
+      targetHandle: e.targetHandle ?? undefined,
+    }));
+    const analysis = analyzeSelection(
+      graphNodes,
+      graphEdges,
+      selectedNodes.map((n) => n.id),
+    );
+    setMacroAnalysis(analysis);
+  }, [nodes, edges, selectedNodes]);
+
+  const handleConfirmMakeMacro = useCallback((options: MacroConversionOptions) => {
+    if (!macroAnalysis || !onCreateMacro) {
+      setMacroAnalysis(null);
+      return;
+    }
+    const macroId = `user-macro-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const result = convertSelectionToMacro(
+      macroAnalysis,
+      macroId,
+      options.name,
+      options.inputNames,
+      options.outputNames,
+    );
+    const now = new Date().toISOString();
+    const macroInputs = result.macroInputNodes.map((n) => ({
+      id: n.id,
+      name: String(n.data.name || 'input'),
+      type: String(n.data.inputType || 'any'),
+      required: Boolean(n.data.required),
+      defaultValue: n.data.defaultValue ? String(n.data.defaultValue) : undefined,
+    }));
+    const macroOutputs = result.macroOutputNodes.map((n) => ({
+      id: n.id,
+      name: String(n.data.name || 'output'),
+      type: String(n.data.outputType || 'any'),
+    }));
+    onCreateMacro({
+      id: macroId,
+      name: options.name,
+      description: options.description || undefined,
+      isMacro: true,
+      tags: ['user-created'],
+      createdAt: now,
+      updatedAt: now,
+      graph: {
+        nodes: [...result.macroInputNodes, ...result.macroNodes, ...result.macroOutputNodes],
+        edges: result.macroEdges,
+      },
+      macroMetadata: { inputs: macroInputs, outputs: macroOutputs },
+    });
+    const removeNodeIds = new Set(result.nodesToRemove);
+    const removeEdgeIds = new Set(result.edgesToRemove);
+    const replacementNode: Node = {
+      id: result.macroNode.id,
+      type: result.macroNode.type,
+      position: result.macroNode.position ?? { x: 0, y: 0 },
+      data: result.macroNode.data,
+      selected: true,
+    };
+    const addedEdges: Edge[] = result.parentEdges.map((e, idx) => ({
+      id: e.id || `edge-${e.source}-${e.target}-${idx}`,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle ?? null,
+      targetHandle: e.targetHandle ?? null,
+    }));
+    setNodes((nds) => [...nds.filter((n) => !removeNodeIds.has(n.id)).map((n) => ({ ...n, selected: false })), replacementNode]);
+    setEdges((eds) => [...eds.filter((e) => !removeEdgeIds.has(e.id)), ...addedEdges]);
+    setMacroAnalysis(null);
+    onShowToast?.(`Created macro "${options.name}"`, 'success');
+  }, [macroAnalysis, onCreateMacro, setNodes, setEdges, onShowToast]);
+
   // Watch the canvas's width (the side panels and the window both change it).
   useEffect(() => {
     const el = reactFlowWrapper.current;
@@ -1243,7 +1422,6 @@ export default function OAIYBuilder({
     <div
       ref={builderRef}
       className={`oaiy-builder${narrow ? ' narrow' : ''}${paletteOver ? ' palette-over' : ''}${paletteOpen ? ' left-open' : ''}${propsOpen || logOpen ? ' right-open' : ''}`}
-      style={{ backgroundColor: 'rgb(var(--bg-primary))' }}
       onKeyDown={onKeyDown}
       tabIndex={0}
     >
@@ -1493,6 +1671,27 @@ export default function OAIYBuilder({
             <span>{allCollapsed ? 'Expand' : 'Compact'}</span>
           </button>
           <span className="sep" aria-hidden="true" />
+          <button
+            type="button"
+            onClick={undo}
+            disabled={!canUndo}
+            className="oaiy-tool"
+            aria-label="Undo"
+            title={`Undo (${shortcut('Z')})`}
+          >
+            <Undo2 size={15} />
+          </button>
+          <button
+            type="button"
+            onClick={redo}
+            disabled={!canRedo}
+            className="oaiy-tool"
+            aria-label="Redo"
+            title={`Redo (${shortcut('Z', { shift: true })})`}
+          >
+            <Redo2 size={15} />
+          </button>
+          <span className="sep" aria-hidden="true" />
 
           {isMacro && (
             <span className="oaiy-pill accent" title="This flow is a macro: other flows use it as a node">
@@ -1603,13 +1802,53 @@ export default function OAIYBuilder({
                 </div>
                 <div className="oaiy-side-body">
                   {selectedNodes.length > 1 ? (
-                    <div className="flex flex-col gap-2 p-3">
-                      <p className="oaiy-help faint px-1">{shortcut('C')} copies them, Delete removes them ({shortcut('Z')} brings them back). Pick one to set it up.</p>
+                    <div className="flex flex-col gap-3 p-3">
+                      <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Selection actions">
+                        <button
+                          type="button"
+                          onClick={handleGroupSelected}
+                          className="btn btn-sm justify-center"
+                          title={`Group selected nodes (${shortcut('G')})`}
+                        >
+                          <Group size={13} /> Group
+                        </button>
+                        {onCreateMacro && !isMacro && (
+                          <button
+                            type="button"
+                            onClick={handleOpenMakeMacro}
+                            className="btn btn-sm justify-center"
+                            title="Extract selected nodes into a reusable macro"
+                          >
+                            <Layers size={13} /> Make Macro
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleDuplicateSelected}
+                          className="btn btn-sm justify-center"
+                          title="Duplicate selected nodes"
+                        >
+                          <Copy size={13} /> Duplicate
+                        </button>
+                        <button
+                          type="button"
+                          onClick={deleteSelected}
+                          className="btn btn-danger btn-sm justify-center"
+                          title="Delete selected nodes (Delete)"
+                        >
+                          <Trash2 size={13} /> Delete
+                        </button>
+                      </div>
+                      <p className="oaiy-help faint px-1">Pick one node below to edit its properties.</p>
                       <ul className="m-0 flex list-none flex-col gap-1 p-0">
                         {selectedNodes.map((node) => {
                           const def = node.data.__definition as { name?: string; color?: string; icon?: string } | undefined;
-                          const nodeName = def?.name || node.type || 'Unknown';
-                          const nodeColor = def?.color || 'slate';
+                          const customLabel = typeof node.data.label === 'string' && node.data.label.trim() ? node.data.label.trim() : '';
+                          const kindLabel = def?.name || humanizeNodeType(node.type);
+                          const displayName = customLabel || kindLabel;
+                          const subtitle = customLabel && customLabel !== kindLabel ? kindLabel : humanizeNodeType(node.type);
+                          const rawColor = (def?.color || 'slate').toLowerCase().split('-')[0];
+                          const nodeColor = SWATCH_CLASS[rawColor] ? rawColor : 'slate';
                           return (
                             <li key={node.id}>
                               <button
@@ -1619,11 +1858,12 @@ export default function OAIYBuilder({
                                   // Deselect all others and select just this one
                                   setNodes(nds => nds.map(n => ({ ...n, selected: n.id === node.id })));
                                 }}
+                                title={`${displayName} (${node.id})`}
                               >
                                 <span className={`h-6 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[nodeColor] ?? SWATCH_CLASS.slate}`} />
                                 <span className="oaiy-node-text">
-                                  <strong>{nodeName}</strong>
-                                  <small className="font-mono">{node.id}</small>
+                                  <strong>{displayName}</strong>
+                                  <small>{subtitle}</small>
                                 </span>
                               </button>
                             </li>
@@ -1648,6 +1888,14 @@ export default function OAIYBuilder({
           </div>
         </aside>
       )}
+
+      {/* Convert selection to reusable macro dialog */}
+      <ConvertToMacroDialog
+        isOpen={Boolean(macroAnalysis)}
+        analysis={macroAnalysis}
+        onConvert={handleConfirmMakeMacro}
+        onCancel={() => setMacroAnalysis(null)}
+      />
 
       {/* ComfyUI Workflow Configuration Dialog (rendered here to escape React Flow transform context) */}
       {comfyWorkflowDialogState && (

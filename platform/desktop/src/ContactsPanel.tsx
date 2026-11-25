@@ -48,6 +48,8 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
   useUnsaved('contacts', dirty, 'the contact you are editing');
   const [nudge, setNudge] = useState(0);
   const [exporting, setExporting] = useState(false);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const restoreFocusRef = useRef(false);
 
   // (each local write counted: a reading asked before one lands says what was there before, and would overwrite it)
   const writes = useRef(0);
@@ -70,11 +72,16 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
 
   /** Show `next` beside the list, unless the open contact has changes: then its save bar says so. */
   const go = useCallback(
-    (next: Side | null) => {
+    (next: Side | null, trigger?: HTMLElement | null) => {
       const same = next?.kind === 'contact' && side?.kind === 'contact' && next.key === side.key;
       if (dirty && !same) {
         setNudge((n) => n + 1);
         return;
+      }
+      if (!side && next) {
+        openerRef.current = trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+      } else if (!next) {
+        openerRef.current = null;
       }
       setSide(next);
     },
@@ -90,15 +97,30 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, list === null]);
 
-  // Escape closes the panel (not over unsaved changes).
+  // Escape closes the panel when clean (returning focus to what opened it), or nudges the savebar when dirty.
   useEffect(() => {
     if (!side) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !dirty) setSide(null);
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      e.preventDefault();
+      if (dirty) {
+        setNudge((n) => n + 1);
+        return;
+      }
+      restoreFocusRef.current = true;
+      setSide(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [side, dirty]);
+
+  useEffect(() => {
+    if (side || !restoreFocusRef.current) return;
+    restoreFocusRef.current = false;
+    const back = openerRef.current;
+    openerRef.current = null;
+    if (back?.isConnected) back.focus();
+  }, [side]);
 
   // A panel opened has its heading brought into view (a narrow window shows the panel alone), and focused.
   const sideKey = side ? (side.kind === 'contact' ? `contact:${side.key}` : side.kind) : null;
@@ -162,19 +184,36 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
         <div className="contacts-toolbar">
           <label className="contacts-search">
             <Search size={15} aria-hidden />
-            <input type="search" value={q} placeholder="Search by name, number or notes" aria-label="Search contacts" onChange={(e) => setQ(e.target.value)} />
+            <input
+              type="search"
+              value={q}
+              placeholder="Search by name, number or notes"
+              aria-label="Search contacts"
+              onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape' && q) {
+                  e.preventDefault();
+                  setQ('');
+                }
+              }}
+            />
+            {q && (
+              <button type="button" className="run-search-clear" aria-label="Clear search" title="Clear search" onClick={() => setQ('')}>
+                <X size={12} aria-hidden="true" />
+              </button>
+            )}
           </label>
           <span className="contacts-count" aria-live="polite">
             {count}
           </span>
           <div className="contacts-actions">
-            <button type="button" className="btn btn-ghost" onClick={() => go({ kind: 'import' })}>
+            <button type="button" className="btn btn-ghost" onClick={(e) => go({ kind: 'import' }, e.currentTarget)}>
               <Upload size={14} /> Import CSV
             </button>
             <button type="button" className="btn btn-ghost" disabled={!list?.length || exporting} onClick={() => void exportCsv()}>
               <Download size={14} /> {exporting ? 'Exporting…' : 'Export CSV'}
             </button>
-            <button type="button" className="btn btn-primary" onClick={() => go({ kind: 'new' })}>
+            <button type="button" className="btn btn-primary" onClick={(e) => go({ kind: 'new' }, e.currentTarget)}>
               <UserPlus size={14} /> Add contact
             </button>
           </div>
@@ -192,10 +231,10 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
                 <p>Contacts appear as people ring and text, or add one.</p>
                 <p>You can name them, and leave notes the receptionist reads on every call.</p>
                 <div className="contacts-empty-actions">
-                  <button type="button" className="btn btn-primary" onClick={() => go({ kind: 'new' })}>
+                  <button type="button" className="btn btn-primary" onClick={(e) => go({ kind: 'new' }, e.currentTarget)}>
                     <UserPlus size={14} /> Add contact
                   </button>
-                  <button type="button" className="btn btn-ghost" onClick={() => go({ kind: 'import' })}>
+                  <button type="button" className="btn btn-ghost" onClick={(e) => go({ kind: 'import' }, e.currentTarget)}>
                     <Upload size={14} /> Import CSV
                   </button>
                 </div>
@@ -210,7 +249,7 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
                   const on = side?.kind === 'contact' && side.key === c.key;
                   return (
                     <li key={c.key}>
-                      <button type="button" className={`contact-row${on ? ' is-selected' : ''}`} aria-current={on ? 'true' : undefined} onClick={() => go({ kind: 'contact', key: c.key })}>
+                      <button type="button" className={`contact-row${on ? ' is-selected' : ''}`} aria-current={on ? 'true' : undefined} onClick={(e) => go({ kind: 'contact', key: c.key }, e.currentTarget)}>
                         <span className={`contact-avatar${c.name ? '' : ' is-unnamed'}`} aria-hidden>
                           {initials(c.name) || <Phone size={14} />}
                         </span>

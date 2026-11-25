@@ -974,12 +974,29 @@ fn load_st_experts(
     let dn_name = format!("{prefix}layers.{layer_idx}.mlp.experts.down_proj");
     let gate_up = read_st_f32(index, &gu_name)?;
     let down = read_st_f32(index, &dn_name)?;
+    let (e_cnt, ff, h) = (cfg.n_experts, cfg.ff_dim, cfg.hidden);
+    let expected_gu = e_cnt
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(ff))
+        .and_then(|v| v.checked_mul(h))
+        .ok_or_else(|| cfg_err(format!("layer {layer_idx} dense expert gate_up_proj size overflow")))?;
+    let expected_dn = e_cnt
+        .checked_mul(h)
+        .and_then(|v| v.checked_mul(ff))
+        .ok_or_else(|| cfg_err(format!("layer {layer_idx} dense expert down_proj size overflow")))?;
+    if gate_up.len() != expected_gu || down.len() != expected_dn {
+        return Err(cfg_err(format!(
+            "layer {layer_idx} dense expert shape mismatch: gate_up_proj={} (expected {expected_gu}), down_proj={} (expected {expected_dn})",
+            gate_up.len(),
+            down.len()
+        )));
+    }
     Ok(Inkling2Experts::DenseF32 {
         gate_up,
         down,
-        n_experts: cfg.n_experts,
-        hidden: cfg.hidden,
-        ff: cfg.ff_dim,
+        n_experts: e_cnt,
+        hidden: h,
+        ff,
     })
 }
 

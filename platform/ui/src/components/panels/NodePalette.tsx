@@ -47,8 +47,10 @@ let globalDragState: { isDragging: boolean; nodeType: NodeType | null; macroData
   macroData: null,
 };
 
-// Persist expanded categories across flow navigation (module-level state)
-let persistedExpandedCategories: Set<string> = new Set();
+// Persist expanded categories across flow navigation (module-level state).
+// Open Input, Services ('AI'), and Output by default so a new user immediately
+// sees the core building blocks without extra clicks.
+let persistedExpandedCategories: Set<string> = new Set(['Input', 'AI', 'Output']);
 let persistedSearchQuery: string = '';
 
 export function getGlobalDragState() {
@@ -476,7 +478,14 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = fal
             className="oaiy-input"
           />
           {searchQuery && (
-            <button type="button" onClick={() => setSearchQuery('')} aria-label="Clear search">
+            <button
+              type="button"
+              onClick={() => {
+                setSearchQuery('');
+                searchInputRef.current?.focus();
+              }}
+              aria-label="Clear search"
+            >
               <X size={13} />
             </button>
           )}

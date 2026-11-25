@@ -79,6 +79,7 @@ export function createTester(deps: TesterDeps): Tester {
       return { ok: true, models: list.map((m) => (m.label ? { id: m.id, label: m.label } : { id: m.id })) };
     } catch (e) {
       if (exhausted) return budgetResult(exhausted);
+      if (e instanceof BudgetExhausted) return budgetResult(e);
       if (redirected) return redirectResult(redirected);
       if (e instanceof RedirectRefused) return redirectResult(e);
       if (isTimeoutError(e)) {

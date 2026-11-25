@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { CalendarDays, CalendarPlus, Check, ChevronLeft, ChevronRight, Columns3, List, Pencil, RefreshCw, X } from 'lucide-react';
 import { calendar, type Appointment, type AppointmentStatus, type CalendarSettings, type CalendarSync } from './api';
 import { AppointmentDetails, BookingForm, StatusPill, sayLongDay, type BookingValues } from './CalendarBooking';
@@ -104,6 +104,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
   const [sync, setSync] = useState<CalendarSync | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [side, setSide] = useState<Side | null>(null);
+  const [bookingDirty, setBookingDirty] = useState(false);
   const [filter, setFilter] = useState<'all' | AppointmentStatus>('all');
   const requests = useWaitingRequests(true);
   const opener = useRef<HTMLElement | null>(null);
@@ -157,6 +158,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
     setSide(next);
   };
   const closeSide = useCallback(() => {
+    setBookingDirty(false);
     setSide(null);
     const back = opener.current;
     opener.current = null;
@@ -184,15 +186,21 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
     return () => cancelAnimationFrame(id);
   }, [sideKey]);
 
-  // Escape closes the side panel.
+  // Escape closes the side panel, unless editing a dirty booking form or typing inside a form field.
   useEffect(() => {
     if (!side) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeSide();
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) {
+        return;
+      }
+      if (bookingDirty) return;
+      closeSide();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [side, closeSide]);
+  }, [side, bookingDirty, closeSide]);
 
   // The appointment shown stays current as the calendar is asked again.
   const everyone = useMemo(() => {
@@ -333,17 +341,43 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
           )}
           <h2 className="cal-title">{title}</h2>
         </div>
-        <div className="seg-tabs cal-modes" role="tablist" aria-label="Show the calendar as">
-          {(narrow ? (['day', 'list'] as Mode[]) : (['week', 'day', 'list'] as Mode[])).map((m) => {
-            const Icon = m === 'week' ? Columns3 : m === 'day' ? CalendarDays : List;
-            return (
-              <button type="button" role="tab" key={m} aria-selected={mode === m} className={mode === m ? 'active' : undefined} onClick={() => pickMode(m)}>
-                <Icon size={14} />
-                <span>{m === 'week' ? 'Week' : m === 'day' ? 'Day' : 'List'}</span>
-              </button>
-            );
-          })}
-        </div>
+        {(() => {
+          const modes: Mode[] = narrow ? ['day', 'list'] : ['week', 'day', 'list'];
+          const onModeKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+            const i = modes.indexOf(mode);
+            if (i < 0) return;
+            let nextIdx = -1;
+            if (e.key === 'ArrowRight') nextIdx = (i + 1) % modes.length;
+            else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + modes.length) % modes.length;
+            else if (e.key === 'Home') nextIdx = 0;
+            else if (e.key === 'End') nextIdx = modes.length - 1;
+            if (nextIdx < 0) return;
+            e.preventDefault();
+            pickMode(modes[nextIdx]);
+            e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+          };
+          return (
+            <div className="seg-tabs cal-modes" role="tablist" aria-label="Show the calendar as" onKeyDown={onModeKey}>
+              {modes.map((m) => {
+                const Icon = m === 'week' ? Columns3 : m === 'day' ? CalendarDays : List;
+                return (
+                  <button
+                    type="button"
+                    role="tab"
+                    key={m}
+                    aria-selected={mode === m}
+                    tabIndex={mode === m ? 0 : -1}
+                    className={mode === m ? 'active' : undefined}
+                    onClick={() => pickMode(m)}
+                  >
+                    <Icon size={14} />
+                    <span>{m === 'week' ? 'Week' : m === 'day' ? 'Day' : 'List'}</span>
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })()}
         <div className="cal-toolbar-end">
           <SyncChip sync={sync} syncing={syncing} onSync={() => void syncNow()} />
           <button type="button" className="btn btn-primary" disabled={!settings} onClick={() => newAt(mode === 'list' ? today : ymd(mode === 'day' ? anchor : week < parseYmd(today) ? now : week), null)}>
@@ -450,6 +484,7 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
                   initial={{ date: side.date, time: side.time ?? undefined }}
                   wanted={side.time}
                   submitLabel="Book it"
+                  onDirty={setBookingDirty}
                   onSubmit={(v) => book(v)}
                   onCancel={closeSide}
                 />
@@ -460,8 +495,12 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
                   appointment={shown}
                   initial={{ service: shown.service, date: dateOf(shown.start), time: timeOf(shown.start), name: shown.name, phone: shown.phone, notes: shown.notes }}
                   submitLabel="Save the change"
+                  onDirty={setBookingDirty}
                   onSubmit={(v, confirm) => saveChange(shown, v, confirm)}
-                  onCancel={() => setSide({ kind: 'details', a: shown })}
+                  onCancel={() => {
+                    setBookingDirty(false);
+                    setSide({ kind: 'details', a: shown });
+                  }}
                 />
               ) : shown ? (
                 <AppointmentDetails
@@ -785,10 +824,23 @@ function DayStrip({
   appointments: Appointment[];
   onPick: (date: string) => void;
 }) {
+  const weekDates = Array.from({ length: 7 }, (_, i) => ymd(addDays(week, i)));
+  const onDayKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const i = weekDates.indexOf(anchor);
+    if (i < 0) return;
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (i + 1) % weekDates.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + weekDates.length) % weekDates.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = weekDates.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    onPick(weekDates[nextIdx]);
+    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+  };
   return (
-    <div className="cal-daystrip" role="tablist" aria-label="Day of the week">
-      {Array.from({ length: 7 }, (_, i) => {
-        const date = ymd(addDays(week, i));
+    <div className="cal-daystrip" role="tablist" aria-label="Day of the week" onKeyDown={onDayKey}>
+      {weekDates.map((date, i) => {
         const d = parseYmd(date);
         const n = appointments.filter((a) => dateOf(a.start) === date && a.status !== 'cancelled' && a.status !== 'declined').length;
         const closed = (settings.hours[weekdayOf(d)] ?? []).length === 0;
@@ -798,6 +850,7 @@ function DayStrip({
             role="tab"
             key={date}
             aria-selected={date === anchor}
+            tabIndex={date === anchor ? 0 : -1}
             className={`cal-daychip${date === anchor ? ' is-on' : ''}${date === today ? ' is-today' : ''}${closed ? ' is-off' : ''}`}
             onClick={() => onPick(date)}
           >
@@ -842,13 +895,34 @@ function AgendaList({
     { id: 'confirmed', label: 'Confirmed' },
     { id: 'cancelled', label: 'Cancelled' },
   ];
+  const onFilterKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const i = filters.findIndex((f) => f.id === filter);
+    if (i < 0) return;
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (i + 1) % filters.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + filters.length) % filters.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = filters.length - 1;
+    if (nextIdx < 0) return;
+    e.preventDefault();
+    onFilter(filters[nextIdx].id);
+    e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+  };
   return (
     <div className="cal-agenda">
       <div className="cal-agenda-head">
         <p className="form-hint">The next {LIST_DAYS} days.</p>
-        <div className="seg-tabs" role="tablist" aria-label="Show">
+        <div className="seg-tabs" role="tablist" aria-label="Show" onKeyDown={onFilterKey}>
           {filters.map((f) => (
-            <button type="button" role="tab" key={f.id} aria-selected={filter === f.id} className={filter === f.id ? 'active' : undefined} onClick={() => onFilter(f.id)}>
+            <button
+              type="button"
+              role="tab"
+              key={f.id}
+              aria-selected={filter === f.id}
+              tabIndex={filter === f.id ? 0 : -1}
+              className={filter === f.id ? 'active' : undefined}
+              onClick={() => onFilter(f.id)}
+            >
               <span>{f.label}</span>
             </button>
           ))}

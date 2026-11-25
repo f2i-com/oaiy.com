@@ -1860,7 +1860,7 @@ async function main(): Promise<void> {
   };
 
   const fileInput = (accept: string, directory: boolean, onFiles: (files: FileList) => void | Promise<void>) => {
-    const input = h('input', { type: 'file', accept, style: 'display:none' });
+    const input = h('input.hidden-file-input', { type: 'file', accept });
     if (directory) input.setAttribute('webkitdirectory', '');
     input.addEventListener('change', () => void (input.files && onFiles(input.files)));
     document.body.append(input);
@@ -2443,10 +2443,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
   }
 
   // Incognito, on or off: a toggle in the actions, and a chip in the top bar that shows while it is on.
-  const incognitoButton = h('button.incognito-toggle', { 'aria-checked': 'false', onclick: () => void toggleIncognito() });
+  const incognitoButton = h('button.incognito-toggle', { 'aria-checked': 'false', onclick: () => void toggleIncognito() }, icon('glasses'), 'Incognito: OFF');
   const incognitoChip = h('span.incognito-chip', { title: 'Incognito is on: nothing of this project is kept unless you export it', hidden: true }, '🕶 INCOGNITO');
   function showIncognito(on: boolean): void {
-    incognitoButton.textContent = on ? '🕶 Incognito: ON' : '🕶 Incognito: OFF';
+    incognitoButton.replaceChildren(icon('glasses'), document.createTextNode(on ? 'Incognito: ON' : 'Incognito: OFF'));
     incognitoButton.title = on
       ? 'Incognito is on: nothing of this project is kept. Click to leave it (the project is deleted; export it first to keep it)'
       : 'Incognito is off. Click for a private project: nothing is kept (no conversation, files or media) unless you export it';
@@ -2454,7 +2454,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     incognitoButton.setAttribute('aria-checked', String(on));
     incognitoChip.hidden = !on;
     // (named apart from the conversation's own Clear, which empties only the conversation)
-    deleteButton.textContent = on ? 'Clear incognito' : 'Delete';
+    deleteButton.replaceChildren(icon('trash'), document.createTextNode(on ? 'Clear incognito' : 'Delete'));
     deleteButton.title = on ? 'Clear this incognito project: delete everything in it (files, media and the conversation) and start a fresh one (incognito stays on)' : 'Delete this project from the browser';
     document.body.classList.toggle('incognito', on);
   }
@@ -2482,10 +2482,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
       project.meta = await renameProject(project.meta, name);
       await renderProjects();
     }
-  } }, 'Rename') as HTMLButtonElement;
+  } }, icon('pencil'), 'Rename') as HTMLButtonElement;
 
   // Delete, or in incognito Clear: the temporary project is wiped and a fresh one opens, incognito staying on.
-  const deleteButton = h('button.danger.delete-toggle', { onclick: () => void deleteOrClear() }, 'Delete');
+  const deleteButton = h('button.danger.delete-toggle', { onclick: () => void deleteOrClear() }, icon('trash'), 'Delete');
   async function deleteOrClear(): Promise<void> {
     if (project === frontDesk || project.meta.id === SETUP_PROJECT.id) return;
     if (project.meta.incognito) {
@@ -2521,7 +2521,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
     menuItems()[0]?.focus();
   };
   // "Set up OAIY": the conversation with the Agent about OAIY itself (while there is a desktop to set up).
-  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !(desktop && canDo('setup')), onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
+  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !(desktop && canDo('setup')), onclick: () => void openSetup() }, icon('sparkle'), 'Set up OAIY') as HTMLButtonElement;
+  const menuSep = () => h('span.menu-sep', { role: 'separator' });
   const actions = h(
     'div.actions',
     {
@@ -2552,15 +2553,15 @@ A project can hold several apps, each in its own folder (any folder whose manife
       if (!(await mayLeaveRun())) return;
       const name = await askText({ title: 'New project', message: `An empty project, kept ${KEPT_HERE}.`, label: 'Project name', value: 'untitled', ok: 'Create' });
       if (name) await openProject(await createProject(name));
-    } }, 'New'),
+    } }, icon('plus'), 'New'),
     h('button', { title: IN_OAIY ? "Open a folder from this computer (a copy is kept in OAIY's own storage)" : 'Open a folder from this computer (a copy is kept in the browser)', onclick: async () => {
       if (canPickFolder()) await importing(() => importFolder());
       else fileInput('', true, (files) => importing(() => importFileList(files)));
-    } }, 'Open folder…'),
-    h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, (files) => importing(() => importZip(files[0]))) }, 'Import .zip'),
+    } }, icon('folder-open'), 'Open folder…'),
+    h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, (files) => importing(() => importZip(files[0]))) }, icon('upload'), 'Import .zip'),
     h('button', { title: 'Download this project as a .zip', onclick: async () => {
       downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), exportFiles());
-    } }, 'Export .zip'),
+    } }, icon('download'), 'Export .zip'),
     h('button', { title: 'Write this project\'s files into a folder on this computer', onclick: async () => {
       if (!canPickFolder()) {
         chat.system('This browser cannot write to a folder: use Export .zip.', 'error');
@@ -2572,14 +2573,18 @@ A project can hold several apps, each in its own folder (any folder whose manife
       } catch (error) {
         chat.system(`Could not export to the folder: ${(error as Error).message}`, 'error');
       }
-    } }, 'Export to folder…'),
+    } }, icon('folder'), 'Export to folder…'),
+    menuSep(),
     incognitoButton,
-    h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
-    h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
-    h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
+    menuSep(),
+    h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, icon('app'), 'New SoftN app'),
+    h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, icon('upload'), 'Import .softn…'),
+    h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, icon('package'), 'Export .softn'),
+    menuSep(),
     // (the Instructions chip's dialog: on a phone the chip gives way, and this is where it is)
-    h('button.instructions-item', { title: "Whose instructions this project's conversation takes (yours, its own, or none), and whether the business's tools are offered here", onclick: () => void editInstructions() }, 'Instructions…'),
+    h('button.instructions-item', { title: "Whose instructions this project's conversation takes (yours, its own, or none), and whether the business's tools are offered here", onclick: () => void editInstructions() }, icon('file-text'), 'Instructions…'),
     renameButton,
+    menuSep(),
     deleteButton,
   );
   // (each a menu item; incognito one that is on or off)
@@ -2636,6 +2641,15 @@ A project can hold several apps, each in its own folder (any folder whose manife
 
   // The center shows the editor or the app preview, with the terminal below.
   // Editor and Preview: tabs, the one shown selected (the arrow keys move between them, as tabs' do).
+  const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  const filesShortcut = isMac ? '⌘B' : 'Ctrl+B';
+  const filesToggle = h('button.files-toggle', {
+    type: 'button',
+    'aria-pressed': 'true',
+    'aria-label': 'Toggle files sidebar',
+    title: `Hide files sidebar (${filesShortcut})`,
+    onclick: () => toggleFiles(),
+  }, icon('panel-left')) as HTMLButtonElement;
   const centerTabs = h(
     'div.center-tabs',
     { role: 'tablist', 'aria-label': 'Editor or preview' },
@@ -2649,7 +2663,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   preview.element.id = 'pane-preview';
   preview.element.setAttribute('role', 'tabpanel');
   preview.element.setAttribute('aria-labelledby', 'pane-tab-preview');
-  const center = h('div.center', centerTabs, h('div.center-main', editor.element, preview.element), terminal.element);
+  const center = h('div.center', h('div.center-bar', filesToggle, centerTabs), h('div.center-main', editor.element, preview.element), terminal.element);
   function showPane(pane: 'editor' | 'preview'): void {
     center.dataset.pane = pane;
     selectTab(centerTabs, (b) => b.dataset.pane === pane);
@@ -2659,6 +2673,11 @@ A project can hold several apps, each in its own folder (any folder whose manife
 
   // On a narrow screen one pane shows at a time, chosen from a tab bar.
   const workspace = h('main.workspace', tree.element, center, chat.element);
+  function toggleFiles(): void {
+    const hidden = workspace.classList.toggle('files-hidden');
+    filesToggle.setAttribute('aria-pressed', String(!hidden));
+    filesToggle.title = hidden ? `Show files sidebar (${filesShortcut})` : `Hide files sidebar (${filesShortcut})`;
+  }
   const views = [['files', 'Files'], ['editor', 'Editor'], ['preview', 'Preview'], ['terminal', 'Terminal'], ['agent', 'Agent']] as const;
   const tabs = h('nav.tabs', { role: 'tablist', 'aria-label': 'Panes' }, ...views.map(([view, label]) => h('button', { role: 'tab', 'data-view': view, onclick: () => showView(view) }, label)));
   arrowTabs(tabs);
@@ -2697,7 +2716,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
       if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
       e.preventDefault();
       if (narrow.matches) showView(workspace.dataset.view === 'files' ? 'agent' : 'files');
-      else workspace.classList.toggle('files-hidden');
+      else toggleFiles();
     } else if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key === '`') {
       e.preventDefault();
       if (narrow.matches) showView(workspace.dataset.view === 'terminal' ? 'agent' : 'terminal');

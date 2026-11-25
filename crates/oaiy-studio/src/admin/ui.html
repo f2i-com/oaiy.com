@@ -29,7 +29,7 @@
   --rail-bg: #090e18; --field: rgba(24, 34, 53, .7); --hover: rgba(24, 34, 53, .7);
   --gpu-soft: rgba(113, 103, 255, .14); --gpu-text: #948cff; --sel-ring: inset 0 0 0 1px rgba(113, 103, 255, .3);
   --good-text: #45d6a2; --ssd-text: #f2b84b; --ram-text: #35d4e8;
-  --shadow-card: 0 10px 26px rgba(0, 0, 0, .1); --shadow-pop: 0 18px 50px rgba(0, 0, 0, .34);
+  --shadow-card: 0 10px 26px rgba(0, 0, 0, .1); --shadow-card-hover: 0 14px 32px rgba(0, 0, 0, .22); --shadow-pop: 0 18px 50px rgba(0, 0, 0, .34);
   --go-shadow: 0 4px 14px rgba(113, 103, 255, .22), inset 0 1px rgba(255, 255, 255, .16);
   --rail-w: 216px; --dock-h: 0px; --pad: clamp(16px, 2.6vw, 44px);
   --display: "Public Sans", "Bahnschrift", "Segoe UI Variable Display", system-ui, sans-serif;
@@ -51,7 +51,7 @@
   --rail-bg: #fffdfa; --field: #f6f3ed; --hover: rgba(50, 42, 30, .06);
   --gpu-soft: rgba(36, 87, 230, .1); --gpu-text: #2457e6; --sel-ring: none;
   --good-text: #1b6e42; --ssd-text: #835805; --ram-text: #126399;
-  --shadow-card: 2px 2px 0 rgba(50, 42, 30, .045); --shadow-pop: 0 14px 34px rgba(50, 42, 30, .14); --go-shadow: 2px 2px 0 rgba(50, 42, 30, .14);
+  --shadow-card: 2px 2px 0 rgba(50, 42, 30, .045); --shadow-card-hover: 3px 3px 0 rgba(50, 42, 30, .09); --shadow-pop: 0 14px 34px rgba(50, 42, 30, .14); --go-shadow: 2px 2px 0 rgba(50, 42, 30, .14);
   --r-card: 8px; --r: 7px; --r-sm: 5px;
 }
 @media (prefers-color-scheme: light) {
@@ -64,7 +64,7 @@
     --rail-bg: #fffdfa; --field: #f6f3ed; --hover: rgba(50, 42, 30, .06);
     --gpu-soft: rgba(36, 87, 230, .1); --gpu-text: #2457e6; --sel-ring: none;
     --good-text: #1b6e42; --ssd-text: #835805; --ram-text: #126399;
-    --shadow-card: 2px 2px 0 rgba(50, 42, 30, .045); --shadow-pop: 0 14px 34px rgba(50, 42, 30, .14); --go-shadow: 2px 2px 0 rgba(50, 42, 30, .14);
+    --shadow-card: 2px 2px 0 rgba(50, 42, 30, .045); --shadow-card-hover: 3px 3px 0 rgba(50, 42, 30, .09); --shadow-pop: 0 14px 34px rgba(50, 42, 30, .14); --go-shadow: 2px 2px 0 rgba(50, 42, 30, .14);
     --r-card: 8px; --r: 7px; --r-sm: 5px;
   }
 }
@@ -185,10 +185,10 @@ a.btn { color: var(--text); text-decoration: none; }
 .btn.go:not(:disabled):hover { filter: brightness(1.08); background: var(--go); border-color: var(--go); }
 .btn.go:disabled { box-shadow: none; }
 .btn.warn { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); background: color-mix(in srgb, var(--bad) 8%, transparent); }
-.btn.warn:not(:disabled):hover { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.btn.warn:not(:disabled):hover { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); background: color-mix(in srgb, var(--bad) 16%, transparent); }
 .btn.quiet { background: transparent; border-color: transparent; color: var(--muted); min-height: 30px; padding: 0 10px; font-weight: 560; }
 .btn.quiet:not(:disabled):hover { color: var(--text); border-color: transparent; background: var(--hover); }
-.btn.quiet.warn:not(:disabled):hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.btn.quiet.warn:not(:disabled):hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
 label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); align-content: start; }
 label.f > span:first-child { font-weight: 550; }
 /* (a field that is not one box, such as a row of choices under its name, stacks the same way, its name above) */
@@ -252,16 +252,20 @@ input[type=range]:focus-visible { outline: 2px solid var(--gpu); outline-offset:
 /* the tier strip */
 .strip { display: flex; height: 30px; border-radius: var(--r); overflow: hidden; border: 1px solid var(--line); background: var(--bg); }
 .strip > div { display: flex; align-items: center; padding: 0 10px; font: 600 11.5px var(--display); letter-spacing: .03em; color: var(--on-tier); white-space: nowrap; overflow: hidden; min-width: 0; transition: flex-grow .35s ease; }
-.strip .t-gpu { background: var(--gpu); } .strip .t-ram { background: var(--ram); }
+.strip .t-gpu { background: var(--go); color: var(--on-accent); } .strip .t-ram { background: var(--ram); }
 .strip .t-ssd { background: repeating-linear-gradient(135deg, var(--ssd) 0 8px, color-mix(in srgb, var(--ssd) 84%, #000) 8px 16px); }
 .strip-legend { display: flex; gap: 6px 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .key { display: inline-flex; align-items: center; gap: 6px; } .key i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 /* A meter is a rounded trough of the page's ground with a hairline, its parts filling it (Free's key is drawn so). */
 .meter { height: 6px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); border-radius: 999px; overflow: hidden; }
 .meter > div { height: 100%; transition: width .5s ease; }
-.hw { display: grid; gap: 16px; }
+#hw-note { font-variant-numeric: tabular-nums; }
+.hw { display: grid; gap: 0; }
 .hw .meter { height: 8px; }
-.hw-row { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(110px, 150px); gap: 14px; align-items: center; }
+.hw-row { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(110px, 150px); gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.hw-row:first-child { padding-top: 2px; }
+.hw-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.hw-row .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .hw-row .label { font: 600 13px/1.35 var(--display); } .hw-row .label small { display: block; font: 12px/1.4 var(--body); color: var(--muted); margin-top: 1px; }
 /* a GPU's memory and load, each a meter with its numbers, and what it runs under them (`--rows`: the lines they take);
    a Mac's unified memory with its parts' key under it */
@@ -365,6 +369,14 @@ table.routes td.path input { font-family: var(--code); }
 .chips button:focus-visible { outline: 2px solid var(--gpu); outline-offset: 2px; }
 .now { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 12px; border: 1px solid var(--line); border-radius: var(--r); background: color-mix(in srgb, var(--bg) 55%, var(--panel)); }
 .now img, .now .ph { width: 96px; height: 72px; object-fit: cover; border-radius: var(--r-sm); background: var(--panel-2); }
+.now .ph { position: relative; display: grid; place-items: center; color: var(--gpu-text); border: 1px solid color-mix(in srgb, var(--gpu) 28%, var(--line)); background: color-mix(in srgb, var(--gpu) 8%, var(--panel-2)); overflow: hidden; }
+.now .ph svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; position: relative; z-index: 1; }
+.now .ph .ph-spin { position: absolute; width: 42px; height: 42px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--gpu) 22%, transparent); border-top-color: var(--gpu); animation: spin 1.1s linear infinite, pulse 2s ease-in-out infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.gal-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; margin-bottom: 16px; }
+.gal-toolbar .chips { margin-bottom: 0; flex: 1 1 auto; }
+.gal-search-wrap { flex: 0 1 260px; max-width: 100%; }
+.viewer-nav { min-width: 30px; padding: 0 7px; font-size: 14px; }
 .viewer { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 300px); height: 100%; }
 .viewer .media { background: var(--media-bg); display: grid; place-items: center; min-height: 240px; min-width: 0; overflow: hidden; }
 .viewer .media img, .viewer .media video { width: 100%; height: 100%; max-height: calc(96vh - 2px); object-fit: contain; display: block; }
@@ -401,9 +413,23 @@ body.incognito .banner { display: flex; }
 .job img { cursor: pointer; }
 .job img, .job .ph { width: 64px; height: 48px; object-fit: cover; border-radius: var(--r-sm); background: var(--panel-2); }
 .job .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.job-meta { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 3px; }
+.job-err { color: var(--bad); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 48ch; }
+.log-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 12px; }
+.log-bar .tabs { margin-bottom: 0; }
+.log-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.log-search-wrap { flex: 1 1 180px; max-width: 240px; }
+.log-wrap { position: relative; }
 .log:empty::before { content: "Nothing logged yet."; color: var(--faint); font-family: var(--body); }
 /* (down to a little above the window's foot: the heading over it is shorter than it was) */
-.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r-card); padding: 12px 14px; height: calc(100vh - 225px - var(--dock-h)); height: calc(100dvh - 225px - var(--dock-h)); min-height: 280px; overflow: auto; font: 12px/1.6 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
+.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r-card); padding: 10px 12px; height: calc(100vh - 235px - var(--dock-h)); height: calc(100dvh - 235px - var(--dock-h)); min-height: 280px; overflow: auto; font: 12px/1.6 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
+.log-line { display: flex; gap: 10px; padding: 1px 6px; border-radius: 3px; border-left: 2px solid transparent; }
+.log-line .log-ts { color: var(--faint); flex: none; user-select: none; font-variant-numeric: tabular-nums; }
+.log-line .log-txt { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.log-line.log-err { color: var(--bad); background: color-mix(in srgb, var(--bad) 9%, transparent); border-left-color: var(--bad); }
+.log-line.log-warn { color: var(--ssd-text); background: color-mix(in srgb, var(--ssd) 8%, transparent); border-left-color: var(--ssd); }
+.log-jump { position: absolute; right: 18px; bottom: 14px; z-index: 2; min-height: 28px; padding: 0 12px; border-radius: 999px; font-size: 12px; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid color-mix(in srgb, var(--gpu) 45%, var(--line)); color: var(--gpu-text); box-shadow: var(--shadow-pop); backdrop-filter: blur(10px); }
+.log-jump:hover { background: var(--gpu-soft); border-color: var(--gpu); color: var(--text); }
 .endpoint { display: grid; grid-template-columns: minmax(90px, 120px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 .endpoint:last-child { border-bottom: 0; padding-bottom: 0; }
 .endpoint code { font: 12.5px var(--code); color: var(--text); word-break: break-all; }
@@ -441,6 +467,8 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .msg.assistant { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--line); padding: 10px 14px; border-radius: 12px 12px 12px 4px; }
 .msg .who { font: 600 10.5px/1.4 var(--code); letter-spacing: .01em; color: var(--faint); margin-bottom: 4px; }
 .msg.assistant .body pre { background: var(--bg); }
+.msg.assistant .body code { background: color-mix(in srgb, var(--bg) 65%, var(--panel-2)); border: 1px solid var(--line); }
+.msg.assistant .body pre code { background: none; border: 0; }
 .chat-empty { margin: auto; text-align: center; width: min(640px, 100%); display: grid; gap: 10px; justify-items: center; color: var(--muted); font-size: 13px; }
 .chat-empty h2 { margin: 0; color: var(--text); font-size: 16px; }
 .suggest { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 8px; width: 100%; margin-top: 10px; }
@@ -565,8 +593,12 @@ figure .audio-card svg { width: 36px; height: 36px; stroke: currentColor; fill: 
 .savebar > span::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ssd); flex: none; }
 /* Toasts as the dashboard's: a card with the kind's colour along its edge, at the top right. */
 .toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; max-width: calc(100vw - 40px); }
-.toast { background: var(--panel); border: 1px solid color-mix(in srgb, var(--good) 35%, var(--line)); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r-card); max-width: 380px; white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; box-shadow: var(--shadow-pop); animation: toast-in .24s cubic-bezier(.2, .9, .2, 1); }
-.toast.err { border-color: color-mix(in srgb, var(--bad) 35%, var(--line)); border-left-color: var(--bad); }
+.toast { display: flex; align-items: flex-start; gap: 10px; background: var(--panel); border: 1px solid color-mix(in srgb, var(--good) 35%, var(--line)); border-left: 3px solid var(--good); padding: 10px 12px 10px 14px; border-radius: var(--r-card); max-width: 380px; white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; box-shadow: var(--shadow-pop); animation: toast-in .24s cubic-bezier(.2, .9, .2, 1); }
+.toast-msg { flex: 1; min-width: 0; }
+.toast-close { all: unset; cursor: pointer; flex: none; width: 20px; height: 20px; display: grid; place-items: center; border-radius: var(--r-sm); color: var(--muted); font: 600 15px/1 var(--body); margin: -1px -3px -1px 0; transition: background .12s, color .12s; }
+.toast-close:hover { color: var(--text); background: var(--hover); }
+.toast-close:focus-visible { outline: 2px solid var(--gpu); outline-offset: 1px; }
+.toast.err, .toast.bad { border-color: color-mix(in srgb, var(--bad) 35%, var(--line)); border-left-color: var(--bad); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(-10px) scale(.98); } }
 /* (along the bottom, the status pills are at the top right: the toasts start under them, not over them) */
 .dock .toasts { top: 58px; }
@@ -649,6 +681,7 @@ dialog::backdrop { background: var(--backdrop); }
 }
 @media (max-width: 860px) {
   .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .hw-row .num { text-align: left; }
   .hw-row.card .label { grid-row: auto; }
   .hw-row.card .doing { grid-column: 1 / -1; margin-top: 0; }
   .chat { height: calc(100dvh - 330px); }
@@ -716,9 +749,9 @@ dialog::backdrop { background: var(--backdrop); }
 @media (max-width: 560px) { .dl-q { grid-template-columns: minmax(0, 1fr) auto; } .dl-q .meter { grid-column: 1 / -1; grid-row: 2; } }
 .dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 14px; }
 .dl-grid > .empty { grid-column: 1 / -1; padding: 36px 20px; text-align: center; }
-.dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: var(--r-card); background: var(--panel); box-shadow: var(--shadow-card); overflow: hidden; transition: border-color .15s; }
+.dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr; grid-auto-rows: auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: var(--r-card); background: var(--panel); box-shadow: var(--shadow-card); overflow: hidden; transition: border-color .15s, transform .15s, box-shadow .15s; }
 .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: var(--accent); opacity: .9; }
-.dl-card:hover { border-color: var(--line-2); }
+.dl-card:hover { border-color: var(--line-2); transform: translateY(-1px); box-shadow: var(--shadow-card-hover); }
 /* (a card as wide as its column, whatever a chip or a line in it holds: a long licence ends in an ellipsis) */
 .dl-card, .dl-card > div { min-width: 0; }
 .dl-body { display: grid; gap: 8px; align-content: start; grid-template-columns: minmax(0, 1fr); }
@@ -741,7 +774,9 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 .dl-chip-toggle:hover { border-color: var(--line-2); color: var(--text); }
 .dl-chip-toggle[aria-pressed="true"] { border-color: color-mix(in srgb, var(--gpu) 55%, var(--line)); background: var(--gpu-soft); color: var(--text); }
 .dl-count-note { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.dl-cnt { opacity: .65; font: 500 11px/1 var(--code); margin-left: 4px; }
+.dl-cnt { color: var(--muted); font: 500 11px/1 var(--code); font-variant-numeric: tabular-nums; margin-left: 4px; }
+.dl-cnt:empty { display: none; }
+.chips button[aria-pressed=true] .dl-cnt { color: inherit; }
 .dl-facts span.dl-fit-ok { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); background: color-mix(in srgb, var(--good) 9%, var(--panel-2)); }
 .dl-facts span.dl-fit-tight { color: var(--ssd-text); border-color: color-mix(in srgb, var(--ssd) 38%, var(--line)); background: color-mix(in srgb, var(--ssd) 9%, var(--panel-2)); }
 .dl-facts span.dl-fit-no { color: var(--muted); border-style: dashed; }
@@ -760,7 +795,8 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 .dl-facts span b { color: var(--text); font-weight: 600; }
 .dl-gated { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; line-height: 1.45; color: var(--ssd-text); }
 .dl-gated svg { width: 14px; height: 14px; flex: none; margin-top: 1px; stroke: currentColor; fill: none; stroke-width: 2; }
-.dl-state { display: grid; gap: 6px; font-size: 12px; min-height: 22px; }
+.dl-state { display: grid; gap: 6px; font-size: 12px; }
+.dl-state:empty { display: none; }
 .dl-state .meter { height: 6px; }
 .dl-state .meter > div { background: var(--accent); }
 .dl-state .line { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); }
@@ -826,13 +862,22 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 .in-oaiy.dock { --dock-h: 0px; }
 .in-oaiy.dock .app { grid-template-rows: minmax(0, 1fr); }
 .in-oaiy.dock main { grid-area: 1 / 1; padding-top: calc(var(--row-h) + 20px); padding-bottom: 48px; }
-.in-oaiy.dock .sections {
-  position: fixed; z-index: 7; top: 0; right: 0; bottom: auto; left: 0;
-  display: flex; flex-wrap: wrap; align-content: flex-start; align-items: stretch; justify-content: flex-start; gap: 0 2px;
-  min-height: var(--row-h); padding: 0 0 0 calc(var(--pad) - 9px);
-  border-top: 0; border-bottom: 1px solid var(--line); border-radius: 0;
-  background: color-mix(in srgb, var(--panel) 91%, transparent); backdrop-filter: blur(18px); box-shadow: none;
+.in-oaiy.dock .rail {
+  position: fixed; z-index: 7; top: 0; right: 0; left: 0;
+  display: flex; flex-direction: row; align-items: flex-start; gap: 12px;
+  height: auto; min-height: var(--row-h); padding: 0 12px 0 calc(var(--pad) - 9px);
+  border-right: 0; border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 91%, transparent); backdrop-filter: blur(18px);
+  overflow: visible;
 }
+.in-oaiy.dock .sections {
+  position: static; flex: 1 1 auto; min-width: 0;
+  display: flex; flex-wrap: nowrap; align-items: stretch; justify-content: flex-start; gap: 0 2px;
+  min-height: calc(var(--row-h) - 1px); padding: 0;
+  border: 0; border-radius: 0; background: transparent; backdrop-filter: none; box-shadow: none;
+  overflow-x: auto; scrollbar-width: none;
+}
+.in-oaiy.dock .sections::-webkit-scrollbar { display: none; }
 .in-oaiy.dock .sections button {
   flex: none; flex-direction: row; gap: 6px; max-width: none; height: calc(var(--row-h) - 1px); min-height: 0; margin: 0; padding: 0 9px;
   border-radius: 0; background: transparent; color: var(--muted); font: 560 13px/1.2 var(--body); letter-spacing: 0;
@@ -850,7 +895,7 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 .in-oaiy.dock .sections .more .label::after { content: " \25BE"; }
 /* How the page stands, at the row's right end. */
 .in-oaiy.dock .rail-foot {
-  position: fixed; z-index: 8; top: 0; right: 12px; display: flex; height: var(--row-h); flex-wrap: nowrap; align-items: center; gap: 6px;
+  position: static; flex: none; display: flex; height: calc(var(--row-h) - 1px); flex-wrap: nowrap; align-items: center; gap: 6px;
   margin: 0; border: 0; padding: 0;
 }
 .in-oaiy.dock .rail-foot > .row, .in-oaiy.dock .incog { height: 20px; min-height: 20px; gap: 5px; padding: 0 8px; box-shadow: none; font-size: 11px; font-weight: 600; }
@@ -874,6 +919,7 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
 /* Too narrow for nine words and the chips (the window at its smallest gives the page 686px): the first four, and
    More at the row's end opens the other five on a second line of the same row. Nothing in the first line moves. */
 @media (max-width: 1039px) {
+  .in-oaiy.dock .sections { flex-wrap: wrap; align-content: flex-start; overflow-x: visible; }
   .in-oaiy.dock .sections .more { display: flex; order: 1; }
   .in-oaiy.dock .sections .row-break { display: block; order: 2; flex-basis: 100%; height: 0; }
   .in-oaiy.dock .sections button[data-more] { display: none; order: 3; }
@@ -1217,10 +1263,16 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
     <section class="view" id="v-gallery" aria-labelledby="h-gallery">
       <h1 id="h-gallery">Gallery</h1>
       <p class="lede">What this session made. Open one for its prompt and settings, or to use the prompt again. Incognito requests are never listed.</p>
-      <div class="chips" id="gallery-filter">
-        <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
-        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound effects</button><button data-f="model3d" aria-pressed="false">3D</button><button data-f="picture" aria-pressed="false">Picture tools</button><button data-f="active" aria-pressed="false">In progress</button>
-        <button data-f="failed" aria-pressed="false">Failed</button>
+      <div class="gal-toolbar">
+        <div class="chips" id="gallery-filter">
+          <button data-f="all" aria-pressed="true">All<span class="dl-cnt"></span></button><button data-f="image" aria-pressed="false">Images<span class="dl-cnt"></span></button>
+          <button data-f="video" aria-pressed="false">Videos<span class="dl-cnt"></span></button><button data-f="speech" aria-pressed="false">Speech<span class="dl-cnt"></span></button><button data-f="music" aria-pressed="false">Music<span class="dl-cnt"></span></button><button data-f="sound" aria-pressed="false">Sound effects<span class="dl-cnt"></span></button><button data-f="model3d" aria-pressed="false">3D<span class="dl-cnt"></span></button><button data-f="picture" aria-pressed="false">Picture tools<span class="dl-cnt"></span></button><button data-f="active" aria-pressed="false">In progress<span class="dl-cnt"></span></button>
+          <button data-f="failed" aria-pressed="false">Failed<span class="dl-cnt"></span></button>
+        </div>
+        <div class="dl-search-wrap gal-search-wrap" role="search" aria-label="Search gallery">
+          <input type="text" class="dl-search" id="gallery-search" placeholder="Search prompts or models…" aria-label="Search prompts or models" autocomplete="off" spellcheck="false">
+          <button type="button" class="dl-search-clear" id="gallery-search-clear" hidden aria-label="Clear search" title="Clear search (Esc)">×</button>
+        </div>
       </div>
       <div class="gallery" id="gallery"></div>
     </section>
@@ -1487,23 +1539,41 @@ input.dl-search:focus { outline: none; border-color: var(--gpu); box-shadow: 0 0
     <section class="view" id="v-logs" aria-labelledby="h-logs">
       <h1 id="h-logs">Logs</h1>
       <p class="lede">What OAIY's engines print, newest at the bottom.</p>
-      <div class="tabs" role="tablist">
-        <button role="tab" aria-selected="true" data-log="studio">Engines</button>
-        <button role="tab" aria-selected="false" data-log="llm">Language model</button>
-        <button role="tab" aria-selected="false" data-log="media">Media</button>
-        <button role="tab" aria-selected="false" data-log="egpu" id="log-egpu" hidden>eGPU</button>
+      <div class="log-bar">
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-log="studio">Engines</button>
+          <button role="tab" aria-selected="false" data-log="llm">Language model</button>
+          <button role="tab" aria-selected="false" data-log="media">Media</button>
+          <button role="tab" aria-selected="false" data-log="egpu" id="log-egpu" hidden>eGPU</button>
+        </div>
+        <div class="log-tools">
+          <div class="dl-search-wrap log-search-wrap" role="search" aria-label="Filter logs">
+            <input type="text" class="dl-search" id="log-search" placeholder="Filter log lines…" aria-label="Filter log lines" autocomplete="off" spellcheck="false">
+            <button type="button" class="dl-search-clear" id="log-search-clear" hidden aria-label="Clear log filter" title="Clear filter (Esc)">×</button>
+          </div>
+          <div class="seg" id="log-level" role="group" aria-label="Log level">
+            <button type="button" data-level="all" aria-pressed="true">All</button>
+            <button type="button" data-level="warn" aria-pressed="false">Warn+</button>
+            <button type="button" data-level="err" aria-pressed="false">Errors</button>
+          </div>
+          <button type="button" class="btn quiet" id="log-copy">Copy</button>
+          <button type="button" class="btn quiet" id="log-clear">Clear</button>
+        </div>
       </div>
-      <div class="log" id="log" tabindex="0" role="log" aria-live="off" aria-label="Log"></div>
+      <div class="log-wrap">
+        <div class="log" id="log" tabindex="0" role="log" aria-live="off" aria-label="Log"></div>
+        <button type="button" class="btn log-jump" id="log-jump" hidden>Auto-scroll paused · Jump to bottom</button>
+      </div>
     </section>
   </main>
 </div>
 
 <div class="savebar" id="savebar"><span>Unsaved changes</span><div class="row"><button class="btn quiet" id="discard">Discard</button><button class="btn go" id="save">Save changes</button></div></div>
-<div class="toasts" id="toasts" aria-live="assertive"></div>
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
 <dialog id="viewer" class="wide" aria-label="Generated media">
   <div class="viewer"><div class="media" id="viewer-media"></div>
-    <div class="info"><div class="spread"><h2 style="margin:0" id="viewer-title"></h2><button class="btn quiet" id="viewer-close">Close</button></div>
+    <div class="info"><div class="spread"><h2 style="margin:0" id="viewer-title"></h2><div class="row" style="gap:4px"><button class="btn quiet viewer-nav" id="viewer-prev" type="button" title="Previous (Left arrow)" aria-label="Previous item" hidden>←</button><span class="muted small num" id="viewer-pos" hidden></span><button class="btn quiet viewer-nav" id="viewer-next" type="button" title="Next (Right arrow)" aria-label="Next item" hidden>→</button><button class="btn quiet" id="viewer-close" type="button">Close</button></div></div>
       <p id="viewer-prompt" style="margin:0"></p><dl id="viewer-meta"></dl><div class="row" id="viewer-actions"></div></div></div>
 </dialog>
 
@@ -1642,8 +1712,38 @@ function pathEnds(root = document) {
 }
 function toast(msg, err) {
   const t = document.createElement("div");
-  t.className = "toast" + (err ? " err" : ""); t.textContent = msg;
-  $("#toasts").append(t); setTimeout(() => t.remove(), err ? 9000 : 3500);
+  t.className = "toast" + (err ? " err bad" : "");
+  t.setAttribute("role", err ? "alert" : "status");
+  const text = document.createElement("span");
+  text.className = "toast-msg";
+  text.textContent = msg;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "toast-close";
+  close.setAttribute("aria-label", "Dismiss");
+  close.textContent = "×";
+  t.append(text, close);
+  $("#toasts").append(t);
+  let left = err ? 9000 : 3500, started = Date.now(), timer = null;
+  const dismiss = () => { clearTimeout(timer); t.remove(); };
+  const arm = () => { started = Date.now(); clearTimeout(timer); timer = setTimeout(dismiss, left); };
+  const pause = () => { if (!timer) return; clearTimeout(timer); timer = null; left = Math.max(1200, left - (Date.now() - started)); };
+  close.onclick = dismiss;
+  t.addEventListener("mouseenter", pause);
+  t.addEventListener("focusin", pause);
+  t.addEventListener("mouseleave", arm);
+  t.addEventListener("focusout", e => { if (!t.contains(e.relatedTarget)) arm(); });
+  arm();
+}
+for (const id of ["#viewer", "#picker", "#ask"]) {
+  const d = $(id);
+  d?.addEventListener("click", e => {
+    if (e.target !== d) return;
+    const r = d.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+      d.close(id === "#ask" ? "cancel" : "");
+    }
+  });
 }
 
 /* ---------- state ---------- */
@@ -2722,7 +2822,12 @@ function renderHardware() {
   const made = document.createElement("template");
   made.innerHTML = rows.join("") || '<div class="empty">No GPU or memory reported. Without a GPU the engines run on the CPU, slowly, and video, sound, speech and 3D do not run.</div>';
   morph(hw, made.content);
-  $("#hw-note").textContent = sys?.gpus?.length ? "" : "";
+  const discreteVramMb = (sys?.gpus || []).filter(g => !g.unified).reduce((sum, g) => sum + (g.memory_total_mb || 0), 0)
+    + (e?.available && e.enabled ? (e.usage?.memory_total_mb || e.memory_total_mb || 0) : 0);
+  const hwParts = [];
+  if (discreteVramMb > 0) hwParts.push(`${Math.round(discreteVramMb / 1024)} GB VRAM`);
+  if (ram?.total_mb) hwParts.push(`${Math.round(ram.total_mb / 1024)} GB ${unified.length ? "unified memory" : "RAM"}`);
+  $("#hw-note").textContent = hwParts.join(" · ");
 }
 // The Overview's first block, "Your models": for each kind of model, which one is chosen (the default, else the first
 // switched on), whether it is ready, and one button: Change (it is chosen under Models) or Get one (Get models).
@@ -2823,11 +2928,13 @@ function renderState() {
   // (written again only when it changes: read every 1.5 s, it would take a selection or the keyboard's place away)
   if ($("#ov-endpoints").dataset.was !== endpoints) { $("#ov-endpoints").innerHTML = endpoints; $("#ov-endpoints").dataset.was = endpoints; }
   const jobs = state.media.jobs.slice(0, 8);
-  keepRows($("#ov-jobs"), jobs, j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">`
-      : AUDIO_ICONS[j.kind] && j.files[0] ? `<div class="ph icon" data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open the result"><svg viewBox="0 0 24 24" aria-hidden="true">${AUDIO_ICONS[j.kind]}</svg></div>` : '<div class="ph"></div>'}
-    <div><div class="p">${esc(jobTitle(j))}</div><div class="muted small">${[esc(j.model), esc(jobSize(j)), statusText(j)].filter(Boolean).join(", ")}</div></div>
-    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${esc(j.id)}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" rel="noopener noreferrer" data-open>Open</a>` : ""}</div></div>`,
-    nothingYet);
+  keepRows($("#ov-jobs"), jobs, j => {
+    const metaBits = [esc(j.model), esc(jobSize(j))].filter(Boolean).join(" · ");
+    return `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="Open the result" data-job="${esc(j.id)}" tabindex="0" role="button">`
+        : AUDIO_ICONS[j.kind] && j.files[0] ? `<div class="ph icon" data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open the result"><svg viewBox="0 0 24 24" aria-hidden="true">${AUDIO_ICONS[j.kind]}</svg></div>` : '<div class="ph"></div>'}
+      <div><div class="p">${esc(jobTitle(j))}</div><div class="job-meta">${jobStatusPill(j)}${metaBits ? `<span class="muted small">${metaBits}</span>` : ""}${j.status === "failed" && j.error ? `<span class="small job-err" title="${esc(j.error)}">${esc(j.error.slice(0, 120))}</span>` : ""}</div></div>
+      <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${esc(j.id)}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank" rel="noopener noreferrer" data-open>Open</a>` : ""}</div></div>`;
+  }, nothingYet);
   $$("#ov-jobs [data-job]").forEach(el => el.onclick = () => openViewer(el.dataset.job));
   const all = [...state.media.jobs, ...priv];
   const now = all.find(j => j.status === "in_progress") || all.find(j => j.status === "queued");
@@ -2835,7 +2942,8 @@ function renderState() {
   if (now) {
     const active = now, hidden = !("prompt" in now);
     const tpl = document.createElement("template");
-    tpl.innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
+    const kindIcon = MEDIA_ICONS[active.kind] || MEDIA_ICONS.image;
+    tpl.innerHTML = `<div class="now"><div class="ph" aria-hidden="true"><span class="ph-spin"></span><svg viewBox="0 0 24 24">${kindIcon}</svg></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(jobTitle(active))}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
       <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${[esc(active.model), esc(jobSize(active))].filter(Boolean).join(", ")}`}: ${statusText(active)}</div></div>
       <button class="btn warn" data-cancel="${esc(active.id)}">Cancel</button></div>`;
@@ -2917,9 +3025,21 @@ function jobSize(j) {
   if (j.kind === "picture") return /birefnet/i.test(j.model || "") ? "" : j.size || "";
   return j.size || "";
 }
-// The pictures a sound's thumbnail is drawn with.
+// The pictures a sound's thumbnail is drawn with, and media kind icons for active jobs.
 const AUDIO_ICONS = {speech: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/>', music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
   sound: '<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/>'};
+const MEDIA_ICONS = {...AUDIO_ICONS,
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/>',
+  video: '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/>',
+  model3d: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
+  picture: '<path d="M4 20l7-7M14 4l6 6M12 6l6 6-8 8H4v-6z"/>'};
+function jobStatusPill(j) {
+  if (j.status === "completed") return `<span class="tag good">${esc(j.seconds_taken ? `Done in ${j.seconds_taken.toFixed(0)} s` : "Done")}</span>`;
+  if (j.status === "failed") return `<span class="tag bad" title="${esc(j.error || "")}">Failed</span>`;
+  if (j.status === "in_progress") return `<span class="tag gpu">${statusText(j)}</span>`;
+  if (j.status === "queued") return `<span class="tag gpu">Queued</span>`;
+  return `<span class="tag">${statusText(j)}</span>`;
+}
 // An engine's error as the card shows it: what happened in one line (how it ended, and its last word), what it said
 // folded under that, and its log a press away.
 function errorHtml(error, log) {
@@ -3622,7 +3742,9 @@ $("#m3d-form").onsubmit = async e => {
 };
 
 /* ---------- gallery and viewer ---------- */
-let galleryJobs = [], galleryFilter = "all";
+let galleryJobs = [], galleryVisible = [], galleryFilter = "all", galleryQuery = "", viewerList = [], viewerIdx = -1;
+const GALLERY_PICKS = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d", picture: j => j.kind === "picture",
+  active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"};
 // What an empty Gallery says, by its filter (each said "Generate something", Failed and In progress too).
 const nothingYet = '<div class="empty">Nothing generated yet. <button class="btn quiet" type="button" data-goto="play">Open the Playground</button></div>';
 const galleryEmpty = {all: nothingYet, image: '<div class="empty">No images in the list.</div>', video: '<div class="empty">No videos in the list.</div>',
@@ -3631,9 +3753,27 @@ const galleryEmpty = {all: nothingYet, image: '<div class="empty">No images in t
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
-  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d", picture: j => j.kind === "picture",
-    active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
-  const items = galleryJobs.filter(pick);
+  const q = galleryQuery.trim().toLowerCase();
+  const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+  const matched = tokens.length ? galleryJobs.filter(j => {
+    const hay = `${j.prompt || ""} ${j.model || ""} ${jobTitle(j)} ${kindText(j.kind)}`.toLowerCase();
+    return tokens.every(tok => hay.includes(tok));
+  }) : galleryJobs;
+  $("#gallery-search-clear").hidden = !galleryQuery;
+  for (const b of $$("#gallery-filter button")) {
+    const f = b.dataset.f, fn = GALLERY_PICKS[f];
+    const cnt = $(".dl-cnt", b);
+    if (!cnt || !fn) continue;
+    const n = matched.filter(fn).length;
+    const want = n > 0 || f === "all" ? String(n) : "";
+    if (cnt.textContent !== want) cnt.textContent = want;
+  }
+  const pick = GALLERY_PICKS[galleryFilter] || GALLERY_PICKS.all;
+  const items = matched.filter(pick);
+  galleryVisible = items;
+  const emptyHtml = tokens.length
+    ? '<div class="empty">No results match your search. <button class="btn quiet" type="button" data-gal-clear>Clear search</button></div>'
+    : (galleryEmpty[galleryFilter] || galleryEmpty.all);
   keepRows($("#gallery"), items, j => {
     const done = j.status === "completed";
     const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
@@ -3644,14 +3784,35 @@ function renderGallery(fresh) {
       : j.kind === "sound" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg></div>`
       : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(jobTitle(j))}" loading="lazy">`;
-    return `<figure data-job="${j.id}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p" title="${esc(j.prompt || "")}">${esc(j.kind === "model3d" ? "3D model" : jobTitle(j).slice(0, 240))}</span><span>${esc(j.kind === "image" && j.files.length > 1 ? j.files.length + " images" : jobSize(j))}</span></figcaption></figure>`;
-  }, galleryEmpty[galleryFilter] || galleryEmpty.all);
+    return `<figure data-job="${esc(j.id)}" tabindex="0" role="button" aria-label="Open ${esc(j.kind === "model3d" ? "the 3D model" : "the result")}">${media}<figcaption><span class="p" title="${esc(j.prompt || "")}">${esc(j.kind === "model3d" ? "3D model" : jobTitle(j).slice(0, 240))}</span><span>${esc(j.kind === "image" && j.files.length > 1 ? j.files.length + " images" : jobSize(j))}</span></figcaption></figure>`;
+  }, emptyHtml);
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
 $$("#gallery-filter button").forEach(b => b.onclick = () => { galleryFilter = b.dataset.f; $$("#gallery-filter button").forEach(x => x.setAttribute("aria-pressed", x === b)); renderGallery(); });
+$("#gallery-search").addEventListener("input", e => { galleryQuery = e.target.value; renderGallery(); });
+$("#gallery-search").addEventListener("keydown", e => { if (e.key === "Escape" && galleryQuery) { e.preventDefault(); galleryQuery = ""; $("#gallery-search").value = ""; renderGallery(); } });
+$("#gallery-search-clear").addEventListener("click", () => { galleryQuery = ""; $("#gallery-search").value = ""; renderGallery(); $("#gallery-search").focus(); });
+$("#gallery").addEventListener("click", e => { if (e.target.closest("[data-gal-clear]")) { galleryQuery = ""; $("#gallery-search").value = ""; renderGallery(); } });
+function syncViewerNav(id) {
+  const list = galleryVisible.some(x => x.id === id) ? galleryVisible
+    : galleryJobs.some(x => x.id === id) ? galleryJobs
+    : (state?.media?.jobs || []);
+  viewerList = list;
+  viewerIdx = list.findIndex(x => x.id === id);
+  const multi = list.length > 1 && viewerIdx >= 0;
+  $("#viewer-prev").hidden = !multi;
+  $("#viewer-next").hidden = !multi;
+  $("#viewer-pos").hidden = !multi;
+  if (multi) {
+    $("#viewer-prev").disabled = viewerIdx <= 0;
+    $("#viewer-next").disabled = viewerIdx >= list.length - 1;
+    $("#viewer-pos").textContent = `${viewerIdx + 1} / ${list.length}`;
+  }
+}
 function openViewer(id) {
   const j = galleryJobs.find(j => j.id === id) || state?.media?.jobs?.find(j => j.id === id);
   if (!j) return;
+  syncViewerNav(j.id);
   const file = j.files[0];
   $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px${j.status === "failed" ? ";color:var(--bad)" : ""}">${statusText(j)}</div>`
     : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
@@ -3679,11 +3840,14 @@ function openViewer(id) {
   };
   if (!j.status.match(/completed|failed|cancelled/)) $("#viewer-delete").textContent = "Cancel and remove";
   $("#viewer-delete").onclick = async () => {
-    try { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); } catch (e) { return toast(e.message, true); }
+    if (!j.id) return toast("Invalid job ID", true);
+    try { await api(`/api/jobs/${encodeURIComponent(safeJobId(j.id))}`, {method: "DELETE"}); } catch (e) { return toast(e.message, true); }
     galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh();
   };
-  $("#viewer").showModal();
+  if (!$("#viewer").open) $("#viewer").showModal();
 }
+$("#viewer-prev").onclick = () => { if (viewerIdx > 0 && viewerList[viewerIdx - 1]) openViewer(viewerList[viewerIdx - 1].id); };
+$("#viewer-next").onclick = () => { if (viewerIdx >= 0 && viewerIdx < viewerList.length - 1 && viewerList[viewerIdx + 1]) openViewer(viewerList[viewerIdx + 1].id); };
 $("#viewer-close").onclick = () => $("#viewer").close();
 // In OAIY's window, which opens no other windows, an output's Open (the viewer's, a Recent media row's, a result's in the
 // Playground) opens it in this computer's own viewer. The page knows it is there by `in-oaiy`, set before its first
@@ -3718,18 +3882,90 @@ $("#disc-copy").onclick = () => navigator.clipboard.writeText($("#disc-json").te
 addEventListener("keydown", e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && $("#savebar").classList.contains("on")) { e.preventDefault(); saveConfig(); }
   if (e.key === "Escape" && sections.classList.contains("open")) { unfoldSections(false); $("#sections-more").focus(); }
+  if ($("#viewer").open && !e.altKey && !e.ctrlKey && !e.metaKey && !e.target.matches?.("input, textarea, select, video, audio")) {
+    if (e.key === "ArrowLeft" && !$("#viewer-prev").hidden && !$("#viewer-prev").disabled) { e.preventDefault(); $("#viewer-prev").click(); }
+    if (e.key === "ArrowRight" && !$("#viewer-next").hidden && !$("#viewer-next").disabled) { e.preventDefault(); $("#viewer-next").click(); }
+  }
 });
 
 /* ---------- logs ---------- */
-let logSource = "studio", logAfter = 0;
+let logSource = "studio", logAfter = 0, logEntries = [], logQuery = "", logLevel = "all", logPaused = false;
 $$("#v-logs .tabs button").forEach(b => b.onclick = () => { $$("#v-logs .tabs button").forEach(x => x.setAttribute("aria-selected", x === b)); logSource = b.dataset.log; pollLogs(true); });
 // (each read belongs to the log as it was when it was asked: one answered after the tab changed, or the log was read
 // afresh, is another log's and left out. One read at a time, a slow one waited for rather than each dropped for the
 // next; a line already shown is not shown again. The log keeps its last lines, not every line of a day.)
 let logGen = 0, logReading = false;
 const LOG_KEPT = 2000;
+function logLineLevel(line) {
+  if (/\b(error|err|fatal|panic|failed|exception|traceback)\b/i.test(line)) return "err";
+  if (/\b(warn|warning|deprecated)\b/i.test(line)) return "warn";
+  return "info";
+}
+function logMatches(entry) {
+  if (logLevel === "err" && entry.level !== "err") return false;
+  if (logLevel === "warn" && entry.level !== "warn" && entry.level !== "err") return false;
+  const q = logQuery.trim().toLowerCase();
+  if (!q) return true;
+  return q.split(/\s+/).every(tok => entry.hay.includes(tok));
+}
+function makeLogRow(entry) {
+  const row = document.createElement("div");
+  row.className = "log-line" + (entry.level === "err" ? " log-err" : entry.level === "warn" ? " log-warn" : "");
+  const ts = document.createElement("span");
+  ts.className = "log-ts";
+  ts.textContent = entry.ts;
+  const txt = document.createElement("span");
+  txt.className = "log-txt";
+  txt.textContent = entry.line;
+  row.append(ts, txt);
+  return row;
+}
+function syncLogJump() {
+  const el = $("#log");
+  const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight <= 30;
+  logPaused = !atEnd && el.childNodes.length > 0;
+  $("#log-jump").hidden = !logPaused;
+}
+function renderLogs(forceBottom = false) {
+  const el = $("#log");
+  const frag = document.createDocumentFragment();
+  for (const entry of logEntries) if (logMatches(entry)) frag.append(makeLogRow(entry));
+  el.replaceChildren(frag);
+  $("#log-search-clear").hidden = !logQuery;
+  if (forceBottom || !logPaused) {
+    el.scrollTop = el.scrollHeight;
+    logPaused = false;
+    $("#log-jump").hidden = true;
+  } else syncLogJump();
+}
+$("#log").addEventListener("scroll", syncLogJump);
+$("#log-jump").onclick = () => {
+  const el = $("#log");
+  el.scrollTop = el.scrollHeight;
+  logPaused = false;
+  $("#log-jump").hidden = true;
+};
+$("#log-search").addEventListener("input", e => { logQuery = e.target.value; renderLogs(false); });
+$("#log-search").addEventListener("keydown", e => { if (e.key === "Escape" && logQuery) { e.preventDefault(); logQuery = ""; $("#log-search").value = ""; renderLogs(false); } });
+$("#log-search-clear").addEventListener("click", () => { logQuery = ""; $("#log-search").value = ""; renderLogs(false); $("#log-search").focus(); });
+$$("#log-level button").forEach(b => b.onclick = () => {
+  logLevel = b.dataset.level;
+  $$("#log-level button").forEach(x => x.setAttribute("aria-pressed", x === b));
+  renderLogs(false);
+});
+$("#log-copy").onclick = () => {
+  const text = logEntries.filter(logMatches).map(e => `${e.ts}  ${e.line}`).join("\n");
+  if (!text) return toast("Nothing to copy");
+  navigator.clipboard.writeText(text).then(() => toast("Copied"), () => toast("Could not copy logs", true));
+};
+$("#log-clear").onclick = () => {
+  logEntries = [];
+  $("#log").replaceChildren();
+  logPaused = false;
+  $("#log-jump").hidden = true;
+};
 async function pollLogs(reset) {
-  if (reset) { logGen++; logAfter = 0; $("#log").textContent = ""; }
+  if (reset) { logGen++; logAfter = 0; logEntries = []; logPaused = false; $("#log").replaceChildren(); $("#log-jump").hidden = true; }
   else if (logReading) return;
   const gen = logGen, source = logSource;
   logReading = true;
@@ -3737,9 +3973,23 @@ async function pollLogs(reset) {
     const r = await api(`/api/logs?source=${source}&after=${logAfter}`);
     if (gen !== logGen || source !== logSource) return;
     const el = $("#log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-    for (const l of r.lines) { if (l.n <= logAfter) continue; el.append(new Date(l.t).toLocaleTimeString() + "  " + l.line + "\n"); logAfter = l.n; }
-    while (el.childNodes.length > LOG_KEPT) el.firstChild.remove();
-    if (atEnd || reset) el.scrollTop = el.scrollHeight;
+    const frag = document.createDocumentFragment();
+    let added = false;
+    for (const l of r.lines) {
+      if (l.n <= logAfter) continue;
+      const ts = new Date(l.t).toLocaleTimeString();
+      const entry = {n: l.n, ts, line: l.line, level: logLineLevel(l.line), hay: (ts + " " + l.line).toLowerCase()};
+      logEntries.push(entry);
+      if (logMatches(entry)) { frag.append(makeLogRow(entry)); added = true; }
+      logAfter = l.n;
+    }
+    if (logEntries.length > LOG_KEPT) logEntries = logEntries.slice(-LOG_KEPT);
+    if (added) {
+      el.append(frag);
+      while (el.childNodes.length > LOG_KEPT) el.firstChild.remove();
+    }
+    if (atEnd || reset) { el.scrollTop = el.scrollHeight; logPaused = false; $("#log-jump").hidden = true; }
+    else syncLogJump();
   } catch {} finally { if (gen === logGen) logReading = false; }
 }
 

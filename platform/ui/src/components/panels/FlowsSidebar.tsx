@@ -324,7 +324,7 @@ export default function FlowsSidebar({
   return (
     <>
       {/* Below md the rail lies over the canvas: a scrim to dismiss it. */}
-      <div className="oaiy-rail-scrim" onClick={onClose} />
+      <div className="oaiy-rail-scrim" aria-hidden="true" onClick={onClose} />
 
       <div className="oaiy-rail" data-testid="flows-rail">
         {/* Loaded packages: their flows, above the project's own. */}
@@ -360,22 +360,15 @@ export default function FlowsSidebar({
                       const isActive = activePackageFlow?.packageId === packageId && activePackageFlow?.flowId === flow.id;
                       return (
                         <li key={flow.id}>
-                          <div
-                            role="button"
-                            tabIndex={0}
-                            className={`oaiy-flow-item${isActive ? ' active' : ''}`}
+                          <button
+                            type="button"
+                            className={`oaiy-flow-item w-full text-left${isActive ? ' active' : ''}`}
                             onClick={() => onSelectPackageFlow?.(packageId, flow.id)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                onSelectPackageFlow?.(packageId, flow.id);
-                              }
-                            }}
                             aria-current={isActive ? 'true' : undefined}
                           >
                             <FileText size={14} />
                             <span>{flow.name}</span>
-                          </div>
+                          </button>
                         </li>
                       );
                     })}
@@ -526,37 +519,39 @@ export default function FlowsSidebar({
                       />
                     ) : (
                       <div
-                        role="button"
-                        tabIndex={0}
-                        className={`oaiy-flow-item${active ? ' active' : ''}${flow.isMacro ? ' macro' : flow.localOnly ? ' local' : ''}${flow.description ? ' has-desc' : ''}`}
-                        onClick={() => onSelectFlow(flow.id)}
-                        onKeyDown={(e) => {
-                          if (e.target !== e.currentTarget) return;
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            onSelectFlow(flow.id);
-                          }
-                          if (e.key === 'F2') {
-                            e.preventDefault();
-                            handleStartRename(flow);
-                          }
-                        }}
+                        className={`oaiy-flow-item split${active ? ' active' : ''}${flow.isMacro ? ' macro' : flow.localOnly ? ' local' : ''}${flow.description ? ' has-desc' : ''}`}
                         onContextMenu={(e) => handleContextMenu(e, flow.id)}
-                        aria-label={`Select flow: ${flow.name}`}
-                        aria-current={active ? 'true' : undefined}
                         ref={active ? activeRef : undefined}
-                        data-flow-name={flow.name}
-                        title={flow.description ? `${flow.name}\n${flow.description}` : flow.name}
                       >
-                        {flowIcon(flow)}
-                        <span className="oaiy-flow-text">
-                          <span>{flow.name}</span>
-                          {flow.description && <small>{flow.description}</small>}
-                        </span>
-                        {flow.remote && <Globe size={13} className="oaiy-flow-shared" aria-label="Shared with apps" />}
-                        {running ? (
-                          <span className="oaiy-pill dot accent live" title="Running">Running</span>
-                        ) : null}
+                        <button
+                          type="button"
+                          className="oaiy-flow-select"
+                          onClick={() => onSelectFlow(flow.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'F2') {
+                              e.preventDefault();
+                              handleStartRename(flow);
+                            }
+                          }}
+                          aria-label={`Select flow: ${flow.name}`}
+                          aria-current={active ? 'true' : undefined}
+                          data-flow-name={flow.name}
+                          title={flow.description ? `${flow.name}\n${flow.description}` : flow.name}
+                        >
+                          {flowIcon(flow)}
+                          <span className="oaiy-flow-text">
+                            <span>{flow.name}</span>
+                            {flow.description && <small>{flow.description}</small>}
+                          </span>
+                          {flow.remote && <Globe size={13} className="oaiy-flow-shared" aria-label="Shared with apps" />}
+                          {running ? (
+                            <span
+                              className="oaiy-node-status-dot oaiy-flow-running-dot"
+                              title="Running"
+                              aria-label="Running"
+                            />
+                          ) : null}
+                        </button>
                         <button
                           type="button"
                           className="oaiy-flow-more"
@@ -597,17 +592,10 @@ export default function FlowsSidebar({
                 <ul>
                   {shownExamples.map((example) => (
                     <li key={example.id}>
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        className={`oaiy-flow-item example${example.description ? ' has-desc' : ''}`}
+                      <button
+                        type="button"
+                        className={`oaiy-flow-item example w-full text-left${example.description ? ' has-desc' : ''}`}
                         onClick={() => onAddExample?.(example)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            onAddExample?.(example);
-                          }
-                        }}
                         aria-label={`Add the example flow: ${example.name}`}
                         // (the rail shows the one line; the flow's own notes, how it works step by step, are here to read)
                         title={`Add it to your flows${example.notes || example.description ? `\n${example.notes || example.description}` : ''}`}
@@ -618,7 +606,7 @@ export default function FlowsSidebar({
                           {example.description && <small>{example.description}</small>}
                         </span>
                         <span className="oaiy-flow-add"><Plus size={12} /> Add</span>
-                      </div>
+                      </button>
                     </li>
                   ))}
                 </ul>

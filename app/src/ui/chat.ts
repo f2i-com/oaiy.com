@@ -16,7 +16,7 @@ import type { Vfs } from '../vfs/vfs';
 import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } from '../agent/tools';
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
-import { icon } from './icons';
+import { fileIcon, icon } from './icons';
 import { confirmAction } from './modal';
 import { IN_WINDOW } from './where';
 import { mediaElement, mediaKind, type Media } from './media';
@@ -48,6 +48,13 @@ import { thinkingLabel, thinkingStatus, type ThinkingCount } from './chat/thinki
 import { renderDeliverablesCard } from './chat/deliverablesCard';
 import { SLASH_COMMANDS, attachComposerAutocomplete, type ComposerAutocomplete, type SlashCommandItem } from './chat/mentions';
 import { mountPlanReviewCard, mountQuestionCard } from './chat/questionCard';
+
+/** Format a byte size compactly for attachment chips. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
@@ -160,7 +167,7 @@ export class ChatPane {
   private readonly input = h('textarea.chat-input', { rows: 1, placeholder: 'Ask OAIY…', 'aria-label': 'Message the agent', 'aria-describedby': 'composer-hint', title: 'Enter sends; Shift+Enter starts a new line' }) as HTMLTextAreaElement;
   private readonly send = h('button.send-button', { type: 'button' }) as HTMLButtonElement;
   private readonly attachButton = h('button.attach', { type: 'button', title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, icon('paperclip'), h('span', 'Attach'));
-  private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
+  private readonly picker = h('input.hidden-file-input', { type: 'file', multiple: true });
   private readonly pending = h('div.attachments');
   private files: File[] = [];
   /** What the agent is doing now, at the end of the log; said to a screen reader by `statusSaid`, outside the log. */
@@ -199,7 +206,7 @@ export class ChatPane {
    * after the first message and a "Prompt · 1 message · about 170 tokens" line over every reply, where they read as
    * the agent's words to a person who had asked for neither.
    */
-  private readonly contextPop = h('div.context-pop', { id: 'context-pop', role: 'dialog', 'aria-label': "The model's context", hidden: true });
+  private readonly contextPop = h('div.context-pop', { id: 'context-pop', role: 'dialog', 'aria-label': "The model's context", tabindex: '-1', hidden: true });
   private contextNotes: string[] = [];
   private prompts: Array<{ label: string; counted: boolean; text: () => string }> = [];
   private contextUsed: { used: number; window: number } | null = null;
@@ -341,15 +348,15 @@ export class ChatPane {
     this.clearButton.addEventListener('click', () => void this.askToClear());
     // The meter opens what is behind it; Escape, or a click anywhere else, closes it.
     this.meter.addEventListener('click', () => this.openContext(this.contextPop.hidden, 'top'));
-    // (Escape with the focus on the meter, where a click leaves it, or inside what it opened)
-    for (const el of [this.meter, this.contextPop] as HTMLElement[]) {
-      el.addEventListener('keydown', (e: KeyboardEvent) => {
-        if (e.key !== 'Escape' || this.contextPop.hidden) return;
-        e.stopPropagation();
-        this.openContext(false);
-        (this.contextTrigger === 'bottom' ? (this.statCtxBtn ?? this.meter) : this.meter).focus();
-      });
-    }
+    // (Escape closes the popover from anywhere in the document and returns focus to its trigger)
+    document.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || this.contextPop.hidden) return;
+      if (document.querySelector('dialog[open]')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.openContext(false);
+      (this.contextTrigger === 'bottom' ? (this.statCtxBtn ?? this.meter) : this.meter).focus();
+    });
     document.addEventListener('pointerdown', (e) => {
       if (this.contextPop.hidden) return;
       const at = e.target as Node | null;
@@ -479,13 +486,15 @@ export class ChatPane {
     this.files.forEach((file) => {
       const url = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
       if (url) this.pendingUrls.push(url);
-      const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', icon('file'));
+      const fi = fileIcon(file.name);
+      const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', { class: `tone-${fi.tone}` }, icon(fi.icon));
       this.pending.append(
         h(
           'span.attachment',
           { title: `${file.name} (${file.size.toLocaleString()} bytes)` },
           thumb,
           h('span.attachment-name', file.name),
+          h('span.attachment-size', formatBytes(file.size)),
           // (by the file, not its place: a second click on a row already gone removes nothing else)
           h('button.icon', { type: 'button', title: 'Remove', 'aria-label': `Remove ${file.name}`, onclick: () => {
             this.files = this.files.filter((f) => f !== file);
@@ -841,6 +850,7 @@ export class ChatPane {
     // Only a number can go on the list (a sender's name, such as the carrier's "Missed calls", is never answered anyway).
     this.blockButton.hidden = !person || !this.handlers.block || (person.key ?? '').replace(/\D/g, '').length < 6;
     const blocked = !!person?.blocked;
+    this.blockButton.classList.toggle('blocked', blocked);
     this.blockButton.setAttribute('aria-pressed', String(blocked));
     this.blockButton.lastElementChild!.textContent = blocked ? 'Blocked' : 'Block';
     this.blockButton.title = blocked
@@ -912,9 +922,10 @@ export class ChatPane {
   /** How full the context is: `used` tokens of `window`. */
   showContext(used: number, window: number): void {
     const share = Math.min(1, used / Math.max(1, window));
+    const pct = Math.min(100, Math.round(share * 100));
     this.meter.hidden = false;
-    this.meterFill.style.width = `${Math.round(share * 100)}%`;
-    this.meter.dataset.level = share > 0.9 ? 'high' : share > 0.7 ? 'mid' : 'low';
+    this.meterFill.style.width = `${pct}%`;
+    this.meter.dataset.level = pct >= 85 ? 'high' : pct >= 65 ? 'mid' : 'low';
     this.meterText.textContent = `${formatTokens(used)} / ${formatTokens(window)}`;
     this.contextUsed = { used, window };
     this.drawContext();
@@ -1065,24 +1076,40 @@ export class ChatPane {
       h(
         'div.context-pop-head',
         h('strong.context-pop-title', "The model's context"),
-        ...(this.handlers.compact && used && used.used > 0
-          ? [
-              h(
-                'button.context-compact-btn',
-                {
-                  type: 'button',
-                  disabled: this.busy,
-                  title: this.busy ? 'Wait for the current run to finish before compacting' : 'Prune older tool outputs and summarize earlier turns (/compact)',
-                  onclick: () => {
-                    this.openContext(false);
-                    this.handlers.compact?.();
+        h(
+          'div.context-pop-actions',
+          ...(this.handlers.compact && used && used.used > 0
+            ? [
+                h(
+                  'button.context-compact-btn',
+                  {
+                    type: 'button',
+                    disabled: this.busy,
+                    title: this.busy ? 'Wait for the current run to finish before compacting' : 'Prune older tool outputs and summarize earlier turns (/compact)',
+                    onclick: () => {
+                      this.openContext(false);
+                      this.handlers.compact?.();
+                    },
                   },
-                },
-                icon('layers'),
-                h('span', 'Compact now'),
-              ),
-            ]
-          : []),
+                  icon('layers'),
+                  h('span', 'Compact now'),
+                ),
+              ]
+            : []),
+          h(
+            'button.context-pop-close',
+            {
+              type: 'button',
+              title: 'Close',
+              'aria-label': 'Close context details',
+              onclick: () => {
+                this.openContext(false);
+                (this.contextTrigger === 'bottom' ? (this.statCtxBtn ?? this.meter) : this.meter).focus();
+              },
+            },
+            icon('x'),
+          ),
+        ),
       ),
       ...(used ? [h('p.context-pop-used', used.used ? `${formatTokens(used.used)} of ${formatTokens(used.window)} tokens used by the last step: what the model was sent, and its reply.` : `Room for ${formatTokens(used.window)} tokens. Nothing has been counted yet.`)] : []),
       ...this.contextNotes.map((note) => h('p.context-pop-note', note)),
@@ -1136,16 +1163,18 @@ export class ChatPane {
         this.planOpen = !open;
         this.showPlan(plan, running);
       } },
-      h('span.plan-title', finished ? '✓ Done' : running ? 'Working on' : 'Plan'),
+      h('span.plan-title', ...(finished ? [icon('check', 'plan-title-icon'), 'Done'] : [running ? 'Working on' : 'Plan'])),
       h('span.plan-goal', plan.goal || plan.items.find((i) => i.status === 'active')?.text || ''),
       h('span.plan-count', `${done}/${total}`),
       icon('chevron-down', 'plan-caret'),
     );
-    const bar = h('div.plan-bar', h('span', { style: `width:${Math.round((done / total) * 100)}%` }));
-    const toggle = (label: string, title: string) => h('li.plan-fold', h('button', { type: 'button', title, onclick: () => {
+    const barFill = h('span');
+    barFill.style.width = `${Math.round((done / total) * 100)}%`;
+    const bar = h('div.plan-bar', barFill);
+    const toggle = (label: string, title: string, withCheck = false) => h('li.plan-fold', h('button', { type: 'button', title, onclick: () => {
       this.planAll = !this.planAll;
       this.showPlan(plan, running);
-    } }, label));
+    } }, ...(withCheck ? [icon('check'), h('span', label)] : [label])));
     const current = plan.items.findIndex((i) => i.status === 'active');
     const last = current < 0 ? -1 : current + PLAN_UPCOMING;
     const all = this.planAll || finished;
@@ -1161,11 +1190,11 @@ export class ChatPane {
       rows.push(h(
         `li.plan-item.${item.status}`,
         { class: active && running ? 'running' : '' },
-        h('span.plan-mark', { 'aria-label': item.status }, item.status === 'done' ? '✓' : ''),
+        h('span.plan-mark', { 'aria-label': item.status }, ...(item.status === 'done' ? [icon('check')] : [])),
         h('span.plan-body', h('span.plan-text', `${i + 1}. ${item.text}`), ...(active && running ? [this.planActivity] : [])),
       ));
     });
-    if (!all && done) rows.unshift(toggle(`✓ ${done} step${done > 1 ? 's' : ''} done`, 'Show every step'));
+    if (!all && done) rows.unshift(toggle(`${done} step${done > 1 ? 's' : ''} done`, 'Show every step', true));
     if (!all && hiddenLater) rows.push(toggle(`+${hiddenLater} more`, 'Show every step'));
     if (this.planAll && !finished) rows.push(toggle('Show less', 'Show only the step in progress and the next ones'));
     const list = h('ol.plan-items', ...rows);
@@ -1187,14 +1216,14 @@ export class ChatPane {
     const fresh = !before || (!!after.goal && !!before.goal && after.goal !== before.goal);
     const { done, started } = planChanges(before, after);
     const n = after.items.length;
-    const mark = (cls: string, glyph: string, text: string) => {
+    const mark = (cls: string, iconName: string, text: string) => {
       this.current = null;
-      this.add(h(`div.msg.step${cls}`, h('span.step-icon', glyph), h('span.step-text', { title: text }, text)), 'agent');
+      this.add(h(`div.msg.step${cls}`, h('span.step-icon', icon(iconName)), h('span.step-text', { title: text }, text)), 'agent');
     };
-    if (fresh) mark('.plan-made', '☰', `Plan: ${after.goal || `${n} steps`}${after.goal ? ` (${n} steps)` : ''}`);
-    else if (after.items.map((i) => i.text).join('\n') !== before.items.map((i) => i.text).join('\n')) mark('.plan-changed', '✎', `Plan changed: now ${n} steps`);
-    for (const i of done) mark('.done', '✓', `Step ${i + 1} of ${n} done: ${after.items[i].text}`);
-    for (const i of started) mark('.started', '▶', `Step ${i + 1} of ${n}: ${after.items[i].text}`);
+    if (fresh) mark('.plan-made', 'list', `Plan: ${after.goal || `${n} steps`}${after.goal ? ` (${n} steps)` : ''}`);
+    else if (after.items.map((i) => i.text).join('\n') !== before.items.map((i) => i.text).join('\n')) mark('.plan-changed', 'pencil', `Plan changed: now ${n} steps`);
+    for (const i of done) mark('.done', 'check', `Step ${i + 1} of ${n} done: ${after.items[i].text}`);
+    for (const i of started) mark('.started', 'play', `Step ${i + 1} of ${n}: ${after.items[i].text}`);
     if (done.length || started.length || fresh) this.scroll();
   }
 
@@ -1344,15 +1373,14 @@ export class ChatPane {
     this.input.setSelectionRange(this.input.value.length, this.input.value.length);
   }
 
-  private async copyCode(button: HTMLElement): Promise<void> {
-    const code = button.closest('.code-block')?.querySelector('pre')?.textContent ?? '';
+  private async copyText(text: string, button: HTMLElement): Promise<void> {
     let ok = false;
     try {
-      await navigator.clipboard.writeText(code);
+      await navigator.clipboard.writeText(text);
       ok = true;
     } catch {
       // No clipboard access: copy what is selected the old way.
-      const area = h('textarea', { style: 'position:fixed;opacity:0' }, code) as HTMLTextAreaElement;
+      const area = h('textarea.copy-fallback', text) as HTMLTextAreaElement;
       document.body.append(area);
       area.select();
       ok = document.execCommand('copy');
@@ -1364,6 +1392,11 @@ export class ChatPane {
       button.textContent = 'Copy';
       button.classList.remove('copied');
     }, 1600);
+  }
+
+  private copyCode(button: HTMLElement): Promise<void> {
+    const code = button.closest('.code-block')?.querySelector('pre')?.textContent ?? '';
+    return this.copyText(code, button);
   }
 
   /**
@@ -1379,13 +1412,13 @@ export class ChatPane {
       // A picture the agent made can be flagged: the agent makes it again.
       if (flaggable && this.handlers.flag && mediaKind(path) === 'image') {
         const wrap = h('span.flaggable', media.element);
-        wrap.append(h('button.flag-button', { type: 'button', title: 'Flag this picture: say what is wrong (or let the agent find it), and it is made again', 'aria-label': `Flag ${path}`, onclick: () => this.flagBox(path, wrap) }, '⚑'));
+        wrap.append(h('button.flag-button', { type: 'button', title: 'Flag this picture: say what is wrong (or let the agent find it), and it is made again', 'aria-label': `Flag ${path}`, onclick: () => this.flagBox(path, wrap) }, icon('flag')));
         return wrap;
       }
       return media.element;
     }
-    const glyph = app || /\.softn$/i.test(name) ? 'package' : mediaKind(path) === 'image' ? 'image' : 'file';
-    return h('button.attachment', { type: 'button', title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', icon(glyph)), h('span.attachment-name', name));
+    const fi = app || /\.softn$/i.test(name) ? { icon: 'package', tone: 'package' } : fileIcon(name);
+    return h('button.attachment', { type: 'button', title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', { class: `tone-${fi.tone}` }, icon(fi.icon)), h('span.attachment-name', name));
   }
 
   /**
@@ -1421,7 +1454,7 @@ export class ChatPane {
     const box = h(
       'div.msg.flag-box',
       { 'data-flag': path },
-      h('div.flag-title', `⚑ Flag ${path.split('/').pop() ?? path}`),
+      h('div.flag-title', icon('flag'), h('span', `Flag ${path.split('/').pop() ?? path}`)),
       comment,
       h('div.flag-actions', note, h('button', { type: 'button', onclick: () => done(null) }, 'Cancel'), h('button.primary', { type: 'button', onclick: () => done(comment.value.trim()) }, 'Flag')),
     );
@@ -1670,7 +1703,7 @@ export class ChatPane {
 
   /** A box with the model's thinking: open while streaming, collapsed by default on replay. */
   private thoughtBox(text: string, streaming = false): HTMLElement {
-    const summary = h('summary', icon('sparkle'), h('span.thinking-label', streaming ? 'Thinking…' : 'What the model thought'));
+    const summary = h('summary', icon('sparkle'), h('span.thinking-label', streaming ? 'Thinking…' : 'What the model thought'), icon('chevron-right', 'thinking-caret'));
     const box = h('details.thinking', { open: streaming, class: streaming ? 'streaming' : '' }, summary, h('pre', text));
     summary.addEventListener('click', () => {
       box.dataset.userToggled = '1';
@@ -1836,10 +1869,23 @@ export class ChatPane {
     if (!this.replaying) this.scroll();
   }
 
+  /** Full formatted result text per tool card, for the Result Copy button. */
+  private readonly toolOutputs = new WeakMap<HTMLElement, string>();
+
   /** A tool call's row: what it did in plain words, on what, and (opened) its arguments and result. */
   private toolRow(call: ToolCall, extra = ''): HTMLDetailsElement {
     const prompt = mediaPrompt(call);
     const args = h('div.tool-args');
+    const copyBtn = h('button.tool-copy', {
+      type: 'button',
+      title: 'Copy full tool output',
+      'aria-label': 'Copy tool output',
+      onclick: (e: Event) => {
+        e.stopPropagation();
+        const text = this.toolOutputs.get(card) ?? card.querySelector('.tool-result')?.textContent ?? '';
+        void this.copyText(text, copyBtn);
+      },
+    }, 'Copy');
     const card = h(
       'details.tool',
       { class: extra, 'data-tool': call.name },
@@ -1851,12 +1897,13 @@ export class ChatPane {
         h('span.tool-name', toolLabel(call.name, call.input)),
         h('span.tool-arg', summarizeCall(call)),
         h('span.tool-time'),
+        icon('chevron-right', 'tool-caret'),
         ...(prompt ? [h('span.tool-prompt', { title: prompt }, prompt)] : []),
       ),
       h(
         'div.tool-detail',
         h('div.tool-section', h('div.tool-section-head', h('span', 'Input'), h('code.tool-raw', call.name)), args),
-        h('div.tool-section.tool-output', h('div.tool-section-head', h('span', 'Result')), h('pre.tool-result', 'running…')),
+        h('div.tool-section.tool-output', h('div.tool-section-head', h('span', 'Result'), copyBtn), h('pre.tool-result', 'running…')),
       ),
     ) as HTMLDetailsElement;
     // The arguments (a whole file, sometimes) are laid out when the row is first opened.
@@ -1885,6 +1932,7 @@ export class ChatPane {
     const pre = card.querySelector('.tool-result');
     if (!pre) return;
     const full = prettyResult(content);
+    this.toolOutputs.set(card, full);
     const { text, more } = clip(full);
     // (an address in it, a sign-in page to open, is a link)
     pre.replaceChildren(...linkedText(text || '(nothing)'));
@@ -2162,6 +2210,28 @@ export class ChatPane {
   /** What an agent is doing; `via`, in a person's conversation, the lane it is (their calls' agent, or their texts'). */
   event(e: AgentEvent, via?: 'call' | 'sms' | 'task'): void {
     switch (e.type) {
+      case 'stream_reset':
+        if (this.current) {
+          this.cancelRedraw(this.current.box);
+          this.removeEntry(this.current.box);
+          this.current = null;
+        }
+        if (this.quiet) {
+          this.removeEntry(this.quiet.box);
+          this.quiet = null;
+        }
+        if (this.thinking) {
+          this.cancelRedraw(this.thinking.box);
+          this.removeEntry(this.thinking.box);
+          this.thinking = null;
+        }
+        if (this.draft) {
+          this.cancelRedraw(this.draft.box);
+          this.removeEntry(this.draft.box);
+          this.draft = null;
+          this.draftName = '';
+        }
+        break;
       case 'text': {
         this.doneThinking();
         const why = this.unsaidWhy(via);

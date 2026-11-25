@@ -450,4 +450,12 @@ describe('Transfers', () => {
     expect(text()).toContain('cannot put callers through to you yet');
     expect(host.querySelector('input[type=checkbox]')).toBeNull();
   });
+
+  it('marks every .switch input with role="switch"', async () => {
+    await mount();
+    await click(box('Do not ring me during quiet hours'));
+    const switches = [...host.querySelectorAll<HTMLInputElement>('input.switch')];
+    expect(switches.length).toBe(5);
+    expect(switches.every((el) => el.getAttribute('role') === 'switch')).toBe(true);
+  });
 });

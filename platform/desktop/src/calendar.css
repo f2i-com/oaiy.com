@@ -219,10 +219,10 @@
 }
 .cal-dayhead small { max-width: 100%; overflow: hidden; color: var(--faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .cal-dayhead.is-today .cal-dayname { color: var(--primary-text); }
-.cal-dayhead.is-today strong { background: var(--primary); color: #fff; }
+.cal-dayhead.is-today strong { background: var(--primary-btn); color: #fff; }
 :root:not([data-theme='light']) .cal-dayhead.is-today strong { box-shadow: 0 0 14px color-mix(in srgb, var(--primary) 45%, transparent); }
-.cal-dayhead.is-past strong,
-.cal-dayhead.is-past .cal-dayname { opacity: 0.55; }
+.cal-dayhead.is-past strong { color: var(--muted); }
+.cal-dayhead.is-past .cal-dayname { color: var(--faint); }
 
 .cal-grid-body {
   position: relative;
@@ -565,7 +565,7 @@
   transition: border-color 0.14s, background 0.14s;
 }
 .cal-chip:hover { border-color: var(--primary); }
-.cal-chip.is-on { border-color: var(--primary); background: var(--primary); color: #fff; }
+.cal-chip.is-on { border-color: var(--primary-btn); background: var(--primary-btn); color: #fff; }
 .cal-chip > em { font-size: 10.5px; font-style: normal; opacity: 0.75; }
 .cal-other-time { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
 .cal-other-time > .form-row { flex-basis: 100%; }

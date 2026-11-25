@@ -377,10 +377,15 @@ function SectionTabs({
   const views = section.tabs.map((t) => t.view);
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const i = views.indexOf(view);
-    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
-    if (!step || i < 0) return;
+    if (i < 0) return;
+    let nextIdx = -1;
+    if (e.key === 'ArrowRight') nextIdx = (i + 1) % views.length;
+    else if (e.key === 'ArrowLeft') nextIdx = (i - 1 + views.length) % views.length;
+    else if (e.key === 'Home') nextIdx = 0;
+    else if (e.key === 'End') nextIdx = views.length - 1;
+    if (nextIdx < 0) return;
     e.preventDefault();
-    const next = views[(i + step + views.length) % views.length];
+    const next = views[nextIdx];
     onSelect(next as View);
     requestAnimationFrame(() => document.getElementById(`tab-${next}`)?.focus());
   };
@@ -814,12 +819,12 @@ export default function App() {
   // notice is one line in the header's own row, in the place given below (`top-notices`, between the tabs and the
   // buttons). The box the webview follows (EmbeddedPage) is the same with or without a notice.
 
-  const navButton = (s: NavSection) => {
+  const navButton = (s: NavSection, idPrefix = '') => {
     const Icon = s.icon;
     const active = section?.id === s.id;
     const calling = s.id === 'agent' && onCall;
     const badge = newBadge(s, seen);
-    if (s.sub) return navSub(s, calling);
+    if (s.sub) return navSub(s, calling, idPrefix);
     // What waits on this page: the Calendar's requests and the new messages (a page of its own when no plugin's
     // section holds it), and the computers asking to pair with this one. A count, which stays in the narrow sidebar.
     const count = s.id === 'network' ? netWaiting : s.tabs.reduce((n, t) => n + countOf(t.view), 0);
@@ -831,6 +836,7 @@ export default function App() {
           : s.tabs.some((t) => t.view === 'messages')
             ? `${count} new message${count === 1 ? '' : 's'}`
             : `${count} request${count === 1 ? '' : 's'} waiting`;
+    const onCallId = `${idPrefix}nav-on-call`;
     return (
       <button
         type="button"
@@ -843,7 +849,7 @@ export default function App() {
            all — so name it explicitly. The name stays the section's even on a
            call (scripts find the Agent by it); the call is said in its description. */
         aria-label={counted ? `${s.label}, ${counted}` : s.label}
-        aria-describedby={calling ? 'nav-on-call' : undefined}
+        aria-describedby={calling ? onCallId : undefined}
         title={
           calling
             ? 'Agent: on a call now. Open it to see the call.'
@@ -858,7 +864,7 @@ export default function App() {
         <Icon size={18} />
         <span>{s.label}</span>
         {calling && (
-          <em className="nav-badge on-call" id="nav-on-call">
+          <em className="nav-badge on-call" id={onCallId}>
             On call
           </em>
         )}
@@ -875,7 +881,7 @@ export default function App() {
    * own, indented under it. In the narrow sidebar (icons only) its pages show
    * while one of them is open.
    */
-  const navSub = (s: NavSection, calling: boolean) => {
+  const navSub = (s: NavSection, calling: boolean, idPrefix = '') => {
     const Icon = s.icon;
     const inside = section?.id === s.id;
     const open = isOpen(s.id);
@@ -884,6 +890,8 @@ export default function App() {
     const countText = countWords;
     // The parent's count adds the requests and the new messages: said as what waits for the owner.
     const parentText = (n: number) => (s.tabs.some((t) => t.view === 'messages') && s.tabs.some((t) => t.view === 'calendar') ? `${n} waiting for you` : countText(n, s.tabs.find((t) => countOf(t.view) > 0)?.view));
+    const subId = `${idPrefix}nav-sub-${s.id}`;
+    const onCallId = `${idPrefix}nav-on-call`;
     return (
       <div key={s.id} className={`nav-sub${open ? ' is-expanded' : ''}${inside ? ' has-active' : ''}`}>
         <div className="nav-sub-head">
@@ -894,7 +902,7 @@ export default function App() {
             className={`nav-parent${inside ? ' active' : ''}${calling ? ' on-call' : ''}`}
             aria-current={inside && !open ? 'page' : undefined}
             aria-label={s.label}
-            aria-describedby={calling ? 'nav-on-call' : undefined}
+            aria-describedby={calling ? onCallId : undefined}
             title={s.pluginName ? `${s.label}, from the ${s.pluginName} plugin` : s.label}
             onClick={() => {
               setOpen(s.id, true);
@@ -904,7 +912,7 @@ export default function App() {
             <Icon size={18} />
             <span>{s.label}</span>
             {calling && (
-              <em className="nav-badge on-call" id="nav-on-call">
+              <em className="nav-badge on-call" id={onCallId}>
                 On call
               </em>
             )}
@@ -921,7 +929,7 @@ export default function App() {
             type="button"
             className="nav-toggle"
             aria-expanded={open}
-            aria-controls={`nav-sub-${s.id}`}
+            aria-controls={subId}
             aria-label={open ? `Close the ${s.label} menu` : `Open the ${s.label} menu`}
             title={open ? 'Close this menu' : 'Open this menu'}
             onClick={() => setOpen(s.id, !open)}
@@ -929,7 +937,7 @@ export default function App() {
             <ChevronDown size={15} />
           </button>
         </div>
-        <div className="nav-children" id={`nav-sub-${s.id}`} role="group" aria-label={s.label}>
+        <div className="nav-children" id={subId} role="group" aria-label={s.label}>
           {s.tabs.map((t) => {
             const TabIcon = t.icon;
             const on = t.view === view;
@@ -959,7 +967,7 @@ export default function App() {
     );
   };
 
-  const sidebarContent = (
+  const renderSidebar = (idPrefix = '') => (
       <>
         <div className="brand">
           <strong>OAIY</strong>
@@ -977,7 +985,7 @@ export default function App() {
             // A plugin's own sections are already at the end of their group
             // (sections.ts), after the built-ins, so a plugin extends the app
             // without displacing them.
-            return [heading, navButton(s)];
+            return [heading, navButton(s, idPrefix)];
           })}
         </nav>
 
@@ -1017,13 +1025,15 @@ export default function App() {
     <div className="app-shell">
       <a className="skip" href="#main">Skip to dashboard</a>
       <RingDialog on={phoneOn === true} onShowing={onRingShowing} />
-      <div className="sidebar-rail"><aside className="sidebar">{!menuOpen && sidebarContent}</aside></div>
+      <div className="sidebar-rail" aria-hidden={menuOpen || undefined} inert={menuOpen}>
+        <aside className="sidebar">{renderSidebar()}</aside>
+      </div>
       <dialog ref={menu} id="workspace-navigation" className="workspace-nav-dialog" aria-label="Workspace navigation"
         onCancel={() => setMenuOpen(false)} onClose={() => setMenuOpen(false)}
         onClick={event => { if (event.target === event.currentTarget) setMenuOpen(false); }}>
         {menuOpen && <div className="sidebar">
           <button className="icon-button nav-dismiss" type="button" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={18} /></button>
-          {sidebarContent}
+          {renderSidebar('drawer-')}
         </div>}
       </dialog>
 

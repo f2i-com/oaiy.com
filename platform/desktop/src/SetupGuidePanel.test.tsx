@@ -159,8 +159,9 @@ describe('the setup card', () => {
     expect(host.querySelector('.setup-guide')!.className).not.toContain('is-complete');
     expect(host.textContent).not.toContain('Setup is finished.');
     // Outside the collapsed list: the runtime alone (the model is chosen in Engines).
-    const outside = Array.from(host.querySelectorAll('.setup-guide > .setup-list .setup-step')).map((li) => li.querySelector('strong')?.textContent);
-    expect(outside).toEqual(['Get the flow runtime ready']);
+    const outsideRows = Array.from(host.querySelectorAll('.setup-guide > .setup-list .setup-step'));
+    expect(outsideRows.map((li) => li.querySelector('strong')?.textContent)).toEqual(['Get the flow runtime ready']);
+    expect(outsideRows[0].classList.contains('is-alarm')).toBe(true);
   });
 
   it('says a plugin waits to be trusted under “Something needs a look”, with the way to Plugins', async () => {

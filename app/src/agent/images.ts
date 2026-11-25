@@ -32,7 +32,10 @@ const IMAGE_EXT: Record<string, string> = {
 };
 
 export function imageMimeFor(path: string): string | null {
-  return IMAGE_EXT[path.slice(path.lastIndexOf('.') + 1).toLowerCase()] ?? null;
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  const dot = path.lastIndexOf('.');
+  if (dot <= slash + 1) return null;
+  return IMAGE_EXT[path.slice(dot + 1).toLowerCase()] ?? null;
 }
 
 export const DEFAULT_VIEW_SIZE = 1024;

@@ -82,24 +82,36 @@ interface ToastItemProps {
 
 function ToastItem({ toast, onRemove }: ToastItemProps) {
   const [isExiting, setIsExiting] = useState(false);
+  const [paused, setPaused] = useState(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const remainingRef = useRef<number>(toast.duration ?? 0);
+  const startedAtRef = useRef<number>(0);
 
   useEffect(() => {
-    if (toast.duration && toast.duration > 0) {
-      const exitTimer = setTimeout(() => {
-        setIsExiting(true);
-      }, toast.duration - 300); // Start exit animation 300ms before removal
+    remainingRef.current = toast.duration ?? 0;
+  }, [toast.id, toast.duration]);
 
-      const removeTimer = setTimeout(() => {
-        onRemove(toast.id);
-      }, toast.duration);
+  useEffect(() => {
+    if (!toast.duration || toast.duration <= 0 || paused) return;
 
-      return () => {
-        clearTimeout(exitTimer);
-        clearTimeout(removeTimer);
-      };
-    }
-  }, [toast.id, toast.duration, onRemove]);
+    const remaining = remainingRef.current;
+    startedAtRef.current = Date.now();
+
+    const exitTimer = setTimeout(() => {
+      setIsExiting(true);
+    }, Math.max(0, remaining - 300)); // Start exit animation 300ms before removal
+
+    const removeTimer = setTimeout(() => {
+      onRemove(toast.id);
+    }, Math.max(0, remaining));
+
+    return () => {
+      clearTimeout(exitTimer);
+      clearTimeout(removeTimer);
+      const elapsed = Date.now() - startedAtRef.current;
+      remainingRef.current = Math.max(400, remaining - elapsed);
+    };
+  }, [toast.id, toast.duration, paused, onRemove]);
 
   // Cleanup close timer on unmount
   useEffect(() => {
@@ -127,6 +139,14 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
       // non-errors so the reader announces them at the next pause.
       role={toast.type === 'error' ? 'alert' : 'status'}
       aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
+      onMouseEnter={() => { setIsExiting(false); setPaused(true); }}
+      onMouseLeave={() => setPaused(false)}
+      onFocus={() => { setIsExiting(false); setPaused(true); }}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setPaused(false);
+        }
+      }}
     >
       <Icon size={16} aria-hidden="true" />
       {/* (an error in words: a service's JSON answer by its message, without its HTTP status, lib/readableError.ts) */}

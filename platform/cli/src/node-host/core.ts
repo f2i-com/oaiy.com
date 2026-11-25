@@ -129,8 +129,9 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
   );
   // (the run's signal: a run stopped or timed out stops its request, rather than waiting on it up to ten minutes)
   const stopped = r.signal instanceof AbortSignal ? (r.signal as AbortSignal) : null;
-  if (stopped?.aborted) ac.abort(new Error('Operation aborted by user'));
-  stopped?.addEventListener('abort', () => ac.abort(new Error('Operation aborted by user')), { once: true });
+  const onStop = () => ac.abort(new Error('Operation aborted by user'));
+  if (stopped?.aborted) onStop();
+  else stopped?.addEventListener('abort', onStop, { once: true });
   try {
     // SSRF guard under `oaiy worker` (untrusted URL inputs): block private/loopback/
     // link-local/metadata targets and re-validate every redirect hop. `oaiy run` (no
@@ -235,6 +236,7 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     };
   } finally {
     clearTimeout(timer);
+    stopped?.removeEventListener('abort', onStop);
   }
 }
 
@@ -289,14 +291,18 @@ async function listFolder(args: InvokeArgs): Promise<unknown> {
   }));
 }
 
+const MAX_FILE_CHUNKS = 100_000;
+
 async function readChunkContent(args: InvokeArgs): Promise<string> {
   const a = (args ?? {}) as Record<string, any>;
   const p = resolvePath(String(a.path ?? ''));
-  const start = Math.max(0, Number(a.start ?? 0));
+  const rawStart = Number(a.start ?? 0);
+  const start = Number.isFinite(rawStart) ? Math.max(0, Math.trunc(rawStart)) : 0;
   // Cap the requested length: Buffer.alloc(length) eagerly reserves the full size, so
   // an attacker-supplied length (e.g. 1e11) would OOM the worker before reading a byte.
   const MAX_CHUNK_BYTES = 128 * 1024 * 1024;
-  const length = Math.min(Math.max(0, Number(a.length ?? 0)), MAX_CHUNK_BYTES);
+  const rawLen = Number(a.length ?? 0);
+  const length = Number.isFinite(rawLen) ? Math.min(Math.max(0, Math.trunc(rawLen)), MAX_CHUNK_BYTES) : 0;
   const readAs = a.readAs ?? 'text';
   const fd = await fsp.open(p, 'r');
   try {
@@ -312,12 +318,32 @@ async function readChunkContent(args: InvokeArgs): Promise<string> {
 async function calculateFileChunks(args: InvokeArgs): Promise<unknown> {
   const a = (args ?? {}) as Record<string, any>;
   const orig = String(a.path ?? '');
+  const rawChunkSize = a.chunkSize === undefined || a.chunkSize === null ? 1024 * 1024 : Number(a.chunkSize);
+  if (!Number.isFinite(rawChunkSize) || rawChunkSize <= 0) {
+    throw new Error(`calculate_file_chunks: chunkSize must be a finite positive number (got ${String(a.chunkSize)})`);
+  }
+  const chunkSize = Math.max(1, Math.trunc(rawChunkSize));
+  const rawOverlap = a.overlap === undefined || a.overlap === null ? 0 : Number(a.overlap);
+  if (!Number.isFinite(rawOverlap) || rawOverlap < 0) {
+    throw new Error(`calculate_file_chunks: overlap must be a non-negative finite number (got ${String(a.overlap)})`);
+  }
+  const overlap = Math.trunc(rawOverlap);
+  if (overlap >= chunkSize) {
+    throw new Error(`calculate_file_chunks: overlap (${overlap}) must be less than chunkSize (${chunkSize})`);
+  }
   const size = (await fsp.stat(resolvePath(orig))).size;
-  const chunkSize = Math.max(1, Number(a.chunkSize ?? 1024 * 1024));
-  const overlap = Math.max(0, Number(a.overlap ?? 0));
-  const step = Math.max(1, chunkSize - overlap);
+  const step = chunkSize - overlap;
+  const expectedChunks = size <= chunkSize ? 1 : Math.ceil((size - chunkSize) / step) + 1;
+  if (expectedChunks > MAX_FILE_CHUNKS) {
+    throw new Error(
+      `calculate_file_chunks: requested chunking produces ${expectedChunks} chunks (max ${MAX_FILE_CHUNKS})`,
+    );
+  }
   const starts: number[] = [];
   for (let s = 0; s < size; s += step) {
+    if (starts.length >= MAX_FILE_CHUNKS) {
+      throw new Error(`calculate_file_chunks: exceeds maximum chunk count (${MAX_FILE_CHUNKS})`);
+    }
     starts.push(s);
     if (s + chunkSize >= size) break;
   }

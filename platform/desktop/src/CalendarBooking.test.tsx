@@ -187,4 +187,33 @@ describe('a new booking', () => {
     expect(host.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
     expect(host.querySelector('.cal-when-sum')?.textContent).toBe('Pick a time');
   });
+
+  it('cycles time chips with arrow keys and only marks BookingForm dirty after a user edit', async () => {
+    free.mockResolvedValue(week({ 0: ['08:00', '09:00', '10:00'] }));
+    const onDirty = vi.fn();
+    await act(async () =>
+      root.render(<BookingForm settings={SETTINGS} initial={{ date: day(0) }} submitLabel="Book it" onDirty={onDirty} onSubmit={vi.fn()} onCancel={vi.fn()} />),
+    );
+    await settle();
+    // Auto-picking the initial free slot must not mark a fresh form dirty.
+    expect(onDirty).toHaveBeenLastCalledWith(false);
+
+    const group = host.querySelector<HTMLDivElement>('[role="radiogroup"][aria-label="Morning times"]')!;
+    const chips = () => [...group.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+    expect(chips().map((c) => c.getAttribute('aria-checked'))).toEqual(['true', 'false', 'false']);
+    chips()[0].focus();
+    await act(async () => group.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })));
+    await settle();
+    expect(chips().map((c) => c.getAttribute('aria-checked'))).toEqual(['false', 'true', 'false']);
+    await act(async () => group.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })));
+    await settle();
+    expect(chips().map((c) => c.getAttribute('aria-checked'))).toEqual(['false', 'false', 'true']);
+
+    const name = host.querySelector<HTMLInputElement>('input[placeholder="Who it is for"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(name, 'Sam');
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(onDirty).toHaveBeenLastCalledWith(true);
+  });
 });

@@ -850,7 +850,7 @@ function FindWorkers({
                   {f.addresses[0] && <span className="pairing-origin">{f.addresses[0]}</span>}
                   {!f.compatible && <span className="card-warn">A different version of OAIY Network: update both computers to pair them.</span>}
                 </span>
-                <button className="btn btn-primary btn-tiny" disabled={starting || !!pairing || !f.compatible} onClick={() => void start({ nodeId: f.nodeId })}>
+                <button className="btn-tiny btn-primary" disabled={starting || !!pairing || !f.compatible} onClick={() => void start({ nodeId: f.nodeId })}>
                   Pair
                 </button>
               </div>

@@ -850,6 +850,7 @@ export function ServiceForm({
           Nothing is filled in for the person. A service that takes no model leaves it empty. */}
       <Row
         label="Model"
+        group
         hint={listSaid ? undefined : 'Which model the service runs. List models asks the service for the ones it has; leave it empty for a service that takes none.'}
       >
         <div className="flex gap-2">

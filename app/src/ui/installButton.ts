@@ -5,13 +5,14 @@
  */
 import type { InstallController } from '../pwa/install';
 import { h } from './dom';
+import { icon } from './icons';
 import { modal } from './modal';
 
 /** The one thing to tell someone on iOS Safari. */
 export const IOS_INSTALL_HINT = 'Tap the Share button, then Add to Home Screen.';
 
 export function installButton(install: InstallController): HTMLButtonElement {
-  const button = h('button.install-app', { hidden: true }, 'Install app') as HTMLButtonElement;
+  const button = h('button.install-app', { hidden: true }, icon('download'), 'Install app') as HTMLButtonElement;
   const show = (): void => {
     const state = install.state;
     button.hidden = state !== 'available' && state !== 'ios';

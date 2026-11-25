@@ -108,6 +108,8 @@ struct AttendCheck {
     rows: Vec<(&'static str, usize, usize, f32)>,
     /// (the same set, of; of the layers past a ratio of 1 and of 1)
     picks: [(usize, usize); 2],
+    /// Diagnostic lines collected when `attend_check` is enabled (returned via [`Model::attend_check_report`], never printed from library code).
+    notes: Vec<String>,
 }
 
 impl AttendCheck {
@@ -283,10 +285,15 @@ impl Model {
         bytes
     }
 
+    /// Diagnostic lines from the most recent forward when `attend_on(..., true)` is enabled.
+    pub fn attend_check_report(&self) -> &[String] {
+        &self.attend_found.notes
+    }
+
     /// Whether a forward of `t` rows at `start_pos` makes its attention on the device, the caches brought over to the
     /// side that makes it: a decode step within the device's reach there, anything else here.
     fn attend_where(&mut self, t: usize, start_pos: usize) -> bool {
-        let Model { attend, states, cfg, attend_check, .. } = self;
+        let Model { attend, states, cfg, attend_check, attend_found, .. } = self;
         let Some(dc) = attend.as_mut() else { return false };
         let device = t == 1 && start_pos < dc.reach;
         if device {
@@ -297,7 +304,10 @@ impl Model {
                     let mut back = states.clone();
                     dc.download(cfg, &mut back, start_pos);
                     let same = back.iter().zip(states.iter()).filter(|(a, b)| a.same_as(b)).count();
-                    eprintln!("    attention check: the caches of {start_pos} positions to the device and back, {same} of {} layers' the same", states.len());
+                    attend_found.notes.push(format!(
+                        "attention check: the caches of {start_pos} positions to the device and back, {same} of {} layers' the same",
+                        states.len()
+                    ));
                 }
             }
             dc.newer = if *attend_check { Newer::Neither } else { Newer::Device };
@@ -376,8 +386,8 @@ impl Model {
         if t == 0 || start_pos + t > self.max_seq {
             return Err(Error::Arg(format!("{t} tokens at {start_pos} do not fit max_seq {}", self.max_seq)));
         }
-        let on_device = self.attend_where(t, start_pos);
         self.attend_found = AttendCheck::default();
+        let on_device = self.attend_where(t, start_pos);
         // (an image's tokens take its span's rows in place of their embedding, and no part in the n-grams)
         let pictured = image_rows(&self.images, start_pos, t, d)?;
         self.image_mask = if pictured.iter().any(Option::is_some) { pictured.iter().map(Option::is_some).collect() } else { Vec::new() };
@@ -448,7 +458,8 @@ impl Model {
         }
 
         if on_device && self.attend_check {
-            eprintln!("    {}", self.attend_found.line(start_pos));
+            let summary = self.attend_found.line(start_pos);
+            self.attend_found.notes.push(summary);
         }
         if let Some(gpu) = &self.experts.gpu {
             gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());
@@ -573,7 +584,7 @@ impl Model {
                     if let Some((dc, got)) = checked {
                         match got {
                             Some(got) => compare_check(attend_found, cfg, ly, dc, states, shared, l, start_pos, got, &o, &attn_mix[0]),
-                            None => eprintln!("    attention check: layer {l}'s program could not be made on the device"),
+                            None => attend_found.notes.push(format!("attention check: layer {l}'s program could not be made on the device")),
                         }
                         // (the device's caches then the host's again, as the next layer's step finds them)
                         let picks = ly.attn.roles().2.is_some().then(|| shared.first_picks()).flatten().map(|p| (p, cfg.window_size));

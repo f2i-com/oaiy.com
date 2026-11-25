@@ -605,5 +605,7 @@ describe('RunsPanel', () => {
     runsMock.mockRejectedValue(new Error('bridge is down'));
     await mount();
     expect(text()).toContain('bridge is down');
+    expect(host.querySelector('.empty-state .spin')).toBeNull();
+    expect(host.querySelector('.empty-state.is-loading')).toBeNull();
   });
 });

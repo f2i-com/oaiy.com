@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
+import { AlertCircle, CheckCircle2, Info, X } from 'lucide-react';
 import {
   isPermissionGranted,
   requestPermission,
@@ -167,16 +168,20 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             onFocus={() => hold(t.id, 'focus')}
             onBlur={() => release(t.id, 'focus')}
           >
+            <span className="toast-icon" aria-hidden="true">
+              {t.kind === 'success' ? <CheckCircle2 size={15} /> : t.kind === 'error' ? <AlertCircle size={15} /> : <Info size={15} />}
+            </span>
             <div className="toast-content">
               <div className="toast-title">{t.title}</div>
               {t.body && <div className="toast-body">{t.body}</div>}
             </div>
             <button
+              type="button"
               className="toast-close"
               onClick={() => dismiss(t.id)}
               aria-label="Dismiss"
             >
-              ✕
+              <X size={13} aria-hidden="true" />
             </button>
           </div>
         ))}

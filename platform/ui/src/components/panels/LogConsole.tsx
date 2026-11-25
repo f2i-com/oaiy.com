@@ -1,5 +1,5 @@
-import { memo, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ScrollText, X } from 'lucide-react';
+import { memo, useEffect, useRef, useCallback, useMemo, useState } from 'react';
+import { ArrowDown, ScrollText, Search, X } from 'lucide-react';
 import type { LogEntry } from 'oaiy-core';
 import { CopyButton } from '../ui/CopyButton';
 
@@ -14,6 +14,8 @@ interface LogConsoleProps {
   onClose: () => void;
 }
 
+type LogFilter = 'all' | 'errors' | 'output';
+
 interface LogEntryRowProps {
   log: LogEntry;
   formatTime: (timestamp: number) => string;
@@ -24,14 +26,17 @@ const LogEntryRow = memo(function LogEntryRow({ log, formatTime }: LogEntryRowPr
   const isOutput = log.source === 'Output';
   const isNode = log.source !== 'System' && !isOutput;
   // Where the line came from, as a pill: the run's output, a node, or the system.
-  const pill = isOutput ? 'oaiy-pill ok' : isNode ? 'oaiy-pill accent' : 'oaiy-pill info';
+  const pill = isOutput ? 'oaiy-pill ok' : log.type === 'error' ? 'oaiy-pill err' : isNode ? 'oaiy-pill accent' : 'oaiy-pill info';
   const kind = isOutput ? 'output' : log.type || 'info';
 
   return (
     <div className={`oaiy-log-line ${kind}`}>
       <time>{formatTime(log.timestamp)}</time>
-      <span className={pill}>{isOutput ? 'OUT' : isNode ? 'NODE' : 'SYS'}</span>
-      <span>
+      <span className={pill}>{isOutput ? 'OUT' : log.type === 'error' ? 'ERR' : isNode ? 'NODE' : 'SYS'}</span>
+      <span className="oaiy-log-msg">
+        {isNode && log.source && (
+          <span className="oaiy-log-source" title={log.source}>{log.source}</span>
+        )}
         {log.message}
         {/* Blinking cursor for streaming */}
         {log.isStreaming && <span className="oaiy-log-cursor" />}
@@ -42,22 +47,56 @@ const LogEntryRow = memo(function LogEntryRow({ log, formatTime }: LogEntryRowPr
 
 function LogConsole({ logs, onClear, onClose }: LogConsoleProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [filter, setFilter] = useState<LogFilter>('all');
+  const [query, setQuery] = useState('');
+  const [isScrolledUp, setIsScrolledUp] = useState(false);
+
   // Whether the user is pinned to the bottom — tracked from the scroll event (not
   // measured post-render) so stick-to-bottom only resumes when they're near the
   // bottom; otherwise scrolling up to read history gets yanked back down mid-run.
   const isPinnedRef = useRef(true);
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
-    if (el) isPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    if (!el) return;
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    isPinnedRef.current = pinned;
+    setIsScrolledUp(!pinned && el.scrollHeight > el.clientHeight + 24);
   }, []);
+
+  const errorCount = useMemo(() => logs.filter((l) => l.type === 'error').length, [logs]);
+  const outputCount = useMemo(() => logs.filter((l) => l.source === 'Output').length, [logs]);
+
+  const filteredLogs = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return logs.filter((log) => {
+      if (filter === 'errors' && log.type !== 'error') return false;
+      if (filter === 'output' && log.source !== 'Output') return false;
+      if (q) {
+        const msg = (log.message || '').toLowerCase();
+        const src = (log.source || '').toLowerCase();
+        if (!msg.includes(q) && !src.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [logs, filter, query]);
 
   // Auto-scroll to bottom when new logs arrive — only if already pinned there.
   useEffect(() => {
     const el = scrollRef.current;
     if (el && isPinnedRef.current) {
       el.scrollTop = el.scrollHeight;
+      setIsScrolledUp(false);
     }
-  }, [logs]);
+  }, [filteredLogs]);
+
+  const jumpToLatest = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    isPinnedRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    setIsScrolledUp(false);
+  }, []);
 
   const formatTime = useCallback((timestamp: number) => {
     const date = new Date(timestamp);
@@ -69,23 +108,23 @@ function LogConsole({ logs, onClear, onClose }: LogConsoleProps) {
     });
   }, []);
 
-  // Format all logs as text for copying
+  // Format all visible logs as text for copying
   const logsAsText = useMemo(() => {
-    return logs.map(log => {
+    return filteredLogs.map(log => {
       const time = formatTime(log.timestamp);
-      const source = log.source === 'Output' ? 'OUT' : log.source === 'System' ? 'SYS' : 'NODE';
+      const source = log.source === 'Output' ? 'OUT' : log.source === 'System' ? 'SYS' : `NODE:${log.source}`;
       return `[${time}] [${source}] ${log.message}`;
     }).join('\n');
-  }, [logs, formatTime]);
+  }, [filteredLogs, formatTime]);
 
   return (
     <>
       <div className="oaiy-side-head">
         <h2>
-          Log <small>{logs.length}</small>
+          Log <small>{filteredLogs.length !== logs.length ? `${filteredLogs.length}/${logs.length}` : logs.length}</small>
         </h2>
         <div className="oaiy-side-tools">
-          {logs.length > 0 && <CopyButton text={logsAsText} label="Copy" size="sm" />}
+          {filteredLogs.length > 0 && <CopyButton text={logsAsText} label="Copy" size="sm" />}
           {onClear && logs.length > 0 && (
             <button type="button" onClick={onClear} className="btn btn-ghost btn-sm">
               Clear
@@ -97,23 +136,95 @@ function LogConsole({ logs, onClear, onClose }: LogConsoleProps) {
         </div>
       </div>
 
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        role="log"
-        aria-live="polite"
-        aria-relevant="additions"
-        aria-label="Execution log"
-        className="oaiy-log"
-      >
-        {logs.length === 0 ? (
-          <div className="oaiy-empty bare">
-            <ScrollText size={20} />
-            <p className="oaiy-empty-title">Nothing yet</p>
-            <p className="oaiy-empty-text">Run the flow, and what it says shows here.</p>
+      {logs.length > 0 && (
+        <div className="oaiy-log-bar">
+          <div className="oaiy-log-filters" role="group" aria-label="Filter log lines">
+            <button
+              type="button"
+              className={`oaiy-chip${filter === 'all' ? ' accent' : ''}`}
+              aria-pressed={filter === 'all'}
+              onClick={() => setFilter('all')}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              className={`oaiy-chip${filter === 'errors' ? ' accent' : ''}`}
+              aria-pressed={filter === 'errors'}
+              onClick={() => setFilter('errors')}
+            >
+              Errors{errorCount > 0 ? ` (${errorCount})` : ''}
+            </button>
+            <button
+              type="button"
+              className={`oaiy-chip${filter === 'output' ? ' accent' : ''}`}
+              aria-pressed={filter === 'output'}
+              onClick={() => setFilter('output')}
+            >
+              Output{outputCount > 0 ? ` (${outputCount})` : ''}
+            </button>
           </div>
-        ) : (
-          logs.map((log) => <LogEntryRow key={log.id} log={log} formatTime={formatTime} />)
+          <div className="oaiy-search oaiy-log-search">
+            <Search size={12} />
+            <input
+              ref={searchRef}
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape' && query) { e.stopPropagation(); setQuery(''); } }}
+              placeholder="Filter logs…"
+              aria-label="Filter logs"
+              className="oaiy-input oaiy-input-sm"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => { setQuery(''); searchRef.current?.focus(); }}
+                aria-label="Clear log filter"
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          aria-label="Execution log"
+          className="oaiy-log"
+        >
+          {logs.length === 0 ? (
+            <div className="oaiy-empty bare">
+              <ScrollText size={20} />
+              <p className="oaiy-empty-title">Nothing yet</p>
+              <p className="oaiy-empty-text">Run the flow, and what it says shows here.</p>
+            </div>
+          ) : filteredLogs.length === 0 ? (
+            <div className="oaiy-empty bare">
+              <Search size={18} />
+              <p className="oaiy-empty-title">No matching log lines</p>
+              <p className="oaiy-empty-text">Try another filter or clear the search.</p>
+            </div>
+          ) : (
+            filteredLogs.map((log) => <LogEntryRow key={log.id} log={log} formatTime={formatTime} />)
+          )}
+        </div>
+        {isScrolledUp && filteredLogs.length > 0 && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="oaiy-log-jump"
+            aria-label="Jump to latest log entry"
+          >
+            <ArrowDown size={12} aria-hidden="true" />
+            Jump to latest
+          </button>
         )}
       </div>
     </>
