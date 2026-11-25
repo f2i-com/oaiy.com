@@ -223,12 +223,30 @@ impl Request {
             lora: match j.get("lora") {
                 None | Some(Json::Null) => None,
                 Some(Json::Str(p)) => Some((PathBuf::from(p), 1.0)),
-                Some(l) => Some((
-                    l.get("path").and_then(Json::as_str).filter(|s| !s.trim().is_empty()).map(PathBuf::from).ok_or("lora.path must be a local path")?,
-                    l.get("strength").and_then(Json::as_f64).unwrap_or(1.0),
-                )),
+                Some(l) => {
+                    let path = l
+                        .get("path")
+                        .and_then(Json::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(PathBuf::from)
+                        .ok_or("lora.path must be a local path")?;
+                    let strength = match l.get("strength") {
+                        None | Some(Json::Null) => 1.0,
+                        Some(v) => v
+                            .as_f64()
+                            .filter(|s| s.is_finite() && (-10.0..=10.0).contains(s))
+                            .ok_or("lora.strength must be a finite number between -10 and 10")?,
+                    };
+                    Some((path, strength))
+                }
             },
-            identity_guidance: j.get("identity_guidance").and_then(Json::as_f64).unwrap_or(0.0),
+            identity_guidance: match j.get("identity_guidance") {
+                None | Some(Json::Null) => 0.0,
+                Some(v) => v
+                    .as_f64()
+                    .filter(|g| g.is_finite() && (0.0..=20.0).contains(g))
+                    .ok_or("identity_guidance must be a finite number between 0 and 20")?,
+            },
             image_crf: j.get("image_crf").and_then(Json::as_i64).map(|v| v.clamp(0, 51) as u32),
             identity: j.get("identity").and_then(Json::as_bool).unwrap_or(false),
             soundtrack_mode: match j.get("soundtrack_mode").and_then(Json::as_str).unwrap_or("inpaint") {
@@ -334,6 +352,17 @@ impl Request {
         {
             return Err("video dimensions must be multiples of 32 in 128..1024".into());
         }
+        if self.refine.is_some() && (self.width % 64 != 0 || self.height % 64 != 0) {
+            return Err("two-stage video refinement requires width and height to be multiples of 64".into());
+        }
+        if let Some((_, strength)) = &self.lora {
+            if !strength.is_finite() || !(-10.0..=10.0).contains(strength) {
+                return Err("lora.strength must be a finite number between -10 and 10".into());
+            }
+        }
+        if !self.identity_guidance.is_finite() || !(0.0..=20.0).contains(&self.identity_guidance) {
+            return Err("identity_guidance must be a finite number between 0 and 20".into());
+        }
         if !(9..=121).contains(&self.frames) || (self.frames - 1) % 8 != 0 {
             return Err("frames must be 8k+1 in 9..121".into());
         }
@@ -387,5 +416,86 @@ impl Request {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_request(width: usize, height: usize) -> Request {
+        Request {
+            model: "ltx-2.3".into(),
+            transformer: PathBuf::from("model.safetensors"),
+            text_encoder: PathBuf::from("text.gguf"),
+            tokenizer: None,
+            vae: PathBuf::from("vae.safetensors"),
+            audio_vae: None,
+            audio: false,
+            audio_file: None,
+            speech: None,
+            transcript: None,
+            frames_from_audio: false,
+            a2v_guidance: 3.0,
+            soundtrack_mode: "inpaint".into(),
+            guidance: None,
+            negative_prompt: None,
+            nag: (0.0, 0.0, 0.0),
+            refine: None,
+            sampler: "auto".into(),
+            lora: None,
+            reference_voice: None,
+            identity: false,
+            identity_guidance: 3.0,
+            image_crf: None,
+            output: PathBuf::from("out"),
+            prompt: "a sunny meadow".into(),
+            image: None,
+            end_image: None,
+            cache_dir: None,
+            width,
+            height,
+            frames: 9,
+            fps: 24,
+            seed: 0,
+            device: 0,
+            memory: "auto".into(),
+            ram_bytes: 4 * GIB,
+            vram_bytes: 4 * GIB,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            webgpu: false,
+        }
+    }
+
+    #[test]
+    fn refine_requires_multiple_of_64_dimensions() {
+        let mut r = minimal_request(544, 512);
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
+        r.refine = Some(Refine {
+            transformer: PathBuf::from("distilled.safetensors"),
+            upsampler: PathBuf::from("up.safetensors"),
+        });
+        assert!(r.validate().unwrap_err().contains("multiples of 64"));
+        r.width = 512;
+        r.height = 544;
+        assert!(r.validate().unwrap_err().contains("multiples of 64"));
+        r.height = 512;
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
+    }
+
+    #[test]
+    fn rejects_invalid_lora_strength_and_identity_guidance() {
+        let mut r = minimal_request(512, 512);
+        r.identity_guidance = f64::NAN;
+        assert!(r.validate().unwrap_err().contains("identity_guidance"));
+        r.identity_guidance = 25.0;
+        assert!(r.validate().unwrap_err().contains("identity_guidance"));
+        r.identity_guidance = 3.0;
+        r.lora = Some((PathBuf::from("a.safetensors"), f64::INFINITY));
+        assert!(r.validate().unwrap_err().contains("lora.strength"));
+        r.lora = Some((PathBuf::from("a.safetensors"), 11.0));
+        assert!(r.validate().unwrap_err().contains("lora.strength"));
+        r.lora = Some((PathBuf::from("a.safetensors"), 1.0));
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
     }
 }

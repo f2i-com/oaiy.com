@@ -7,9 +7,18 @@
  */
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
+import { validatePath } from '../core-filesystem/runtime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createInputMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
+
+function formatPath(path: string): string {
+  if (typeof ctx?.formatPath === 'function') return ctx.formatPath(path);
+  if (!path) return '';
+  const normalized = String(path).replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized;
+}
 
 /**
  * Read a file selected by the user
@@ -29,8 +38,11 @@ async function readInputFile(
     throw new Error('Operation aborted by user');
   }
 
+  // Validate path with the shared traversal / Windows device-path guard
+  validatePath(filePath, 'readInputFile');
+
   ctx.onNodeStatus?.(nodeId, 'running');
-  ctx.log('info', `[InputFile] Reading: ${filePath}`);
+  ctx.log('info', `[InputFile] Reading: ${formatPath(filePath)}`);
 
   if (!ctx.tauri) {
     ctx.onNodeStatus?.(nodeId, 'error');

@@ -538,7 +538,7 @@ fn write_f32_slice(out: &mut dyn Write, data: &[f32]) -> std::io::Result<()> {
 
 fn read_f32_vec(input: &mut dyn Read, count: usize) -> oaiy_engine::Result<Vec<f32>> {
     const CHUNK_FLOATS: usize = 16_384;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(CHUNK_FLOATS));
     let mut buf = [0u8; CHUNK_FLOATS * 4];
     let mut remaining = count;
     while remaining > 0 {
@@ -625,48 +625,94 @@ impl Inkling2StateSnapshot {
 
     /// Decode a snapshot streamed from `input` of exact declared byte `length`.
     pub fn read_from(input: &mut dyn Read, length: u64) -> oaiy_engine::Result<Self> {
+        const MAX_POS: u64 = 1 << 24;
+        let mut remaining = length
+            .checked_sub(SNAPSHOT_HEADER_BYTES as u64)
+            .ok_or_else(|| oaiy_engine::Error::Format("truncated Inkling-2 prompt state header".into()))?;
         let mut limited = std::io::BufReader::with_capacity(256 * 1024, input.take(length));
         let mut head = [0u8; SNAPSHOT_HEADER_BYTES];
         limited.read_exact(&mut head)?;
         if &head[..8] != SNAPSHOT_MAGIC {
             return Err(oaiy_engine::Error::Format("invalid Inkling-2 prompt state magic".into()));
         }
-        let read_u64 = |off: usize| -> usize {
-            u64::from_le_bytes(head[off..off + 8].try_into().expect("8 bytes")) as usize
+        let read_u64 = |off: usize| -> u64 {
+            u64::from_le_bytes(head[off..off + 8].try_into().expect("8 bytes"))
         };
-        let pos = read_u64(8);
-        let hidden = read_u64(16);
-        let conv_kernel = read_u64(24);
-        let sliding_window = read_u64(32);
-        let n_slots = read_u64(40);
-        if hidden == 0 || hidden > (1 << 20) || conv_kernel == 0 || conv_kernel > 64 || n_slots == 0 || n_slots > 1024 {
+        let pos_u64 = read_u64(8);
+        let hidden_u64 = read_u64(16);
+        let conv_kernel_u64 = read_u64(24);
+        let sliding_window_u64 = read_u64(32);
+        let n_slots_u64 = read_u64(40);
+        if pos_u64 > MAX_POS
+            || hidden_u64 == 0
+            || hidden_u64 > (1 << 20)
+            || conv_kernel_u64 == 0
+            || conv_kernel_u64 > 64
+            || sliding_window_u64 > MAX_POS
+            || n_slots_u64 == 0
+            || n_slots_u64 > 1024
+            || n_slots_u64
+                .checked_mul(SLOT_HEADER_BYTES as u64)
+                .is_none_or(|need| need > remaining)
+        {
             return Err(oaiy_engine::Error::Format("invalid Inkling-2 prompt state header".into()));
         }
-        let past = conv_kernel.saturating_sub(1);
+        let pos = pos_u64 as usize;
+        let hidden = hidden_u64 as usize;
+        let conv_kernel = conv_kernel_u64 as usize;
+        let sliding_window = sliding_window_u64 as usize;
+        let n_slots = n_slots_u64 as usize;
+        let past_u64 = conv_kernel_u64.saturating_sub(1);
         let mut slots = Vec::with_capacity(n_slots);
         let mut sh = [0u8; SLOT_HEADER_BYTES];
         for _ in 0..n_slots {
+            remaining = remaining
+                .checked_sub(SLOT_HEADER_BYTES as u64)
+                .ok_or_else(|| oaiy_engine::Error::Format("truncated Inkling-2 slot header".into()))?;
             limited.read_exact(&mut sh)?;
             let is_swa = match sh[0] {
                 0 => false,
                 1 => true,
                 _ => return Err(oaiy_engine::Error::Format("invalid Inkling-2 slot swa flag".into())),
             };
-            let kv_dim = u64::from_le_bytes(sh[1..9].try_into().expect("8 bytes")) as usize;
-            let base_pos = u64::from_le_bytes(sh[9..17].try_into().expect("8 bytes")) as usize;
-            let stored_rows = u64::from_le_bytes(sh[17..25].try_into().expect("8 bytes")) as usize;
-            if kv_dim == 0 || kv_dim > (1 << 20) || base_pos.saturating_add(stored_rows) > pos {
+            let kv_dim_u64 = u64::from_le_bytes(sh[1..9].try_into().expect("8 bytes"));
+            let base_pos_u64 = u64::from_le_bytes(sh[9..17].try_into().expect("8 bytes"));
+            let stored_rows_u64 = u64::from_le_bytes(sh[17..25].try_into().expect("8 bytes"));
+            if kv_dim_u64 == 0
+                || kv_dim_u64 > (1 << 20)
+                || base_pos_u64
+                    .checked_add(stored_rows_u64)
+                    .is_none_or(|end| end > pos_u64)
+            {
                 return Err(oaiy_engine::Error::Format("invalid Inkling-2 slot dimensions".into()));
             }
-            let kv_elems = stored_rows
-                .checked_mul(kv_dim)
+            let kv_elems_u64 = stored_rows_u64
+                .checked_mul(kv_dim_u64)
                 .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 kv overflow".into()))?;
-            let kv_conv_elems = past
-                .checked_mul(kv_dim)
+            let kv_conv_elems_u64 = past_u64
+                .checked_mul(kv_dim_u64)
                 .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 kv_conv overflow".into()))?;
-            let post_conv_elems = past
-                .checked_mul(hidden)
+            let post_conv_elems_u64 = past_u64
+                .checked_mul(hidden_u64)
                 .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 post_conv overflow".into()))?;
+            let slot_bytes = kv_elems_u64
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(kv_conv_elems_u64.checked_mul(2)?))
+                .and_then(|n| n.checked_add(post_conv_elems_u64.checked_mul(2)?))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| oaiy_engine::Error::Format("Inkling-2 slot size overflow".into()))?;
+            remaining = remaining
+                .checked_sub(slot_bytes)
+                .ok_or_else(|| oaiy_engine::Error::Format("truncated Inkling-2 slot payload".into()))?;
+            let kv_elems = usize::try_from(kv_elems_u64)
+                .map_err(|_| oaiy_engine::Error::Format("Inkling-2 kv overflow".into()))?;
+            let kv_conv_elems = usize::try_from(kv_conv_elems_u64)
+                .map_err(|_| oaiy_engine::Error::Format("Inkling-2 kv_conv overflow".into()))?;
+            let post_conv_elems = usize::try_from(post_conv_elems_u64)
+                .map_err(|_| oaiy_engine::Error::Format("Inkling-2 post_conv overflow".into()))?;
+            let kv_dim = kv_dim_u64 as usize;
+            let base_pos = base_pos_u64 as usize;
+            let stored_rows = stored_rows_u64 as usize;
             let k_cache = read_f32_vec(&mut limited, kv_elems)?;
             let v_cache = read_f32_vec(&mut limited, kv_elems)?;
             let k_conv = read_f32_vec(&mut limited, kv_conv_elems)?;
@@ -685,6 +731,9 @@ impl Inkling2StateSnapshot {
                 attn_post_conv,
                 ffn_post_conv,
             });
+        }
+        if remaining != 0 {
+            return Err(oaiy_engine::Error::Format("trailing bytes in Inkling-2 prompt state".into()));
         }
         // Reject trailing garbage so corrupted files are caught immediately.
         let mut extra = [0u8; 1];
@@ -867,5 +916,22 @@ mod tests {
         let mut extended = raw.clone();
         extended.push(0);
         assert!(<Arc<Inkling2StateSnapshot> as PromptState>::decode(&extended).is_err());
+
+        // Huge pos / stored_rows / kv_dim header on a small buffer must return Err without OOM.
+        let mut huge = Vec::new();
+        huge.extend_from_slice(SNAPSHOT_MAGIC);
+        huge.extend_from_slice(&(1u64 << 20).to_le_bytes()); // pos
+        huge.extend_from_slice(&(1u64 << 18).to_le_bytes()); // hidden
+        huge.extend_from_slice(&4u64.to_le_bytes()); // conv_kernel
+        huge.extend_from_slice(&1024u64.to_le_bytes()); // sliding_window
+        huge.extend_from_slice(&1u64.to_le_bytes()); // n_slots
+        huge.push(0); // is_swa
+        huge.extend_from_slice(&(1u64 << 18).to_le_bytes()); // kv_dim
+        huge.extend_from_slice(&0u64.to_le_bytes()); // base_pos
+        huge.extend_from_slice(&(1u64 << 20).to_le_bytes()); // stored_rows (2^38 floats!)
+        assert!(<Arc<Inkling2StateSnapshot> as PromptState>::decode(&huge).is_err());
+        // Even with an inflated declared length, chunked reading hits EOF without OOM.
+        let mut cur = std::io::Cursor::new(&huge);
+        assert!(Inkling2StateSnapshot::read_from(&mut cur, 1u64 << 50).is_err());
     }
 }

@@ -83,6 +83,25 @@ function memoryClear(): void {
   memory.clear();
 }
 
+function sanitizeUrlForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    const sensitive = /^(?:api[_-]?key|key|token|access[_-]?token|auth|secret|password|passwd|sig|signature|session|cookie)$/i;
+    for (const k of Array.from(u.searchParams.keys())) {
+      if (sensitive.test(k)) {
+        u.searchParams.set(k, '[REDACTED]');
+      }
+    }
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/:\/\/[^/@\s]+@/, '://[REDACTED]@');
+  }
+}
+
 /**
  * Make an HTTP request (used by Playwright browser integration)
  * Returns: { status: number, headers: object, body: string }
@@ -99,7 +118,7 @@ async function httpRequest(
     throw new Error('Operation aborted by user');
   }
 
-  ctx.log('info', `[Utility] HTTP ${method} ${url}`);
+  ctx.log('info', `[Utility] HTTP ${method} ${sanitizeUrlForLog(url)}`);
 
   try {
     // Use secureFetch if available (handles local network permissions)
@@ -107,6 +126,7 @@ async function httpRequest(
       const fetchOptions: RequestInit = {
         method,
         headers,
+        signal: ctx.abortSignal,
       };
 
       if (body) {
@@ -132,6 +152,7 @@ async function httpRequest(
     const fetchOptions: RequestInit = {
       method,
       headers,
+      signal: ctx.abortSignal,
     };
 
     if (body) {
@@ -190,6 +211,7 @@ async function comfyuiFreeMemory(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(requestBody),
+      signal: ctx.abortSignal,
     });
 
     if (!response.ok) {
@@ -234,7 +256,10 @@ async function getServiceUrl(serviceId: string): Promise<string | null> {
     // Fallback: try the API endpoint if not in Tauri context
     if (ctx.secureFetch || ctx.fetch) {
       const fetchFn = ctx.secureFetch || ctx.fetch;
-      const response = await fetchFn(`http://127.0.0.1:8767/api/services/${serviceId}/port`);
+      const response = await fetchFn(
+        `http://127.0.0.1:8767/api/services/${encodeURIComponent(serviceId)}/port`,
+        { signal: ctx.abortSignal },
+      );
       if (response.ok) {
         const data = await response.json();
         if (data.data?.port) {
@@ -298,9 +323,13 @@ async function ensureService(serviceId: string): Promise<string | null> {
     // Fallback: try the API endpoint if not in Tauri context
     if (ctx.secureFetch || ctx.fetch) {
       const fetchFn = ctx.secureFetch || ctx.fetch;
-      const response = await fetchFn(`http://127.0.0.1:8767/api/services/${serviceId}/ensure`, {
-        method: 'POST',
-      });
+      const response = await fetchFn(
+        `http://127.0.0.1:8767/api/services/${encodeURIComponent(serviceId)}/ensure`,
+        {
+          method: 'POST',
+          signal: ctx.abortSignal,
+        },
+      );
       if (response.ok) {
         const data = await response.json();
         if (data.data?.success && data.data?.port) {

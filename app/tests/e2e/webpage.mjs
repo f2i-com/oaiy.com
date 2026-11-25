@@ -623,6 +623,82 @@ loader.load(
   );
 });
 
+await check('Wave 2 sandbox hardening: JSON.stringify/JSON.parse/toJSON hijack resistance, host window immutability, and setHTMLUnsafe harvesting', async () => {
+  await write({
+    'wave2sec/index.html': `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Wave2 Security</title></head>
+<body>
+<div id="host"></div>
+<p id="result">pending</p>
+<script>
+// Attempt to hijack JSON.stringify / JSON.parse / prototype toJSON hooks to forge host bridge calls.
+const origStringify = JSON.stringify;
+const origParse = JSON.parse;
+JSON.stringify = function () { return '["window"]'; };
+JSON.parse = function () { return { ok: { $h: 1, c: ['Window'] } }; };
+Array.prototype.toJSON = function () { return ['new', 'Function', ['return parent']]; };
+Object.prototype.toJSON = function () { return { $h: 1 }; };
+
+// DOM operations must keep working through captured primordials, unaffected by guest tampering.
+const host = document.getElementById('host');
+let domOk = false;
+if (host) {
+  const probe = document.createElement('span');
+  probe.textContent = 'bridge-intact';
+  host.appendChild(probe);
+  domOk = host.textContent === 'bridge-intact';
+}
+
+// Attempt to mutate host-side window properties through allowed on* vs disallowed globals.
+window.URL = null;
+window.DOMParser = null;
+window.Blob = null;
+
+// Verify setHTMLUnsafe strips scripts and harvests inline on* handlers onto Zipp.
+window.__harvested = 0;
+let unsafeRan = 'unsupported';
+if (typeof host.setHTMLUnsafe === 'function') {
+  host.setHTMLUnsafe('<button id="unsafe-btn" onclick="window.__harvested = 42; document.getElementById(&quot;clicked&quot;).textContent = &quot;zipp-42&quot;">Trigger Unsafe</button><span id="clicked">no</span><scr' + 'ipt>window.__nativeUnsafe = 1;</scr' + 'ipt>');
+  unsafeRan = 'ready';
+}
+
+// Restore guest JSON for reading output cleanly.
+delete Array.prototype.toJSON;
+delete Object.prototype.toJSON;
+JSON.stringify = origStringify;
+JSON.parse = origParse;
+
+document.getElementById('result').textContent = 'domOk:' + domOk + ' unsafe:' + unsafeRan;
+</script>
+</body>
+</html>`,
+  });
+  const checked = await tool('page_check', { path: 'wave2sec/index.html' });
+  expect(!checked.isError, checked.content);
+  const inspected = await tool('page_inspect', {});
+  expect(inspected.content.includes('domOk:true'), inspected.content);
+
+  // Host frame globals must remain untouched and native script inside setHTMLUnsafe must never execute.
+  const hostState = await frame().evaluate(() => ({
+    urlIntact: typeof window.URL === 'function',
+    domParserIntact: typeof window.DOMParser === 'function',
+    blobIntact: typeof window.Blob === 'function',
+    noNativeUnsafe: window.__nativeUnsafe === undefined,
+    hasRawScript: document.querySelector('#host script') !== null,
+    hasRawOnclick: document.querySelector('#unsafe-btn')?.hasAttribute('onclick') === true,
+    supportsSetHTMLUnsafe: typeof Element.prototype.setHTMLUnsafe === 'function',
+  }));
+  expect(
+    hostState.urlIntact && hostState.domParserIntact && hostState.blobIntact && hostState.noNativeUnsafe && !hostState.hasRawScript && !hostState.hasRawOnclick,
+    JSON.stringify(hostState),
+  );
+  if (hostState.supportsSetHTMLUnsafe) {
+    const clicked = await tool('page_interact', { actions: [{ click: 'Trigger Unsafe' }] });
+    expect(!clicked.isError && clicked.content.includes('zipp-42'), clicked.content);
+  }
+});
+
 await browser.close();
 await server.close();
 console.log(failures ? `\n${failures} failed` : '\nall passed');

@@ -119,8 +119,7 @@ export function createTemplateCompiler(
       let outputAssignments = '';
 
       if (outputs.length > 1) {
-        // Multi-output node: need to create suffixed variables
-        // These are always new variables, so always use 'let'
+        // Multi-output node: assign (or declare when not hoisted by loop) suffixed variables
         for (const output of outputs) {
           const suffix = output.varSuffix !== undefined ? output.varSuffix : `_${output.id}`;
           const suffixedVar = `${ctx.outputVar}${suffix}`;
@@ -130,7 +129,7 @@ export function createTemplateCompiler(
 
           if (isMainOutput) {
             // Main output - assign the computed value
-            outputAssignments += `\n  let ${suffixedVar} = ${outputVarName};`;
+            outputAssignments += `\n  ${letOrAssign}${suffixedVar} = ${outputVarName};`;
           } else {
             // Additional output - check if we have a specific variable from additionalOutputs
             const additionalVar = definition.compiler.additionalOutputs?.[output.id];
@@ -138,10 +137,10 @@ export function createTemplateCompiler(
               const varName = additionalVar
                 .replace(/\{\{sanitizedId\}\}/g, ctx.sanitizedId)
                 .replace(/\{\{outputVar\}\}/g, ctx.outputVar);
-              outputAssignments += `\n  let ${suffixedVar} = ${varName};`;
+              outputAssignments += `\n  ${letOrAssign}${suffixedVar} = ${varName};`;
             } else {
               // No specific variable - use null or the output var
-              outputAssignments += `\n  let ${suffixedVar} = ${outputVarName};`;
+              outputAssignments += `\n  ${letOrAssign}${suffixedVar} = ${outputVarName};`;
             }
           }
         }
@@ -150,7 +149,7 @@ export function createTemplateCompiler(
         const output = outputs[0];
         if (output.varSuffix && output.varSuffix !== '') {
           const suffixedVar = `${ctx.outputVar}${output.varSuffix}`;
-          outputAssignments += `\n  let ${suffixedVar} = ${outputVarName};`;
+          outputAssignments += `\n  ${letOrAssign}${suffixedVar} = ${outputVarName};`;
         }
       }
 

@@ -19,6 +19,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import sandboxRuntime from 'virtual:sandbox-runtime';
 import type { CustomNodeUIProps } from '../services/customNodeUILoader';
+import { sanitizeDataForSandbox, sanitizeSandboxUpdates } from '../lib/sandboxData';
+
+export { sanitizeDataForSandbox, sanitizeSandboxUpdates };
 
 const CSP = [
   "default-src 'none'",
@@ -105,8 +108,16 @@ export const SandboxedCustomNodeUI: React.FC<Props> = ({
   dataRef.current = data;
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
-  const onDataChangeRef = useRef(onDataChange);
-  onDataChangeRef.current = onDataChange;
+  // React Flow passes custom node props inside `data` rather than top-level props, so
+  // accept either top-level `onDataChange` or a host-wired `data.onDataChange` callback
+  // (which sanitizeDataForSandbox strips before postMessage into the iframe).
+  const resolvedOnDataChange =
+    onDataChange ??
+    (typeof (data as { onDataChange?: unknown } | undefined)?.onDataChange === 'function'
+      ? ((data as { onDataChange: (updates: Record<string, unknown>) => void }).onDataChange)
+      : undefined);
+  const onDataChangeRef = useRef(resolvedOnDataChange);
+  onDataChangeRef.current = resolvedOnDataChange;
   const readyRef = useRef(false);
 
   const postToFrame = useCallback((msg: Record<string, unknown>) => {
@@ -117,15 +128,20 @@ export const SandboxedCustomNodeUI: React.FC<Props> = ({
     const onMsg = (ev: MessageEvent) => {
       // Only accept messages from OUR iframe.
       if (ev.source !== iframeRef.current?.contentWindow) return;
-      const m = ev.data as { __oaiybox?: string; updates?: Record<string, unknown>; px?: number };
+      const m = ev.data as { __oaiybox?: string; updates?: unknown; px?: number };
       if (!m || typeof m.__oaiybox !== 'string') return;
       if (m.__oaiybox === 'boot') {
         readyRef.current = true;
         postToFrame({ __oaiybox: 'theme', theme: readHostThemeTokens() });
         postToFrame({ __oaiybox: 'init', code, nodeId: nodeTypeId });
-        postToFrame({ __oaiybox: 'props', data: dataRef.current, selected: selectedRef.current });
+        postToFrame({
+          __oaiybox: 'props',
+          data: sanitizeDataForSandbox(dataRef.current),
+          selected: selectedRef.current,
+        });
       } else if (m.__oaiybox === 'dataChange') {
-        onDataChangeRef.current?.(m.updates ?? {});
+        const clean = sanitizeSandboxUpdates(m.updates);
+        if (clean) onDataChangeRef.current?.(clean);
       } else if (m.__oaiybox === 'height' && typeof m.px === 'number' && Number.isFinite(m.px)) {
         setHeight(Math.max(24, Math.min(m.px, 2000)));
       }
@@ -151,9 +167,15 @@ export const SandboxedCustomNodeUI: React.FC<Props> = ({
     return () => observer.disconnect();
   }, [postToFrame]);
 
-  // Push prop changes to the frame once it's booted.
+  // Push prop changes to the frame once it's booted (sanitized for structured clone + secret isolation).
   useEffect(() => {
-    if (readyRef.current) postToFrame({ __oaiybox: 'props', data, selected });
+    if (readyRef.current) {
+      postToFrame({
+        __oaiybox: 'props',
+        data: sanitizeDataForSandbox(data),
+        selected,
+      });
+    }
   }, [data, selected, postToFrame]);
 
   return (

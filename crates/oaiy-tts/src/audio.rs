@@ -51,7 +51,14 @@ pub fn decode_with_ffmpeg(path: &Path, ffmpeg: &Path) -> std::io::Result<Vec<f32
         let log = String::from_utf8_lossy(&out.stderr);
         return Err(err(format!("FFmpeg could not read {}: {}", path.display(), log.lines().last().unwrap_or("").trim())));
     }
-    Ok(out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    Ok(out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| {
+            let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if v.is_finite() { v } else { 0.0 }
+        })
+        .collect())
 }
 
 /// A RIFF WAV of integer PCM (8, 16, 24 or 32 bits) or float (32 or 64
@@ -63,17 +70,25 @@ pub fn parse_wav(bytes: &[u8]) -> std::io::Result<(Vec<Vec<f32>>, usize)> {
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     let (mut format, mut data) = (None, None);
-    let mut at = 12;
-    while at + 8 <= bytes.len() {
+    let mut at: usize = 12;
+    while at.checked_add(8).is_some_and(|end| end <= bytes.len()) {
         let id = &bytes[at..at + 4];
         let size = u32_at(bytes, at + 4) as usize;
-        let body = &bytes[at + 8..(at + 8 + size).min(bytes.len())];
+        let body_start = at + 8;
+        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body = &bytes[body_start..body_end];
         match id {
             b"fmt " if body.len() >= 16 => format = Some(body),
             b"data" => data = Some(body),
             _ => {}
         }
-        at += 8 + size + (size & 1);
+        let next = size
+            .checked_add(size & 1)
+            .and_then(|s| body_start.checked_add(s));
+        match next {
+            Some(pos) if pos > at => at = pos,
+            _ => break,
+        }
     }
     let (fmt, data) = (format.ok_or_else(|| err("WAV without a fmt chunk"))?, data.ok_or_else(|| err("WAV without a data chunk"))?);
     let mut kind = u16_at(fmt, 0);
@@ -102,11 +117,15 @@ pub fn parse_wav(bytes: &[u8]) -> std::io::Result<(Vec<Vec<f32>>, usize)> {
     if width == 0 || sample(&[0; 8]).is_none() {
         return Err(err(format!("WAV format {kind} with {bits}-bit samples is not plain PCM")));
     }
-    let frames = data.len() / (width * channels);
+    let frame_bytes = width
+        .checked_mul(channels)
+        .ok_or_else(|| err("WAV frame size overflow"))?;
+    let frames = data.len() / frame_bytes;
     let mut out = vec![Vec::with_capacity(frames); channels];
-    for f in data.chunks_exact(width * channels) {
+    for f in data.chunks_exact(frame_bytes) {
         for (c, s) in f.chunks_exact(width).enumerate() {
-            out[c].push(sample(s).unwrap_or(0.).clamp(-1., 1.));
+            let v = sample(s).unwrap_or(0.);
+            out[c].push(if v.is_finite() { v.clamp(-1., 1.) } else { 0. });
         }
     }
     Ok((out, rate))
@@ -132,7 +151,10 @@ fn gcd(a: usize, b: usize) -> usize {
 /// side, cut off just below the lower Nyquist frequency. Rational ratios
 /// (every common rate to 24 kHz) use a table of the filter's phases.
 pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
-    if from == to || x.is_empty() {
+    if from == 0 || to == 0 || x.is_empty() {
+        return Vec::new();
+    }
+    if from == to {
         return x.to_vec();
     }
     let g = gcd(from, to);
@@ -219,7 +241,13 @@ pub fn limit_length(x: Vec<f32>, max: usize) -> Vec<f32> {
 
 /// Samples in [-1, 1] as 16-bit PCM.
 pub fn to_pcm16(samples: &[f32]) -> Vec<i16> {
-    samples.iter().map(|s| (s.clamp(-1., 1.) * 32767.).round() as i16).collect()
+    samples
+        .iter()
+        .map(|&s| {
+            let v = if s.is_finite() { s.clamp(-1., 1.) } else { 0. };
+            (v * 32767.).round() as i16
+        })
+        .collect()
 }
 
 /// 16-bit PCM mono WAV bytes.
@@ -284,8 +312,10 @@ mod tests {
         let s24 = build(1, 2, 24, &[0, 0, 0x40, 0, 0, 0xC0]);
         let (ch, rate) = parse_wav(&s24).unwrap();
         assert_eq!((ch, rate), (vec![vec![0.5], vec![-0.5]], 48_000));
-        let f32s: Vec<u8> = [0.25f32, -0.75].iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(parse_wav(&build(3, 1, 32, &f32s)).unwrap().0, vec![vec![0.25, -0.75]]);
+        let f32s: Vec<u8> = [0.25f32, -0.75, f32::NAN, f32::INFINITY].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(parse_wav(&build(3, 1, 32, &f32s)).unwrap().0, vec![vec![0.25, -0.75, 0.0, 0.0]]);
+        assert!(resample(&[1.0, 2.0], 0, 24_000).is_empty());
+        assert!(resample(&[1.0, 2.0], 24_000, 0).is_empty());
         assert!(parse_wav(&build(2, 1, 4, &[0, 0])).is_err(), "ADPCM needs FFmpeg");
         assert!(parse_wav(b"ID3\x04 an mp3").is_err());
         assert_eq!(mix(&[vec![1., 0.5], vec![0., 0.5]]), vec![0.5, 0.5]);

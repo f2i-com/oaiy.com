@@ -166,15 +166,17 @@ export function normalizeSql(sql: string): string {
       out += sql.slice(start, i);
       continue;
     }
-    // Positional placeholder $1, $2, ...
+    // Positional placeholder $1, $2, ... (skip when followed by identifier chars like $1name)
     if (ch === '$' && i + 1 < len && sql[i + 1] >= '0' && sql[i + 1] <= '9') {
       const prev = i > 0 ? sql[i - 1] : '';
       if (!/[A-Za-z0-9_]/.test(prev)) {
         let j = i + 1;
         while (j < len && sql[j] >= '0' && sql[j] <= '9') j++;
-        out += '?' + sql.slice(i + 1, j);
-        i = j;
-        continue;
+        if (j >= len || !/[A-Za-z0-9_]/.test(sql[j])) {
+          out += '?' + sql.slice(i + 1, j);
+          i = j;
+          continue;
+        }
       }
     }
     out += ch;
@@ -188,8 +190,17 @@ export interface QueryResult {
   lastInsertId?: number;
 }
 
+// Cache in-memory fallback SQLite handles by normalized DB name so repeated
+// Database.load() calls for the same flow/DB within a session share tables/rows
+// instead of creating a fresh empty `:memory:` database every time.
+const memoryDbs = new Map<string, SqliteHandle>();
+
 export default class Database {
-  private constructor(private handle: SqliteHandle, public path: string) {}
+  private constructor(
+    private handle: SqliteHandle,
+    public path: string,
+    private memoryName?: string,
+  ) {}
 
   static async load(conn: string): Promise<Database> {
     const { sqlite3, pool } = await getEnv();
@@ -197,12 +208,16 @@ export default class Database {
     let handle: SqliteHandle;
     if (pool) {
       handle = new pool.OpfsSAHPoolDb('/' + name);
+      return new Database(handle, conn);
     } else {
-      // In-memory fallback: namespacing by file name keeps separate flows apart
-      // within a session (no cross-reload persistence in this mode).
-      handle = new sqlite3.oo1.DB(':memory:', 'c');
+      // In-memory fallback: reuse cached handle per logical DB name within the session
+      let cached = memoryDbs.get(name);
+      if (!cached) {
+        cached = new sqlite3.oo1.DB(':memory:', 'c');
+        memoryDbs.set(name, cached);
+      }
+      return new Database(cached, conn, name);
     }
-    return new Database(handle, conn);
   }
 
   async execute(sql: string, params: unknown[] = []): Promise<QueryResult> {
@@ -230,6 +245,9 @@ export default class Database {
   }
 
   async close(): Promise<boolean> {
+    if (this.memoryName && memoryDbs.get(this.memoryName) === this.handle) {
+      memoryDbs.delete(this.memoryName);
+    }
     try {
       this.handle.close();
     } catch {

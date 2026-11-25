@@ -264,18 +264,23 @@ final class Cli
         }
         Paths::ensureDir(dirname($file));
         $ver = (string)$db->val('SELECT sqlite_version()');
-        if (version_compare($ver, '3.27.0', '>=')) {
-            $db->pdo()->exec('VACUUM INTO ' . $db->pdo()->quote($file));
-        } else {
-            $db->pdo()->exec('PRAGMA wal_checkpoint(TRUNCATE)');
-            $db->pdo()->exec('BEGIN EXCLUSIVE');
-            try {
-                if (!copy($db->sqlitePath(), $file)) {
-                    throw new \RuntimeException('cannot copy the database');
+        $old = umask(0177);
+        try {
+            if (version_compare($ver, '3.27.0', '>=')) {
+                $db->pdo()->exec('VACUUM INTO ' . $db->pdo()->quote($file));
+            } else {
+                $db->pdo()->exec('PRAGMA wal_checkpoint(TRUNCATE)');
+                $db->pdo()->exec('BEGIN EXCLUSIVE');
+                try {
+                    if (!copy($db->sqlitePath(), $file)) {
+                        throw new \RuntimeException('cannot copy the database');
+                    }
+                } finally {
+                    $db->pdo()->exec('ROLLBACK');
                 }
-            } finally {
-                $db->pdo()->exec('ROLLBACK');
             }
+        } finally {
+            umask($old);
         }
         @chmod($file, 0600);
     }
@@ -321,8 +326,13 @@ final class Cli
         foreach (['-wal', '-shm', '-journal'] as $s) {
             @unlink($target . $s);
         }
-        if (!copy($src, $target)) {
-            throw new \RuntimeException('cannot put the backup in place; the previous database is at ' . $safety);
+        $old = umask(0177);
+        try {
+            if (!copy($src, $target)) {
+                throw new \RuntimeException('cannot put the backup in place; the previous database is at ' . $safety);
+            }
+        } finally {
+            umask($old);
         }
         @chmod($target, 0600);
         $fresh = $this->ctx();
@@ -343,20 +353,30 @@ final class Cli
         if (file_exists($dir)) {
             throw new \RuntimeException('the export folder already exists');
         }
-        if (Fs::isInside($dir, Paths::publicDir())) {
+        if (Installer::dataInsideWebroot($dir)) {
             throw new \RuntimeException('an export holds the secrets: not inside the web root');
         }
         $ctx = $this->ctx();
         Paths::ensureDir($dir, 0700);
-        $this->vacuumInto($ctx->db, $dir . '/relay.sqlite');
-        copy($this->data . '/config.json', $dir . '/config.json');
-        @chmod($dir . '/config.json', 0600);
         Paths::ensureDir($dir . '/secrets', 0700);
-        foreach (Fs::entries($this->data . '/secrets') as $f) {
-            if (is_file($f)) {
-                copy($f, $dir . '/secrets/' . basename($f));
-                @chmod($dir . '/secrets/' . basename($f), 0600);
+        $this->vacuumInto($ctx->db, $dir . '/relay.sqlite');
+        $old = umask(0177);
+        try {
+            if (!copy($this->data . '/config.json', $dir . '/config.json')) {
+                throw new \RuntimeException('cannot copy config.json');
             }
+            @chmod($dir . '/config.json', 0600);
+            foreach (Fs::entries($this->data . '/secrets') as $f) {
+                if (is_file($f)) {
+                    $dst = $dir . '/secrets/' . basename($f);
+                    if (!copy($f, $dst)) {
+                        throw new \RuntimeException('cannot copy secret ' . basename($f));
+                    }
+                    @chmod($dst, 0600);
+                }
+            }
+        } finally {
+            umask($old);
         }
         $manifest = [];
         foreach (['relay.sqlite', 'config.json'] as $f) {
@@ -386,25 +406,74 @@ final class Cli
         if (!is_string($manifest)) {
             throw new \RuntimeException('not an export folder (no MANIFEST.txt)');
         }
-        foreach (array_filter(explode("\n", $manifest)) as $line) {
-            if (!preg_match('/^([0-9a-f]{64})  ((?:secrets\/)?[A-Za-z0-9._-]+)$/D', $line, $m) || !is_file($dir . '/' . $m[2]) || !hash_equals($m[1], (string)hash_file('sha256', $dir . '/' . $m[2]))) {
+        $verified = [];
+        foreach (explode("\n", str_replace("\r\n", "\n", $manifest)) as $line) {
+            if ($line === '') {
+                continue;
+            }
+            if (!preg_match('/^([0-9a-f]{64})  ((?:secrets\/)?[A-Za-z0-9._-]+)$/D', $line, $m)) {
                 throw new \RuntimeException('the export is damaged or was changed: a file does not match its checksum');
             }
+            $rel = $m[2];
+            $base = basename($rel);
+            if ($base === '.' || $base === '..' || strpos($rel, '..') !== false || isset($verified[$rel])) {
+                throw new \RuntimeException('the export is damaged or was changed: invalid or duplicate manifest entry');
+            }
+            $full = $dir . '/' . $rel;
+            if (!is_file($full) || is_link($full)) {
+                throw new \RuntimeException('the export is damaged or was changed: a file does not match its checksum');
+            }
+            $hash = hash_file('sha256', $full);
+            if (!is_string($hash) || !hash_equals($m[1], $hash)) {
+                throw new \RuntimeException('the export is damaged or was changed: a file does not match its checksum');
+            }
+            $verified[$rel] = $full;
         }
-        if (Fs::isInside($this->data, Paths::publicDir())) {
+        foreach (['relay.sqlite', 'config.json', 'secrets/relay.key', 'secrets/admission.hmac', 'secrets/admin.json'] as $req) {
+            if (!isset($verified[$req])) {
+                throw new \RuntimeException('the export is incomplete: missing ' . $req . ' in MANIFEST.txt');
+            }
+        }
+        $secretFiles = Fs::entries($dir . '/secrets');
+        if ($secretFiles === []) {
+            throw new \RuntimeException('the export is incomplete: secrets folder is missing or empty');
+        }
+        foreach ($secretFiles as $f) {
+            if (!is_file($f) || is_link($f)) {
+                throw new \RuntimeException('the export is damaged or was changed: unexpected entry in secrets/');
+            }
+            if (!isset($verified['secrets/' . basename($f)])) {
+                throw new \RuntimeException('the export is damaged or was changed: unverified file in secrets/');
+            }
+        }
+        if (Installer::dataInsideWebroot($this->data)) {
             throw new \RuntimeException('the data folder is inside the web root');
         }
+        Paths::ensureDir($this->data);
+        Installer::writeGuards($this->data);
         foreach (['secrets', 'holds', 'wake', 'cache', 'backups', 'logs'] as $sub) {
             Paths::ensureDir($this->data . '/' . $sub);
         }
-        copy($dir . '/relay.sqlite', $this->data . '/relay.sqlite');
-        copy($dir . '/config.json', $this->data . '/config.json');
-        foreach (Fs::entries($dir . '/secrets') as $f) {
-            copy($f, $this->data . '/secrets/' . basename($f));
-            @chmod($this->data . '/secrets/' . basename($f), 0600);
+        $old = umask(0177);
+        try {
+            if (!copy($verified['relay.sqlite'], $this->data . '/relay.sqlite')) {
+                throw new \RuntimeException('cannot copy relay.sqlite');
+            }
+            if (!copy($verified['config.json'], $this->data . '/config.json')) {
+                throw new \RuntimeException('cannot copy config.json');
+            }
+            foreach ($secretFiles as $f) {
+                $dst = $this->data . '/secrets/' . basename($f);
+                if (!copy($f, $dst)) {
+                    throw new \RuntimeException('cannot copy secret ' . basename($f));
+                }
+                @chmod($dst, 0600);
+            }
+            @chmod($this->data . '/relay.sqlite', 0600);
+            @chmod($this->data . '/config.json', 0600);
+        } finally {
+            umask($old);
         }
-        @chmod($this->data . '/relay.sqlite', 0600);
-        @chmod($this->data . '/config.json', 0600);
         Paths::writeFile($this->data . '/' . Installer::LOCK, (string)Clock::now() . "\n", 0600);
         $ctx = $this->ctx(); // opens it: schema and config are checked here
         ($this->out)("imported relay " . $ctx->relayId() . ". Identity, tokens and mailboxes are as they were. Point the hostname here and run: php bin/doctor.php\n");

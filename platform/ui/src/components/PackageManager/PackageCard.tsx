@@ -29,7 +29,7 @@ export function PackageCard({
       case 'updating':
         return 'bg-yellow-500';
       default:
-        return 'bg-slate-500';
+        return 'bg-content-faint';
     }
   };
 
@@ -38,25 +38,25 @@ export function PackageCard({
     switch (pkg.trustLevel) {
       case 'trusted':
         return (
-          <span className="px-1.5 py-0.5 text-xs bg-green-100 dark:bg-green-500/20 text-green-600 dark:text-green-400 rounded">
+          <span className="px-1.5 py-0.5 text-xs bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-400 rounded">
             Trusted
           </span>
         );
       case 'verified':
         return (
-          <span className="px-1.5 py-0.5 text-xs bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded">
+          <span className="px-1.5 py-0.5 text-xs bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 rounded">
             Verified
           </span>
         );
       case 'blocked':
         return (
-          <span className="px-1.5 py-0.5 text-xs bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 rounded">
+          <span className="px-1.5 py-0.5 text-xs bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400 rounded">
             Blocked
           </span>
         );
       default:
         return (
-          <span className="px-1.5 py-0.5 text-xs bg-yellow-100 dark:bg-yellow-500/20 text-yellow-600 dark:text-yellow-400 rounded">
+          <span className="px-1.5 py-0.5 text-xs bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400 rounded">
             Untrusted
           </span>
         );
@@ -64,14 +64,14 @@ export function PackageCard({
   };
 
   return (
-    <div className="p-3 bg-slate-100/50 dark:bg-slate-700/50 rounded-lg border border-slate-300/50 dark:border-slate-600/50 hover:border-slate-400/50 dark:hover:border-slate-500/50 transition-colors">
+    <div className="p-3 bg-surface-tertiary/60 rounded-lg border border-edge-primary hover:border-edge-strong transition-colors">
       <div className="flex items-start justify-between gap-3">
         {/* Package icon and info */}
         <div className="flex items-start gap-3 flex-1 min-w-0">
           {/* Icon */}
-          <div className="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center flex-shrink-0">
+          <div className="w-10 h-10 rounded-lg bg-accent/15 flex items-center justify-center flex-shrink-0">
             <svg
-              className="w-5 h-5 text-purple-400"
+              className="w-5 h-5 text-accent"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -88,10 +88,10 @@ export function PackageCard({
           {/* Info */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate">
+              <h3 className="text-sm font-medium text-content-primary truncate">
                 {pkg.name}
               </h3>
-              <span className="text-xs text-slate-500">v{pkg.version}</span>
+              <span className="text-xs text-content-secondary">v{pkg.version}</span>
               {getTrustBadge()}
               {/* Status indicator */}
               <div
@@ -100,12 +100,12 @@ export function PackageCard({
               />
             </div>
             {pkg.description && (
-              <p className="text-xs text-slate-400 truncate mt-0.5">
+              <p className="text-xs text-content-secondary truncate mt-0.5">
                 {pkg.description}
               </p>
             )}
             {pkg.author && (
-              <p className="text-xs text-slate-500 truncate mt-0.5">
+              <p className="text-xs text-content-secondary truncate mt-0.5">
                 by {pkg.author}
               </p>
             )}
@@ -117,7 +117,7 @@ export function PackageCard({
           {installing ? (
             <div className="px-3 py-1.5">
               <svg
-                className="w-4 h-4 text-purple-400 animate-spin"
+                className="w-4 h-4 text-accent animate-spin"
                 fill="none"
                 viewBox="0 0 24 24"
               >
@@ -140,9 +140,10 @@ export function PackageCard({
             <>
               {/* Open button */}
               <button
+                type="button"
                 onClick={onOpen}
                 disabled={disabled || pkg.trustLevel === 'blocked'}
-                className="px-2.5 py-1.5 text-xs font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-2.5 py-1.5 text-xs font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Open package"
               >
                 Open
@@ -150,9 +151,11 @@ export function PackageCard({
 
               {/* Uninstall button */}
               <button
+                type="button"
                 onClick={onUninstall}
                 disabled={disabled || pkg.status === 'running'}
-                className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="Uninstall package"
+                className="p-1.5 text-content-secondary hover:text-red-600 dark:hover:text-red-400 hover:bg-red-500/10 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Uninstall package"
               >
                 <svg

@@ -250,9 +250,14 @@ impl Weights {
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
         if let Some((key, _)) = self.fused_half(name) {
             let mut dims = match self {
-                Self::Gguf { content, .. } => content.tensor_infos[&key].shape.dims().to_vec(),
+                Self::Gguf { content, .. } => content.tensor_infos.get(&key)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?
+                    .shape.dims().to_vec(),
                 Self::Safe(s) => s.info(&key).map_err(candle_core::Error::wrap)?.shape.clone(),
             };
+            if dims.is_empty() || dims[0] % 2 != 0 {
+                candle_core::bail!("{key}: invalid fused half shape {dims:?}");
+            }
             dims[0] /= 2;
             return Ok(dims);
         }
@@ -279,10 +284,21 @@ impl Weights {
             Self::Safe(s) => {
                 let info = s.info(&key).map_err(candle_core::Error::wrap)?.clone();
                 let size = info.dtype.size();
+                let row_bytes = k
+                    .checked_mul(size)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("{name}: row byte size overflow")))?;
+                let out_len = ids
+                    .len()
+                    .checked_mul(k)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("{name}: selection size overflow")))?;
                 let mut file = File::open(s.shard_path(info.shard))?;
-                let (mut row, mut out) = (vec![0u8; k * size], Vec::with_capacity(ids.len() * k));
+                let (mut row, mut out) = (vec![0u8; row_bytes], Vec::with_capacity(out_len));
                 for &id in ids {
-                    file.seek(SeekFrom::Start(info.start + (id as usize * k * size) as u64))?;
+                    let off = (id as u64)
+                        .checked_mul(row_bytes as u64)
+                        .and_then(|o| info.start.checked_add(o))
+                        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: row offset overflow")))?;
+                    file.seek(SeekFrom::Start(off))?;
                     file.read_exact(&mut row)?;
                     let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
                     match info.dtype {
@@ -297,10 +313,24 @@ impl Weights {
             Self::Gguf { content, file } => {
                 let info = content.tensor_infos.get(&key).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?;
                 let t = info.ggml_dtype;
-                let row = k / t.block_size() * t.type_size();
-                let mut bytes = vec![0u8; ids.len() * row];
+                let block_size = t.block_size();
+                if k == 0 || block_size == 0 || k % block_size != 0 {
+                    candle_core::bail!("{name}: row width {k} must be a non-zero multiple of block size {block_size}");
+                }
+                let row = (k / block_size)
+                    .checked_mul(t.type_size())
+                    .ok_or_else(|| candle_core::Error::Msg(format!("{name}: row byte size overflow")))?;
+                let total = ids
+                    .len()
+                    .checked_mul(row)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("{name}: selection byte size overflow")))?;
+                let mut bytes = vec![0u8; total];
                 for (dst, &id) in bytes.chunks_exact_mut(row).zip(ids) {
-                    file.seek(SeekFrom::Start(content.tensor_data_offset + info.offset + (id as usize * row) as u64))?;
+                    let off = (id as u64)
+                        .checked_mul(row as u64)
+                        .and_then(|o| content.tensor_data_offset.checked_add(info.offset)?.checked_add(o))
+                        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: row offset overflow")))?;
+                    file.seek(SeekFrom::Start(off))?;
                     file.read_exact(dst)?;
                 }
                 ggml_file::qtensor_from_ggml(t, &bytes, vec![ids.len(), k], &Device::Cpu)?.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()

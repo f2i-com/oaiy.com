@@ -551,10 +551,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         let i = wg.x * 4096u + j * 256u + t;
         if (i < n) {
             let v = x[row * n + i];
-            if (v > m) {
+            if ((bitcast<u32>(v) & 0x7fffffffu) > 0x7f800000u) {
+                continue;
+            }
+            if (idx == 0xffffffffu) {
+                m = v;
+                idx = i;
+                s = 1.0;
+            } else if (v > m) {
                 s = s * exp(m - v) + 1.0;
                 m = v;
                 idx = i;
+            } else if (v == m) {
+                s += 1.0;
             } else {
                 s += exp(v - m);
             }
@@ -566,15 +575,30 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     workgroupBarrier();
     for (var st = 128u; st > 0u; st /= 2u) {
         if (t < st) {
-            let m1 = mv[t];
-            let m2 = mv[t + st];
             let i1 = mi[t];
             let i2 = mi[t + st];
-            let take = m2 > m1 || (m2 == m1 && i2 < i1);
-            let mm = select(m1, m2, take);
-            ms[t] = ms[t] * exp(m1 - mm) + ms[t + st] * exp(m2 - mm);
-            mv[t] = mm;
-            mi[t] = select(i1, i2, take);
+            if (i2 != 0xffffffffu) {
+                let m2 = mv[t + st];
+                let s2 = ms[t + st];
+                if (i1 == 0xffffffffu) {
+                    mv[t] = m2;
+                    mi[t] = i2;
+                    ms[t] = s2;
+                } else {
+                    let m1 = mv[t];
+                    let s1 = ms[t];
+                    if (m2 > m1) {
+                        mv[t] = m2;
+                        mi[t] = i2;
+                        ms[t] = s1 * exp(m1 - m2) + s2;
+                    } else if (m2 == m1) {
+                        mi[t] = min(i1, i2);
+                        ms[t] = s1 + s2;
+                    } else {
+                        ms[t] = s1 + s2 * exp(m2 - m1);
+                    }
+                }
+            }
         }
         workgroupBarrier();
     }
@@ -607,13 +631,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     var s = 0.0;
     for (var g = t; g < count; g += 256u) {
         let at = 4u * (row * count + g);
-        let m2 = parts[at];
         let i2 = bitcast<u32>(parts[at + 1u]);
-        let take = m2 > m || (m2 == m && i2 < idx);
-        let mm = select(m, m2, take);
-        s = s * exp(m - mm) + parts[at + 2u] * exp(m2 - mm);
-        m = mm;
-        idx = select(idx, i2, take);
+        if (i2 == 0xffffffffu) {
+            continue;
+        }
+        let m2 = parts[at];
+        let s2 = parts[at + 2u];
+        if (idx == 0xffffffffu) {
+            m = m2;
+            idx = i2;
+            s = s2;
+        } else if (m2 > m) {
+            s = s * exp(m - m2) + s2;
+            m = m2;
+            idx = i2;
+        } else if (m2 == m) {
+            s += s2;
+            idx = min(idx, i2);
+        } else {
+            s += s2 * exp(m2 - m);
+        }
     }
     mv[t] = m;
     mi[t] = idx;
@@ -621,22 +658,43 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     workgroupBarrier();
     for (var st = 128u; st > 0u; st /= 2u) {
         if (t < st) {
-            let m1 = mv[t];
-            let m2 = mv[t + st];
             let i1 = mi[t];
             let i2 = mi[t + st];
-            let take = m2 > m1 || (m2 == m1 && i2 < i1);
-            let mm = select(m1, m2, take);
-            ms[t] = ms[t] * exp(m1 - mm) + ms[t + st] * exp(m2 - mm);
-            mv[t] = mm;
-            mi[t] = select(i1, i2, take);
+            if (i2 != 0xffffffffu) {
+                let m2 = mv[t + st];
+                let s2 = ms[t + st];
+                if (i1 == 0xffffffffu) {
+                    mv[t] = m2;
+                    mi[t] = i2;
+                    ms[t] = s2;
+                } else {
+                    let m1 = mv[t];
+                    let s1 = ms[t];
+                    if (m2 > m1) {
+                        mv[t] = m2;
+                        mi[t] = i2;
+                        ms[t] = s1 * exp(m1 - m2) + s2;
+                    } else if (m2 == m1) {
+                        mi[t] = min(i1, i2);
+                        ms[t] = s1 + s2;
+                    } else {
+                        ms[t] = s1 + s2 * exp(m2 - m1);
+                    }
+                }
+            }
         }
         workgroupBarrier();
     }
     if (t == 0u) {
-        out[4u * row] = bitcast<f32>(mi[0]);
-        out[4u * row + 1u] = mv[0];
-        out[4u * row + 2u] = ms[0];
+        if (mi[0] == 0xffffffffu) {
+            out[4u * row] = bitcast<f32>(0u);
+            out[4u * row + 1u] = mv[0];
+            out[4u * row + 2u] = 0.0;
+        } else {
+            out[4u * row] = bitcast<f32>(mi[0]);
+            out[4u * row + 1u] = mv[0];
+            out[4u * row + 2u] = ms[0];
+        }
     }
 }
 "#;

@@ -42,6 +42,10 @@ fn bad(what: impl std::fmt::Display) -> candle_core::Error {
 
 impl YuNet {
     pub fn load(path: &Path, dev: &Device) -> Result<Self> {
+        let len = std::fs::metadata(path)?.len();
+        if len > onnx::MAX_FILE as u64 {
+            return Err(bad("an ONNX file larger than a face detector"));
+        }
         let bytes = std::fs::read(path)?;
         let graph = onnx::read(&bytes).map_err(bad)?;
         if let Some(n) = graph.nodes.iter().find(|n| !OPS.contains(&n.op.as_str())) {
@@ -96,23 +100,72 @@ impl YuNet {
                         return Err(bad(format!("{} resizes other than to the nearest", node.name)));
                     }
                     let scales = node.inputs.get(2).and_then(|n| self.graph.initializers.get(n)).map(|t| t.floats.clone()).unwrap_or_default();
-                    if scales.len() != 4 || scales[0] != 1. || scales[1] != 1. || scales[2].fract() != 0. || scales[3].fract() != 0. {
-                        return Err(bad(format!("{} scales by other than whole numbers", node.name)));
+                    if scales.len() != 4
+                        || scales[0] != 1.
+                        || scales[1] != 1.
+                        || !scales[2].is_finite()
+                        || !scales[3].is_finite()
+                        || scales[2] < 1.
+                        || scales[3] < 1.
+                        || scales[2] > 64.
+                        || scales[3] > 64.
+                        || scales[2].fract() != 0.
+                        || scales[3].fract() != 0.
+                    {
+                        return Err(bad(format!("{} scales by other than valid whole numbers", node.name)));
                     }
                     let x = arg(0)?;
                     let (_, _, h, w) = x.dims4()?;
-                    x.upsample_nearest2d(h * scales[2] as usize, w * scales[3] as usize)?
+                    let out_h = h.checked_mul(scales[2] as usize).ok_or_else(|| bad("resize height overflow"))?;
+                    let out_w = w.checked_mul(scales[3] as usize).ok_or_else(|| bad("resize width overflow"))?;
+                    x.upsample_nearest2d(out_h, out_w)?
                 }
                 "Add" => arg(0)?.broadcast_add(&arg(1)?)?,
                 "Transpose" => {
-                    let perm: Vec<usize> = node.ints("perm").ok_or_else(|| bad("a transpose without its order"))?.iter().map(|&p| p as usize).collect();
+                    let perm: Vec<usize> = node
+                        .ints("perm")
+                        .ok_or_else(|| bad("a transpose without its order"))?
+                        .iter()
+                        .map(|&p| usize::try_from(p).map_err(|_| bad("negative transpose axis")))
+                        .collect::<Result<Vec<_>>>()?;
                     arg(0)?.permute(perm)?.contiguous()?
                 }
                 "Reshape" => {
                     let x = arg(0)?;
                     let shape = node.inputs.get(1).and_then(|n| self.ints.get(n)).ok_or_else(|| bad("a reshape to a shape it computes"))?;
-                    let known: usize = shape.iter().enumerate().map(|(i, &d)| if d == 0 { x.dims()[i] } else if d < 0 { 1 } else { d as usize }).product();
-                    let dims: Vec<usize> = shape.iter().enumerate().map(|(i, &d)| if d == 0 { x.dims()[i] } else if d < 0 { x.elem_count() / known.max(1) } else { d as usize }).collect();
+                    let x_dims = x.dims();
+                    let mut neg_count = 0usize;
+                    let mut known = 1usize;
+                    for (i, &d) in shape.iter().enumerate() {
+                        let dim = if d == 0 {
+                            *x_dims.get(i).ok_or_else(|| bad(format!("{} reshape axis {i} out of bounds", node.name)))?
+                        } else if d == -1 {
+                            neg_count += 1;
+                            if neg_count > 1 {
+                                return Err(bad(format!("{} reshape has multiple -1 dims", node.name)));
+                            }
+                            1
+                        } else if d < -1 {
+                            return Err(bad(format!("{} reshape has invalid dim {d}", node.name)));
+                        } else {
+                            usize::try_from(d).map_err(|_| bad(format!("{} reshape dim overflow", node.name)))?
+                        };
+                        known = known.checked_mul(dim).ok_or_else(|| bad(format!("{} reshape shape overflow", node.name)))?;
+                    }
+                    let mut dims = Vec::with_capacity(shape.len());
+                    for (i, &d) in shape.iter().enumerate() {
+                        let dim = if d == 0 {
+                            x_dims[i]
+                        } else if d == -1 {
+                            if known == 0 || x.elem_count() % known != 0 {
+                                return Err(bad(format!("{} reshape cannot infer -1 dim", node.name)));
+                            }
+                            x.elem_count() / known
+                        } else {
+                            d as usize
+                        };
+                        dims.push(dim);
+                    }
                     x.reshape(dims)?
                 }
                 "Sigmoid" => candle_nn::ops::sigmoid(&arg(0)?)?,
@@ -128,11 +181,21 @@ impl YuNet {
         let strides = node.ints("strides").unwrap_or(&[1, 1]);
         let pads = node.ints("pads").unwrap_or(&[0, 0, 0, 0]);
         let dilations = node.ints("dilations").unwrap_or(&[1, 1]);
-        let group = node.int("group").unwrap_or(1) as usize;
-        if strides.len() != 2 || strides[0] != strides[1] || pads.len() != 4 || pads.iter().any(|&p| p != pads[0]) || dilations != [1, 1] {
+        let group_i = node.int("group").unwrap_or(1);
+        if strides.len() != 2
+            || strides[0] != strides[1]
+            || strides[0] <= 0
+            || pads.len() != 4
+            || pads.iter().any(|&p| p != pads[0] || p < 0)
+            || dilations != [1, 1]
+            || group_i <= 0
+        {
             return Err(bad(format!("{} is a convolution of a kind it does not have", node.name)));
         }
-        let y = x.conv2d(w, pads[0] as usize, strides[0] as usize, 1, group)?;
+        let pad = usize::try_from(pads[0]).map_err(|_| bad("conv pad overflow"))?;
+        let stride = usize::try_from(strides[0]).map_err(|_| bad("conv stride overflow"))?;
+        let group = usize::try_from(group_i).map_err(|_| bad("conv group overflow"))?;
+        let y = x.conv2d(w, pad, stride, 1, group)?;
         match b {
             Some(b) => y.broadcast_add(&b.reshape((1, (), 1, 1))?),
             None => Ok(y),
@@ -164,19 +227,25 @@ impl YuNet {
         for stride in STRIDES {
             let (cols, rows) = (pw / stride, ph / stride);
             let (cls, obj, bbox, kps) = (flat(format!("cls_{stride}"))?, flat(format!("obj_{stride}"))?, flat(format!("bbox_{stride}"))?, flat(format!("kps_{stride}"))?);
-            if cls.len() != rows * cols || bbox.len() != rows * cols * 4 || kps.len() != rows * cols * 10 {
+            if cls.len() != rows * cols || obj.len() != rows * cols || bbox.len() != rows * cols * 4 || kps.len() != rows * cols * 10 {
                 return Err(bad("its outputs are not the picture's size"));
             }
             let s = stride as f32;
             for r in 0..rows {
                 for c in 0..cols {
                     let i = r * cols + c;
+                    if !cls[i].is_finite() || !obj[i].is_finite() {
+                        continue;
+                    }
                     let score = (cls[i].clamp(0., 1.) * obj[i].clamp(0., 1.)).sqrt();
-                    if score < score_threshold {
+                    if !score.is_finite() || score < score_threshold {
                         continue;
                     }
                     let (cx, cy) = ((c as f32 + bbox[i * 4]) * s, (r as f32 + bbox[i * 4 + 1]) * s);
                     let (w, h) = (bbox[i * 4 + 2].exp() * s, bbox[i * 4 + 3].exp() * s);
+                    if !cx.is_finite() || !cy.is_finite() || !w.is_finite() || !h.is_finite() || w <= 0. || h <= 0. {
+                        continue;
+                    }
                     let mut landmarks = [0f32; 10];
                     for n in 0..5 {
                         landmarks[2 * n] = (kps[i * 10 + 2 * n] + c as f32) * s;
@@ -196,22 +265,29 @@ impl YuNet {
 /// OpenCV's `NMSBoxes` on its whole-pixel boxes (each coordinate cut to an integer): candidates above the threshold,
 /// best first (ties in their order), each kept unless it overlaps one already kept by more than `nms_threshold`.
 fn suppress(faces: &[Face], score_threshold: f32, nms_threshold: f32, top_k: usize) -> Vec<usize> {
-    let boxes: Vec<[i64; 4]> = faces.iter().map(|f| [f.x as i64, f.y as i64, f.w as i64, f.h as i64]).collect();
-    let mut order: Vec<usize> = (0..faces.len()).filter(|&i| faces[i].score > score_threshold).collect();
-    order.sort_by(|&a, &b| faces[b].score.partial_cmp(&faces[a].score).unwrap_or(std::cmp::Ordering::Equal));
+    let to_coord = |v: f32| if v.is_finite() { v.clamp(-1e7, 1e7) as i128 } else { 0 };
+    let to_size = |v: f32| if v.is_finite() { v.clamp(0., 1e7) as i128 } else { 0 };
+    let boxes: Vec<[i128; 4]> = faces.iter().map(|f| [to_coord(f.x), to_coord(f.y), to_size(f.w), to_size(f.h)]).collect();
+    let mut order: Vec<usize> = (0..faces.len()).filter(|&i| faces[i].score.is_finite() && faces[i].score >= score_threshold).collect();
+    order.sort_by(|&a, &b| faces[b].score.total_cmp(&faces[a].score).then(a.cmp(&b)));
     if top_k > 0 && top_k < order.len() {
         order.truncate(top_k);
     }
-    let overlap = |a: [i64; 4], b: [i64; 4]| -> f32 {
-        let (area_a, area_b) = (a[2] * a[3], b[2] * b[3]);
-        if area_a + area_b <= 0 {
+    let overlap = |a: [i128; 4], b: [i128; 4]| -> f32 {
+        let (area_a, area_b) = (a[2].saturating_mul(a[3]), b[2].saturating_mul(b[3]));
+        let area_sum = area_a.saturating_add(area_b);
+        if area_sum <= 0 {
             return 1.;
         }
         let (x1, y1) = (a[0].max(b[0]), a[1].max(b[1]));
-        let (x2, y2) = ((a[0] + a[2]).min(b[0] + b[2]), (a[1] + a[3]).min(b[1] + b[3]));
-        let inter = if x2 > x1 && y2 > y1 { ((x2 - x1) * (y2 - y1)) as f64 } else { 0. };
+        let (x2, y2) = (a[0].saturating_add(a[2]).min(b[0].saturating_add(b[2])), a[1].saturating_add(a[3]).min(b[1].saturating_add(b[3])));
+        let inter = if x2 > x1 && y2 > y1 { (x2 - x1).saturating_mul(y2 - y1) as f64 } else { 0. };
         // OpenCV's `rectOverlap`: one less its Jaccard distance, the distance cut to a float first.
-        let distance = 1. - inter / ((area_a + area_b) as f64 - inter);
+        let denom = area_sum as f64 - inter;
+        if denom <= 0. {
+            return 1.;
+        }
+        let distance = 1. - inter / denom;
         1. - distance as f32
     };
     let mut kept: Vec<usize> = Vec::new();

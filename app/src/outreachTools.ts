@@ -106,7 +106,9 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
         const why = await deps.ready(kind);
         if (why) throw new Error(why);
         if (e.campaigns.filter((c) => c.state === 'running').length >= MAX_RUNNING) throw new Error(`${MAX_RUNNING} outreach lists are running already: wait for one to finish, or stop one (outreach_stop)`);
-        const plan = e.plan(input, await deps.screening().catch(() => null));
+        const screening = await deps.screening().catch(() => null);
+        if (!screening) throw new Error("could not read the phone's screening settings: try again once the phone answers");
+        const plan = e.plan(input, screening);
         if (typeof plan === 'string') throw new Error(plan);
         if (!(await deps.approve(plan))) return 'The person declined, so nothing was sent or dialled. Do not start it again unless they ask.';
         const c = await e.create(plan, deps.origin());

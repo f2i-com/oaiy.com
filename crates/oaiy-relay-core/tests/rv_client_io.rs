@@ -1036,20 +1036,20 @@ fn evidence_the_file_store_only_grows() {
 /// says ten years ahead included. Now `relay_now` stays empty (the local clock is used) and the clocks are reported as differing.
 #[test]
 fn the_first_relay_time_sample_is_not_believed_when_it_is_a_day_or_more_from_the_wall_clock() {
-    // `GET /v1/health` needs no proof and no credential, and every response is sampled.
+    // Verified `prove()` responses sample `X-OAIY-Time`; a sample a day or more from the wall clock is not believed.
     let clock = Arc::new(oaiy_relay_core::testing::FakeClock::new(T0));
     let lie = Arc::new(Mutex::new(T0 + 10 * 365 * 86_400));
     let l2 = lie.clone();
-    let http = ScriptedHttp::new(move |_| Ok(json_response(200, &[], r#"{"ok":true,"time":1,"authHeaderSeen":false}"#, *l2.lock().unwrap())));
+    let stub = StubRelay::with_clocks(quick(), move || *l2.lock().unwrap(), || Duration::ZERO);
     let client = RelayClient::new(
         RelayUrl::parse("https://relay.stub.test").unwrap(),
-        None,
-        Arc::new(http),
+        Some(stub.relay_thumbprint()),
+        Arc::new(stub),
         clock.clone(),
         Box::new(oaiy_relay_core::testing::SeededRng::new(1)),
         ClientConfig::default(),
     );
-    client.health(&Cancel::new()).unwrap();
+    client.prove(&Cancel::new()).unwrap();
     println!("after one response: relay_now = {:?}; clock_mismatch = {}", client.relay_now(), client.clock_mismatch());
     assert_eq!(client.relay_now(), None, "a relay that says it is ten years later does not set the time windows are judged by");
     assert_eq!(client.relay_now_or_local(), T0, "the local clock is used");
@@ -1057,18 +1057,18 @@ fn the_first_relay_time_sample_is_not_believed_when_it_is_a_day_or_more_from_the
     // A relay at the largest time the header grammar allows (16 digits) does not overflow anything.
     *lie.lock().unwrap() = 9_999_999_999_999_999;
     for _ in 0..8 {
-        client.health(&Cancel::new()).unwrap();
+        client.prove(&Cancel::new()).unwrap();
     }
     assert_eq!(client.relay_now(), None);
     // And a relay that goes back to the past.
     *lie.lock().unwrap() = 0;
     for _ in 0..8 {
-        client.health(&Cancel::new()).unwrap();
+        client.prove(&Cancel::new()).unwrap();
     }
     assert_eq!(client.relay_now(), None);
     // A relay that tells the time (a few seconds off) is believed from its next answer.
     *lie.lock().unwrap() = T0 + 3;
-    client.health(&Cancel::new()).unwrap();
+    client.prove(&Cancel::new()).unwrap();
     assert_eq!(client.relay_now(), Some(T0 + 3));
     assert!(!client.clock_mismatch());
 }
@@ -1118,18 +1118,18 @@ fn finding_the_relay_time_does_not_follow_a_step_of_the_wall_clock() {
         move || T0 + c.monotonic().as_secs() as i64
     };
     let t2 = truth.clone();
-    let http = ScriptedHttp::new(move |_| Ok(json_response(200, &[], r#"{"ok":true,"time":1,"authHeaderSeen":false}"#, t2())));
+    let stub = StubRelay::with_clocks(quick(), move || t2(), || Duration::ZERO);
     let client = RelayClient::new(
         RelayUrl::parse("https://relay.stub.test").unwrap(),
-        None,
-        Arc::new(http),
+        Some(stub.relay_thumbprint()),
+        Arc::new(stub),
         clock.clone(),
         Box::new(oaiy_relay_core::testing::SeededRng::new(1)),
         ClientConfig::default(),
     );
-    client.health(&Cancel::new()).unwrap();
+    client.prove(&Cancel::new()).unwrap();
     clock.advance(Duration::from_secs(100));
-    client.health(&Cancel::new()).unwrap();
+    client.prove(&Cancel::new()).unwrap();
     assert_eq!(client.relay_now().unwrap(), truth());
     // The owner (or NTP) sets the PC's clock forward by an hour.
     clock.step_wall(3600);
@@ -1137,7 +1137,7 @@ fn finding_the_relay_time_does_not_follow_a_step_of_the_wall_clock() {
     // Ten minutes later, with a sample every ten seconds.
     for _ in 0..60 {
         clock.advance(Duration::from_secs(10));
-        client.health(&Cancel::new()).unwrap();
+        client.prove(&Cancel::new()).unwrap();
     }
     let later = client.relay_now().unwrap() - truth();
     println!("relay_now is wrong by {right_after} s at once after a 3600 s step, and still by {later} s ten minutes and sixty good samples later");

@@ -419,10 +419,19 @@ impl Store {
             let b = file.tensor(&b_name, &Device::Cpu, false)?;
             // A is (rank, in) and B (out, rank); B A must be the weight's shape
             // (an NVFP4 weight stores half its columns).
-            let columns = if self.nvfp4(&weight) { info.shape[1] * 2 } else { info.shape[1] };
+            if info.shape.len() != 2 {
+                candle_core::bail!("LoRA {} for {weight}: expected 2D weight, got {:?}", path.display(), info.shape);
+            }
+            let columns = if self.nvfp4(&weight) {
+                info.shape[1]
+                    .checked_mul(2)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("LoRA {} for {weight}: column count overflow", path.display())))?
+            } else {
+                info.shape[1]
+            };
             let (out, rank) = b.dims2()?;
             let (rank_a, inner) = a.dims2()?;
-            if rank != rank_a || info.shape.len() != 2 || out != info.shape[0] || inner != columns {
+            if rank != rank_a || out != info.shape[0] || inner != columns {
                 candle_core::bail!("LoRA {} for {weight}: B {:?} A {:?} do not make its {:?}", path.display(), b.dims(), a.dims(), info.shape);
             }
             self.lora.insert(weight, LoraPair { a, b });
@@ -607,6 +616,7 @@ impl Store {
         if !matches!(stored, Dtype::BF16 | Dtype::F16 | Dtype::F32 | Dtype::F8E4M3 | Dtype::I8) {
             candle_core::bail!("unsupported embedding dtype {stored:?}");
         }
+        let rows = info.shape[0];
         let width = info.shape[1];
         let row_bytes = width
             .checked_mul(stored.size())
@@ -621,7 +631,7 @@ impl Store {
             let offset = (id as u64)
                 .checked_mul(row_bytes as u64)
                 .ok_or_else(|| candle_core::Error::Msg("embedding offset overflow".into()))?;
-            if offset + row_bytes as u64 > info.nbytes {
+            if offset.checked_add(row_bytes as u64).is_none_or(|end| end > info.nbytes) {
                 candle_core::bail!("embedding row outside tensor");
             }
             file.seek(SeekFrom::Start(info.start.checked_add(offset).ok_or_else(
@@ -632,7 +642,12 @@ impl Store {
         self.disk_bytes += size as u64;
         let scale = match self.scale(key)? {
             // A per-row scale follows the selected rows.
-            Some(s) if s.len() > 1 => Some(ids.iter().map(|&i| s[i as usize]).collect()),
+            Some(s) if s.len() > 1 => {
+                if s.len() != rows {
+                    candle_core::bail!("LTX tensor {key}: per-row scale length {} does not match {rows} rows", s.len());
+                }
+                Some(ids.iter().map(|&i| s[i as usize]).collect())
+            }
             other => other,
         };
         decode(key, stored, &[ids.len(), width], &bytes, scale.as_deref(), dev)

@@ -120,6 +120,12 @@ fn read_at(file: &mut File, start: u64, len: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Caps for untrusted archive metadata / pickle graphs.
+const MAX_TAR_META: u64 = 1 << 20;
+const MAX_PICKLE_BYTES: u64 = 64 << 20;
+const MAX_PICKLE_NODES: usize = 2_000_000;
+const MAX_PICKLE_DEPTH: usize = 128;
+
 /// The members of a POSIX (ustar or GNU) tar: name and data span. Long names
 /// (GNU `L` records and pax `path=` headers) are followed.
 fn tar_members(file: &mut File) -> Result<Vec<(String, Span)>> {
@@ -127,7 +133,7 @@ fn tar_members(file: &mut File) -> Result<Vec<(String, Span)>> {
     let mut out = Vec::new();
     let mut at = 0u64;
     let mut long_name: Option<String> = None;
-    while at + 512 <= size {
+    while at.checked_add(512).is_some_and(|end| end <= size) {
         let h = read_at(file, at, 512)?;
         if h.iter().all(|&b| b == 0) {
             break;
@@ -139,23 +145,33 @@ fn tar_members(file: &mut File) -> Result<Vec<(String, Span)>> {
         };
         let octal = field(124, 136);
         let len = if h[124] & 0x80 != 0 {
-            // GNU base-256 size.
-            h[125..136].iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
+            // GNU base-256 size (must be non-negative and fit u64).
+            if h[124] != 0x80 || h[125..128].iter().any(|&b| b != 0) {
+                return Err(bad("tar: member size overflows u64"));
+            }
+            h[128..136].iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
         } else {
             u64::from_str_radix(octal.trim_matches(|c: char| c == ' ' || c == '\0'), 8).map_err(|_| bad(format!("tar: bad size {octal:?}")))?
         };
         let kind = h[156];
-        let data = at + 512;
-        let padded = len.div_ceil(512) * 512;
-        if data + len > size {
+        let data = at.checked_add(512).ok_or_else(|| bad("tar: offset overflow"))?;
+        let padded = len.div_ceil(512).checked_mul(512).ok_or_else(|| bad("tar: member size overflow"))?;
+        let end = data.checked_add(len).ok_or_else(|| bad("tar: member end overflow"))?;
+        if end > size {
             return Err(bad("tar: a member runs past the end of the file"));
         }
         match kind {
             b'L' => {
+                if len > MAX_TAR_META {
+                    return Err(bad("tar: long-name metadata record too large"));
+                }
                 let n = read_at(file, data, len as usize)?;
                 long_name = Some(String::from_utf8_lossy(&n).trim_end_matches('\0').to_string());
             }
             b'x' => {
+                if len > MAX_TAR_META {
+                    return Err(bad("tar: pax metadata record too large"));
+                }
                 let n = read_at(file, data, len as usize)?;
                 for rec in String::from_utf8_lossy(&n).lines() {
                     if let Some(p) = rec.split_once(' ').and_then(|(_, kv)| kv.strip_prefix("path=")) {
@@ -171,7 +187,7 @@ fn tar_members(file: &mut File) -> Result<Vec<(String, Span)>> {
             }
             _ => long_name = None,
         }
-        at = data + padded;
+        at = data.checked_add(padded).ok_or_else(|| bad("tar: offset overflow"))?;
     }
     Ok(out)
 }
@@ -185,12 +201,19 @@ impl NemoArchive {
         let pkl = entries.keys().find(|k| k.ends_with("/data.pkl")).cloned().ok_or_else(|| bad("the checkpoint has no data.pkl"))?;
         let folder = pkl.trim_end_matches("/data.pkl").to_string();
         let span = entries[&pkl];
-        let bytes = read_at(&mut file, span.start, span.len as usize)?;
+        if span.len > MAX_PICKLE_BYTES {
+            return Err(bad(format!("data.pkl is too large ({} bytes)", span.len)));
+        }
+        let pkl_len = usize::try_from(span.len).map_err(|_| bad("data.pkl length exceeds usize"))?;
+        let bytes = read_at(&mut file, span.start, pkl_len)?;
         let root = unpickle(&bytes)?;
         // A plain state dict, or Lightning's {"state_dict": {...}}.
-        let dict = match &root {
-            Value::Dict(items) => items.iter().find(|(k, _)| matches!(k, Value::Str(s) if s == "state_dict")).map(|(_, v)| v.clone()).unwrap_or(root.clone()),
-            _ => return Err(bad("the checkpoint is not a dict")),
+        let Value::Dict(mut root_items) = root else {
+            return Err(bad("the checkpoint is not a dict"));
+        };
+        let dict = match root_items.iter().position(|(k, _)| matches!(k, Value::Str(s) if s == "state_dict")) {
+            Some(idx) => root_items.swap_remove(idx).1,
+            None => Value::Dict(root_items),
         };
         let Value::Dict(items) = dict else { return Err(bad("the state dict is not a dict")) };
         let mut tensors = HashMap::new();
@@ -238,23 +261,34 @@ impl NemoArchive {
     /// One tensor's bytes and shape.
     pub fn tensor(&mut self, name: &str) -> Result<RawTensor> {
         let Some(Value::Tensor { storage, dtype, offset, shape, stride }) = self.tensors.get(name) else { return Err(bad(format!("tensor {name} not in {}", self.path.display()))) };
+        if shape.len() != stride.len() {
+            return Err(bad(format!("{name}: shape/stride rank mismatch")));
+        }
         // Only contiguous row-major tensors (what a state dict holds).
-        let mut expect = 1;
-        for (d, s) in shape.iter().zip(stride).rev() {
-            if *d > 1 && *s != expect {
+        let mut expect: usize = 1;
+        for (&d, &s) in shape.iter().zip(stride).rev() {
+            if d > 1 && s != expect {
                 return Err(bad(format!("{name} is not contiguous")));
             }
-            expect *= d;
+            expect = expect.checked_mul(d).ok_or_else(|| bad(format!("{name}: shape overflow")))?;
         }
-        let numel: usize = shape.iter().product();
+        let nonzero = shape
+            .iter()
+            .filter(|&&d| d != 0)
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| bad(format!("{name}: shape overflow")))?;
+        let numel = if shape.contains(&0) { 0 } else { nonzero };
         let size = dtype.size();
         let key = format!("{}/data/{storage}", self.folder);
         let span = *self.entries.get(&key).ok_or_else(|| bad(format!("{name}: no storage {key}")))?;
-        let (from, len) = (offset * size, numel * size);
-        if (from + len) as u64 > span.len {
+        let from = offset.checked_mul(size).ok_or_else(|| bad(format!("{name}: offset overflow")))?;
+        let len = numel.checked_mul(size).ok_or_else(|| bad(format!("{name}: size overflow")))?;
+        let end = (from as u64).checked_add(len as u64).ok_or_else(|| bad(format!("{name}: range overflow")))?;
+        if end > span.len {
             return Err(bad(format!("{name} runs past its storage")));
         }
-        let bytes = read_at(&mut self.file, span.start + from as u64, len)?;
+        let file_start = span.start.checked_add(from as u64).ok_or_else(|| bad(format!("{name}: file offset overflow")))?;
+        let bytes = read_at(&mut self.file, file_start, len)?;
         Ok(RawTensor { dtype: *dtype, shape: shape.clone(), bytes })
     }
 }
@@ -265,7 +299,8 @@ fn zip_entries(file: &mut File, zip: Span) -> Result<HashMap<String, Span>> {
     let size = zip.len;
     // The end of central directory record (and the zip64 one, past 4 GB).
     let tail_len = size.min(65_536 + 22);
-    let tail = read_at(file, zip.start + size - tail_len, tail_len as usize)?;
+    let tail_start = zip.start.checked_add(size - tail_len).ok_or_else(|| bad("bad zip offset"))?;
+    let tail = read_at(file, tail_start, tail_len as usize)?;
     let eocd = (0..tail.len().saturating_sub(21)).rev().find(|&i| u32_at(&tail, i) == 0x0605_4b50).ok_or_else(|| bad("model_weights.ckpt is not a zip (a legacy torch.save file?)"))?;
     let mut count = u16_at(&tail, eocd + 10) as u64;
     let mut cd_size = u32_at(&tail, eocd + 12) as u64;
@@ -273,19 +308,30 @@ fn zip_entries(file: &mut File, zip: Span) -> Result<HashMap<String, Span>> {
     if cd_start == 0xffff_ffff || count == 0xffff || cd_size == 0xffff_ffff {
         let loc = eocd.checked_sub(20).filter(|&i| u32_at(&tail, i) == 0x0706_4b50).ok_or_else(|| bad("zip64 locator missing"))?;
         let at = u64_at(&tail, loc + 8);
-        let rec = read_at(file, zip.start + at, 56)?;
+        if at.checked_add(56).is_none_or(|end| end > size) {
+            return Err(bad("bad zip64 end of central directory"));
+        }
+        let rec_start = zip.start.checked_add(at).ok_or_else(|| bad("bad zip64 offset"))?;
+        let rec = read_at(file, rec_start, 56)?;
+        if u32_at(&rec, 0) != 0x0606_4b50 {
+            return Err(bad("bad zip64 end of central directory signature"));
+        }
         count = u64_at(&rec, 32);
         cd_size = u64_at(&rec, 40);
         cd_start = u64_at(&rec, 48);
     }
-    if cd_start + cd_size > size || cd_size > 64 << 20 {
+    if cd_size > 64 << 20 || cd_start.checked_add(cd_size).is_none_or(|end| end > size) {
         return Err(bad("bad zip central directory"));
     }
-    let cd = read_at(file, zip.start + cd_start, cd_size as usize)?;
+    let cd_file_start = zip.start.checked_add(cd_start).ok_or_else(|| bad("bad zip central directory offset"))?;
+    let cd = read_at(file, cd_file_start, cd_size as usize)?;
+    if count > (cd.len() / 46) as u64 {
+        return Err(bad("bad zip central directory count"));
+    }
     let mut entries = HashMap::new();
-    let mut i = 0;
+    let mut i: usize = 0;
     for _ in 0..count {
-        if i + 46 > cd.len() || u32_at(&cd, i) != 0x0201_4b50 {
+        if i.checked_add(46).is_none_or(|end| end > cd.len()) || u32_at(&cd, i) != 0x0201_4b50 {
             return Err(bad("bad zip central directory"));
         }
         let method = u16_at(&cd, i + 10);
@@ -294,41 +340,70 @@ fn zip_entries(file: &mut File, zip: Span) -> Result<HashMap<String, Span>> {
         let extra_len = u16_at(&cd, i + 30) as usize;
         let comment_len = u16_at(&cd, i + 32) as usize;
         let mut local = u32_at(&cd, i + 42) as u64;
-        if i + 46 + name_len + extra_len > cd.len() {
+        let name_start = i + 46;
+        let name_end = name_start.checked_add(name_len).ok_or_else(|| bad("bad zip central directory"))?;
+        let extra_end = name_end.checked_add(extra_len).ok_or_else(|| bad("bad zip central directory"))?;
+        let next_i = extra_end.checked_add(comment_len).ok_or_else(|| bad("bad zip central directory"))?;
+        if next_i > cd.len() {
             return Err(bad("bad zip central directory"));
         }
-        let name = String::from_utf8_lossy(&cd[i + 46..i + 46 + name_len]).into_owned();
+        let name = String::from_utf8_lossy(&cd[name_start..name_end]).into_owned();
         // Zip64 sizes and offset, in the extra field.
-        let mut e = i + 46 + name_len;
-        let end = e + extra_len;
+        let mut e = name_end;
+        let end = extra_end;
         while e + 4 <= end {
             let (id, n) = (u16_at(&cd, e), u16_at(&cd, e + 2) as usize);
+            let field_end = (e + 4).checked_add(n).ok_or_else(|| bad("bad zip extra field"))?;
+            if field_end > end {
+                return Err(bad("truncated zip extra field"));
+            }
             if id == 1 {
                 let mut f = e + 4;
                 if u32_at(&cd, i + 24) == 0xffff_ffff {
+                    if f + 8 > field_end {
+                        return Err(bad("truncated zip64 uncompressed size"));
+                    }
                     len = u64_at(&cd, f);
                     f += 8;
                 }
                 if u32_at(&cd, i + 20) == 0xffff_ffff {
+                    if f + 8 > field_end {
+                        return Err(bad("truncated zip64 compressed size"));
+                    }
                     f += 8;
                 }
                 if u32_at(&cd, i + 42) == 0xffff_ffff {
+                    if f + 8 > field_end {
+                        return Err(bad("truncated zip64 local header offset"));
+                    }
                     local = u64_at(&cd, f);
                 }
             }
-            e += 4 + n;
+            e = field_end;
         }
         if method != 0 {
             return Err(bad(format!("{name} is compressed")));
         }
         // The data starts after the local header, whose extra field may differ.
-        let lh = read_at(file, zip.start + local, 30)?;
-        let start = local + 30 + u16_at(&lh, 26) as u64 + u16_at(&lh, 28) as u64;
-        if start + len > size {
+        if local.checked_add(30).is_none_or(|lh_end| lh_end > size) {
+            return Err(bad(format!("{name}: local header past end of zip")));
+        }
+        let lh_start = zip.start.checked_add(local).ok_or_else(|| bad("bad zip local header offset"))?;
+        let lh = read_at(file, lh_start, 30)?;
+        if u32_at(&lh, 0) != 0x0403_4b50 {
+            return Err(bad(format!("{name}: bad zip local header signature")));
+        }
+        let start = local
+            .checked_add(30)
+            .and_then(|v| v.checked_add(u16_at(&lh, 26) as u64))
+            .and_then(|v| v.checked_add(u16_at(&lh, 28) as u64))
+            .ok_or_else(|| bad(format!("{name}: local header overflow")))?;
+        if start.checked_add(len).is_none_or(|entry_end| entry_end > size) {
             return Err(bad(format!("{name} runs past the end of the zip")));
         }
-        entries.insert(name, Span { start: zip.start + start, len });
-        i = end + comment_len;
+        let abs_start = zip.start.checked_add(start).ok_or_else(|| bad(format!("{name}: offset overflow")))?;
+        entries.insert(name, Span { start: abs_start, len });
+        i = next_i;
     }
     Ok(entries)
 }
@@ -359,14 +434,49 @@ fn global(module: &str, name: &str) -> Result<Value> {
     }
 }
 
+fn charge_node(budget: &mut usize) -> Result<()> {
+    if *budget == 0 {
+        return Err(bad("pickle exceeds node budget"));
+    }
+    *budget -= 1;
+    Ok(())
+}
+
+fn clone_budgeted(v: &Value, budget: &mut usize) -> Result<Value> {
+    let mut work = vec![(v, 0usize)];
+    while let Some((cur, depth)) = work.pop() {
+        if depth > MAX_PICKLE_DEPTH {
+            return Err(bad("pickle nesting too deep"));
+        }
+        charge_node(budget)?;
+        match cur {
+            Value::List(xs) | Value::Tuple(xs) => {
+                for x in xs {
+                    work.push((x, depth + 1));
+                }
+            }
+            Value::Dict(pairs) => {
+                for (k, val) in pairs {
+                    work.push((k, depth + 1));
+                    work.push((val, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(v.clone())
+}
+
 /// Interpret a pickle (protocols 2 to 5) with only data-building operations.
 pub fn unpickle(b: &[u8]) -> Result<Value> {
     let mut stack: Vec<Value> = Vec::new();
     let mut memo: HashMap<u32, Value> = HashMap::new();
-    let mut i = 0;
+    let mut budget = MAX_PICKLE_NODES;
+    let mut i: usize = 0;
     let take = |i: &mut usize, n: usize| -> Result<&[u8]> {
-        let s = b.get(*i..*i + n).ok_or_else(|| bad("truncated pickle"))?;
-        *i += n;
+        let end = i.checked_add(n).ok_or_else(|| bad("truncated pickle"))?;
+        let s = b.get(*i..end).ok_or_else(|| bad("truncated pickle"))?;
+        *i = end;
         Ok(s)
     };
     let pop = |stack: &mut Vec<Value>| stack.pop().ok_or_else(|| bad("empty pickle stack"));
@@ -380,6 +490,7 @@ pub fn unpickle(b: &[u8]) -> Result<Value> {
     loop {
         let op = *b.get(i).ok_or_else(|| bad("truncated pickle"))?;
         i += 1;
+        charge_node(&mut budget)?;
         match op {
             0x80 => {
                 take(&mut i, 1)?;
@@ -433,23 +544,28 @@ pub fn unpickle(b: &[u8]) -> Result<Value> {
             }
             b'q' => {
                 let k = take(&mut i, 1)?[0] as u32;
-                memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty pickle stack"))?);
+                let top = stack.last().ok_or_else(|| bad("empty pickle stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
             }
             b'r' => {
                 let k = u32_le(take(&mut i, 4)?);
-                memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty pickle stack"))?);
+                let top = stack.last().ok_or_else(|| bad("empty pickle stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
             }
             0x94 => {
                 let k = memo.len() as u32;
-                memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty pickle stack"))?);
+                let top = stack.last().ok_or_else(|| bad("empty pickle stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
             }
             b'h' => {
                 let k = take(&mut i, 1)?[0] as u32;
-                stack.push(memo.get(&k).cloned().ok_or_else(|| bad("bad pickle memo"))?);
+                let val = memo.get(&k).ok_or_else(|| bad("bad pickle memo"))?;
+                stack.push(clone_budgeted(val, &mut budget)?);
             }
             b'j' => {
                 let k = u32_le(take(&mut i, 4)?);
-                stack.push(memo.get(&k).cloned().ok_or_else(|| bad("bad pickle memo"))?);
+                let val = memo.get(&k).ok_or_else(|| bad("bad pickle memo"))?;
+                stack.push(clone_budgeted(val, &mut budget)?);
             }
             b't' => {
                 let items = pop_mark(&mut stack)?;
@@ -494,11 +610,13 @@ pub fn unpickle(b: &[u8]) -> Result<Value> {
             }
             b'u' => {
                 let items = pop_mark(&mut stack)?;
+                if items.len() % 2 != 0 {
+                    return Err(bad("SETITEMS with odd item count"));
+                }
                 let Some(Value::Dict(d)) = stack.last_mut() else { return Err(bad("SETITEMS on a non-dict")) };
-                for pair in items.chunks(2) {
-                    if let [k, v] = pair {
-                        d.push((k.clone(), v.clone()));
-                    }
+                let mut it = items.into_iter();
+                while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    d.push((k, v));
                 }
             }
             b'c' => {
@@ -537,13 +655,30 @@ pub fn unpickle(b: &[u8]) -> Result<Value> {
                 stack.push(match f.as_str() {
                     "collections.OrderedDict" => Value::Dict(Vec::new()),
                     "torch._utils._rebuild_tensor_v2" => match args.as_slice() {
-                        [Value::Storage { key, dtype }, Value::Int(offset), shape, stride, ..] => Value::Tensor {
-                            storage: key.clone(),
-                            dtype: *dtype,
-                            offset: usize::try_from(*offset).map_err(|_| bad("negative tensor offset"))?,
-                            shape: shape.ints().ok_or_else(|| bad("bad tensor shape"))?.into_iter().map(|d| d as usize).collect(),
-                            stride: stride.ints().ok_or_else(|| bad("bad tensor stride"))?.into_iter().map(|d| d as usize).collect(),
-                        },
+                        [Value::Storage { key, dtype }, Value::Int(offset), shape, stride, ..] => {
+                            let shape: Vec<usize> = shape
+                                .ints()
+                                .ok_or_else(|| bad("bad tensor shape"))?
+                                .into_iter()
+                                .map(|d| usize::try_from(d).map_err(|_| bad("negative tensor shape dim")))
+                                .collect::<Result<Vec<_>>>()?;
+                            let stride: Vec<usize> = stride
+                                .ints()
+                                .ok_or_else(|| bad("bad tensor stride"))?
+                                .into_iter()
+                                .map(|d| usize::try_from(d).map_err(|_| bad("negative tensor stride")))
+                                .collect::<Result<Vec<_>>>()?;
+                            if shape.len() != stride.len() {
+                                return Err(bad("tensor shape/stride length mismatch"));
+                            }
+                            Value::Tensor {
+                                storage: key.clone(),
+                                dtype: *dtype,
+                                offset: usize::try_from(*offset).map_err(|_| bad("negative tensor offset"))?,
+                                shape,
+                                stride,
+                            }
+                        }
                         _ => return Err(bad("bad _rebuild_tensor_v2 arguments")),
                     },
                     other => return Err(bad(format!("{other} is not callable here"))),
@@ -606,5 +741,74 @@ mod tests {
         assert!(matches!(&items[0].1, Value::Tensor { dtype: StorageType::I64, shape, .. } if shape == &vec![2]));
         let evil = b"\x80\x02cos\nsystem\n.";
         assert!(unpickle(evil).is_err());
+    }
+
+    #[test]
+    fn pickle_rejects_exponential_clone_bomb_and_negative_dims() {
+        // Billion-laughs pickle bomb: double tuple size via memo 25 times -> 2^25 nodes.
+        let mut bomb = vec![0x80, 2, b'K', 1, b'q', 0];
+        for k in 1u8..=25 {
+            bomb.extend_from_slice(&[b'h', k - 1, b'h', k - 1, 0x86, b'q', k]);
+        }
+        bomb.push(b'.');
+        assert!(unpickle(&bomb).is_err(), "exponential pickle bomb must be rejected");
+
+        // Negative shape dim (-1) in _rebuild_tensor_v2 must be rejected.
+        let mut neg = vec![0x80, 2];
+        neg.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n");
+        neg.extend_from_slice(b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpuK\x01tQ");
+        neg.extend_from_slice(b"K\x00J\xff\xff\xff\xff\x85K\x01\x85\x89tR.");
+        assert!(unpickle(&neg).is_err(), "negative tensor dimension must be rejected");
+    }
+
+    #[test]
+    fn zip64_truncated_extra_and_tar_overflow_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("oaiy-voice-nemo-hardening-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // TAR member claiming huge base-256 size must fail cleanly (no overflow/panic).
+        let mut bad_tar = vec![0u8; 1024];
+        bad_tar[0] = b'a';
+        bad_tar[124] = 0x80;
+        bad_tar[125] = 0x01; // > u64::MAX
+        bad_tar[156] = b'0';
+        let tar_path = dir.join("bad.tar");
+        std::fs::write(&tar_path, &bad_tar).unwrap();
+        let mut f = File::open(&tar_path).unwrap();
+        assert!(tar_members(&mut f).is_err());
+        drop(f);
+
+        // ZIP with truncated Zip64 extra field (claims 0xffffffff size, extra len = 4 < 8) must fail cleanly, not panic.
+        let mut zip = Vec::new();
+        // Local header stub (30 bytes)
+        zip.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        zip.resize(30, 0);
+        let cd_start = zip.len() as u32;
+        // Central directory header (46 bytes) + 1-byte name + 8-byte extra (id=1, len=4, 4 bytes payload < 8)
+        let mut cd = vec![0u8; 46];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd[24..28].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // zip64 uncompressed size sentinel
+        cd[28..30].copy_from_slice(&1u16.to_le_bytes()); // name_len = 1
+        cd[30..32].copy_from_slice(&8u16.to_le_bytes()); // extra_len = 8
+        cd.push(b'x');
+        cd.extend_from_slice(&1u16.to_le_bytes()); // zip64 extra id
+        cd.extend_from_slice(&4u16.to_le_bytes()); // extra payload len = 4 (< 8!)
+        cd.extend_from_slice(&[0u8; 4]);
+        let cd_size = cd.len() as u32;
+        zip.extend_from_slice(&cd);
+        // EOCD (22 bytes)
+        let mut eocd = vec![0u8; 22];
+        eocd[0..4].copy_from_slice(&0x0605_4b50u32.to_le_bytes());
+        eocd[10..12].copy_from_slice(&1u16.to_le_bytes());
+        eocd[12..16].copy_from_slice(&cd_size.to_le_bytes());
+        eocd[16..20].copy_from_slice(&cd_start.to_le_bytes());
+        zip.extend_from_slice(&eocd);
+
+        let zip_path = dir.join("bad.zip");
+        std::fs::write(&zip_path, &zip).unwrap();
+        let mut zf = File::open(&zip_path).unwrap();
+        assert!(zip_entries(&mut zf, Span { start: 0, len: zip.len() as u64 }).is_err());
+        drop(zf);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

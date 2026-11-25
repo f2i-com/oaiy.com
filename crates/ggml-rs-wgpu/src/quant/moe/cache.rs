@@ -86,26 +86,25 @@ fn main(@builtin(local_invocation_index) t: u32) {
     tried = 0u;
     taken = 0u;
     var left = 0u;
-    if (atomicLoad(&cold) != 0u) {
-        if (p[0].z == 1u) {
-            for (var e = 0u; e < experts; e++) {
-                var at = 0xffffffffu;
-                if (atomicLoad(&mark[e]) == 1u && state[e] == 0xffffffffu) {
-                    if (!take(e)) {
-                        at = left;
-                        left++;
-                    }
+    if (p[0].z == 1u) {
+        let has_cold = atomicLoad(&cold) != 0u;
+        for (var e = 0u; e < experts; e++) {
+            var at = 0xffffffffu;
+            if (has_cold && atomicLoad(&mark[e]) == 1u && state[e] == 0xffffffffu) {
+                if (!take(e)) {
+                    at = left;
+                    left++;
                 }
-                state[3u * experts + 4u + e] = at;
             }
-        } else {
-            for (var q = 0u; q < min(pairs, 256u); q++) {
-                if (none[q] == 1u) {
-                    let e = jobs[2u * q];
-                    if (state[e] == 0xffffffffu) {
-                        if (!take(e)) {
-                            left++;
-                        }
+            state[3u * experts + 4u + e] = at;
+        }
+    } else if (atomicLoad(&cold) != 0u) {
+        for (var q = 0u; q < min(pairs, 256u); q++) {
+            if (none[q] == 1u) {
+                let e = jobs[2u * q];
+                if (state[e] == 0xffffffffu) {
+                    if (!take(e)) {
+                        left++;
                     }
                 }
             }

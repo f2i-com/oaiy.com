@@ -161,18 +161,62 @@ enum Order {
     Cols { head: usize },
 }
 
+fn check_order(key: &str, n: usize, k: usize, order: Order) -> Result<()> {
+    let _ = n.checked_mul(k).ok_or_else(|| err(format!("{key}: shape [{n}, {k}] overflows")))?;
+    match order {
+        Order::Same => Ok(()),
+        Order::Rows { from, head } => {
+            let need = NV
+                .checked_mul(head)
+                .and_then(|v| from.checked_add(v))
+                .ok_or_else(|| err(format!("{key}: reorder row count overflow")))?;
+            if n < need {
+                candle_core::bail!("{key}: expected at least {need} rows for reorder, got {n}");
+            }
+            Ok(())
+        }
+        Order::Cols { head } => {
+            let need = NV
+                .checked_mul(head)
+                .ok_or_else(|| err(format!("{key}: reorder col count overflow")))?;
+            if k == 0 || k < need {
+                candle_core::bail!("{key}: expected at least {need} cols for reorder, got {k}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `values` (`[n, k]` of `size`-byte elements) reordered as `order` says.
-fn reorder<T: Copy>(values: &mut [T], n: usize, k: usize, order: Order) {
+fn reorder<T: Copy>(values: &mut [T], n: usize, k: usize, order: Order) -> Result<()> {
+    let Some(total) = n.checked_mul(k) else {
+        candle_core::bail!("reorder: shape [{n}, {k}] overflows");
+    };
+    if values.len() != total {
+        candle_core::bail!("reorder: expected {total} elements for [{n}, {k}], got {}", values.len());
+    }
     match order {
         Order::Same => {}
         Order::Rows { from, head } => {
-            let part = values[from * k..n * k].to_vec();
+            let Some(need) = NV.checked_mul(head).and_then(|v| from.checked_add(v)) else {
+                candle_core::bail!("reorder: row range overflow");
+            };
+            if n < need {
+                candle_core::bail!("reorder: expected at least {need} rows, got {n}");
+            }
+            let part = values[from * k..need * k].to_vec();
             for v in 0..NV {
                 let o = grouped(v);
                 values[(from + v * head) * k..(from + (v + 1) * head) * k].copy_from_slice(&part[o * head * k..(o + 1) * head * k]);
             }
         }
         Order::Cols { head } => {
+            let Some(need) = NV.checked_mul(head) else {
+                candle_core::bail!("reorder: col range overflow");
+            };
+            if k == 0 || k < need {
+                candle_core::bail!("reorder: expected at least {need} cols, got {k}");
+            }
             for row in values.chunks_exact_mut(k) {
                 let old = row.to_vec();
                 for v in 0..NV {
@@ -182,6 +226,7 @@ fn reorder<T: Copy>(values: &mut [T], n: usize, k: usize, order: Order) {
             }
         }
     }
+    Ok(())
 }
 
 /// A matrix on the GPU (`[n, k]`): a checkpoint's as f16 (its inputs read as f32), a GGUF's K-quant blocks as they
@@ -353,6 +398,7 @@ impl WgpuMossText {
         let shape = self.w.shape(key)?;
         let &[n, k] = shape.as_slice() else { candle_core::bail!("{key}: a matrix of shape {shape:?}") };
         let order = if self.names == Names::Gguf { Order::Same } else { order };
+        check_order(key, n, k, order)?;
         if let (Some(g), 0) = (self.w.ggml_dtype(key).and_then(coop_type), k % 256) {
             if let Some(Raw::Ggml(_, bytes)) = self.w.raw(key)? {
                 let q = self.gpu.to_device_quant(QuantizedTensor::from_bytes_cpu(bytes, vec![n, k], g));
@@ -365,13 +411,13 @@ impl WgpuMossText {
         let words = match self.w.raw(key)? {
             Some(Raw::Bf16(bytes)) => {
                 let mut halves: Vec<[u8; 2]> = bytes.chunks_exact(2).map(|b| [b[0], b[1]]).collect();
-                reorder(&mut halves, n, k, order);
+                reorder(&mut halves, n, k, order)?;
                 f16_words(&halves.concat())
             }
             Some(Raw::Ggml(t, bytes)) => f16_words_ggml(t, &bytes, n, k),
             None => {
                 let mut values = self.w.tensor(key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                reorder(&mut values, n, k, order);
+                reorder(&mut values, n, k, order)?;
                 f16_words_f32(&values)
             }
         }
@@ -386,12 +432,15 @@ impl WgpuMossText {
     fn values(&mut self, key: &str, order: Order) -> Result<Vec<f32>> {
         let mut v = self.w.tensor(key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         if let (Names::Hf(_), Order::Rows { from, head }) = (self.names, order) {
-            let n = from + NV * head;
-            if v.len() % n != 0 {
+            let n = NV
+                .checked_mul(head)
+                .and_then(|x| from.checked_add(x))
+                .ok_or_else(|| err(format!("{key}: row count overflow")))?;
+            if n == 0 || v.len() % n != 0 {
                 candle_core::bail!("{key}: {} values are not {n} rows", v.len());
             }
             let k = v.len() / n;
-            reorder(&mut v, n, k, order);
+            reorder(&mut v, n, k, order)?;
         }
         Ok(v)
     }
@@ -435,7 +484,7 @@ impl WgpuMossText {
             let dt = self.values(&key(Part::DtBias), Order::Rows { from: 0, head: 1 })?;
             let conv = self.values(&key(Part::Conv), Order::Rows { from: 2 * NK * DK, head: DK })?;
             let norm = self.values(&key(Part::SsmNorm), Order::Same)?;
-            if beta_alpha.len() != 2 * NV * D || a.len() != NV || dt.len() != NV || conv.len() != CH * KERN || norm.len() != DK || z.n != NV * DK || out.k != NV * DK {
+            if beta_alpha.len() != 2 * NV * D || a.len() != NV || dt.len() != NV || conv.len() != CH * KERN || norm.len() != DK || qkv.n != CH || z.n != NV * DK || out.k != NV * DK {
                 candle_core::bail!("MOSS-Image requires the Qwen3.5-9B text encoder (layer {i}'s delta net)");
             }
             let beta_alpha = Mat { w: W::F32(self.upload(&beta_alpha)), n: 2 * NV, k: D };
@@ -602,13 +651,20 @@ mod tests {
         // rows from 2 (two rows a head), and columns (one a head)
         let (n, k) = (2 + 2 * NV, 3);
         let mut m: Vec<usize> = (0..n * k).collect();
-        reorder(&mut m, n, k, Order::Rows { from: 2, head: 2 });
+        reorder(&mut m, n, k, Order::Rows { from: 2, head: 2 }).unwrap();
         assert_eq!(&m[..6], &[0, 1, 2, 3, 4, 5]);
         // (tiled head 1 is grouped head 2: its rows 2 + 4 and 2 + 5)
         assert_eq!(&m[(2 + 2) * k..(2 + 4) * k], &[(2 + 4) * k, (2 + 4) * k + 1, (2 + 4) * k + 2, (2 + 5) * k, (2 + 5) * k + 1, (2 + 5) * k + 2]);
         let mut c: Vec<usize> = (0..NV).collect();
-        reorder(&mut c, 1, NV, Order::Cols { head: 1 });
+        reorder(&mut c, 1, NV, Order::Cols { head: 1 }).unwrap();
         assert_eq!(c, (0..NV).map(grouped).collect::<Vec<_>>());
+        // Out-of-bounds orders fail cleanly instead of panicking.
+        assert!(check_order("qkv", NV - 1, 3, Order::Rows { from: 0, head: 1 }).is_err());
+        assert!(check_order("out", 4, NV - 1, Order::Cols { head: 1 }).is_err());
+        assert!(check_order("out", 4, 0, Order::Cols { head: 1 }).is_err());
+        let mut small = vec![0usize; 6];
+        assert!(reorder(&mut small, 2, 3, Order::Rows { from: 0, head: 1 }).is_err());
+        assert!(reorder(&mut small, 2, 3, Order::Cols { head: 1 }).is_err());
     }
 
     /// The states of Qwen3.5-9B (`OAIY_MOSS_TEXT_ENCODER`, Hugging Face's checkpoint or a GGUF of it; with

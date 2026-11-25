@@ -411,7 +411,7 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder(super::net::Keep::Burst)
+    super::creds::client_builder(super::net::Keep::Burst)
         // On the client, where every request of this lane always had it, and not on
         // each request: a client's timeout bounds the wait for a reply and then, on
         // a budget of its own, the reading of it, while a request's runs to the last
@@ -524,7 +524,8 @@ fn serve(
     // anything with a side effect. Another runtime under the same account may
     // already have taken this run, and work done before the claim is work done
     // twice.
-    let claim_url = super::oauth::join(&account.base_url, &lane.claim.replace("{id}", &run.id));
+    let run_seg = super::oauth::path_segment(&run.id, "run id")?;
+    let claim_url = super::oauth::join(&account.base_url, &lane.claim.replace("{id}", &run_seg));
     let claimed = match http
         .post(&claim_url)
         .bearer_auth(&account.credential)
@@ -1122,7 +1123,8 @@ fn report(
             "error": { "code": f.code, "message": clip(&f.message, MAX_MESSAGE_BYTES) },
         }),
     };
-    let url = super::oauth::join(&account.base_url, &lane.complete.replace("{id}", run_id));
+    let run_seg = super::oauth::path_segment(run_id, "run id")?;
+    let url = super::oauth::join(&account.base_url, &lane.complete.replace("{id}", &run_seg));
 
     let mut last = String::new();
     for attempt in 0..COMPLETE_ATTEMPTS {
@@ -1233,6 +1235,16 @@ fn resend_pending(dir: &Path, account: &LinkedAccount) {
             continue;
         };
         if kept.base_url != account.base_url {
+            continue;
+        }
+        if !super::oauth::at_provider(&kept.url, &account.base_url) {
+            log::warn!(
+                "flow run {}: refusing kept outcome pointing outside provider origin; setting aside",
+                kept.run_id
+            );
+            if let Err(why) = super::put_aside(&path, "a kept flow completion") {
+                log::warn!("{why}");
+            }
             continue;
         }
         // (kept a week and still not taken: the run is long over on the provider's side, and it is let go)
@@ -2341,25 +2353,53 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
-        // This lane's redirect policy is the client's default, unchanged. What is
-        // not followed is the bearer, which reqwest drops on the way to another host
-        // or port (this moves it to another port; it does not drop it for a change
-        // of scheme alone). The sealed flow lane, by contrast, follows no redirect
-        // at all.
+    fn redirects_are_not_followed_and_traversal_or_off_origin_kept_urls_are_refused() {
+        // Credentialed flow-runner clients never follow redirects (prevents credential or
+        // request redirection across hosts/schemes).
         let elsewhere = Provider::start(|_| Reply::ok(r#"{"runs":[]}"#));
         let moved_to = format!("{}/moved", elsewhere.base);
         let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
         let flows = spec();
         let lane = Lane::of(&flows).unwrap();
 
-        let (handled, trouble) =
-            poll_once(&account(origin.base.clone()), &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
-        assert_eq!((handled, trouble), (0, None), "the answer from where it was sent");
+        let err = poll_once(&account(origin.base.clone()), &flows, &lane, "oaiy-test", None, &Held::NotRequired)
+            .unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
         assert_eq!(origin.requests()[0].header("authorization"), Some("Bearer flk_secret"));
-        let followed = elsewhere.requests();
-        assert_eq!(followed.len(), 1);
-        assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
+
+        // Traversal runId is rejected before any claim/complete request is sent.
+        let bad_run = QueuedRun {
+            id: "../admin?x=1".into(),
+            flow: Some("f".into()),
+            flow_definition_id: None,
+            app_id: None,
+            binding_id: None,
+            idempotency_key: None,
+            input_snapshot: Value::Null,
+        };
+        let before = origin.requests().len();
+        assert!(serve(&account(origin.base.clone()), &flows, &lane, "oaiy-test", None, &bad_run, &Held::NotRequired).is_err());
+        assert!(report(&account(origin.base.clone()), &lane, "oaiy-test", "../admin", Ok(json!({}))).is_err());
+        assert_eq!(origin.requests().len(), before, "traversal run id must not send requests");
+
+        // A persisted completion whose `url` points outside `account.base_url` is refused and set aside.
+        let dir = crate::test_dirs::temp_path("oaiy-fr-at-provider");
+        std::fs::create_dir_all(&dir).unwrap();
+        let acc = account(origin.base.clone());
+        let tampered = PendingCompletion {
+            base_url: acc.base_url.clone(),
+            run_id: "r-evil".into(),
+            url: format!("{}/steal", elsewhere.base),
+            body: json!({ "status": "done" }),
+            kept_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let file = dir.join("r-evil.json");
+        std::fs::write(&file, serde_json::to_string(&tampered).unwrap()).unwrap();
+        resend_pending(&dir, &acc);
+        assert!(elsewhere.requests().is_empty(), "off-origin kept url must not receive bearer");
+        assert!(!file.exists(), "off-origin kept completion must be put aside");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

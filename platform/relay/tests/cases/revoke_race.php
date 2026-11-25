@@ -166,6 +166,36 @@ test('4.10.3 a phone\'s response to a rendezvous whose desktop was revoked meanw
     eq('open', pair_row($r, $c->pid)['state'], 'and the rendezvous was not changed');
 });
 
+test('4.5 token rotation and roster push for a device revoked after authentication are 401 revoked and change nothing', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ph = $r->phone($d);
+    $ctx = $r->ctx();
+    $authReq = new Request('POST', '/v1/tokens/rotate', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $d->token], '', null);
+    $principal = $ctx->auth->device($authReq);
+    // Revoke the desktop after auth succeeded and before handler write transactions run.
+    Devices::revoke($ctx, $d->id);
+    $err = null;
+    try {
+        Oaiy\Relay\Handlers\DevicesApi::rotate($ctx, $authReq, $principal, []);
+    } catch (ApiError $e) {
+        $err = $e;
+    }
+    eq([401, 'revoked'], [$err->status ?? 0, $err->errorCode ?? ''], 'rotate refuses revoked device in-tx');
+    eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM tokens WHERE device_id = ? AND revoked_at IS NULL', [$d->id]), 'no unrevoked token minted');
+
+    $rosterBody = json_encode(['appId' => 'aokie', 'revision' => 1, 'thumbprints' => []]);
+    $rosterReq = new Request('POST', '/v1/roster', [], ['REMOTE_ADDR' => '127.0.0.1', 'CONTENT_TYPE' => 'application/json'], $rosterBody, null);
+    $err = null;
+    try {
+        Oaiy\Relay\Handlers\DevicesApi::roster($ctx, $rosterReq, $principal, []);
+    } catch (ApiError $e) {
+        $err = $e;
+    }
+    eq([401, 'revoked'], [$err->status ?? 0, $err->errorCode ?? ''], 'roster refuses revoked desktop in-tx');
+    eq(0, (int)$ctx->db->val('SELECT COUNT(*) FROM roster WHERE desktop_dev = ?', [$d->id]), 'no roster row written for revoked desktop');
+});
+
 /**
  * Real requests racing a real revocation: eight posters through four servers, the revocation at a random moment among them. However
  * the moments fall, when the revocation has returned nothing of the sender is live in any mailbox and, for a revoked recipient, no

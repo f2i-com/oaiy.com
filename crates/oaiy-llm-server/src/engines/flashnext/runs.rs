@@ -372,7 +372,7 @@ impl FlashNext {
                 // the layer's entries are true ones up to the trunk's last position, the draft taken or not
                 g.valid = n;
             }
-            if 1.0 / total < min_p {
+            if !(total > 0.0 && 1.0 / total >= min_p) || (best as usize) >= cfg.vocab {
                 break;
             }
             drafts.push(best);

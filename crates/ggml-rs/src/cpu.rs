@@ -448,7 +448,11 @@ impl Backend for CpuBackend {
             let q_pos = past + s;
             // the positions this query sees: causal, and within the window if there is one
             let hi = (q_pos + 1).min(kv_len);
-            let lo = sliding_window.map_or(0, |w| q_pos.saturating_sub(w - 1)).min(hi);
+            let lo = match sliding_window {
+                None => 0,
+                Some(0) => hi,
+                Some(w) => q_pos.saturating_sub(w - 1).min(hi),
+            };
             if lo == hi {
                 return;
             }
@@ -867,5 +871,16 @@ mod tests {
         let x = Tensor::from_vec(vec![1.0, 3.0, 2.0,    4.0, 0.0, 1.0], vec![2, 3]);
         let r = cpu.argmax_last(&x);
         assert_eq!(r, vec![1, 0]);
+    }
+
+    #[test]
+    fn attention_sliding_window_zero_is_safe() {
+        let cpu = CpuBackend::new();
+        let q = Tensor::from_vec(vec![1.0; 4], vec![1, 1, 4]);
+        let k = Tensor::from_vec(vec![1.0; 8], vec![2, 1, 4]);
+        let v = Tensor::from_vec(vec![2.0; 8], vec![2, 1, 4]);
+        let out = cpu.attention(&q, &k, &v, 2, 0.5, 1, Some(0));
+        assert_eq!(out.shape(), [1, 1, 4]);
+        assert!(out.data().iter().all(|&x| x == 0.0));
     }
 }

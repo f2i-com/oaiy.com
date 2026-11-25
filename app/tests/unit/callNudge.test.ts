@@ -270,7 +270,7 @@ describe('what says that calls were started (outreachTools)', () => {
       engine: () => w.outreach,
       origin: () => ({ kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' }),
       ready: async () => ready,
-      screening: async () => null,
+      screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
       approve: async () => approve,
     });
   }
@@ -401,7 +401,7 @@ describe('the runner, with its real tools and campaigns', () => {
     engine((_b, asker) => (asker === 'runner' ? [planStep, { text: 'The person said no.' }, { text: 'Checking.' }, { text: 'Done.' }][step++] ?? { text: 'Done.' } : { text: 'Hi.' }), log);
     const w = world();
     await w.sessions.load();
-    const tools = outreachTools({ engine: () => w.outreach, origin: () => ({ kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' }), ready: async () => '', screening: async () => null, approve: async () => false });
+    const tools = outreachTools({ engine: () => w.outreach, origin: () => ({ kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' }), ready: async () => '', screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }), approve: async () => false });
     const { agent: runner, events, emit } = agent('runner', { sessionTools: tools, waitingOnCall: () => true });
     await runner.run('Ring Jane.', emit);
     expect(nudges(events).length).toBeGreaterThan(0);

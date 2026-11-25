@@ -389,7 +389,7 @@ impl Catalog {
 }
 
 fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+    super::creds::client_builder(super::net::Keep::Never)
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the app-logic client: {e}"))
@@ -1172,10 +1172,11 @@ fn submit(
     key: Option<&str>,
 ) -> Result<Option<String>, Failed> {
     let form = form_id(spec, entry, effect)?;
+    let form_seg = super::oauth::path_segment(form, "form id")?;
     let values = record(spec, effect)?;
     let url = super::oauth::join(
         &account.base_url,
-        &spec.submit_path.replace("{formId}", form),
+        &spec.submit_path.replace("{formId}", &form_seg),
     );
     let mut body = json!({ &spec.fields.record: values });
     if let (Some(k), Some(field)) = (key, spec.fields.write_key.as_deref()) {
@@ -1288,12 +1289,14 @@ fn update(
             .to_string());
     };
 
+    let form_seg = super::oauth::path_segment(form, "form id")?;
+    let id_seg = super::oauth::path_segment(&id, "record id")?;
     let url = super::oauth::join(
         &account.base_url,
         &spec
             .update_path
-            .replace("{formId}", form)
-            .replace("{id}", &id),
+            .replace("{formId}", &form_seg)
+            .replace("{id}", &id_seg),
     );
     let resp = client()?
         .put(&url)
@@ -1326,7 +1329,8 @@ fn find_record(
     field: &str,
     wanted: &Value,
 ) -> Result<Option<String>, Failed> {
-    let path = spec.list_path.replace("{formId}", form);
+    let form_seg = super::oauth::path_segment(form, "form id")?;
+    let path = spec.list_path.replace("{formId}", &form_seg);
     let sep = if path.contains('?') { '&' } else { '?' };
     let url = format!(
         "{}{sep}limit={}",
@@ -3073,5 +3077,51 @@ mod tests {
         assert!(out.is_empty());
         assert!(!storage.path().exists(), "nothing was written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_logic_rejects_traversal_ids_and_does_not_follow_redirects() {
+        use crate::link::testkit::{Provider, Reply};
+        let elsewhere = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let acc = account(origin.base.clone());
+        let s = spec();
+
+        // Redirects on catalogue fetch and record submit must NOT be followed.
+        let err = fetch(&acc, &s).unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
+        let ok_app = entry(json!([{ "id": "form-1", "packFormId": "calls" }]), json!([]));
+        let sub_err = submit(
+            &acc,
+            &s,
+            &ok_app,
+            &json!({ "formKey": "calls", "answers": { "a": 1 } }),
+            None,
+        )
+        .unwrap_err();
+        assert!(sub_err.message.contains("HTTP 307"), "{}", sub_err.message);
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
+
+        // Traversal formId or recordId is rejected before any HTTP request is made.
+        let evil_app = entry(json!([{ "id": "../admin", "packFormId": "calls" }]), json!([]));
+        let before = origin.requests().len();
+        assert!(submit(
+            &acc,
+            &s,
+            &evil_app,
+            &json!({ "formKey": "calls", "answers": { "a": 1 } }),
+            None,
+        )
+        .is_err());
+        assert!(update(
+            &acc,
+            &s,
+            &ok_app,
+            &json!({ "formKey": "calls", "recordId": "../../evil?x=1", "answers": { "a": 1 } }),
+            None,
+        )
+        .is_err());
+        assert_eq!(origin.requests().len(), before, "traversal IDs must not reach the network");
     }
 }

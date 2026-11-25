@@ -5,13 +5,14 @@
  * to create a distributable .oaiy file.
  */
 
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo } from 'react';
+import { Package } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import type { Flow } from 'oaiy-core';
 import type { PackagePermission, OAIYPackageManifest } from 'oaiy-core';
 import { packageLogger as logger } from '../../utils/logger';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
+import Dialog from '../ui/Dialog';
 
 interface PackageCreatorProps {
   flows: Flow[];
@@ -60,21 +61,6 @@ export function PackageCreator({
   const [step, setStep] = useState<WizardStep>('metadata');
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const dialogRef = useRef<HTMLDivElement>(null);
-  useFocusTrap(dialogRef, true);
-
-  // Escape closes — matches the rest of the app's modal convention.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   // Metadata state
   const [packageId, setPackageId] = useState('');
@@ -246,7 +232,7 @@ export function PackageCreator({
         return (
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1">
+              <label className="block text-sm font-medium text-content-primary mb-1">
                 Package ID *
               </label>
               <input
@@ -254,15 +240,15 @@ export function PackageCreator({
                 value={packageId}
                 onChange={(e) => setPackageId(e.target.value)}
                 placeholder="com.example.my-package"
-                className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
               />
-              <p className="mt-1 text-xs text-slate-500">
+              <p className="mt-1 text-xs text-content-secondary">
                 Unique identifier (reverse domain style)
               </p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1">
+              <label className="block text-sm font-medium text-content-primary mb-1">
                 Package Name *
               </label>
               <input
@@ -270,12 +256,12 @@ export function PackageCreator({
                 value={packageName}
                 onChange={(e) => setPackageName(e.target.value)}
                 placeholder="My Awesome Package"
-                className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
               />
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1">
+              <label className="block text-sm font-medium text-content-primary mb-1">
                 Version *
               </label>
               <input
@@ -283,12 +269,12 @@ export function PackageCreator({
                 value={version}
                 onChange={(e) => setVersion(e.target.value)}
                 placeholder="1.0.0"
-                className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
               />
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1">
+              <label className="block text-sm font-medium text-content-primary mb-1">
                 Description
               </label>
               <textarea
@@ -296,12 +282,12 @@ export function PackageCreator({
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What does this package do?"
                 rows={3}
-                className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 resize-none"
+                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50 resize-none"
               />
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-600 dark:text-slate-300 mb-1">
+              <label className="block text-sm font-medium text-content-primary mb-1">
                 Author
               </label>
               <input
@@ -309,7 +295,7 @@ export function PackageCreator({
                 value={author}
                 onChange={(e) => setAuthor(e.target.value)}
                 placeholder="Your name"
-                className="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full px-3 py-2 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
               />
             </div>
           </div>
@@ -320,7 +306,7 @@ export function PackageCreator({
           <div className="space-y-6">
             {/* Flows selection */}
             <div>
-              <h3 className="text-sm font-medium text-slate-600 dark:text-slate-300 mb-2">
+              <h3 className="text-sm font-medium text-content-primary mb-2">
                 Include Flows
               </h3>
               <div className="space-y-2 max-h-48 overflow-y-auto">
@@ -329,36 +315,37 @@ export function PackageCreator({
                     key={flow.id}
                     className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                       selectedFlows.has(flow.id)
-                        ? 'bg-purple-500/10 border-purple-500/30'
-                        : 'bg-slate-50 dark:bg-slate-700/30 border-slate-200 dark:border-slate-600/50 hover:border-slate-300 dark:hover:border-slate-500/50'
+                        ? 'bg-accent/10 border-accent/40'
+                        : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
                     }`}
                   >
                     <input
                       type="checkbox"
                       checked={selectedFlows.has(flow.id)}
                       onChange={() => toggleFlow(flow.id)}
-                      className="w-4 h-4 rounded border-slate-300 dark:border-slate-500 text-purple-500 focus:ring-purple-500/50 bg-white dark:bg-slate-600"
+                      className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
                     />
-                    <div className="flex-1">
-                      <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-content-primary truncate">
                         {flow.name}
                       </p>
                       {flow.description && (
-                        <p className="text-xs text-slate-400">
+                        <p className="text-xs text-content-secondary truncate">
                           {flow.description}
                         </p>
                       )}
                     </div>
                     {selectedFlows.has(flow.id) && (
                       <button
+                        type="button"
                         onClick={(e) => {
                           e.preventDefault();
                           setEntryFlowId(flow.id);
                         }}
                         className={`px-2 py-1 text-xs rounded transition-colors ${
                           entryFlowId === flow.id
-                            ? 'bg-purple-500 text-white'
-                            : 'bg-slate-200 dark:bg-slate-600 text-slate-600 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-500'
+                            ? 'bg-accent text-white'
+                            : 'bg-surface-tertiary text-content-secondary hover:text-content-primary border border-edge-primary'
                         }`}
                       >
                         {entryFlowId === flow.id ? 'Entry' : 'Set as Entry'}
@@ -368,7 +355,7 @@ export function PackageCreator({
                 ))}
               </div>
               {selectedFlows.size > 0 && !entryFlowId && (
-                <p className="mt-2 text-xs text-yellow-400">
+                <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
                   Please select an entry flow
                 </p>
               )}
@@ -377,7 +364,7 @@ export function PackageCreator({
             {/* Services selection */}
             {services.length > 0 && (
               <div>
-                <h3 className="text-sm font-medium text-slate-600 dark:text-slate-300 mb-2">
+                <h3 className="text-sm font-medium text-content-primary mb-2">
                   Include Services (optional)
                 </h3>
                 <div className="space-y-2 max-h-32 overflow-y-auto">
@@ -386,21 +373,21 @@ export function PackageCreator({
                       key={service.id}
                       className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                         selectedServices.has(service.id)
-                          ? 'bg-purple-500/10 border-purple-500/30'
-                          : 'bg-slate-50 dark:bg-slate-700/30 border-slate-200 dark:border-slate-600/50 hover:border-slate-300 dark:hover:border-slate-500/50'
+                          ? 'bg-accent/10 border-accent/40'
+                          : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
                       }`}
                     >
                       <input
                         type="checkbox"
                         checked={selectedServices.has(service.id)}
                         onChange={() => toggleService(service.id)}
-                        className="w-4 h-4 rounded border-slate-300 dark:border-slate-500 text-purple-500 focus:ring-purple-500/50 bg-white dark:bg-slate-600"
+                        className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
                       />
-                      <div className="flex-1">
-                        <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-content-primary truncate">
                           {service.name}
                         </p>
-                        <p className="text-xs text-slate-500">{service.id}</p>
+                        <p className="text-xs text-content-secondary truncate">{service.id}</p>
                       </div>
                     </label>
                   ))}
@@ -413,7 +400,7 @@ export function PackageCreator({
       case 'permissions':
         return (
           <div className="space-y-4">
-            <p className="text-sm text-slate-400">
+            <p className="text-sm text-content-secondary">
               Select the permissions your package requires. Users will be asked
               to grant these when installing.
             </p>
@@ -424,21 +411,21 @@ export function PackageCreator({
                   key={perm.id}
                   className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                     permissions.has(perm.id)
-                      ? 'bg-purple-500/10 border-purple-500/30'
-                      : 'bg-slate-50 dark:bg-slate-700/30 border-slate-200 dark:border-slate-600/50 hover:border-slate-300 dark:hover:border-slate-500/50'
+                      ? 'bg-accent/10 border-accent/40'
+                      : 'bg-surface-tertiary/60 border-edge-primary hover:border-edge-strong'
                   }`}
                 >
                   <input
                     type="checkbox"
                     checked={permissions.has(perm.id)}
                     onChange={() => togglePermission(perm.id)}
-                    className="w-4 h-4 rounded border-slate-300 dark:border-slate-500 text-purple-500 focus:ring-purple-500/50 bg-white dark:bg-slate-600"
+                    className="w-4 h-4 rounded border-edge-strong text-accent focus:ring-accent/50 bg-surface-secondary"
                   />
                   <div className="flex-1">
-                    <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                    <p className="text-sm font-medium text-content-primary">
                       {perm.label}
                     </p>
-                    <p className="text-xs text-slate-400">{perm.description}</p>
+                    <p className="text-xs text-content-secondary">{perm.description}</p>
                   </div>
                 </label>
               ))}
@@ -449,23 +436,23 @@ export function PackageCreator({
       case 'review':
         return (
           <div className="space-y-4">
-            <div className="p-4 bg-slate-50 dark:bg-slate-700/30 rounded-lg space-y-3">
+            <div className="p-4 bg-surface-tertiary/60 border border-edge-primary rounded-lg space-y-3">
               <div>
-                <p className="text-xs text-slate-500">Package</p>
-                <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                <p className="text-xs text-content-secondary">Package</p>
+                <p className="text-sm font-medium text-content-primary">
                   {packageName}
                 </p>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-content-secondary">
                   {packageId} v{version}
                 </p>
               </div>
 
               <div>
-                <p className="text-xs text-slate-500">Flows</p>
-                <p className="text-sm text-slate-600 dark:text-slate-300">
+                <p className="text-xs text-content-secondary">Flows</p>
+                <p className="text-sm text-content-primary">
                   {selectedFlows.size} flow(s) included
                 </p>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-content-secondary">
                   Entry:{' '}
                   {flows.find((f) => f.id === entryFlowId)?.name ?? entryFlowId}
                 </p>
@@ -473,16 +460,16 @@ export function PackageCreator({
 
               {selectedServices.size > 0 && (
                 <div>
-                  <p className="text-xs text-slate-500">Services</p>
-                  <p className="text-sm text-slate-600 dark:text-slate-300">
+                  <p className="text-xs text-content-secondary">Services</p>
+                  <p className="text-sm text-content-primary">
                     {selectedServices.size} service(s) included
                   </p>
                 </div>
               )}
 
               <div>
-                <p className="text-xs text-slate-500">Permissions</p>
-                <p className="text-sm text-slate-600 dark:text-slate-300">
+                <p className="text-xs text-content-secondary">Permissions</p>
+                <p className="text-sm text-content-primary">
                   {permissions.size === 0
                     ? 'None required'
                     : Array.from(permissions).join(', ')}
@@ -491,8 +478,8 @@ export function PackageCreator({
             </div>
 
             {error && (
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-sm text-red-400">
-                {error}
+              <div className="oaiy-banner err">
+                <span className="flex-1">{error}</span>
               </div>
             )}
           </div>
@@ -502,90 +489,61 @@ export function PackageCreator({
 
   // Step indicator
   const stepIndicator = (
-    <div className="flex items-center justify-center gap-2 mb-6">
+    <div className="flex items-center justify-center gap-2 mb-5">
       {STEPS.map((s, idx) => (
         <div
           key={s}
           className={`w-2 h-2 rounded-full transition-colors ${
-            idx <= currentStepIndex ? 'bg-purple-500' : 'bg-slate-600'
+            idx <= currentStepIndex ? 'bg-accent' : 'bg-edge-strong'
           }`}
         />
       ))}
     </div>
   );
 
+  const stepDescription =
+    step === 'metadata'
+      ? 'Enter package information'
+      : step === 'content'
+        ? 'Select flows and services to include'
+        : step === 'permissions'
+          ? 'Configure required permissions'
+          : 'Review and create your package';
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div
-        ref={dialogRef}
-        className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-2xl max-w-lg w-full mx-4 overflow-hidden"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="pkg-creator-title"
-      >
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-700">
-          <div className="flex items-center justify-between">
-            <h2 id="pkg-creator-title" className="text-lg font-semibold text-slate-700 dark:text-slate-200">
-              Create Package
-            </h2>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close package creator"
-              className="p-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-            >
-              <svg
-                className="w-5 h-5"
-                fill="none"
-                stroke="currentColor"
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M6 18L18 6M6 6l12 12"
-                />
-              </svg>
-            </button>
-          </div>
-          <p className="text-sm text-slate-400 mt-1">
-            {step === 'metadata' && 'Enter package information'}
-            {step === 'content' && 'Select flows and services to include'}
-            {step === 'permissions' && 'Configure required permissions'}
-            {step === 'review' && 'Review and create your package'}
-          </p>
-        </div>
-
-        {/* Content */}
-        <div className="px-6 py-4">
-          {stepIndicator}
-          {renderStep()}
-        </div>
-
-        {/* Actions */}
-        <div className="px-6 py-4 flex justify-between border-t border-slate-200 dark:border-slate-700">
+    <Dialog
+      open
+      onClose={onClose}
+      title="Create Package"
+      description={stepDescription}
+      icon={<Package size={16} />}
+      tone="accent"
+      size="md"
+      dismissible={!creating}
+      footer={
+        <>
           <button
+            type="button"
             onClick={goBack}
-            disabled={currentStepIndex === 0}
-            className="px-4 py-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={currentStepIndex === 0 || creating}
+            className="btn btn-secondary mr-auto"
           >
             Back
           </button>
 
           {step === 'review' ? (
             <button
+              type="button"
               onClick={handleCreate}
               disabled={creating}
-              className="px-4 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              className="btn btn-primary flex items-center gap-2"
             >
               {creating && (
                 <svg
                   className="w-4 h-4 animate-spin"
                   fill="none"
                   viewBox="0 0 24 24"
+                  aria-hidden="true"
                 >
                   <circle
                     className="opacity-25"
@@ -606,18 +564,22 @@ export function PackageCreator({
             </button>
           ) : (
             <button
+              type="button"
               onClick={goNext}
               disabled={
                 (step === 'metadata' && !metadataValid) ||
                 (step === 'content' && !contentValid)
               }
-              className="px-4 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn btn-primary"
             >
               Next
             </button>
           )}
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      {stepIndicator}
+      {renderStep()}
+    </Dialog>
   );
 }

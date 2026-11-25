@@ -883,3 +883,116 @@ fn a_proof_that_is_answered_with_a_503_and_retry_after_is_paced_by_it_and_never_
     assert_eq!(log[0].status, 503);
     assert!(log[0].authorization.is_none(), "the proof request carries no token");
 }
+
+#[test]
+fn unauthenticated_x_oaiy_time_does_not_shift_offset_clock() {
+    // P1-1: an unauthenticated response (health, failed prove, or non-2xx authed response) carrying X-OAIY-Time +86400s must not poison OffsetClock.
+    let clock = Arc::new(oaiy_relay_core::testing::FakeClock::new(T0));
+    let poisoned_time = T0 + 86_400;
+    let http = oaiy_relay_core::testing::ScriptedHttp::new(move |req| {
+        if req.url.ends_with("/v1/health") {
+            return Ok(oaiy_relay_core::testing::json_response(
+                200,
+                &[],
+                r#"{"ok":true,"time":1,"authHeaderSeen":false}"#,
+                poisoned_time,
+            ));
+        }
+        Ok(oaiy_relay_core::testing::json_response(
+            200,
+            &[("x-oaiy-proof", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")],
+            "{}",
+            poisoned_time,
+        ))
+    });
+    let client = RelayClient::new(
+        RelayUrl::parse("https://relay.stub.test").unwrap(),
+        Some("b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw".into()),
+        Arc::new(http),
+        clock,
+        Box::new(oaiy_relay_core::testing::SeededRng::new(1)),
+        ClientConfig::default(),
+    );
+    client.health(&Cancel::new()).unwrap();
+    assert_eq!(client.relay_now(), None, "unauthenticated /v1/health must not sample X-OAIY-Time");
+    assert_eq!(client.relay_offset_s(), None);
+    assert!(!client.clock_mismatch());
+
+    assert!(matches!(client.prove(&Cancel::new()), Err(ProveError::Invalid(_))));
+    assert_eq!(client.relay_now(), None, "a failed proof must not sample X-OAIY-Time");
+    assert_eq!(client.relay_offset_s(), None);
+    assert!(!client.clock_mismatch());
+
+    // A non-2xx response on an authenticated call must not shift OffsetClock either.
+    let e = env(quick());
+    let (token, _) = e.enrol_desktop();
+    let baseline = e.client.relay_now().unwrap();
+    e.stub.fail_next_on(
+        "/v1/tokens/rotate",
+        1,
+        Fault::Respond(500, vec![("x-oaiy-time".into(), (T0 + 86_400).to_string())], r#"{"error":{"code":"internal","message":"err"}}"#.into()),
+    );
+    assert!(e.client.rotate_token(&token, &Cancel::new()).is_err());
+    assert_eq!(e.client.relay_now(), Some(baseline), "5xx response must not shift OffsetClock");
+    assert!(!e.client.clock_mismatch());
+}
+
+#[test]
+fn read_info_requires_x_oaiy_sig_and_426_re_proves_with_nonce() {
+    // P1-2: read_info() must reject a 200 /v1/info without X-OAIY-Sig.
+    let e = env(quick());
+    let valid_resp = e.stub.handle(&HttpRequest {
+        method: Method::Get,
+        url: format!("{}/v1/info", e.stub.public_url()),
+        headers: vec![],
+        body: None,
+        timeout: Duration::from_secs(5),
+        max_response_bytes: oaiy_relay_core::client::relay::MAX_RESPONSE_BYTES,
+        cancel: Cancel::new(),
+    }).unwrap();
+    let unsigned_body = valid_resp.body.clone();
+    let unsigned_http = oaiy_relay_core::testing::ScriptedHttp::new(move |_| {
+        Ok(HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into()), ("x-oaiy-time".into(), T0.to_string())],
+            body: unsigned_body.clone(),
+        })
+    });
+    let client = RelayClient::new(
+        RelayUrl::parse("https://relay.stub.test").unwrap(),
+        Some(e.stub.relay_thumbprint()),
+        Arc::new(unsigned_http),
+        e.clock.clone(),
+        Box::new(oaiy_relay_core::testing::SeededRng::new(2)),
+        ClientConfig::default(),
+    );
+    assert_eq!(client.read_info(&Cancel::new()).unwrap_err(), ClientError::BadAnswer("missing X-OAIY-Sig"));
+
+    // On 426, PollLoop uses prove() (sending X-OAIY-Nonce) rather than unsigned/cached read_info().
+    let e2 = env(quick());
+    let (token, _) = e2.enrol_desktop();
+    let stub = e2.stub.clone();
+    let nonces_on_info = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let nonces_ref = nonces_on_info.clone();
+    let spy = oaiy_relay_core::testing::ScriptedHttp::new(move |req| {
+        if req.url.ends_with("/v1/info") {
+            assert!(req.header("x-oaiy-nonce").is_some(), "every /v1/info from poll loop must carry X-OAIY-Nonce");
+            nonces_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        stub.handle(req)
+    });
+    let spy_client = Arc::new(RelayClient::new(
+        RelayUrl::parse(&e2.stub.public_url()).unwrap(),
+        Some(e2.stub.relay_thumbprint()),
+        Arc::new(spy),
+        e2.clock.clone(),
+        Box::new(oaiy_relay_core::testing::SeededRng::new(3)),
+        ClientConfig::default(),
+    ));
+    let running = run_loop(&spy_client, &token, MemoryPollStore::new());
+    running.wait_for("connected", |ev| ev.iter().any(|x| matches!(x, Event::State(ConnectionState::Connected))));
+    e2.stub.configure(|c| c.min_client = 2);
+    let (end, _) = running.join();
+    assert!(matches!(end, LoopEnd::Stopped { action: Action::UpdateClient, status: Some(426), .. }), "{end:?}");
+    assert!(nonces_on_info.load(std::sync::atomic::Ordering::SeqCst) >= 2, "initial proof + 426 re-proof both used X-OAIY-Nonce");
+}

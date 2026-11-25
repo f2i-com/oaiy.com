@@ -1378,6 +1378,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       while ((m = re.exec(text)) !== null) {
         if (m[0] === '') re.lastIndex++;
         count++;
+        if (count > 100_000) break;
         if (count > max) continue;
         const li = lineOf(m.index);
         const col = m.index - starts[li];
@@ -1387,7 +1388,6 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         const block: string[] = [`match ${count}: line ${li + 1}, column ${col + 1}, char ${m.index}`];
         for (let j = from; j <= to; j++) block.push(`${j === li ? '>' : ' '}${j + 1}\t${clip(lines[j])}`);
         out.push(block.join('\n'));
-        if (count > 100_000) break;
       }
       if (!count) return `no matches in /${key} (${lines.length.toLocaleString()} lines)`;
       return cut(`${count.toLocaleString()} match${count === 1 ? '' : 'es'} in /${key}${count > max ? ` (showing the first ${max})` : ''}\n\n${out.join('\n\n')}`);

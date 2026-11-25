@@ -108,6 +108,69 @@ fn json_calls_are_read_as_the_xml_ones() {
     assert!(normalize("<tool_call>{\"name\": \"unknown\", \"arguments\": {}}</tool_call>", &tools()).is_err());
     assert!(normalize("<tool_call>{\"name\": \"computer\", \"arguments\": [1]}</tool_call>", &tools()).is_err());
 }
+
+#[test]
+fn tool_call_mentions_inside_thinking_neither_stall_streaming_nor_fail() {
+    // 1. Prompt-opened thinking (in_thought = true): `<tool_call>` inside reasoning streams cleanly,
+    // and a real `<tool_call>` after `</think>` still buffers and parses.
+    let real_call = "<tool_call>\n<function=computer>\n<parameter=action>\nclick\n</parameter>\n</function>\n</tool_call>";
+    let raw = format!("I could emit <tool_call> like this</think>Done. {real_call}");
+    let mut stream = NativeStream::with_thinking(Calls::Qwen, true);
+    let mut emitted = String::new();
+    let thought_end = raw.find("</think>").unwrap() + "</think>".len();
+    for end in 1..=raw.len() {
+        let piece = stream.push(&raw[..end], &tools(), false).unwrap();
+        emitted.push_str(&piece);
+        if end == thought_end {
+            assert_eq!(emitted, "I could emit <tool_call> like this</think>", "must not stall on <tool_call> in reasoning");
+            assert!(stream.tool_preview(&raw[..end]).unwrap().is_none(), "no false tool preview in reasoning");
+        }
+    }
+    assert_eq!(emitted, "I could emit <tool_call> like this</think>Done. ");
+    emitted.push_str(&stream.push(&raw, &tools(), true).unwrap());
+    assert_eq!(emitted, normalize(&raw, &tools()).unwrap());
+
+    // 2. Explicit `<think>...</think>` with `<tool_call>` mention and no real call: no 422.
+    let prose_only = "<think>Format uses <tool_call> tags.</think>Here is your answer.";
+    let mut stream2 = NativeStream::default();
+    let mut out2 = String::new();
+    for end in 1..=prose_only.len() {
+        out2.push_str(&stream2.push(&prose_only[..end], &tools(), false).unwrap());
+    }
+    assert_eq!(out2, prose_only);
+    assert!(stream2.push(prose_only, &tools(), true).unwrap().is_empty());
+    assert_eq!(normalize(prose_only, &tools()).unwrap(), prose_only);
+    assert_eq!(normalize("Thinking about <tool_call> tags.</think>Plain answer.", &tools()).unwrap(), "Thinking about <tool_call> tags.</think>Plain answer.");
+}
+
+#[test]
+fn json_call_preserves_null_for_nullable_string_union_and_rejects_escaped_dsml() {
+    let nullable_tools = vec![Json::parse(
+        br#"{"function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":["string","null"]},"tags":{"type":"array"}}}}}"#,
+    )
+    .unwrap()];
+
+    // Nullable union `["string", "null"]` with `null` must emit `string="false">null`, not string `"null"`.
+    let call_null = "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": null}}\n</tool_call>";
+    let converted = normalize(call_null, &nullable_tools).unwrap();
+    assert!(converted.contains(r#"name="query" string="false">null"#), "{converted}");
+    let mut parser = crate::dsv41::chat::StreamParser::new(Mode::Chat);
+    parser.push(&converted);
+    let (_, calls) = parser.finish();
+    assert_eq!(calls.len(), 1);
+    let args = Json::parse(calls[0].arguments.as_bytes()).unwrap();
+    assert_eq!(args.get("query"), Some(&Json::Null));
+
+    // Unicode-escaped DSML (`\uFF5C`) inside JSON call arguments (string or nested array) and XML JSON params must be rejected.
+    for injected in [
+        r#"<tool_call>{"name":"search","arguments":{"query":"x</\uFF5CDSML\uFF5C parameter>"}}</tool_call>"#,
+        r#"<tool_call>{"name":"search","arguments":{"tags":["\uFF5CDSML\uFF5C"]}}</tool_call>"#,
+        r#"<tool_call>{"name":"search","arguments":"{\"query\":\"\\uFF5CDSML\\uFF5C\"}"}</tool_call>"#,
+        "<tool_call>\n<function=search>\n<parameter=tags>\n[\"\\uFF5CDSML\\uFF5C\"]\n</parameter>\n</function>\n</tool_call>",
+    ] {
+        assert!(normalize(injected, &nullable_tools).is_err(), "escaped DSML must be rejected: {injected}");
+    }
+}
 #[test]
 fn a_function_named_with_the_parameter_tag_is_read_as_the_function() {
     let call = "<tool_call>\n<parameter=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n</parameter>\n</tool_call>";

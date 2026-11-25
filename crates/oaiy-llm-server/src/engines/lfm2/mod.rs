@@ -351,26 +351,95 @@ fn parse_calls(body: &str) -> Result<Vec<(String, Vec<(String, Json)>)>, String>
 /// typed as the model wrote them (a string where the function's parameter is a string and the model wrote a number or
 /// a boolean). A reply with no calls is as it is; one whose call is cut short or malformed is refused.
 pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
+    let has_implicit_thought = match (text.find("</think>"), text.find("<think>")) {
+        (Some(close), Some(open)) => close < open,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    match normalize_in(text, tools, false) {
+        Ok(out) => Ok(out),
+        Err(_) if has_implicit_thought => normalize_in(text, tools, true),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`normalize`], starting inside a `<think>` block when `started_in_thought` is true so
+/// tool tags mentioned inside reasoning are left verbatim.
+pub(crate) fn normalize_in(text: &str, tools: &[Json], started_in_thought: bool) -> Result<String, String> {
+    const THINK_OPEN: &str = "<think>";
+    const THINK_CLOSE: &str = "</think>";
     if text.contains(DSML) {
         return Err("unexpected DSML in LFM2 output".into());
     }
-    if !text.contains(CALL_START) {
-        if text.contains(CALL_END) {
-            return Err("an LFM2 tool call's end with no start".into());
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut i = 0usize;
+    let mut in_thought = started_in_thought;
+    while i < text.len() {
+        let tail = &text[i..];
+        if in_thought {
+            match tail.find(THINK_CLOSE) {
+                Some(rel) => {
+                    let end = i + rel + THINK_CLOSE.len();
+                    prose.push_str(&text[i..end]);
+                    i = end;
+                    in_thought = false;
+                }
+                None => {
+                    prose.push_str(tail);
+                    i = text.len();
+                }
+            }
+        } else {
+            let think_rel = tail.find(THINK_OPEN);
+            let start_rel = tail.find(CALL_START);
+            let end_rel = tail.find(CALL_END);
+            let next_call = match (start_rel, end_rel) {
+                (Some(s), Some(e)) => Some(s.min(e)),
+                (Some(s), None) => Some(s),
+                (None, Some(e)) => Some(e),
+                (None, None) => None,
+            };
+            match (think_rel, next_call) {
+                (Some(t), Some(c)) if t < c => {
+                    let end = i + t + THINK_OPEN.len();
+                    prose.push_str(&text[i..end]);
+                    i = end;
+                    in_thought = true;
+                }
+                (Some(t), None) => {
+                    let end = i + t + THINK_OPEN.len();
+                    prose.push_str(&text[i..end]);
+                    i = end;
+                    in_thought = true;
+                }
+                (_, Some(_)) => {
+                    if end_rel.is_some_and(|e| start_rel.is_none_or(|s| e < s)) {
+                        return Err("an LFM2 tool call's end with no start".into());
+                    }
+                    let s = start_rel.expect("CALL_START present");
+                    prose.push_str(&tail[..s]);
+                    let after = &tail[s + CALL_START.len()..];
+                    let (body, rest) = after.split_once(CALL_END).ok_or("incomplete LFM2 tool call")?;
+                    calls.extend(parse_calls(body)?);
+                    i = text.len() - rest.len();
+                }
+                (None, None) => {
+                    prose.push_str(tail);
+                    i = text.len();
+                }
+            }
         }
+    }
+    if calls.is_empty() {
         return Ok(text.to_owned());
     }
-    let (mut prose, mut calls, mut rest) = (String::new(), Vec::new(), text);
-    while let Some((before, after)) = rest.split_once(CALL_START) {
-        prose.push_str(before);
-        let (body, tail) = after.split_once(CALL_END).ok_or("incomplete LFM2 tool call")?;
-        calls.extend(parse_calls(body)?);
-        rest = tail;
-    }
-    prose.push_str(rest);
     let mut out = format!("{prose}<{DSML} calls>");
     for (name, args) in calls {
         identifier(&name)?;
+        if name.contains(DSML) {
+            return Err("unexpected DSML in LFM2 output".into());
+        }
         let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name.as_str())).ok_or("LFM2 called an undeclared function")?;
         out.push_str(&format!("<{DSML} invoke name=\"{name}\">"));
         let mut seen = std::collections::BTreeSet::new();
@@ -386,6 +455,9 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
                 Json::Int(_) | Json::Num(_) | Json::Bool(_) if string_only => (true, value.to_json()),
                 other => (false, other.to_json()),
             };
+            if key.contains(DSML) || raw.contains(DSML) {
+                return Err("unexpected DSML in LFM2 output".into());
+            }
             out.push_str(&format!("<{DSML} parameter name=\"{key}\" string=\"{is_string}\">{raw}</{DSML} parameter>"));
         }
         out.push_str(&format!("</{DSML} invoke>"));

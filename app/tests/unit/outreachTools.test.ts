@@ -25,7 +25,7 @@ function setup(o: { approve?: boolean; ready?: string } = {}) {
     phone: () => ({ holdsCalls: true, holdsTexts: true, connected: true }),
     line: new PhoneLine(),
     callbacks: () => null,
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     callsToOaiy: async () => true,
     rules: async () => ({ quietStart: 0, quietEnd: 0, maxDailyDials: 20, outboundEnabled: true }),
     sessions: () => null,
@@ -40,7 +40,7 @@ function setup(o: { approve?: boolean; ready?: string } = {}) {
     engine: () => engine,
     origin: () => ({ kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' }),
     ready: async () => o.ready ?? '',
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     approve: async (plan) => {
       asked.push(plan);
       return o.approve ?? true;

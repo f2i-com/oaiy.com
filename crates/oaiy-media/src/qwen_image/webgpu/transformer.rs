@@ -87,6 +87,7 @@ pub(crate) fn coop_type(t: GgmlDType) -> Option<ggml_quants::GgmlType> {
 }
 
 /// A tensor's values as an f16 matrix on `gpu`.
+#[cfg(test)]
 fn f16_vec(gpu: &ggml_rs_wgpu::WgpuBackend, t: &Tensor, what: &str) -> Result<DeviceVec> {
     let words = crate::common::webgpu_weights::f16_words_f32(&t.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{what}: past f16's range")))?;
     let v = gpu.vec(words.len());
@@ -224,7 +225,18 @@ pub(crate) fn matrix_as(w: &mut Weights, lora: &mut Loras, gpu: &ggml_rs_wgpu::W
             if !lora.is_empty() {
                 for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
                     let rank = a.dim(0)?;
-                    low.push((f16_vec(gpu, &a, name)?, f16_vec(gpu, &b, name)?, rank));
+                    if rank == 0 {
+                        continue;
+                    }
+                    let a_raw = a.flatten_all()?.to_vec1::<f32>()?;
+                    let b_raw = b.flatten_all()?.to_vec1::<f32>()?;
+                    let (a_pad, b_pad, padded_rank) = crate::common::webgpu_weights::pad_lora_even_rank(&a_raw, &b_raw, n, k, rank);
+                    let a_words = crate::common::webgpu_weights::f16_words_f32(&a_pad).ok_or_else(|| err(format!("{name}: past f16's range")))?;
+                    let b_words = crate::common::webgpu_weights::f16_words_f32(&b_pad).ok_or_else(|| err(format!("{name}: past f16's range")))?;
+                    let (av, bv) = (gpu.vec(a_words.len()), gpu.vec(b_words.len()));
+                    gpu.upload(&av, &a_words);
+                    gpu.upload(&bv, &b_words);
+                    low.push((av, bv, padded_rank));
                 }
             }
             return Ok(Mat { w: W::Quant(q), n, k, lora: low });

@@ -348,6 +348,52 @@ fn a_drafts_token_is_the_first_largest_logit_and_its_share() {
     }
 }
 
+/// `argmax_softmax` skips NaN logits (including full-workgroup runs of NaN), handles all-`-inf`
+/// without producing `u32::MAX` or NaN sums, and falls back to `(0, _, 0.0)` when every logit is NaN.
+#[test]
+fn argmax_softmax_handles_nan_and_neg_inf_logits() {
+    let Ok(b) = WgpuBackend::new(Some(1 << 30)) else { return };
+    let run = |x: &[f32]| -> [f32; 3] {
+        let (xd, out) = (b.vec(x.len()), b.vec(3));
+        DeviceChain::upload(&b, &xd, x);
+        let mut rec = b.begin();
+        rec.argmax_softmax(&xd, &out);
+        rec.read(&out);
+        let got = rec.finish().pop().unwrap();
+        [got[0], got[1], got[2]]
+    };
+
+    // Mixed NaN (including entire first 4096-element workgroup and negative NaN) + valid logits.
+    let mut mixed = vec![f32::NAN; 5000];
+    mixed[0] = f32::from_bits(0xffc0_0001);
+    mixed[4096] = -10.0;
+    mixed[4200] = 4.5;
+    mixed[4999] = 4.5;
+    let got = run(&mixed);
+    assert_eq!(got[0].to_bits(), 4200, "first finite max skipping NaN workgroup");
+    assert_eq!(got[1], 4.5);
+    let want_sum = ((-10.0f64 - 4.5).exp() + 2.0) as f32;
+    assert!((got[2] - want_sum).abs() <= 1e-5 * want_sum, "sum {} vs {want_sum}", got[2]);
+
+    // All -inf logits across both small (< 4096) and multi-workgroup (> 4096) sizes.
+    for n in [17usize, 5000] {
+        let neg_inf = vec![f32::NEG_INFINITY; n];
+        let got = run(&neg_inf);
+        assert_eq!(got[0].to_bits(), 0, "{n} all -inf must pick index 0, not u32::MAX");
+        assert!(got[1].is_infinite() && got[1].is_sign_negative());
+        assert!((got[2] - n as f32).abs() <= 1e-3 * n as f32, "{n} all -inf sum {} vs {n}", got[2]);
+    }
+
+    // All NaN logits must emit idx = 0 and s = 0.0 (never u32::MAX or NaN).
+    for n in [17usize, 5000] {
+        let all_nan = vec![f32::NAN; n];
+        let got = run(&all_nan);
+        assert_eq!(got[0].to_bits(), 0, "{n} all NaN must emit idx 0");
+        assert!(!got[1].is_nan(), "{n} all NaN max must not be NaN");
+        assert_eq!(got[2], 0.0, "{n} all NaN sum must be 0.0");
+    }
+}
+
 /// Several rows' tokens are each row's first largest logit and its share: rows of a vocabulary's 248,320 and of a
 /// few, a row's peak in its first and its last workgroup of 4,096, equals within a row.
 #[test]

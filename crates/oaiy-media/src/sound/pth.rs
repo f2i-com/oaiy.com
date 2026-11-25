@@ -68,8 +68,14 @@ struct Entry {
     len: u64,
 }
 
+const MAX_CD_BYTES: u64 = 64 << 20;
+const MAX_PICKLE_BYTES: u64 = 64 << 20;
+const MAX_PICKLE_NODES: usize = 2_000_000;
+const MAX_PICKLE_DEPTH: usize = 128;
+
 pub struct Pth {
     file: File,
+    file_size: u64,
     entries: HashMap<String, Entry>,
     /// The archive's folder (its entries are `<folder>/data.pkl`, `<folder>/data/<key>`).
     folder: String,
@@ -99,23 +105,36 @@ impl Pth {
         let mut count = u16_at(&tail, eocd + 10) as u64;
         let mut cd_size = u32_at(&tail, eocd + 12) as u64;
         let mut cd_start = u32_at(&tail, eocd + 16) as u64;
-        if cd_start == 0xffff_ffff || count == 0xffff {
+        if cd_start == 0xffff_ffff || count == 0xffff || cd_size == 0xffff_ffff {
             let loc = eocd.checked_sub(20).filter(|&i| u32_at(&tail, i) == 0x0706_4b50).ok_or_else(|| bad("zip64 locator missing"))?;
             let at = u64_at(&tail, loc + 8);
+            if at.checked_add(56).is_none_or(|end| end > size) {
+                return Err(bad("zip64 end of central directory past end of file"));
+            }
             let mut rec = [0u8; 56];
             file.seek(SeekFrom::Start(at))?;
             file.read_exact(&mut rec)?;
+            if u32_at(&rec, 0) != 0x0606_4b50 {
+                return Err(bad("bad zip64 end of central directory signature"));
+            }
             count = u64_at(&rec, 32);
             cd_size = u64_at(&rec, 40);
             cd_start = u64_at(&rec, 48);
         }
-        let mut cd = vec![0u8; cd_size as usize];
+        if cd_size > MAX_CD_BYTES || cd_start.checked_add(cd_size).is_none_or(|end| end > size) {
+            return Err(bad("bad central directory bounds"));
+        }
+        let cd_len = usize::try_from(cd_size).map_err(|_| bad("central directory size exceeds usize"))?;
+        let mut cd = vec![0u8; cd_len];
         file.seek(SeekFrom::Start(cd_start))?;
         file.read_exact(&mut cd)?;
+        if count > (cd.len() / 46) as u64 {
+            return Err(bad("bad central directory count"));
+        }
         let mut entries = HashMap::new();
-        let mut i = 0;
+        let mut i: usize = 0;
         for _ in 0..count {
-            if u32_at(&cd, i) != 0x0201_4b50 {
+            if i.checked_add(46).is_none_or(|end| end > cd.len()) || u32_at(&cd, i) != 0x0201_4b50 {
                 return Err(bad("bad central directory"));
             }
             let method = u16_at(&cd, i + 10);
@@ -124,42 +143,89 @@ impl Pth {
             let extra_len = u16_at(&cd, i + 30) as usize;
             let comment_len = u16_at(&cd, i + 32) as usize;
             let mut local = u32_at(&cd, i + 42) as u64;
-            let name = String::from_utf8_lossy(&cd[i + 46..i + 46 + name_len]).into_owned();
+            let name_start = i + 46;
+            let name_end = name_start.checked_add(name_len).ok_or_else(|| bad("bad central directory"))?;
+            let extra_end = name_end.checked_add(extra_len).ok_or_else(|| bad("bad central directory"))?;
+            let next_i = extra_end.checked_add(comment_len).ok_or_else(|| bad("bad central directory"))?;
+            if next_i > cd.len() {
+                return Err(bad("bad central directory"));
+            }
+            let name = String::from_utf8_lossy(&cd[name_start..name_end]).into_owned();
             // Zip64 sizes and offset, in the extra field.
-            let mut e = i + 46 + name_len;
-            let end = e + extra_len;
+            let mut e = name_end;
+            let end = extra_end;
             while e + 4 <= end {
                 let (id, n) = (u16_at(&cd, e), u16_at(&cd, e + 2) as usize);
+                let field_end = (e + 4).checked_add(n).ok_or_else(|| bad("bad zip extra field"))?;
+                if field_end > end {
+                    return Err(bad("truncated zip extra field"));
+                }
                 if id == 1 {
                     let mut f = e + 4;
-                    if u32_at(&cd, i + 24) == 0xffff_ffff { len = u64_at(&cd, f); f += 8; }
-                    if u32_at(&cd, i + 20) == 0xffff_ffff { f += 8; }
-                    if u32_at(&cd, i + 42) == 0xffff_ffff { local = u64_at(&cd, f); }
+                    if u32_at(&cd, i + 24) == 0xffff_ffff {
+                        if f + 8 > field_end {
+                            return Err(bad("truncated zip64 uncompressed size"));
+                        }
+                        len = u64_at(&cd, f);
+                        f += 8;
+                    }
+                    if u32_at(&cd, i + 20) == 0xffff_ffff {
+                        if f + 8 > field_end {
+                            return Err(bad("truncated zip64 compressed size"));
+                        }
+                        f += 8;
+                    }
+                    if u32_at(&cd, i + 42) == 0xffff_ffff {
+                        if f + 8 > field_end {
+                            return Err(bad("truncated zip64 local header offset"));
+                        }
+                        local = u64_at(&cd, f);
+                    }
                 }
-                e += 4 + n;
+                e = field_end;
             }
             if method != 0 {
                 return Err(bad(format!("{name} is compressed")));
             }
             // The data starts after the local header, whose extra field may differ.
+            if local.checked_add(30).is_none_or(|lh_end| lh_end > size) {
+                return Err(bad(format!("{name}: local header past end of file")));
+            }
             let mut lh = [0u8; 30];
             file.seek(SeekFrom::Start(local))?;
             file.read_exact(&mut lh)?;
-            let start = local + 30 + u16_at(&lh, 26) as u64 + u16_at(&lh, 28) as u64;
+            if u32_at(&lh, 0) != 0x0403_4b50 {
+                return Err(bad(format!("{name}: bad local header signature")));
+            }
+            let start = local
+                .checked_add(30)
+                .and_then(|v| v.checked_add(u16_at(&lh, 26) as u64))
+                .and_then(|v| v.checked_add(u16_at(&lh, 28) as u64))
+                .ok_or_else(|| bad(format!("{name}: local header overflow")))?;
+            if start.checked_add(len).is_none_or(|entry_end| entry_end > size) {
+                return Err(bad(format!("{name} runs past end of file")));
+            }
             entries.insert(name, Entry { start, len });
-            i = end + comment_len;
+            i = next_i;
         }
         let pkl = entries.keys().find(|k| k.ends_with("/data.pkl")).cloned().ok_or_else(|| bad("no data.pkl"))?;
         let folder = pkl.trim_end_matches("/data.pkl").to_string();
-        let mut out = Self { file, entries, folder, root: Value::None };
-        let bytes = out.read_entry(&pkl)?;
+        let mut out = Self { file, file_size: size, entries, folder, root: Value::None };
+        let bytes = out.read_entry_capped(&pkl, MAX_PICKLE_BYTES)?;
         out.root = unpickle(&bytes)?;
         Ok(out)
     }
 
-    fn read_entry(&mut self, name: &str) -> Result<Vec<u8>> {
+    fn read_entry_capped(&mut self, name: &str, max_len: u64) -> Result<Vec<u8>> {
         let e = self.entries.get(name).ok_or_else(|| bad(format!("no entry {name}")))?;
-        let mut buf = vec![0u8; e.len as usize];
+        if e.len > max_len {
+            return Err(bad(format!("entry {name} exceeds limit ({} > {max_len})", e.len)));
+        }
+        if e.start.checked_add(e.len).is_none_or(|end| end > self.file_size) {
+            return Err(bad(format!("entry {name} runs past end of file")));
+        }
+        let len = usize::try_from(e.len).map_err(|_| bad(format!("entry {name} length exceeds usize")))?;
+        let mut buf = vec![0u8; len];
         self.file.seek(SeekFrom::Start(e.start))?;
         self.file.read_exact(&mut buf)?;
         Ok(buf)
@@ -168,18 +234,39 @@ impl Pth {
     /// A tensor value's data, as F32 on `dev`.
     pub fn tensor(&mut self, value: &Value, dev: &Device) -> Result<Tensor> {
         let Value::Tensor { storage, dtype, offset, shape, stride } = value else { return Err(bad("not a tensor")) };
+        if shape.len() != stride.len() {
+            return Err(bad("tensor shape/stride length mismatch"));
+        }
         // Only contiguous row-major tensors (what a state dict holds).
-        let mut expect = 1;
-        for (d, s) in shape.iter().zip(stride).rev() {
-            if *d > 1 && *s != expect {
+        let mut expect: usize = 1;
+        for (&d, &s) in shape.iter().zip(stride).rev() {
+            if d > 1 && s != expect {
                 return Err(bad("a non-contiguous tensor"));
             }
-            expect *= d;
+            expect = expect.checked_mul(d).ok_or_else(|| bad("tensor shape overflow"))?;
         }
-        let numel: usize = shape.iter().product();
+        let nonzero = shape
+            .iter()
+            .filter(|&&d| d != 0)
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| bad("tensor shape overflow"))?;
+        let numel = if shape.contains(&0) { 0 } else { nonzero };
         let size = dtype.size_in_bytes();
-        let bytes = self.read_entry(&format!("{}/data/{storage}", self.folder))?;
-        let data = bytes.get(offset * size..(offset + numel) * size).ok_or_else(|| bad("a tensor past its storage"))?;
+        let byte_off = offset.checked_mul(size).ok_or_else(|| bad("tensor offset overflow"))?;
+        let byte_len = numel.checked_mul(size).ok_or_else(|| bad("tensor byte length overflow"))?;
+        let byte_end = byte_off.checked_add(byte_len).ok_or_else(|| bad("tensor byte range overflow"))?;
+        let key = format!("{}/data/{storage}", self.folder);
+        let e = self.entries.get(&key).ok_or_else(|| bad(format!("no entry {key}")))?;
+        if (byte_end as u64) > e.len {
+            return Err(bad("a tensor past its storage"));
+        }
+        let read_start = e.start.checked_add(byte_off as u64).ok_or_else(|| bad("tensor file offset overflow"))?;
+        if read_start.checked_add(byte_len as u64).is_none_or(|end| end > self.file_size) {
+            return Err(bad("tensor runs past end of file"));
+        }
+        let mut data = vec![0u8; byte_len];
+        self.file.seek(SeekFrom::Start(read_start))?;
+        self.file.read_exact(&mut data)?;
         let values: Vec<f32> = match dtype {
             DType::F32 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             DType::F16 => data.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
@@ -188,6 +275,39 @@ impl Pth {
         };
         Tensor::from_vec(values, shape.clone(), dev)
     }
+}
+
+fn charge_node(budget: &mut usize) -> Result<()> {
+    if *budget == 0 {
+        return Err(bad("pickle exceeds node budget"));
+    }
+    *budget -= 1;
+    Ok(())
+}
+
+fn clone_budgeted(v: &Value, budget: &mut usize) -> Result<Value> {
+    let mut work = vec![(v, 0usize)];
+    while let Some((cur, depth)) = work.pop() {
+        if depth > MAX_PICKLE_DEPTH {
+            return Err(bad("pickle nesting too deep"));
+        }
+        charge_node(budget)?;
+        match cur {
+            Value::List(xs) | Value::Tuple(xs) => {
+                for x in xs {
+                    work.push((x, depth + 1));
+                }
+            }
+            Value::Dict(pairs) => {
+                for (k, val) in pairs {
+                    work.push((k, depth + 1));
+                    work.push((val, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(v.clone())
 }
 
 fn storage_dtype(name: &str) -> Result<DType> {
@@ -203,10 +323,12 @@ fn storage_dtype(name: &str) -> Result<DType> {
 fn unpickle(b: &[u8]) -> Result<Value> {
     let mut stack: Vec<Value> = Vec::new();
     let mut memo: HashMap<u32, Value> = HashMap::new();
-    let mut i = 0;
+    let mut budget = MAX_PICKLE_NODES;
+    let mut i: usize = 0;
     let take = |i: &mut usize, n: usize| -> Result<&[u8]> {
-        let s = b.get(*i..*i + n).ok_or_else(|| bad("truncated pickle"))?;
-        *i += n;
+        let end = i.checked_add(n).ok_or_else(|| bad("truncated pickle"))?;
+        let s = b.get(*i..end).ok_or_else(|| bad("truncated pickle"))?;
+        *i = end;
         Ok(s)
     };
     let pop = |stack: &mut Vec<Value>| stack.pop().ok_or_else(|| bad("empty stack"));
@@ -219,6 +341,7 @@ fn unpickle(b: &[u8]) -> Result<Value> {
     loop {
         let op = *b.get(i).ok_or_else(|| bad("truncated pickle"))?;
         i += 1;
+        charge_node(&mut budget)?;
         match op {
             0x80 => { take(&mut i, 1)?; } // PROTO
             0x95 => { take(&mut i, 8)?; } // FRAME
@@ -250,11 +373,31 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                 let n = take(&mut i, 1)?[0] as usize;
                 stack.push(Value::Str(String::from_utf8_lossy(take(&mut i, n)?).into_owned()));
             }
-            b'q' => { let k = take(&mut i, 1)?[0] as u32; memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty stack"))?); }
-            b'r' => { let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()); memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty stack"))?); }
-            0x94 => { let k = memo.len() as u32; memo.insert(k, stack.last().cloned().ok_or_else(|| bad("empty stack"))?); }
-            b'h' => { let k = take(&mut i, 1)?[0] as u32; stack.push(memo.get(&k).cloned().ok_or_else(|| bad("bad memo"))?); }
-            b'j' => { let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap()); stack.push(memo.get(&k).cloned().ok_or_else(|| bad("bad memo"))?); }
+            b'q' => {
+                let k = take(&mut i, 1)?[0] as u32;
+                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
+            }
+            b'r' => {
+                let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
+                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
+            }
+            0x94 => {
+                let k = memo.len() as u32;
+                let top = stack.last().ok_or_else(|| bad("empty stack"))?;
+                memo.insert(k, clone_budgeted(top, &mut budget)?);
+            }
+            b'h' => {
+                let k = take(&mut i, 1)?[0] as u32;
+                let val = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
+                stack.push(clone_budgeted(val, &mut budget)?);
+            }
+            b'j' => {
+                let k = u32::from_le_bytes(take(&mut i, 4)?.try_into().unwrap());
+                let val = memo.get(&k).ok_or_else(|| bad("bad memo"))?;
+                stack.push(clone_budgeted(val, &mut budget)?);
+            }
             b't' => { let items = pop_mark(&mut stack)?; stack.push(Value::Tuple(items)); }
             0x85 => { let a = pop(&mut stack)?; stack.push(Value::Tuple(vec![a])); }
             0x86 => { let b2 = pop(&mut stack)?; let a = pop(&mut stack)?; stack.push(Value::Tuple(vec![a, b2])); }
@@ -268,9 +411,13 @@ fn unpickle(b: &[u8]) -> Result<Value> {
             }
             b'u' => {
                 let items = pop_mark(&mut stack)?;
+                if items.len() % 2 != 0 {
+                    return Err(bad("SETITEMS with odd item count"));
+                }
                 let Some(Value::Dict(d)) = stack.last_mut() else { return Err(bad("SETITEMS on a non-dict")) };
-                for pair in items.chunks(2) {
-                    if let [k, v] = pair { d.push((k.clone(), v.clone())); }
+                let mut it = items.into_iter();
+                while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    d.push((k, v));
                 }
             }
             b'c' => {
@@ -309,13 +456,31 @@ fn unpickle(b: &[u8]) -> Result<Value> {
                 stack.push(match f.as_str() {
                     "collections.OrderedDict" => Value::Dict(Vec::new()),
                     "torch._utils._rebuild_tensor_v2" => match args.as_slice() {
-                        [Value::Storage { key, dtype }, Value::Int(offset), shape, stride, ..] => Value::Tensor {
-                            storage: key.clone(),
-                            dtype: *dtype,
-                            offset: *offset as usize,
-                            shape: shape.ints().ok_or_else(|| bad("bad tensor shape"))?.into_iter().map(|d| d as usize).collect(),
-                            stride: stride.ints().ok_or_else(|| bad("bad tensor stride"))?.into_iter().map(|d| d as usize).collect(),
-                        },
+                        [Value::Storage { key, dtype }, Value::Int(offset), shape, stride, ..] => {
+                            let offset = usize::try_from(*offset).map_err(|_| bad("negative tensor offset"))?;
+                            let shape: Vec<usize> = shape
+                                .ints()
+                                .ok_or_else(|| bad("bad tensor shape"))?
+                                .into_iter()
+                                .map(|d| usize::try_from(d).map_err(|_| bad("negative tensor dim")))
+                                .collect::<Result<Vec<_>>>()?;
+                            let stride: Vec<usize> = stride
+                                .ints()
+                                .ok_or_else(|| bad("bad tensor stride"))?
+                                .into_iter()
+                                .map(|d| usize::try_from(d).map_err(|_| bad("negative tensor stride")))
+                                .collect::<Result<Vec<_>>>()?;
+                            if shape.len() != stride.len() {
+                                return Err(bad("tensor shape/stride length mismatch"));
+                            }
+                            Value::Tensor {
+                                storage: key.clone(),
+                                dtype: *dtype,
+                                offset,
+                                shape,
+                                stride,
+                            }
+                        }
                         _ => return Err(bad("bad _rebuild_tensor_v2 arguments")),
                     },
                     other => return Err(bad(format!("{other} is not callable here"))),
@@ -334,5 +499,78 @@ fn global(module: &str, name: &str) -> Result<Value> {
     match full.as_str() {
         "collections.OrderedDict" | "torch._utils._rebuild_tensor_v2" | "torch.FloatStorage" | "torch.HalfStorage" | "torch.BFloat16Storage" => Ok(Value::Global(full)),
         _ => Err(bad(format!("refusing {full}: only tensors and plain data are read"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pickle_rejects_clone_bomb_negative_dims_and_rank_mismatch() {
+        // Exponential clone bomb via memo.
+        let mut bomb = vec![0x80, 2, b'K', 1, b'q', 0];
+        for k in 1u8..=25 {
+            bomb.extend_from_slice(&[b'h', k - 1, b'h', k - 1, 0x86, b'q', k]);
+        }
+        bomb.push(b'.');
+        assert!(unpickle(&bomb).is_err(), "clone bomb must fail");
+
+        // Negative tensor offset must fail.
+        let mut neg_off = vec![0x80, 2];
+        neg_off.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n");
+        neg_off.extend_from_slice(b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpuK\x01tQ");
+        neg_off.extend_from_slice(b"J\xff\xff\xff\xffK\x01\x85K\x01\x85\x89tR.");
+        assert!(unpickle(&neg_off).is_err(), "negative offset must fail");
+
+        // Shape/stride rank mismatch must fail.
+        let mut mismatch = vec![0x80, 2];
+        mismatch.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n");
+        mismatch.extend_from_slice(b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpuK\x02tQ");
+        mismatch.extend_from_slice(b"K\x00K\x01K\x02\x86K\x01\x85\x89tR.");
+        assert!(unpickle(&mismatch).is_err(), "shape/stride rank mismatch must fail");
+    }
+
+    #[test]
+    fn zip_rejects_oversized_cd_and_truncated_zip64_extra() {
+        let dir = std::env::temp_dir().join(format!("oaiy-media-pth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Central directory size past file end.
+        let mut bad_cd = vec![0u8; 22];
+        bad_cd[0..4].copy_from_slice(&0x0605_4b50u32.to_le_bytes());
+        bad_cd[10..12].copy_from_slice(&1u16.to_le_bytes());
+        bad_cd[12..16].copy_from_slice(&(100u32 << 20).to_le_bytes());
+        let p1 = dir.join("bad_cd.pth");
+        std::fs::write(&p1, &bad_cd).unwrap();
+        assert!(Pth::open(&p1).is_err());
+
+        // Truncated Zip64 extra field (claims 0xffffffff size, extra len = 4 < 8).
+        let mut zip = Vec::new();
+        zip.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        zip.resize(30, 0);
+        let cd_start = zip.len() as u32;
+        let mut cd = vec![0u8; 46];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd[24..28].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        cd[28..30].copy_from_slice(&1u16.to_le_bytes());
+        cd[30..32].copy_from_slice(&8u16.to_le_bytes());
+        cd.push(b'a');
+        cd.extend_from_slice(&1u16.to_le_bytes());
+        cd.extend_from_slice(&4u16.to_le_bytes());
+        cd.extend_from_slice(&[0u8; 4]);
+        let cd_size = cd.len() as u32;
+        zip.extend_from_slice(&cd);
+        let mut eocd = vec![0u8; 22];
+        eocd[0..4].copy_from_slice(&0x0605_4b50u32.to_le_bytes());
+        eocd[10..12].copy_from_slice(&1u16.to_le_bytes());
+        eocd[12..16].copy_from_slice(&cd_size.to_le_bytes());
+        eocd[16..20].copy_from_slice(&cd_start.to_le_bytes());
+        zip.extend_from_slice(&eocd);
+        let p2 = dir.join("bad_z64.pth");
+        std::fs::write(&p2, &zip).unwrap();
+        assert!(Pth::open(&p2).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

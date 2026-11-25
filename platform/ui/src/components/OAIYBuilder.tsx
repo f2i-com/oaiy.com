@@ -15,6 +15,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import { createLogger } from '../utils/logger';
 import { isCanvasTarget } from '../lib/canvasTarget';
+import { sanitizeSandboxUpdates } from '../lib/sandboxData';
 import { Respacer } from '../lib/respace';
 
 const logger = createLogger('OAIYBuilder');
@@ -699,6 +700,20 @@ export default function OAIYBuilder({
     // The per-node data object builder. Extracted so the cache-hit path can
     // skip it entirely.
     function buildNodeData(node: Node): Record<string, unknown> {
+      // SECURITY: never attach host-wide secrets/context (projectConstants,
+      // projectSettings, llmEndpoints, availableFlows) onto package custom nodes.
+      // Wire only minimal safe update callbacks for GenericNode + SandboxedCustomNodeUI.
+      if (typeof node.type === 'string' && node.type.startsWith('pkg:')) {
+        return {
+          ...node.data,
+          onChange: handlers.onChange(node.id),
+          onCollapsedChange: handlers.onCollapsedChange(node.id),
+          onDataChange: (updates: Record<string, unknown>) => {
+            const clean = sanitizeSandboxUpdates(updates);
+            if (clean) updateNodeData(node.id, clean);
+          },
+        };
+      }
       return {
         ...node.data,
         // Use stable handlers bound to node.id
@@ -872,7 +887,7 @@ export default function OAIYBuilder({
         onOpenComfyWorkflowDialog: (analysis: ComfyUIAnalysis, fileName: string) => handleOpenComfyWorkflowDialog(node.id, analysis, fileName),
       };
     }
-  }, [nodes, handlers, availableFlows, llmEndpoints, projectConstants, projectSettings, handleOpenComfyWorkflowDialog, onShowToast, flowTransitioning]);
+  }, [nodes, handlers, updateNodeData, availableFlows, llmEndpoints, projectConstants, projectSettings, handleOpenComfyWorkflowDialog, onShowToast, flowTransitioning]);
 
   // Make all edges selectable and use custom edge type
   // Also filter to only show edges with valid source and target nodes (prevents flicker during flow loading)

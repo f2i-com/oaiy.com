@@ -106,13 +106,34 @@ impl Dac {
         let pth = Pth::open(path)?;
         let root = pth.root.clone();
         let kwargs = root.get("metadata").and_then(|m| m.get("kwargs")).ok_or_else(|| bad("no metadata.kwargs"))?;
-        let int = |k: &str| kwargs.get(k).and_then(Value::as_i64).map(|v| v as usize).ok_or_else(|| bad(format!("no {k}")));
-        let ints = |k: &str| kwargs.get(k).and_then(Value::ints).map(|v| v.into_iter().map(|x| x as usize).collect::<Vec<_>>()).ok_or_else(|| bad(format!("no {k}")));
+        let int = |k: &str| {
+            kwargs
+                .get(k)
+                .and_then(Value::as_i64)
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v > 0)
+                .ok_or_else(|| bad(format!("missing or invalid {k}")))
+        };
+        let ints = |k: &str| {
+            kwargs
+                .get(k)
+                .and_then(Value::ints)
+                .ok_or_else(|| bad(format!("no {k}")))?
+                .into_iter()
+                .map(|x| usize::try_from(x).ok().filter(|&v| v > 0).ok_or_else(|| bad(format!("invalid {k} entry {x}"))))
+                .collect::<Result<Vec<_>>>()
+        };
+        let encoder_rates = ints("encoder_rates")?;
+        let hop = encoder_rates
+            .iter()
+            .try_fold(1usize, |acc, &r| acc.checked_mul(r))
+            .filter(|&h| h > 0)
+            .ok_or_else(|| bad("invalid encoder_rates / hop"))?;
         let cfg = DacConfig {
             latent_dim: int("latent_dim")?,
             decoder_dim: int("decoder_dim")?,
             decoder_rates: ints("decoder_rates")?,
-            hop: ints("encoder_rates")?.iter().product(),
+            hop,
             sample_rate: int("sample_rate")?,
         };
         let continuous = kwargs.get("continuous").and_then(Value::as_bool).unwrap_or(false);

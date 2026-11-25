@@ -155,8 +155,8 @@ const CoreAudioCompiler: ModuleCompiler = {
     ${JSON.stringify(String(data.filename || 'tts_output'))},
     "Text to Speech"
   );
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
             }
 
@@ -190,8 +190,8 @@ const CoreAudioCompiler: ModuleCompiler = {
     filename: "${filename}",
   });
   // Suffixed outputs for the multi-output node pattern.
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
@@ -271,8 +271,8 @@ const CoreAudioCompiler: ModuleCompiler = {
     ${JSON.stringify(String(data.filename || 'music_output'))},
     "Music Gen"
   );
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
             }
             // Get service type (ace-step or heartmula)
@@ -336,8 +336,8 @@ const CoreAudioCompiler: ModuleCompiler = {
   );
   // Create suffixed output variables for multi-output node pattern
   // Always use 'let' for suffix variables as they are only created here (not pre-declared by main compiler)
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
@@ -362,8 +362,8 @@ const CoreAudioCompiler: ModuleCompiler = {
   );
   // Create suffixed output variables for multi-output node pattern
   // Always use 'let' for suffix variables as they are only created here (not pre-declared by main compiler)
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
@@ -397,10 +397,10 @@ const CoreAudioCompiler: ModuleCompiler = {
     ${JSON.stringify(String(data.language || ''))},
     "${node.id}"
   );
-  let ${outputVar}_text = ${outputVar}.text || "";
-  let ${outputVar}_segments = ${outputVar}.segments || [];
-  let ${outputVar}_language = ${outputVar}.language || "unknown";
-  let ${outputVar}_duration = ${outputVar}.duration || 0;
+  ${letOrAssign}${outputVar}_text = ${outputVar}.text || "";
+  ${letOrAssign}${outputVar}_segments = ${outputVar}.segments || [];
+  ${letOrAssign}${outputVar}_language = ${outputVar}.language || "unknown";
+  ${letOrAssign}${outputVar}_duration = ${outputVar}.duration || 0;
   workflow_context["${node.id}"] = ${outputVar};`;
             }
 
@@ -436,10 +436,10 @@ const CoreAudioCompiler: ModuleCompiler = {
     ${hfTokenConstant ? `"${hfTokenConstant}"` : 'null'}
   );
   // Create suffixed output variables for multi-output node pattern
-  let ${outputVar}_text = ${outputVar}.text || "";
-  let ${outputVar}_segments = ${outputVar}.segments || [];
-  let ${outputVar}_language = ${outputVar}.language || "unknown";
-  let ${outputVar}_duration = ${outputVar}.duration || 0;
+  ${letOrAssign}${outputVar}_text = ${outputVar}.text || "";
+  ${letOrAssign}${outputVar}_segments = ${outputVar}.segments || [];
+  ${letOrAssign}${outputVar}_language = ${outputVar}.language || "unknown";
+  ${letOrAssign}${outputVar}_duration = ${outputVar}.duration || 0;
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
@@ -469,8 +469,8 @@ const CoreAudioCompiler: ModuleCompiler = {
     ${JSON.stringify(String(data.filename || 'sound_effect'))},
     "Sound Effect"
   );
-  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         }
 
@@ -500,8 +500,8 @@ const CoreAudioCompiler: ModuleCompiler = {
     "${node.id}"
   );
   // Create suffixed output variables for multi-output node pattern
-  let ${outputVar}_video = ${outputVar}.video || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;

@@ -406,7 +406,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) l
 
     let q_off = h * 128u + lane * 4u;
     let q4 = vec4<f32>(q[q_off], q[q_off + 1u], q[q_off + 2u], q[q_off + 3u]);
-    let r_val = select(0.0, r[h * d_rel + lane], lane < d_rel);
+    var r_val = 0.0;
+    if (lane < d_rel) {
+        r_val = r[h * d_rel + lane];
+    }
     let scale = inverseSqrt(128.0);
 
     var m = select(-1.0e30, sinks[h], warp == 0u);

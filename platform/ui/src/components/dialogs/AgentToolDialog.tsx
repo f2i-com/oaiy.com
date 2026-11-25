@@ -76,11 +76,14 @@ export default function AgentToolDialog({ flow, onClose, onDone }: Props) {
 
   const takeBack = async () => {
     setBusy(true);
+    setError(null);
     try {
       if (now.tool) await withdrawTool(flow);
       if (now.hook) await withdrawHook(flow);
       onDone(`"${flow.name}" is no longer given to the agent.`);
       onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }

@@ -97,15 +97,45 @@ fn ggml_type(d: GgmlDType) -> Result<u32> {
 /// table were 13.7 GB at once for `q8_0`, and a 16 GB machine (the kind the smaller file is for) killed the
 /// conversion.
 struct Spill {
-    file: std::io::BufWriter<std::fs::File>,
+    file: Option<std::io::BufWriter<std::fs::File>>,
     path: PathBuf,
     tensors: Vec<(String, Vec<usize>, GgmlDType)>,
     open: usize,
+    cleanup: bool,
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // Close the open file handle before removing (required on Windows).
+        self.file.take();
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct PartialGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PartialGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl Spill {
     fn create(path: PathBuf) -> Result<Self> {
-        Ok(Self { file: std::io::BufWriter::new(std::fs::File::create(&path)?), path, tensors: Vec::new(), open: 0 })
+        Ok(Self {
+            file: Some(std::io::BufWriter::new(std::fs::File::create(&path)?)),
+            path,
+            tensors: Vec::new(),
+            open: 0,
+            cleanup: true,
+        })
     }
 
     /// A tensor whose bytes follow ([`Self::bytes`], then [`Self::end`]).
@@ -115,7 +145,8 @@ impl Spill {
     }
 
     fn bytes(&mut self, b: &[u8]) -> Result<()> {
-        std::io::Write::write_all(&mut self.file, b)?;
+        let file = self.file.as_mut().ok_or_else(|| msg("spill file closed"))?;
+        std::io::Write::write_all(file, b)?;
         self.open += b.len();
         Ok(())
     }
@@ -126,7 +157,9 @@ impl Spill {
         if self.open != want {
             return Err(msg(format!("{}: {} bytes written, {want} its shape's", self.tensors.last().map_or("", |t| t.0.as_str()), self.open)));
         }
-        std::io::Write::write_all(&mut self.file, &[0u8; 32][..(32 - self.open % 32) % 32])?;
+        let pad = (32 - self.open % 32) % 32;
+        let file = self.file.as_mut().ok_or_else(|| msg("spill file closed"))?;
+        std::io::Write::write_all(file, &[0u8; 32][..pad])?;
         Ok(())
     }
 
@@ -140,16 +173,17 @@ impl Spill {
     /// never mistaken for a finished one); the spill removed.
     fn finish(mut self, out: &Path, meta: &[(&str, Meta)]) -> Result<()> {
         use std::io::{Seek, Write};
-        self.file.flush()?;
-        drop(self.file);
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+        }
         let string = |w: &mut dyn Write, s: &str| -> Result<()> {
             w.write_all(&(s.len() as u64).to_le_bytes())?;
             w.write_all(s.as_bytes())?;
             Ok(())
         };
-        let partial = out.with_extension("gguf.partial");
+        let mut partial = PartialGuard { path: out.with_extension("gguf.partial"), armed: true };
         {
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&partial.path)?);
             w.write_all(&0x4655_4747u32.to_le_bytes())?;
             w.write_all(&2u32.to_le_bytes())?;
             w.write_all(&(self.tensors.len() as u64).to_le_bytes())?;
@@ -189,7 +223,9 @@ impl Spill {
             w.flush()?;
         }
         std::fs::remove_file(&self.path)?;
-        std::fs::rename(&partial, out)?;
+        self.cleanup = false;
+        std::fs::rename(&partial.path, out)?;
+        partial.armed = false;
         Ok(())
     }
 }
@@ -332,6 +368,34 @@ mod tests {
             println!("{dtype:?}: whole {:.3e}, parallel {:.3e}", err(&whole)?, err(&parallel)?);
             assert!(err(&parallel)? < 0.1, "{dtype:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn spill_and_partial_are_cleaned_up_on_drop_and_error() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("oaiy-spill-clean-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+
+        // 1. Early drop removes `.gguf.spill`.
+        let spill_path = dir.join("early.gguf.spill");
+        {
+            let mut spill = Spill::create(spill_path.clone())?;
+            spill.bytes(b"partial-bytes")?;
+            assert!(spill_path.exists());
+        }
+        assert!(!spill_path.exists(), "spill file should be removed on drop");
+
+        // 2. Error during finish removes both `.gguf.spill` and `.gguf.partial`.
+        let out = dir.join("fail.gguf");
+        let spill_path2 = out.with_extension("gguf.spill");
+        let partial_path = out.with_extension("gguf.partial");
+        let mut spill = Spill::create(spill_path2.clone())?;
+        spill.begin("bad", vec![32], GgmlDType::Q2K); // Q2K is rejected by ggml_type()
+        assert!(spill.finish(&out, &[]).is_err());
+        assert!(!spill_path2.exists(), "spill file should be removed on finish error");
+        assert!(!partial_path.exists(), "partial file should be removed on finish error");
+
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }

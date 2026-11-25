@@ -838,7 +838,7 @@ impl LiteralCode {
     }
     fn contains_next_marker(&mut self) -> bool {
         self.flush_run();
-        self.delimiter.is_some() || self.escaped
+        self.delimiter.is_some()
     }
 }
 
@@ -889,7 +889,8 @@ impl StreamParser {
                     };
                     let prefix = self.pending[..p].to_string();
                     self.literal.push(&prefix);
-                    let literal = self.literal.contains_next_marker();
+                    let literal = !(self.phase == Phase::Reasoning && marker == THINK_END)
+                        && self.literal.contains_next_marker();
                     let shown = if !literal && marker == calls_start {
                         prefix.strip_suffix("\n\n").unwrap_or(&prefix).to_string()
                     } else { prefix };
@@ -902,11 +903,18 @@ impl StreamParser {
                         self.calls = self.pending[p..].to_string();
                         self.pending.clear();
                         self.phase = Phase::ToolCalls;
+                        self.literal = LiteralCode::default();
                         self.try_complete();
                         return out;
                     } else {
                         // Idempotent boundaries; later openings allow rethinking.
-                        self.phase = if marker == THINK_START { Phase::Reasoning } else { Phase::Content };
+                        let next_phase = if marker == THINK_START { Phase::Reasoning } else { Phase::Content };
+                        if next_phase != self.phase {
+                            self.literal = LiteralCode::default();
+                        } else {
+                            self.literal.escaped = false;
+                        }
+                        self.phase = next_phase;
                         self.pending.drain(..p + marker.len());
                     }
                 }
@@ -1099,6 +1107,66 @@ mod tests {
             for delta in parser.finish().0 { if let Delta::Content(s)=delta {shown.push_str(&s);} }
             assert_eq!(shown, text);
         }
+    }
+
+    #[test]
+    fn unclosed_code_in_reasoning_and_trailing_backslash_never_suppress_markers() {
+        // 1. Unclosed backtick / fence in reasoning must NOT suppress `</think>`, and must reset on phase change.
+        let call = format!("<{DSML} calls>\n<{DSML} invoke name=\"ping\">\n\n</{DSML} invoke>\n</{DSML} calls>");
+        for thought in ["Check `unclosed", "```rust\nfn x()", "~~~txt\nopen fence"] {
+            let full = format!("{thought}</think>Answer.\n\n{call}");
+            let mut p = StreamParser::new(Mode::Thinking);
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for ch in full.chars() {
+                for d in p.push(&ch.to_string()) {
+                    match d {
+                        Delta::Reasoning(s) => reasoning.push_str(&s),
+                        Delta::Content(s) => content.push_str(&s),
+                    }
+                }
+            }
+            let (rest, calls) = p.finish();
+            assert!(rest.is_empty(), "{thought}: {rest:?}");
+            assert_eq!(reasoning, thought);
+            assert_eq!(content, "Answer.");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "ping");
+        }
+
+        // 2. Trailing backslash `\` before `</think>` or `<｜DSML｜ calls>` must NOT suppress them.
+        let with_bs_think = r"C:\dir\</think>Final";
+        let mut p = StreamParser::new(Mode::Thinking);
+        let (mut r, mut c) = (String::new(), String::new());
+        for ch in with_bs_think.chars() {
+            for d in p.push(&ch.to_string()) {
+                match d {
+                    Delta::Reasoning(s) => r.push_str(&s),
+                    Delta::Content(s) => c.push_str(&s),
+                }
+            }
+        }
+        for d in p.finish().0 {
+            match d {
+                Delta::Reasoning(s) => r.push_str(&s),
+                Delta::Content(s) => c.push_str(&s),
+            }
+        }
+        assert_eq!(r, r"C:\dir\");
+        assert_eq!(c, "Final");
+
+        let with_bs_call = format!(r"C:\dir\{call}");
+        let mut p = StreamParser::new(Mode::Chat);
+        let mut shown = String::new();
+        for ch in with_bs_call.chars() {
+            for d in p.push(&ch.to_string()) {
+                if let Delta::Content(s) = d { shown.push_str(&s); }
+            }
+        }
+        let (rest, calls) = p.finish();
+        assert!(rest.is_empty());
+        assert_eq!(shown, r"C:\dir\");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ping");
     }
 
     #[test]

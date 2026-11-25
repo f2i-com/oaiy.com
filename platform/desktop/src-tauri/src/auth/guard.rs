@@ -58,11 +58,11 @@ use super::host::{
 };
 use super::mode::{AccessMode, Exposure};
 use super::presets::App;
-use super::principal::{Principal, PrincipalKind};
+use super::principal::{ControlLevel, Principal, PrincipalKind};
 use super::routes::{
     lookup, pattern_existed_before, pattern_is_public, route_class, Class, DeskRole, Verb,
 };
-use super::scopes::is_dangerous;
+use super::scopes::{is_auth_scope, is_dangerous, is_reserved};
 use super::store::{AuthError, AuthStore};
 use super::token;
 
@@ -458,6 +458,46 @@ pub fn authorize(class: &Class, principal: Option<&Principal>, mode: AccessMode)
             }
         }
     }
+}
+
+/// Whether a route's scope MUST still be strictly enforced against exact `principal.scopes`
+/// (plus elevation) even for an in-process MCP tool subrequest ([`crate::control::tools::McpDispatch`]).
+/// Preserves privilege-escalation boundaries for all dangerous, reserved, `auth.*`,
+/// `calls.settings`, `calls.manage`, and `agent.settings` routes.
+fn mcp_requires_exact_scope(scope: &str) -> bool {
+    is_dangerous(scope)
+        || is_reserved(scope)
+        || is_auth_scope(scope)
+        || matches!(scope, "calls.settings" | "calls.manage" | "agent.settings")
+}
+
+/// Authorize an in-process MCP tool subrequest (`McpDispatch` with `Peer::InProcess`).
+///
+/// Allows `control.read` to authorize non-dangerous, non-reserved read routes (`GET`/`HEAD`)
+/// and `control.project` to authorize non-dangerous, non-reserved project routes, while
+/// strictly enforcing exact `principal.scopes` + elevation for every `is_dangerous()`,
+/// `is_reserved()`, `auth.*`, `calls.settings`, `calls.manage`, `agent.settings`, and
+/// non-scope route class.
+fn authorize_mcp_dispatch(
+    class: &Class,
+    method: &Method,
+    principal: Option<&Principal>,
+    mode: AccessMode,
+) -> Verdict {
+    let base = authorize(class, principal, mode);
+    if matches!(base, Verdict::Allow) {
+        return base;
+    }
+    if let (Class::Scope(scope), Some(p)) = (class, principal) {
+        if !mcp_requires_exact_scope(scope) {
+            let level = p.control_level();
+            let is_read = matches!(*method, Method::GET | Method::HEAD);
+            if (is_read && level >= ControlLevel::Read) || level == ControlLevel::Project {
+                return Verdict::Allow;
+            }
+        }
+    }
+    base
 }
 
 // ---- configuration ----------------------------------------------------------------------------
@@ -1196,6 +1236,11 @@ impl Guard {
         } else {
             None
         };
+        let mcp_dispatch = peer == Peer::InProcess
+            && req
+                .extensions()
+                .get::<crate::control::McpDispatch>()
+                .is_some();
 
         // Setup-only mode (design 4.7.1): an install with a web login and no owner answers an UNAUTHENTICATED caller
         // only the short list of routes that say whether there is a login and make one, and 401 `setup_required` to
@@ -1269,7 +1314,12 @@ impl Guard {
                 ));
             }
         }
-        match authorize(&class, principal.as_ref(), self.mode) {
+        let verdict = if mcp_dispatch {
+            authorize_mcp_dispatch(&class, &method, principal.as_ref(), self.mode)
+        } else {
+            authorize(&class, principal.as_ref(), self.mode)
+        };
+        match verdict {
             Verdict::Allow => Ok(Admitted {
                 principal,
                 info: Some(info),

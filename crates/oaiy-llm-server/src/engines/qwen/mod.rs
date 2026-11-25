@@ -337,15 +337,68 @@ fn without_special_token(s: &str) -> &str {
         .map_or(s, |(_, rest)| rest.trim_start())
 }
 
+/// Find the byte offset of the first `<tool_call>` outside `<think>...</think>` blocks.
+/// Returns `Err` if an incomplete `<tool_call` tag appears outside thinking.
+fn find_call_outside_thinking(text: &str, mut in_thought: bool) -> Result<Option<usize>, String> {
+    const THINK_OPEN: &str = "<think>";
+    const THINK_CLOSE: &str = "</think>";
+    let mut i = 0usize;
+    while i < text.len() {
+        let tail = &text[i..];
+        if in_thought {
+            let Some(rel) = tail.find(THINK_CLOSE) else {
+                return Ok(None);
+            };
+            i += rel + THINK_CLOSE.len();
+            in_thought = false;
+        } else {
+            let think_rel = tail.find(THINK_OPEN);
+            let call_rel = tail.find("<tool_call");
+            match (think_rel, call_rel) {
+                (Some(t), Some(c)) if t < c => {
+                    i += t + THINK_OPEN.len();
+                    in_thought = true;
+                }
+                (Some(t), None) => {
+                    i += t + THINK_OPEN.len();
+                    in_thought = true;
+                }
+                (_, Some(c)) => {
+                    let pos = i + c;
+                    if text[pos..].starts_with("<tool_call>") {
+                        return Ok(Some(pos));
+                    }
+                    return Err("incomplete Qwen tool call".into());
+                }
+                (None, None) => return Ok(None),
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Convert a complete, schema-typed native call to the server's existing
 /// strict tool parser. Partial/malformed calls never become executable calls.
 pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
+    let has_implicit_thought = match (text.find("</think>"), text.find("<think>")) {
+        (Some(close), Some(open)) => close < open,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    match normalize_in(text, tools, false) {
+        Ok(out) => Ok(out),
+        Err(_) if has_implicit_thought => normalize_in(text, tools, true),
+        Err(e) => Err(e),
+    }
+}
+
+fn normalize_in(text: &str, tools: &[Json], started_in_thought: bool) -> Result<String, String> {
     if text.contains(DSML) { return Err("unexpected DSML in Qwen output".into()); }
-    let Some((prefix, rest)) = text.split_once("<tool_call>") else {
-        if text.contains("<tool_call") { return Err("incomplete Qwen tool call".into()); }
+    let Some(at) = find_call_outside_thinking(text, started_in_thought)? else {
         return Ok(text.to_owned());
     };
-    let mut rest = rest;
+    let prefix = &text[..at];
+    let mut rest = &text[at + "<tool_call>".len()..];
     let mut out = format!("{prefix}<{DSML} calls>");
     loop {
         let (block, tail) = rest.split_once("</tool_call>").ok_or("incomplete Qwen tool call")?;
@@ -377,6 +430,9 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
             let typ = schema.get("parameters").and_then(|p| p.get("properties")).and_then(|p| p.get(key)).and_then(|p|p.get("type"));
             let is_string = typ.and_then(Json::as_str) == Some("string") || typ.and_then(Json::as_array).is_some_and(|a| a.iter().any(|t| t.as_str() == Some("string")));
             let raw = if is_string { value.to_owned() } else { Json::parse(value.trim().as_bytes()).map_err(|e| format!("invalid JSON parameter {key}: {e}"))?.to_json() };
+            if name.contains(DSML) || key.contains(DSML) || raw.contains(DSML) {
+                return Err("unexpected DSML in Qwen output".into());
+            }
             out.push_str(&format!("<{DSML} parameter name=\"{key}\" string=\"{is_string}\">{raw}</{DSML} parameter>"));
             params = tail.trim();
         }
@@ -389,12 +445,12 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
 }
 
 /// A call in Qwen3's JSON form (`{"name": ..., "arguments": {...}}`, the arguments an object or that object as a
-/// string) in the server's markup, each argument a string where the function's schema says it is one.
+/// string) in the server's markup, preserving JSON value types so nullable unions with `null` are not coerced.
 fn json_call(block: &str, tools: &[Json]) -> Result<String, String> {
     let call = Json::parse(block.trim().as_bytes()).map_err(|e| format!("invalid JSON tool call: {e}"))?;
     let name = call.get("name").and_then(Json::as_str).ok_or("a JSON tool call without its name")?;
     identifier(name)?;
-    let schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or_else(|| format!("unknown tool {name}: Qwen called an undeclared function"))?;
+    let _schema = tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name)).ok_or_else(|| format!("unknown tool {name}: Qwen called an undeclared function"))?;
     let args = match call.get("arguments").or_else(|| call.get("parameters")) {
         Some(Json::Str(s)) => Json::parse(s.as_bytes()).map_err(|e| format!("invalid JSON arguments: {e}"))?,
         Some(v) => v.clone(),
@@ -404,12 +460,13 @@ fn json_call(block: &str, tools: &[Json]) -> Result<String, String> {
     let mut out = format!("<{DSML} invoke name=\"{name}\">");
     for (key, value) in args {
         identifier(&key)?;
-        let typ = schema.get("parameters").and_then(|p| p.get("properties")).and_then(|p| p.get(&key)).and_then(|p| p.get("type"));
-        let is_string = typ.and_then(Json::as_str) == Some("string") || typ.and_then(Json::as_array).is_some_and(|a| a.iter().any(|t| t.as_str() == Some("string")));
-        let raw = match (&value, is_string) {
-            (Json::Str(s), true) => s.clone(),
-            _ => value.to_json(),
+        let (is_string, raw) = match &value {
+            Json::Str(s) => (true, s.clone()),
+            _ => (false, value.to_json()),
         };
+        if name.contains(DSML) || key.contains(DSML) || raw.contains(DSML) {
+            return Err("unexpected DSML in Qwen output".into());
+        }
         out.push_str(&format!("<{DSML} parameter name=\"{key}\" string=\"{is_string}\">{raw}</{DSML} parameter>"));
     }
     out.push_str(&format!("</{DSML} invoke>"));
@@ -449,18 +506,29 @@ struct NativeStream {
     call_start_at: Option<usize>,
     dsml_checked: usize,
     calls: Calls,
+    started_in_thought: bool,
+    in_thought: bool,
+    thought_scan: usize,
 }
 
 impl NativeStream {
+    fn with_thinking(calls: Calls, in_thought: bool) -> Self {
+        Self {
+            calls,
+            started_in_thought: in_thought,
+            in_thought,
+            ..Default::default()
+        }
+    }
+
     fn tool_preview(&mut self, decoded: &str) -> Result<Option<(String, bool)>, String> {
         let tag = self.calls.open().0;
         let at = match self.tool_open_at {
             Some(pos) => pos,
             None => {
-                let mut from = self.sent_len.saturating_sub(tag.len());
-                while from > 0 && !decoded.is_char_boundary(from) { from -= 1; }
-                let Some(rel) = decoded[from..].find(tag) else { return Ok(None) };
-                let pos = from + rel;
+                let Some(start) = self.call_start_at else { return Ok(None) };
+                let Some(rel) = decoded[start..].find(tag) else { return Ok(None) };
+                let pos = start + rel;
                 self.tool_open_at = Some(pos);
                 pos
             }
@@ -478,7 +546,7 @@ impl NativeStream {
 
     fn push(&mut self, decoded: &str, tools: &[Json], complete: bool) -> Result<String, String> {
         if complete {
-            let text = self.calls.normalize(decoded, tools)?;
+            let text = self.calls.normalize_in(decoded, tools, self.started_in_thought)?;
             let sent = decoded.get(..self.sent_len).ok_or("Qwen decoded text changed after streaming")?;
             let delta = text.strip_prefix(sent).ok_or("Qwen decoded text changed after streaming")?.to_owned();
             self.sent_len = text.len();
@@ -492,21 +560,60 @@ impl NativeStream {
         self.dsml_checked = decoded.len();
 
         let (tag, start) = self.calls.open();
-        let end = if let Some(at) = self.call_start_at {
-            at
-        } else {
-            let mut from = self.sent_len.saturating_sub(start.len());
-            while from > 0 && !decoded.is_char_boundary(from) { from -= 1; }
-            if let Some(rel) = decoded[from..].find(start) {
-                let at = from + rel;
-                self.call_start_at = Some(at);
-                at
-            } else {
-                let held = (1..tag.len()).rev().find(|&n| decoded.ends_with(&tag[..n])).unwrap_or(0);
-                decoded.len() - held
+        let clean = decoded.trim_end_matches('\u{fffd}');
+        if self.call_start_at.is_none() {
+            const THINK_OPEN: &str = "<think>";
+            const THINK_CLOSE: &str = "</think>";
+            while self.thought_scan < clean.len() {
+                let tail = &clean[self.thought_scan..];
+                if self.in_thought {
+                    if let Some(rel) = tail.find(THINK_CLOSE) {
+                        self.thought_scan += rel + THINK_CLOSE.len();
+                        self.in_thought = false;
+                    } else {
+                        let held = (1..THINK_CLOSE.len())
+                            .rev()
+                            .find(|&n| tail.ends_with(&THINK_CLOSE[..n]))
+                            .unwrap_or(0);
+                        self.thought_scan = clean.len() - held;
+                        break;
+                    }
+                } else {
+                    let think_rel = tail.find(THINK_OPEN);
+                    let call_rel = tail.find(start);
+                    match (think_rel, call_rel) {
+                        (Some(t), Some(c)) if t < c => {
+                            self.thought_scan += t + THINK_OPEN.len();
+                            self.in_thought = true;
+                        }
+                        (Some(t), None) => {
+                            self.thought_scan += t + THINK_OPEN.len();
+                            self.in_thought = true;
+                        }
+                        (_, Some(c)) => {
+                            let at = self.thought_scan + c;
+                            self.call_start_at = Some(at);
+                            self.thought_scan = at;
+                            break;
+                        }
+                        (None, None) => {
+                            let mut held = 0usize;
+                            for marker in [THINK_OPEN, tag] {
+                                let h = (1..marker.len())
+                                    .rev()
+                                    .find(|&n| tail.ends_with(&marker[..n]))
+                                    .unwrap_or(0);
+                                held = held.max(h);
+                            }
+                            self.thought_scan = clean.len() - held;
+                            break;
+                        }
+                    }
+                }
             }
-        };
-        let ready = decoded[..end].trim_end_matches('\u{fffd}');
+        }
+        let end = self.call_start_at.unwrap_or(self.thought_scan).min(clean.len());
+        let ready = &clean[..end];
         if ready.len() < self.sent_len {
             return Err("Qwen decoded text changed after streaming".into());
         }
@@ -1043,10 +1150,16 @@ impl Calls {
     }
 
     /// A complete reply's calls in the server's tool markup.
-    fn normalize(self, text: &str, tools: &[Json]) -> Result<String, String> {
+    fn normalize_in(self, text: &str, tools: &[Json], started_in_thought: bool) -> Result<String, String> {
         match self {
-            Calls::Qwen => normalize(text, tools),
-            Calls::Lfm2 => crate::engines::lfm2::normalize(text, tools),
+            Calls::Qwen => {
+                if started_in_thought {
+                    normalize_in(text, tools, true)
+                } else {
+                    normalize(text, tools)
+                }
+            }
+            Calls::Lfm2 => crate::engines::lfm2::normalize_in(text, tools, started_in_thought),
         }
     }
 }
@@ -1286,7 +1399,17 @@ impl QwenEngine {
         // it as from any live state. A big live state that this prompt shares little with is set
         // aside too, now, while all its checkpoints are there: the logic below drops the ones the
         // prompt does not share. An incognito request neither takes from the RAM nor gives to it.
-        let aside = if self.model.sets_aside() { self.aside_for(&keys) } else { "" };
+        if job.forget && self.private_session.is_none() {
+            self.aside = None;
+        }
+        let same_private_session = job.forget
+            && job.session.is_some()
+            && self.private_session.as_ref() == Some(&job.session);
+        let aside = if (!job.forget || same_private_session) && self.model.sets_aside() {
+            self.aside_for(&keys)
+        } else {
+            ""
+        };
         let swapped = !job.forget && self.parking.swap_in(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
         if !job.forget {
             self.parking.park_displaced(Held { kv: &mut self.kv, covered: &mut self.covered, checkpoints: &mut self.checkpoints, private: self.private_session.is_some() }, &keys);
@@ -1369,12 +1492,19 @@ impl QwenEngine {
         for image in &job.images {
             if image.start + image.prep.n_tokens() <= start { continue; }
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
-            let (t, ds) = if let Some((_,t,ds)) = self.vision_cache.iter().find(|(hash,_,_)| *hash == image.hash) { (t.clone(), ds.clone()) } else {
+            let (t, ds) = if let Some((_, t, ds)) = (!job.forget)
+                .then(|| self.vision_cache.iter().find(|(hash, _, _)| *hash == image.hash))
+                .flatten()
+            {
+                (t.clone(), ds.clone())
+            } else {
                 let (ImagePrep::Qwen { pixels, .. } | ImagePrep::MiniCpmV { pixels, .. }) = &image.prep else { return Err("wrong image format for Qwen".into()); };
                 let (t, ds) = self.projector.as_ref().ok_or("Qwen vision projector is not configured")?.forward_deepstack(pixels).map_err(|e| e.to_string())?;
                 let (t, ds): (Tensor, Vec<Tensor>) = (t.to_host(), ds.into_iter().map(|d| d.to_host()).collect());
-                self.vision_cache.push_back((image.hash,t.clone(),ds.clone()));
-                while self.vision_cache.len() > 8 { self.vision_cache.pop_front(); }
+                if !job.forget {
+                    self.vision_cache.push_back((image.hash, t.clone(), ds.clone()));
+                    while self.vision_cache.len() > 8 { self.vision_cache.pop_front(); }
+                }
                 (t, ds)
             };
             soft.push((image.start,t,ds));
@@ -1497,7 +1627,7 @@ impl QwenEngine {
         let mut generated = Vec::new(); let mut think_used = 0usize;
         let mut decoded = String::with_capacity(4096);
         let mut utf8_pending: Vec<u8> = Vec::with_capacity(8);
-        let mut stream = NativeStream { calls: self.calls, ..Default::default() };
+        let mut stream = NativeStream::with_thinking(self.calls, in_thought);
         // The reply's prose (past its thought, outside its tool calls, where code rightly repeats): its recent tokens,
         // for its repeat, presence and frequency penalties (`crate::engines::job::penalize_reply`).
         let (mut in_call, mut prose) = (false, std::collections::VecDeque::<u32>::new());
@@ -1641,7 +1771,7 @@ impl QwenEngine {
             let clock = std::time::Instant::now();
             let prev_len = decoded.len();
             tok.decode_token_incremental(next, &mut utf8_pending, &mut decoded);
-            if decoded.len() > prev_len {
+            if !in_thought && decoded.len() > prev_len {
                 let mut scan = prev_len.saturating_sub(call_overlap);
                 while scan > 0 && !decoded.is_char_boundary(scan) { scan -= 1; }
                 let tail = &decoded[scan..];

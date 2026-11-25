@@ -115,16 +115,11 @@ const externalGlobals: Record<string, string> = {
   '@monaco-editor/react': '__PLUGIN_GLOBALS__.MonacoReact',
 };
 
-// Tauri imports that we *deliberately* block from custom-node code. If a
-// custom node tries to import any of these we return a stub module that
-// throws on access, with a message pointing at the broker.
-const BLOCKED_TAURI_IMPORTS: ReadonlySet<string> = new Set([
-  '@tauri-apps/api',
-  '@tauri-apps/api/core',
-  '@tauri-apps/api/event',
-  '@tauri-apps/api/path',
-  '@tauri-apps/plugin-sql',
-]);
+// Tauri imports that we *deliberately* block from custom-node code: ANY
+// `@tauri-apps/*` specifier (core, plugin-fs, plugin-shell, plugin-sql, etc.)
+// returns a stub module that throws on access, pushing package authors back
+// through the permission-gated oaiy-core runtime context.
+const isBlockedTauriImport = (specifier: string): boolean => /^@tauri-apps(?:\/|$)/.test(specifier);
 
 // ============================================
 // Compilation Functions
@@ -174,7 +169,7 @@ function createVirtualPlugin(sources: Map<string, string>, entryPath: string): e
 
       // Handle external modules
       build.onResolve({ filter: /^[^.]/ }, (args) => {
-        if (BLOCKED_TAURI_IMPORTS.has(args.path)) {
+        if (isBlockedTauriImport(args.path)) {
           // Custom nodes are not allowed to call Tauri APIs directly —
           // route the import to a stub that throws a clear, actionable
           // error at runtime so package authors get pushed back through

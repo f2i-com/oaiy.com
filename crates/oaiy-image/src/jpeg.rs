@@ -623,7 +623,7 @@ fn ac_refine(b: &mut [i16], a: &Huffman, scan: &Scan, bits: &mut Bits, eobrun: &
                     break;
                 }
             }
-            if s != 0 {
+            if s != 0 && k <= scan.se {
                 b[NATURAL[k]] = s;
             }
             k += 1;

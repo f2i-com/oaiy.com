@@ -243,17 +243,26 @@ async function call(
   const ensureInvoke = ctx?.tauri?.invoke as
     | (<T>(cmd: string, args?: unknown) => Promise<T>)
     | undefined;
-  if (ensureInvoke && /(?:127\.0\.0\.1|localhost)/.test(endpoint)) {
-    const portMatch = endpoint.match(/:(\d+)/);
-    if (portMatch) {
-      const port = parseInt(portMatch[1], 10);
+  let parsedEndpoint: URL | null = null;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch {
+    parsedEndpoint = null;
+  }
+  const isLoopbackHost =
+    parsedEndpoint !== null &&
+    (parsedEndpoint.hostname === '127.0.0.1' || parsedEndpoint.hostname === 'localhost');
+  if (ensureInvoke && isLoopbackHost && parsedEndpoint && parsedEndpoint.port) {
+    const port = parseInt(parsedEndpoint.port, 10);
+    if (Number.isFinite(port) && port > 0) {
       try {
         const r = await ensureInvoke<{ success?: boolean; port?: number }>(
           'ensure_service_ready_by_port',
           { port },
         );
         if (r?.success && r.port && r.port !== port) {
-          endpoint = endpoint.replace(`:${port}`, `:${r.port}`);
+          parsedEndpoint.port = String(r.port);
+          endpoint = parsedEndpoint.toString();
         }
       } catch {
         /* no companion / not reachable — fall through to the direct request */

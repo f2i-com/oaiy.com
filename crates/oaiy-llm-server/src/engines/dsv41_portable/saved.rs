@@ -32,6 +32,11 @@ fn kept(v: &[f32], fill: f32) -> (usize, bool) {
 
 /// A vector's header: its length, its values written, its fill's bits, whether as bf16.
 const VECTOR_HEAD: usize = 8 + 8 + 4 + 1;
+const MAX_POS: u64 = 1 << 24;
+const MAX_LAYERS: u64 = 1024;
+const MAX_VEC_LEN: u64 = 1 << 27;
+const MAX_TOTAL_FLOATS: u64 = 1 << 30;
+const MAX_HISTORY: u64 = 1 << 24;
 
 impl SavedState {
     pub fn new(pos: usize, state: Arc<Checkpoint>) -> SavedState {
@@ -39,56 +44,105 @@ impl SavedState {
         SavedState { pos, state, plan }
     }
 
-    fn read(input: &mut dyn Read) -> std::io::Result<SavedState> {
+    fn read(input: &mut dyn Read, length: u64) -> std::io::Result<SavedState> {
+        const CHUNK_ELEMS: usize = 16_384;
         let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("a damaged DeepSeek-V4.1 state: {what}"));
+        let mut remaining = length.checked_sub(16).ok_or_else(|| bad("truncated header"))?;
         let mut word = [0u8; 8];
         let mut u64_of = |input: &mut dyn Read| -> std::io::Result<u64> {
             input.read_exact(&mut word)?;
             Ok(u64::from_le_bytes(word))
         };
-        let pos = u64_of(input)? as usize;
-        let layers = u64_of(input)? as usize;
-        if layers > 1024 {
+        let pos_u64 = u64_of(input)?;
+        let layers_u64 = u64_of(input)?;
+        if pos_u64 == 0 || pos_u64 > MAX_POS {
+            return Err(bad("its position"));
+        }
+        let min_layer_bytes = layers_u64
+            .checked_mul(7 * VECTOR_HEAD as u64)
+            .and_then(|b| b.checked_add(8));
+        if layers_u64 > MAX_LAYERS || min_layer_bytes.is_none_or(|need| need > remaining) {
             return Err(bad("its layers"));
         }
+        let pos = usize::try_from(pos_u64).map_err(|_| bad("its position"))?;
+        let layers = usize::try_from(layers_u64).map_err(|_| bad("its layers"))?;
         let mut states = Vec::with_capacity(layers);
         let mut plan = Vec::with_capacity(layers * 7);
+        let mut total_floats = 0u64;
+        let mut scratch = vec![0u8; CHUNK_ELEMS * 4];
         for _ in 0..layers {
             let mut parts = Vec::with_capacity(7);
             for _ in 0..7 {
-                let (len, n) = (u64_of(input)? as usize, u64_of(input)? as usize);
+                remaining = remaining.checked_sub(VECTOR_HEAD as u64).ok_or_else(|| bad("truncated vector header"))?;
+                let len_u64 = u64_of(input)?;
+                let n_u64 = u64_of(input)?;
                 let mut fill = [0u8; 4];
                 input.read_exact(&mut fill)?;
                 let mut kind = [0u8; 1];
                 input.read_exact(&mut kind)?;
-                if n > len || len > 1 << 32 || kind[0] > 1 {
+                if n_u64 > len_u64 || len_u64 > MAX_VEC_LEN || kind[0] > 1 {
                     return Err(bad("a vector's length"));
                 }
-                let mut v = vec![f32::from_bits(u32::from_le_bytes(fill)); len];
+                total_floats = total_floats
+                    .checked_add(len_u64)
+                    .filter(|&t| t <= MAX_TOTAL_FLOATS)
+                    .ok_or_else(|| bad("its total size"))?;
                 let bf16 = kind[0] == 1;
-                let mut bytes = vec![0u8; n * if bf16 { 2 } else { 4 }];
-                input.read_exact(&mut bytes)?;
-                if bf16 {
-                    for (x, b) in v.iter_mut().zip(bytes.chunks_exact(2)) {
-                        *x = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+                let elem_bytes = if bf16 { 2u64 } else { 4u64 };
+                let data_bytes = n_u64.checked_mul(elem_bytes).ok_or_else(|| bad("a vector's length"))?;
+                remaining = remaining.checked_sub(data_bytes).ok_or_else(|| bad("truncated vector data"))?;
+                let len = usize::try_from(len_u64).map_err(|_| bad("a vector's length"))?;
+                let n = usize::try_from(n_u64).map_err(|_| bad("a vector's length"))?;
+                let fill_f32 = f32::from_bits(u32::from_le_bytes(fill));
+                let mut v = Vec::with_capacity(n.min(CHUNK_ELEMS));
+                let mut left = n;
+                while left > 0 {
+                    let take = left.min(CHUNK_ELEMS);
+                    let buf = &mut scratch[..take * elem_bytes as usize];
+                    input.read_exact(buf)?;
+                    if bf16 {
+                        for b in buf.chunks_exact(2) {
+                            v.push(f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16));
+                        }
+                    } else {
+                        for b in buf.chunks_exact(4) {
+                            v.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                        }
                     }
-                } else {
-                    for (x, b) in v.iter_mut().zip(bytes.chunks_exact(4)) {
-                        *x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    }
+                    left -= take;
                 }
+                v.resize(len, fill_f32);
                 plan.push((n, bf16));
                 parts.push(v);
             }
             states.push(AttnState::from_parts(parts).ok_or_else(|| bad("a layer"))?);
         }
-        let n = u64_of(input)? as usize;
-        if n > 1 << 32 {
+        remaining = remaining.checked_sub(8).ok_or_else(|| bad("truncated history header"))?;
+        let hist_u64 = u64_of(input)?;
+        let hist_bytes = hist_u64.checked_mul(8).ok_or_else(|| bad("its history"))?;
+        if hist_u64 > MAX_HISTORY || hist_bytes > remaining {
             return Err(bad("its history"));
         }
-        let mut bytes = vec![0u8; n * 8];
-        input.read_exact(&mut bytes)?;
-        let history = bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().expect("eight bytes"))).collect();
+        remaining -= hist_bytes;
+        if remaining != 0 {
+            return Err(bad("trailing bytes"));
+        }
+        let n = usize::try_from(hist_u64).map_err(|_| bad("its history"))?;
+        let mut history = Vec::with_capacity(n.min(CHUNK_ELEMS));
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(CHUNK_ELEMS / 2);
+            let buf = &mut scratch[..take * 8];
+            input.read_exact(buf)?;
+            for b in buf.chunks_exact(8) {
+                history.push(i64::from_le_bytes(b.try_into().expect("eight bytes")));
+            }
+            left -= take;
+        }
+        let mut extra = [0u8; 1];
+        if input.read(&mut extra)? != 0 {
+            return Err(bad("trailing bytes"));
+        }
         Ok(SavedState { pos, state: Arc::new(Checkpoint::from_parts(states, history)), plan })
     }
 }
@@ -142,12 +196,12 @@ impl crate::engines::disk::PromptState for SavedState {
 
     fn decode(bytes: &[u8]) -> oaiy_engine::Result<SavedState> {
         let mut input = bytes;
-        SavedState::read(&mut input).map_err(oaiy_engine::Error::Io)
+        SavedState::read(&mut input, bytes.len() as u64).map_err(oaiy_engine::Error::Io)
     }
 
     fn read_from(input: &mut dyn Read, length: u64) -> oaiy_engine::Result<SavedState> {
         let mut input = std::io::BufReader::with_capacity(1 << 22, input.take(length));
-        SavedState::read(&mut input).map_err(oaiy_engine::Error::Io)
+        SavedState::read(&mut input, length).map_err(oaiy_engine::Error::Io)
     }
 }
 
@@ -204,5 +258,32 @@ mod tests {
         let mut wrong = bytes.clone();
         wrong[8..16].copy_from_slice(&5000u64.to_le_bytes());
         assert!(SavedState::read_from(&mut &wrong[..], wrong.len() as u64).is_err(), "its layers' count");
+
+        // pos == 0 rejected
+        let mut zero_pos = bytes.clone();
+        zero_pos[0..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(SavedState::decode(&zero_pos).is_err(), "pos == 0");
+
+        // trailing bytes rejected
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(SavedState::decode(&trailing).is_err(), "trailing bytes");
+
+        // huge vector len / n in truncated buffer must fail cleanly without OOM
+        let mut huge_vec = Vec::new();
+        huge_vec.extend_from_slice(&1u64.to_le_bytes()); // pos
+        huge_vec.extend_from_slice(&1u64.to_le_bytes()); // layers
+        huge_vec.extend_from_slice(&(1u64 << 31).to_le_bytes()); // len
+        huge_vec.extend_from_slice(&(1u64 << 30).to_le_bytes()); // n
+        huge_vec.extend_from_slice(&0u32.to_le_bytes()); // fill
+        huge_vec.push(0); // f32
+        assert!(SavedState::decode(&huge_vec).is_err(), "huge vector counts");
+
+        // huge history count in truncated buffer must fail cleanly without OOM
+        let mut huge_hist = Vec::new();
+        huge_hist.extend_from_slice(&1u64.to_le_bytes()); // pos
+        huge_hist.extend_from_slice(&0u64.to_le_bytes()); // 0 layers
+        huge_hist.extend_from_slice(&(1u64 << 30).to_le_bytes()); // huge history len
+        assert!(SavedState::decode(&huge_hist).is_err(), "huge history count");
     }
 }

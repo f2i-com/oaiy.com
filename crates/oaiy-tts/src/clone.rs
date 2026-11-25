@@ -23,8 +23,16 @@ fn reflect(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
     if left == 0 && right == 0 {
         return Ok(x.clone());
     }
-    let n = x.dim(D::Minus1)? as i64;
-    let idx: Vec<u32> = (-(left as i64)..n + right as i64)
+    let len = x.dim(D::Minus1)?;
+    if len <= left || len <= right {
+        return Err(msg(format!(
+            "reflect padding ({left}, {right}) requires input length > pad, got {len}"
+        )));
+    }
+    let n = i64::try_from(len).map_err(|_| msg("reflect input length overflow"))?;
+    let left_i = i64::try_from(left).map_err(|_| msg("reflect pad overflow"))?;
+    let right_i = i64::try_from(right).map_err(|_| msg("reflect pad overflow"))?;
+    let idx: Vec<u32> = (-left_i..n + right_i)
         .map(|i| {
             let mut i = i;
             if i < 0 {
@@ -342,6 +350,8 @@ mod tests {
     fn reflect_padding_mirrors_without_the_edge() -> Result<()> {
         let x = Tensor::new(&[[1f32, 2., 3., 4.]], &Device::Cpu)?;
         assert_eq!(reflect(&x, 2, 2)?.to_vec2::<f32>()?, vec![vec![3., 2., 1., 2., 3., 4., 3., 2.]]);
+        assert!(reflect(&x, 4, 0).is_err(), "pad == len must return clean error");
+        assert!(reflect(&x, 0, 5).is_err(), "pad > len must return clean error");
         Ok(())
     }
 

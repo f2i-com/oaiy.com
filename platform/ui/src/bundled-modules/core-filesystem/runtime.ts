@@ -7,9 +7,91 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 
+// =============================================================================
+// PATH VALIDATION (exported so core-input and tests share the exact same guard)
+// =============================================================================
+
+/**
+ * Validates a file path to prevent path traversal and Windows device-path attacks.
+ * Throws an error if the path is unsafe.
+ */
+export function validatePath(path: string, operation: string): void {
+  if (!path || typeof path !== 'string') {
+    throw new Error(`${operation}: Path is required`);
+  }
+
+  // Check length (Windows MAX_PATH is 260, long paths up to 32767)
+  if (path.length > 32767) {
+    throw new Error(`${operation}: Path exceeds maximum length`);
+  }
+
+  // Check for null bytes (can be used to truncate paths)
+  if (path.includes('\0')) {
+    throw new Error(`${operation}: Path contains null bytes`);
+  }
+
+  // Reject Windows drive-relative paths like "C:foo.txt" (must be "C:\..." or "C:/...")
+  if (/^[a-zA-Z]:(?![\\/])/.test(path)) {
+    throw new Error(`${operation}: Drive-relative Windows path is not allowed`);
+  }
+
+  // Normalize slashes for consistent checking
+  const normalizedPath = path.replace(/\\/g, '/');
+
+  // Check for path traversal sequences as whole segments so filenames like
+  // "report..final.txt" remain valid while "../x", "x/../y", "x/..", and ".." fail.
+  if (normalizedPath.split('/').includes('..')) {
+    throw new Error(`${operation}: Path traversal detected`);
+  }
+
+  // Check for URL-encoded traversal
+  if (normalizedPath.includes('%2e%2e') || normalizedPath.includes('%2E%2E')) {
+    throw new Error(`${operation}: Encoded path traversal detected`);
+  }
+
+  // Unconditionally reject Windows device / extended-length namespace prefixes
+  // (works even when paths use forward slashes without a drive letter, e.g. //./COM1)
+  const dangerousPrefixes = [
+    '\\\\.\\',      // Device namespace
+    '\\\\?\\',      // Extended-length path prefix
+    '//?/',         // Forward-slash extended path prefix
+    '//./',         // Forward-slash device namespace prefix
+  ];
+
+  for (const prefix of dangerousPrefixes) {
+    if (path.startsWith(prefix) || normalizedPath.startsWith(prefix.replace(/\\/g, '/'))) {
+      throw new Error(`${operation}: Dangerous path prefix detected`);
+    }
+  }
+
+  // Unconditionally reject Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+  // in any path segment (regardless of OS heuristics or slash style).
+  const devicePattern = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+  for (const segment of normalizedPath.split('/')) {
+    if (segment && devicePattern.test(segment)) {
+      throw new Error(`${operation}: Reserved device name in path`);
+    }
+  }
+}
+
+function mintFileRefToken(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `fileref_${crypto.randomUUID()}`;
+    }
+  } catch {
+    // Fallback below
+  }
+  return `fileref_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`;
+}
+
 // Per-job method factory: methods close over THIS job's `ctx` (no module-level
 // singleton), so concurrent jobs don't cross-contaminate. Invoked once per job.
 function createFilesystemMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
+  // Per-job table of runtime-issued large-file tokens -> verified file metadata.
+  // Prevents untrusted text containing forged {"__type":"file_ref","path":...}
+  // from tricking text_chunker into reading arbitrary files off disk.
+  const issuedFileRefs = new Map<string, { path: string; size: number }>();
 
 /**
  * Format a path for log output through the project's `logPathPolicy`.
@@ -22,76 +104,6 @@ function formatPath(path: string): string {
   const normalized = String(path).replace(/\\/g, '/');
   const idx = normalized.lastIndexOf('/');
   return idx >= 0 ? normalized.slice(idx + 1) : normalized;
-}
-
-// =============================================================================
-// PATH VALIDATION
-// =============================================================================
-
-/**
- * Validates a file path to prevent path traversal attacks.
- * Throws an error if the path is unsafe.
- *
- * Rules:
- * - No path traversal sequences (../, ..\)
- * - No null bytes
- * - Must be a reasonable length
- * - Cannot start with certain dangerous prefixes on Windows
- */
-function validatePath(path: string, operation: string): void {
-  if (!path || typeof path !== 'string') {
-    throw new Error(`${operation}: Path is required`);
-  }
-
-  // Check length (Windows MAX_PATH is 260, but long paths can be 32767)
-  if (path.length > 32767) {
-    throw new Error(`${operation}: Path exceeds maximum length`);
-  }
-
-  // Normalize the path for consistent checking
-  const normalizedPath = path.replace(/\\/g, '/');
-
-  // Check for null bytes (can be used to truncate paths)
-  if (path.includes('\0')) {
-    throw new Error(`${operation}: Path contains null bytes`);
-  }
-
-  // Check for path traversal sequences. Use a whole-segment check so that
-  // legitimate filenames containing double dots (e.g. "report..final.txt")
-  // are accepted, while "../x", "x/../y", "x/.." and bare ".." are rejected.
-  if (normalizedPath.split('/').includes('..')) {
-    throw new Error(`${operation}: Path traversal detected in "${path}"`);
-  }
-
-  // Check for URL-encoded traversal
-  if (normalizedPath.includes('%2e%2e') || normalizedPath.includes('%2E%2E')) {
-    throw new Error(`${operation}: Encoded path traversal detected`);
-  }
-
-  // Windows-specific dangerous paths
-  // Check for Windows by looking for common Windows path patterns
-  const isWindows = path.includes('\\') || /^[a-zA-Z]:/.test(path);
-  if (isWindows) {
-    const dangerousPrefixes = [
-      '\\\\.\\',      // Device namespace
-      '\\\\?\\',      // Extended-length path prefix
-      '//?/',         // Alternative device namespace
-      '//.//',        // UNC device path
-    ];
-
-    for (const prefix of dangerousPrefixes) {
-      if (path.startsWith(prefix) || normalizedPath.startsWith(prefix.replace(/\\/g, '/'))) {
-        throw new Error(`${operation}: Dangerous path prefix detected`);
-      }
-    }
-
-    // Check for device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-    const devicePattern = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
-    const fileName = normalizedPath.split('/').pop() || '';
-    if (devicePattern.test(fileName)) {
-      throw new Error(`${operation}: Reserved device name in path`);
-    }
-  }
 }
 
 /**
@@ -226,13 +238,16 @@ async function readFile(
       readAs,
     });
 
-    // Handle large file references
+    // Handle large file references with an unforgeable per-job token
     if (result.isLargeFile) {
+      const token = mintFileRefToken();
+      issuedFileRefs.set(token, { path: result.path, size: result.size });
+      ctx.onNodeStatus?.(nodeId, 'completed');
       ctx.log('warn', `[FileSystem] File too large for memory: ${formatPath(path)} (${result.size} bytes)`);
-      // Return a reference marker that can be used for streaming
+      // Return an opaque reference marker that can only be resolved within this run
       return JSON.stringify({
         __type: 'file_ref',
-        path: result.path,
+        token,
         size: result.size,
         name: result.name,
       });
@@ -251,19 +266,30 @@ async function readFile(
 }
 
 /**
- * Calculate chunk boundaries for a large file (streaming support)
+ * Calculate chunk boundaries for a large file (streaming support).
+ * Requires a runtime-issued file_ref token from readFile (never raw paths).
  */
 async function calculateFileChunks(
-  path: string,
+  token: string,
   chunkSize: number,
   overlap: number,
   nodeId: string
-): Promise<Array<{path: string; start: number; length: number; index: number; total: number}>> {
-  // Validate path before proceeding
-  validatePath(path, 'calculateFileChunks');
+): Promise<Array<{token: string; start: number; length: number; index: number; total: number}>> {
+  if (ctx.abortSignal?.aborted) {
+    ctx.log('info', '[FileSystem] Aborted by user before calculateFileChunks');
+    throw new Error('Operation aborted by user');
+  }
+
+  const ref = typeof token === 'string' ? issuedFileRefs.get(token) : undefined;
+  if (!ref) {
+    ctx.onNodeStatus?.(nodeId, 'error');
+    throw new Error('calculateFileChunks: Invalid or unissued file reference token');
+  }
+
+  validatePath(ref.path, 'calculateFileChunks');
 
   ctx.onNodeStatus?.(nodeId, 'running');
-  ctx.log('info', `[FileSystem] Calculating chunks for: ${formatPath(sanitizePath(path))} (size: ${chunkSize}, overlap: ${overlap})`);
+  ctx.log('info', `[FileSystem] Calculating chunks for: ${formatPath(sanitizePath(ref.path))} (size: ${chunkSize}, overlap: ${overlap})`);
 
   if (!ctx.tauri) {
     ctx.onNodeStatus?.(nodeId, 'error');
@@ -271,14 +297,20 @@ async function calculateFileChunks(
   }
 
   try {
-    const chunks = await ctx.tauri.invoke<Array<{path: string; start: number; length: number; index: number; total: number}>>(
+    const chunks = await ctx.tauri.invoke<Array<{path?: string; start: number; length: number; index: number; total: number}>>(
       'plugin:oaiy-filesystem|calculate_file_chunks',
-      { path, chunkSize, overlap }
+      { path: ref.path, chunkSize, overlap }
     );
 
     ctx.onNodeStatus?.(nodeId, 'completed');
     ctx.log('success', `[FileSystem] Calculated ${chunks.length} chunks`);
-    return chunks;
+    return chunks.map((c) => ({
+      token,
+      start: c.start,
+      length: c.length,
+      index: c.index,
+      total: c.total,
+    }));
   } catch (error) {
     ctx.onNodeStatus?.(nodeId, 'error');
     const errMsg = error instanceof Error ? error.message : (typeof error === 'string' ? error : 'Unknown error');
@@ -288,16 +320,25 @@ async function calculateFileChunks(
 }
 
 /**
- * Read a specific chunk from a file (streaming support)
+ * Read a specific chunk from a file (streaming support).
+ * Requires a runtime-issued file_ref token from readFile (never raw paths).
  */
 async function readChunkContent(
-  path: string,
+  token: string,
   start: number,
   length: number,
   readAs: string = 'text'
 ): Promise<string> {
-  // Validate path before proceeding
-  validatePath(path, 'readChunkContent');
+  if (ctx.abortSignal?.aborted) {
+    throw new Error('Operation aborted by user');
+  }
+
+  const ref = typeof token === 'string' ? issuedFileRefs.get(token) : undefined;
+  if (!ref) {
+    throw new Error('readChunkContent: Invalid or unissued file reference token');
+  }
+
+  validatePath(ref.path, 'readChunkContent');
 
   if (!ctx.tauri) {
     throw new Error('Tauri not available for filesystem operations');
@@ -306,7 +347,7 @@ async function readChunkContent(
   try {
     const content = await ctx.tauri.invoke<string>(
       'plugin:oaiy-filesystem|read_chunk_content',
-      { path, start, length, readAs }
+      { path: ref.path, start, length, readAs }
     );
     return content;
   } catch (error) {
@@ -332,7 +373,7 @@ async function copyFile(
   if (nodeId) {
     ctx.onNodeStatus?.(nodeId, 'running');
   }
-  ctx.log('info', `[FileSystem] Copying file: ${sanitizePath(source)} -> ${sanitizePath(destination)}`);
+  ctx.log('info', `[FileSystem] Copying file: ${formatPath(sanitizePath(source))} -> ${formatPath(sanitizePath(destination))}`);
 
   if (!ctx.tauri) {
     if (nodeId) {
@@ -403,9 +444,8 @@ async function writeFile(
     throw new Error(`File Write was given a path that is not one: ${formatPath(path)}`);
   }
 
-  // On Windows, valid absolute paths should have a drive letter (e.g., C:)
-  // Check if path looks like a Windows absolute path
-  const hasWindowsDrive = /^[a-zA-Z]:/.test(path);
+  // On Windows, valid absolute paths must have a drive letter followed by a separator (e.g., C:\ or C:/)
+  const hasWindowsDrive = /^[a-zA-Z]:[\\/]/.test(path);
   const hasUnixRoot = path.startsWith('/');
 
   if (!hasWindowsDrive && !hasUnixRoot) {

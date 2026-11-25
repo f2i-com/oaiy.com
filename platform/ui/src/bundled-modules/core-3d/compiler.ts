@@ -51,9 +51,9 @@ const Core3DCompiler: ModuleCompiler = {
     "${node.id}",
     ${JSON.stringify(String(data.filename || 'model'))}
   );
-  let ${outputVar}_model = ${outputVar}.model;
-  let ${outputVar}_path = ${outputVar}.path;
-  let ${outputVar}_picture = ${outputVar}.picture;
+  ${letOrAssign}${outputVar}_model = ${outputVar}.model;
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path;
+  ${letOrAssign}${outputVar}_picture = ${outputVar}.picture;
   workflow_context["${node.id}"] = ${outputVar};`;
   },
 };

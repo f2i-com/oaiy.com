@@ -188,7 +188,7 @@ static HTTP: Lane = super::net::LaneClient::new(build_client);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder(super::net::Keep::Between)
+    super::creds::client_builder(super::net::Keep::Between)
         .build()
         .map_err(|e| format!("could not build the relay client: {e}"))
 }
@@ -305,9 +305,10 @@ fn serve(
     // may already have taken it, and doing the work before claiming would run
     // it twice — for `services.start` that is merely wasteful, but the contract
     // is what makes it safe to have two desktops at all.
+    let cmd_seg = super::oauth::path_segment(&command.id, "command id")?;
     let claim_url = super::oauth::join(
         &account.base_url,
-        &spec.claim_path.replace("{id}", &command.id),
+        &spec.claim_path.replace("{id}", &cmd_seg),
     );
     let claimed = http
         .post(&claim_url)
@@ -368,7 +369,7 @@ fn serve(
 
     let complete_url = super::oauth::join(
         &account.base_url,
-        &spec.complete_path.replace("{id}", &command.id),
+        &spec.complete_path.replace("{id}", &cmd_seg),
     );
     // The work is done (a text may have gone), so its outcome is worth a few
     // tries: lost, the provider shows the command as never picked up, and a
@@ -1098,23 +1099,32 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
-        // The redirect policy of this lane is the client's default, unchanged: a
-        // provider that moves the queue is followed. What is not followed is the
-        // bearer, which reqwest drops on the way to another host or port (this
-        // moves it to another port; it does not drop it for a change of scheme alone).
+    fn redirects_are_not_followed_and_traversal_command_ids_are_rejected() {
+        // Credentialed relay clients never follow redirects.
         let elsewhere = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
         let moved_to = format!("{}/moved", elsewhere.base);
         let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
 
-        let (handled, trouble) =
-            poll_once(&account(origin.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap();
-        assert_eq!((handled, trouble), (0, None), "the answer from where it was sent");
-
+        let err = poll_once(&account(origin.base.clone()), &spec(), "oaiy-test", &working_dispatcher())
+            .unwrap_err();
+        assert!(matches!(err, Refused::Trouble(ref m) if m.contains("HTTP 307")), "{err:?}");
         assert_eq!(origin.requests()[0].header("authorization"), Some("Bearer flk_secret"));
-        let followed = elsewhere.requests();
-        assert_eq!(followed.len(), 1);
-        assert!(followed[0].target.starts_with("/moved"), "{}", followed[0].target);
-        assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
+
+        // A command with a path-traversal id is rejected before claim/complete requests are sent.
+        let bad_batch = r#"{"commands":[{"commandId":"../admin?x=1","command":"plugins.list"}]}"#;
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/pending") {
+                Reply::ok(bad_batch)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (handled, trouble) =
+            poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher())
+                .unwrap();
+        assert_eq!(handled, 1);
+        assert!(trouble.as_deref().is_some_and(|m| m.contains("invalid command id")), "{trouble:?}");
+        assert_eq!(server.requests().len(), 1, "only /pending may be hit; traversal claim must not be sent");
     }
 }

@@ -154,7 +154,7 @@
             const items = rt.vfs.listDir(dir).map((n) => ({ cls: DirEntry, dict: new Map([["name", n], ["path", dir === "." ? n : dir.replace(/\/+$/, "") + "/" + n]]) }));
             return { cls: Scan, dict: new Map([["_items", list(items)]]) };
         }, 0);
-        fn(g, "replace", 2, (a) => { const f = rt.vfs.get(needStr(a[0])); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); rt.vfs.set(needStr(a[1]), f); rt.vfs.remove(needStr(a[0])); return null; });
+        fn(g, "replace", 2, (a) => { const src = needStr(a[0]), dst = needStr(a[1]), f = rt.vfs.get(src); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + src + "'"); if (absPath(src) !== absPath(dst)) { rt.vfs.set(dst, f); rt.vfs.remove(src); } return null; });
         const path = g.get("path");
         const pg = path && path.globals;
         if (pg) {

@@ -70,6 +70,7 @@ pub struct Request {
 impl Request {
     /// The talker's sampling: the request's settings, for the code predictor too.
     fn sampling(&self) -> Sampling {
+        let greedy = self.greedy || !self.temperature.is_finite() || self.temperature <= 0.0;
         Sampling {
             temperature: self.temperature,
             top_k: self.top_k,
@@ -77,7 +78,7 @@ impl Request {
             repetition_penalty: self.repetition_penalty,
             sub_temperature: self.temperature,
             sub_top_k: self.top_k,
-            greedy: self.greedy,
+            greedy,
             seed: self.seed,
             ..Sampling::default()
         }
@@ -117,11 +118,19 @@ impl Request {
         if r.text.len() > 20_000 || r.instructions.len() > 4_000 {
             return Err("speech: text is limited to 20000 bytes and instructions to 4000".into());
         }
-        if !(1.0..=600.0).contains(&r.max_seconds) {
+        if !r.max_seconds.is_finite() || !(1.0..=600.0).contains(&r.max_seconds) {
             return Err("speech: max_seconds must be 1..600".into());
         }
-        if !(0.05..=2.0).contains(&r.temperature) || !(0.0..=1.0).contains(&r.top_p) || r.top_p == 0.0 {
-            return Err("speech: temperature must be 0.05..2 and top_p in (0, 1]".into());
+        if !r.temperature.is_finite() || !(0.0..=2.0).contains(&r.temperature) || !r.top_p.is_finite() || !(0.0..=1.0).contains(&r.top_p) || r.top_p == 0.0 {
+            return Err("speech: temperature must be 0..2 and top_p in (0, 1]".into());
+        }
+        if !r.repetition_penalty.is_finite() || r.repetition_penalty <= 0.0 {
+            return Err("speech: repetition_penalty must be finite and > 0".into());
+        }
+        if let Some(scale) = r.cfg_scale {
+            if !scale.is_finite() || scale < 0.0 {
+                return Err("speech: cfg_scale must be finite and >= 0".into());
+            }
         }
         Ok(r)
     }
@@ -451,6 +460,30 @@ mod tests {
         assert_eq!(trimmed.len(), rate + rate / 10);
         assert_eq!(trim_leading_silence(vec![0.; 100], rate).len(), 100);
         assert_eq!(trim_leading_silence(vec![0.3; 100], rate).len(), 100);
+    }
+
+    #[test]
+    fn request_validates_sampling_and_cfg_bounds() {
+        let base = |extra: &[(&str, Json)]| -> std::result::Result<Request, String> {
+            let mut fields = vec![
+                ("model_dir", Json::str("/tmp/model")),
+                ("text", Json::str("hello")),
+                ("output_dir", Json::str("/tmp/out")),
+            ];
+            fields.extend_from_slice(extra);
+            Request::parse(&Json::obj(fields))
+        };
+        let r0 = base(&[("temperature", Json::Num(0.0))]).expect("temperature=0 should be accepted as greedy");
+        assert!(r0.sampling().greedy);
+        assert!(base(&[("temperature", Json::Num(-0.1))]).is_err());
+        assert!(base(&[("temperature", Json::Num(f64::NAN))]).is_err());
+        assert!(base(&[("repetition_penalty", Json::Num(0.0))]).is_err());
+        assert!(base(&[("repetition_penalty", Json::Num(-1.0))]).is_err());
+        assert!(base(&[("repetition_penalty", Json::Num(f64::INFINITY))]).is_err());
+        assert!(base(&[("cfg_scale", Json::Num(-0.5))]).is_err());
+        assert!(base(&[("cfg_scale", Json::Num(f64::NAN))]).is_err());
+        assert!(base(&[("cfg_scale", Json::Num(0.0))]).is_ok());
+        assert!(base(&[("cfg_scale", Json::Num(2.5))]).is_ok());
     }
 
     fn relative(actual: &Tensor, expected: &Tensor) -> Result<f32> {

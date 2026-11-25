@@ -446,15 +446,18 @@ export function importSoftn(vfs: Vfs, bytes: Uint8Array, fileName: string, paren
   } catch {
     throw new Error(`${fileName}: manifest.json is not valid JSON`);
   }
-  const base = (manifestName || fileName.replace(/\.softn$/i, '')).replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'app';
+  const cleaned = (manifestName || fileName.replace(/\.softn$/i, '')).replace(/[^\w.-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
+  const base = !cleaned || cleaned === '.' || cleaned === '..' ? 'app' : cleaned;
   const parentKey = appKey(parent);
   let root = parentKey ? `${parentKey}/${base}` : base;
   for (let n = 2; vfs.exists(`/${root}`); n++) root = parentKey ? `${parentKey}/${base}-${n}` : `${base}-${n}`;
   let count = 0;
   for (const name of names) {
     if (!name.startsWith(prefix)) continue;
-    const rel = normalizePath(name.slice(prefix.length));
-    if (!rel || name.slice(prefix.length).split('/').includes('..')) continue;
+    const rawRel = name.slice(prefix.length);
+    if (rawRel.split(/[\\/]/).includes('..')) continue;
+    const rel = normalizePath(rawRel);
+    if (!rel) continue;
     vfs.writeFile(`/${root}/${rel}`, entries[name], { parents: true });
     count++;
   }

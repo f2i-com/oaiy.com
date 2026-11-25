@@ -9,7 +9,7 @@
 //!   never followed (the [`HttpClient`] contract).
 //! - **A response is read as bytes and judged by what it is**, not by what the relay says it is: an error answer's `message` is returned as data (and never shown as anything
 //!   but "message from your relay (unverified)"), a `2xx` whose body is not what its schema says is [`ClientError::BadAnswer`].
-//! - **The relay clock** is sampled from `X-OAIY-Time` on every response, when the response is received.
+//! - **The relay clock** is sampled from `X-OAIY-Time` only after cryptographic proof verification (`prove`) or on authenticated `2xx` responses.
 //!
 //! All methods take `&self`: the state behind them (the proof, the clock offset) is a mutex that is never held across an HTTP call, so a poll loop on one thread and a post
 //! from another share one client.
@@ -327,7 +327,7 @@ impl RelayClient {
         }
     }
 
-    /// One exchange, with the headers every request carries, and the relay clock sampled from the response.
+    /// One exchange, with the headers every request carries.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn exchange(
         &self,
@@ -356,9 +356,7 @@ impl RelayClient {
         let request =
             HttpRequest { method, url: self.url.join(path), headers, body, timeout, max_response_bytes: MAX_RESPONSE_BYTES, cancel: cancel.clone() };
         // The adapter is trusted to send and to return what it was given, not to have normalised the names of the headers.
-        let response = self.http.send(&request)?.normalised();
-        self.sample_time(&response);
-        Ok(response)
+        Ok(self.http.send(&request)?.normalised())
     }
 
     pub(crate) fn gate(&self) -> Result<(), ClientError> {
@@ -383,7 +381,11 @@ impl RelayClient {
         cancel: &Cancel,
     ) -> Result<HttpResponse, ClientError> {
         self.gate()?;
-        Ok(self.exchange(method, path, body, Some(token), &[], timeout.unwrap_or(self.config.request_timeout), cancel)?)
+        let response = self.exchange(method, path, body, Some(token), &[], timeout.unwrap_or(self.config.request_timeout), cancel)?;
+        if (200..300).contains(&response.status) {
+            self.sample_time(&response);
+        }
+        Ok(response)
     }
 
     /// The error answer of a response that is not a success: its status, and what its body said, as data.
@@ -430,10 +432,12 @@ impl RelayClient {
         let verdict = info::verify_proof(&response.body, &nonce, time, proof, &pin);
         match verdict {
             Ok(proved) => {
+                let (local, mono) = (self.clock.unix_now(), self.clock.monotonic());
                 let mut s = lock(&self.state);
                 s.suspect = false;
-                s.proof = Some(ProofRecord { at: self.clock.monotonic(), wall: self.clock.unix_now(), info: proved.info.clone() });
+                s.proof = Some(ProofRecord { at: mono, wall: local, info: proved.info.clone() });
                 s.info_read = Some(proved.info.clone());
+                s.clock.observe(proved.relay_time, local, mono);
                 Ok(proved)
             }
             Err(e) => {
@@ -457,8 +461,8 @@ impl RelayClient {
         }
     }
 
-    /// `GET /v1/info` without a nonce (README 8.5: cached for ten minutes, and never what identity rests on): the document and, when the relay sent `X-OAIY-Sig`, its static
-    /// signature checked against the pinned key. Used to re-read `minClient` after a `426`.
+    /// `GET /v1/info` without a nonce (README 8.5: cached for ten minutes, and never what identity rests on): the document and its required `X-OAIY-Sig` static
+    /// signature checked against the pinned key.
     pub fn read_info(&self, cancel: &Cancel) -> Result<Info, ClientError> {
         let pin = lock(&self.state).pin.clone().ok_or(ClientError::NoPin)?;
         let response = self.exchange(Method::Get, "/v1/info", None, None, &[], self.config.request_timeout, cancel)?;
@@ -469,9 +473,8 @@ impl RelayClient {
         if info.relay_key.thumbprint() != pin {
             return Err(ClientError::Suspect);
         }
-        if let Some(sig) = response.header("x-oaiy-sig") {
-            info::verify_static_signature(&info.relay_key, &response.body, sig).map_err(ClientError::Protocol)?;
-        }
+        let sig = response.header("x-oaiy-sig").ok_or(ClientError::BadAnswer("missing X-OAIY-Sig"))?;
+        info::verify_static_signature(&info.relay_key, &response.body, sig).map_err(ClientError::Protocol)?;
         lock(&self.state).info_read = Some(info.clone());
         Ok(info)
     }
@@ -556,6 +559,9 @@ impl RelayClient {
         self.gate()?;
         match self.exchange(Method::Get, &path, None, Some(token), &[], timeout, cancel) {
             Ok(r) => {
+                if (200..300).contains(&r.status) {
+                    self.sample_time(&r);
+                }
                 let body = json::parse(&r.body).ok();
                 Ok(PollReply { status: Some(r.status), headers: r.headers, body, transport: None })
             }
@@ -605,11 +611,16 @@ impl RelayClient {
         cancel: &Cancel,
     ) -> Result<MobileAdmission, ClientError> {
         let body = request.to_body().map_err(ClientError::Request)?;
-        let response = self.authed(token, Method::Post, "/v1/admission", Some(body.into_bytes()), None, cancel)?;
-        if response.status != 200 {
-            return Err(ClientError::Relay(self.error_of(&response)));
-        }
-        MobileAdmission::parse_with(&response.body, expect, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
+        let mut response = self.authed(token, Method::Post, "/v1/admission", Some(body.into_bytes()), None, cancel)?;
+        // The answer holds the admission bearer and any TURN credentials as text: wipe the raw body on every path.
+        let result = (|| {
+            if response.status != 200 {
+                return Err(ClientError::Relay(self.error_of(&response)));
+            }
+            MobileAdmission::parse_with(&response.body, expect, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
+        })();
+        zeroize::Zeroize::zeroize(&mut response.body);
+        result
     }
 
     /// `POST /v1/admission` for a paired phone: the request and the expectation are made from the phone's profile, and the answer is **also** compared with what the owner approved
@@ -641,11 +652,16 @@ impl RelayClient {
     /// `POST /v1/admission` with a desktop's token: the plugin's admission.
     pub fn admission_plugin(&self, token: &Token, request: &PluginRequest, cancel: &Cancel) -> Result<PluginAdmission, ClientError> {
         let body = request.to_body().map_err(ClientError::Request)?;
-        let response = self.authed(token, Method::Post, "/v1/admission", Some(body.into_bytes()), None, cancel)?;
-        if response.status != 200 {
-            return Err(ClientError::Relay(self.error_of(&response)));
-        }
-        PluginAdmission::parse_with(&response.body, request, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
+        let mut response = self.authed(token, Method::Post, "/v1/admission", Some(body.into_bytes()), None, cancel)?;
+        // The answer holds the admission bearer and any TURN credentials as text: wipe the raw body on every path.
+        let result = (|| {
+            if response.status != 200 {
+                return Err(ClientError::Relay(self.error_of(&response)));
+            }
+            PluginAdmission::parse_with(&response.body, request, self.relay_now_or_local(), self.lax_transport()).map_err(ClientError::Protocol)
+        })();
+        zeroize::Zeroize::zeroize(&mut response.body);
+        result
     }
 }
 

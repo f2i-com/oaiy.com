@@ -5,9 +5,42 @@
  * (the VFS normalises every one), and unpacking is checked against the
  * import limits before anything is inflated.
  */
-import { gunzipSync, gzipSync, strFromU8, strToU8, zipSync } from 'fflate';
+import { Gunzip, gzipSync, strFromU8, strToU8, zipSync } from 'fflate';
 import { unzipChecked } from '../vfs/transfer';
 import { normalizePath, type Vfs } from '../vfs/vfs';
+
+const MAX_INFLATED_BYTES = 512 << 20;
+
+/**
+ * Streaming gzip decompression that aborts immediately once cumulative inflated
+ * bytes exceed `maxBytes` (preventing gzip bombs from exhausting memory).
+ */
+export function gunzipChecked(bytes: Uint8Array, maxBytes = MAX_INFLATED_BYTES): Uint8Array {
+  const limitLabel = maxBytes % (1 << 20) === 0 ? `${maxBytes >> 20} MB` : `${maxBytes} bytes`;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const gz = new Gunzip((chunk) => {
+    total += chunk.byteLength;
+    if (total > maxBytes) throw new Error(`the file unpacks to more than ${limitLabel}`);
+    chunks.push(chunk.slice());
+  });
+  const STEP = 16 * 1024;
+  if (bytes.byteLength === 0) {
+    gz.push(bytes, true);
+  } else {
+    for (let offset = 0; offset < bytes.byteLength; offset += STEP) {
+      const end = Math.min(offset + STEP, bytes.byteLength);
+      gz.push(bytes.subarray(offset, end), end >= bytes.byteLength);
+    }
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
 
 export interface ArchiveRequest {
   op: 'zip' | 'unzip' | 'tar' | 'untar' | 'gzip' | 'gunzip';
@@ -79,10 +112,16 @@ function tarPack(entries: Array<[string, Uint8Array]>): Uint8Array {
     const put = (text: string, at: number, len: number) => header.set(strToU8(text).subarray(0, len), at);
     let path = name;
     let prefix = '';
-    if (path.length > 100) {
-      const cut = path.lastIndexOf('/', path.length - 101 >= 0 ? 155 : path.length);
+    if (strToU8(path).byteLength > 100) {
+      const cut = path.lastIndexOf('/', Math.min(155, path.length - 1));
+      if (cut <= 0 || path.length - cut - 1 > 100) {
+        throw new Error(`tar path is too long for ustar header: ${name}`);
+      }
       prefix = path.slice(0, cut);
       path = path.slice(cut + 1);
+      if (strToU8(prefix).byteLength > 155 || strToU8(path).byteLength > 100) {
+        throw new Error(`tar path is too long for ustar header: ${name}`);
+      }
     }
     put(path, 0, 100);
     put(dir ? '0000755\0' : '0000644\0', 100, 8);
@@ -201,7 +240,7 @@ export function archive(vfs: Vfs, req: ArchiveRequest): ArchiveResult {
     }
     case 'untar': {
       let bytes = vfs.readBytes(req.file);
-      if (req.gzip || (bytes[0] === 0x1f && bytes[1] === 0x8b)) bytes = gunzipSync(bytes);
+      if (req.gzip || (bytes[0] === 0x1f && bytes[1] === 0x8b)) bytes = gunzipChecked(bytes);
       const entries = tarUnpack(bytes);
       if (req.list) return { files: entries.map(([path, data]) => ({ path, size: data.byteLength })) };
       return extract(vfs, entries, req.dest ?? base, req.overwrite !== false, req.only);
@@ -216,8 +255,7 @@ export function archive(vfs: Vfs, req: ArchiveRequest): ArchiveResult {
       return { files: [{ path: target, size: data.byteLength }] };
     }
     case 'gunzip': {
-      const data = gunzipSync(vfs.readBytes(req.file));
-      if (data.byteLength > 512 << 20) throw new Error('the file unpacks to more than 512 MB');
+      const data = gunzipChecked(vfs.readBytes(req.file));
       if (req.stdout) return { files: [], data: bytesToBase64(data) };
       const target = req.file.replace(/\.(gz|tgz|z)$/i, (m) => (m.toLowerCase() === '.tgz' ? '.tar' : ''));
       if (target === req.file) throw new Error(`${req.file}: unknown suffix -- ignored`);

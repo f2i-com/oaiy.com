@@ -288,22 +288,36 @@ impl StateSnapshot {
 
     /// Read back what [`Self::encode`] wrote.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        const MAX_LAYERS: usize = 1024;
+        const MAX_LEN: u64 = 1 << 24;
         let bad = || LlamaError::Config("forward: damaged prompt state".into());
         let mut at = 0usize;
-        let mut take = |n: usize| -> Result<&[u8]> {
+        let take = |at: &mut usize, n: usize| -> Result<&[u8]> {
             let end = at.checked_add(n).ok_or_else(bad)?;
-            let s = bytes.get(at..end).ok_or_else(bad)?;
-            at = end;
+            let s = bytes.get(*at..end).ok_or_else(bad)?;
+            *at = end;
             Ok(s)
         };
-        let len = u64::from_le_bytes(take(8)?.try_into().map_err(|_| bad())?) as usize;
+        let len_u64 = u64::from_le_bytes(take(&mut at, 8)?.try_into().map_err(|_| bad())?);
+        if len_u64 > MAX_LEN {
+            return Err(bad());
+        }
+        let len = len_u64 as usize;
         let mut groups: Vec<Vec<Vec<f32>>> = Vec::with_capacity(4);
         for _ in 0..4 {
-            let n = u32::from_le_bytes(take(4)?.try_into().map_err(|_| bad())?) as usize;
+            let n = u32::from_le_bytes(take(&mut at, 4)?.try_into().map_err(|_| bad())?) as usize;
+            let rem = bytes.len() - at;
+            if n > MAX_LAYERS || n.checked_mul(8).is_none_or(|need| need > rem) {
+                return Err(bad());
+            }
             let mut group = Vec::with_capacity(n);
             for _ in 0..n {
-                let count = u64::from_le_bytes(take(8)?.try_into().map_err(|_| bad())?) as usize;
-                let raw = take(count.checked_mul(4).ok_or_else(bad)?)?;
+                let count = u64::from_le_bytes(take(&mut at, 8)?.try_into().map_err(|_| bad())?);
+                let byte_len = count
+                    .checked_mul(4)
+                    .and_then(|b| usize::try_from(b).ok())
+                    .ok_or_else(bad)?;
+                let raw = take(&mut at, byte_len)?;
                 group.push(
                     raw.chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -441,5 +455,31 @@ impl State {
         self.kpool.restore_rows(&snap.kpool)?;
         self.len = snap.len;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_snapshot_decode_rejects_huge_counts_without_oom() {
+        let mut huge_group = Vec::new();
+        huge_group.extend_from_slice(&1u64.to_le_bytes()); // len
+        huge_group.extend_from_slice(&u32::MAX.to_le_bytes()); // huge group count
+        assert!(StateSnapshot::decode(&huge_group).is_err());
+
+        let mut huge_vec = Vec::new();
+        huge_vec.extend_from_slice(&1u64.to_le_bytes()); // len
+        huge_vec.extend_from_slice(&1u32.to_le_bytes()); // 1 layer
+        huge_vec.extend_from_slice(&(u64::MAX / 4).to_le_bytes()); // huge float count
+        assert!(StateSnapshot::decode(&huge_vec).is_err());
+
+        let mut huge_len = Vec::new();
+        huge_len.extend_from_slice(&u64::MAX.to_le_bytes()); // huge pos len
+        for _ in 0..4 {
+            huge_len.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(StateSnapshot::decode(&huge_len).is_err());
     }
 }

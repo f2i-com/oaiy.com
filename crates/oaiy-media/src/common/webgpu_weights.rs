@@ -231,6 +231,33 @@ pub fn f16_words_ggml(t: GgmlDType, bytes: &[u8], rows: usize, k: usize) -> Opti
     })
 }
 
+/// Pad a row-major `[rows, cols]` matrix with one zero column when `cols` is odd so packed f16
+/// `matmul_f16_rows` (which requires an even inner dimension) never panics.
+pub fn pad_rows_even_cols(src: &[f32], rows: usize, cols: usize) -> (Vec<f32>, usize) {
+    if cols % 2 == 0 {
+        return (src.to_vec(), cols);
+    }
+    let padded = cols + 1;
+    let mut out = vec![0.0f32; rows * padded];
+    for r in 0..rows {
+        out[r * padded..r * padded + cols].copy_from_slice(&src[r * cols..(r + 1) * cols]);
+    }
+    (out, padded)
+}
+
+/// Pad odd-rank LoRA factors `A` (`[rank, k]`) and `B` (`[n, rank]`) with one zero row/column so
+/// `B_pad * A_pad == B * A` and the inner dimension `rank_pad` is even for packed f16 matmuls.
+pub fn pad_lora_even_rank(a: &[f32], b: &[f32], n: usize, k: usize, rank: usize) -> (Vec<f32>, Vec<f32>, usize) {
+    if rank % 2 == 0 {
+        return (a.to_vec(), b.to_vec(), rank);
+    }
+    let padded = rank + 1;
+    let mut a_pad = vec![0.0f32; padded * k];
+    a_pad[..rank * k].copy_from_slice(a);
+    let (b_pad, _) = pad_rows_even_cols(b, n, rank);
+    (a_pad, b_pad, padded)
+}
+
 /// `name.weight` (`[n, k]`) from `w` as an f16 matrix on `gpu` (its vector, `n`, `k`), from its stored bytes where
 /// [`Weights::raw`] gives them, else as [`Weights::tensor`] reads it; each of `lora`'s factors for `name` (`B A`) added
 /// on the GPU (the f16 matmul makes `B A`, rounded into the weight as the host's merge rounds it: on the host it took
@@ -274,14 +301,22 @@ pub fn f16_matrix(w: &mut Weights, gpu: &ggml_rs_wgpu::WgpuBackend, name: &str, 
     if !lora.is_empty() {
         for (a, b) in lora.factors(name, n, k, &Device::Cpu, DType::F32)? {
             let rank = a.dim(0)?;
-            // `A` transposed (the matmul's weight, `[k, rank]`) as f16, `B`'s rows its tokens
-            let at = f16_words_f32(&a.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?).ok_or_else(|| err(format!("{name}: a LoRA factor past f16's range")))?;
-            let (ad, bd, delta) = (gpu.vec(at.len()), gpu.vec(n * rank), gpu.vec(n * k));
+            if rank == 0 {
+                continue;
+            }
+            // `A` transposed (the matmul's weight, `[k, rank]`) as f16, `B`'s rows its tokens;
+            // pad odd ranks by one zero column so packed f16 `matmul_f16_rows` has an even inner dim.
+            let at_raw = a.t()?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let b_raw = b.flatten_all()?.to_vec1::<f32>()?;
+            let (at_pad, padded_rank) = pad_rows_even_cols(&at_raw, k, rank);
+            let (b_pad, _) = pad_rows_even_cols(&b_raw, n, rank);
+            let at = f16_words_f32(&at_pad).ok_or_else(|| err(format!("{name}: a LoRA factor past f16's range")))?;
+            let (ad, bd, delta) = (gpu.vec(at.len()), gpu.vec(n * padded_rank), gpu.vec(n * k));
             gpu.upload(&ad, &at);
-            gpu.upload(&bd, &b.flatten_all()?.to_vec1::<f32>()?);
+            gpu.upload(&bd, &b_pad);
             let mut rec = gpu.begin();
             rec.keep_groups(false);
-            rec.matmul_f16_rows(&ad, k, rank, &bd, &delta, n);
+            rec.matmul_f16_rows(&ad, k, padded_rank, &bd, &delta, n);
             rec.add_f16(&v, &delta, n * k);
             rec.finish();
         }
@@ -306,6 +341,27 @@ mod f16_tests {
         for bad in [0x7c00u16, 0xfc00, 0x7e00] {
             let bytes: Vec<u8> = [1u16, bad].iter().flat_map(|h| h.to_le_bytes()).collect();
             assert!(f16_words_halves(&bytes).is_none(), "{bad:#x}");
+        }
+    }
+
+    #[test]
+    fn odd_rank_lora_padding_preserves_product_and_makes_rank_even() {
+        let (n, k, rank) = (3usize, 4usize, 3usize);
+        let a: Vec<f32> = (0..rank * k).map(|i| (i as f32 - 5.0) * 0.25).collect();
+        let b: Vec<f32> = (0..n * rank).map(|i| (i as f32 - 3.0) * 0.5).collect();
+        let (ap, bp, pr) = pad_lora_even_rank(&a, &b, n, k, rank);
+        assert_eq!(pr, 4);
+        assert_eq!(ap.len(), pr * k);
+        assert_eq!(bp.len(), n * pr);
+        assert!(f16_words_f32(&ap).is_some());
+        assert!(f16_words_f32(&bp).is_some());
+        // Verify B_pad * A_pad == B * A exactly.
+        for row in 0..n {
+            for col in 0..k {
+                let want: f32 = (0..rank).map(|r| b[row * rank + r] * a[r * k + col]).sum();
+                let got: f32 = (0..pr).map(|r| bp[row * pr + r] * ap[r * k + col]).sum();
+                assert!((got - want).abs() < 1e-6, "({row},{col}): {got} vs {want}");
+            }
         }
     }
 }

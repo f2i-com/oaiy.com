@@ -203,6 +203,7 @@ final class Stream
             if ($due) {
                 $lastFetch = Clock::mono();
                 $rows = Party::fetch($ctx, $f->mailbox, $since, self::PAGE_FRAMES, self::PAGE_BYTES, Clock::now());
+                $ctx->db->close(); // a waiting request never holds a database connection
                 if (Clock::now() > $authEnd) {
                     return [[], false];
                 }

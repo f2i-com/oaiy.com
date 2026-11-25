@@ -528,6 +528,17 @@ export function convertSelectionToMacro(
 
   // Generate the replacement macro node for the parent flow
   const macroNodeId = generateNodeId();
+  const macroInputsMeta = macroInputNodes.map((n) => ({
+    id: n.id,
+    name: String((n.data as Record<string, unknown> | undefined)?.name || (n.data as Record<string, unknown> | undefined)?.label || 'input'),
+    type: String((n.data as Record<string, unknown> | undefined)?.dataType || 'any'),
+    required: Boolean((n.data as Record<string, unknown> | undefined)?.required),
+  }));
+  const macroOutputsMeta = macroOutputNodes.map((n) => ({
+    id: n.id,
+    name: String((n.data as Record<string, unknown> | undefined)?.name || (n.data as Record<string, unknown> | undefined)?.label || 'output'),
+    type: String((n.data as Record<string, unknown> | undefined)?.dataType || 'any'),
+  }));
   const macroNode: GraphNode = {
     id: macroNodeId,
     type: 'macro',
@@ -540,30 +551,38 @@ export function convertSelectionToMacro(
       flowId: macroId,
       flowName: macroName,
       _macroWorkflowId: macroId,
-      // Input/output handles will be derived from the macro definition
+      _macroName: macroName,
+      _macroInputs: macroInputsMeta,
+      _macroOutputs: macroOutputsMeta,
     },
   };
 
   // Generate parent edges (connecting external nodes to the new macro node)
   const parentEdges: GraphEdge[] = [];
 
-  // Input edges
-  for (const input of externalInputs) {
+  // Input edges (include targetHandle + index in id so multiple edges from the same source stay unique)
+  for (let i = 0; i < externalInputs.length; i++) {
+    const input = externalInputs[i];
+    const key = `${input.targetNode.id}:${input.targetHandle}`;
+    const targetHandle = inputHandleToNodeId.get(key) || inputNames[key] || input.suggestedName;
     parentEdges.push({
-      id: `edge_${input.edge.source}_to_${macroNodeId}`,
+      id: `edge_${input.edge.source}_to_${macroNodeId}_${targetHandle}_${i}`,
       source: input.edge.source,
       sourceHandle: input.edge.sourceHandle,
       target: macroNodeId,
-      targetHandle: inputNames[`${input.targetNode.id}:${input.targetHandle}`] || input.suggestedName,
+      targetHandle,
     });
   }
 
-  // Output edges
-  for (const output of externalOutputs) {
+  // Output edges (include sourceHandle + index in id so multiple edges to the same target stay unique)
+  for (let i = 0; i < externalOutputs.length; i++) {
+    const output = externalOutputs[i];
+    const key = `${output.sourceNode.id}:${output.sourceHandle}`;
+    const sourceHandle = outputHandleToNodeId.get(key) || outputNames[key] || output.suggestedName;
     parentEdges.push({
-      id: `edge_${macroNodeId}_to_${output.edge.target}`,
+      id: `edge_${macroNodeId}_${sourceHandle}_to_${output.edge.target}_${i}`,
       source: macroNodeId,
-      sourceHandle: outputNames[`${output.sourceNode.id}:${output.sourceHandle}`] || output.suggestedName,
+      sourceHandle,
       target: output.edge.target,
       targetHandle: output.edge.targetHandle,
     });

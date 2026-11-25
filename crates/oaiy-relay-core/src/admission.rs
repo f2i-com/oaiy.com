@@ -272,7 +272,7 @@ fn parse_ice(servers: &Json, relay_only: bool, now: i64) -> Result<(Vec<IceServe
             })
             .collect::<Result<_>>()?;
         let username = s.get_str("username").ok_or(bad.clone())?.to_string();
-        let credential = s.get_str("credential").ok_or(bad.clone())?.to_string();
+        let mut credential = Zeroizing::new(s.get_str("credential").ok_or(bad.clone())?.to_string());
         let turn = urls.iter().any(|u| u.starts_with("turn"));
         let stun = urls.iter().any(|u| u.starts_with("stun"));
         if turn && stun {
@@ -296,7 +296,7 @@ fn parse_ice(servers: &Json, relay_only: bool, now: i64) -> Result<(Vec<IceServe
         } else if !(username.is_empty() && credential.is_empty() && expires_at.is_none() && members.len() == 3) {
             return Err(bad);
         }
-        out.push(IceServer { urls, username, credential, expires_at });
+        out.push(IceServer { urls, username, credential: std::mem::take(&mut *credential), expires_at });
     }
     let earliest = out.iter().filter(|s| s.is_turn()).filter_map(|s| s.expires_at).min();
     if relay_only && earliest.is_none() {
@@ -332,25 +332,34 @@ fn usable_endpoints(v: Option<&Json>, lax: bool) -> Option<RelayEndpoints> {
     Some(RelayEndpoints { challenge_url, frames_url, stream_url, poll_mode: v.get_str("mode") == Some("poll") })
 }
 
-/// `(scheme, host in lower case, port)` of a URL that is safe to use (`https`, or `http` on loopback when `lax`; no credentials, no fragment), else `None`.
+/// `(scheme, host in lower case, port)` of a URL that is safe to use (`https`, or `http` on loopback when `lax`; no credentials, no fragment, no control characters or backslashes), else `None`.
 fn origin_of(url: &str, lax: bool) -> Option<(&'static str, String, u16)> {
+    if url.bytes().any(|b| b <= 0x20 || b >= 0x7f || b == b'\\' || b == b'#') {
+        return None;
+    }
     let (scheme, rest) = match url.strip_prefix("https://") {
         Some(r) => ("https", r),
         None if lax && loopback_origin(url, "http://") => ("http", &url["http://".len()..]),
         None => return None,
     };
-    if url.contains('#') {
-        return None;
-    }
     let authority = rest.split(['/', '?']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
         return None;
     }
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        Some((h, p)) => {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let port = p.parse::<u16>().ok()?;
+            if port == 0 {
+                return None;
+            }
+            (h, port)
+        }
         None => (authority, if scheme == "https" { 443 } else { 80 }),
     };
-    if host.is_empty() {
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')) {
         return None;
     }
     Some((scheme, host.to_ascii_lowercase(), port))
@@ -359,7 +368,7 @@ fn origin_of(url: &str, lax: bool) -> Option<(&'static str, String, u16)> {
 /// `http` writes (a test build only; the shipped readers take `https` and `wss` alone).
 fn loopback_origin(url: &str, scheme: &str) -> bool {
     let Some(rest) = url.strip_prefix(scheme) else { return false };
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
     let host = authority.split(':').next().unwrap_or("");
     matches!(host, "127.0.0.1" | "localhost")
 }
@@ -478,7 +487,7 @@ impl MobileAdmission {
             "expectedPeerKeyThumbprint",
             "device",
         ];
-        let doc = json::parse(body)?;
+        let doc = json::parse_wiped(body)?;
         // As the shipped phone: `iceServers` and `relay` may be absent (no ICE servers; no compatibility routes), every other member is required, and none outside the list is allowed.
         let required: Vec<&str> = ALL.iter().copied().filter(|m| !matches!(*m, "iceServers" | "relay")).collect();
         if !members_are(&doc, &ALL, &required) {
@@ -614,7 +623,7 @@ impl PluginAdmission {
             "peerRosterHash",
             "relay",
         ];
-        let doc = json::parse(body)?;
+        let doc = json::parse_wiped(body)?;
         // As the shipped plugin: only `relay` may be absent.
         let required: Vec<&str> = ALL.iter().copied().filter(|m| *m != "relay").collect();
         if !members_are(&doc, &ALL, &required) {
@@ -719,5 +728,29 @@ mod tests {
         assert!(some(&two_ports, false).is_none());
         let missing = json::parse(br#"{"challengeUrl":"https://a.example.com/a","framesUrl":"https://a.example.com/b"}"#).unwrap();
         assert!(some(&missing, false).is_none());
+    }
+
+    #[test]
+    fn origin_of_rejects_control_chars_backslashes_bad_hosts_and_port_zero() {
+        for bad in [
+            "https://relay.example.com:0/a",
+            "https://relay.example.com:+443/a",
+            "https://relay.example.com:/a",
+            "https://relay.example.com:443\\@evil.com/a",
+            "https://evil.com\\relay.example.com/a",
+            "https://relay.example.com/a b",
+            "https://relay.example.com/\x01a",
+            "https://relay.example.com/\x7fa",
+            "https://relay.example.com/é",
+            "https://relay_bad.example.com/a",
+            "https://[2001:db8::1]/a",
+            "https://a:b:443/a",
+        ] {
+            assert_eq!(origin_of(bad, false), None, "must reject {bad:?}");
+        }
+        assert_eq!(origin_of("http://127.0.0.1?q=1", true), Some(("http", "127.0.0.1".into(), 80)));
+        assert_eq!(origin_of("http://localhost:8080?q=1", true), Some(("http", "localhost".into(), 8080)));
+        assert_eq!(origin_of("http://127.0.0.1:0/a", true), None);
+        assert_eq!(origin_of("http://127.0.0.1?q=1", false), None);
     }
 }

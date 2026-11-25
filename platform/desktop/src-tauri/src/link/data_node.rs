@@ -254,7 +254,7 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder(super::net::Keep::Never)
+    super::creds::client_builder(super::net::Keep::Never)
         .build()
         .map_err(|e| format!("could not build the enrolment client: {e}"))
 }
@@ -553,5 +553,30 @@ mod tests {
             let held = server.closed_after_reply(conn, Duration::from_secs(15));
             assert!(held < Duration::from_secs(2), "connection {conn} was held open {held:?} after its reply");
         }
+    }
+
+    #[test]
+    fn data_node_client_does_not_follow_redirects() {
+        use crate::link::testkit::{Provider, Reply};
+        let elsewhere = Provider::start(|_| Reply::ok("{}"));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let account = LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: origin.base.clone(),
+            credential: "flk_node".into(),
+            account_id: None,
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        };
+        let spec = descriptor::builtin().remove(0).data_node.unwrap();
+        let identity = NodeIdentity::from_secret_bytes([9u8; 32]);
+
+        let err = register(&account, &spec, &identity).unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
+        assert!(refresh(&account, &spec).is_none());
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
     }
 }

@@ -75,6 +75,43 @@ impl PreparedInkling2Image {
     }
 }
 
+/// Compute resized `(width, height)` so that `height.div_ceil(cell) * width.div_ceil(cell) <= max_tokens.max(1)`
+/// even for extreme aspect ratios like `1 x 1_000_000`.
+fn fit_dimensions(width: usize, height: usize, cell: usize, max_tokens: usize) -> (usize, usize) {
+    let cell = cell.max(1);
+    let max_tok = max_tokens.max(1);
+    let est_tokens = height.div_ceil(cell).saturating_mul(width.div_ceil(cell));
+    if est_tokens <= max_tok {
+        return (width, height);
+    }
+    let scale = (max_tok as f64 / est_tokens as f64).sqrt();
+    let mut new_w = ((width as f64 * scale).floor() as usize).max(1);
+    let mut new_h = ((height as f64 * scale).floor() as usize).max(1);
+    let mut grid_w = new_w.div_ceil(cell);
+    let mut grid_h = new_h.div_ceil(cell);
+    if grid_h.saturating_mul(grid_w) > max_tok {
+        if new_w >= new_h {
+            let cap_w = (max_tok / grid_h).max(1).saturating_mul(cell);
+            new_w = new_w.min(cap_w);
+            grid_w = new_w.div_ceil(cell);
+        } else {
+            let cap_h = (max_tok / grid_w).max(1).saturating_mul(cell);
+            new_h = new_h.min(cap_h);
+            grid_h = new_h.div_ceil(cell);
+        }
+        if grid_h.saturating_mul(grid_w) > max_tok {
+            let cap_h = (max_tok / grid_w).max(1).saturating_mul(cell);
+            new_h = new_h.min(cap_h);
+            grid_h = new_h.div_ceil(cell);
+            if grid_h.saturating_mul(grid_w) > max_tok {
+                let cap_w = (max_tok / grid_h).max(1).saturating_mul(cell);
+                new_w = new_w.min(cap_w);
+            }
+        }
+    }
+    (new_w.max(1), new_h.max(1))
+}
+
 /// Decode image bytes and run the exact `Inkling2ImageProcessor` preprocessing.
 pub fn preprocess_image_bytes(
     bytes: &[u8],
@@ -89,15 +126,11 @@ pub fn preprocess_image_bytes(
     }
 
     let cell = cfg.cell_size();
-    let max_tok = max_tokens.max(1);
-    let est_tokens = height.div_ceil(cell) * width.div_ceil(cell);
-    let img = if est_tokens > max_tok {
-        let scale = (max_tok as f64 / est_tokens as f64).sqrt();
-        let new_w = ((width as f64 * scale).floor() as u32).max(1);
-        let new_h = ((height as f64 * scale).floor() as u32).max(1);
-        width = new_w as usize;
-        height = new_h as usize;
-        img.resize_exact(new_w, new_h, image::imageops::FilterType::CatmullRom)
+    let (new_w, new_h) = fit_dimensions(width, height, cell, max_tokens);
+    let img = if new_w != width || new_h != height {
+        width = new_w;
+        height = new_h;
+        img.resize_exact(new_w as u32, new_h as u32, image::imageops::FilterType::CatmullRom)
     } else {
         img
     };
@@ -1084,5 +1117,28 @@ mod tests {
         assert!((gelu_exact(1.0) - 0.84134475).abs() < 1e-5);
         assert!((gelu_exact(-1.0) - (-0.15865525)).abs() < 1e-5);
         assert!((gelu_exact(3.0) - 2.99595).abs() < 1e-4);
+    }
+
+    #[test]
+    fn extreme_aspect_ratios_never_exceed_max_tokens() {
+        let cell = 40usize;
+        for max_tok in [1usize, 10, 256, 1024] {
+            for (w, h) in [
+                (1_000_000, 1),
+                (1, 1_000_000),
+                (10_000_000, 2),
+                (2, 10_000_000),
+                (2000, 2000),
+                (1280, 720),
+            ] {
+                let (nw, nh) = fit_dimensions(w, h, cell, max_tok);
+                let tokens = nh.div_ceil(cell) * nw.div_ceil(cell);
+                assert!(
+                    tokens <= max_tok,
+                    "{w}x{h} with max_tok={max_tok} resized to {nw}x{nh} ({tokens} tokens)"
+                );
+                assert!(nw >= 1 && nh >= 1);
+            }
+        }
     }
 }

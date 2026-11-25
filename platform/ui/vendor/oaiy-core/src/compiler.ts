@@ -269,6 +269,27 @@ export class OAIYCompiler {
       }
       seenIds.add(n.id);
     }
+    // SECURITY: validate edge handle IDs against SAFE_NODE_TOKEN as well — handle IDs
+    // flow into generated variable names (e.g. logic_block `let <targetHandle> = ...`
+    // and multi-output handle suffixes). Reject anything with quotes, spaces, semicolons, etc.
+    for (const e of graph.edges) {
+      if (
+        e.sourceHandle !== undefined &&
+        e.sourceHandle !== null &&
+        e.sourceHandle !== '' &&
+        (typeof e.sourceHandle !== 'string' || !SAFE_NODE_TOKEN.test(e.sourceHandle))
+      ) {
+        throw new Error(`Invalid edge sourceHandle (unsafe characters): ${JSON.stringify(e.sourceHandle)}`);
+      }
+      if (
+        e.targetHandle !== undefined &&
+        e.targetHandle !== null &&
+        e.targetHandle !== '' &&
+        (typeof e.targetHandle !== 'string' || !SAFE_NODE_TOKEN.test(e.targetHandle))
+      ) {
+        throw new Error(`Invalid edge targetHandle (unsafe characters): ${JSON.stringify(e.targetHandle)}`);
+      }
+    }
     // Filter out invalid edges (self-loops and edges that reference non-existent nodes)
     const nodeIds = new Set(graph.nodes.map(n => n.id));
     const validEdges = graph.edges.filter(e =>
@@ -769,24 +790,65 @@ workflow_context;
   // --- Loop Start: ${startNode.id} (mode: ${loopMode}, ${innerNodes.length} inner nodes, stopCondition: ${stopCondition}) ---`;
 
     // Pre-declare inner node output variables at outer scope so they can be accessed after the loop
-    // This allows nodes outside the loop to reference the last value from inner nodes
+    // This allows nodes outside the loop to reference the last value from inner nodes, and ensures
+    // branch resets inside loops (`gateOnBranch`) reset suffixed outputs cleanly too.
     for (const innerNode of innerNodes) {
       const innerOutVar = `node_${this.sanitizeId(innerNode.id)}_out`;
       code += `
   let ${innerOutVar} = null; // Pre-declared for outer scope access`;
-      // Also declare special output variables for certain node types
-      if (innerNode.type === 'browser_control') {
+      const predeclaredSuffixes = new Set<string>();
+      const addSuffix = (suffix: string, init = 'null') => {
+        if (!suffix || predeclaredSuffixes.has(suffix)) return;
+        predeclaredSuffixes.add(suffix);
         code += `
-  let ${innerOutVar}_page = "";
-  let ${innerOutVar}_screenshot = "";
-  let ${innerOutVar}_session = null;
-  let ${innerOutVar}_ai_response = "";`;
+  let ${innerOutVar}${suffix} = ${init};`;
+      };
+      // Legacy built-in special output variables
+      if (innerNode.type === 'browser_control') {
+        addSuffix('_page', '""');
+        addSuffix('_screenshot', '""');
+        addSuffix('_session', 'null');
+        addSuffix('_ai_response', '""');
       }
       // Pre-declare condition node branch outputs so they can be accessed outside the loop
       if (innerNode.type === 'condition') {
-        code += `
-  let ${innerOutVar}_true = null;
-  let ${innerOutVar}_false = null;`;
+        addSuffix('_true', 'null');
+        addSuffix('_false', 'null');
+      }
+      // Pre-declare all declared outputs from the module registry definition
+      const def = this.moduleRegistry?.getNodeDefinition(innerNode.type);
+      if (def?.outputs) {
+        for (const out of def.outputs) {
+          if (out.varSuffix && out.varSuffix !== '') {
+            addSuffix(out.varSuffix, 'null');
+          }
+          if (out.id) {
+            addSuffix(`_${this.sanitizeId(out.id)}`, 'null');
+          }
+        }
+      }
+      // Extra suffixed outputs emitted by video/audio compilers beyond their single declared handle
+      if (
+        innerNode.type === 'audio_mixer' ||
+        innerNode.type === 'video_pip' ||
+        innerNode.type === 'video_captions'
+      ) {
+        addSuffix('_path', 'null');
+      } else if (innerNode.type === 'video_avatar') {
+        addSuffix('_video_path', 'null');
+      }
+      // Pre-declare macro dynamic outputs from _macroOutputs / macroOutputs
+      if (innerNode.type === 'macro') {
+        const nodeData = (innerNode.data ?? {}) as Record<string, unknown>;
+        const macroOutputs =
+          (nodeData._macroOutputs as Array<{ id?: string }> | undefined) ??
+          (nodeData.macroOutputs as Array<{ id?: string }> | undefined) ??
+          [];
+        for (const out of macroOutputs) {
+          if (typeof out?.id === 'string' && out.id) {
+            addSuffix(`_${this.sanitizeId(out.id)}`, 'null');
+          }
+        }
       }
     }
 

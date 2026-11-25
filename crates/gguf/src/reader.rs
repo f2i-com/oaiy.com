@@ -127,10 +127,19 @@ impl GgufFile {
         if count <= 1 {
             return Ok(Self { inner: Arc::new(probe) });
         }
-        let paths = split_shard_paths(path, count as usize).ok_or_else(|| {
+        let count_usize = usize::try_from(count).ok().filter(|&c| c <= 99_999);
+        let paths = count_usize
+            .and_then(|c| split_shard_paths(path, c))
+            .ok_or_else(|| {
+                GgufError::Split(format!(
+                    "{} declares split.count {count} but its name does not follow the \
+                     <prefix>-%05d-of-%05d.gguf convention, so the siblings cannot be found",
+                    path.display()
+                ))
+            })?;
+        let file_no = split_shard_index(path).ok_or_else(|| {
             GgufError::Split(format!(
-                "{} declares split.count {count} but its name does not follow the \
-                 <prefix>-%05d-of-%05d.gguf convention, so the siblings cannot be found",
+                "{} does not carry a valid shard index in its filename",
                 path.display()
             ))
         })?;
@@ -138,10 +147,23 @@ impl GgufFile {
             .metadata
             .get("split.no")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                GgufError::Split(format!(
+                    "{} declares split.count {count} without explicit split.no",
+                    path.display()
+                ))
+            })?;
+        if no >= count || no as usize != file_no {
+            return Err(GgufError::Split(format!(
+                "{} declares split.no {no} (count {count}), which disagrees with filename shard {}",
+                path.display(),
+                file_no + 1
+            )));
+        }
 
         // The primary shard carries the full metadata KV, so it has to be the
         // one we keep even when the caller named a later shard.
+        let primary_path = if no == 0 { path } else { &paths[0] };
         let mut inner = if no == 0 {
             probe
         } else {
@@ -149,7 +171,13 @@ impl GgufFile {
             Self::open_one(&paths[0], streaming)?
         };
 
+        let primary_canon = std::fs::canonicalize(primary_path).ok();
         for sp in paths.iter().skip(1) {
+            if let (Some(pc), Ok(sc)) = (&primary_canon, std::fs::canonicalize(sp)) {
+                if *pc == sc {
+                    continue;
+                }
+            }
             let shard = Self::open_one(sp, streaming)?;
             inner.merge_shard(shard, sp)?;
         }
@@ -637,14 +665,17 @@ fn parse(backing: Backing, bodies: Bodies) -> Result<GgufInner> {
             None => return Err(GgufError::TensorSize { name: info.name, shape: info.shape }),
         };
 
-        // Verify block alignment.
+        // Verify block alignment: GGUF quantizes along the innermost dimension (`shape[0]`).
         let block = dtype.block_size();
-        if block > 1 && numel % (block as u64) != 0 {
-            return Err(GgufError::NotBlockAligned {
-                name: info.name,
-                block,
-                numel,
-            });
+        if block > 1 {
+            let row_len = info.shape.first().copied().unwrap_or(1);
+            if row_len % (block as u64) != 0 || numel % (block as u64) != 0 {
+                return Err(GgufError::NotBlockAligned {
+                    name: info.name,
+                    block,
+                    numel: row_len,
+                });
+            }
         }
 
         tensors_by_name.insert(info.name.clone(), i as usize);
@@ -743,6 +774,10 @@ pub fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
     if !five(total) || !five(cur) {
         return None;
     }
+    let cur_num = cur.parse::<usize>().ok()?;
+    if cur_num == 0 || cur_num > count {
+        return None;
+    }
     // Trust the metadata count over the filename, but they should agree.
     if total.parse::<usize>().ok()? != count {
         return None;
@@ -753,6 +788,14 @@ pub fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
             .map(|i| dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf")))
             .collect(),
     )
+}
+
+fn split_shard_index(path: &Path) -> Option<usize> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, _) = stem.rsplit_once("-of-")?;
+    let (_, cur) = head.rsplit_once('-')?;
+    cur.parse::<usize>().ok()?.checked_sub(1)
 }
 
 #[inline]
@@ -1351,5 +1394,34 @@ mod tests {
         use crate::source::GgufSource;
         let src = GgufSource(GgufFile::from_bytes(make_simple_gguf()).unwrap());
         assert!(matches!(src.read_range(u64::MAX - 3, &mut [0u8; 8]), Err(GgufError::Truncated { .. })));
+    }
+
+    #[test]
+    fn block_quantized_tensor_requires_innermost_dim_block_aligned() {
+        // shape [16, 2] has numel = 32, but innermost dim 16 is not divisible by Q4_0 block size 32.
+        let mut out = head(1, 0);
+        entry(&mut out, "bad_q4", &[16, 2], GgmlType::Q4_0, 0);
+        out.resize(align_up(out.len() as u64, DEFAULT_ALIGNMENT) as usize, 0);
+        out.extend_from_slice(&[0u8; 18]);
+        let err = GgufFile::from_bytes(out).unwrap_err();
+        assert!(matches!(err, GgufError::NotBlockAligned { block: 32, .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn split_without_explicit_split_no_or_mismatched_split_no_is_rejected() {
+        let dir = Scratch::new("split_missing_no");
+        let make = |split_no: Option<u16>, name: &str| {
+            let mut md = BTreeMap::new();
+            md.insert("split.count".to_string(), Value::U16(2));
+            if let Some(no) = split_no {
+                md.insert("split.no".to_string(), Value::U16(no));
+            }
+            let t = TensorInfo { name: name.into(), shape: vec![4], dtype: GgmlType::F32, offset: 0 };
+            write_to_vec(&md, &[(t, vec![0u8; 16])], 32).unwrap()
+        };
+        let p0 = dir.file("m-00001-of-00002.gguf", &make(None, "a"));
+        let p1 = dir.file("m-00002-of-00002.gguf", &make(Some(0), "b"));
+        assert!(matches!(GgufFile::open(&p0), Err(GgufError::Split(_))));
+        assert!(matches!(GgufFile::open(&p1), Err(GgufError::Split(_))));
     }
 }

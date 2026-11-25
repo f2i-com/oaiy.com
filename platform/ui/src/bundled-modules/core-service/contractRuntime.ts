@@ -94,13 +94,25 @@ export function absoluteUrl(url: string, desktop: Desktop = desktopAccess()): st
 /** The desktop's credential, when `url` is one of its engine routes. */
 export function desktopCredential(url: string, desktop: Desktop): string | null | undefined {
   let u: URL;
+  let desktopOrigin: string;
   try {
     u = new URL(url);
+    desktopOrigin = new URL(desktop.origin).origin;
   } catch {
     return undefined;
   }
-  if (u.origin !== new URL(desktop.origin).origin) return undefined;
-  if (!DESKTOP_ROUTES.some((r) => u.pathname.startsWith(r)) && !WORKER_ROUTE.test(u.pathname)) return undefined;
+  if (u.origin !== desktopOrigin) return undefined;
+  // Reject percent-encoded dot/slash/backslash sequences and raw backslashes so encoded
+  // path traversal can never smuggle desktop credentials onto arbitrary desktop routes.
+  const hostIdx = url.indexOf(u.host);
+  const rawPath = hostIdx >= 0 ? url.slice(hostIdx + u.host.length).split(/[?#]/)[0] : '';
+  if (/%2e|%2f|%5c|\\/i.test(u.pathname) || /%2e|%2f|%5c|\\/i.test(rawPath)) {
+    return undefined;
+  }
+  const matchesRoute =
+    DESKTOP_ROUTES.some((r) => (r.endsWith('/') ? u.pathname.startsWith(r) : u.pathname === r || u.pathname.startsWith(`${r}/`))) ||
+    WORKER_ROUTE.test(u.pathname);
+  if (!matchesRoute) return undefined;
   return desktop.token;
 }
 
@@ -131,7 +143,7 @@ async function send(ctx: RuntimeContext, url: string, method: string, headers: R
     })) as unknown as Reply;
   }
   if (body instanceof Uint8Array) throw new Error(`${url}: a recording can only be sent to OAIY Voice`);
-  return (await ctx.fetch(url, { method, headers, body })) as unknown as Reply;
+  return (await ctx.fetch(url, { method, headers, body, signal: ctx.abortSignal })) as unknown as Reply;
 }
 
 async function failure(reply: Reply, what: string): Promise<Error> {
@@ -268,13 +280,13 @@ export async function valueBytes(ctx: RuntimeContext, value: unknown): Promise<{
     return { bytes, mime: head.split(';')[0] || 'application/octet-stream' };
   }
   if (ref.startsWith('blob:')) {
-    const r = await fetch(ref);
+    const r = await fetch(ref, { signal: ctx.abortSignal });
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
   }
   if (/^https?:\/\//.test(ref)) {
     const own = await desktopFileBytes(ref, ctx.abortSignal);
     if (own) return own;
-    const r = (await ctx.fetch(ref)) as unknown as Reply;
+    const r = (await ctx.fetch(ref, { signal: ctx.abortSignal })) as unknown as Reply;
     if (!r.ok) throw new Error(`could not read ${ref}: HTTP ${r.status}`);
     return { bytes: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get('content-type') || mimeOf(ref) };
   }
@@ -339,13 +351,14 @@ export async function wav16k(ctx: RuntimeContext, value: unknown): Promise<Uint8
 
 /** Keep what a service made as a file in the temp folder; its path and a URL to show it. */
 export async function keepFile(ctx: RuntimeContext, bytes: Uint8Array, ext: string, base: string): Promise<{ path: string; url: string }> {
+  const safeExt = String(ext || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
   if (!ctx.tauri) {
     // No filesystem (a bare runtime): a data: URL stands in for both.
-    const url = `data:${mimeOf(ext)};base64,${toBase64(bytes)}`;
+    const url = `data:${mimeOf(safeExt)};base64,${toBase64(bytes)}`;
     return { path: url, url };
   }
   const name = (base || 'output').replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 60) || 'output';
-  const path = `${await tempDir(ctx)}/oaiy-media/${name}_${Date.now()}.${ext}`;
+  const path = `${await tempDir(ctx)}/oaiy-media/${name}_${Date.now()}.${safeExt}`;
   await ctx.tauri.invoke('plugin:oaiy-filesystem|write_file', { path, content: toBase64(bytes), contentType: 'base64', createDirs: true });
   let url = path;
   try {
@@ -460,7 +473,8 @@ function extFor(service: CustomService, mime: string | null, fallback: string): 
     const hit = Object.entries(MIME).find(([, m]) => mime.startsWith(m));
     if (hit) return hit[0];
   }
-  return service.outputFormat || fallback;
+  const raw = service.outputFormat || fallback;
+  return String(raw || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
 }
 
 /**

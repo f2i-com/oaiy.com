@@ -16,6 +16,32 @@
  * a typed array {$ta: name, d: [...]}, a date {$date: ms}.
  */
 var __zdom_entry = (function () {
+var __jsonStringify = JSON.stringify;
+var __jsonParse = JSON.parse;
+var __isArray = Array.isArray;
+var __hasOwn = Object.prototype.hasOwnProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __objKeys = Object.keys;
+var __getProtoOf = Object.getPrototypeOf;
+var __objCreate = Object.create;
+var __defineProp = Object.defineProperty;
+var __isView = typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView ? ArrayBuffer.isView : null;
+var __arrayFrom = Array.from;
+var __fromCharCode = String.fromCharCode;
+var __Uint8Array = Uint8Array;
+var __ArrayBuffer = ArrayBuffer;
+var __Date = Date;
+var __Promise = Promise;
+var __Error = Error;
+var __TypeError = TypeError;
+var __Number = Number;
+var __isFinite = isFinite;
+var __mapGet = Map.prototype.get;
+var __mapSet = Map.prototype.set;
+var __mapDel = Map.prototype.delete;
+var __weakMapGet = WeakMap.prototype.get;
+var __weakMapSet = WeakMap.prototype.set;
+var __weakMapHas = WeakMap.prototype.has;
 var window = globalThis;
 var self = window;
 var __MAGIC = '\u0000oaiy.agent.page:';
@@ -45,15 +71,45 @@ var __fnIds = new Map();
 var __fns = new Map();
 var __promises = new Map();
 var __nextFn = 1;
-var __classes = Object.create(null);
+var __classes = __objCreate(null);
+
+/** Serialize wire payloads without consulting mutable JSON.stringify or prototype toJSON hooks. */
+function __serialize(v) {
+  if (v === null || v === undefined) return 'null';
+  var t = typeof v;
+  if (t === 'boolean') return v ? 'true' : 'false';
+  if (t === 'number') return __isFinite(v) ? '' + v : 'null';
+  if (t === 'string') return __jsonStringify(v);
+  if (__isArray(v)) {
+    var parts = '';
+    for (var i = 0; i < v.length; i++) {
+      if (i > 0) parts += ',';
+      parts += __serialize(v[i]);
+    }
+    return '[' + parts + ']';
+  }
+  if (t === 'object') {
+    var keys = __objKeys(v);
+    var out = '';
+    for (var j = 0; j < keys.length; j++) {
+      var k = keys[j];
+      var val = v[k];
+      if (val === undefined) continue;
+      if (out) out += ',';
+      out += __jsonStringify(k) + ':' + __serialize(val);
+    }
+    return '{' + out + '}';
+  }
+  return 'null';
+}
 
 function __host(op, a, b, c) {
-  var reply = JSON.parse(__channel('ls.getItem', __MAGIC + JSON.stringify([op, a, b, c])));
-  if (reply === null || typeof reply !== 'object') throw new Error('the preview did not answer');
-  if (reply.h) __inlineHandlers(reply.h);
-  if (reply.q) __flush();
-  if (typeof reply.err === 'string') {
-    var err = new Error(reply.err.replace(/^\w+: /, ''));
+  var reply = __jsonParse(__channel('ls.getItem', __MAGIC + __serialize([op, a, b, c])));
+  if (reply === null || typeof reply !== 'object') throw new __Error('the preview did not answer');
+  if (__hasOwn.call(reply, 'h') && reply.h) __inlineHandlers(reply.h);
+  if (__hasOwn.call(reply, 'q') && reply.q) __flush();
+  if (__hasOwn.call(reply, 'err') && typeof reply.err === 'string') {
+    var err = new __Error(reply.err.replace(/^\w+: /, ''));
     var name = /^(\w+): /.exec(reply.err);
     if (name) err.name = name[1];
     throw err;
@@ -63,8 +119,8 @@ function __host(op, a, b, c) {
 
 /** Callbacks the frame queued while it was answering (an event a call of ours fired). */
 function __flush() {
-  var queued = JSON.parse(__channel('ls.getItem', __MAGIC + JSON.stringify(['flush'])));
-  var list = queued && queued.ok ? queued.ok : [];
+  var queued = __jsonParse(__channel('ls.getItem', __MAGIC + '["flush"]'));
+  var list = queued && __hasOwn.call(queued, 'ok') && __isArray(queued.ok) ? queued.ok : [];
   for (var i = 0; i < list.length; i++) __zdom_cb(list[i][0], list[i][1], list[i][2]);
 }
 
@@ -73,11 +129,11 @@ function __cls(name, chain, exposeGlobal) {
   var parentName = chain && chain.length > 1 ? chain[1] : null;
   var parent = parentName ? __cls(parentName, chain.slice(1), exposeGlobal) : null;
   var C = function () {
-    throw new TypeError('Illegal constructor');
+    throw new __TypeError('Illegal constructor');
   };
-  C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+  C.prototype = __objCreate(parent ? parent.prototype : Object.prototype);
   C.prototype.constructor = C;
-  Object.defineProperty(C, 'name', { value: name });
+  __defineProp(C, 'name', { value: name });
   __classes[name] = C;
   if (exposeGlobal !== false && typeof globalThis[name] === 'undefined') globalThis[name] = C;
   return C;
@@ -85,60 +141,66 @@ function __cls(name, chain, exposeGlobal) {
 
 function __isPlain(v) {
   if (v === null || typeof v !== 'object') return false;
-  var proto = Object.getPrototypeOf(v);
-  return proto === Object.prototype || proto === null || Array.isArray(v);
+  var proto = __getProtoOf(v);
+  return proto === Object.prototype || proto === null || __isArray(v);
 }
 
 function __encode(v) {
   if (v === undefined) return { $u: 1 };
   if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
-  if (typeof v === 'number') return isFinite(v) ? v : { $num: String(v) };
+  if (typeof v === 'number') return __isFinite(v) ? v : { $num: String(v) };
   if (typeof v === 'bigint') return String(v);
   if (typeof v === 'function') {
-    var id = __fnIds.get(v);
+    var id = __mapGet.call(__fnIds, v);
     if (!id) {
       id = __nextFn++;
-      __fnIds.set(v, id);
-      __fns.set(id, v);
+      __mapSet.call(__fnIds, v, id);
+      __mapSet.call(__fns, id, v);
     }
     return { $f: id };
   }
   if (typeof v === 'symbol') return String(v);
   if (v === window) return { $win: 1 };
-  var wid = __wrapperIds.get(v);
+  var wid = __weakMapGet.call(__wrapperIds, v);
   if (wid !== undefined) return { $h: wid };
-  if (ArrayBuffer.isView && ArrayBuffer.isView(v)) return { $ta: v.constructor.name, d: Array.from(v) };
-  if (v instanceof ArrayBuffer) {
-    var bytes = new Uint8Array(v);
+  if (__isView && __isView(v)) return { $ta: v.constructor.name, d: __arrayFrom(v) };
+  if (v instanceof __ArrayBuffer) {
+    var bytes = new __Uint8Array(v);
     if (bytes.byteLength > 1024) {
       var bin = '';
       for (var bi = 0; bi < bytes.length; bi += 0x8000) {
-        bin += String.fromCharCode.apply(null, bytes.subarray(bi, bi + 0x8000));
+        bin += __fromCharCode.apply(null, bytes.subarray(bi, bi + 0x8000));
       }
       return { $ab: btoa(bin) };
     }
-    return { $ta: 'ArrayBuffer', d: Array.from(bytes) };
+    return { $ta: 'ArrayBuffer', d: __arrayFrom(bytes) };
   }
-  if (v instanceof Date) return { $date: v.getTime() };
-  if (Array.isArray(v)) return v.map(__encode);
-  var out = {};
-  for (var k in v) {
+  if (v instanceof __Date) return { $date: v.getTime() };
+  if (__isArray(v)) {
+    var arr = [];
+    for (var ai = 0; ai < v.length; ai++) arr[ai] = __encode(v[ai]);
+    return arr;
+  }
+  var out = __objCreate(null);
+  var keys = __objKeys(v);
+  for (var ki = 0; ki < keys.length; ki++) {
+    var k = keys[ki];
     if (k === '__proto__') continue;
     out[k] = __encode(v[k]);
   }
   return { $o: out };
 }
 
-var __threeMods = Object.create(null);
+var __threeMods = __objCreate(null);
 function __threeCtor(key, name, chain) {
   var F = function () {};
   if (name) {
     try {
-      Object.defineProperty(F, 'name', { value: name });
+      __defineProp(F, 'name', { value: name });
     } catch (_e) {}
   }
   F.prototype = __cls(name || 'Object', chain || ['Object'], false).prototype;
-  var statics = {};
+  var statics = __objCreate(null);
   return new Proxy(F, {
     construct: function (_t, args) {
       var encoded = [];
@@ -154,7 +216,7 @@ function __threeCtor(key, name, chain) {
       if (prop === 'prototype') return t.prototype;
       if (prop === 'name') return t.name;
       if (typeof prop === 'symbol') return t[prop];
-      if (Object.prototype.hasOwnProperty.call(statics, prop)) return statics[prop];
+      if (__hasOwn.call(statics, prop)) return statics[prop];
       var v = __host('threeStaticGet', key, prop);
       if (v === __METHOD_TOKEN) {
         statics[prop] = function () {
@@ -177,10 +239,14 @@ function __zdom_import(spec) {
 
 function __decode(v) {
   if (v === null || typeof v !== 'object') return v;
-  if (Array.isArray(v)) return v.map(__decode);
-  if (Object.prototype.hasOwnProperty.call(v, '$o') && v.$o && typeof v.$o === 'object' && !Array.isArray(v.$o)) {
+  if (__isArray(v)) {
+    var arr = [];
+    for (var i = 0; i < v.length; i++) arr[i] = __decode(v[i]);
+    return arr;
+  }
+  if (__hasOwn.call(v, '$o') && v.$o && typeof v.$o === 'object' && !__isArray(v.$o)) {
     var plain = {};
-    var okeys = Object.keys(v.$o);
+    var okeys = __objKeys(v.$o);
     for (var oi = 0; oi < okeys.length; oi++) {
       var ok = okeys[oi];
       if (ok === '__proto__') continue;
@@ -188,33 +254,35 @@ function __decode(v) {
     }
     return plain;
   }
-  if (v.$m === 1) return __METHOD_TOKEN;
-  if (v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
-  if (v.$h !== undefined) return __wrap(v.$h, v.c, v.ng === 1);
-  if (v.$u) return undefined;
-  if (v.$win) return window;
-  if (v.$num !== undefined) return Number(v.$num);
-  if (v.$f !== undefined) return __fns.get(v.$f);
-  if (v.$date !== undefined) return new Date(v.$date);
-  if (v.$ab !== undefined) {
+  if (__hasOwn.call(v, '$m') && v.$m === 1) return __METHOD_TOKEN;
+  if (__hasOwn.call(v, '$tc') && v.$tc !== undefined) return __threeCtor(v.$tc, v.n, v.ch);
+  if (__hasOwn.call(v, '$h') && v.$h !== undefined) return __wrap(v.$h, v.c, v.ng === 1);
+  if (__hasOwn.call(v, '$u') && v.$u) return undefined;
+  if (__hasOwn.call(v, '$win') && v.$win) return window;
+  if (__hasOwn.call(v, '$num') && v.$num !== undefined) return __Number(v.$num);
+  if (__hasOwn.call(v, '$f') && v.$f !== undefined) return __mapGet.call(__fns, v.$f);
+  if (__hasOwn.call(v, '$date') && v.$date !== undefined) return new __Date(v.$date);
+  if (__hasOwn.call(v, '$ab') && v.$ab !== undefined) {
     var rawBin = atob(v.$ab);
-    var abBytes = new Uint8Array(rawBin.length);
+    var abBytes = new __Uint8Array(rawBin.length);
     for (var ai = 0; ai < rawBin.length; ai++) abBytes[ai] = rawBin.charCodeAt(ai);
     return abBytes.buffer;
   }
-  if (v.$ta !== undefined) {
-    if (v.$ta === 'ArrayBuffer') return new Uint8Array(v.d).buffer;
-    var T = (Object.prototype.hasOwnProperty.call(__TYPED, v.$ta) && __TYPED[v.$ta]) || Uint8Array;
+  if (__hasOwn.call(v, '$ta') && v.$ta !== undefined) {
+    if (v.$ta === 'ArrayBuffer') return new __Uint8Array(v.d).buffer;
+    var T = (__hasOwn.call(__TYPED, v.$ta) && __TYPED[v.$ta]) || __Uint8Array;
     return new T(v.d);
   }
-  if (v.$p !== undefined) {
+  if (__hasOwn.call(v, '$p') && v.$p !== undefined) {
     var pid = v.$p;
-    return new Promise(function (resolve, reject) {
-      __promises.set(pid, [resolve, reject]);
+    return new __Promise(function (resolve, reject) {
+      __mapSet.call(__promises, pid, [resolve, reject]);
     });
   }
   var out = {};
-  for (var k in v) {
+  var vkeys = __getOwnPropNames(v);
+  for (var vi = 0; vi < vkeys.length; vi++) {
+    var k = vkeys[vi];
     if (k === '__proto__') continue;
     out[k] = __decode(v[k]);
   }
@@ -233,15 +301,15 @@ var __special = {
 };
 
 function __wrap(id, chain, noGlobal) {
-  var existing = __wrappers.get(id);
+  var existing = __mapGet.call(__wrappers, id);
   if (existing) return existing;
   chain = chain || ['Object'];
   var C = __cls(chain[0], chain, noGlobal ? false : true);
-  var target = Object.create(C.prototype);
-  var methods = {};
-  var extra = {};
-  __expando.set(id, extra);
-  var special = {};
+  var target = __objCreate(C.prototype);
+  var methods = __objCreate(null);
+  var extra = __objCreate(null);
+  __mapSet.call(__expando, id, extra);
+  var special = __objCreate(null);
   for (var i = chain.length - 1; i >= 0; i--) {
     var s = __special[chain[i]];
     if (s) for (var key in s) special[key] = s[key];
@@ -259,7 +327,7 @@ function __wrap(id, chain, noGlobal) {
       }
       if (k === 'then') return undefined;
       if (k === 'constructor') return C;
-      if (Object.prototype.hasOwnProperty.call(extra, k)) return extra[k];
+      if (__hasOwn.call(extra, k)) return extra[k];
       if (special[k]) return special[k].get ? special[k].get() : special[k].value;
       if (methods[k]) return methods[k];
       var value = __host('get', id, k);
@@ -280,27 +348,27 @@ function __wrap(id, chain, noGlobal) {
         return true;
       }
       // The page's own data on a DOM node stays here, as itself; non-Node host objects (e.g. Three.js userData/uniforms) forward to the host.
-      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && !__wrapperIds.has(v) && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
+      if (chain.indexOf('Node') >= 0 && v !== null && typeof v === 'object' && !__weakMapHas.call(__wrapperIds, v) && __isPlain(v) && !(k === 'style' || k === 'dataset')) {
         extra[k] = v;
         return true;
       }
-      if (Object.prototype.hasOwnProperty.call(extra, k)) delete extra[k];
+      if (__hasOwn.call(extra, k)) delete extra[k];
       delete methods[k];
       __host('set', id, k, __encode(v));
       return true;
     },
     has: function (t, k) {
       if (typeof k === 'symbol') return k === Symbol.iterator;
-      if (Object.prototype.hasOwnProperty.call(extra, k) || special[k]) return true;
+      if (__hasOwn.call(extra, k) || special[k]) return true;
       return __host('has', id, k);
     },
     deleteProperty: function (t, k) {
-      if (Object.prototype.hasOwnProperty.call(extra, k)) delete extra[k];
+      if (__hasOwn.call(extra, k)) delete extra[k];
       else __host('del', id, k);
       return true;
     },
     ownKeys: function () {
-      var own = Object.keys(extra);
+      var own = __objKeys(extra);
       // A node's keys are its own data; a record's (dataset, a DOMRect, a style) are the browser's.
       if (chain.indexOf('Node') >= 0) return own;
       return own.concat(__host('keys', id).filter(function (k) {
@@ -308,20 +376,20 @@ function __wrap(id, chain, noGlobal) {
       }));
     },
     getOwnPropertyDescriptor: function (t, k) {
-      if (Object.prototype.hasOwnProperty.call(extra, k)) return { value: extra[k], writable: true, enumerable: true, configurable: true };
+      if (__hasOwn.call(extra, k)) return { value: extra[k], writable: true, enumerable: true, configurable: true };
       if (chain.indexOf('Node') >= 0 || typeof k === 'symbol') return undefined;
       var value = proxy[k];
       return value === undefined ? undefined : { value: value, writable: true, enumerable: true, configurable: true };
     },
   });
-  __wrappers.set(id, proxy);
-  __wrapperIds.set(proxy, id);
+  __mapSet.call(__wrappers, id, proxy);
+  __weakMapSet.call(__wrapperIds, proxy, id);
   return proxy;
 }
 
 /** A callback from the frame: a listener, timer or observer of the page's. */
 function __zdom_cb(fnId, thisValue, args) {
-  var fn = __fns.get(fnId);
+  var fn = __mapGet.call(__fns, fnId);
   if (!fn) return { $u: 1 };
   try {
     return __encode(__watch(fn.apply(__decode(thisValue), __decode(args)), 'in an async callback'));
@@ -333,7 +401,7 @@ function __zdom_cb(fnId, thisValue, args) {
 
 /** A promise the page's code left behind (an async handler's, say): its failure is reported, as a browser reports an unhandled rejection. */
 function __watch(value, where) {
-  if (value && typeof value === 'object' && typeof value.then === 'function' && !__wrapperIds.has(value)) {
+  if (value && typeof value === 'object' && typeof value.then === 'function' && !__weakMapHas.call(__wrapperIds, value)) {
     value.then(null, function (error) {
       __report(error, where);
     });
@@ -343,11 +411,11 @@ function __watch(value, where) {
 }
 
 function __zdom_settle(pid, ok, value) {
-  var p = __promises.get(pid);
+  var p = __mapGet.call(__promises, pid);
   if (!p) return;
-  __promises.delete(pid);
+  __mapDel.call(__promises, pid);
   if (ok) p[0](__decode(value));
-  else p[1](new Error(String(value)));
+  else p[1](new __Error(String(value)));
 }
 
 function __report(error, where) {
@@ -387,17 +455,17 @@ function __zdom_run(source, name) {
 function __format(v) {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
-  if (v && typeof v === 'object' && __wrapperIds.has(v)) {
+  if (v && typeof v === 'object' && __weakMapHas.call(__wrapperIds, v)) {
     try {
       return '<' + String(v.tagName || v.nodeName || 'object').toLowerCase() + (v.id ? '#' + v.id : '') + '>';
     } catch (e) {
       return '[object]';
     }
   }
-  if (v instanceof Error) return (v.name || 'Error') + ': ' + v.message;
+  if (v instanceof __Error) return (v.name || 'Error') + ': ' + v.message;
   if (typeof v === 'function') return 'function ' + (v.name || '');
   try {
-    var s = JSON.stringify(v);
+    var s = __jsonStringify(v);
     return s === undefined ? String(v) : s;
   } catch (e) {
     return String(v);

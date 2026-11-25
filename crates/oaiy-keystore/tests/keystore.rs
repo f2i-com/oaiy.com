@@ -1218,6 +1218,36 @@ mod unix {
         fs::write(scratch.keys(), b"not a folder").unwrap();
         assert!(matches!(open_at(scratch.keys(), ProviderChoice::Keyfile), Err(KeyError::Permissions(why)) if why.contains("not a directory")));
     }
+
+    #[test]
+    fn a_trailing_slash_on_a_symlink_keys_dir_is_still_refused() {
+        let target = Scratch::new("trailing-target");
+        let _ = open_at(target.keys(), ProviderChoice::Keyfile).unwrap();
+        let parent = Scratch::new("trailing-link");
+        let link = parent.0.join("keys");
+        symlink(target.keys(), &link).unwrap();
+        let with_slash = PathBuf::from(format!("{}/", link.display()));
+        assert!(matches!(open_at(with_slash, ProviderChoice::Keyfile), Err(KeyError::Permissions(why)) if why.contains("symbolic link")));
+    }
+
+    #[test]
+    fn an_intermediate_symlink_inside_an_untrusted_parent_is_refused() {
+        let safe = Scratch::new("symlink-safe-target");
+        let real = safe.0.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let scratch = Scratch::new("symlink-untrusted-parent");
+        let shared = scratch.0.join("shared");
+        fs::create_dir(&shared).unwrap();
+        symlink(&real, shared.join("link")).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = open_at(shared.join("link").join("keys"), ProviderChoice::Keyfile).err().expect("refused");
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("above the keys directory") && why.contains("sticky")), "{error:?}");
+        assert!(!real.join("keys").exists(), "nothing was created through a symlink inside an untrusted parent");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
 
 /// What Windows adds: a junction is a reparse point that `std` follows, and the folder is held open so that it cannot be swapped.

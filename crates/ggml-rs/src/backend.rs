@@ -43,10 +43,25 @@ fn host_delta_net(
     eps:         f32,
     sigmoid_gate: bool,
 ) -> (Tensor, Tensor, Tensor) {
+    assert!(head_k_dim > 0 && head_v_dim > 0 && num_k_heads > 0 && num_v_heads > 0, "delta-net dimensions must be non-zero");
     assert!(head_k_dim <= 128 && head_v_dim <= 128, "delta-net heads of at most 128 on the host");
+    if seq == 0 {
+        return (Tensor::zeros(vec![0, num_v_heads * head_v_dim]), conv_state.to_host(), state.to_host());
+    }
     // Host fallback: per-token loop matching the CUDA kernels.
-    let conv_dim    = mixed_qkv.numel() / seq;
+    assert!(conv_weight.rank() >= 2, "delta-net conv_weight must be at least 2D");
     let conv_kernel = conv_weight.dim(1);
+    assert!(conv_kernel >= 1, "delta-net conv_kernel must be >= 1");
+    assert_eq!(mixed_qkv.numel() % seq, 0, "delta-net mixed_qkv numel not divisible by seq");
+    let conv_dim    = mixed_qkv.numel() / seq;
+    let q_base = 0;
+    let k_base = num_k_heads.checked_mul(head_k_dim).expect("delta-net k_base overflow");
+    let v_base = k_base.checked_mul(2).expect("delta-net v_base overflow");
+    let v_total = num_v_heads.checked_mul(head_v_dim).expect("delta-net v_total overflow");
+    let min_conv_dim = v_base.checked_add(v_total).expect("delta-net conv_dim overflow");
+    assert!(conv_dim >= min_conv_dim, "delta-net conv_dim {conv_dim} < required {min_conv_dim}");
+    assert_eq!(conv_dim.checked_mul(conv_kernel), Some(conv_weight.numel()), "delta-net conv_weight size mismatch");
+
     let mqkv_h = mixed_qkv.to_host();   let mqkv = mqkv_h.data();
     let z_full_h = z_in.to_host();      let z_full = z_full_h.data();
     let ba_full_h = beta_alpha.to_host(); let ba_full = ba_full_h.data();
@@ -59,12 +74,31 @@ fn host_delta_net(
     let cs          = conv_h.data_mut();
     let mut state_h = state.to_host();
     let st          = state_h.data_mut();
-    let mut output  = vec![0.0f32; seq * num_v_heads * head_v_dim];
-    let mut conv_out = vec![0.0f32; conv_dim];
 
-    let q_base = 0;
-    let k_base = num_k_heads * head_k_dim;
-    let v_base = 2 * num_k_heads * head_k_dim;
+    let expected_cs = (conv_kernel - 1).checked_mul(conv_dim).expect("delta-net conv_state overflow");
+    assert!(cs.len() >= expected_cs, "delta-net conv_state len {} < required {expected_cs}", cs.len());
+    let expected_z = seq.checked_mul(v_total).expect("delta-net z_in overflow");
+    assert!(z_full.len() >= expected_z, "delta-net z_in len {} < required {expected_z}", z_full.len());
+    let expected_ba = seq.checked_mul(2).and_then(|v| v.checked_mul(num_v_heads)).expect("delta-net beta_alpha overflow");
+    assert!(ba_full.len() >= expected_ba, "delta-net beta_alpha len {} < required {expected_ba}", ba_full.len());
+    assert!(sa.len() >= num_v_heads, "delta-net ssm_a len {} < {num_v_heads}", sa.len());
+    assert!(dt.len() >= num_v_heads, "delta-net dt_bias len {} < {num_v_heads}", dt.len());
+    assert!(nm.len() >= head_v_dim, "delta-net ssm_norm len {} < {head_v_dim}", nm.len());
+
+    let state_cols = if state.rank() >= 3 {
+        assert_eq!(state.dim(0), num_v_heads, "delta-net state dim 0 mismatch");
+        assert_eq!(state.dim(1), head_v_dim, "delta-net state dim 1 mismatch");
+        state.dim(2)
+    } else {
+        assert_eq!(st.len() % v_total, 0, "delta-net flat state len {} not divisible by {v_total}", st.len());
+        st.len() / v_total
+    };
+    assert!(state_cols >= head_k_dim, "delta-net state row stride {state_cols} < head_k_dim {head_k_dim}");
+    let head_state_len = head_v_dim.checked_mul(state_cols).expect("delta-net head state size overflow");
+    assert_eq!(num_v_heads.checked_mul(head_state_len), Some(st.len()), "delta-net state size mismatch");
+
+    let mut output  = vec![0.0f32; expected_z];
+    let mut conv_out = vec![0.0f32; conv_dim];
 
     for t in 0..seq {
         // ---- conv1d for this token ------------------------------------
@@ -76,20 +110,22 @@ fn host_delta_net(
             }
             acc += mqkv_t[c] * cw[c * conv_kernel + (conv_kernel - 1)];
             conv_out[c] = acc / (1.0 + (-acc).exp());
-            for k in 0..(conv_kernel - 2) {
-                cs[k * conv_dim + c] = cs[(k + 1) * conv_dim + c];
+            if conv_kernel >= 2 {
+                for k in 0..(conv_kernel - 2) {
+                    cs[k * conv_dim + c] = cs[(k + 1) * conv_dim + c];
+                }
+                cs[(conv_kernel - 2) * conv_dim + c] = mqkv_t[c];
             }
-            cs[(conv_kernel - 2) * conv_dim + c] = mqkv_t[c];
         }
         // ---- per-head delta-net step (TILED V order) ------------------
-        let z_t  = &z_full[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
+        let z_t  = &z_full[t * v_total..(t + 1) * v_total];
         let ba_t = &ba_full[t * 2 * num_v_heads..(t + 1) * 2 * num_v_heads];
-        let out_t = &mut output[t * num_v_heads * head_v_dim..(t + 1) * num_v_heads * head_v_dim];
+        let out_t = &mut output[t * v_total..(t + 1) * v_total];
         let conv_out = &conv_out;
         // The heads are independent within a token: each takes its own state and output (rayon), where one thread
         // did all 48 of a Flash-Next layer.
         use rayon::prelude::*;
-        st.par_chunks_mut(head_v_dim * head_v_dim).zip(out_t.par_chunks_mut(head_v_dim)).enumerate().for_each(|(h_v, (st_h, out_h))| {
+        st.par_chunks_mut(head_state_len).zip(out_t.par_chunks_mut(head_v_dim)).enumerate().for_each(|(h_v, (st_h, out_h))| {
             let h_k = h_v % num_k_heads;
             let q_h = &conv_out[q_base + h_k * head_k_dim..q_base + (h_k + 1) * head_k_dim];
             let k_h = &conv_out[k_base + h_k * head_k_dim..k_base + (h_k + 1) * head_k_dim];
@@ -110,7 +146,7 @@ fn host_delta_net(
 
             let mut kv_mem = [0.0f32; 128];
             for i in 0..head_v_dim {
-                let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let row = &st_h[i * state_cols..i * state_cols + head_k_dim];
                 let mut acc = 0.0f32;
                 for j in 0..head_k_dim { acc += row[j] * k_n[j]; }
                 kv_mem[i] = acc;
@@ -118,13 +154,13 @@ fn host_delta_net(
             let mut delta = [0.0f32; 128];
             for i in 0..head_v_dim { delta[i] = (v_h[i] - kv_mem[i]) * bh; }
             for i in 0..head_v_dim {
-                let row = &mut st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let row = &mut st_h[i * state_cols..i * state_cols + head_k_dim];
                 let di = delta[i];
                 for j in 0..head_k_dim { row[j] += di * k_n[j]; }
             }
             let mut core = [0.0f32; 128];
             for i in 0..head_v_dim {
-                let row = &st_h[i * head_v_dim..(i + 1) * head_v_dim];
+                let row = &st_h[i * state_cols..i * state_cols + head_k_dim];
                 let mut acc = 0.0f32;
                 for j in 0..head_k_dim { acc += row[j] * q_n[j]; }
                 core[i] = acc;
@@ -138,7 +174,7 @@ fn host_delta_net(
             }
         });
     }
-    (Tensor::from_vec(output, vec![seq, num_v_heads * head_v_dim]), conv_h, state_h)
+    (Tensor::from_vec(output, vec![seq, v_total]), conv_h, state_h)
 }
 
 
@@ -1412,6 +1448,9 @@ pub trait Backend: Send + Sync + Debug + 'static {
         debug_assert_eq!(n_h_q % n_h_kv, 0);
         let n_rep = n_h_q / n_h_kv;
         let seq = q.dim(0);
+        if sliding_window == Some(0) || kv_len == 0 {
+            return self.alloc_zeros(vec![seq, n_h_q, q.dim(2)]);
+        }
 
         // Slice the cache prefix.
         let k_pref = self.slice_axis0(k_buffer, kv_len);
@@ -1431,7 +1470,7 @@ pub trait Backend: Send + Sync + Debug + 'static {
             let data = scores.data_mut();
             for s in 0..seq {
                 let q_pos = past + s;
-                let lo = q_pos.saturating_sub(w - 1);
+                let lo = q_pos.saturating_sub(w.saturating_sub(1));
                 for h in 0..n_h_q {
                     let row_off = (s * n_h_q + h) * kv_len;
                     for t in 0..lo.min(kv_len) {
@@ -1634,11 +1673,14 @@ pub fn moe_route_topk_host(logits: &[f32], top_k: usize, n_experts: usize) -> (V
     );
     let seq = logits.len() / n_experts;
     let k = top_k.min(n_experts);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let mut ids = Vec::with_capacity(seq * k);
     let mut weights = Vec::with_capacity(seq * k);
     for row in logits.chunks_exact(n_experts) {
         let mut pairs: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
-        pairs.select_nth_unstable_by(k.saturating_sub(1), |a, b| b.1.total_cmp(&a.1));
+        pairs.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
         pairs.truncate(k);
         pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
         let max_l = pairs[0].1;
@@ -1648,4 +1690,34 @@ pub fn moe_route_topk_host(logits: &[f32], top_k: usize, n_experts: usize) -> (V
         weights.extend(exps.iter().map(|e| e / sum));
     }
     (ids, weights)
+}
+
+#[cfg(test)]
+mod delta_net_tests {
+    use super::*;
+
+    #[test]
+    fn host_delta_net_handles_kernel_1_and_rect_state() {
+        let (seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim) = (2, 2, 1, 3, 4);
+        let conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim;
+        let mixed_qkv = Tensor::from_vec(vec![0.5; seq * conv_dim], vec![seq, conv_dim]);
+        let z_in = Tensor::from_vec(vec![0.25; seq * num_v_heads * head_v_dim], vec![seq, num_v_heads * head_v_dim]);
+        let beta_alpha = Tensor::from_vec(vec![0.1; seq * 2 * num_v_heads], vec![seq, 2 * num_v_heads]);
+        let conv_weight = Tensor::from_vec(vec![1.0; conv_dim], vec![conv_dim, 1]);
+        let ssm_a = Tensor::from_vec(vec![-0.1; num_v_heads], vec![num_v_heads]);
+        let dt_bias = Tensor::from_vec(vec![0.0; num_v_heads], vec![num_v_heads]);
+        let ssm_norm = Tensor::from_vec(vec![1.0; head_v_dim], vec![head_v_dim]);
+        let conv_state = Tensor::zeros(vec![0, conv_dim]);
+        let state = Tensor::zeros(vec![num_v_heads, head_v_dim, head_k_dim]);
+
+        let (out, cs, st) = host_delta_net(
+            &mixed_qkv, &z_in, &beta_alpha, &conv_weight, &ssm_a, &dt_bias, &ssm_norm,
+            &conv_state, &state, seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim,
+            1.0, 1e-5, false,
+        );
+        assert_eq!(out.shape(), [seq, num_v_heads * head_v_dim]);
+        assert!(out.data().iter().all(|v| v.is_finite()));
+        assert_eq!(cs.numel(), 0);
+        assert_eq!(st.shape(), [num_v_heads, head_v_dim, head_k_dim]);
+    }
 }

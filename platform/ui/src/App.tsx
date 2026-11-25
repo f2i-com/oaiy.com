@@ -17,6 +17,7 @@ import PasswordPromptModal from './components/dialogs/PasswordPromptModal';
 import { getCliRunConfig, type CliRunConfig } from './hooks/useCliRunMode';
 import { createLogger } from './utils/logger';
 import { flowWithoutRunOutputs } from './utils/runOutputs';
+import { stripUnsafeImportedSettings } from './utils/ProjectIO';
 import { withNewIds } from './lib/flowIds';
 import { BOOT_NOTICE_KEY } from './lib/bootNotice';
 import { v4 as uuidv4 } from 'uuid';
@@ -142,7 +143,11 @@ function App() {
                   createdAt: result.meta.created_at,
                   updatedAt: result.meta.updated_at,
                   flows: [],
-                  settings: flowJson.settings ?? {},
+                  settings: stripUnsafeImportedSettings(
+                    flowJson.settings && typeof flowJson.settings === 'object'
+                      ? (flowJson.settings as Record<string, unknown>)
+                      : undefined,
+                  ).cleaned,
                   constants: Array.isArray(flowJson.constants) ? flowJson.constants : [],
                   llmEndpoints: [],
                   imageGenEndpoints: [],

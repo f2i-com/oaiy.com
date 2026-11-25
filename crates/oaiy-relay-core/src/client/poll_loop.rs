@@ -350,7 +350,23 @@ impl<S: PollStore> PollLoop<S> {
 
             let min_client_above_ours = if reply.status == Some(426) {
                 let cancel = self.handle.arm();
-                self.client.read_info(&cancel).map(|i| i.min_client > u64::from(self.config.level)).unwrap_or(false)
+                match self.client.prove(&cancel) {
+                    Ok(proved) => {
+                        poll_info = PollInfo::from_info(&proved.info);
+                        wait_s = proved.info.wait.default.min(proved.info.wait.max);
+                        last_proof = Some(clock.monotonic());
+                        proved.info.min_client > u64::from(self.config.level)
+                    }
+                    Err(ProveError::Invalid(_)) => {
+                        set_state!(ConnectionState::Suspect);
+                        self.emit(Event::Action(Action::ReportRelayChanged));
+                        return LoopEnd::Stopped { action: Action::ReportRelayChanged, status: None, code: None, counters };
+                    }
+                    Err(ProveError::NoAnswer(super::relay::ClientError::Cancelled)) if self.handle.stopped() => {
+                        return LoopEnd::Cancelled;
+                    }
+                    Err(ProveError::NoAnswer(_)) => false,
+                }
             } else {
                 false
             };

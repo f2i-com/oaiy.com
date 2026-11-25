@@ -197,4 +197,31 @@ fn what_a_drop_wipes() {
     assert_eq!(leaks(&r), 0, "a dropped document left the token in a freed block: {r:?}");
     let r = measure(token_needles(), || json::parse(body.as_bytes()).unwrap());
     assert!(leaks(&r) > 0, "the detector did not see a token in a tree that was not wiped");
+
+    // ---- P2-3: MobileAdmission::parse_with wipes its parsed JSON tree and TURN credential even on parse error.
+    let adm_mac = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    let adm_claims_hex = "7b22657870223a313739303030303130307d"; // {"exp":1790000100}
+    let adm_bearer = Zeroizing::new(format!("aokie-adm-v2.{adm_claims_hex}.{adm_mac}"));
+    let adm_cred = Zeroizing::new("TURN-SECRET-MUST-WIPE-ON-ERROR-987654321".to_string());
+    let holder = Signer::generate().unwrap().thumbprint();
+    let peer = Signer::generate().unwrap().thumbprint();
+    let adm_body = Zeroizing::new(format!(
+        r#"{{"accessToken":"{}","tokenType":"Bearer","expiresIn":100,"expiresAt":1790000100,"gatewayUrl":"wss://relay.example.com/v2/realtime","appId":"aokie","scopes":["state_read"],"iceServers":[{{"urls":["turns:turn.example.com:443","stun:stun.example.com:3478"],"username":"1790000100:u","credential":"{}","expiresAt":1790000100}}],"relayOnly":false,"turnCredentialExpiresAt":1790000100,"holderKeyThumbprint":"{}","subjectId":"dev-AAAAAAAAAAAAAAAAAAAAAA","role":"mobile","expectedPeerKeyThumbprint":"{}","device":{{"id":"d1","appId":"aokie","subjectId":"dev-AAAAAAAAAAAAAAAAAAAAAA","role":"mobile","displayName":"Phone","grants":["state_read"],"approvedAt":"2026-01-01T00:00:00Z","lastSeenAt":"2026-01-01T00:00:00Z"}}}}"#,
+        adm_bearer.as_str(),
+        adm_cred.as_str(),
+        holder,
+        peer
+    ));
+    let expect = oaiy_relay_core::admission::MobileExpect { app_id: "aokie", device_id: "dev-AAAAAAAAAAAAAAAAAAAAAA", holder_thumbprint: &holder };
+    let r = measure(
+        vec![
+            Needle { name: "admission bearer", bytes: adm_bearer.as_bytes().to_vec() },
+            Needle { name: "turn credential", bytes: adm_cred.as_bytes().to_vec() },
+        ],
+        || {
+            let res = oaiy_relay_core::admission::MobileAdmission::parse_with(adm_body.as_bytes(), &expect, 1_790_000_000, false);
+            assert!(res.is_err(), "mixed STUN+TURN entry must fail parse_ice");
+        },
+    );
+    assert_eq!(leaks(&r), 0, "MobileAdmission::parse_with leaked bearer or TURN credential on error: {r:?}");
 }

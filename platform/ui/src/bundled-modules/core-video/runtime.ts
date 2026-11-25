@@ -17,6 +17,55 @@ import { runContract } from '../core-service/contractRuntime';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
 import { applyVideoOverrides, analyzeComfyUIVideoWorkflow } from './comfyui-video-analyzer';
 
+const VIDEO_FORMATS = new Set(['mp4', 'webm', 'mov', 'mkv', 'gif']);
+const FFMPEG_COLOR_PATTERN = /^(?:[A-Za-z]{1,20}|(?:0x|#)[0-9A-Fa-f]{6,8})(?:@(?:0(?:\.\d+)?|1(?:\.0+)?))?$/;
+
+export function sanitizeVideoFilename(name: string | undefined, fallback: string): string {
+  const cleaned = String(name ?? '')
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80);
+  return cleaned || fallback;
+}
+
+export function sanitizeVideoFormat(format: string | undefined, fallback: string = 'mp4'): string {
+  const normalized = String(format ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return VIDEO_FORMATS.has(normalized) ? normalized : fallback;
+}
+
+export function sanitizeFfmpegColor(color: string | undefined, fallback: string): string {
+  const raw = String(color ?? '').trim();
+  if (!raw) return fallback;
+  const rgbaMatch = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})(?:\s*,\s*(0(?:\.\d+)?|1(?:\.0+)?|\.\d+))?\s*\)$/i.exec(raw);
+  if (rgbaMatch) {
+    const r = Math.min(255, parseInt(rgbaMatch[1], 10)).toString(16).padStart(2, '0');
+    const g = Math.min(255, parseInt(rgbaMatch[2], 10)).toString(16).padStart(2, '0');
+    const b = Math.min(255, parseInt(rgbaMatch[3], 10)).toString(16).padStart(2, '0');
+    const a = rgbaMatch[4] !== undefined ? Math.max(0, Math.min(1, parseFloat(rgbaMatch[4]))) : 1;
+    return `0x${r}${g}${b}@${a}`;
+  }
+  return FFMPEG_COLOR_PATTERN.test(raw) ? raw : fallback;
+}
+
+function sanitizeUrlForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    const sensitive = /^(?:api[_-]?key|key|token|access[_-]?token|auth|secret|password|passwd|sig|signature|session|cookie)$/i;
+    for (const k of Array.from(u.searchParams.keys())) {
+      if (sensitive.test(k)) {
+        u.searchParams.set(k, '[REDACTED]');
+      }
+    }
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/:\/\/[^/@\s]+@/, '://[REDACTED]@');
+  }
+}
+
 // Per-job method factory: methods close over THIS job's ctx + a per-job set of temp
 // folders (no module-level singletons), so concurrent jobs don't cross-contaminate
 // (notably: one job's temp cleanup can't delete another's in-use folders).
@@ -102,7 +151,7 @@ async function checkServiceAvailable(apiUrl: string, serviceName: string): Promi
   const baseUrl = apiUrl.replace(/\/[^/]+$/, '');
 
   try {
-    const healthCheck = await ctx.fetch(`${baseUrl}/health`, { method: 'GET' });
+    const healthCheck = await ctx.fetch(`${baseUrl}/health`, { method: 'GET', signal: ctx.abortSignal });
     if (!healthCheck.ok) {
       const healthData = await healthCheck.json().catch(() => ({})) as { missing?: string[] };
       if (healthData.missing?.length) {
@@ -454,6 +503,7 @@ async function waitForComfyUIVideo(
       const historyResponse = await ctx.secureFetch(`${endpoint}/history/${promptId}`, {
         method: 'GET',
         purpose: 'ComfyUI polling',
+        signal: ctx.abortSignal,
       });
 
       if (!historyResponse.ok) {
@@ -535,8 +585,8 @@ async function uploadImageToComfyUI(
     blob = new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
     ctx.log('info', `[VideoGen] Created blob: size=${blob.size}, type=${blob.type}`);
   } else if (imageData.startsWith('http')) {
-    ctx.log('info', `[VideoGen] Fetching image from URL: ${imageData}`);
-    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI' });
+    ctx.log('info', `[VideoGen] Fetching image from URL: ${sanitizeUrlForLog(imageData)}`);
+    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI', signal: ctx.abortSignal });
     ctx.log('info', `[VideoGen] Fetch response: status=${response.status}, content-type=${response.headers.get('content-type')}`);
 
     // Get ArrayBuffer and create Blob explicitly to ensure binary data
@@ -592,6 +642,7 @@ async function uploadImageToComfyUI(
     method: 'POST',
     body: formData,
     purpose: 'ComfyUI image upload',
+    signal: ctx.abortSignal,
   });
 
   if (!uploadResponse.ok) {
@@ -725,6 +776,7 @@ async function generateVideoWan2GP(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       purpose: 'Wan2GP video generation',
+      signal: ctx.abortSignal,
     });
 
     if (submitResponse.status !== 503) break;
@@ -763,6 +815,7 @@ async function generateVideoWan2GP(
 
     const pollResponse = await ctx.secureFetch(`${baseUrl}/job/${jobId}`, {
       purpose: 'Wan2GP job status poll',
+      signal: ctx.abortSignal,
     });
 
     if (!pollResponse.ok) {
@@ -1037,7 +1090,7 @@ async function generate(
               node.inputs.image_base64 = imageDataToUpload;
             } else {
               // If it was a URL, we need to fetch and convert
-              const res = await ctx.secureFetch(imageDataToUpload, { purpose: 'Fetch image for base64' });
+              const res = await ctx.secureFetch(imageDataToUpload, { purpose: 'Fetch image for base64', signal: ctx.abortSignal });
               const blob = await res.blob();
               const ab = await blob.arrayBuffer();
               const bytes = new Uint8Array(ab);
@@ -1102,7 +1155,8 @@ async function generate(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: workflow }),
-    purpose: 'ComfyUI video gen'
+    purpose: 'ComfyUI video gen',
+    signal: ctx.abortSignal,
   });
 
   if (!res.ok) {
@@ -1178,13 +1232,14 @@ async function save(
       }
       blob = new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
     } else if (videoUrl.startsWith('http')) {
-      const response = await ctx.secureFetch(videoUrl, { purpose: 'Download video for save' });
+      const response = await ctx.secureFetch(videoUrl, { purpose: 'Download video for save', signal: ctx.abortSignal });
       if (!response.ok) throw new Error(`Failed to fetch video: ${response.status}`);
       blob = await response.blob();
     } else {
       // Local path - just copy it
-      const ext = format || 'mp4';
-      const targetFilename = `${filename || 'video'}.${ext}`;
+      const ext = sanitizeVideoFormat(format, 'mp4');
+      const safeFilename = sanitizeVideoFilename(filename, 'video');
+      const targetFilename = `${safeFilename}.${ext}`;
       let targetPath = savePath;
       if (!targetPath || targetPath === '') {
         // Get downloads folder
@@ -1206,8 +1261,9 @@ async function save(
     }
 
     // Determine extension
-    const ext = format || 'mp4';
-    const targetFilename = `${filename || 'video'}.${ext}`;
+    const ext = sanitizeVideoFormat(format, 'mp4');
+    const safeFilename = sanitizeVideoFilename(filename, 'video');
+    const targetFilename = `${safeFilename}.${ext}`;
     let targetPath = savePath;
     if (!targetPath || targetPath === '') {
       const downloads = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_downloads_path');
@@ -1320,7 +1376,8 @@ async function extendVideos(
       const padDuration = targetDuration - currentDuration;
       ctx.log('info', `[ExtendVideos] Video ${i}: Extending by ${padDuration.toFixed(1)}s (freeze frame)`);
 
-      const outputPath = `${appDataDir}/output/${filename || 'extended'}_${i}_${Date.now()}.mp4`;
+      const safeFilename = sanitizeVideoFilename(filename, 'extended');
+      const outputPath = `${appDataDir}/output/${safeFilename}_${i}_${Date.now()}.mp4`;
 
       const args = [
         '-i', videoPath.replace(/\\/g, '/'),
@@ -1393,45 +1450,82 @@ async function appendVideos(
     const appDataDir = await ctx.tauri?.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
     if (!appDataDir) throw new Error('Could not get app data directory');
 
-    const outputPath = `${appDataDir}/output/${filename || 'appended'}_${Date.now()}.${format || 'mp4'}`;
+    const safeFilename = sanitizeVideoFilename(filename, 'appended');
+    const safeFormat = sanitizeVideoFormat(format, 'mp4');
+    const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.${safeFormat}`;
 
     // Create temp concat list file (use system temp dir which always exists)
     const tempDir = await ctx.tauri?.invoke<string>('plugin:oaiy-filesystem|get_temp_dir');
     if (!tempDir) throw new Error('Could not get temp directory');
-    const concatListPath = `${tempDir}/oaiy_concat_${Date.now()}.txt`;
+    const stamp = Date.now();
+    const concatListPath = `${tempDir}/oaiy_concat_${stamp}.txt`;
+    const tempFilesToClean: string[] = [concatListPath];
 
-    // Build concat file content - need to handle URLs vs local paths
-    // Each entry quoted as the list's format quotes (a `'` is `'\''`), a URL too: one written as it came let a
-    // quote or a line break in it (a run's input) add directives of its own to the list.
+    // Stage any remote http(s) inputs via policy-enforced ctx.secureFetch so FFmpeg
+    // never opens outbound/local-network sockets directly (-protocol_whitelist file).
     const videoEntries: string[] = [];
-    for (const video of validVideos) {
-      if (/[\u0000-\u001f]/.test(video)) throw new Error(`A video's path or address has a line break or control character in it: ${JSON.stringify(video)}`);
-      const local = video.startsWith('http://') || video.startsWith('https://') ? video : video.replace(/\\/g, '/');
-      videoEntries.push(`file '${local.replace(/'/g, "'\\''")}'`);
-    }
-
-    await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {
-      path: concatListPath,
-      content: videoEntries.join('\n'),
-      contentType: 'text',
-      createDirs: true
-    });
-
-    // Execute FFmpeg
-    const result = await ctx.tauri?.invoke<{ code: number; stdout: string; stderr: string }>(
-      'plugin:oaiy-filesystem|run_command',
-      {
-        command: 'ffmpeg',
-        args: ['-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file,http,https,tcp,tls',
-          '-i', concatListPath, '-c', 'copy', '-y', outputPath],
-        cwd: null
+    let result: { code: number; stdout: string; stderr: string } | undefined;
+    try {
+      for (let i = 0; i < validVideos.length; i++) {
+        const video = validVideos[i];
+        if (/[\u0000-\u001f]/.test(video)) {
+          throw new Error(`A video's path or address has a line break or control character in it: ${JSON.stringify(video)}`);
+        }
+        let localPath: string;
+        if (video.startsWith('http://') || video.startsWith('https://')) {
+          const resp = await ctx.secureFetch(video, {
+            purpose: 'Download video for append',
+            signal: ctx.abortSignal,
+          });
+          if (!resp.ok) {
+            throw new Error(`Failed to fetch video ${sanitizeUrlForLog(video)}: HTTP ${resp.status}`);
+          }
+          const bytes = new Uint8Array(await resp.arrayBuffer());
+          let bin = '';
+          for (let b = 0; b < bytes.length; b += 0x8000) {
+            bin += String.fromCharCode(...bytes.subarray(b, b + 0x8000));
+          }
+          const stagedPath = `${tempDir}/oaiy_concat_in_${stamp}_${i}.mp4`;
+          await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {
+            path: stagedPath,
+            content: btoa(bin),
+            contentType: 'base64',
+            createDirs: true,
+          });
+          tempFilesToClean.push(stagedPath);
+          localPath = stagedPath.replace(/\\/g, '/');
+        } else {
+          localPath = video.replace(/\\/g, '/');
+        }
+        videoEntries.push(`file '${localPath.replace(/'/g, "'\\''")}'`);
       }
-    );
 
-    // Cleanup temp file (best effort - don't fail if cleanup fails)
-    await ctx.tauri?.invoke('plugin:oaiy-filesystem|delete_file', { path: concatListPath }).catch((e) => {
-      ctx.log?.('info', `[VideoAppend] Cleanup failed for ${concatListPath}: ${e}`);
-    });
+      await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {
+        path: concatListPath,
+        content: videoEntries.join('\n'),
+        contentType: 'text',
+        createDirs: true,
+      });
+
+      // Execute FFmpeg restricted strictly to local files (no http/https/tcp/tls SSRF)
+      result = await ctx.tauri?.invoke<{ code: number; stdout: string; stderr: string }>(
+        'plugin:oaiy-filesystem|run_command',
+        {
+          command: 'ffmpeg',
+          args: [
+            '-f', 'concat', '-safe', '0', '-protocol_whitelist', 'file',
+            '-i', concatListPath, '-c', 'copy', '-y', outputPath,
+          ],
+          cwd: null,
+        }
+      );
+    } finally {
+      for (const tempPath of tempFilesToClean) {
+        await ctx.tauri?.invoke('plugin:oaiy-filesystem|delete_file', { path: tempPath }).catch((e) => {
+          ctx.log?.('info', `[VideoAppend] Cleanup failed for ${tempPath}: ${e}`);
+        });
+      }
+    }
 
     if (result?.code !== 0) {
       throw new Error(`FFmpeg concat failed: ${result?.stderr || 'Unknown error'}`);
@@ -1496,7 +1590,8 @@ async function mixAudio(
     const appDataDir = await ctx.tauri?.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
     if (!appDataDir) throw new Error('Could not get app data directory');
 
-    const outputPath = `${appDataDir}/output/${filename || 'mixed'}_${Date.now()}.mp4`;
+    const safeFilename = sanitizeVideoFilename(filename, 'mixed');
+    const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.mp4`;
 
     let args: string[];
 
@@ -1849,7 +1944,7 @@ async function generateAvatar(
     ctx.log('info', `[VideoAvatar] Generating avatar video...`);
     ctx.log('info', `[VideoAvatar] Image: ${imagePath}`);
     ctx.log('info', `[VideoAvatar] Audio: ${audioPath}`);
-    ctx.log('info', `[VideoAvatar] API URL: ${apiUrl}`);
+    ctx.log('info', `[VideoAvatar] API URL: ${sanitizeUrlForLog(apiUrl)}`);
 
     // Check if Video Avatar service is running
     await checkServiceAvailable(apiUrl, 'Video Avatar');
@@ -1864,6 +1959,7 @@ async function generateAvatar(
         image_path: imagePath,
         audio_path: audioPath,
       }),
+      signal: ctx.abortSignal,
     });
 
     if (!response.ok) {
@@ -1963,9 +2059,19 @@ async function videoCaptions(
 
     const outputPath = `${appDataDir}/output/captioned_${Date.now()}.mp4`;
 
+    // Strictly validate numeric style parameters and FFmpeg colors to prevent
+    // drawtext filter injection via crafted color/size/margin/padding strings.
+    const rawMargin = Number(margin);
+    const effectiveMargin = Math.max(0, Math.min(500, Math.round(Number.isFinite(rawMargin) && rawMargin >= 0 ? rawMargin : 50)));
+    const rawFontSize = Number(fontSize);
+    const effectiveFontSize = Math.max(8, Math.min(256, Math.round(Number.isFinite(rawFontSize) && rawFontSize > 0 ? rawFontSize : 48)));
+    const rawPadding = Number(padding);
+    const effectivePadding = Math.max(0, Math.min(100, Math.round(Number.isFinite(rawPadding) && rawPadding >= 0 ? rawPadding : 15)));
+    const effectiveFontColor = sanitizeFfmpegColor(fontColor, 'white');
+    const effectiveBgColor = sanitizeFfmpegColor(backgroundColor, 'black@0.7');
+
     // Calculate Y position based on position setting
     let yExpr: string;
-    const effectiveMargin = margin || 50;
     switch (position) {
       case 'top':
         yExpr = String(effectiveMargin);
@@ -1979,30 +2085,16 @@ async function videoCaptions(
         break;
     }
 
-    // Build drawtext filters using textfile approach for each segment
-    // This avoids complex escaping issues with special characters
-    const effectiveFontSize = fontSize || 48;
-    const effectiveFontColor = fontColor || 'white';
-
-    // Use Comic Sans for a friendly picture book style (Windows path)
-    // Fall back to default if not found
-    const fontFile = 'C\\:/Windows/Fonts/comic.ttf';
-    const horizontalMargin = effectiveMargin; // Use same margin for horizontal padding
-    // Convert rgba() format to FFmpeg format (color@opacity)
-    let effectiveBgColor = backgroundColor || 'black@0.7';
-    const rgbaMatch = effectiveBgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (rgbaMatch) {
-      const r = parseInt(rgbaMatch[1]).toString(16).padStart(2, '0');
-      const g = parseInt(rgbaMatch[2]).toString(16).padStart(2, '0');
-      const b = parseInt(rgbaMatch[3]).toString(16).padStart(2, '0');
-      const a = rgbaMatch[4] ? parseFloat(rgbaMatch[4]) : 1;
-      effectiveBgColor = `0x${r}${g}${b}@${a}`;
-    }
-    const effectivePadding = padding || 15;
-
     // Get temp directory for text files
     const tempDir = await ctx.tauri?.invoke<string>('plugin:oaiy-filesystem|get_temp_dir');
     if (!tempDir) throw new Error('Could not get temp directory');
+
+    // Only specify Windows font path when running on Windows paths; otherwise let FFmpeg use default font
+    const isWindowsHost = /^[A-Za-z]:[\\/]/.test(appDataDir) || /^[A-Za-z]:[\\/]/.test(tempDir);
+    const fontFileOption = isWindowsHost ? `fontfile='C\\:/Windows/Fonts/comic.ttf':` : '';
+    const horizontalMargin = effectiveMargin; // Use same margin for horizontal padding
+    void yExpr;
+    void horizontalMargin;
 
     const textFiles: string[] = [];
     const drawtextFilters: string[] = [];
@@ -2032,98 +2124,86 @@ async function videoCaptions(
     // Max characters per line - keep it narrow for readability (40 chars max)
     const maxCharsPerLine = Math.max(25, Math.min(40, Math.floor(50 * 48 / effectiveFontSize)));
 
-    for (let i = 0; i < segments.length; i++) {
-      // Clean text - replace special chars with ASCII equivalents
-      let segmentText = segments[i].trim()
-        .replace(/[\r\n]+/g, ' ')
-        .replace(/—/g, '-')      // em-dash to hyphen
-        .replace(/–/g, '-')      // en-dash to hyphen
-        .replace(/'/g, "'")      // smart quotes
-        .replace(/'/g, "'")
-        .replace(/"/g, '"')
-        .replace(/"/g, '"')
-        .replace(/…/g, '...')    // ellipsis
-        .replace(/\[|\]/g, '');  // remove square brackets
+    let result: { code: number; stdout: string; stderr: string } | undefined;
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        // Clean and split into lines - render each line separately to avoid newline char issues
+        const cleanLines = wrapText(segments[i].trim().replace(/[\r\n]+/g, ' '), maxCharsPerLine)
+          .split('\n')
+          .map(line => line.trim().replace(/[^\x20-\x7E]/g, '')) // Only printable ASCII
+          .filter(line => line.length > 0);
 
-      // Wrap text to multiple lines for better fit
-      segmentText = wrapText(segmentText, maxCharsPerLine);
+        const { start: startTime, end: endTime } = segmentTimings[i];
+        const normalizedTempDir = tempDir.replace(/[\/\\]+$/, '');
+        const lineHeight = effectiveFontSize + 8; // Font size + small gap
 
-      // Clean and split into lines - render each line separately to avoid newline char issues
-      const cleanLines = wrapText(segments[i].trim().replace(/[\r\n]+/g, ' '), maxCharsPerLine)
-        .split('\n')
-        .map(line => line.trim().replace(/[^\x20-\x7E]/g, '')) // Only printable ASCII
-        .filter(line => line.length > 0);
+        // Create a separate drawtext filter for each line, stacked vertically
+        for (let lineIdx = 0; lineIdx < cleanLines.length; lineIdx++) {
+          const lineText = cleanLines[lineIdx];
+          const textFilePath = `${normalizedTempDir}/oaiy_caption_${Date.now()}_${i}_${lineIdx}.txt`;
 
-      const { start: startTime, end: endTime } = segmentTimings[i];
-      const normalizedTempDir = tempDir.replace(/[\/\\]+$/, '');
-      const lineHeight = effectiveFontSize + 8; // Font size + small gap
+          await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {
+            path: textFilePath,
+            content: lineText,
+            contentType: 'text',
+            createDirs: true
+          });
+          textFiles.push(textFilePath);
 
-      // Create a separate drawtext filter for each line, stacked vertically
-      for (let lineIdx = 0; lineIdx < cleanLines.length; lineIdx++) {
-        const lineText = cleanLines[lineIdx];
-        const textFilePath = `${normalizedTempDir}/oaiy_caption_${Date.now()}_${i}_${lineIdx}.txt`;
+          let ffmpegPath = textFilePath.replace(/\\/g, '/');
+          ffmpegPath = ffmpegPath.replace(/^([A-Za-z]):/, '$1\\:');
 
-        await ctx.tauri?.invoke('plugin:oaiy-filesystem|write_file', {
-          path: textFilePath,
-          content: lineText,
-          contentType: 'text',
-          createDirs: true
-        });
-        textFiles.push(textFilePath);
+          // Calculate Y position for this line (stack from bottom up)
+          const totalLines = cleanLines.length;
+          const lineOffset = (totalLines - 1 - lineIdx) * lineHeight;
+          let lineYExpr: string;
+          switch (position) {
+            case 'top':
+              lineYExpr = `${effectiveMargin + lineIdx * lineHeight}`;
+              break;
+            case 'center':
+              lineYExpr = `(h/2)-(${totalLines}*${lineHeight}/2)+(${lineIdx}*${lineHeight})`;
+              break;
+            case 'bottom':
+            default:
+              lineYExpr = `h-${effectiveMargin}-${lineOffset}-${effectiveFontSize}`;
+              break;
+          }
 
-        let ffmpegPath = textFilePath.replace(/\\/g, '/');
-        ffmpegPath = ffmpegPath.replace(/^([A-Za-z]):/, '$1\\:');
-
-        // Calculate Y position for this line (stack from bottom up)
-        const totalLines = cleanLines.length;
-        const lineOffset = (totalLines - 1 - lineIdx) * lineHeight;
-        let lineYExpr: string;
-        switch (position) {
-          case 'top':
-            lineYExpr = `${effectiveMargin + lineIdx * lineHeight}`;
-            break;
-          case 'center':
-            lineYExpr = `(h/2)-(${totalLines}*${lineHeight}/2)+(${lineIdx}*${lineHeight})`;
-            break;
-          case 'bottom':
-          default:
-            lineYExpr = `h-${effectiveMargin}-${lineOffset}-${effectiveFontSize}`;
-            break;
+          drawtextFilters.push(
+            `drawtext=textfile='${ffmpegPath}':` +
+            fontFileOption +
+            `fontsize=${effectiveFontSize}:fontcolor=${effectiveFontColor}:` +
+            `x=(w-text_w)/2:y=${lineYExpr}:` +
+            `box=1:boxcolor=${effectiveBgColor}:boxborderw=${effectivePadding}:` +
+            `enable='between(t,${startTime.toFixed(2)},${endTime.toFixed(2)})'`
+          );
         }
-
-        drawtextFilters.push(
-          `drawtext=textfile='${ffmpegPath}':` +
-          `fontfile='${fontFile}':` +
-          `fontsize=${effectiveFontSize}:fontcolor=${effectiveFontColor}:` +
-          `x=(w-text_w)/2:y=${lineYExpr}:` +
-          `box=1:boxcolor=${effectiveBgColor}:boxborderw=${effectivePadding}:` +
-          `enable='between(t,${startTime.toFixed(2)},${endTime.toFixed(2)})'`
-        );
       }
-    }
 
-    // Combine all drawtext filters
-    const filterComplex = drawtextFilters.join(',');
+      // Combine all drawtext filters
+      const filterComplex = drawtextFilters.join(',');
 
-    const args = [
-      '-i', videoPath,
-      '-vf', filterComplex,
-      '-c:a', 'copy',
-      '-y', outputPath
-    ];
+      const args = [
+        '-i', videoPath,
+        '-vf', filterComplex,
+        '-c:a', 'copy',
+        '-y', outputPath
+      ];
 
-    ctx.log('info', `[VideoCaptions] Running FFmpeg with ${drawtextFilters.length} text segments`);
+      ctx.log('info', `[VideoCaptions] Running FFmpeg with ${drawtextFilters.length} text segments`);
 
-    const result = await ctx.tauri?.invoke<{ code: number; stdout: string; stderr: string }>(
-      'plugin:oaiy-filesystem|run_command',
-      { command: 'ffmpeg', args, cwd: null }
-    );
-
-    // Cleanup temp text files (best effort - don't fail if cleanup fails)
-    for (const tf of textFiles) {
-      await ctx.tauri?.invoke('plugin:oaiy-filesystem|delete_file', { path: tf }).catch((e) => {
-        ctx.log?.('info', `[VideoCaptions] Cleanup failed for ${tf}: ${e}`);
-      });
+      result = await ctx.tauri?.invoke<{ code: number; stdout: string; stderr: string }>(
+        'plugin:oaiy-filesystem|run_command',
+        { command: 'ffmpeg', args, cwd: null }
+      );
+    } finally {
+      // Cleanup temp text files (best effort - don't fail if cleanup fails)
+      for (const tf of textFiles) {
+        await ctx.tauri?.invoke('plugin:oaiy-filesystem|delete_file', { path: tf }).catch((e) => {
+          ctx.log?.('info', `[VideoCaptions] Cleanup failed for ${tf}: ${e}`);
+        });
+      }
     }
 
     if (result?.code !== 0) {
@@ -2166,8 +2246,8 @@ async function downloadVideo(
       throw new Error('No URL provided');
     }
 
-    ctx.log('info', `[VideoDownloader] Downloading (${mode}): ${url}`);
-    ctx.log('info', `[VideoDownloader] API URL: ${apiUrl}`);
+    ctx.log('info', `[VideoDownloader] Downloading (${mode}): ${sanitizeUrlForLog(url)}`);
+    ctx.log('info', `[VideoDownloader] API URL: ${sanitizeUrlForLog(apiUrl)}`);
     ctx.log('info', `[VideoDownloader] Quality: ${quality}, Time: ${start}s - ${end ?? 'end'}`);
 
     // Check if service is running (auto-starts if needed)
@@ -2188,6 +2268,7 @@ async function downloadVideo(
           end,
           quality,
         }),
+        signal: ctx.abortSignal,
       });
     } catch (fetchError) {
       // Network error - service not running

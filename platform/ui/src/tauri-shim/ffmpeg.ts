@@ -388,25 +388,38 @@ export interface VfsBridge {
  * so the calling runtime sees the same failure shape as the desktop
  * sidecar (which would set code = exit code on failure).
  */
+// Promise-queue mutex serializing all operations against the singleton ffmpeg.wasm
+// instance + its shared MEMFS/WORKERFS filesystem (prevents concurrent exec / log
+// listener interleaving and MEMFS file collisions).
+let ffmpegQueue: Promise<void> = Promise.resolve();
+function withFFmpegLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = ffmpegQueue;
+  let release!: () => void;
+  ffmpegQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return prev.then(fn).finally(() => release());
+}
+
 export async function runFFmpegCommand(
   command: 'ffmpeg' | 'ffprobe',
   args: string[],
   vfs: VfsBridge,
 ): Promise<RunCommandResult> {
   // ffprobe support — ffmpeg.wasm doesn't ship ffprobe as a separate
-  // binary. For the small number of probe queries the runtimes do (mainly
-  // "get duration"), we re-implement using `ffmpeg -i <file>` which writes
-  // the same metadata to stderr, then parse out the requested field.
-  //
-  // The audio_fade node is the only current ffprobe caller and it asks
-  // for `format=duration`. Implementing the general -show_entries query
-  // language inside the shim is overkill; we recognise the duration query
-  // specifically and synthesise stdout. Extend this switch as new probe
-  // patterns appear.
+  // binary. Keep outside withFFmpegLock because runFfprobeShim delegates to
+  // runFFmpegCommand('ffmpeg', ...) which acquires the lock itself.
   if (command === 'ffprobe') {
     return runFfprobeShim(args, vfs);
   }
 
+  return withFFmpegLock(() => runFFmpegCommandLocked(args, vfs));
+}
+
+async function runFFmpegCommandLocked(
+  args: string[],
+  vfs: VfsBridge,
+): Promise<RunCommandResult> {
   let ff: FFmpeg;
   try {
     ff = await getFFmpeg();
@@ -530,103 +543,103 @@ export async function runFFmpegCommand(
     return null;
   };
 
-  for (const path of inputs) {
-    const err = await stageFile(path);
-    if (err) return err;
-  }
-
-  // Rewrite args so any mounted-input path is swapped for the mount
-  // location. Done as a substring replace because the path can appear
-  // as a bare arg (`-i path`) OR embedded in a filter (`subtitles=path:…`).
-  const execArgs = args.map((a) => {
-    if (typeof a !== 'string') return a;
-    let out = a;
-    for (const [orig, mounted] of pathRewrites) {
-      if (out === orig) {
-        out = mounted;
-      } else if (out.includes(orig)) {
-        out = out.split(orig).join(mounted);
-      }
-    }
-    return out;
-  });
-
-  // Pre-create the parent directory tree for every output path.
-  // ffmpeg's output write errors with "No such file or directory" if
-  // the parent dir isn't present in MEMFS.
-  for (const out of outputs) {
-    await ensureParentDirs(ff, out);
-  }
-
-  // Capture ffmpeg's stderr (where it logs progress + diagnostics) so we
-  // can return it to the caller for nodes that grep it (e.g. duration
-  // parsing). The log listener already prints to console; here we just
-  // tee into a buffer for this run.
-  const stderrChunks: string[] = [];
-  const teeListener = ({ type, message }: { type: string; message: string }) => {
-    if (type === 'fferr' || type === 'stderr') stderrChunks.push(message);
-  };
-  ff.on('log', teeListener);
-
-  let code = 0;
-  let runError: unknown;
   try {
-    // exec returns 0 on success, non-zero on ffmpeg failure.
-    code = await ff.exec(execArgs);
-  } catch (e) {
-    runError = e;
-    code = -1;
-  } finally {
-    ff.off('log', teeListener);
-  }
+    for (const path of inputs) {
+      const err = await stageFile(path);
+      if (err) return err;
+    }
 
-  if (runError) {
-    const msg = runError instanceof Error ? runError.message : String(runError);
-    stderrChunks.push(`ffmpeg-shim: exec threw: ${msg}`);
-  }
-
-  // Read outputs back even on non-zero exit — some ffmpeg failures still
-  // produce a partial output we want to surface (or at least not lose
-  // silently).
-  if (code === 0) {
-    for (const path of outputs) {
-      try {
-        const data = await ff.readFile(memfsName(path));
-        if (data instanceof Uint8Array) {
-          vfs.writeBytes(path, data, guessContentType(path));
-        } else if (typeof data === 'string') {
-          // readFile with default 'binary' returns Uint8Array; in case
-          // someone switches it to 'utf8' in the future, handle that too.
-          const enc = new TextEncoder().encode(data);
-          vfs.writeBytes(path, enc, guessContentType(path));
+    // Rewrite args so any mounted-input path is swapped for the mount
+    // location. Done as a substring replace because the path can appear
+    // as a bare arg (`-i path`) OR embedded in a filter (`subtitles=path:…`).
+    const execArgs = args.map((a) => {
+      if (typeof a !== 'string') return a;
+      let out = a;
+      for (const [orig, mounted] of pathRewrites) {
+        if (out === orig) {
+          out = mounted;
+        } else if (out.includes(orig)) {
+          out = out.split(orig).join(mounted);
         }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        stderrChunks.push(`ffmpeg-shim: output not produced (${path}): ${msg}`);
-        code = code || -1;
+      }
+      return out;
+    });
+
+    // Pre-create the parent directory tree for every output path.
+    // ffmpeg's output write errors with "No such file or directory" if
+    // the parent dir isn't present in MEMFS.
+    for (const out of outputs) {
+      await ensureParentDirs(ff, out);
+    }
+
+    // Capture ffmpeg's stderr (where it logs progress + diagnostics) so we
+    // can return it to the caller for nodes that grep it (e.g. duration
+    // parsing). The log listener already prints to console; here we just
+    // tee into a buffer for this run.
+    const stderrChunks: string[] = [];
+    const teeListener = ({ type, message }: { type: string; message: string }) => {
+      if (type === 'fferr' || type === 'stderr') stderrChunks.push(message);
+    };
+    ff.on('log', teeListener);
+
+    let code = 0;
+    let runError: unknown;
+    try {
+      // exec returns 0 on success, non-zero on ffmpeg failure.
+      code = await ff.exec(execArgs);
+    } catch (e) {
+      runError = e;
+      code = -1;
+    } finally {
+      ff.off('log', teeListener);
+    }
+
+    if (runError) {
+      const msg = runError instanceof Error ? runError.message : String(runError);
+      stderrChunks.push(`ffmpeg-shim: exec threw: ${msg}`);
+    }
+
+    // Read outputs back even on non-zero exit — some ffmpeg failures still
+    // produce a partial output we want to surface (or at least not lose
+    // silently).
+    if (code === 0) {
+      for (const path of outputs) {
+        try {
+          const data = await ff.readFile(memfsName(path));
+          if (data instanceof Uint8Array) {
+            vfs.writeBytes(path, data, guessContentType(path));
+          } else if (typeof data === 'string') {
+            // readFile with default 'binary' returns Uint8Array; in case
+            // someone switches it to 'utf8' in the future, handle that too.
+            const enc = new TextEncoder().encode(data);
+            vfs.writeBytes(path, enc, guessContentType(path));
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          stderrChunks.push(`ffmpeg-shim: output not produced (${path}): ${msg}`);
+          code = code || -1;
+        }
       }
     }
-  }
 
-  // Best-effort cleanup so we don't accumulate MEMFS state across calls.
-  // Failures are non-fatal — files/dirs may already be gone (e.g. ffmpeg
-  // crashed mid-write) and surfacing those errors would mask the real
-  // exec failure above.
-  for (const path of [...stagedPaths, ...outputs]) {
-    try {
-      await ff.deleteFile(memfsName(path));
-    } catch {
-      // intentionally ignored
+    return { code, stdout: '', stderr: stderrChunks.join('') };
+  } finally {
+    // Best-effort cleanup so we don't accumulate MEMFS state across calls,
+    // including when input staging fails partway through.
+    for (const path of [...stagedPaths, ...outputs]) {
+      try {
+        await ff.deleteFile(memfsName(path));
+      } catch {
+        // intentionally ignored
+      }
+    }
+    // Unmount + remove the synthetic mount dirs from the WORKERFS inputs.
+    // Must unmount BEFORE deleteDir or Emscripten errors with EBUSY.
+    for (const dir of mountedDirs) {
+      try { await ff.unmount(dir); } catch { /* ignored */ }
+      try { await ff.deleteDir(dir); } catch { /* ignored */ }
     }
   }
-  // Unmount + remove the synthetic mount dirs from the WORKERFS inputs.
-  // Must unmount BEFORE deleteDir or Emscripten errors with EBUSY.
-  for (const dir of mountedDirs) {
-    try { await ff.unmount(dir); } catch { /* ignored */ }
-    try { await ff.deleteDir(dir); } catch { /* ignored */ }
-  }
-
-  return { code, stdout: '', stderr: stderrChunks.join('') };
 }
 
 /**
@@ -701,6 +714,14 @@ export interface ExtractFramesOptions {
  * downstream nodes can read it via plugin:oaiy-filesystem|read_file.
  */
 export async function extractVideoFrames(
+  sourcePath: string,
+  options: ExtractFramesOptions,
+  vfs: VfsBridge,
+): Promise<FrameInfo[]> {
+  return withFFmpegLock(() => extractVideoFramesLocked(sourcePath, options, vfs));
+}
+
+async function extractVideoFramesLocked(
   sourcePath: string,
   options: ExtractFramesOptions,
   vfs: VfsBridge,

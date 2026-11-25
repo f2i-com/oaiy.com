@@ -1080,6 +1080,15 @@ function pausedCampaign(data: Uint8Array): Uint8Array | null {
   campaign.waitingFor = '';
   // It was never approved on this computer: it is started by a person, and only then.
   campaign.approvedAt = 0;
+  // Nothing from a backup auto-posts into a conversation or auto-triggers a runner report.
+  if (isObject(campaign.report)) {
+    campaign.report.pending = false;
+  }
+  if (Array.isArray(campaign.lines)) {
+    for (const line of campaign.lines) {
+      if (isObject(line)) line.posted = true;
+    }
+  }
   return new TextEncoder().encode(JSON.stringify(campaign));
 }
 

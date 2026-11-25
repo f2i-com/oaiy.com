@@ -72,15 +72,70 @@ pub(crate) fn valid_plugin_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-/// Reject an archive entry whose path escapes the extraction root.
+/// Whether a single archive path segment is safe on every platform (including
+/// Windows): non-empty, not `.` / `..`, no separators / colons / control chars /
+/// Windows-illegal filename chars, no trailing dot or space (which Windows
+/// silently strips), and not a Windows reserved device name (`CON`, `PRN`,
+/// `AUX`, `NUL`, `COM0..9`, `LPT0..9`, etc., with or without extension).
+fn safe_member_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg == "." || seg == ".." {
+        return false;
+    }
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return false;
+    }
+    if seg.chars().any(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+    }) {
+        return false;
+    }
+    !crate::backup::container::is_reserved_device_name(seg.split('.').next().unwrap_or(seg))
+}
+
+/// Shared archive member-name validation across `.zip` and `.tar.gz`, run on
+/// the raw archive entry name before any platform-specific path parsing.
+fn safe_member_name(raw: &str, is_dir: bool) -> bool {
+    if raw.is_empty() || zip_name_is_rooted(raw) || raw.contains('\\') || raw.contains(':') {
+        return false;
+    }
+    if raw.chars().any(char::is_control) {
+        return false;
+    }
+    let trimmed = if is_dir {
+        raw.strip_suffix('/').unwrap_or(raw)
+    } else if raw.ends_with('/') {
+        return false;
+    } else {
+        raw
+    };
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.split('/').all(safe_member_segment)
+}
+
+/// Reject an archive entry whose path escapes the extraction root or contains
+/// Windows-unsafe segments.
 fn safe_relative(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && !path.to_string_lossy().contains(':')
-        && !path.to_string_lossy().split(['/', '\\']).any(|part| part == "..")
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return false;
+    }
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(os) => {
+                let Some(seg) = os.to_str() else {
+                    return false;
+                };
+                if !safe_member_segment(seg) {
+                    return false;
+                }
+                saw_normal = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_normal
 }
 
 /// Recursively copy `src` into `dst`, enforcing the size/entry caps.
@@ -128,16 +183,25 @@ fn extract_tar_gz(archive: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("{} is not a readable tar.gz: {e}", archive.display()))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("corrupt archive entry: {e}"))?;
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err("archive entry is not a regular file or directory".into());
+        }
+        let raw_name = {
+            let bytes = entry.path_bytes();
+            std::str::from_utf8(bytes.as_ref())
+                .map_err(|_| "archive entry name is not valid UTF-8".to_string())?
+                .to_string()
+        };
+        if !safe_member_name(&raw_name, kind.is_dir()) {
+            return Err(format!("archive entry {raw_name:?} escapes the package or uses an unsafe name"));
+        }
         let path = entry
             .path()
             .map_err(|e| format!("unreadable archive path: {e}"))?
             .into_owned();
         if !safe_relative(&path) {
             return Err(format!("archive entry {:?} escapes the package", path.display()));
-        }
-        let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
-            return Err(format!("archive entry {:?} is not a regular file or directory", path.display()));
         }
         count += 1;
         total = total.saturating_add(entry.size());
@@ -169,8 +233,12 @@ fn extract_zip(archive: &Path, dst: &Path) -> Result<(), String> {
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        if zip_name_is_rooted(&entry.name().map_err(|e| format!("invalid plugin ZIP: {e}"))?) {
-            return Err("ZIP path escapes the package".into());
+        let is_dir = entry.is_dir();
+        {
+            let raw_name = entry.name().map_err(|e| format!("invalid plugin ZIP: {e}"))?;
+            if zip_name_is_rooted(&raw_name) || !safe_member_name(&raw_name, is_dir) {
+                return Err("ZIP path escapes the package or uses an unsafe member name".into());
+            }
         }
         let relative = entry.enclosed_name().ok_or("ZIP path escapes the package")?;
         if !safe_relative(&relative) || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
@@ -313,6 +381,20 @@ pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustServic
     install_from_path_stopping(source, plugins_root, trust, |_| {})
 }
 
+/// Acquire the exclusive per-root install/uninstall lock so concurrent installs
+/// and uninstalls cannot race on a live bundle or its sibling data dir.
+fn acquire_install_lock(plugins_root: &Path) -> Result<std::fs::File, String> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(plugins_root.join(".install.lock"))
+        .map_err(|e| e.to_string())?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .map_err(|_| "another plugin installation is in progress".to_string())?;
+    Ok(lock)
+}
+
 /// [`install_from_path`], calling `stop` with the package's plugin id once it is staged and verified and before
 /// anything replaces the installed one: an archive's id is only known once it is unpacked, and a plugin left running
 /// from a folder taken away under it keeps its process (and the devices it holds) while a newer one shows as running.
@@ -326,12 +408,10 @@ pub fn install_from_path_stopping(source: &Path, plugins_root: &Path, trust: &Tr
 
     // Stage beside the destination (same volume, so the final swap is a rename).
     let staging = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
-    // Serialize installs sharing a destination root. Unique staging paths alone
-    // do not prevent two replacements from moving each other's live bundle.
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
-        .open(plugins_root.join(".install.lock")).map_err(|e| e.to_string())?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .map_err(|_| "another plugin installation is in progress".to_string())?;
+    // Serialize installs and uninstalls sharing a destination root. Unique
+    // staging paths alone do not prevent two replacements from moving each
+    // other's live bundle.
+    let _lock = acquire_install_lock(plugins_root)?;
 
     let result = (|| -> Result<Installed, String> {
         let mut budget = MAX_TOTAL_BYTES;
@@ -412,6 +492,10 @@ pub fn uninstall(id: &str, plugins_root: &Path) -> Result<(), String> {
     if !valid_plugin_id(id) {
         return Err(format!("invalid plugin id {id:?}"));
     }
+    if !plugins_root.is_dir() {
+        return Err(format!("no plugin {id:?} is installed"));
+    }
+    let _lock = acquire_install_lock(plugins_root)?;
     let dir = plugins_root.join(id);
     if !dir.exists() {
         return Err(format!("no plugin {id:?} is installed"));
@@ -843,6 +927,133 @@ mod tests {
             assert!(err.contains("does not exist"), "{source}: {err}");
         }
         assert!(!base.join("plugins").exists(), "nothing was even started");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn write_raw_tar_gz(archive: &Path, entries: &[(&str, tar::EntryType, &[u8])]) {
+        let file = std::fs::File::create(archive).unwrap();
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(enc);
+        for (name, kind, data) in entries {
+            let mut header = tar::Header::new_ustar();
+            let bytes = name.as_bytes();
+            assert!(bytes.len() < 100, "test entry name too long for ustar: {name:?}");
+            header.as_ustar_mut().unwrap().name[..bytes.len()].copy_from_slice(bytes);
+            header.set_size(data.len() as u64);
+            header.set_mode(if kind.is_dir() { 0o755 } else { 0o644 });
+            header.set_entry_type(*kind);
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn tar_gz_and_zip_share_windows_member_name_validation() {
+        use std::io::Write;
+        let base = tmp("archive-windows-parity");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let manifest = std::fs::read(src.join("manifest.json")).unwrap();
+        let exe = std::fs::read(src.join("x.exe")).unwrap();
+
+        let hostile = [
+            "CON",
+            "PRN",
+            "NUL",
+            "ui/aux.txt",
+            "COM1.exe",
+            "LPT9",
+            "con .txt",
+            "manifest.json.",
+            "manifest.json ",
+            "notes.txt:hidden",
+            "ui\\evil.txt",
+            "bad\x07name",
+            "../outside.txt",
+        ];
+
+        let tgz = base.join("plugin.tar.gz");
+        let zip_path = base.join("plugin.zip");
+        for bad in hostile {
+            assert!(!safe_member_name(bad, false), "safe_member_name accepted {bad:?}");
+
+            write_raw_tar_gz(
+                &tgz,
+                &[
+                    ("manifest.json", tar::EntryType::Regular, &manifest),
+                    ("x.exe", tar::EntryType::Regular, &exe),
+                    (bad, tar::EntryType::Regular, b"nope"),
+                ],
+            );
+            assert!(
+                install_from_path(&tgz, &root, &dev_trust(&base)).is_err(),
+                "tar.gz unpacked unsafe member {bad:?}"
+            );
+            assert!(!root.join("demo").exists(), "tar.gz left plugin after {bad:?}");
+
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            for (name, bytes) in [("manifest.json", &manifest), ("x.exe", &exe)] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.start_file(bad, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"nope").unwrap();
+            zip.finish().unwrap();
+            assert!(
+                install_from_path(&zip_path, &root, &dev_trust(&base)).is_err(),
+                "zip unpacked unsafe member {bad:?}"
+            );
+            assert!(!root.join("demo").exists(), "zip left plugin after {bad:?}");
+        }
+
+        // Valid .tar.gz with directory + nested file installs cleanly.
+        write_raw_tar_gz(
+            &tgz,
+            &[
+                ("manifest.json", tar::EntryType::Regular, &manifest),
+                ("x.exe", tar::EntryType::Regular, &exe),
+                ("ui/", tar::EntryType::Directory, b""),
+                ("ui/app.js", tar::EntryType::Regular, b"console.log('ok');"),
+            ],
+        );
+        let out = install_from_path(&tgz, &root, &dev_trust(&base)).unwrap();
+        assert_eq!(out.id, "demo");
+        assert!(root.join("demo/ui/app.js").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstall_acquires_exclusive_install_lock() {
+        let base = tmp("uninstall-lock");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        install_from_path(&src, &root, &dev_trust(&base)).unwrap();
+
+        let data = super::super::runner::plugin_data_dir(&root.join("demo"));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state.json"), b"{}").unwrap();
+
+        // While another install holds .install.lock, uninstall must fail and preserve both dirs.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(".install.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+
+        let err = uninstall("demo", &root).unwrap_err();
+        assert!(err.contains("in progress"), "{err}");
+        assert!(root.join("demo/manifest.json").is_file(), "bundle must stay while locked");
+        assert!(data.join("state.json").is_file(), "data dir must stay while locked");
+
+        drop(held);
+        uninstall("demo", &root).unwrap();
+        assert!(!root.join("demo").exists());
+        assert!(!data.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

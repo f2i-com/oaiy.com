@@ -294,7 +294,7 @@ export class Desktop {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) return;
-      buffer += value.replace(/\r\n/g, '\n');
+      buffer = (buffer + value).replace(/\r\n/g, '\n');
       let end: number;
       while ((end = buffer.indexOf('\n\n')) >= 0) {
         const block = buffer.slice(0, end);
@@ -505,11 +505,19 @@ export class Desktop {
     try {
       while (!RUN_ENDED.has(String(run.status ?? '')) && Date.now() < deadline) {
         await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(resolve, pollMs);
-          signal?.addEventListener('abort', () => {
-            clearTimeout(timer);
+          if (signal?.aborted) {
             reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-          }, { once: true });
+            return;
+          }
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          };
+          const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+          }, pollMs);
+          signal?.addEventListener('abort', onAbort, { once: true });
         });
         const now = await reply(await fetch(`${this.origin}/api/bridge/runs/${encodeURIComponent(id)}`, { headers: this.headers(), signal }));
         if (isRecord(now)) run = now;

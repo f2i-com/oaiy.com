@@ -235,22 +235,29 @@ export class OaiyBridgeClient {
    * parsed. Every other method assumes this passed.
    */
   async health(): Promise<Health> {
-    const body = await this.get<Health>('/api/health', { open: true });
-    if (body.product !== PRODUCT) {
+    const body = await this.get<unknown>('/api/health', { open: true, omitAuth: true });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new BridgeError(
+        'wrong_product',
+        `expected ${PRODUCT} at ${this.base}, but it returned ${JSON.stringify(body)}`,
+      );
+    }
+    const h = body as Partial<Health>;
+    if (h.product !== PRODUCT) {
       throw new BridgeError(
         'wrong_product',
         `expected ${PRODUCT} at ${this.base}, but it identifies as ${JSON.stringify(
-          body.product,
+          h.product,
         )}`,
       );
     }
-    if (majorOf(body.protocol) !== majorOf(PROTOCOL)) {
+    if (typeof h.protocol !== 'string' || majorOf(h.protocol) !== majorOf(PROTOCOL)) {
       throw new BridgeError(
         'protocol_mismatch',
-        `this client speaks ${PROTOCOL}; the runtime speaks ${body.protocol}`,
+        `this client speaks ${PROTOCOL}; the runtime speaks ${JSON.stringify(h.protocol)}`,
       );
     }
-    return body;
+    return h as Health;
   }
 
   /** A soft check: resolves false instead of throwing when OAIY is absent. */
@@ -403,11 +410,23 @@ export class OaiyBridgeClient {
     command: string,
     opts: { payload?: unknown; idempotencyKey?: string } = {},
   ): Promise<unknown> {
-    const r = await this.send<{ ok: boolean; result?: unknown }>(
+    const r = await this.send<{
+      ok?: boolean;
+      result?: unknown;
+      error?: { code?: string; message?: string; detail?: string };
+    }>(
       'POST',
       `/api/bridge/connectors/${encodeURIComponent(connectorId)}/request`,
       { command, payload: opts.payload, idempotencyKey: opts.idempotencyKey },
     );
+    if (!r || typeof r !== 'object' || r.ok !== true) {
+      const err = r && typeof r === 'object' ? r.error : undefined;
+      throw new BridgeError(
+        (err?.code as BridgeErrorCode) ?? 'internal',
+        err?.message ?? `connector ${connectorId} command ${command} failed`,
+        { detail: err?.detail },
+      );
+    }
     return r.result;
   }
 
@@ -443,7 +462,7 @@ export class OaiyBridgeClient {
 
   // --- transport ----------------------------------------------------------
 
-  private async get<T>(path: string, o: { open?: boolean } = {}): Promise<T> {
+  private async get<T>(path: string, o: { open?: boolean; omitAuth?: boolean } = {}): Promise<T> {
     return this.request<T>('GET', path, undefined, o);
   }
 
@@ -460,18 +479,19 @@ export class OaiyBridgeClient {
     method: string,
     path: string,
     body: unknown,
-    o: { open?: boolean; timeoutMs?: number } = {},
+    o: { open?: boolean; omitAuth?: boolean; timeoutMs?: number } = {},
   ): Promise<T> {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    // The bearer is sent on every request, not just exec ones: a restricted
-    // READ (events, runs) needs it too from a non-browser client. Harmless on
-    // an open route.
-    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    // The bearer is sent on authenticated routes (and restricted reads like
+    // events/runs), but omitted on the unverified /api/health handshake so a
+    // loopback port squatter can never steal it before identity is verified.
+    if (this.token && !o.omitAuth) headers['Authorization'] = `Bearer ${this.token}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), o.timeoutMs ?? this.requestTimeoutMs);
     let resp: Response;
+    let text: string;
     try {
       resp = await this.fetchImpl(`${this.base}${path}`, {
         method,
@@ -480,8 +500,10 @@ export class OaiyBridgeClient {
         // The API sets no Access-Control-Allow-Credentials, so a credentialed
         // request would fail the CORS check outright in a browser.
         credentials: 'omit',
+        redirect: 'error',
         signal: controller.signal,
       });
+      text = await resp.text();
     } catch (e) {
       throw new BridgeError(
         'unreachable',
@@ -492,7 +514,6 @@ export class OaiyBridgeClient {
       clearTimeout(timer);
     }
 
-    const text = await resp.text();
     const json = text ? safeJson(text) : undefined;
 
     if (!resp.ok) {
@@ -520,6 +541,7 @@ export function isTerminal(status: RunStatus): boolean {
 }
 
 function majorOf(protocol: string): string {
+  if (typeof protocol !== 'string') return '';
   // `oaiy-bridge/1` → `oaiy-bridge/1`; `oaiy-bridge/1.2` → `oaiy-bridge/1`.
   const [name, ver = ''] = protocol.split('/');
   return `${name}/${ver.split('.')[0]}`;
@@ -554,15 +576,16 @@ function nowMs(): number {
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }

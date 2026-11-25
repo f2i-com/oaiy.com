@@ -65,8 +65,8 @@ const CoreImageCompiler: ModuleCompiler = {
           const seed = data.seed === '' || data.seed == null || !Number.isFinite(Number(data.seed)) || Number(data.seed) < 0 ? null : Math.floor(Number(data.seed));
           code += `
   ${letOrAssign}${outputVar} = null;
-  let ${outputVar}_image = null;
-  let ${outputVar}_info = null;
+  ${letOrAssign}${outputVar}_image = null;
+  ${letOrAssign}${outputVar}_info = null;
   if (${promptInputVar} === null) {
     console.log("[Image Gen] (${node.id}) Skipped - prompt is null");
     workflow_context["${node.id}"] = null;
@@ -243,8 +243,8 @@ const CoreImageCompiler: ModuleCompiler = {
         // there and never redeclares.
         code += `
   ${letOrAssign}${outputVar} = null;
-  let ${outputVar}_image = null;
-  let ${outputVar}_info = null;
+  ${letOrAssign}${outputVar}_image = null;
+  ${letOrAssign}${outputVar}_info = null;
   if (${promptInputVar} === null) {
     console.log("[Image Gen] (${node.id}) Skipped - prompt is null");
     ${outputVar} = null;
@@ -318,7 +318,7 @@ const CoreImageCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variable for 'path' output handle
-  let ${outputVar}_path = ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
@@ -341,7 +341,7 @@ const CoreImageCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variable for 'image' output handle
-  let ${outputVar}_image = ${outputVar};
+  ${letOrAssign}${outputVar}_image = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }
@@ -366,7 +366,7 @@ const CoreImageCompiler: ModuleCompiler = {
     "${node.id}",
     ${JSON.stringify(kind === 'upscale' ? 'Upscale' : 'Remove Background')}
   );
-  let ${outputVar}_image = ${outputVar};
+  ${letOrAssign}${outputVar}_image = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;
       }

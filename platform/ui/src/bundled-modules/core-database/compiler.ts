@@ -61,10 +61,10 @@ const CoreDatabaseCompiler: ModuleCompiler = {
       // Use collectionName property (with fallback for backwards compatibility)
       const collection = escapeString(String(data.collectionName || data.collection_name || 'default'));
 
-      // If filter is connected via input, use that; otherwise use the property
+      // If filter is connected via input, avoid double-stringifying an already-JSON string
       let filterVar: string;
       if (filterInput) {
-        filterVar = `JSON.stringify(${filterInput} || {})`;
+        filterVar = `(typeof ${filterInput} === "string" ? ${filterInput} : JSON.stringify(${filterInput} || {}))`;
       } else {
         filterVar = `"${filterJson}"`;
       }

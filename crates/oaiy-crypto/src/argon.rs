@@ -81,7 +81,9 @@ pub fn argon2id13_into(password: &[u8], salt: &[u8], ops: u64, mem_bytes: u64, o
 /// The same, with parameters already checked.
 pub fn derive(password: &[u8], salt: &[u8; SALT_LEN], params: Params) -> Result<Secret<32>, Error> {
     let mut out = Secret::<32>::zeroed();
-    derive_into(password, salt, params, &mut out)?;
+    let result = derive_into(password, salt, params, &mut out);
+    scrub_stack();
+    result?;
     Ok(out)
 }
 

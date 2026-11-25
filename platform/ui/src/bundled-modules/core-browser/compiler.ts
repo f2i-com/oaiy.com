@@ -153,14 +153,14 @@ const CoreBrowserCompiler: ModuleCompiler = {
   // Multi-output: emit suffixed variables for both handles ("session", "result").
   // Suffixed vars are always fresh declarations; the unsuffixed primary
   // respects letOrAssign so macros that pre-declare it don't double-declare.
-  let ${outputVar}_result = {
+  ${letOrAssign}${outputVar}_result = {
     url: _url_${sanitizedId},
     title: _title_${sanitizedId},
     html: _html_${sanitizedId},
     status: _status_${sanitizedId},
     text: _text_${sanitizedId},
   };
-  let ${outputVar}_session = _session_${sanitizedId};
+  ${letOrAssign}${outputVar}_session = _session_${sanitizedId};
   ${letOrAssign}${outputVar} = ${outputVar}_session;
   workflow_context["${node.id}"] = ${outputVar}_result;`;
         break;
@@ -324,8 +324,8 @@ const CoreBrowserCompiler: ModuleCompiler = {
     throw new Error("[browser_action:${action}] no session connected");
   }
   let _mode_${sanitizedId} = _session_${sanitizedId}.mode || "chromium";
-  let ${outputVar}_session = _session_${sanitizedId};
-  let ${outputVar}_result = null;
+  ${letOrAssign}${outputVar}_session = _session_${sanitizedId};
+  ${letOrAssign}${outputVar}_result = null;
   ${letOrAssign}${outputVar} = ${outputVar}_session;`;
 
         if (action === 'click') {

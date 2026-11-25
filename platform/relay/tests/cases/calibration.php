@@ -309,3 +309,22 @@ test('4.18.7 stream-probe: a phone is 403 and an anonymous client 401, and neith
     not_contains('keepalive', $res['body']);
     eq(401, $srv->request('GET', '/v1/admin/stream-probe')['status']);
 });
+
+test('4.18.7 stream-probe: counts as an admin hold (released when done) and enforces the admin hold time budget', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $srv = $r->serve();
+    $pend = $srv->begin('GET', '/v1/admin/stream-probe', ['Authorization' => 'Bearer ' . $d->token]);
+    usleep(600000);
+    eq(1, $r->ctx()->holds->byKind()['admin'], 'stream-probe holds an admin marker while running');
+    $res = $pend->finish(10);
+    eq(200, $res['status']);
+    eq(0, $r->ctx()->holds->liveCount(), 'marker released once stream-probe finishes');
+    // Exhaust the 600s admin hold budget (199 * 3 = 597s already used, plus 3s above = 600s).
+    $ctx = $r->ctx();
+    $p = $ctx->auth->device(new Oaiy\Relay\Request('GET', '/v1/admin/stream-probe', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $d->token], '', null));
+    Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 597);
+    $refused = $r->call($d, 'GET', '/v1/admin/stream-probe');
+    eq([429, 'rate_limited'], [$refused['status'], $refused['json']['error']['code'] ?? '']);
+    eq(0, $r->ctx()->holds->liveCount(), 'refused stream-probe left no marker');
+});

@@ -317,8 +317,12 @@ impl WgpuMoss {
                     if (f.out, f.input) != (mat.n, mat.k) {
                         candle_core::bail!("{p}: the distillation's factors are for a {}x{} matrix, not {}x{}", f.out, f.input, mat.n, mat.k);
                     }
-                    (rank, widest) = (rank.max(f.rank), widest.max(f.out));
-                    mat.lora.push((f16_vec(&gpu, &f.a, &p)?, f16_vec(&gpu, &f.b, &p)?, f.rank));
+                    if f.rank == 0 {
+                        return Ok(());
+                    }
+                    let (a_pad, b_pad, r) = crate::common::webgpu_weights::pad_lora_even_rank(&f.a, &f.b, f.out, f.input, f.rank);
+                    (rank, widest) = (rank.max(r), widest.max(f.out));
+                    mat.lora.push((f16_vec(&gpu, &a_pad, &p)?, f16_vec(&gpu, &b_pad, &p)?, r));
                     Ok(())
                 };
                 let mut take = |module: &str| d.factors(i, module);

@@ -240,7 +240,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--observer-vram-gb" => a.observer_vram_gb = num(val()?)?,
             "--observer-device" => a.observer_device = { let v = val()?; if v == "auto" { usize::MAX } else { num(v)? } },
             "--expert-trace" => a.expert_trace = Some(val()?.into()),
-            "--api-key" => a.api_key = Some(val()?),
+            "--api-key" => a.api_key = Some(val()?).filter(|k| !k.is_empty()),
             "--thinking" => a.thinking = true,
             "--effort" => a.effort = num(val()?)?.clamp(1, 100) as u32,
             "--max-tokens" => a.max_tokens = num(val()?)?.max(1),
@@ -322,6 +322,13 @@ mod tests {
         assert_eq!(a.mtp.iter().map(String::as_str).collect::<Vec<_>>(), ["other", "q"]);
         assert!(parse_args_from(["--model", "m"].into_iter().map(str::to_owned)).unwrap().mtp.is_empty());
         assert!(parse_args_from(["--model", "m", "--mtp"].into_iter().map(str::to_owned)).is_err());
+    }
+    #[test]
+    fn empty_api_key_is_treated_as_unset() {
+        let a = parse_args_from(["--model", "m", "--api-key", ""].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(a.api_key, None);
+        let b = parse_args_from(["--model", "m", "--api-key", "secret"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(b.api_key.as_deref(), Some("secret"));
     }
 }
 

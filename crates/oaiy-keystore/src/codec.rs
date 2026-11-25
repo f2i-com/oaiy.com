@@ -115,7 +115,7 @@ impl Codec for KeyfileCodec {
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&blob[8..40]);
         let len = u32::from_be_bytes([blob[40], blob[41], blob[42], blob[43]]) as usize;
-        if blob.len() != HEADER + len + CHECK {
+        if HEADER.checked_add(len).and_then(|n| n.checked_add(CHECK)) != Some(blob.len()) {
             return Err(KeyError::Corrupt("length"));
         }
         let value = &blob[HEADER..HEADER + len];
@@ -216,6 +216,16 @@ mod tests {
             little[40..44].reverse();
             assert_ne!(little, unhex(file));
             assert!(KeyfileCodec.open(&name, &little).is_err(), "a little-endian length was accepted");
+        }
+    }
+
+    #[test]
+    fn a_keyfile_with_an_overflowing_length_field_is_corrupt_not_a_panic() {
+        let name = Name::new("archive.writer").unwrap();
+        let mut blob = KeyfileCodec.seal(&name, b"secret").unwrap().to_vec();
+        for bad_len in [u32::MAX, u32::MAX - (HEADER as u32), u32::MAX - (HEADER as u32) - (CHECK as u32) + 1] {
+            blob[40..44].copy_from_slice(&bad_len.to_be_bytes());
+            assert!(matches!(KeyfileCodec.open(&name, &blob), Err(KeyError::Corrupt("length"))), "len {bad_len:#x}");
         }
     }
 }

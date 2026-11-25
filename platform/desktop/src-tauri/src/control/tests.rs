@@ -1706,3 +1706,229 @@ async fn mcp_enforces_control_project_and_forwards_principal_in_scoped_mode() {
     .await;
     assert!(is_error(&escalate_call["result"]), "Agent must not escalate to plugins.install: {escalate_call}");
 }
+
+#[tokio::test]
+async fn mcp_dispatch_restores_mcp_agent_and_relay_presets_while_blocking_dangerous_and_admin_routes() {
+    use crate::auth::clock::SystemClock;
+    use crate::auth::guard::{Guard, GuardConfig};
+    use crate::auth::mode::AccessMode;
+    use crate::auth::presets::{App, Preset, RelayTier};
+    use crate::auth::store::{AuthStore, MintSpec};
+    use crate::auth::token::Kind;
+
+    let sb = Sandbox::new("scoped-mcp-presets");
+    let control = Control::with_navigator(&sb.0, None);
+    let clock: Arc<dyn crate::auth::clock::Clock> = Arc::new(SystemClock);
+    let store = Arc::new(AuthStore::memory(clock.clone()));
+    let (cfg, _) = GuardConfig::from_env(&|_| None, false, true, 17972);
+    let guard = Arc::new(Guard::new(AccessMode::Scoped, cfg, store.clone(), None, None, clock));
+
+    let flows = Arc::new(crate::bridge::FlowStore::new(sb.0.join("flows")));
+    let desk_routes = Router::new()
+        // Routes exercised by `status`, `flows_list`, `services_list`, `flow_create`, `service_start`, `model_set_default`
+        .route("/api/control/settings", get(|| async { Json(json!({ "agentMayChange": true })) }))
+        .route("/api/engines", get(|| async { Json(json!({ "running": true, "llm": { "state": "ready" }, "gpus": [] })) }))
+        .route(
+            "/api/engines/defaults",
+            get(|| async { Json(json!({ "defaults": { "llm": "demo-llm" } })) })
+                .put(|| async { Json(json!({ "ok": true })) }),
+        )
+        .route("/api/services", get(|| async { Json(json!({ "services": [{ "id": "oaiy-voice", "status": "stopped", "installed": true }] })) }))
+        .route("/api/services/:id/start", axum::routing::post(|| async { Json(json!({ "ok": true })) }))
+        .route("/api/services/:id/uninstall", axum::routing::post(|| async { Json(json!({ "removed": 1 })) }))
+        .route("/api/plugins", get(|| async { Json(json!({ "plugins": [] })) }))
+        .route("/api/plugins/install", axum::routing::post(|| async { Json(json!({ "id": "evil", "name": "Evil", "version": "1.0.0" })) }))
+        .route("/api/setup", get(|| async { Json(json!({ "firstRun": { "finished": true }, "plugins": {} })) }))
+        .route("/api/modules", get(|| async { Json(json!({ "modules": [] })) }))
+        .route("/api/ai/codex/status", get(|| async { Json(json!({ "available": true, "connected": false })) }))
+        .route("/api/ai/codex/login", axum::routing::post(|| async { Json(json!({ "authUrl": "https://example.test/login" })) }))
+        .route(
+            "/api/agent/preferences",
+            get(|| async { Json(json!({ "model": { "source": "engine" } })) })
+                .put(|| async { Json(json!({ "model": { "source": "chatgpt" } })) }),
+        )
+        .route("/api/link", get(|| async { Json(json!({ "linked": false })) }))
+        .route("/api/calendar/sync", get(|| async { Json(json!({ "state": "idle" })) }))
+        .route("/api/network/status", get(|| async { Json(json!({ "enabled": true, "agentMaySetUp": true })) }))
+        .route("/api/network/settings", axum::routing::put(|| async { Json(json!({ "enabled": true })) }))
+        .route(
+            "/api/bridge/flows",
+            get({
+                let flows = flows.clone();
+                move || {
+                    let flows = flows.clone();
+                    async move {
+                        let list: Vec<Value> = flows
+                            .listed()
+                            .into_iter()
+                            .map(|f| json!({ "id": f.id, "name": f.name }))
+                            .collect();
+                        Json(json!({ "flows": list }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/bridge/flows/:id",
+            axum::routing::put({
+                let flows = flows.clone();
+                move |axum::extract::Path(id): axum::extract::Path<String>, Json(body): Json<Value>| {
+                    let flows = flows.clone();
+                    async move {
+                        let _ = flows.put(&id, &body.to_string());
+                        Json(json!({ "id": id }))
+                    }
+                }
+            }),
+        );
+
+    let g = guard.clone();
+    let app = desk_routes
+        .merge(
+            Router::new()
+                .route("/api/mcp", axum::routing::post(super::mcp::handle))
+                .with_state(control.clone()),
+        )
+        .layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let g = g.clone();
+            async move { g.handle(req, next).await }
+        }));
+    control.set_router(app.clone());
+
+    let loopback = |method: Method, uri: &str, headers: &[(&str, &str)], body: Option<String>| {
+        let app = app.clone();
+        let uri = uri.to_string();
+        let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        async move {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("Host", "127.0.0.1:17972")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50001))));
+            if body.is_some() {
+                req = req.header("content-type", "application/json");
+            }
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let response = app
+                .oneshot(req.body(body.map_or_else(Body::empty, Body::from)).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+
+    let mcp_call = |headers: &[(&str, &str)], name: &str, args: Value| {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        })
+        .to_string();
+        loopback(Method::POST, "/api/mcp", headers, Some(payload))
+    };
+
+    // --- 1. Preset::Mcp (holds ONLY control.read + control.project) ---
+    let mut mcp_spec = MintSpec::new(Kind::Pat, "external mcp", Preset::Mcp.scopes(), 60_000);
+    mcp_spec.preset = Some(Preset::Mcp);
+    let mcp = store.mint(mcp_spec).unwrap();
+    let mcp_auth = format!("Bearer {}", mcp.token);
+    let mcp_headers = [("Authorization", mcp_auth.as_str()), ("X-OAIY-Session", "project")];
+
+    // Direct REST call outside MCP must stay blocked (403 insufficient_scope).
+    let (direct_status, direct_body) = loopback(Method::GET, "/api/bridge/flows", &[("Authorization", mcp_auth.as_str())], None).await;
+    assert_eq!(direct_status, StatusCode::FORBIDDEN, "Preset::Mcp must not hit REST directly: {direct_body}");
+
+    // `status` hits 11 distinct read routes across engines/services/plugins/setup/ai/link/calendar.
+    let (st, res) = mcp_call(&mcp_headers, "status", json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert!(!is_error(&res["result"]), "Preset::Mcp status failed: {res}");
+    let sc = &res["result"]["structuredContent"];
+    for section in ["agentMayChange", "engines", "services", "plugins", "modules", "chatgpt", "agentModel", "link", "setup"] {
+        assert!(sc[section].get("error").is_none(), "Preset::Mcp status.{section} errored: {sc}");
+    }
+
+    // `flows_list`, `flow_create`, `service_start`, `model_set_default` all succeed.
+    let (_, res) = mcp_call(&mcp_headers, "flows_list", json!({})).await;
+    assert!(!is_error(&res["result"]), "Preset::Mcp flows_list: {res}");
+    let (_, res) = mcp_call(
+        &mcp_headers,
+        "flow_create",
+        json!({ "id": "mcp-flow", "flow": { "name": "MCP Flow", "nodes": [], "edges": [] } }),
+    )
+    .await;
+    assert!(!is_error(&res["result"]), "Preset::Mcp flow_create: {res}");
+    let (_, res) = mcp_call(&mcp_headers, "service_start", json!({ "id": "oaiy-voice" })).await;
+    assert!(!is_error(&res["result"]), "Preset::Mcp service_start: {res}");
+    let (_, res) = mcp_call(&mcp_headers, "model_set_default", json!({ "group": "llm", "model": "demo-llm" })).await;
+    assert!(!is_error(&res["result"]), "Preset::Mcp model_set_default: {res}");
+
+    // Dangerous, auth.*, and agent.settings routes MUST stay blocked for Preset::Mcp.
+    for (tool, args) in [
+        ("plugin_install", json!({ "source": "C:/evil" })),
+        ("service_uninstall", json!({ "id": "oaiy-voice" })),
+        ("chatgpt_sign_in", json!({})),
+        ("agent_model_set", json!({ "source": "chatgpt" })),
+        ("network_status", json!({})),
+        ("network_setup", json!({ "enabled": true })),
+    ] {
+        let (_, res) = mcp_call(&mcp_headers, tool, args).await;
+        assert!(is_error(&res["result"]), "Preset::Mcp must be blocked on {tool}: {res}");
+    }
+
+    // --- 2. Preset::Agent (webview desk token) ---
+    let mut agent_spec = MintSpec::new(Kind::Dsk, "agent webview", Preset::Agent.scopes(), 60_000);
+    agent_spec.preset = Some(Preset::Agent);
+    agent_spec.app = Some(App::Agent);
+    agent_spec.origins = vec!["http://oaiy.localhost".into()];
+    let agent = store.mint(agent_spec).unwrap();
+    let agent_auth = format!("Bearer {}", agent.token);
+    let agent_headers = [
+        ("Authorization", agent_auth.as_str()),
+        ("Origin", "http://oaiy.localhost"),
+        ("X-OAIY-Session", "project"),
+    ];
+
+    let (_, res) = mcp_call(&agent_headers, "status", json!({})).await;
+    assert!(!is_error(&res["result"]), "Preset::Agent status failed: {res}");
+    let sc = &res["result"]["structuredContent"];
+    for section in ["agentMayChange", "engines", "services", "plugins", "modules", "chatgpt", "agentModel", "link", "setup"] {
+        assert!(sc[section].get("error").is_none(), "Preset::Agent status.{section} errored: {sc}");
+    }
+    let (_, res) = mcp_call(&agent_headers, "flows_list", json!({})).await;
+    assert!(!is_error(&res["result"]), "Preset::Agent flows_list: {res}");
+    let (_, res) = mcp_call(&agent_headers, "service_start", json!({ "id": "oaiy-voice" })).await;
+    assert!(!is_error(&res["result"]), "Preset::Agent service_start: {res}");
+    for (tool, args) in [
+        ("plugin_install", json!({ "source": "C:/evil" })),
+        ("service_uninstall", json!({ "id": "oaiy-voice" })),
+        ("chatgpt_sign_in", json!({})),
+        ("agent_model_set", json!({ "source": "chatgpt" })),
+        ("network_status", json!({})),
+    ] {
+        let (_, res) = mcp_call(&agent_headers, tool, args).await;
+        assert!(is_error(&res["result"]), "Preset::Agent must be blocked on {tool}: {res}");
+    }
+
+    // --- 3. RelayTier::Read (control.read only, no control.project) ---
+    let relay_read = store
+        .mint(MintSpec::new(Kind::Pat, "relay read", RelayTier::Read.scopes(), 60_000))
+        .unwrap();
+    let relay_auth = format!("Bearer {}", relay_read.token);
+    let relay_headers = [("Authorization", relay_auth.as_str()), ("X-OAIY-Session", "project")];
+
+    let (_, res) = mcp_call(&relay_headers, "status", json!({})).await;
+    assert!(!is_error(&res["result"]), "RelayTier::Read status failed: {res}");
+    let sc = &res["result"]["structuredContent"];
+    for section in ["agentMayChange", "engines", "services", "plugins", "modules", "chatgpt", "agentModel", "link", "setup"] {
+        assert!(sc[section].get("error").is_none(), "RelayTier::Read status.{section} errored: {sc}");
+    }
+    let (_, res) = mcp_call(&relay_headers, "flows_list", json!({})).await;
+    assert!(!is_error(&res["result"]), "RelayTier::Read flows_list: {res}");
+    let (_, res) = mcp_call(&relay_headers, "service_start", json!({ "id": "oaiy-voice" })).await;
+    assert!(is_error(&res["result"]), "RelayTier::Read must not run mutating tools: {res}");
+}

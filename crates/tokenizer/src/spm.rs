@@ -28,11 +28,34 @@ use crate::Tokenizer;
 
 const SPM_SPACE: char = '▁';
 
+/// Maximum byte length of plain text merged as one piece (matching `bpe::MAX_PIECE`),
+/// so huge whitespace-free inputs cannot allocate unbounded merge structures.
+const MAX_PIECE: usize = 64 << 10;
+
+fn next_chunk(rest: &str) -> (&str, &str) {
+    if rest.len() <= MAX_PIECE {
+        return (rest, "");
+    }
+    let mut limit = MAX_PIECE;
+    while limit > 0 && !rest.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    let prefix = &rest[..limit];
+    // Prefer splitting right before a space so SentencePiece keeps `▁word` intact.
+    let split = prefix
+        .rfind(' ')
+        .filter(|&i| i > 0)
+        .or_else(|| prefix.rfind(char::is_whitespace).filter(|&i| i > 0))
+        .unwrap_or(limit);
+    rest.split_at(split)
+}
+
 pub fn encode(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     let mut prev_special = true;
+    let mut escaped = String::new();
     for (n, frag) in partition(text, tok.special_tokens()).into_iter().enumerate() {
         match frag {
             Frag::Special(id) => {
@@ -44,12 +67,19 @@ pub fn encode(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
                 if piece.is_empty() {
                     continue;
                 }
-                let mut escaped = String::with_capacity(piece.len() + 3);
-                if tok.add_space_prefix() && prev_special && (n == 0 || !tok.space_first_only()) {
-                    escaped.push(SPM_SPACE);
+                let mut rest = &*piece;
+                let mut first_chunk = true;
+                while !rest.is_empty() {
+                    let (chunk, tail) = next_chunk(rest);
+                    rest = tail;
+                    escaped.clear();
+                    if first_chunk && tok.add_space_prefix() && prev_special && (n == 0 || !tok.space_first_only()) {
+                        escaped.push(SPM_SPACE);
+                    }
+                    escaped.extend(chunk.chars().map(|c| if c == ' ' { SPM_SPACE } else { c }));
+                    merge(tok, &escaped, out)?;
+                    first_chunk = false;
                 }
-                escaped.extend(piece.chars().map(|c| if c == ' ' { SPM_SPACE } else { c }));
-                merge(tok, &escaped, out)?;
                 prev_special = false;
             }
         }
@@ -176,8 +206,13 @@ fn merge(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Result<()> {
         let (l, r) = (&syms[left], &syms[right]);
         let len = l.len + r.len;
         let priority = if by_rank {
-            let pair = (text[l.start..l.start + l.len].to_string(), text[r.start..r.start + r.len].to_string());
-            tok.merges_rank().get(&pair).map(|&rank| -(rank as f32))
+            let merged = &text[l.start..l.start + len];
+            if tok.id_of(merged).is_some_and(|id| tok.is_control(id)) {
+                None
+            } else {
+                let pair = (text[l.start..l.start + l.len].to_string(), text[r.start..r.start + r.len].to_string());
+                tok.merges_rank().get(&pair).map(|&rank| -(rank as f32))
+            }
         } else {
             // (a pair merges into any piece of the vocabulary, and `<`, `s`, `>` would make `<s>` of a message's text)
             tok.id_of(&text[l.start..l.start + len]).filter(|&id| !tok.is_control(id)).map(score)

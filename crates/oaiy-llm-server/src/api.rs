@@ -278,12 +278,32 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
 /// it, which browsers keep on loopback whatever DNS says) or a loopback address.
 fn loopback_name(host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
-    let name = match host.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(""),
-        None if host.parse::<std::net::IpAddr>().is_ok() => host.as_str(),
-        None => host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(name, _)| name),
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else { return false };
+        let port_ok = after.is_empty()
+            || after
+                .strip_prefix(':')
+                .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok());
+        return port_ok
+            && inner
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    }
+    let name = if host.parse::<std::net::IpAddr>().is_ok() {
+        host.as_str()
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok() => name,
+            Some(_) => return false,
+            None => host.as_str(),
+        }
     };
-    name == "localhost" || name.ends_with(".localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    name == "localhost"
+        || (name.ends_with(".localhost") && name.len() > ".localhost".len())
+        || name.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => v6.to_canonical().is_loopback(),
+        })
 }
 
 /// Whether an `Origin` is a page served from this computer's loopback.
@@ -315,6 +335,7 @@ fn gate(key: Option<&str>, loopback: bool, req: &Request) -> Option<Refusal> {
         return Some(Refusal::new(403, "this server answers to its loopback address only (localhost or 127.0.0.1)", "forbidden_host"));
     }
     let path = req.route();
+    let key = key.filter(|k| !k.is_empty());
     match key {
         None if req.header("origin").is_some_and(|o| !loopback_origin(o)) => Some(Refusal::new(
             403,
@@ -351,7 +372,7 @@ impl Server {
         if path == "/health" || path == "/" {
             return json_response(w, 200, &Json::obj([("status", Json::str("ok"))]));
         }
-        if let Some(key) = &self.api_key {
+        if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
             if !key_matches(req.header("authorization"), key) {
                 return error_response(w, &ApiError { status: 401, message: "missing or wrong API key".into(), code: "invalid_api_key" });
             }
@@ -599,13 +620,25 @@ impl Server {
             }
         }
         let Some(vc) = &a.cfg.vision else { return Err(no_vision()) };
+        let count = prompt.iter().filter(|&&t| t == image).count();
+        if count != records.len() {
+            return Err(bad(format!("found {count} image tokens but got {} images", records.len())));
+        }
+        let mut total_tokens = prompt.len();
         let mut preps = Vec::with_capacity(records.len());
         let mut hashes = Vec::with_capacity(records.len());
         for (i, rec) in records.iter().enumerate() {
+            if total_tokens >= a.cfg.max_seq {
+                return Err(image_refusal(past_context(total_tokens, a.cfg.max_seq)));
+            }
             let bytes = vision::image_bytes(rec, self.local_images).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
             let turn = vision::decoding_turn().ok_or_else(|| ApiError { status: 503, message: "the server is busy decoding other pictures: try again shortly".into(), code: "busy" })?;
             let prep = vision::load_image(&bytes, vc).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
             drop(turn);
+            total_tokens = total_tokens.saturating_add(prep.n_tokens().saturating_sub(1));
+            if total_tokens >= a.cfg.max_seq {
+                return Err(image_refusal(past_context(total_tokens, a.cfg.max_seq)));
+            }
             let mut h = std::hash::DefaultHasher::new();
             std::hash::Hasher::write(&mut h, &bytes);
             hashes.push(std::hash::Hasher::finish(&h));
@@ -663,11 +696,17 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
     if count != records.len() {
         return Err("the pictures' markers in the prompt are not one a picture".into());
     }
+    if prompt.len() >= max_seq {
+        return Err(past_context(prompt.len(), max_seq));
+    }
     let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
     for id in prompt {
         if id != image_id {
             ids.push(id);
             continue;
+        }
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
@@ -678,6 +717,9 @@ pub(crate) fn gemma_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv
         images.push(JobImage { start: ids.len(), prep: crate::engines::job::ImagePrep::Gemma { pixels, tokens }, hash: crate::engines::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));
         ids.push(gv.close);
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
+        }
     }
     if ids.len() >= max_seq {
         return Err(past_context(ids.len(), max_seq));
@@ -693,11 +735,17 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
     if count != records.len() {
         return Err("the pictures' markers in the prompt are not one a picture".into());
     }
+    if prompt.len() >= max_seq {
+        return Err(past_context(prompt.len(), max_seq));
+    }
     let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
     for id in prompt {
         if id != image_id {
             ids.push(id);
             continue;
+        }
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local).map_err(|e| format!("image {i}: {e}"))?;
@@ -705,6 +753,9 @@ pub(crate) fn glm_images(records: &[Json], prompt: Vec<u32>, image_id: u32, gv: 
         let tokens = gv.shape.n_out_tokens(width / gv.shape.patch, height / gv.shape.patch);
         images.push(JobImage { start: ids.len(), prep: crate::engines::job::ImagePrep::Glm { pixels, width, height, tokens }, hash: crate::engines::disk::fnv(&bytes, 0) });
         ids.extend(std::iter::repeat_n(image_id, tokens));
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
+        }
     }
     if ids.len() >= max_seq {
         return Err(past_context(ids.len(), max_seq));
@@ -727,11 +778,17 @@ pub(crate) fn inkling_images(
     if count != records.len() {
         return Err("the pictures' markers in the prompt are not one a picture".into());
     }
+    if prompt.len() >= max_seq {
+        return Err(past_context(prompt.len(), max_seq));
+    }
     let (mut ids, mut images, mut records) = (Vec::with_capacity(prompt.len()), Vec::new(), records.iter());
     for id in prompt {
         if id != image_id {
             ids.push(id);
             continue;
+        }
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
         }
         let i = images.len() + 1;
         let bytes = vision::image_bytes(records.next().expect("a record a marker"), local)
@@ -749,6 +806,9 @@ pub(crate) fn inkling_images(
             hash: crate::engines::disk::fnv(&bytes, 0),
         });
         ids.extend(std::iter::repeat_n(image_id, tokens));
+        if ids.len() >= max_seq {
+            return Err(past_context(ids.len(), max_seq));
+        }
     }
     if ids.len() >= max_seq {
         return Err(past_context(ids.len(), max_seq));
@@ -1463,16 +1523,57 @@ mod gate_tests {
 
     #[test]
     fn loopback_is_localhost_and_the_loopback_addresses_with_or_without_a_port() {
-        for host in ["localhost", "LOCALHOST:8000", "127.0.0.1", "127.0.0.1:8000", "[::1]:8000", "::1", "oaiy.localhost:80", "127.9.9.9"] {
+        for host in ["localhost", "LOCALHOST:8000", "127.0.0.1", "127.0.0.1:8000", "[::1]", "[::1]:8000", "[::ffff:127.0.0.1]:8000", "::1", "oaiy.localhost:80", "127.9.9.9"] {
             assert!(loopback_name(host), "{host}");
         }
-        for host in ["evil.example", "evil.example:8000", "192.168.1.4:8000", "localhost.evil.example", "[::2]:80", ""] {
+        for host in [
+            "evil.example",
+            "evil.example:8000",
+            "192.168.1.4:8000",
+            "localhost.evil.example",
+            "[::2]:80",
+            "[::1].evil.com",
+            "[::1].evil.com:8000",
+            "[127.0.0.1]evil.com",
+            "[127.0.0.1]",
+            "[localhost",
+            "[localhost]",
+            "[::1]:",
+            "[::1]:99999",
+            ".localhost",
+            "",
+        ] {
             assert!(!loopback_name(host), "{host}");
         }
-        assert!(loopback_origin("http://localhost:5173") && loopback_origin("https://127.0.0.1"));
-        for origin in ["null", "https://evil.example", "http://localhost.evil.example", "file://", "http://localhost/x", "chrome-extension://abc"] {
+        assert!(loopback_origin("http://localhost:5173") && loopback_origin("https://127.0.0.1") && loopback_origin("http://[::1]:8080"));
+        for origin in [
+            "null",
+            "https://evil.example",
+            "http://localhost.evil.example",
+            "http://[::1].evil.com",
+            "http://[127.0.0.1]evil.com",
+            "http://[localhost",
+            "file://",
+            "http://localhost/x",
+            "chrome-extension://abc",
+        ] {
             assert!(!loopback_origin(origin), "{origin}");
         }
+    }
+
+    #[test]
+    fn empty_api_key_behaves_like_no_key_in_gate() {
+        let page = req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8000"), ("Origin", "https://evil.example")]);
+        let r1 = gate(Some(""), true, &page).expect("refused");
+        assert_eq!(r1.status, 403);
+        assert!(r1.body.contains("forbidden_origin"));
+        let with_empty_bearer = req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8000"), ("Origin", "https://evil.example"), ("Authorization", "Bearer ")]);
+        let r2 = gate(Some(""), true, &with_empty_bearer).expect("refused");
+        assert_eq!(r2.status, 403);
+        assert!(r2.body.contains("forbidden_origin"));
+        let mut opts = crate::Options::default();
+        opts.api_key = Some(String::new());
+        assert!(!opts.local_images_or_default(true));
     }
 
     #[test]
@@ -1660,6 +1761,12 @@ mod tests {
         let rec = Json::obj([("url", Json::Str(png.into()))]);
         let Err(e) = gemma_images(std::slice::from_ref(&rec), vec![1, 9], 9, &gv, false, 200) else { panic!("past the context") };
         assert!(e.contains("is 259 tokens, and the model's maximum context length is 200 tokens here"), "{e}");
+        assert_eq!(image_refusal(e).code, "context_length_exceeded");
+        // Multimodal DoS: once the first image crosses `max_seq`, later images are not decoded at all.
+        let broken = Json::obj([("url", Json::Str("data:image/png;base64,not-valid-base64!!!".into()))]);
+        let Err(e) = gemma_images(&[rec.clone(), broken.clone()], vec![1, 9, 9], 9, &gv, false, 200) else { panic!("past the context") };
+        assert_eq!(image_refusal(e).code, "context_length_exceeded");
+        let Err(e) = gemma_images(&[broken], vec![1, 1, 9], 9, &gv, false, 3) else { panic!("past the context before decode") };
         assert_eq!(image_refusal(e).code, "context_length_exceeded");
         // Qwen's, before a picture is read: one of 24 x 24 tokens (768 pixels, patches of 16 merged two by two)
         let cfg = crate::llm::MmProjConfig {

@@ -322,12 +322,13 @@ const CoreFilesystemCompiler: ModuleCompiler = {
       }
 
       case 'text_chunker': {
-        // Guard chunkSize >= 1 and clamp overlap <= chunkSize - 1 so the raw
-        // chunking loop's _pos always advances (avoids an infinite loop when
-        // overlap >= chunkSize). These clamped values also feed
-        // FileSystem.calculateFileChunks below.
-        const chunkSize = Math.max(1, Number(data.chunkSize) || 1000);
-        const overlap = Math.min(Number(data.overlap ?? 100), Math.max(0, chunkSize - 1));
+        // Guard chunkSize >= 1 and clamp overlap into [0, chunkSize - 1] with
+        // Number.isFinite so NaN / negative / huge values can never cause an
+        // infinite loop or invalid chunk bounds.
+        const rawChunkSize = Number(data.chunkSize);
+        const chunkSize = Math.max(1, Number.isFinite(rawChunkSize) && rawChunkSize > 0 ? Math.floor(rawChunkSize) : 1000);
+        const rawOverlap = Number(data.overlap ?? 100);
+        const overlap = Math.min(Math.max(0, Number.isFinite(rawOverlap) ? Math.floor(rawOverlap) : 0), Math.max(0, chunkSize - 1));
         const contentType = escapeString(String(data.contentType || 'auto'));
         const csvHasHeader = data.csvHasHeader !== false;
         const indexName = escapeString(String(data.indexName || 'default'));
@@ -339,44 +340,45 @@ const CoreFilesystemCompiler: ModuleCompiler = {
   let _content_type_${sanitizedId} = "${contentType}";
   let _is_file_ref_${sanitizedId} = false;
 
-  // Check if input is a file reference (from large file read)
+  // Check if input is a runtime-issued file reference (from large file read)
   if (typeof _input_${sanitizedId} === 'string' && _input_${sanitizedId}.indexOf('"__type":"file_ref"') >= 0) {
+    let _ref_${sanitizedId} = null;
     try {
-      let _ref_${sanitizedId} = JSON.parse(_input_${sanitizedId});
-      if (_ref_${sanitizedId}.__type === "file_ref" && _ref_${sanitizedId}.path) {
-        _is_file_ref_${sanitizedId} = true;
-        console.log("[TextChunker] Detected large file reference: " + _ref_${sanitizedId}.path + " (" + _ref_${sanitizedId}.size + " bytes)");
-
-        // Use streaming: calculate chunk boundaries then read each chunk
-        let _chunk_refs_${sanitizedId} = await FileSystem.calculateFileChunks(
-          _ref_${sanitizedId}.path,
-          ${chunkSize},
-          ${overlap},
-          "${node.id}"
-        );
-
-        // Read each chunk content
-        for (let _ci_${sanitizedId} = 0; _ci_${sanitizedId} < _chunk_refs_${sanitizedId}.length; _ci_${sanitizedId}++) {
-          let _cref_${sanitizedId} = _chunk_refs_${sanitizedId}[_ci_${sanitizedId}];
-          let _chunk_text_${sanitizedId} = await FileSystem.readChunkContent(
-            _cref_${sanitizedId}.path,
-            _cref_${sanitizedId}.start,
-            _cref_${sanitizedId}.length,
-            "text"
-          );
-          let _chunk_obj_${sanitizedId} = JSON.parse("{}");
-          _chunk_obj_${sanitizedId}.text = _chunk_text_${sanitizedId};
-          _chunk_obj_${sanitizedId}.index = _cref_${sanitizedId}.index;
-          _chunk_obj_${sanitizedId}.start = _cref_${sanitizedId}.start;
-          _chunk_obj_${sanitizedId}.end = _cref_${sanitizedId}.start + _cref_${sanitizedId}.length;
-          _chunk_obj_${sanitizedId}.documentId = "${indexName}_" + _cref_${sanitizedId}.index;
-          _chunk_obj_${sanitizedId}.total = _cref_${sanitizedId}.total;
-          _chunks_${sanitizedId}.push(_chunk_obj_${sanitizedId});
-        }
-        console.log("[TextChunker] Streamed " + _chunks_${sanitizedId}.length + " chunks from large file");
-      }
+      _ref_${sanitizedId} = JSON.parse(_input_${sanitizedId});
     } catch (_parse_err_${sanitizedId}) {
       console.log("[TextChunker] Not a valid file ref JSON, processing as text");
+    }
+    if (_ref_${sanitizedId} && _ref_${sanitizedId}.__type === "file_ref" && typeof _ref_${sanitizedId}.token === "string" && _ref_${sanitizedId}.token) {
+      _is_file_ref_${sanitizedId} = true;
+      console.log("[TextChunker] Detected large file reference: " + (_ref_${sanitizedId}.name || "file") + " (" + _ref_${sanitizedId}.size + " bytes)");
+
+      // Use streaming: calculate chunk boundaries via opaque token then read each chunk
+      let _chunk_refs_${sanitizedId} = await FileSystem.calculateFileChunks(
+        _ref_${sanitizedId}.token,
+        ${chunkSize},
+        ${overlap},
+        "${node.id}"
+      );
+
+      // Read each chunk content
+      for (let _ci_${sanitizedId} = 0; _ci_${sanitizedId} < _chunk_refs_${sanitizedId}.length; _ci_${sanitizedId}++) {
+        let _cref_${sanitizedId} = _chunk_refs_${sanitizedId}[_ci_${sanitizedId}];
+        let _chunk_text_${sanitizedId} = await FileSystem.readChunkContent(
+          _cref_${sanitizedId}.token,
+          _cref_${sanitizedId}.start,
+          _cref_${sanitizedId}.length,
+          "text"
+        );
+        let _chunk_obj_${sanitizedId} = JSON.parse("{}");
+        _chunk_obj_${sanitizedId}.text = _chunk_text_${sanitizedId};
+        _chunk_obj_${sanitizedId}.index = _cref_${sanitizedId}.index;
+        _chunk_obj_${sanitizedId}.start = _cref_${sanitizedId}.start;
+        _chunk_obj_${sanitizedId}.end = _cref_${sanitizedId}.start + _cref_${sanitizedId}.length;
+        _chunk_obj_${sanitizedId}.documentId = "${indexName}_" + _cref_${sanitizedId}.index;
+        _chunk_obj_${sanitizedId}.total = _cref_${sanitizedId}.total;
+        _chunks_${sanitizedId}.push(_chunk_obj_${sanitizedId});
+      }
+      console.log("[TextChunker] Streamed " + _chunks_${sanitizedId}.length + " chunks from large file");
     }
   }
 

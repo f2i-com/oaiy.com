@@ -1350,32 +1350,80 @@ impl Registry {
                 .any(|r| canonical_path_key(r) == t)
     }
 
-    /// True when `p` is EXACTLY a managed root OR a SHARED structural dir under the data dir
-    /// (`bin`/`venvs`/`services`/`templates`/`scripts`/`auth`/`plugins`/`flows`/`voices`/`python`/`node`).
-    /// Uninstall must refuse these: removing one would wipe EVERY service's files or OAIY's own
-    /// credentials/plugins/flows/runtimes, not just this service's. Paths strictly UNDER them
-    /// (e.g. `${dataDir}/venvs/<id>`) are fine — this is an equality check, so they pass through.
+    /// Defense-in-depth denylist: true when `p` IS or sits anywhere UNDER a sensitive
+    /// non-service subtree of `data_dir` (`t == dir || t.starts_with(dir + sep)`).
+    /// Ensures service `uninstall.paths` and `installedMarker` can never delete or overwrite
+    /// OAIY's credentials, plugins, flows, runtimes, backups, links, logs, personal data, or templates.
+    fn is_sensitive_non_service_subtree(&self, p: &Path) -> bool {
+        let t = canonical_path_key(p);
+        if t.is_empty() {
+            return true;
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        const SENSITIVE_SUBTREES: &[&str] = &[
+            "auth",
+            "plugins",
+            "plugin-data",
+            "flows",
+            "voices",
+            "python",
+            "node",
+            "ai",
+            "backup",
+            "link",
+            "relay",
+            "companion",
+            "logs",
+            "contacts",
+            "calendar",
+            "messages",
+            "ring",
+            "templates",
+            "scripts",
+        ];
+        SENSITIVE_SUBTREES.iter().any(|sub| {
+            let dir = canonical_path_key(&self.data_dir.join(sub));
+            !dir.is_empty() && (t == dir || t.starts_with(&format!("{dir}{sep}")))
+        })
+    }
+
+    /// Explicit allowlist of service-owned parent roots: true only when `p` is a strict
+    /// non-root descendant of `${dataDir}/bin/`, `${dataDir}/venvs/`, `${dataDir}/services/`,
+    /// or one of the configured `model_dirs` entries.
+    fn is_within_service_owned_root(&self, p: &Path) -> bool {
+        let t = canonical_path_key(p);
+        if t.is_empty() {
+            return false;
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        ["bin", "venvs", "services"]
+            .into_iter()
+            .map(|sub| self.data_dir.join(sub))
+            .chain(self.model_dirs.iter().cloned())
+            .any(|root| {
+                let r = canonical_path_key(&root);
+                !r.is_empty() && t.starts_with(&format!("{r}{sep}"))
+            })
+    }
+
+    /// True when `p` is a managed root, a shared service root (`bin`/`venvs`/`services`),
+    /// or inside any sensitive non-service subtree under `data_dir`.
     fn is_protected_uninstall_root(&self, p: &Path) -> bool {
-        if self.is_managed_root(p) {
+        if self.is_managed_root(p) || self.is_sensitive_non_service_subtree(p) {
             return true;
         }
         let t = canonical_path_key(p);
         !t.is_empty()
-            && [
-                "bin",
-                "venvs",
-                "services",
-                "templates",
-                "scripts",
-                "auth",
-                "plugins",
-                "flows",
-                "voices",
-                "python",
-                "node",
-            ]
-            .iter()
-            .any(|sub| canonical_path_key(&self.data_dir.join(sub)) == t)
+            && ["bin", "venvs", "services"]
+                .iter()
+                .any(|sub| canonical_path_key(&self.data_dir.join(sub)) == t)
+    }
+
+    /// True when `p` is permitted as a service `uninstall.paths` entry or `installedMarker`
+    /// target: strictly inside an allowlisted service-owned root AND outside every protected
+    /// root and sensitive non-service subtree.
+    fn is_allowed_service_artifact_path(&self, p: &Path) -> bool {
+        self.is_within_service_owned_root(p) && !self.is_protected_uninstall_root(p)
     }
 
     /// Remove the files/dirs a service's `uninstall` spec declares, so the user
@@ -1416,12 +1464,12 @@ impl Registry {
                 log::warn!("uninstall {id}: skipping invalid or out-of-root path: {resolved}");
                 continue;
             };
-            // Refuse a path that IS a managed root or a shared structural dir (${dataDir},
-            // ${modelsDir}, ${binDir}, ${dataDir}/venvs, ${dataDir}/auth, …). remove_dir_all
-            // on one of these would nuke every OTHER service's files / OAIY's own data — a
-            // hostile or buggy template's "Uninstall <ServiceX>" must only touch ServiceX's subtree.
-            if self.is_protected_uninstall_root(&canonical) {
-                log::warn!("uninstall {id}: refusing managed-root/structural path: {resolved}");
+            // Require the target to be a strict non-root descendant of an explicit service-owned
+            // root (`${dataDir}/bin/`, `${dataDir}/venvs/`, `${dataDir}/services/`, or a configured
+            // `model_dirs` entry) and outside every sensitive non-service subtree (`auth/`,
+            // `plugins/`, `backup/`, …).
+            if !self.is_allowed_service_artifact_path(&canonical) {
+                log::warn!("uninstall {id}: refusing non-service or protected path: {resolved}");
                 continue;
             }
             // Refuse a glob sitting DIRECTLY in a managed root or protected structural dir
@@ -1491,13 +1539,14 @@ impl Registry {
         bare_program_in(raw, own, &self.data_dir.join("bin"), later_program_dirs(exe_dir()))
     }
 
-    /// Validate and canonicalize an `installedMarker` string against managed roots.
-    /// Rejects UNC/network paths, `.`/`..` segments, symlink/junction escapes,
-    /// paths outside a managed root, and managed/protected root directories themselves.
+    /// Validate and canonicalize an `installedMarker` string against allowlisted service-owned roots.
+    /// Rejects UNC/network paths, `.`/`..` segments, symlink/junction escapes, paths outside
+    /// `${dataDir}/{bin,venvs,services}/` or `model_dirs`, protected root directories, and all
+    /// sensitive non-service subtrees (`auth/`, `plugins/`, `backup/`, …).
     fn resolve_install_marker(&self, raw_marker: &str, port: u16) -> Option<PathBuf> {
         let resolved = os_fix_path(substitute(raw_marker, &self.ctx(port)));
         let canon = self.normalize_managed_path(&resolved)?;
-        if self.is_protected_uninstall_root(&canon) {
+        if !self.is_allowed_service_artifact_path(&canon) {
             return None;
         }
         Some(canon)
@@ -2379,11 +2428,23 @@ impl Registry {
         // no marker) correctly stays not-installed even though its venv interpreter exists.
         for (port, marker) in mark_installed {
             let Some(resolved) = self.resolve_install_marker(&marker, port) else {
-                log::warn!("refusing to write invalid or out-of-root install marker: {marker}");
+                log::warn!("refusing to write invalid or non-service install marker: {marker}");
                 continue;
             };
             if let Some(parent) = resolved.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+            // Re-validate after creating parent directories so a symlink planted during install
+            // cannot steer the write outside the allowlisted service-owned roots.
+            let Some(resolved) = self.resolve_install_marker(&marker, port) else {
+                log::warn!("refusing to write install marker after parent creation: {marker}");
+                continue;
+            };
+            if std::fs::symlink_metadata(&resolved)
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                log::warn!("refusing to write install marker through symlink: {}", resolved.display());
+                continue;
             }
             if let Err(e) = std::fs::write(&resolved, "installed by oaiy\n") {
                 log::warn!("could not write install marker {}: {e}", resolved.display());
@@ -4741,6 +4802,158 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         .unwrap();
         assert!(reg.install_marker_path(&good, 19993).is_some());
         reg.add_template(good).expect("valid marker template accepted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_and_installed_marker_enforce_service_owned_allowlist_and_block_sensitive_subtrees() {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-service-subtree-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let models = dir.join("models");
+        for sub in [
+            "templates",
+            "auth",
+            "plugins/aokie",
+            "plugin-data/aokie",
+            "backup",
+            "flows",
+            "voices",
+            "python",
+            "node",
+            "ai",
+            "link",
+            "relay",
+            "companion",
+            "logs",
+            "contacts",
+            "calendar",
+            "messages",
+            "ring",
+            "scripts",
+            "bin",
+            "venvs/legit-svc",
+            "services/legit-svc",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::create_dir_all(models.join("legit-svc")).unwrap();
+        std::fs::write(dir.join("auth/owner.json"), b"secret").unwrap();
+        std::fs::write(dir.join("backup/x"), b"backup").unwrap();
+
+        let mut reg = Registry::empty(dir.clone(), models.clone());
+
+        let forbidden_targets = [
+            "${dataDir}/auth/owner.json",
+            "${dataDir}/plugins/aokie",
+            "${dataDir}/plugin-data/aokie/state.json",
+            "${dataDir}/backup/x",
+            "${dataDir}/flows/flow1.json",
+            "${dataDir}/voices/v.wav",
+            "${dataDir}/python/python.exe",
+            "${dataDir}/node/node.exe",
+            "${dataDir}/ai/providers.json",
+            "${dataDir}/link/account.json",
+            "${dataDir}/relay/state.json",
+            "${dataDir}/companion/pair.json",
+            "${dataDir}/logs/desktop.log",
+            "${dataDir}/contacts/c.json",
+            "${dataDir}/calendar/cal.json",
+            "${dataDir}/messages/m.json",
+            "${dataDir}/ring/settings.json",
+            "${dataDir}/templates/oaiy-voice.json",
+            "${dataDir}/scripts/install-playwright.ps1",
+            "${dataDir}/control-settings.json",
+            "${dataDir}/bin",
+            "${dataDir}/venvs",
+            "${dataDir}/services",
+            "${modelsDir}",
+        ];
+
+        // 1. begin_uninstall must filter out every forbidden target and keep only strict
+        //    descendants of bin/, venvs/, services/, and model_dirs.
+        let mut all_paths: Vec<&str> = forbidden_targets.to_vec();
+        all_paths.extend_from_slice(&[
+            "${dataDir}/bin/legit.exe",
+            "${dataDir}/venvs/legit-svc",
+            "${dataDir}/services/legit-svc",
+            "${modelsDir}/legit-svc",
+        ]);
+        let tpl: ServiceTemplate = serde_json::from_value(serde_json::json!({
+            "id": "subtree-test",
+            "name": "Subtree Test",
+            "description": "",
+            "category": "test",
+            "defaultPort": 19994,
+            "run": { "command": "legit.exe", "args": [] },
+            "uninstall": { "paths": all_paths }
+        }))
+        .unwrap();
+        reg.add_template(tpl).unwrap();
+        let resolved = reg.begin_uninstall("subtree-test").unwrap();
+        assert_eq!(
+            resolved.len(),
+            4,
+            "only strict descendants of bin/, venvs/, services/, model_dirs may pass; got {resolved:?}"
+        );
+        reg.finish_uninstall("subtree-test", 0);
+        assert!(dir.join("auth/owner.json").exists());
+        assert!(dir.join("plugins/aokie").exists());
+        assert!(dir.join("backup/x").exists());
+
+        // 2. installedMarker must reject every forbidden target in BOTH resolve_install_marker
+        //    and add_template.
+        for (i, marker) in forbidden_targets.iter().enumerate() {
+            let tpl: ServiceTemplate = serde_json::from_value(serde_json::json!({
+                "id": format!("bad-sub-marker-{i}"),
+                "name": "Bad",
+                "description": "",
+                "category": "test",
+                "defaultPort": 19995,
+                "installedMarker": marker,
+                "run": { "command": "bad.exe", "args": [] }
+            }))
+            .unwrap();
+            assert!(
+                reg.install_marker_path(&tpl, 19995).is_none(),
+                "installedMarker must reject {marker}"
+            );
+            assert!(
+                reg.add_template(tpl).is_err(),
+                "add_template must reject installedMarker {marker}"
+            );
+        }
+
+        // 3. Valid markers strictly inside each allowlisted service-owned root succeed.
+        for (i, ok_marker) in [
+            "${dataDir}/bin/legit/.oaiy-installed",
+            "${dataDir}/venvs/legit-svc/.oaiy-installed",
+            "${dataDir}/services/legit-svc/.oaiy-installed",
+            "${modelsDir}/legit-svc/.oaiy-installed",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let tpl: ServiceTemplate = serde_json::from_value(serde_json::json!({
+                "id": format!("ok-sub-marker-{i}"),
+                "name": "Ok",
+                "description": "",
+                "category": "test",
+                "defaultPort": 19996,
+                "installedMarker": ok_marker,
+                "run": { "command": "ok.exe", "args": [] }
+            }))
+            .unwrap();
+            assert!(
+                reg.install_marker_path(&tpl, 19996).is_some(),
+                "installedMarker must allow {ok_marker}"
+            );
+            reg.add_template(tpl).unwrap();
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

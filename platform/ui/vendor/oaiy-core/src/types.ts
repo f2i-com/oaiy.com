@@ -528,6 +528,11 @@ export interface Flow {
    * (`"oaiyRemote": true` in the desktop's document of it).
    */
   remote?: boolean;
+  /**
+   * Flow arrived from an untrusted source (shared link, imported project/flow).
+   * Executed under hardened sandbox restrictions with minimal permissions.
+   */
+  untrusted?: boolean;
 }
 
 /**

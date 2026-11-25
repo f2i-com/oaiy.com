@@ -276,23 +276,41 @@ impl ProfileStore for MemoryProfileStore {
     }
 }
 
+static ATOMIC_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Writes `bytes` to `path` so that a reader sees the old file or the new one and never half of either: a temporary file in the same directory, flushed to the device, then renamed
 /// over the target, and (where the platform lets a program do it: Unix) the directory flushed so that the rename itself survives a crash. On Windows `std` cannot flush a
 /// directory and the rename is `MoveFileEx` without write-through: a power cut right after it can leave the old file, which for a cursor is a re-delivery and loses nothing.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let dir = path.parent().ok_or_else(|| StoreError("no parent directory".into()))?;
-    fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let file_name = path.file_name().ok_or_else(|| StoreError("no file name".into()))?;
+    if !dir.as_os_str().is_empty() {
+        fs::create_dir_all(dir)?;
+    }
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".tmp.{}.{seq}", std::process::id()));
+    let tmp = if dir.as_os_str().is_empty() { PathBuf::from(tmp_name) } else { dir.join(tmp_name) };
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
-    sync_dir(dir)
+    sync_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
 }
 
 /// Flushes a directory so that a rename or a new file in it is on the device (Unix); nothing elsewhere (see [`write_atomic`]).
@@ -632,7 +650,11 @@ impl FilePollStore {
             Err(e) => return Err(e.into()),
         };
         for s in self.closed_segments()? {
-            total += fs::metadata(s)?.len();
+            match fs::metadata(s) {
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(total)
     }

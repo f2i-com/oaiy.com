@@ -32,6 +32,7 @@ import { createEngine } from '../engine/createEngine';
 import { untrustedWorkerFactory, zippSandboxEnabled } from '../lib/zippPrefs';
 import { useApiBridge, type ApiBridgeCallbacks } from '../hooks/useApiBridge';
 import { createLogger } from '../utils/logger';
+import { isSecretConstant } from '../utils/ProjectIO';
 import { pageHost } from '@oaiy/shared/capabilities/host';
 
 /**
@@ -199,7 +200,7 @@ export function JobQueueProvider({
   const secretConstantNames = useMemo(
     () =>
       new Set(
-        (constants || []).filter((c) => c.key && c.value && c.isSecret).map((c) => c.key),
+        (constants || []).filter((c) => c.key && c.value && isSecretConstant(c)).map((c) => c.key),
       ),
     [constants],
   );

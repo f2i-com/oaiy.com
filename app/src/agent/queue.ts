@@ -20,8 +20,14 @@ export class TaskQueue {
     return new Promise<T>((resolve, reject) => {
       const start = () => {
         this.running++;
-        onStart?.();
-        job()
+        let result: Promise<T>;
+        try {
+          onStart?.();
+          result = Promise.resolve(job());
+        } catch (error) {
+          result = Promise.reject(error);
+        }
+        result
           .then(resolve, reject)
           .finally(() => {
             this.running--;

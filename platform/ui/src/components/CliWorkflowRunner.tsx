@@ -81,13 +81,22 @@ export function CliWorkflowRunner({ onComplete }: CliWorkflowRunnerProps) {
 
         setStatus('running');
 
-        // Submit the workflow job
+        // Submit the workflow job. Packaged workflows (.oaiy) MUST run with a hardened
+        // package permission context (never undefined / trusted local privileges).
         const flowName = workflowPath!.split(/[/\\]/).pop() || 'CLI Workflow';
+        const packageContext = isPackage
+          ? {
+              packageId: `cli-package:${flowName}`,
+              grantedPermissions: ['network', 'constants:read'],
+              packageTrustLevel: 'untrusted' as const,
+            }
+          : undefined;
         const id = submitJob(
           'cli-run',
           { nodes: workflowData.nodes as never[], edges: workflowData.edges as never[] },
           inputValues,
-          flowName
+          flowName,
+          packageContext,
         );
 
         setJobId(id);

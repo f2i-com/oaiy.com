@@ -34,7 +34,7 @@ async function execute(
   // Check for abort before starting
   if (ctx.abortSignal?.aborted) {
     ctx.log('info', '[Database] Aborted by user before operation');
-    return { success: false, error: 'Operation aborted by user' };
+    return '__ABORT__' as unknown as DatabaseResult;
   }
 
   ctx.onNodeStatus?.(nodeId, 'running');
@@ -43,7 +43,7 @@ async function execute(
   if (!ctx.database) {
     ctx.onNodeStatus?.(nodeId, 'error');
     ctx.log('error', '[Database] Database not available in runtime context');
-    return { success: false, error: 'Database not available' };
+    throw new Error('Database not available');
   }
 
   // Parse query if provided

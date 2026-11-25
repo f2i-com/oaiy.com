@@ -89,6 +89,9 @@ pub trait Experts: std::fmt::Debug + Send + Sync {
 /// experts by logit (a tie to the lower index), softmax-weighted among themselves, then the shared expert (index
 /// `logits.len() - 1`) weighted by the sigmoid of its gate.
 pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
     let routed = logits.len() - 1;
     let k = top_k.min(routed);
     // the top k in one pass (a prompt routes each of its rows at every layer): the list kept by logit, a tie after the
@@ -102,9 +105,13 @@ pub fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
         top.insert(at, e);
         top.truncate(k);
     }
-    let max = logits[top[0]];
-    let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
-    let mut out: Vec<(usize, f32)> = top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect();
+    let mut out: Vec<(usize, f32)> = if let Some(&first) = top.first() {
+        let max = logits[first];
+        let sum: f32 = top.iter().map(|&e| (logits[e] - max).exp()).sum();
+        top.iter().map(|&e| (e, (logits[e] - max).exp() / sum)).collect()
+    } else {
+        Vec::with_capacity(1)
+    };
     out.push((routed, 1.0 / (1.0 + (-logits[routed]).exp())));
     out
 }
@@ -136,6 +143,9 @@ impl Routing {
 /// [`Routing::Sigmoid`]'s routing of one row: the top `top_k` by score plus bias (a tie to the lower index), their
 /// scores summed in that order.
 pub fn route_sigmoid(logits: &[f32], top_k: usize, bias: &[f32], scale: f32) -> Vec<(usize, f32)> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
     let routed = logits.len() - 1;
     assert_eq!(bias.len(), routed, "a selection bias for each of {routed} experts");
     let k = top_k.min(routed);
@@ -292,5 +302,24 @@ mod route_tests {
                 assert_eq!(got[got.len() - 1], n - 1, "the shared expert last");
             }
         }
+    }
+
+    #[test]
+    fn route_handles_empty_zero_topk_and_zero_routed() {
+        assert!(route(&[], 2).is_empty());
+        assert!(super::route_sigmoid(&[], 2, &[], 1.0).is_empty());
+
+        let only_shared = route(&[0.0], 4);
+        assert_eq!(only_shared.len(), 1);
+        assert_eq!(only_shared[0].0, 0);
+        assert!((only_shared[0].1 - 0.5).abs() < 1e-6);
+
+        let zero_k = route(&[1.0, 2.0, 0.0], 0);
+        assert_eq!(zero_k.len(), 1);
+        assert_eq!(zero_k[0].0, 2);
+        assert!((zero_k[0].1 - 0.5).abs() < 1e-6);
+
+        let sig_only_shared = super::route_sigmoid(&[1.0], 2, &[], 1.0);
+        assert_eq!(sig_only_shared, vec![(0, 0.0)]);
     }
 }

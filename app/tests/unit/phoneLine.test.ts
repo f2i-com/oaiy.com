@@ -85,7 +85,7 @@ describe('call backs and the line', () => {
     const dials: Array<Record<string, unknown>> = [];
     const desktop = { command: async (_c: string, command: string, payload: Record<string, unknown>) => void dials.push({ command, ...payload }) };
     const settings: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, callBack: true, callBackFilter: 'any' };
-    const callbacks = new Callbacks(project as never, () => settings, () => desktop as unknown as Desktop, () => true, async () => null, () => {}, async () => true, skip);
+    const callbacks = new Callbacks(project as never, () => settings, () => desktop as unknown as Desktop, () => true, async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }), () => {}, async () => true, skip);
     return { callbacks, dials, settings };
   }
 

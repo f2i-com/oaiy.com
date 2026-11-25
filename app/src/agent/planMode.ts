@@ -46,7 +46,7 @@ export function isToolBlockedInPlanMode(
 ): boolean {
   if (PLAN_MODE_RESTRICTED_TOOLS.has(name)) return true;
   if (sessionToolNames?.has(name)) return true;
-  if (name === 'softn_examples' && typeof input?.install_to === 'string' && input.install_to.trim().length > 0) {
+  if (name === 'softn_examples' && typeof input?.install_to === 'string') {
     return true;
   }
   if (name === 'preview_screenshot' && typeof input?.save_to === 'string' && input.save_to.trim().length > 0) {

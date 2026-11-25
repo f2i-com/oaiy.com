@@ -1081,6 +1081,7 @@ export class OAIYRuntime {
     'plugin:oaiy-filesystem|get_downloads_path',
     'plugin:oaiy-filesystem|list_folder',
     'plugin:oaiy-filesystem|read_file',
+    'plugin:oaiy-filesystem|calculate_file_chunks',
     'plugin:oaiy-filesystem|read_chunk_content',
     'plugin:oaiy-filesystem|write_file',
     'plugin:oaiy-filesystem|native_copy_file',
@@ -1109,10 +1110,9 @@ export class OAIYRuntime {
     'plugin:oaiy-browser|browser_v2_get_cookies',
     'plugin:oaiy-browser|browser_v2_set_cookies',
     'plugin:oaiy-browser|browser_v2_http_request',
-    // Engine-update / managed-Chromium control surface
+    // Engine-update / managed-Chromium control surface (read-only / bundled reset)
     'plugin:oaiy-browser|browser_engine_get_status',
     'plugin:oaiy-browser|browser_engine_check_updates',
-    'plugin:oaiy-browser|browser_engine_set_custom_path',
     'plugin:oaiy-browser|browser_engine_use_bundled',
     // === Terminal plugin ==================================================
     'plugin:oaiy-terminal|terminal_create',
@@ -1130,17 +1130,55 @@ export class OAIYRuntime {
     // via HTTP (text_to_speech node External mode). Native command surface
     // gone; backed up at repo-root external/plugin-tts.
 
-    // plugin-agent: LLM-driven assistant with tool access to flows and
-    // node outputs. Phase 1 surface: status + list_tools + call_tool +
-    // set_api_base. The chat panel calls these directly (not from
-    // sandboxed workflow code), but they're on the allowlist so future
-    // workflow nodes that want to invoke the agent (e.g. an
-    // "ask-the-agent" node) can do so too.
+    // plugin-agent: read-only discovery only; agent_call_tool / agent_set_api_base
+    // are administrative chat-panel commands and intentionally excluded here.
     'plugin:oaiy-agent|agent_get_status',
     'plugin:oaiy-agent|agent_list_tools',
-    'plugin:oaiy-agent|agent_call_tool',
-    'plugin:oaiy-agent|agent_set_api_base',
   ]);
+
+  /**
+   * Package capability required for sensitive Tauri commands invoked via the
+   * module broker when `currentPackageId` is set (hardened/untrusted runs).
+   */
+  private static readonly REQUIRED_PERMISSION_BY_TAURI_COMMAND: Readonly<Record<string, string>> = {
+    'plugin:oaiy-filesystem|read_file': 'filesystem:read',
+    'plugin:oaiy-filesystem|list_folder': 'filesystem:read',
+    'plugin:oaiy-filesystem|read_chunk_content': 'filesystem:read',
+    'plugin:oaiy-filesystem|calculate_file_chunks': 'filesystem:read',
+    'plugin:oaiy-filesystem|write_file': 'filesystem',
+    'plugin:oaiy-filesystem|native_copy_file': 'filesystem',
+    'plugin:oaiy-filesystem|delete_file': 'filesystem',
+    'plugin:oaiy-filesystem|run_command': 'process:execute',
+    'ask_agent': 'process:execute',
+    'ensure_service_ready_by_port': 'service:start',
+    'ensure_service_ready': 'service:start',
+    'plugin:oaiy-browser|webview_create': 'browser',
+    'plugin:oaiy-browser|webview_navigate': 'browser',
+    'plugin:oaiy-browser|webview_action': 'browser',
+    'plugin:oaiy-browser|webview_screenshot': 'browser',
+    'plugin:oaiy-browser|webview_evaluate': 'browser',
+    'plugin:oaiy-browser|webview_close': 'browser',
+    'plugin:oaiy-browser|browser_v2_create_session': 'browser',
+    'plugin:oaiy-browser|browser_v2_close_session': 'browser',
+    'plugin:oaiy-browser|browser_v2_list_sessions': 'browser',
+    'plugin:oaiy-browser|browser_v2_goto': 'browser',
+    'plugin:oaiy-browser|browser_v2_evaluate_json': 'browser',
+    'plugin:oaiy-browser|browser_v2_get_html': 'browser',
+    'plugin:oaiy-browser|browser_v2_get_text': 'browser',
+    'plugin:oaiy-browser|browser_v2_get_title': 'browser',
+    'plugin:oaiy-browser|browser_v2_get_url': 'browser',
+    'plugin:oaiy-browser|browser_v2_wait_for_selector': 'browser',
+    'plugin:oaiy-browser|browser_v2_screenshot': 'browser',
+    'plugin:oaiy-browser|browser_v2_get_cookies': 'browser',
+    'plugin:oaiy-browser|browser_v2_set_cookies': 'browser',
+    'plugin:oaiy-browser|browser_v2_http_request': 'browser',
+    'plugin:oaiy-terminal|terminal_create': 'terminal',
+    'plugin:oaiy-terminal|terminal_send_keys': 'terminal',
+    'plugin:oaiy-terminal|terminal_close': 'terminal',
+    'plugin:oaiy-terminal|terminal_screenshot': 'terminal',
+    'plugin:oaiy-terminal|terminal_read_output': 'terminal',
+    'plugin:oaiy-terminal|terminal_show_window': 'terminal',
+  };
 
   /**
    * Tauri commands that workflow/module code is *never* allowed to call,
@@ -1202,6 +1240,44 @@ export class OAIYRuntime {
             `Add it to ALLOWED_TAURI_COMMANDS in runtime.ts if it's needed by a built-in module.`;
           log?.({ source: 'Runtime', message, type: 'error' });
           return Promise.reject(new Error(message));
+        }
+        // Per-command package permission enforcement (defense in depth behind
+        // module-level gating): when running under a package / untrusted context,
+        // sensitive Tauri commands require their explicit capability.
+        if (this.currentPackageId) {
+          const requiredPerm = OAIYRuntime.REQUIRED_PERMISSION_BY_TAURI_COMMAND[cmd];
+          if (requiredPerm && !this.hasPackagePermission(requiredPerm)) {
+            const message =
+              `Refusing module invoke '${cmd}': package '${this.currentPackageId}' lacks required permission '${requiredPerm}'`;
+            log?.({ source: 'Runtime', message, type: 'error' });
+            return Promise.reject(new Error(message));
+          }
+        }
+        // Intercept browser navigation & HTTP impersonation commands so they cannot
+        // bypass local-network consent / SSRF protection by talking to the browser
+        // plugin directly.
+        if (
+          cmd === 'plugin:oaiy-browser|browser_v2_http_request' ||
+          cmd === 'plugin:oaiy-browser|browser_v2_goto' ||
+          cmd === 'plugin:oaiy-browser|browser_v2_navigate' ||
+          cmd === 'plugin:oaiy-browser|webview_navigate'
+        ) {
+          const raw = (args ?? {}) as Record<string, unknown>;
+          const req =
+            raw.request && typeof raw.request === 'object' && !Array.isArray(raw.request)
+              ? (raw.request as Record<string, unknown>)
+              : raw;
+          const targetUrl =
+            typeof req.url === 'string'
+              ? req.url
+              : typeof req.uri === 'string'
+                ? req.uri
+                : '';
+          if (targetUrl) {
+            return this.ensureLocalNetworkAllowed(targetUrl, `Browser request (${cmd})`).then(
+              () => inner(cmd, args) as Promise<T>,
+            );
+          }
         }
         // Never allow raw `http_request` calls to bypass local-network permission /
         // SSRF checks by passing `allow_private_networks: true` straight to the
@@ -1464,6 +1540,34 @@ export class OAIYRuntime {
     } as unknown as Response;
   }
 
+  private async ensureLocalNetworkAllowed(url: string, purpose: string): Promise<void> {
+    if (!this.isLocalNetworkUrl(url)) return;
+    if (this.currentPackageId && !this.hasPackagePermission('network:local')) {
+      throw new Error(
+        `Package '${this.currentPackageId}' lacks required permission 'network:local' for ${this.getHostPort(url)}`,
+      );
+    }
+    if (this.isUrlWhitelisted(url)) return;
+    if (this.onLocalNetworkPermission) {
+      const hostPort = this.getHostPort(url);
+      const response = await this.onLocalNetworkPermission({
+        url,
+        hostPort,
+        purpose,
+      });
+
+      if (!response.allowed) {
+        throw new Error(`Local network access denied for ${hostPort}`);
+      }
+
+      if (response.remember) {
+        this.addToLocalNetworkWhitelist(hostPort);
+      }
+    } else {
+      throw new Error(`Local network access to ${this.getHostPort(url)} is not allowed`);
+    }
+  }
+
   private async performHttpRequest(
     url: string,
     method: string,
@@ -1474,26 +1578,7 @@ export class OAIYRuntime {
   ): Promise<{ status: number; headers: Record<string, string>; body: string; url?: string; bodyIsBase64?: boolean }> {
     const isLocalNetwork = this.isLocalNetworkUrl(url);
 
-    if (isLocalNetwork && !this.isUrlWhitelisted(url)) {
-      if (this.onLocalNetworkPermission) {
-        const hostPort = this.getHostPort(url);
-        const response = await this.onLocalNetworkPermission({
-          url,
-          hostPort,
-          purpose: 'HTTP request from workflow',
-        });
-
-        if (!response.allowed) {
-          throw new Error(`Local network access denied for ${hostPort}`);
-        }
-
-        if (response.remember) {
-          this.addToLocalNetworkWhitelist(hostPort);
-        }
-      } else {
-        throw new Error(`Local network access to ${this.getHostPort(url)} is not allowed`);
-      }
-    }
+    await this.ensureLocalNetworkAllowed(url, 'HTTP request from workflow');
 
     if (this.invokeFn) {
       const result = (await this.invokeFn('http_request', {
@@ -1561,18 +1646,54 @@ export class OAIYRuntime {
     }
 
     const response = await fetch(url, fetchOptions);
-    const responseBody = await response.text();
 
     const responseHeaders: Record<string, string> = {};
     response.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
 
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    const isExplicitBinary =
+      contentType.startsWith('image/') ||
+      contentType.startsWith('audio/') ||
+      contentType.startsWith('video/') ||
+      contentType.startsWith('application/octet-stream') ||
+      contentType.startsWith('application/pdf') ||
+      contentType.startsWith('application/zip') ||
+      contentType.startsWith('font/');
+
+    let responseBody: string;
+    let bodyIsBase64 = false;
+    const encodeBytesBase64 = (bytes: Uint8Array): string => {
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return btoa(bin);
+    };
+
+    if (isExplicitBinary && typeof response.arrayBuffer === 'function') {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      responseBody = encodeBytesBase64(bytes);
+      bodyIsBase64 = true;
+    } else if (!contentType && typeof response.arrayBuffer === 'function') {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      try {
+        responseBody = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        responseBody = encodeBytesBase64(bytes);
+        bodyIsBase64 = true;
+      }
+    } else {
+      responseBody = await response.text();
+    }
+
     return {
       status: response.status,
       headers: responseHeaders,
       body: responseBody,
       url: response.url || url,
+      ...(bodyIsBase64 ? { bodyIsBase64: true } : {}),
     };
   }
 
@@ -1857,6 +1978,7 @@ export class OAIYRuntime {
     const runtimeModule = loadedModule.runtime;
     if (!runtimeModule) return;
 
+    const runtimeSelf = this;
     const context: RuntimeContext = {
       log: (level, message) => {
         if (this.onLog) {
@@ -1922,7 +2044,14 @@ export class OAIYRuntime {
       useClaudeForAI: this.useClaudeForAI,
       currentJobId: this.currentJobId || undefined,
       yieldForAI: this.onYieldForAI || undefined,
-      currentPackageId: this.currentPackageId ?? undefined,
+      // Live getters so setFlowContext() updates called after module registration
+      // are immediately visible to every registered module.
+      get currentPackageId() {
+        return runtimeSelf.currentPackageId ?? undefined;
+      },
+      get currentFlowId() {
+        return runtimeSelf.currentFlowId ?? undefined;
+      },
       hasPermission: (perm: string) => this.hasPackagePermission(perm),
       formatPath: (p: string) =>
         formatPathForLog(p, (this.projectSettings.logPathPolicy ?? 'tilde') as LogPathPolicy),

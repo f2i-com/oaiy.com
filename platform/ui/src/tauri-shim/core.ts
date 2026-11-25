@@ -78,8 +78,9 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   // (the run's signal: a run stopped stops its request, rather than waiting on it up to the timeout)
   const stopped = r.signal instanceof AbortSignal ? (r.signal as AbortSignal) : null;
+  const onAbort = () => ctrl.abort();
   if (stopped?.aborted) ctrl.abort();
-  stopped?.addEventListener('abort', () => ctrl.abort(), { once: true });
+  stopped?.addEventListener('abort', onAbort, { once: true });
   try {
     let resp: Response;
     try {
@@ -156,6 +157,7 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     };
   } finally {
     clearTimeout(timer);
+    stopped?.removeEventListener('abort', onAbort);
   }
 }
 

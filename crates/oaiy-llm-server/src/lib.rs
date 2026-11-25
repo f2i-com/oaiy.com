@@ -317,7 +317,7 @@ impl Options {
     /// loopback and has a key. One with no key answers whatever reaches it, a web page's request too, and the files
     /// a picture's description tells of (or a missing one's error) are this computer's.
     pub(crate) fn local_images_or_default(&self, loopback: bool) -> bool {
-        self.local_images.unwrap_or(loopback && self.api_key.is_some())
+        self.local_images.unwrap_or(loopback && self.api_key.as_deref().is_some_and(|k| !k.is_empty()))
     }
 }
 
@@ -400,6 +400,7 @@ pub fn start(o: Options) -> oaiy_engine::Result<Running> {
 /// does (before the model loads: a client may connect at once, and its
 /// requests wait until the model is there).
 pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> oaiy_engine::Result<Running> {
+    o.api_key = o.api_key.filter(|k| !k.is_empty());
     if o.incognito {
         // Nothing about a request may reach the disk.
         o.prompt_cache = None;

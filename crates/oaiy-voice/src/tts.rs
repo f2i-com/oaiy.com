@@ -188,8 +188,9 @@ struct Asked {
     lines: Vec<Line>,
     /// The lines being prepared, or waiting to be: one asked for again meanwhile is not made twice.
     preparing: Vec<Line>,
-    /// The making going on after a line's first, and its stop (the prepare's own).
-    retry: Option<(Line, Arc<AtomicBool>)>,
+    /// The making going on after a line's first, its stop (the prepare's own), and a flag marking
+    /// that a live `say` request preempted it (distinct from client disconnect).
+    retry: Option<(Line, Arc<AtomicBool>, Arc<AtomicBool>)>,
 }
 
 impl Asked {
@@ -240,8 +241,9 @@ fn preparing<'a>(asked: &'a Mutex<Asked>, line: &Line) -> Option<Preparing<'a>> 
 fn ask<'a>(asked: &'a Mutex<Asked>, line: &Line) -> Asking<'a> {
     let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
     a.lines.push(line.clone());
-    if let Some((_, stop)) = a.retry.as_ref().filter(|(l, _)| l == line) {
-        stop.store(true, Ordering::Relaxed);
+    if let Some((_, stop, preempted)) = a.retry.as_ref().filter(|(l, _, _)| l == line) {
+        preempted.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
     }
     Asking { asked, line: line.clone() }
 }
@@ -621,16 +623,17 @@ fn prepare_line(job: &Job, first_seed: u64, kept: &Mutex<Kept>, asked: &Mutex<As
     let mut best: Option<(f64, u64, Vec<i16>, f64, f64)> = None;
     for seed in first_seed..first_seed + PREPARE_TRIES {
         let retry = seed > first_seed;
+        let preempted = Arc::new(AtomicBool::new(false));
         if let (true, Some(line)) = (retry, &job.line) {
             let mut a = asked.lock().unwrap_or_else(|p| p.into_inner());
             if a.wants(line) {
                 eprintln!("[oaiy-voice] a line being prepared was asked for: it is said as it is made, with seed {seed}");
                 return Ok(Spoken::nothing());
             }
-            a.retry = Some((line.clone(), Arc::clone(&job.cancel)));
+            a.retry = Some((line.clone(), Arc::clone(&job.cancel), Arc::clone(&preempted)));
         }
         let made = making.make(&job.text, seed, &job.cancel);
-        let made_way = retry && retry_over(asked);
+        let made_way = retry && (retry_over(asked) || preempted.load(Ordering::SeqCst));
         // (its asker went: what was made of it is cut short, and kept would be said so every time; or it was stopped
         // for a request to say it)
         if job.cancel.load(Ordering::Relaxed) {
@@ -919,6 +922,20 @@ mod tests {
         assert!(recall(&kept, &line).is_none());
         assert_eq!(kept.lock().unwrap().seed(&line), Some(1));
         assert!(asked.lock().unwrap().retry.is_none());
+
+        // Preemption where the live requester leaves before retry_over runs still counts as making way
+        // (Ok(Spoken::nothing())), NOT Err(LEFT) -> HTTP 500 to a still-connected prepare client.
+        let (starts2, waited2) = mpsc::channel();
+        let mut engine2 = StandIn { likes: vec![0.95, 0.99, 0.99], made: Vec::new(), slow: Some(1), started: Some(starts2) };
+        let job2 = prepare_job(&line);
+        std::thread::scope(|s| {
+            let making = s.spawn(|| prepare_line(&job2, 0, &kept, &asked, &mut engine2));
+            assert_eq!(waited2.recv_timeout(Duration::from_secs(5)), Ok(0));
+            assert_eq!(waited2.recv_timeout(Duration::from_secs(5)), Ok(1));
+            // Trigger preemption and immediately drop Asking before making returns.
+            drop(ask(&asked, &line));
+            assert!(making.join().unwrap().expect("preemption must not error").cancelled);
+        });
 
         // Asked to be prepared while it is: not made twice.
         let first = preparing(&asked, &line).expect("the first");

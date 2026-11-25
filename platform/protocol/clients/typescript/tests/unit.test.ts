@@ -243,20 +243,140 @@ test('an error body with no code still maps by HTTP status', async () => {
   );
 });
 
-// --- auth header ----------------------------------------------------------
+// --- auth header & transport hardening ------------------------------------
 
-test('a token is sent as a bearer on every request', async () => {
+test('health omits Authorization even when a token is configured (never leaks to a squatter)', async () => {
   const f = mockFetch(() => ({ status: 200, body: healthy }));
   await client(f, { token: 'secret' }).health();
+  const headers = (firstCall(f).init.headers ?? {}) as Record<string, string>;
+  assert.equal(headers['Authorization'], undefined);
+});
+
+test('a token is sent as a bearer on non-health requests', async () => {
+  const f = mockFetch(() => ({ status: 200, body: { flows: [] } }));
+  await client(f, { token: 'secret' }).listFlows();
   const auth = (firstCall(f).init.headers as Record<string, string>)['Authorization'];
   assert.equal(auth, 'Bearer secret');
 });
 
 test('no token means no Authorization header (a browser uses its Origin)', async () => {
-  const f = mockFetch(() => ({ status: 200, body: healthy }));
-  await client(f).health();
+  const f = mockFetch(() => ({ status: 200, body: { flows: [] } }));
+  await client(f).listFlows();
   const headers = (firstCall(f).init.headers ?? {}) as Record<string, string>;
   assert.equal(headers['Authorization'], undefined);
+});
+
+test('fetch sets redirect: error so redirects never leak credentials or switch origins', async () => {
+  const f = mockFetch(() => ({ status: 200, body: { flows: [] } }));
+  await client(f, { token: 'secret' }).listFlows();
+  assert.equal(firstCall(f).init.redirect, 'error');
+});
+
+test('health rejects non-object bodies and non-string protocols with BridgeError, not TypeError', async () => {
+  for (const body of [undefined, null, 'plain text', 42, []]) {
+    const c = client(mockFetch(() => ({ status: 200, body })));
+    await assert.rejects(
+      c.health(),
+      (e: unknown) => e instanceof BridgeError && e.code === 'wrong_product',
+    );
+  }
+  for (const protocol of [undefined, null, 1, {}]) {
+    const c = client(mockFetch(() => ({ status: 200, body: { ...healthy, protocol } })));
+    await assert.rejects(
+      c.health(),
+      (e: unknown) => e instanceof BridgeError && e.code === 'protocol_mismatch',
+    );
+  }
+});
+
+test('connector throws BridgeError when a 200 response has ok !== true or a malformed body', async () => {
+  const f1 = mockFetch(() => ({
+    status: 200,
+    body: { ok: false, error: { code: 'node_failed', message: 'plugin failed', detail: 'bad arg' } },
+  }));
+  await assert.rejects(
+    client(f1).connector('echo', 'echo.ping'),
+    (e: unknown) =>
+      e instanceof BridgeError &&
+      e.code === 'node_failed' &&
+      e.message === 'plugin failed' &&
+      e.detail === 'bad arg',
+  );
+  const f2 = mockFetch(() => ({ status: 200, body: undefined }));
+  await assert.rejects(
+    client(f2).connector('echo', 'echo.ping'),
+    (e: unknown) => e instanceof BridgeError && e.code === 'internal',
+  );
+});
+
+test('request timeout covers resp.text() body reads', async () => {
+  const slowBodyFetch: typeof fetch = async (_input, init) => {
+    const signal = init?.signal;
+    return {
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        }),
+    } as unknown as Response;
+  };
+  const c = client(slowBodyFetch, { requestTimeoutMs: 25 });
+  await assert.rejects(
+    c.listFlows(),
+    (e: unknown) =>
+      e instanceof BridgeError && e.code === 'unreachable' && e.message.includes('request timed out'),
+  );
+});
+
+test('streamEvents cleans up abort listeners between polls and stops immediately if pre-aborted', async () => {
+  let polls = 0;
+  const f = mockFetch(() => {
+    polls++;
+    return { status: 200, body: { events: [], next: polls } };
+  });
+  // Spy on addEventListener/removeEventListener of an AbortSignal.
+  const ac = new AbortController();
+  let added = 0;
+  let removed = 0;
+  const origAdd = ac.signal.addEventListener.bind(ac.signal);
+  const origRemove = ac.signal.removeEventListener.bind(ac.signal);
+  ac.signal.addEventListener = ((...args: Parameters<AbortSignal['addEventListener']>) => {
+    added++;
+    return origAdd(...args);
+  }) as AbortSignal['addEventListener'];
+  ac.signal.removeEventListener = ((...args: Parameters<AbortSignal['removeEventListener']>) => {
+    removed++;
+    return origRemove(...args);
+  }) as AbortSignal['removeEventListener'];
+
+  // Stop after 3 empty polls; every completed sleep must remove its abort listener.
+  const iter = client(f).streamEvents({ pollMs: 5, signal: ac.signal });
+  const stopLater = setTimeout(() => ac.abort(), 45);
+  try {
+    for await (const _ev of iter) {
+      // no events
+    }
+  } finally {
+    clearTimeout(stopLater);
+  }
+  assert.ok(polls >= 2, `expected multiple empty polls, got ${polls}`);
+  assert.ok(removed >= added - 1, `listeners leaked: added=${added}, removed=${removed}`);
+
+  // Pre-aborted signal returns immediately without polling.
+  const pre = new AbortController();
+  pre.abort();
+  const fPre = mockFetch(() => ({ status: 200, body: { events: [], next: 1 } }));
+  const got: unknown[] = [];
+  for await (const ev of client(fPre).streamEvents({ pollMs: 5000, signal: pre.signal })) {
+    got.push(ev);
+  }
+  assert.equal(got.length, 0);
+  assert.equal(fPre.calls.length, 0);
 });
 
 // --- helpers --------------------------------------------------------------

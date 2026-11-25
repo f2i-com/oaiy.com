@@ -245,6 +245,7 @@ final class Poll
                     if ($items) {
                         break;
                     }
+                    $this->db->close(); // a waiting request never holds a database connection
                 }
             }
             if (!$items && !$superseded) {

@@ -19,11 +19,17 @@ import { fetch as undiciFetch, Agent } from 'undici';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
+/** Strip surrounding brackets from a URL-formatted IPv6 literal (`[::1]` → `::1`). */
+function stripIpv6Brackets(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
 /** True if an IP literal is loopback/private/link-local/reserved (not internet-routable). */
 export function isBlockedIp(ip: string): boolean {
-  const fam = isIP(ip);
-  if (fam === 4) return isBlockedIpv4(ip);
-  if (fam === 6) return isBlockedIpv6(ip);
+  const bare = stripIpv6Brackets(ip);
+  const fam = isIP(bare);
+  if (fam === 4) return isBlockedIpv4(bare);
+  if (fam === 6) return isBlockedIpv6(bare);
   return true; // not a parseable IP → block, fail closed
 }
 
@@ -99,8 +105,11 @@ function isBlockedIpv6(ip: string): boolean {
 async function resolvePinnedAddress(
   host: string,
 ): Promise<{ address: string; family: number } | null> {
-  if (isIP(host)) {
-    if (isBlockedIp(host)) throw new Error(`blocked request to non-public address: ${host}`);
+  // `URL.hostname` wraps IPv6 literals in `[...]` (e.g. `[2001:4860:4860::8888]`, `[::1]`),
+  // which `node:net.isIP()` rejects unless brackets are stripped first.
+  const bare = stripIpv6Brackets(host);
+  if (isIP(bare)) {
+    if (isBlockedIp(bare)) throw new Error(`blocked request to non-public address: ${host}`);
     return null; // literal — fetch connects straight to it, no DNS step to rebind
   }
   let addrs: Array<{ address: string; family: number }>;
@@ -142,9 +151,12 @@ export async function assertUrlAllowed(raw: string): Promise<URL> {
 
 /** An undici Agent that connects to the PRE-VALIDATED IP — the kernel skips a second DNS lookup
  *  that a rebind could swing private — while the hostname still drives TLS SNI/cert + the Host
- *  header. */
+ *  header. Idle keep-alive is kept minimal because each hop creates a single-use pinned agent. */
 function pinnedAgent(pin: { address: string; family: number }): Agent {
   return new Agent({
+    keepAliveTimeout: 1,
+    keepAliveMaxTimeout: 1,
+    pipelining: 0,
     connect: {
       // undici's connect lookup uses the all-ADDRESSES callback form — cb(err, [{address, family}]) —
       // NOT cb(err, address, family); the latter makes undici read an undefined address and fail.
@@ -153,6 +165,64 @@ function pinnedAgent(pin: { address: string; family: number }): Agent {
       },
     },
   });
+}
+
+/**
+ * Bind a single-use pinned `Agent`'s lifetime to the returned `Response`'s body stream so its
+ * pool/sockets are always closed when the body finishes, errors, or is cancelled.
+ */
+function attachAgentCleanup(
+  resp: Awaited<ReturnType<typeof undiciFetch>>,
+  agent: Agent,
+): Response {
+  let settled = false;
+  const finish = (graceful: boolean) => {
+    if (settled) return;
+    settled = true;
+    (graceful ? agent.close() : agent.destroy()).catch(() => {});
+  };
+  if (!resp.body || resp.status === 204 || resp.status === 205 || resp.status === 304) {
+    resp.body?.cancel().catch(() => {});
+    finish(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return resp as any as Response;
+  }
+  const raw = resp.body as unknown as ReadableStream<Uint8Array>;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const tracked = new ReadableStream<Uint8Array>({
+    start() {
+      reader = raw.getReader();
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader!.read();
+        if (done) {
+          controller.close();
+          finish(true);
+        } else if (value) {
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        controller.error(err);
+        finish(false);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader?.cancel(reason);
+      } finally {
+        finish(false);
+      }
+    },
+  });
+  const wrapped = new Response(tracked, {
+    status: resp.status,
+    statusText: resp.statusText,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    headers: resp.headers as any,
+  });
+  Object.defineProperty(wrapped, 'url', { value: resp.url, enumerable: true });
+  return wrapped;
 }
 
 /**
@@ -207,13 +277,19 @@ export async function ssrfSafeFetch(
     }
     const pin = await resolvePinnedAddress(u.hostname);
     const agent = pin ? pinnedAgent(pin) : undefined;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const resp = await undiciFetch(url, {
-      ...(carried as any),
-      headers: carriedHeaders,
-      redirect: 'manual',
-      ...(agent ? { dispatcher: agent } : {}),
-    });
+    let resp: Awaited<ReturnType<typeof undiciFetch>>;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      resp = await undiciFetch(url, {
+        ...(carried as any),
+        headers: carriedHeaders,
+        redirect: 'manual',
+        ...(agent ? { dispatcher: agent } : {}),
+      });
+    } catch (e) {
+      agent?.destroy().catch(() => {});
+      throw e;
+    }
     if (resp.status >= 300 && resp.status < 400) {
       const loc = resp.headers.get('location');
       if (loc) {
@@ -254,6 +330,9 @@ export async function ssrfSafeFetch(
         url = next;
         continue;
       }
+    }
+    if (agent) {
+      return attachAgentCleanup(resp, agent);
     }
     // undici's Response is the spec Response at runtime; the type is nominally distinct.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

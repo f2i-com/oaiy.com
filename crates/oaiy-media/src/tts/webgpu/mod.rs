@@ -356,7 +356,7 @@ impl WgpuTalker {
         x0.extend_from_slice(self.codec_embedding.row(c0));
         g.upload(&two.x, &x0);
         g.upload(&dev.draws, &[f32::from_bits(draw)]);
-        let temperature = if s.greedy { 0.0 } else { s.sub_temperature as f32 };
+        let temperature = if s.greedy || !s.sub_temperature.is_finite() || s.sub_temperature <= 0.0 { 0.0 } else { s.sub_temperature as f32 };
         let seed = (s.seed ^ (s.seed >> 32)) as u32;
         let mut rec = g.begin();
         let r = rec.as_mut();
@@ -459,7 +459,7 @@ impl WgpuTalker {
         while made < max_frames {
             let s = &sampling;
             let penalty = s.repetition_penalty as f32;
-            if penalty != 1.0 {
+            if penalty.is_finite() && penalty > 0.0 && penalty != 1.0 {
                 for (l, _) in logits.iter_mut().zip(&seen).filter(|(_, &seen)| seen) {
                     *l = if *l < 0. { *l * penalty } else { *l / penalty };
                 }
@@ -472,13 +472,16 @@ impl WgpuTalker {
                     *l = f32::NEG_INFINITY;
                 }
             }
-            let c0 = sample(&logits, s.temperature, s.top_k, s.top_p, s.greedy, &mut rng);
+            let greedy = s.greedy || !s.temperature.is_finite() || s.temperature <= 0.0;
+            let c0 = sample(&logits, s.temperature, s.top_k, s.top_p, greedy, &mut rng);
             if c0 == CODEC_EOS {
                 said(made, in_talker, in_predictor);
                 return Ok(FramesEnd::Ended);
             }
             let predicting = std::time::Instant::now();
-            seen[c0 as usize] = true;
+            if let Some(slot) = seen.get_mut(c0 as usize) {
+                *slot = true;
+            }
             // the other 15 codes, the predictor's from this frame's start: drawn on the device in one submission (a
             // round trip a frame), or on the host a code at a time (the reference's order of draws)
             kept.pcache.len = 0;
@@ -487,9 +490,10 @@ impl WgpuTalker {
                 frame[0] = c0;
                 let mut x = hidden.clone();
                 x.extend_from_slice(self.codec_embedding.row(c0));
+                let sub_greedy = s.greedy || !s.sub_temperature.is_finite() || s.sub_temperature <= 0.0;
                 for i in 0..15 {
                     let l = predictor_step(self, kept, &x, i)?;
-                    let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, s.greedy, &mut rng);
+                    let code = sample(&l, s.sub_temperature, s.sub_top_k, 1.0, sub_greedy, &mut rng);
                     frame[i + 1] = code;
                     x = self.predictor_embeddings[i].row(code).to_vec();
                 }

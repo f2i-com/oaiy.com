@@ -263,7 +263,7 @@ fn input_snapshot(binding: &Binding, spec: &FlowsSpec, envelope: &Value) -> Valu
 }
 
 fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, String> {
-    let http = reqwest::blocking::Client::builder()
+    let http = super::creds::client_builder(super::net::Keep::Never)
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| format!("could not build the flows client: {e}"))?;
@@ -570,7 +570,7 @@ pub fn reserve(
         body["appId"] = json!(app_id);
     }
 
-    let http = reqwest::blocking::Client::builder()
+    let http = super::creds::client_builder(super::net::Keep::Never)
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| format!("could not build the flows client: {e}"))?;
@@ -1165,5 +1165,30 @@ mod tests {
         );
         assert_eq!(again, Ok(None));
         assert_eq!(super::super::flow_runner::woken(), before + 1);
+    }
+
+    #[test]
+    fn flows_clients_do_not_follow_redirects() {
+        use crate::link::testkit::{Provider, Reply};
+        let elsewhere = Provider::start(|_| Reply::ok(r#"{"bindings":[]}"#));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let acc = account(origin.base.clone());
+        let spec = shipped_flows();
+
+        let err = fetch(&acc, &spec).unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
+        let err = reserve(
+            &acc,
+            &spec,
+            &binding("b1", "aokie.call.ended"),
+            "aokie.call.ended",
+            "corr-1",
+            "evt-1",
+            &json!({ "name": "aokie.call.ended", "data": {} }),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("HTTP 307"), "{err}");
+        assert!(elsewhere.requests().is_empty(), "redirects must not be followed");
     }
 }

@@ -14,7 +14,17 @@ import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src
 function createFlowControlMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
   // Track subflow/macro call stack to prevent infinite recursion (per job)
   const callStack: string[] = [];
+  let rootFlowSeeded = false;
   const MAX_RECURSION_DEPTH = 10;
+
+  function ensureRootSeeded(): void {
+    if (!rootFlowSeeded && ctx.currentFlowId) {
+      rootFlowSeeded = true;
+      if (!callStack.includes(ctx.currentFlowId)) {
+        callStack.push(ctx.currentFlowId);
+      }
+    }
+  }
 
 /**
  * Execute a subflow
@@ -27,17 +37,23 @@ async function execute(
   input: unknown,
   nodeId: string
 ): Promise<unknown> {
+  if (ctx.abortSignal?.aborted) {
+    ctx.log('info', `[Subflow] Aborted by user before running flow: ${flowId}`);
+    throw new Error('Operation aborted by user');
+  }
+
+  ensureRootSeeded();
   ctx.onNodeStatus?.(nodeId, 'running');
   ctx.log('info', `[Subflow] Running flow: ${flowId}`);
 
   if (!ctx.runSubflow) {
     ctx.onNodeStatus?.(nodeId, 'error');
     ctx.log('error', '[Subflow] No subflow callback configured in runtime context');
-    return `Error: No subflow callback configured`;
+    throw new Error('No subflow callback configured');
   }
 
-  // Check for infinite recursion
-  if (callStack.includes(flowId)) {
+  // Check for infinite recursion (including direct self-recursion from the top-level flow)
+  if (callStack.includes(flowId) || callStack.includes(`macro:${flowId}`)) {
     ctx.onNodeStatus?.(nodeId, 'error');
     throw new Error(`Recursive subflow detected: ${flowId}`);
   }
@@ -96,6 +112,12 @@ async function executeMacro(
   nodeId: string,
   name?: string
 ): Promise<Record<string, unknown>> {
+  if (ctx.abortSignal?.aborted) {
+    ctx.log('info', `[Macro] Aborted by user before running macro: ${workflowId}`);
+    throw new Error('Operation aborted by user');
+  }
+
+  ensureRootSeeded();
   // (by its name, where the node gives it: the run's log showed the macro's id; what it was given is for a developer,
   // in the console)
   const called = name && name !== 'unnamed' ? `“${name}”` : workflowId;
@@ -109,9 +131,9 @@ async function executeMacro(
     throw new Error('No subflow callback configured');
   }
 
-  // Check for infinite recursion
+  // Check for infinite recursion (including direct self-recursion from the top-level flow)
   const stackKey = `macro:${workflowId}`;
-  if (callStack.includes(stackKey)) {
+  if (callStack.includes(stackKey) || callStack.includes(workflowId)) {
     ctx.onNodeStatus?.(nodeId, 'error');
     throw new Error(`Recursive macro detected: ${workflowId}`);
   }

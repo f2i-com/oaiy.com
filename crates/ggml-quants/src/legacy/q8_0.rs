@@ -88,8 +88,8 @@ fn simd_level() -> SimdLevel {
 pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
     assert_eq!(row.len() % BYTES_PER_BLOCK, 0, "q8_0::dot_row_fast: row not block-aligned");
     assert_eq!(
-        x.len(),
-        row.len() / BYTES_PER_BLOCK * BLOCK_SIZE,
+        (row.len() / BYTES_PER_BLOCK).checked_mul(BLOCK_SIZE),
+        Some(x.len()),
         "q8_0::dot_row_fast: x length mismatch"
     );
     match simd_level() {
@@ -112,8 +112,10 @@ pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
 /// Fused SIMD-accelerated matrix-vector product `out[r] = dot(W[r], x)` for `n_rows` Q8_0 rows.
 pub fn dot_rows_fast(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
     assert_eq!(k % BLOCK_SIZE, 0, "q8_0::dot_rows_fast: k must be multiple of 32");
-    let row_bytes = k / BLOCK_SIZE * BYTES_PER_BLOCK;
-    assert_eq!(w.len(), n_rows * row_bytes, "q8_0::dot_rows_fast: w length mismatch");
+    let expected_w = (k / BLOCK_SIZE)
+        .checked_mul(BYTES_PER_BLOCK)
+        .and_then(|row_bytes| n_rows.checked_mul(row_bytes));
+    assert_eq!(expected_w, Some(w.len()), "q8_0::dot_rows_fast: w length mismatch");
     assert_eq!(x.len(), k, "q8_0::dot_rows_fast: x length mismatch");
     assert_eq!(out.len(), n_rows, "q8_0::dot_rows_fast: out length mismatch");
 
@@ -520,5 +522,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "w length mismatch")]
+    fn dot_rows_fast_rejects_overflowing_dims() {
+        let x = [0.0f32; BLOCK_SIZE];
+        dot_rows_fast(&[], &x, 1usize << (usize::BITS - 1), BLOCK_SIZE, &mut []);
     }
 }

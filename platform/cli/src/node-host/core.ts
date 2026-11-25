@@ -66,6 +66,7 @@ const MAX_RESPONSE_BYTES = (() => {
 async function readBodyCapped(resp: Response): Promise<Buffer> {
   const cl = Number(resp.headers.get('content-length'));
   if (Number.isFinite(cl) && cl > MAX_RESPONSE_BYTES) {
+    await resp.body?.cancel().catch(() => {});
     throw new Error(`http_request: response too large (${cl} > ${MAX_RESPONSE_BYTES} bytes)`);
   }
   if (!resp.body) return Buffer.alloc(0);
@@ -161,7 +162,14 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
     try {
       resp = confined
         ? await ssrfSafeFetch(url, init)
-        : ((await undiciFetch(url, { ...init, dispatcher: PATIENT } as Parameters<typeof undiciFetch>[1])) as unknown as Response);
+        : ((await undiciFetch(url, {
+            ...init,
+            // Under confinement, never auto-follow redirects on local/Desktop API requests:
+            // a 3xx from an allowed Desktop route could otherwise steer the request to a
+            // disallowed Desktop route or a non-public SSRF target.
+            ...(fsConfinementOn() ? { redirect: 'manual' } : {}),
+            dispatcher: PATIENT,
+          } as Parameters<typeof undiciFetch>[1])) as unknown as Response);
     } catch (e) {
       // Node's fetch throws a bare `TypeError: fetch failed` and hides the real
       // reason on `.cause`. Surfaced verbatim through the runtime that became

@@ -210,6 +210,7 @@ final class PairingApi
                 if ($row === null || $row['state'] !== $from) {
                     return [$row, false];
                 }
+                $ctx->db->close(); // a waiting request never holds a database connection
             }
         }
         return [Pairing::live($ctx->db, $pid, Clock::now()), $superseded];

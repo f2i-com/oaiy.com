@@ -42,7 +42,8 @@ export type PackagePermission =
   | 'code:execute'      // Run JS in logic_block / condition expressions / new Function()
   | 'ui:custom'         // Render the package's own React UI components
   | 'secrets:read'      // Read user-stored secrets (API keys, etc.)
-  | 'constants:read';   // Read project constants other than secrets
+  | 'constants:read'    // Read project constants other than secrets
+  | 'diffusion';        // Run local diffusion / image-generation models
 
 /**
  * System dependencies that the package requires.

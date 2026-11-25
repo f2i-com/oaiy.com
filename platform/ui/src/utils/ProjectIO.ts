@@ -157,6 +157,24 @@ const sanitizeList = (
     return item;
   });
 
+/** Underscore-prefixed node fields that represent persistent macro/UI state and must survive export. */
+const PERSISTENT_UNDERSCORE_FIELDS = new Set([
+  '_macroWorkflowId',
+  '_macroName',
+  '_macroInputs',
+  '_macroOutputs',
+  '_macroDescription',
+  '_macroIcon',
+  '_macroColor',
+  '_collapsed',
+]);
+
+/** Whether a project constant holds a secret value (flag, category, or value pattern). */
+export const isSecretConstant = (
+  c: Pick<ProjectConstant, 'isSecret' | 'category' | 'value'>,
+): boolean =>
+  Boolean(c.isSecret || c.category === 'api_key' || (typeof c.value === 'string' && looksLikeSecret(c.value)));
+
 /**
  * Sanitize node data by removing sensitive fields and secret-looking values.
  * Accepts schema-defined secret fields from node definitions, and the fields the
@@ -175,8 +193,8 @@ export const sanitizeNodeData = (
   const pairName = nested && 'value' in data ? [data.name, data.key, data.header].find((n) => typeof n === 'string') as string | undefined : undefined;
 
   for (const [key, value] of Object.entries(data)) {
-    // Skip temporary fields
-    if (key.startsWith('_')) continue;
+    // Skip temporary underscore fields, while keeping persistent macro/UI metadata
+    if (key.startsWith('_') && (nested || !PERSISTENT_UNDERSCORE_FIELDS.has(key))) continue;
 
     // SCHEMA-DRIVEN: If the node schema defines this field as 'secret' type, always redact it
     if (schemaSecretFields?.has(key)) {
@@ -466,7 +484,7 @@ export const sanitizeProjectForExport = (project: OAIYProject): ExportedProject 
   // Collect all known secret values from project constants
   const knownSecrets = new Set<string>();
   for (const constant of project.constants || []) {
-    if (constant.isSecret && constant.value) {
+    if (isSecretConstant(constant) && constant.value) {
       knownSecrets.add(constant.value);
     }
   }
@@ -483,7 +501,7 @@ export const sanitizeProjectForExport = (project: OAIYProject): ExportedProject 
     // Clear secret constant values on export
     constants: (project.constants || []).map(c => ({
       ...c,
-      value: c.isSecret ? '' : c.value,
+      value: isSecretConstant(c) ? '' : c.value,
     })),
     llmEndpoints: project.llmEndpoints?.map((endpoint) => sanitizeProjectRecord(endpoint, knownSecrets)),
     imageGenEndpoints: project.imageGenEndpoints?.map((endpoint) => sanitizeProjectRecord(endpoint, knownSecrets)),
@@ -603,11 +621,12 @@ export const parseImportedProject = (content: string): ExportedProject => {
     ...imported,
     // Normalize each flow's graph so a malformed/missing graph is coerced to an
     // empty one instead of crashing on graph access (or being autosaved over the
-    // only good copy). Legit exports always carry a valid graph, so this is a no-op
-    // for well-formed files.
+    // only good copy). Mark imported flows untrusted so externally obtained project
+    // JSON runs sandboxed (hardened worker + minimal permissions) by default.
     flows: ensureUniqueFlowIds(
       imported.flows.map((f) => ({
         ...f,
+        untrusted: true,
         graph:
           f && f.graph && Array.isArray(f.graph.nodes) && Array.isArray(f.graph.edges)
             ? { ...f.graph, nodes: withoutProviderSeeds(withoutRunOutputs(f.graph.nodes)) }
@@ -633,14 +652,20 @@ export const parseImportedProject = (content: string): ExportedProject => {
         (p) => !defaultHttpPresets.find((d) => d.id === p.id)
       ),
     ],
-    // Merge constants - preserve imported values for matching keys
+    // Merge constants - preserve imported values for matching keys and ensure
+    // any api_key or secret-looking value is flagged isSecret: true.
     constants: defaultConstants.map((dc) => {
       const imported_c = (imported.constants || []).find((c) => c.key === dc.key);
-      return imported_c ? { ...dc, value: imported_c.value } : dc;
+      if (!imported_c) return dc;
+      return {
+        ...dc,
+        value: imported_c.value,
+        isSecret: isSecretConstant(dc) || isSecretConstant(imported_c),
+      };
     }).concat(
-      (imported.constants || []).filter(
-        (c) => !defaultConstants.find((d) => d.key === c.key)
-      )
+      (imported.constants || [])
+        .filter((c) => !defaultConstants.find((d) => d.key === c.key))
+        .map((c) => (isSecretConstant(c) ? { ...c, isSecret: true } : c))
     ),
     // Merge settings — strip untrusted endpoint/local-network override keys so an
     // imported project cannot silently redirect AI traffic or disable SSRF guards.
@@ -703,6 +728,6 @@ export const redactRunHistorySecrets = (logs: LogEntry[]): LogEntry[] => {
 export const redactConstantsForStorage = (constants: ProjectConstant[]): ProjectConstant[] => {
   return constants.map((c) => ({
     ...c,
-    value: c.isSecret ? '' : c.value,
+    value: isSecretConstant(c) ? '' : c.value,
   }));
 };

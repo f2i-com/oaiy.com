@@ -190,7 +190,7 @@ impl Qwen35Chain {
                 // the layer's entries are its own up to the trunk's last position, the draft taken or not
                 g.valid = n;
             }
-            if 1.0 / total < DRAFT_MIN_P {
+            if !(total > 0.0 && 1.0 / total >= DRAFT_MIN_P) || (best as usize) >= m.config.vocab_size {
                 break;
             }
             drafts.push(best);

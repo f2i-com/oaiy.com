@@ -250,8 +250,9 @@ pub fn write_stereo_wav(path: &Path, left: &[f32], right: &[f32], rate: usize) -
 }
 
 fn device(index: usize) -> Result<Device> {
+    // (the language model runs in BF16, which Candle's CPU backend cannot multiply)
     let _ = index;
-    Ok(Device::Cpu)
+    candle_core::bail!("music runs on WebGPU: the cpu backend cannot multiply its BF16 weights")
 }
 
 /// Window `k`'s starting noise, (1, 128, len), from the seed alone.

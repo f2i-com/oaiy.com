@@ -510,6 +510,8 @@ export interface RuntimeContext {
   useClaudeForAI?: boolean;
   /** Current job ID (needed for AI yield) */
   currentJobId?: string;
+  /** Current flow ID being executed (used to detect direct self-recursion in subflows/macros) */
+  currentFlowId?: string;
   /** Callback to yield at an AI node and wait for external response */
   yieldForAI?: (request: {
     nodeId: string;

@@ -305,16 +305,28 @@ fn index_shard(
             if d < 0 {
                 return Err(bad("negative or non-numeric dimension"));
             }
-            shape.push(d as usize);
+            let d = usize::try_from(d).map_err(|_| bad("dimension exceeds usize"))?;
+            shape.push(d);
         }
         let offs = v.get("data_offsets").ok_or_else(|| bad("missing data_offsets"))?;
         let off = |i: usize| offs.at(i).and_then(Json::as_i64).unwrap_or(-1);
         let (a, b) = (off(0), off(1));
-        if a < 0 || b < a || data_base + b as u64 > file_len {
+        if a < 0 || b < a || data_base.checked_add(b as u64).is_none_or(|end| end > file_len) {
             return Err(bad("data_offsets outside the file"));
         }
         let nbytes = (b - a) as u64;
-        let expect = shape.iter().try_fold(dtype.size() as u64, |acc, &d| acc.checked_mul(d as u64));
+        let nonzero = shape
+            .iter()
+            .filter(|&&d| d != 0)
+            .try_fold(dtype.size() as u64, |acc, &d| acc.checked_mul(d as u64));
+        let nonzero_numel = shape
+            .iter()
+            .filter(|&&d| d != 0)
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d));
+        let expect = match (nonzero, nonzero_numel) {
+            (Some(bytes), Some(_)) => Some(if shape.contains(&0) { 0 } else { bytes }),
+            _ => None,
+        };
         if expect != Some(nbytes) {
             return Err(bad(&format!("{nbytes} bytes but shape {shape:?} x {dtype:?} needs {expect:?}")));
         }
@@ -387,5 +399,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(neither.is_some_and(|e| e.contains("more than one shard")), "an index naming neither");
         assert!(none.is_some_and(|e| e.contains("more than one shard")), "no index");
+    }
+
+    #[test]
+    fn zero_dim_does_not_bypass_shape_overflow_check() {
+        let header = r#"{"bad":{"dtype":"F32","shape":[0,4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        let path = std::env::temp_dir().join(format!("st-zero-overflow-{}.safetensors", std::process::id()));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header.as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let res = StIndex::open_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_err(), "overflowing shape with leading 0 must be rejected");
     }
 }

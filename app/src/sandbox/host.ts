@@ -173,8 +173,11 @@ export class SandboxHost implements HostHandler {
         this.wrote(args[1]);
         return '';
       case 'fs.archive': {
-        const result = archive(vfs, JSON.parse(arg(0, 'request')) as ArchiveRequest);
+        const req = JSON.parse(arg(0, 'request')) as ArchiveRequest;
+        const result = archive(vfs, req);
         for (const f of result.files) if (f.path.startsWith('/')) this.wrote(f.path);
+        if (req.op === 'zip' || req.op === 'tar') this.wrote(req.file);
+        if ((req.op === 'gzip' || req.op === 'gunzip') && !req.keep && !req.stdout) this.removed(req.file);
         return JSON.stringify(result);
       }
       case 'net.fetch':
@@ -292,13 +295,21 @@ export class SandboxHost implements HostHandler {
     }
     const decision = this.gate.check(host, this.via);
     if (!decision.ok) throw new TypeError(`fetch failed: ${decision.reason}`);
+    const method = (req.method ?? 'GET').toUpperCase();
     const headers = new Headers();
+    let hasSensitiveHeader = false;
     for (const [name, value] of Object.entries(req.headers ?? {})) {
-      if (!FORBIDDEN_HEADERS.has(name.toLowerCase())) headers.set(name, String(value));
+      const lower = name.toLowerCase();
+      if (lower === 'authorization' || lower === 'cookie' || lower === 'x-api-key') {
+        hasSensitiveHeader = true;
+      }
+      if (!FORBIDDEN_HEADERS.has(lower)) headers.set(name, String(value));
     }
-    // Only an open gate may follow redirects: the browser cannot let the gate
-    // look at a redirect's new host before it goes there.
+    // Only an open gate may follow redirects, and only for safe GET/HEAD requests without
+    // sensitive auth headers: the browser cannot let the gate inspect a redirect's new host
+    // before sending the request, so mutating or credentialed requests must not auto-follow.
     const open = settings.mode === 'open' && settings.deny.length === 0;
+    const canFollowRedirect = open && (method === 'GET' || method === 'HEAD') && !hasSensitiveHeader;
     const controller = new AbortController();
     let timedOut = false;
     const onUpstreamAbort = () => controller.abort(this.signal?.reason);
@@ -317,10 +328,10 @@ export class SandboxHost implements HostHandler {
     let response: Response;
     try {
       response = await fetch(url, {
-        method: (req.method ?? 'GET').toUpperCase(),
+        method,
         headers,
         body: req.body ?? undefined,
-        redirect: open ? 'follow' : 'error',
+        redirect: canFollowRedirect ? 'follow' : 'error',
         credentials: 'omit',
         signal: controller.signal,
       });
@@ -346,7 +357,7 @@ export class SandboxHost implements HostHandler {
         ? 'cancelled'
         : timedOut || controller.signal.aborted
           ? 'timed out'
-          : `${(error as Error).message}. From a browser this usually means the site does not allow cross-origin requests (CORS)${open ? '' : ', or it redirected while the gate is restricted'}`;
+          : `${(error as Error).message}. From a browser this usually means the site does not allow cross-origin requests (CORS)${canFollowRedirect ? '' : ', or it redirected while redirects are restricted'}`;
       throw new TypeError(`fetch failed: ${why}`);
     }
     const limit = req.save_to ? MAX_DOWNLOAD_BYTES : MAX_FETCH_BYTES;

@@ -196,6 +196,110 @@ const OPEN_DEADLINE_MS = 20_000;
 /** A request's answer when the frame was re-rendered under it. */
 const RELOADED = 'the preview was re-rendered while this ran';
 
+export const PREVIEW_STORAGE_LIMITS = {
+  entries: 1000,
+  value: 4 * 1024 * 1024,
+  map: 32 * 1024 * 1024,
+} as const;
+
+const FORBIDDEN_STORAGE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const STORAGE_ENCODER = new TextEncoder();
+
+const storageUtf8Bytes = (s: string): number => STORAGE_ENCODER.encode(s).byteLength;
+
+export function isValidStorageKey(key: unknown): key is string {
+  return typeof key === 'string' && !FORBIDDEN_STORAGE_KEYS.has(key);
+}
+
+/**
+ * Sanitize and enforce host-side entry-count, value-size, and total-map limits
+ * on a preview storage snapshot (`bot:storage`). Returns null for non-records.
+ */
+export function sanitizePreviewStorage(
+  raw: unknown,
+  limits: { entries: number; value: number; map: number } = PREVIEW_STORAGE_LIMITS,
+): Record<string, string> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: Record<string, string> = Object.create(null);
+  let count = 0;
+  let totalBytes = 0;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isValidStorageKey(k) || typeof v !== 'string') continue;
+    const valBytes = storageUtf8Bytes(v);
+    if (valBytes > limits.value) continue;
+    const entryBytes = storageUtf8Bytes(k) + valBytes;
+    if (count >= limits.entries) break;
+    if (totalBytes + entryBytes > limits.map) continue;
+    out[k] = v;
+    count++;
+    totalBytes += entryBytes;
+  }
+  return out;
+}
+
+/**
+ * Apply a `nativeStorage` mutation with host-side validation of string keys/values,
+ * prototype-key rejection, and entry-count / value-size / total-map limits.
+ */
+export function applyPreviewStorageOp(
+  current: Record<string, string> | undefined,
+  input: Record<string, unknown> | undefined,
+  limits: { entries: number; value: number; map: number } = PREVIEW_STORAGE_LIMITS,
+): { ok: true; store: Record<string, string> } | { ok: false; error: string } {
+  const state = new Map<string, string>();
+  if (current) {
+    for (const [k, v] of Object.entries(current)) {
+      if (isValidStorageKey(k) && typeof v === 'string') state.set(k, v);
+    }
+  }
+  const op = input?.operation;
+  if (op === 'clear') {
+    state.clear();
+  } else if (op === 'set') {
+    if (!isValidStorageKey(input?.key) || typeof input?.value !== 'string') {
+      return { ok: false, error: 'Invalid preview storage key or value.' };
+    }
+    if (storageUtf8Bytes(input.value) > limits.value) {
+      return { ok: false, error: 'Preview storage value exceeds size limit.' };
+    }
+    if (!state.has(input.key) && state.size >= limits.entries) {
+      return { ok: false, error: 'Preview storage entry limit exceeded.' };
+    }
+    state.set(input.key, input.value);
+  } else if (op === 'remove') {
+    if (!isValidStorageKey(input?.key)) {
+      return { ok: false, error: 'Invalid preview storage key.' };
+    }
+    state.delete(input.key);
+  } else if (op === 'batch' && Array.isArray(input?.replacements)) {
+    for (const item of input.replacements as Array<{ key?: unknown; value?: unknown }>) {
+      if (!item || !isValidStorageKey(item.key) || typeof item.value !== 'string') {
+        return { ok: false, error: 'Invalid preview storage batch item.' };
+      }
+      if (storageUtf8Bytes(item.value) > limits.value) {
+        return { ok: false, error: 'Preview storage value exceeds size limit.' };
+      }
+      if (!state.has(item.key) && state.size >= limits.entries) {
+        return { ok: false, error: 'Preview storage entry limit exceeded.' };
+      }
+      state.set(item.key, item.value);
+    }
+  } else {
+    return { ok: false, error: 'Unsupported preview storage operation.' };
+  }
+
+  let totalBytes = 0;
+  const out: Record<string, string> = Object.create(null);
+  for (const [k, v] of state) {
+    totalBytes += storageUtf8Bytes(k) + storageUtf8Bytes(v);
+    if (totalBytes > limits.map) {
+      return { ok: false, error: 'Preview storage total size limit exceeded.' };
+    }
+    out[k] = v;
+  }
+  return { ok: true, store: out };
+}
+
 export const targetLabel = (target: PreviewTarget): string => (target.kind === 'app' ? appLabel(target.root) : target.kind === 'model' ? modelLabel(target.path) : pageLabel(target.path));
 const sameTarget = (a: PreviewTarget | null, b: PreviewTarget | null): boolean =>
   !!a && !!b && a.kind === b.kind && (a.kind === 'app' ? a.root === (b as { root: string }).root : a.path === (b as { path: string }).path);
@@ -709,7 +813,8 @@ export class Preview {
       else this.setStatus(`no page /${path} in the project`, 'error');
     } else if (data.type === 'bot:storage' && this.target && this.target.kind !== 'model' && data.store && typeof data.store === 'object') {
       // (a web page's, from the facade; a SoftN app's, from the bridge's stand-in for the frame's localStorage)
-      this.storage.set(storageKey(this.target), data.store as Record<string, string>);
+      const sanitized = sanitizePreviewStorage(data.store);
+      if (sanitized) this.storage.set(storageKey(this.target), sanitized);
     } else if (data.type === 'bot:dialog' && typeof data.message === 'string') {
       this.setStatus(`${data.kind ?? 'alert'}: ${data.message.slice(0, 120)}`, 'ok');
     } else if (data.type === 'bot:download' && data.bytes instanceof Uint8Array && data.bytes.byteLength <= 64 * 1024 * 1024) {
@@ -1336,18 +1441,12 @@ export class Preview {
             // The lite tier is bundled in the hosted frame; fetch the shared full engine only on request.
             void softnZippBytes().then(engine => respond({ result: engine }), error => respond({ error: String(error) }));
           } else if (web && data.action === 'nativeStorage') {
-            const input = data.input;
-            const state = new Map(Object.entries(this.storage.get(webStorageKey) ?? {}));
-            if (input?.operation === 'clear') state.clear();
-            else if (input?.operation === 'set' && typeof input.key === 'string' && typeof input.value === 'string') state.set(input.key, input.value);
-            else if (input?.operation === 'remove' && typeof input.key === 'string') state.delete(input.key);
-            else if (input?.operation === 'batch' && Array.isArray(input.replacements)) {
-              for (const item of input.replacements as Array<{ key?: unknown; value?: unknown }>) {
-                if (item && typeof item.key === 'string' && typeof item.value === 'string') state.set(item.key, item.value);
-              }
+            const applied = applyPreviewStorageOp(this.storage.get(webStorageKey), data.input);
+            if (!applied.ok) {
+              respond({ error: applied.error });
+              return;
             }
-            else { respond({ error: 'Unsupported preview storage operation.' }); return; }
-            this.storage.set(webStorageKey, Object.fromEntries(state));
+            this.storage.set(webStorageKey, applied.store);
             respond({ result: { saved: true } });
           } else {
             respond({ error: 'This preview has no backend: server/ actions run only when the app is deployed.' });

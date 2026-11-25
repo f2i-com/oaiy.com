@@ -38,7 +38,7 @@ export function isParallelSafeTool(name: string): boolean {
 /** Call-aware parallel-safety check (treats mutating options like `softn_examples.install_to` as exclusive barriers). */
 export function isParallelSafeCall(call: Pick<ToolCall, 'name' | 'input'>): boolean {
   if (!PARALLEL_SAFE_TOOLS.has(call.name)) return false;
-  if (call.name === 'softn_examples' && typeof call.input?.install_to === 'string' && call.input.install_to.trim().length > 0) {
+  if (call.name === 'softn_examples' && typeof call.input?.install_to === 'string') {
     return false;
   }
   return true;

@@ -323,7 +323,7 @@ impl Talker {
         // first codes, no EOS for the first 2 frames, control ids
         // suppressed (EOS aside); then temperature, top-k, top-p.
         let penalty = s.repetition_penalty as f32;
-        if penalty != 1.0 {
+        if penalty.is_finite() && penalty > 0.0 && penalty != 1.0 {
             for (l, _) in logits.iter_mut().zip(&g.seen).filter(|(_, &seen)| seen) {
                 *l = if *l < 0. { *l * penalty } else { *l / penalty };
             }
@@ -341,7 +341,9 @@ impl Talker {
             g.done = true;
             return Ok(None);
         }
-        g.seen[c0 as usize] = true;
+        if let Some(slot) = g.seen.get_mut(c0 as usize) {
+            *slot = true;
+        }
         let frame = self.predict_rest(&g.hidden, c0, s.sub_temperature, s.sub_top_k, s.greedy, &mut g.rng, &mut g.predictor_cache)?;
         let step = g.frames;
         g.frames += 1;
@@ -400,7 +402,7 @@ impl Talker {
         let s = &w.sampling;
         let vocab = self.ids.dim(1)?;
         let mut logits = self.codec_head.forward(&w.hidden)?.reshape((1, vocab))?.to_dtype(DType::F32)?;
-        if s.repetition_penalty != 1.0 {
+        if s.repetition_penalty.is_finite() && s.repetition_penalty > 0.0 && s.repetition_penalty != 1.0 {
             let p = s.repetition_penalty;
             let penalized = logits.ge(0f64)?.where_cond(&logits.affine(1. / p, 0.)?, &logits.affine(p, 0.)?)?;
             logits = w.seen.where_cond(&penalized, &logits)?;

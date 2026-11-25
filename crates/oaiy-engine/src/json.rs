@@ -470,7 +470,11 @@ impl Parser<'_> {
                 return Ok(Json::Int(i));
             }
         }
-        text.parse::<f64>().map(Json::Num).map_err(|_| self.fail("bad number"))
+        let v = text.parse::<f64>().map_err(|_| self.fail("bad number"))?;
+        if !v.is_finite() {
+            return Err(self.fail("number out of range"));
+        }
+        Ok(Json::Num(v))
     }
 }
 
@@ -545,6 +549,7 @@ mod tests {
             "", "{", "[1, 2", "{\"a\" 1}", "{\"a\": 1,}", "[1,]", "{a: 1}", "tru", "nul",
             "01", "1.", "-", "1e", ".5", "+1", "\"open", "\"a\\x\"", "\"\\u12\"",
             "\"\\ud800\"", "\"\\udc00\"", "\"\\ud800\\u0041\"", "\"tab\there\"", "1 2", "[] x",
+            "1e400", "-1e400", "1e9999",
         ] {
             assert!(Json::parse(bad.as_bytes()).is_err(), "{bad:?} parsed");
         }

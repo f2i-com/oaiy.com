@@ -176,7 +176,11 @@ pub fn has_avx512_cached() -> bool {
 #[inline]
 pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
     assert_eq!(row.len() % BYTES_PER_BLOCK, 0, "q4_k::dot_row_fast: row not block-aligned");
-    assert_eq!(x.len(), row.len() / BYTES_PER_BLOCK * BLOCK_SIZE, "q4_k::dot_row_fast: x length mismatch");
+    assert_eq!(
+        (row.len() / BYTES_PER_BLOCK).checked_mul(BLOCK_SIZE),
+        Some(x.len()),
+        "q4_k::dot_row_fast: x length mismatch"
+    );
     #[cfg(target_arch = "x86_64")]
     if has_avx512_cached() {
         // SAFETY: avx512f + avx512bw verified by has_avx512_cached(), lengths asserted above.
@@ -189,8 +193,10 @@ pub fn dot_row_fast(row: &[u8], x: &[f32]) -> f32 {
 #[inline]
 pub fn dot_rows_fast(w: &[u8], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
     assert_eq!(k % BLOCK_SIZE, 0, "q4_k::dot_rows_fast: k not block-aligned");
-    let row_bytes = k / BLOCK_SIZE * BYTES_PER_BLOCK;
-    assert_eq!(w.len(), n_rows * row_bytes, "q4_k::dot_rows_fast: w length mismatch");
+    let expected_w = (k / BLOCK_SIZE)
+        .checked_mul(BYTES_PER_BLOCK)
+        .and_then(|row_bytes| n_rows.checked_mul(row_bytes));
+    assert_eq!(expected_w, Some(w.len()), "q4_k::dot_rows_fast: w length mismatch");
     assert_eq!(x.len(), k, "q4_k::dot_rows_fast: x length mismatch");
     assert_eq!(out.len(), n_rows, "q4_k::dot_rows_fast: out length mismatch");
     #[cfg(target_arch = "x86_64")]
@@ -487,6 +493,13 @@ mod fused_dot_tests {
             );
         }
         assert!(got.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    #[should_panic(expected = "w length mismatch")]
+    fn dot_rows_fast_rejects_overflowing_dims() {
+        let x = [0.0f32; BLOCK_SIZE];
+        dot_rows_fast(&[], &x, 1usize << (usize::BITS - 1), BLOCK_SIZE, &mut []);
     }
 
     /// The sum of |w_i * x_i| for a row: the scale a dot product's rounding error

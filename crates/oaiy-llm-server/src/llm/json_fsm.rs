@@ -106,9 +106,13 @@ pub enum JsonFsmState {
     ArrNullU = 32,
     ArrNullL1 = 33,
     ArrNullL2 = 34,
+    /// Saw `-` starting an object number value; require at least one ASCII digit next.
+    ValueNumberMinus = 35,
+    /// Saw `-` starting an array number element; require at least one ASCII digit next.
+    ArrValueNumberMinus = 36,
 }
 
-const N_STATES: usize = 35;
+const N_STATES: usize = 37;
 
 /// Single byte transition: returns the next state, or `None` if the byte is
 /// not legal in `s`. Whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`) is permitted
@@ -158,7 +162,8 @@ fn step(s: JsonFsmState, b: u8) -> Option<JsonFsmState> {
         AfterColon => {
             if is_ws { Some(AfterColon) }
             else if b == b'"' { Some(ValueStringBody) }
-            else if is_digit || b == b'-' { Some(ValueNumberBody) }
+            else if is_digit { Some(ValueNumberBody) }
+            else if b == b'-' { Some(ValueNumberMinus) }
             // Literal entry points — start of `true` / `false` / `null`.
             else if b == b't' { Some(TrueR) }
             else if b == b'f' { Some(FalseA) }
@@ -168,6 +173,10 @@ fn step(s: JsonFsmState, b: u8) -> Option<JsonFsmState> {
         ValueStringBody => {
             if b == b'"' { Some(AfterValue) }
             else if is_string_body && b != b'\\' { Some(ValueStringBody) }
+            else { None }
+        }
+        ValueNumberMinus => {
+            if is_digit { Some(ValueNumberBody) }
             else { None }
         }
         ValueNumberBody => {
@@ -203,7 +212,8 @@ fn step(s: JsonFsmState, b: u8) -> Option<JsonFsmState> {
             else if b == b']' { Some(Done) }
             // Element value entries.
             else if b == b'"' { Some(ArrValueStringBody) }
-            else if is_digit || b == b'-' { Some(ArrValueNumberBody) }
+            else if is_digit { Some(ArrValueNumberBody) }
+            else if b == b'-' { Some(ArrValueNumberMinus) }
             else if b == b't' { Some(ArrTrueR) }
             else if b == b'f' { Some(ArrFalseA) }
             else if b == b'n' { Some(ArrNullU) }
@@ -213,7 +223,8 @@ fn step(s: JsonFsmState, b: u8) -> Option<JsonFsmState> {
             // Strict: no `]` after comma — JSON forbids trailing commas.
             if is_ws { Some(ArrAfterComma) }
             else if b == b'"' { Some(ArrValueStringBody) }
-            else if is_digit || b == b'-' { Some(ArrValueNumberBody) }
+            else if is_digit { Some(ArrValueNumberBody) }
+            else if b == b'-' { Some(ArrValueNumberMinus) }
             else if b == b't' { Some(ArrTrueR) }
             else if b == b'f' { Some(ArrFalseA) }
             else if b == b'n' { Some(ArrNullU) }
@@ -222,6 +233,10 @@ fn step(s: JsonFsmState, b: u8) -> Option<JsonFsmState> {
         ArrValueStringBody => {
             if b == b'"' { Some(ArrAfterValue) }
             else if is_string_body && b != b'\\' { Some(ArrValueStringBody) }
+            else { None }
+        }
+        ArrValueNumberMinus => {
+            if is_digit { Some(ArrValueNumberBody) }
             else { None }
         }
         ArrValueNumberBody => {
@@ -321,6 +336,8 @@ impl JsonObjectFsm {
             JsonFsmState::ArrNullU,
             JsonFsmState::ArrNullL1,
             JsonFsmState::ArrNullL2,
+            JsonFsmState::ValueNumberMinus,
+            JsonFsmState::ArrValueNumberMinus,
         ];
 
         // Decode every token once and cache the text — n_states sees the same
@@ -404,7 +421,9 @@ impl JsonObjectFsm {
                 31 => JsonFsmState::ArrFalseE,
                 32 => JsonFsmState::ArrNullU,
                 33 => JsonFsmState::ArrNullL1,
-                _ => JsonFsmState::ArrNullL2,
+                34 => JsonFsmState::ArrNullL2,
+                35 => JsonFsmState::ValueNumberMinus,
+                _ => JsonFsmState::ArrValueNumberMinus,
             };
             out.insert(s, mask.iter().filter(|&&b| b).count());
         }
@@ -570,5 +589,24 @@ mod tests {
     #[test]
     fn whitespace_in_array() {
         assert_eq!(run(Init, "[  1  ,  2  ]").unwrap(), Done);
+    }
+
+    #[test]
+    fn rejects_bare_minus_and_accepts_negative_integers() {
+        for bad in [
+            r#"{"x": -}"#,
+            r#"{"x": - }"#,
+            r#"{"x": -, "y": 1}"#,
+            r#"{"x": --1}"#,
+            r#"[-]"#,
+            r#"[- ]"#,
+            r#"[-, 1]"#,
+            r#"[1, -]"#,
+            r#"[--1]"#,
+        ] {
+            assert!(run(Init, bad).is_none(), "expected bare minus to be rejected: {bad}");
+        }
+        assert_eq!(run(Init, r#"{"x": -42, "y": -0}"#).unwrap(), Done);
+        assert_eq!(run(Init, "[-1, -42, 0]").unwrap(), Done);
     }
 }

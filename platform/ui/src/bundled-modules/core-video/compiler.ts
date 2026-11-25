@@ -52,8 +52,8 @@ const CoreVideoCompiler: ModuleCompiler = {
   );
   // Destructure outputs for multi-output node pattern
   // Always use 'let' for suffix variables as they are only created here
-  let ${outputVar}_video = ${outputVar}.video;
-  let ${outputVar}_path = ${outputVar}.path;
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video;
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path;
   workflow_context["${node.id}"] = ${outputVar};`;
 
       return code;
@@ -89,8 +89,8 @@ const CoreVideoCompiler: ModuleCompiler = {
   }
   // Destructure outputs for multi-output node pattern
   // Always use 'let' for suffix variables as they are only created here
-  let ${outputVar}_video = ${outputVar};
-  let ${outputVar}_path = ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
       return code;
@@ -249,7 +249,7 @@ const CoreVideoCompiler: ModuleCompiler = {
     },
     "${node.id}"
   );
-  let ${outputVar}_video = ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
       }
       // A service picked on the node is what it runs on: its own Backend and Endpoint show only while Service is blank,
@@ -309,7 +309,7 @@ const CoreVideoCompiler: ModuleCompiler = {
     console.log("[Workflow] aborted");
     return workflow_context;
   }
-  let ${outputVar}_video = ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         return code;
       }
@@ -471,7 +471,7 @@ const CoreVideoCompiler: ModuleCompiler = {
   }
   // Create suffixed output variable for consistency with multi-output pattern
   // Always use 'let' for suffix variables as they are only created here
-  let ${outputVar}_video = ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
       return code;
     }
@@ -504,8 +504,8 @@ const CoreVideoCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variables for multi-output node
-  let ${outputVar}_video = ${outputVar}.video || ${outputVar};
-  let ${outputVar}_video_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video || ${outputVar};
+  ${letOrAssign}${outputVar}_video_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
       return code;
@@ -544,8 +544,8 @@ const CoreVideoCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variables for multi-output node
-  let ${outputVar}_video = ${outputVar}.video || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
 
       return code;
@@ -598,8 +598,8 @@ const CoreVideoCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variables for multi-output node
-  let ${outputVar}_video = ${outputVar}.video || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
       } else {
         // Standard mode: use text and durations inputs directly
@@ -622,8 +622,8 @@ const CoreVideoCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variables for multi-output node
-  let ${outputVar}_video = ${outputVar}.video || ${outputVar};
-  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_video = ${outputVar}.video || ${outputVar};
+  ${letOrAssign}${outputVar}_path = ${outputVar}.path || ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
       }
 
@@ -667,10 +667,10 @@ const CoreVideoCompiler: ModuleCompiler = {
   }
   // Create suffixed output variables for multi-output node
   // Runtime returns { video, path, duration, width, height }
-  let ${outputVar}_video = ${outputVar}.path || ${outputVar};
-  let ${outputVar}_duration = ${outputVar}.duration || 0;
-  let ${outputVar}_width = ${outputVar}.width || 0;
-  let ${outputVar}_height = ${outputVar}.height || 0;
+  ${letOrAssign}${outputVar}_video = ${outputVar}.path || ${outputVar};
+  ${letOrAssign}${outputVar}_duration = ${outputVar}.duration || 0;
+  ${letOrAssign}${outputVar}_width = ${outputVar}.width || 0;
+  ${letOrAssign}${outputVar}_height = ${outputVar}.height || 0;
   workflow_context["${node.id}"] = ${outputVar};`;
 
       return code;

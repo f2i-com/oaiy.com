@@ -126,12 +126,16 @@ fn merge(tok: &Tokenizer, visible: &str, out: &mut Vec<u32>) -> Result<()> {
             return;
         }
         let (l, r) = (&syms[left], &syms[right]);
+        let len = l.len + r.len;
+        if tok.id_of(&visible[l.start..l.start + len]).is_some_and(|id| tok.is_control(id)) {
+            return;
+        }
         key.0.clear();
         key.0.push_str(text(l));
         key.1.clear();
         key.1.push_str(text(r));
         if let Some(&rank) = ranks.get(&key) {
-            heap.push(Reverse((rank, left, right, l.len + r.len)));
+            heap.push(Reverse((rank, left, right, len)));
         }
     };
     let mut heap = BinaryHeap::with_capacity(n);

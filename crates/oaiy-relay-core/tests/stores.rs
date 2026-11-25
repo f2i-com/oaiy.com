@@ -332,3 +332,26 @@ fn a_cursor_that_cannot_be_read_is_an_error_and_never_a_first_run() {
     let mut lp = PollLoop::new(e.client.clone(), token, FilePollStore::new(&*dir), std::sync::Arc::new(NullSink), PollLoopConfig::default());
     assert!(matches!(lp.run(), LoopEnd::StoreUnreadable(_)));
 }
+
+#[test]
+fn write_atomic_handles_concurrent_threads_without_temp_file_collisions() {
+    let dir = scratch("atomic-threads");
+    let handles: Vec<_> = (0..8)
+        .map(|tid| {
+            let path = dir.join(format!("item.{tid}"));
+            std::thread::spawn(move || {
+                for i in 0..32 {
+                    let payload = format!("thread-{tid}-iter-{i}");
+                    write_atomic(&path, payload.as_bytes()).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    for tid in 0..8 {
+        assert_eq!(fs::read_to_string(dir.join(format!("item.{tid}"))).unwrap(), format!("thread-{tid}-iter-31"));
+    }
+    assert!(fs::read_dir(&*dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp")));
+}

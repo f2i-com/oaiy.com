@@ -405,8 +405,16 @@ const CoreUtilityCompiler: ModuleCompiler = {
     // belongs to should read "nothing known" instead of dying, since nothing
     // out here can answer it.
     let app = {};`;
+          const declared = new Set(['context', 'input', '$input', 'nodes', 'inputs', 'event', 'upstream', 'app', 'loop_index']);
           for (const [handleId, sourceVar] of inputs) {
-            if (handleId !== 'default' && handleId !== 'input') {
+            if (
+              handleId !== 'default' &&
+              handleId !== 'input' &&
+              /^[A-Za-z_$][\w$]*$/.test(handleId) &&
+              !RESERVED_WORDS.has(handleId) &&
+              !declared.has(handleId)
+            ) {
+              declared.add(handleId);
               out += `
     let ${handleId} = ${sourceVar};`;
             }
@@ -415,7 +423,6 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // `input2`, …): each is its handle's value, so a block reads what its inputs are called. Before, the
           // names were only labels: a block with a second input named `picture` threw "picture is not defined".
           // A name that is not an identifier, or is one of the names above, stays a label.
-          const declared = new Set(['context', 'input', '$input', 'nodes', 'inputs', 'event', 'upstream', 'app', 'loop_index', ...inputs.keys()]);
           const names = Array.isArray(data.inputNames) ? (data.inputNames as unknown[]) : [];
           names.forEach((name, i) => {
             if (typeof name !== 'string' || !/^[A-Za-z_$][\w$]*$/.test(name) || RESERVED_WORDS.has(name) || declared.has(name)) return;

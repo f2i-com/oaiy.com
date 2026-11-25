@@ -283,8 +283,9 @@ final class Pairing
             throw ApiError::make('invalid_request');
         }
         $now = Clock::now();
-        $revokeAfter = [];
-        $result = $ctx->db->write(function (Db $db) use ($ctx, $p, $pid, $doc, $approve, $now, &$revokeAfter): array {
+        $revoked = [];
+        $result = $ctx->db->write(function (Db $db) use ($ctx, $p, $pid, $doc, $approve, $now, &$revoked): array {
+            $revoked = [];
             $row = self::owned($db, $p, $pid, $now);
             if (!$approve) {
                 if ($row['state'] === 'denied') {
@@ -336,6 +337,9 @@ final class Pairing
             if ($active >= (int)$ctx->cfg->limit('rosterMax')) {
                 throw ApiError::make('conflict');
             }
+            foreach ($same as $old) {
+                $revoked = array_merge($revoked, Devices::revokeInTx($ctx, $db, $old, false, $now));
+            }
             [$id, $token] = Devices::create($db, $ctx->auth, 'phone', $phone['name'], [
                 'ed25519' => $phone['ed'], 'x25519' => $phone['x'], 'owner_desktop' => (string)$row['desktop_dev'], 'app_id' => (string)$row['app_id'],
                 'peer_thumbprint' => (string)$row['desktop_thumb'], 'grants' => $phone['grants'], 'flags' => ['canCmd' => false],
@@ -351,12 +355,9 @@ final class Pairing
                 "UPDATE pairings SET state = 'approved', phone_dev = ?, sealed_token = ?, receipt = ?, response = NULL WHERE pid = ? AND state = 'answered'",
                 [$id, B64::enc($sealed), Json::encode(['issuedAt' => $phone['issuedAt'], 'signature' => $phone['signature'], 'grants' => array_values($signedGrants)]), $pid]
             );
-            $revokeAfter = $same;
             return ['state' => 'approved', 'deviceId' => $id];
         });
-        foreach ($revokeAfter as $old) {
-            Devices::revoke($ctx, $old);
-        }
+        Devices::markRevoked($ctx, $revoked);
         $ctx->signals->wakeWrite('pair:' . $pid);
         return $result;
     }

@@ -161,15 +161,23 @@ pub fn inflate(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<End> {
                 b.pos -= (b.cnt / 8) as usize;
                 b.buf = 0;
                 b.cnt = 0;
-                let hdr = src.get(b.pos..b.pos + 4).ok_or_else(|| bad("truncated stored block"))?;
+                let hdr = b
+                    .pos
+                    .checked_add(4)
+                    .and_then(|end| src.get(b.pos..end))
+                    .ok_or_else(|| bad("truncated stored block"))?;
                 let len = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
                 if len as u16 != !u16::from_le_bytes([hdr[2], hdr[3]]) {
                     return Err(bad("stored block length check failed"));
                 }
                 b.pos += 4;
-                let data = src.get(b.pos..b.pos + len).ok_or_else(|| bad("truncated stored block"))?;
+                let data = b
+                    .pos
+                    .checked_add(len)
+                    .and_then(|end| src.get(b.pos..end))
+                    .ok_or_else(|| bad("truncated stored block"))?;
                 b.pos += len;
-                let room = limit - out.len();
+                let room = limit.saturating_sub(out.len());
                 if len >= room {
                     out.extend_from_slice(&data[..room]);
                     if len > room || !last {
@@ -187,12 +195,18 @@ pub fn inflate(src: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<End> {
                     (Huffman::new(&l).expect("fixed code"), Huffman::new(&[5u8; 30]).expect("fixed code"))
                 });
                 if codes(&mut b, lit, dist, out, limit)? {
+                    if b.overrun() {
+                        return Err(bad("truncated stream"));
+                    }
                     return Ok(End::Limit);
                 }
             }
             2 => {
                 let (lit, dist) = dynamic_codes(&mut b)?;
                 if codes(&mut b, &lit, &dist, out, limit)? {
+                    if b.overrun() {
+                        return Err(bad("truncated stream"));
+                    }
                     return Ok(End::Limit);
                 }
             }
@@ -263,7 +277,10 @@ fn codes(b: &mut Bits, lit: &Huffman, dist: &Huffman, out: &mut Vec<u8>, limit: 
         }
         let sym = lit.decode(b)?;
         if sym < 256 {
-            if out.len() == limit {
+            if b.overrun() {
+                return Err(bad("truncated stream"));
+            }
+            if out.len() >= limit {
                 return Ok(true);
             }
             out.push(sym as u8);
@@ -282,10 +299,13 @@ fn codes(b: &mut Bits, lit: &Huffman, dist: &Huffman, out: &mut Vec<u8>, limit: 
             return Err(bad("invalid distance symbol"));
         }
         let dist = DIST_BASE[d] as usize + b.take(u32::from(DIST_EXTRA[d])) as usize;
+        if b.overrun() {
+            return Err(bad("truncated stream"));
+        }
         if dist > out.len() {
             return Err(bad("distance too far back"));
         }
-        let room = limit - out.len();
+        let room = limit.saturating_sub(out.len());
         let n = len.min(room);
         let start = out.len() - dist;
         if dist >= n {
@@ -358,5 +378,19 @@ mod tests {
         broken[12] ^= 1;
         assert!(zlib_decompress(&broken, 1 << 20).is_err());
         assert!(zlib_decompress(&fixed[..8], 1 << 20).is_err());
+    }
+
+    #[test]
+    fn inflate_handles_over_limit_out_and_truncated_limit_hit() {
+        // out already longer than limit must not underflow
+        let stored_deflate = [1, 3, 0, 252, 255, b'a', b'b', b'c'];
+        let mut out = vec![1, 2, 3, 4];
+        assert_eq!(inflate(&stored_deflate, &mut out, 2).unwrap(), End::Limit);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+
+        // truncated fixed block hitting limit on overrun bits must error, not return End::Limit
+        let fixed_deflate = [203, 72]; // truncated after partial stream
+        let mut out2 = Vec::new();
+        assert!(inflate(&fixed_deflate, &mut out2, 2).is_err());
     }
 }

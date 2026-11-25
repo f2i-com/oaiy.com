@@ -347,6 +347,18 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
 
 /// The audio (24 kHz), how many frames, and how long loading and speaking took.
 fn speak(r: &Request, report: &mut impl FnMut(Json)) -> Result<(Vec<f32>, usize, f64, f64)> {
+    if !r.temperature.is_finite() || r.temperature < 0.0 {
+        candle_core::bail!("speech: temperature must be finite and >= 0");
+    }
+    let penalty = if r.repetition_penalty_set { r.repetition_penalty } else { 1.1 };
+    if !penalty.is_finite() || penalty <= 0.0 {
+        candle_core::bail!("speech: repetition_penalty must be finite and > 0");
+    }
+    let scale = r.cfg_scale.unwrap_or(1.0);
+    if !scale.is_finite() || scale < 0.0 {
+        candle_core::bail!("speech: cfg_scale must be finite and >= 0");
+    }
+    let greedy = r.greedy || r.temperature == 0.0;
     let dev = device(r.device)?;
     report(event("loading_speech_model", 0, 1));
     let load_started = Instant::now();
@@ -374,7 +386,6 @@ fn speak(r: &Request, report: &mut impl FnMut(Json)) -> Result<(Vec<f32>, usize,
             None => vec![Segment::Text(line)],
         }
     };
-    let scale = r.cfg_scale.unwrap_or(1.0);
     let main = with_voice(line(true));
     // Guidance steers toward the instruction: without one there is nothing to steer.
     let negative = if scale != 1.0 && !instruction.is_empty() { Some(with_voice(line(false))) } else { None };
@@ -389,7 +400,6 @@ fn speak(r: &Request, report: &mut impl FnMut(Json)) -> Result<(Vec<f32>, usize,
     drop(te);
     let guided = branches.len() > 1;
     let max_frames = ((r.max_seconds * FRAMES_PER_SECOND).ceil() as usize).min(MAX_FRAMES);
-    let penalty = if r.repetition_penalty_set { r.repetition_penalty } else { 1.1 };
     let mut rng = Rng::new(r.seed);
     let mut history: Vec<usize> = Vec::new();
     let mut frames: Vec<[u32; 16]> = Vec::new();
@@ -397,13 +407,17 @@ fn speak(r: &Request, report: &mut impl FnMut(Json)) -> Result<(Vec<f32>, usize,
         // The frame's first code, from the backbone.
         let logits = guide(model.logits(&branches[0].hidden)?, if guided { Some(model.logits(&branches[1].hidden)?) } else { None }, scale)?;
         let mut l: Vec<f32> = logits.to_vec1()?;
-        for &t in history.iter().collect::<std::collections::BTreeSet<_>>() {
-            l[t] = if l[t] > 0. { l[t] / penalty as f32 } else { l[t] * penalty as f32 };
+        if penalty != 1.0 {
+            for &t in history.iter().collect::<std::collections::BTreeSet<_>>() {
+                if let Some(slot) = l.get_mut(t) {
+                    *slot = if *slot > 0. { *slot / penalty as f32 } else { *slot * penalty as f32 };
+                }
+            }
         }
         for v in &mut l[CODEBOOK_SIZE..EOS] {
             *v = f32::NEG_INFINITY;
         }
-        let first = sample(&l, r.temperature, r.top_k, r.top_p, r.greedy, &mut rng) as usize;
+        let first = sample(&l, r.temperature, r.top_k, r.top_p, greedy, &mut rng) as usize;
         if first == EOS {
             break;
         }
@@ -431,7 +445,7 @@ fn speak(r: &Request, report: &mut impl FnMut(Json)) -> Result<(Vec<f32>, usize,
             for v in &mut l[CODEBOOK_SIZE..] {
                 *v = f32::NEG_INFINITY;
             }
-            let code = sample(&l, r.temperature, r.top_k, r.top_p, r.greedy, &mut rng);
+            let code = sample(&l, r.temperature, r.top_k, r.top_p, greedy, &mut rng);
             frame[c] = code;
             let e = model.audio_embed.narrow(0, code as usize + c * AUDIO_VOCAB, 1)?.unsqueeze(0)?;
             inputs = inputs.iter().map(|_| e.clone()).collect();

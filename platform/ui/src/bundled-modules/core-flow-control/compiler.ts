@@ -118,8 +118,8 @@ const CoreFlowControlCompiler: ModuleCompiler = {
     }
   }`;
 
-          // Use let for branch outputs only if not inside a loop (loop pre-declares them)
-          const branchLetOrAssign = ctx.isInLoop ? '' : 'let ';
+          // Use let for branch outputs only when not pre-declared (e.g. inside a loop)
+          const branchLetOrAssign = (ctx.skipVarDeclaration || ctx.isInLoop) ? '' : 'let ';
           code += `
   ${letOrAssign}${outputVar} = ${inputVar};
   console.log("[Condition] (${node.id}): expression result=" + _cond_result_${sanitizedId});
@@ -231,8 +231,8 @@ const CoreFlowControlCompiler: ModuleCompiler = {
             break;
         }
 
-        // Use let for branch outputs only if not inside a loop (loop pre-declares them)
-        const branchLetOrAssign = ctx.isInLoop ? '' : 'let ';
+        // Use let for branch outputs only when not pre-declared (e.g. inside a loop)
+        const branchLetOrAssign = (ctx.skipVarDeclaration || ctx.isInLoop) ? '' : 'let ';
         code += `
   ${letOrAssign}${outputVar} = ${inputVar};
   console.log("[Condition] (${node.id}): result=" + _cond_result_${sanitizedId});
@@ -411,12 +411,11 @@ const CoreFlowControlCompiler: ModuleCompiler = {
   }
   workflow_context["${node.id}"] = ${outputVar};`;
 
-          // Create output variables for each macro output
-          // Always use 'let' for suffix variables as they are only created here (not pre-declared by main compiler)
+          // Assign (or declare when not pre-declared by enclosing loop) output variables for each macro output
           for (const output of macroOutputs) {
             const outputSafeId = output.id.replace(/[^a-zA-Z0-9_]/g, '_');
             code += `
-  let ${outputVar}_${outputSafeId} = ${outputVar}?.["${escapeString(output.name)}"] ?? null;`;
+  ${letOrAssign}${outputVar}_${outputSafeId} = ${outputVar}?.["${escapeString(output.name)}"] ?? null;`;
           }
         }
         break;

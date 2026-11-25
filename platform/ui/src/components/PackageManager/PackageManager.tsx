@@ -157,7 +157,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
       // the list-area error block is no longer occluded by the TrustDialog.
       setPendingInstall(null);
     },
-    [pendingInstall, peekPackageSize, installPackage]
+    [pendingInstall, peekPackageSize, installPackage, confirm]
   );
 
   // Handle trust dialog cancel
@@ -197,14 +197,15 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
   // Header with collapse toggle
   const header = (
     <button
-      className="flex items-center justify-between w-full px-3 py-2 text-left hover:bg-slate-100 dark:hover:bg-slate-700/50 rounded-lg transition-colors"
+      type="button"
+      className="flex items-center justify-between w-full px-3 py-2 text-left hover:bg-surface-tertiary rounded-lg transition-colors"
       onClick={() => setExpanded(!expanded)}
       disabled={disabled}
       aria-expanded={expanded}
     >
       <div className="flex items-center gap-2">
         <svg
-          className="w-4 h-4 text-purple-400"
+          className="w-4 h-4 text-accent"
           fill="none"
           stroke="currentColor"
           viewBox="0 0 24 24"
@@ -216,15 +217,15 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
             d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
           />
         </svg>
-        <span className="text-sm font-medium text-slate-700 dark:text-slate-200">Packages</span>
+        <span className="text-sm font-medium text-content-primary">Packages</span>
         {installedCount > 0 && (
-          <span className="px-1.5 py-0.5 text-xs font-medium bg-purple-500/20 text-purple-300 rounded">
+          <span className="px-1.5 py-0.5 text-xs font-medium bg-accent/15 text-accent rounded">
             {installedCount}
           </span>
         )}
       </div>
       <svg
-        className={`w-4 h-4 text-slate-400 transition-transform ${
+        className={`w-4 h-4 text-content-secondary transition-transform ${
           expanded ? 'rotate-180' : ''
         }`}
         fill="none"
@@ -243,14 +244,14 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
 
   if (!expanded) {
     return (
-      <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+      <div className="bg-surface-secondary rounded-xl border border-edge-primary">
         {header}
       </div>
     );
   }
 
   return (
-    <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+    <div className="bg-surface-secondary rounded-xl border border-edge-primary">
       {header}
 
       <div className="px-3 pb-3 space-y-3">
@@ -258,7 +259,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
         <div className="flex gap-2">
           <div className="relative flex-1">
             <svg
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400"
+              className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-content-secondary"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -276,7 +277,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
               aria-label="Search packages by name, ID, or description"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-8 pr-3 py-1.5 text-sm bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+              className="w-full pl-8 pr-3 py-1.5 text-sm bg-surface-tertiary border border-edge-primary rounded-lg text-content-primary placeholder:text-content-faint focus:outline-none focus:ring-2 focus:ring-accent/50"
             />
           </div>
           <button
@@ -284,7 +285,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
             onClick={handleBrowsePackage}
             disabled={disabled}
             aria-label="Install package"
-            className="px-3 py-1.5 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+            className="px-3 py-1.5 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
           >
             <svg
               className="w-4 h-4"
@@ -305,8 +306,8 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
 
         {/* Error display */}
         {error && (
-          <div className="px-3 py-2 text-sm bg-red-500/10 border border-red-500/30 rounded-lg text-red-400">
-            {error}
+          <div className="oaiy-banner err">
+            <span className="flex-1">{error}</span>
           </div>
         )}
 
@@ -314,7 +315,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
         {loading ? (
           <div className="flex items-center justify-center py-8">
             <svg
-              className="w-6 h-6 text-purple-400 animate-spin"
+              className="w-6 h-6 text-accent animate-spin"
               fill="none"
               viewBox="0 0 24 24"
             >
@@ -334,9 +335,9 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
             </svg>
           </div>
         ) : packages.length === 0 ? (
-          <div className="text-center py-8 text-slate-500 dark:text-slate-400 text-sm">
+          <div className="text-center py-8 text-content-secondary text-sm">
             <svg
-              className="w-12 h-12 mx-auto mb-3 text-slate-600"
+              className="w-12 h-12 mx-auto mb-3 text-content-faint"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -349,7 +350,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
               />
             </svg>
             <p>No packages installed</p>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            <p className="text-xs text-content-secondary mt-1">
               Click "Install" to add a .oaiy package
             </p>
           </div>
@@ -377,7 +378,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                   onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                   disabled={currentPage === 1}
                   aria-label="Previous page"
-                  className="p-1 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <svg
                     className="w-4 h-4"
@@ -395,7 +396,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                 </button>
                 <span
                   aria-current="page"
-                  className="text-xs text-slate-500 dark:text-slate-400"
+                  className="text-xs text-content-secondary"
                 >
                   {currentPage} / {totalPages}
                 </span>
@@ -406,7 +407,7 @@ export function PackageManager({ disabled, onPackageOpen }: PackageManagerProps)
                   }
                   disabled={currentPage === totalPages}
                   aria-label="Next page"
-                  className="p-1 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="p-1 text-content-secondary hover:text-content-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <svg
                     className="w-4 h-4"

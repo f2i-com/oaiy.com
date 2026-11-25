@@ -14,6 +14,7 @@ use Oaiy\Relay\Devices;
 use Oaiy\Relay\Ids;
 use Oaiy\Relay\Info;
 use Oaiy\Relay\Json;
+use Oaiy\Relay\Mailbox;
 use Oaiy\Relay\Principal;
 use Oaiy\Relay\Request;
 use Oaiy\Relay\Response;
@@ -249,9 +250,18 @@ final class DevicesApi
         $grace = $now + 600;
         [$token, $tokenId, $hash] = $ctx->auth->mint();
         $ctx->db->write(function (Db $db) use ($p, $now, $grace, $tokenId, $hash): void {
-            // The check that follows reads what other rotations have committed. Lock the device row first: on MySQL and
-            // MariaDB a plain count answers from a snapshot and two rotations at once both found no rotation in progress.
-            $db->one('SELECT id FROM devices WHERE id = ?' . $db->forUpdate(), [$p->id]);
+            // Lock the device row first and re-check inside the transaction that neither the device nor the calling token was revoked meanwhile.
+            $dev = $db->one('SELECT revoked_at FROM devices WHERE id = ?' . $db->forUpdate(), [$p->id]);
+            if ($dev === null || $dev['revoked_at'] !== null) {
+                throw ApiError::make('revoked')->because($dev === null ? 'device_not_found_in_transaction' : 'device_revoked_in_transaction');
+            }
+            $tok = $db->one('SELECT revoked_at, not_after FROM tokens WHERE id = ?' . $db->forUpdate(), [$p->tokenId]);
+            if ($tok === null || $tok['revoked_at'] !== null) {
+                throw ApiError::make('revoked')->because('token_revoked_in_transaction');
+            }
+            if ($tok['not_after'] !== null && (int)$tok['not_after'] <= $now) {
+                throw ApiError::make('unauthorized')->because('token_expired_in_transaction');
+            }
             $active = (int)$db->val('SELECT COUNT(*) FROM tokens WHERE device_id = ? AND grace_until IS NOT NULL AND grace_until > ? AND revoked_at IS NULL', [$p->id, $now]);
             if ($active > 0) {
                 throw ApiError::make('conflict');
@@ -307,6 +317,7 @@ final class DevicesApi
         // not interleave (each one's list is stored and acted on whole, in an order), and a failure halfway leaves neither.
         $revoked = $ctx->db->write(function (Db $db) use ($ctx, $p, $app, $rev, $hash, $ths, $now): array {
             $db->gate('roster:' . $p->id);
+            Mailbox::requireActive($db, $p->id, 'revoked');
             $db->insertIgnore('roster', ['desktop_dev' => $p->id, 'app_id' => $app, 'revision' => 0, 'hash' => '', 'thumbprints' => '[]', 'updated_at' => $now]);
             $db->exec('UPDATE roster SET revision = ?, hash = ?, thumbprints = ?, updated_at = ? WHERE desktop_dev = ? AND app_id = ?', [$rev, $hash, Json::encode(array_values($ths)), $now, $p->id, $app]);
             $ids = [];

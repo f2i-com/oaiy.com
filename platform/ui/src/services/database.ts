@@ -9,6 +9,7 @@
  */
 import Database from '@tauri-apps/plugin-sql';
 import { databaseLogger } from '../utils/logger';
+import { isReadOnlySql } from '../lib/sqlReadOnly';
 
 // Tauri invoke type
 declare const window: Window & {
@@ -544,8 +545,7 @@ export class FlowDatabaseManager {
     params?: (string | number | null)[],
     packageId?: string
   ): Promise<QueryResult> {
-    const head = sql.trim().toUpperCase();
-    const isSelect = head.startsWith('SELECT') || head.startsWith('WITH') || head.startsWith('PRAGMA') || head.startsWith('EXPLAIN');
+    const isSelect = isReadOnlySql(sql);
 
     // For SELECT queries, try to open existing database or return empty
     const key = this.getDatabaseKey(flowId, packageId);
@@ -1195,9 +1195,8 @@ export async function executeRawSql(
 ): Promise<QueryResult> {
   const database = await getDatabase();
 
-  // Determine if this is a SELECT or modification query
-  const head = sql.trim().toUpperCase();
-  const isSelect = head.startsWith('SELECT') || head.startsWith('WITH') || head.startsWith('PRAGMA') || head.startsWith('EXPLAIN');
+  // Determine if this is a read-only SELECT or modification query
+  const isSelect = isReadOnlySql(sql);
 
   if (isSelect) {
     const rows = await database.select<Record<string, unknown>[]>(sql, params || []);

@@ -9,6 +9,66 @@ import type { RuntimeMethod } from 'oaiy-core/src/module-types';
 import type { CustomService } from '../core-service/examples';
 import { runContract } from '../core-service/contractRuntime';
 
+const AUDIO_FORMATS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac']);
+
+export function sanitizeAudioFilename(name: string | undefined, fallback: string): string {
+    const cleaned = String(name ?? '')
+        .replace(/[^A-Za-z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80);
+    return cleaned || fallback;
+}
+
+export function sanitizeAudioFormat(format: string | undefined, fallback: string = 'wav'): string {
+    const normalized = String(format ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    return AUDIO_FORMATS.has(normalized) ? normalized : fallback;
+}
+
+export function redactMediaToken(value: string): string {
+    if (!value) return value;
+    return value
+        .replace(/(\/media\/)([^/?#]+)(\/oaiy-output\/)/gi, '$1[REDACTED]$3')
+        .replace(/(\/media\/)([A-Za-z0-9_-]{16,})(\/)/g, '$1[REDACTED]$3')
+        .replace(/:\/\/[^/@\s]+@/, '://[REDACTED]@');
+}
+
+export function resolveLocalMediaUrl(mediaUrl: string, appDataDir: string): string {
+    if (!mediaUrl || typeof mediaUrl !== 'string') return mediaUrl;
+    let parsed: URL;
+    try {
+        parsed = new URL(mediaUrl);
+    } catch {
+        return mediaUrl;
+    }
+    if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost') {
+        return mediaUrl;
+    }
+    // Check raw path BEFORE WHATWG URL normalization collapses /%2e%2e/ or /../ or \
+    const hostIdx = mediaUrl.indexOf(parsed.host);
+    const rawPath = hostIdx >= 0 ? mediaUrl.slice(hostIdx + parsed.host.length).split(/[?#]/)[0] : '';
+    if (/%2e|%2f|%5c|\\/i.test(rawPath) || rawPath.split('/').includes('..')) {
+        throw new Error('Invalid media URL: path traversal detected');
+    }
+    const baseDir = appDataDir.replace(/[/\\]+$/, '');
+    const outputMatch = /^\/media\/(?:[^/]+\/)?oaiy-output\/(.+)$/.exec(parsed.pathname);
+    if (outputMatch) {
+        const rest = decodeURIComponent(outputMatch[1]);
+        if (rest.includes('\0') || rest.replace(/\\/g, '/').split('/').includes('..')) {
+            throw new Error('Invalid media URL: path traversal detected');
+        }
+        return `${baseDir}/output/${rest}`;
+    }
+    const genericMatch = /^\/media\/(?:[A-Za-z0-9_-]{16,}\/)?(.+)$/.exec(parsed.pathname);
+    if (genericMatch) {
+        const rest = decodeURIComponent(genericMatch[1]);
+        if (rest.includes('\0') || rest.replace(/\\/g, '/').split('/').includes('..')) {
+            throw new Error('Invalid media URL: path traversal detected');
+        }
+        return `${baseDir}/${rest}`;
+    }
+    return mediaUrl;
+}
+
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAudioMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
 
@@ -460,10 +520,13 @@ async function runTtsExternal(
     }
 
     // Resolve where the audio bytes are coming from + an extension.
-    const ext = responseType.endsWith('_mp3') ? 'mp3'
-        : responseType.endsWith('_wav') ? 'wav'
-        : (opts.outputFormat || 'wav');
-    const baseName = opts.filename || 'tts_output';
+    const ext = sanitizeAudioFormat(
+        responseType.endsWith('_mp3') ? 'mp3'
+            : responseType.endsWith('_wav') ? 'wav'
+            : opts.outputFormat,
+        'wav'
+    );
+    const baseName = sanitizeAudioFilename(opts.filename, 'tts_output');
     const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
     const outputPath = `${appDataDir}/output/${baseName}_${Date.now()}.${ext}`;
 
@@ -695,7 +758,8 @@ async function textToSpeech(
             ctx.log('info', `[TTS] Generated audio: ${result.audio_path}`);
 
             // Copy the file to our output directory
-            const outputPath = `${appDataDir}/output/${filename || 'tts'}_${Date.now()}.wav`;
+            const safeFilename = sanitizeAudioFilename(filename, 'tts');
+            const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.wav`;
 
             try {
                 await ctx.tauri.invoke('plugin:oaiy-filesystem|native_copy_file', {
@@ -725,8 +789,9 @@ async function textToSpeech(
         }
 
         // Handle PCM16 stream and audio file formats
-        const fileExt = responseFormat === 'audio_file' ? (outputFormat || 'mp3') : 'wav';
-        const outputPath = `${appDataDir}/output/${filename || 'tts'}_${Date.now()}.${fileExt}`;
+        const fileExt = responseFormat === 'audio_file' ? sanitizeAudioFormat(outputFormat, 'mp3') : 'wav';
+        const safeFilename = sanitizeAudioFilename(filename, 'tts');
+        const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.${fileExt}`;
 
         // Make request to external API using FormData
         const formData = new FormData();
@@ -923,8 +988,9 @@ async function saveAudio(
         }
 
         // Construct output path
-        const ext = format || 'wav';
-        const outputPath = `${outputDir}/${filename || 'audio_output'}.${ext}`;
+        const ext = sanitizeAudioFormat(format, 'wav');
+        const safeFilename = sanitizeAudioFilename(filename, 'audio_output');
+        const outputPath = `${outputDir}/${safeFilename}.${ext}`;
 
         ctx.log('info', `[Audio] Copying to: ${outputPath}`);
 
@@ -941,7 +1007,7 @@ async function saveAudio(
         let audioUrl = outputPath;
         try {
             audioUrl = await ctx.tauri.invoke<string>('get_media_url', { filePath: outputPath });
-            ctx.log('info', `[Audio] Media URL: ${audioUrl}`);
+            ctx.log('info', `[Audio] Media URL: ${redactMediaToken(audioUrl)}`);
         } catch (e) {
             ctx.log('error', `[Audio] Failed to get media URL: ${e}`);
         }
@@ -1226,9 +1292,10 @@ async function generateMusic(
 
         // Get app data dir for output
         const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-        // Determine file extension from source path
-        const sourceExt = audioPath.split('.').pop() || 'mp3';
-        const outputPath = `${appDataDir}/output/${filename || 'music'}_${Date.now()}.${sourceExt}`;
+        // Determine file extension from source path (allowlisted)
+        const sourceExt = sanitizeAudioFormat(audioPath.split('.').pop(), 'mp3');
+        const safeFilename = sanitizeAudioFilename(filename, 'music');
+        const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.${sourceExt}`;
 
         // Copy the file to our output directory
         try {
@@ -1340,7 +1407,8 @@ async function grabAudio(
 
         // Get app data dir for output
         const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-        const outputPath = `${appDataDir}/output/audio_dl_${result.video_id || 'clip'}_${Date.now()}.wav`;
+        const safeVideoId = sanitizeAudioFilename(result.video_id, 'clip');
+        const outputPath = `${appDataDir}/output/audio_dl_${safeVideoId}_${Date.now()}.wav`;
 
         // Copy the file to our output directory
         try {
@@ -1433,24 +1501,16 @@ async function speechToText(
         throw new Error('Operation aborted by user');
     }
 
-    ctx.log('info', `[STT] Transcribing: ${mediaPath}`);
+    ctx.log('info', `[STT] Transcribing: ${redactMediaToken(typeof mediaPath === 'string' ? mediaPath : '')}`);
     ctx.onNodeStatus?.(nodeId, 'running');
 
     try {
-        if (!mediaPath || mediaPath.trim() === '') {
+        if (!mediaPath || (typeof mediaPath === 'string' && mediaPath.trim() === '')) {
             throw new Error('No media file provided for transcription');
         }
 
         // Resolve media path - could be a media URL or direct path
         let resolvedPath = mediaPath;
-
-        // If it's a media URL, convert to file path
-        if (mediaPath.startsWith('http://127.0.0.1:') && mediaPath.includes('/media/')) {
-            if (ctx.tauri) {
-                const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-                resolvedPath = mediaPath.replace(/http:\/\/127\.0\.0\.1:\d+\/media\/oaiy-output\//, `${appDataDir}/output/`);
-            }
-        }
 
         // If it's an object with a path property
         if (typeof mediaPath === 'object' && mediaPath !== null) {
@@ -1458,7 +1518,15 @@ async function speechToText(
             resolvedPath = mediaObj.path || mediaObj.audio || mediaObj.video || '';
         }
 
-        ctx.log('info', `[STT] Resolved path: ${resolvedPath}`);
+        // If it's a local media URL (tokenized or untokenized), convert to file path safely
+        if (typeof resolvedPath === 'string' && resolvedPath.includes('/media/')) {
+            if (ctx.tauri) {
+                const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
+                resolvedPath = resolveLocalMediaUrl(resolvedPath, appDataDir);
+            }
+        }
+
+        ctx.log('info', `[STT] Resolved path: ${redactMediaToken(resolvedPath)}`);
 
         // Check if WhisperX service is running
         await checkServiceAvailable(apiUrl, 'WhisperX STT');
@@ -1582,10 +1650,10 @@ async function appendAudio(
                 audioPath = audio.path || audio.audio || '';
             }
             if (audioPath) {
-                // Convert media URLs to file paths if needed
-                if (audioPath.startsWith('http://127.0.0.1:') && audioPath.includes('/media/')) {
+                // Convert local media URLs (tokenized or untokenized) to file paths if needed
+                if (audioPath.includes('/media/')) {
                     const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-                    audioPath = audioPath.replace(/http:\/\/127\.0\.0\.1:\d+\/media\/oaiy-output\//, `${appDataDir}/output/`);
+                    audioPath = resolveLocalMediaUrl(audioPath, appDataDir);
                 }
                 audioPaths.push(audioPath);
             }
@@ -1600,8 +1668,9 @@ async function appendAudio(
         // Get output directory
         const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
         const outputDir = `${appDataDir}/output`;
-        const ext = format || 'wav';
-        const outputPath = `${outputDir}/${filename || 'concatenated_audio'}_${Date.now()}.${ext}`;
+        const ext = sanitizeAudioFormat(format, 'wav');
+        const safeFilename = sanitizeAudioFilename(filename, 'concatenated_audio');
+        const outputPath = `${outputDir}/${safeFilename}_${Date.now()}.${ext}`;
 
         // Create concat list file for FFmpeg
         const tempDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_temp_dir');
@@ -1692,25 +1761,14 @@ async function getAudioDuration(audioPath: string): Promise<number> {
     }
 
     try {
-        // Convert media URL to file path if needed
+        // Convert local media URL (tokenized or untokenized) to file path if needed
         let resolvedPath = audioPath;
-        if (audioPath.startsWith('http://127.0.0.1:') && audioPath.includes('/media/')) {
+        if (audioPath.includes('/media/')) {
             const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-            // Extract the path after /media/oaiy-output/ or /media/
-            const urlMatch = audioPath.match(/\/media\/oaiy-output\/(.+)$/) || audioPath.match(/\/media\/(.+)$/);
-            if (urlMatch) {
-                const relativePath = urlMatch[1];
-                // Use forward slashes - works cross-platform (Windows, Linux, macOS)
-                // The Tauri filesystem plugin handles path normalization
-                if (audioPath.includes('/media/oaiy-output/')) {
-                    resolvedPath = `${appDataDir}/output/${relativePath}`;
-                } else {
-                    resolvedPath = `${appDataDir}/${relativePath}`;
-                }
-            }
+            resolvedPath = resolveLocalMediaUrl(audioPath, appDataDir);
         }
 
-        ctx.log('info', `[Audio] Resolved path for ffprobe: ${resolvedPath}`);
+        ctx.log('info', `[Audio] Resolved path for ffprobe: ${redactMediaToken(resolvedPath)}`);
 
         // Use ffprobe to get duration
         const args = [
@@ -1779,14 +1837,14 @@ async function fadeAudio(
 
         if (!ctx.tauri) throw new Error('Tauri not available');
 
-        // Resolve video path - could be a media URL or direct path
+        // Resolve video path - could be a media URL (tokenized or untokenized) or direct path
         let resolvedPath = videoPath;
-        if (videoPath.startsWith('http://127.0.0.1:') && videoPath.includes('/media/')) {
+        if (videoPath.includes('/media/')) {
             const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-            resolvedPath = videoPath.replace(/http:\/\/127\.0\.0\.1:\d+\/media\/oaiy-output\//, `${appDataDir}/output/`);
+            resolvedPath = resolveLocalMediaUrl(videoPath, appDataDir);
         }
 
-        ctx.log('info', `[Audio Fade] Resolved path: ${resolvedPath}`);
+        ctx.log('info', `[Audio Fade] Resolved path: ${redactMediaToken(resolvedPath)}`);
 
         // Get video duration using ffprobe
         const probeArgs = [
@@ -1808,12 +1866,16 @@ async function fadeAudio(
         const totalDuration = parseFloat(probeResult.stdout.trim());
         ctx.log('info', `[Audio Fade] Video duration: ${totalDuration}s`);
 
-        // Ensure fade duration doesn't exceed video duration
-        const actualFadeDuration = Math.min(fadeDuration, totalDuration);
+        // Ensure fade duration is finite, positive, and doesn't exceed video duration
+        const safeFadeDuration = Number.isFinite(fadeDuration) && fadeDuration > 0 ? fadeDuration : 1;
+        const actualFadeDuration = Math.min(safeFadeDuration, totalDuration);
+
+        // Strictly allowlist fadeDirection ('in' | 'out') to prevent FFmpeg filter injection
+        const safeFadeDirection = fadeDirection === 'in' ? 'in' : 'out';
 
         // Calculate fade start time for fade-out (at end of video)
         // For fade-in, it starts at 0
-        const fadeStart = fadeDirection === 'out' ? Math.max(0, totalDuration - actualFadeDuration) : 0;
+        const fadeStart = safeFadeDirection === 'out' ? Math.max(0, totalDuration - actualFadeDuration) : 0;
 
         // Map fadeType to FFmpeg curve
         // FFmpeg afade curves: tri (linear), exp (exponential), qua (quadratic), etc.
@@ -1821,13 +1883,14 @@ async function fadeAudio(
 
         // Build FFmpeg filter
         // afade=t=TYPE:st=START:d=DURATION:curve=CURVE
-        const afadeFilter = `afade=t=${fadeDirection}:st=${fadeStart}:d=${actualFadeDuration}:curve=${ffmpegCurve}`;
+        const afadeFilter = `afade=t=${safeFadeDirection}:st=${fadeStart}:d=${actualFadeDuration}:curve=${ffmpegCurve}`;
 
         ctx.log('info', `[Audio Fade] Filter: ${afadeFilter}`);
 
         // Get output path
         const appDataDir = await ctx.tauri.invoke<string>('plugin:oaiy-filesystem|get_app_data_dir');
-        const outputPath = `${appDataDir}/output/${filename || 'audio_faded'}_${Date.now()}.mp4`;
+        const safeFilename = sanitizeAudioFilename(filename, 'audio_faded');
+        const outputPath = `${appDataDir}/output/${safeFilename}_${Date.now()}.mp4`;
 
         // Run FFmpeg with audio fade filter
         // Copy video stream, apply filter to audio stream

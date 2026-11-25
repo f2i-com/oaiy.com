@@ -55,7 +55,173 @@ const SQLITE_MAGIC = 'SQLite format 3\0';
 const MAX_STEPS = 50_000_000n;
 const MAX_MEMORY_BYTES = 32n * 1024n * 1024n;
 const MAX_PAGE_READS = 200_000n;
-const READ_ONLY_SQL = /^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*(?:SELECT|WITH|EXPLAIN|PRAGMA|VALUES)\b/i;
+
+const READ_ONLY_PRAGMAS = new Set([
+  'database_list',
+  'table_list',
+  'collation_list',
+  'compile_options',
+  'function_list',
+  'module_list',
+  'pragma_list',
+  'encoding',
+  'foreign_keys',
+  'journal_mode',
+  'page_count',
+  'page_size',
+  'freelist_count',
+  'schema_version',
+  'user_version',
+  'data_version',
+  'application_id',
+  'auto_vacuum',
+  'busy_timeout',
+  'cache_size',
+  'synchronous',
+  'temp_store',
+  'integrity_check',
+  'quick_check',
+  'foreign_key_check',
+  'table_info',
+  'table_xinfo',
+  'index_list',
+  'index_info',
+  'index_xinfo',
+  'foreign_key_list',
+]);
+
+const READ_ONLY_PRAGMAS_WITH_ARGS = new Set([
+  'table_info',
+  'table_xinfo',
+  'index_list',
+  'index_info',
+  'index_xinfo',
+  'foreign_key_list',
+  'foreign_key_check',
+  'table_list',
+  'integrity_check',
+  'quick_check',
+]);
+
+/**
+ * Strip SQL comments (`--...`, `/*...*\/`) and replace quoted strings/identifiers
+ * with neutral placeholders so statement separators and keywords cannot be spoofed
+ * or hidden. Returns `null` on unclosed comments or literals.
+ */
+function stripSqlCommentsAndLiterals(sql: string): string | null {
+  let out = '';
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const ch = sql[i];
+    const next = i + 1 < n ? sql[i + 1] : '';
+    if (ch === '-' && next === '-') {
+      i += 2;
+      while (i < n && sql[i] !== '\n') i++;
+      out += ' ';
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      out += ' ';
+      continue;
+    }
+    if (ch === '\'' || ch === '"' || ch === '`') {
+      const quote = ch;
+      i++;
+      let closed = false;
+      while (i < n) {
+        if (sql[i] === quote) {
+          if (i + 1 < n && sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i++;
+          closed = true;
+          break;
+        }
+        i++;
+      }
+      if (!closed) return null;
+      out += quote === '\'' ? ' __STR__ ' : ' __ID__ ';
+      continue;
+    }
+    if (ch === '[') {
+      const end = sql.indexOf(']', i + 1);
+      if (end < 0) return null;
+      i = end + 1;
+      out += ' __ID__ ';
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Collapse balanced parenthesized groups to `()` so top-level CTE clauses can be checked cleanly. */
+function collapseParentheses(cleaned: string): string | null {
+  let out = '';
+  let depth = 0;
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === '(') {
+      if (depth === 0) out += ' () ';
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+      if (depth < 0) return null;
+    } else if (depth === 0) {
+      out += ch;
+    }
+  }
+  return depth === 0 ? out : null;
+}
+
+/**
+ * Single-statement read-only SQL check for `sqlite_query`: strips comments/strings,
+ * rejects multi-statements (`;`), rejects writable CTEs (`WITH ... INSERT/UPDATE/DELETE/REPLACE`),
+ * rejects mutating PRAGMAs, and recursively checks `EXPLAIN [QUERY PLAN]`.
+ */
+export function isReadOnlySql(sql: string): boolean {
+  const stripped = stripSqlCommentsAndLiterals(sql);
+  if (stripped === null) return false;
+  let body = stripped.trim();
+  if (!body) return false;
+  if (body.endsWith(';')) body = body.slice(0, -1).trim();
+  if (!body || body.includes(';')) return false;
+
+  const explainMatch = /^EXPLAIN(?:\s+QUERY\s+PLAN)?\s+([\s\S]+)$/i.exec(body);
+  if (explainMatch) return isReadOnlySql(explainMatch[1]);
+
+  if (/^(?:SELECT|VALUES)\b/i.test(body)) return true;
+
+  if (/^WITH\b/i.test(body)) {
+    const top = collapseParentheses(body);
+    if (!top) return false;
+    const rest = top.replace(
+      /^WITH(?:\s+RECURSIVE)?\s+(?:[A-Za-z_]\w*|__ID__)(?:\s*\(\))?\s+AS(?:\s+NOT)?(?:\s+MATERIALIZED)?\s*\(\)(?:\s*,\s*(?:[A-Za-z_]\w*|__ID__)(?:\s*\(\))?\s+AS(?:\s+NOT)?(?:\s+MATERIALIZED)?\s*\(\))*\s+/i,
+      '',
+    );
+    if (rest === top) return false;
+    return /^(?:SELECT|VALUES)\b/i.test(rest);
+  }
+
+  if (/^PRAGMA\b/i.test(body)) {
+    if (body.includes('=')) return false;
+    const m = /^PRAGMA\s+(?:(?:[A-Za-z_]\w*|__ID__)\s*\.\s*)?([A-Za-z_]\w*)(?:\s*(\([\s\S]*\)))?$/i.exec(body);
+    if (!m) return false;
+    const name = m[1].toLowerCase();
+    const hasArgs = Boolean(m[2]);
+    if (!READ_ONLY_PRAGMAS.has(name)) return false;
+    if (hasArgs && !READ_ONLY_PRAGMAS_WITH_ARGS.has(name)) return false;
+    return true;
+  }
+
+  return false;
+}
 
 function abortError(signal: AbortSignal): Error {
   const reason = signal.reason;
@@ -534,8 +700,8 @@ export async function querySqlite(
 }> {
   checkAborted(options.signal);
   if (!sql.trim()) throw new Error('SQL query cannot be empty.');
-  if (!READ_ONLY_SQL.test(sql)) {
-    throw new Error('sqlite_query only accepts read-only statements (SELECT, WITH, EXPLAIN, PRAGMA, VALUES). Use sqlite_execute for DDL/DML writes.');
+  if (!isReadOnlySql(sql)) {
+    throw new Error('sqlite_query only accepts single read-only statements (SELECT, WITH ... SELECT/VALUES, EXPLAIN, read-only PRAGMA, VALUES). Use sqlite_execute for DDL/DML writes.');
   }
   const limit = Math.min(Math.max(Math.floor(options.limit ?? 100), 1), 500);
   const { conn, dbName, dbFile } = await openHydratedConnection(vfs, root, options.database, options.signal);
@@ -652,46 +818,68 @@ export async function validateAppDatabases(vfs: Vfs, root = '', signal?: AbortSi
     return findings;
   }
 
-  const targets = declared.length
-    ? declared
-    : databases.map((d) => ({
+  const targets: Array<{
+    name: string;
+    file?: string;
+    seedSqls: string[];
+    seedJsons: Array<string | Record<string, unknown>>;
+    persist?: boolean;
+  }> = declared.length
+    ? declared.map((d) => ({
         name: d.name,
         file: d.file,
-        seedSql: d.seedSql,
-        seedJson: d.seedJson && d.seedJson !== '(inline JSON)' ? d.seedJson : undefined,
+        seedSqls: d.seedSql ? [d.seedSql] : [],
+        seedJsons: d.seedJson !== undefined ? [d.seedJson] : [],
+        persist: d.persist,
+      }))
+    : databases.map((d, index) => ({
+        name: d.name,
+        file: d.file,
+        seedSqls: index === 0 ? [...sqlFiles] : [],
+        seedJsons: index === 0 ? [...seedJsonFiles] : [],
         persist: d.persist,
       }));
 
-  const applySeeds = (targetConn: XdbWasmConnection, cfg: { seedSql?: string; seedJson?: string | Record<string, unknown> }) => {
-    if (cfg.seedSql) {
-      const clean = normalizePath(cfg.seedSql);
-      if (!looksLikeSqlStatement(cfg.seedSql)) {
+  const applySeeds = (
+    targetConn: XdbWasmConnection,
+    cfg: { seedSqls: string[]; seedJsons: Array<string | Record<string, unknown>> },
+    onSource: (source: string) => void,
+  ) => {
+    for (const seedSql of cfg.seedSqls) {
+      checkAborted(signal);
+      const clean = normalizePath(seedSql);
+      if (!looksLikeSqlStatement(seedSql)) {
         if (clean && vfs.exists(inApp(root, clean))) {
+          onSource(clean);
           const sqlText = vfs.readText(inApp(root, clean));
           if (sqlText.trim()) targetConn.execute_json(sqlText, null);
-        } else if (looksLikeFilePath(cfg.seedSql, /\.sql$/i)) {
-          throw new Error(`seedSql file "${cfg.seedSql}" not found in app`);
-        } else if (cfg.seedSql.trim()) {
-          targetConn.execute_json(cfg.seedSql, null);
+        } else if (looksLikeFilePath(seedSql, /\.sql$/i)) {
+          onSource(clean || seedSql);
+          throw new Error(`seedSql file "${seedSql}" not found in app`);
+        } else if (seedSql.trim()) {
+          targetConn.execute_json(seedSql, null);
         }
-      } else if (cfg.seedSql.trim()) {
-        targetConn.execute_json(cfg.seedSql, null);
+      } else if (seedSql.trim()) {
+        targetConn.execute_json(seedSql, null);
       }
     }
-    if (cfg.seedJson !== undefined) {
-      if (typeof cfg.seedJson === 'string') {
-        const clean = normalizePath(cfg.seedJson);
+    for (const seedJson of cfg.seedJsons) {
+      checkAborted(signal);
+      if (typeof seedJson === 'string') {
+        const clean = normalizePath(seedJson);
         let payload: string;
         if (clean && vfs.exists(inApp(root, clean))) {
+          onSource(clean);
           payload = vfs.readText(inApp(root, clean));
-        } else if (!/^\s*[\[{]/.test(cfg.seedJson) && looksLikeFilePath(cfg.seedJson, /\.json$/i)) {
-          throw new Error(`seedJson file "${cfg.seedJson}" not found in app`);
+        } else if (!/^\s*[\[{]/.test(seedJson) && looksLikeFilePath(seedJson, /\.json$/i)) {
+          onSource(clean || seedJson);
+          throw new Error(`seedJson file "${seedJson}" not found in app`);
         } else {
-          payload = cfg.seedJson;
+          payload = seedJson;
         }
         if (payload.trim()) targetConn.seed_json(payload);
       } else {
-        targetConn.seed_json(JSON.stringify(cfg.seedJson));
+        targetConn.seed_json(JSON.stringify(seedJson));
       }
     }
   };
@@ -711,42 +899,37 @@ export async function validateAppDatabases(vfs: Vfs, root = '', signal?: AbortSi
     }
 
     let conn: XdbWasmConnection | null = null;
+    let activeSource = file;
     try {
       conn = new bindings.WasmConnection(initialBytes, null, null, 4096, MAX_STEPS, MAX_MEMORY_BYTES, MAX_PAGE_READS);
       if (!initialBytes) {
-        applySeeds(conn, cfg);
+        applySeeds(conn, cfg, (src) => (activeSource = src));
       }
+      activeSource = file;
       // Verify schema is readable
       conn.execute_json('SELECT name FROM sqlite_master LIMIT 1', null);
     } catch (error) {
-      const sourceFile =
-        typeof cfg.seedSql === 'string' && !looksLikeSqlStatement(cfg.seedSql) && vfs.exists(inApp(root, normalizePath(cfg.seedSql)))
-          ? normalizePath(cfg.seedSql)
-          : file;
       findings.push({
         level: 'error',
-        file: sourceFile,
+        file: activeSource,
         message: `XDB SQLite check failed for database "${cfg.name}": ${error instanceof Error ? error.message : String(error)}`,
       });
     } finally {
       if (conn) closeConn(conn);
     }
 
-    // Even when a persisted `.db` file already exists, dry-run declared seeds on a fresh in-memory
-    // DB so broken edits to `seedSql` / `seedJson` are never silently ignored.
-    if (initialBytes && (cfg.seedSql || cfg.seedJson !== undefined)) {
+    // Even when a persisted `.db` file already exists, dry-run declared/discovered seeds on a fresh
+    // in-memory DB so broken edits to `seedSql` / `seedJson` are never silently ignored.
+    if (initialBytes && (cfg.seedSqls.length > 0 || cfg.seedJsons.length > 0)) {
       let seedConn: XdbWasmConnection | null = null;
+      let seedSource = 'manifest.json';
       try {
         seedConn = new bindings.WasmConnection(null, null, null, 4096, MAX_STEPS, MAX_MEMORY_BYTES, MAX_PAGE_READS);
-        applySeeds(seedConn, cfg);
+        applySeeds(seedConn, cfg, (src) => (seedSource = src));
       } catch (error) {
-        const sourceFile =
-          typeof cfg.seedSql === 'string' && !looksLikeSqlStatement(cfg.seedSql) && vfs.exists(inApp(root, normalizePath(cfg.seedSql)))
-            ? normalizePath(cfg.seedSql)
-            : 'manifest.json';
         findings.push({
           level: 'error',
-          file: sourceFile,
+          file: seedSource,
           message: `XDB SQLite seed check failed for database "${cfg.name}": ${error instanceof Error ? error.message : String(error)}`,
         });
       } finally {

@@ -601,7 +601,7 @@ pub struct Live<'a> {
 
 impl Live<'_> {
     fn client() -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
+        super::creds::client_builder(super::net::Keep::Never)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("could not build the client: {e}"))
@@ -621,9 +621,10 @@ impl Live<'_> {
 
 impl Perform for Live<'_> {
     fn submit(&self, form_id: &str, record: &Value, idempotency_key: &str) -> Result<Option<String>, String> {
+        let form_seg = super::oauth::path_segment(form_id, "form id")?;
         let url = super::oauth::join(
             &self.account.base_url,
-            &self.spec.submit_path.replace("{formId}", form_id),
+            &self.spec.submit_path.replace("{formId}", &form_seg),
         );
         let mut body = json!({ &self.spec.fields.record: record });
         // A binding writing into the form it is bound to is the same loop as a
@@ -651,13 +652,15 @@ impl Perform for Live<'_> {
     }
 
     fn update(&self, form_id: &str, record_id: &str, record: &Value, idempotency_key: &str) -> Result<(), String> {
+        let form_seg = super::oauth::path_segment(form_id, "form id")?;
+        let id_seg = super::oauth::path_segment(record_id, "record id")?;
         let url = super::oauth::join(
             &self.account.base_url,
             &self
                 .spec
                 .update_path
-                .replace("{formId}", form_id)
-                .replace("{id}", record_id),
+                .replace("{formId}", &form_seg)
+                .replace("{id}", &id_seg),
         );
         let resp = Self::client()?
             .put(&url)
@@ -743,6 +746,39 @@ mod tests {
         let bodies: Vec<Value> = seen.iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
         assert_eq!(bodies[0], serde_json::json!({ "answers": record, "flowRunId": "run-7f3a" }));
         assert_eq!(bodies[1], serde_json::json!({ "answers": record }));
+    }
+
+    #[test]
+    fn live_actions_reject_traversal_ids_and_do_not_follow_redirects() {
+        use crate::link::testkit::{Provider, Reply};
+        let elsewhere = Provider::start(|_| Reply::ok(r#"{"id":"stolen"}"#));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let server = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let account = crate::link::LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: server.base.clone(),
+            credential: "flk_secret".into(),
+            account_id: None,
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        };
+        let spec = spec();
+        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-1" };
+        let record = json!({ "a": 1 });
+
+        // Traversal / delimiter IDs are rejected before any request is sent.
+        assert!(live.submit("../admin", &record, "k1").is_err());
+        assert!(live.update("form-a", "../../other?x=1", &record, "k2").is_err());
+        assert!(server.requests().is_empty(), "traversal IDs must not reach the network");
+
+        // Redirects must NOT be followed.
+        let err = live.submit("form-a", &record, "k3").unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
+        let err = live.update("form-a", "r1", &record, "k4").unwrap_err();
+        assert!(err.contains("HTTP 307"), "{err}");
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
     }
 
     fn result_scope(v: &Value) -> Scope<'_> {

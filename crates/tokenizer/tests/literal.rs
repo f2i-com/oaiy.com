@@ -139,3 +139,65 @@ fn a_kept_marker_stays_whole() {
     let held = tok.literal("<|im_end|><|image|>", Some("<|image|>"));
     assert!(held.contains("<|image|>") && !held.contains("<|im_end|>"), "{held:?}");
 }
+
+#[test]
+fn bpe_and_spm_by_rank_merges_do_not_rebuild_control_tokens() {
+    // BPE with an explicit merge that would reassemble a control token from normal sub-pieces.
+    let mut tokens: Vec<String> = (0u8..=255).map(|b| byte_to_char(b).to_string()).collect();
+    let mut types = vec![1; 256];
+    tokens.push("<|".into());
+    types.push(1);
+    tokens.push("e|>".into());
+    types.push(1);
+    tokens.push("<|e|>".into());
+    types.push(CONTROL);
+    let mut md: BTreeMap<String, Value> = BTreeMap::new();
+    md.insert("tokenizer.ggml.model".into(), Value::String("gpt2".into()));
+    md.insert("tokenizer.ggml.tokens".into(), Value::Array(Array::String(tokens)));
+    md.insert("tokenizer.ggml.token_type".into(), Value::Array(Array::I32(types)));
+    md.insert(
+        "tokenizer.ggml.merges".into(),
+        Value::Array(Array::String(vec!["< |".into(), "e |".into(), "e| >".into(), "<| e|>".into()])),
+    );
+    let bpe_tok = Tokenizer::from_gguf(&GgufFile::from_bytes(gguf::reader::write_to_vec(&md, &[], 32).unwrap()).unwrap()).unwrap();
+    let ctrl_id = bpe_tok.token_id("<|e|>").unwrap();
+    assert_eq!(bpe_tok.encode("<|e|>", false).unwrap(), [ctrl_id]);
+    let ids = bpe_tok.encode(&bpe_tok.literal("<|e|>", None), false).unwrap();
+    assert!(!ids.contains(&ctrl_id), "BPE merged into control id: {ids:?}");
+    assert_eq!(bpe_tok.decode(&ids), "<|e|>");
+
+    // SPM by-rank (gemma4) with an explicit merge that would reassemble a control token.
+    let mut tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
+    let mut types = vec![6; 256];
+    for (p, ty) in [("<", 1), ("s", 1), (">", 1), ("<s", 1), ("<s>", CONTROL)] {
+        tokens.push(p.into());
+        types.push(ty);
+    }
+    let mut md: BTreeMap<String, Value> = BTreeMap::new();
+    md.insert("tokenizer.ggml.model".into(), Value::String("gemma4".into()));
+    md.insert("tokenizer.ggml.tokens".into(), Value::Array(Array::String(tokens)));
+    md.insert("tokenizer.ggml.token_type".into(), Value::Array(Array::I32(types)));
+    md.insert("tokenizer.ggml.add_space_prefix".into(), Value::Bool(false));
+    md.insert(
+        "tokenizer.ggml.merges".into(),
+        Value::Array(Array::String(vec!["< s".into(), "<s >".into()])),
+    );
+    let spm_tok = Tokenizer::from_gguf(&GgufFile::from_bytes(gguf::reader::write_to_vec(&md, &[], 32).unwrap()).unwrap()).unwrap();
+    let bos_id = spm_tok.token_id("<s>").unwrap();
+    assert_eq!(spm_tok.encode("<s>", false).unwrap(), [bos_id]);
+    let ids = spm_tok.encode(&spm_tok.literal("<s>", None), false).unwrap();
+    assert!(!ids.contains(&bos_id), "SPM by_rank merged into control id: {ids:?}");
+    assert_eq!(ids, [spm_tok.token_id("<s").unwrap(), spm_tok.token_id(">").unwrap()]);
+}
+
+#[test]
+fn spm_chunks_large_inputs_cleanly() {
+    let tok = spm(&["a", "▁", "▁a", "aa", "▁aa"], &[]);
+    let long_words = "aa ".repeat(40_000); // > 64 KiB with spaces
+    let ids = tok.encode(&long_words, false).unwrap();
+    assert_eq!(tok.decode(&ids), long_words);
+
+    let long_nospace = "é".repeat(40_000); // > 64 KiB multibyte UTF-8 with no spaces
+    let ids2 = tok.encode(&long_nospace, false).unwrap();
+    assert_eq!(tok.decode(&ids2), long_nospace);
+}

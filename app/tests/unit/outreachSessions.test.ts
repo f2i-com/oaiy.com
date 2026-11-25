@@ -75,7 +75,7 @@ function setup() {
     phone: () => phone,
     line: new PhoneLine(),
     callbacks: () => null,
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     callsToOaiy: async () => true,
     rules: async () => ({ quietStart: 0, quietEnd: 0, maxDailyDials: 20, outboundEnabled: true }),
     sessions: () => sessions.forOutreach(),

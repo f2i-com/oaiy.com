@@ -166,7 +166,7 @@ export function world(opts: { answer?: boolean; phone?: { holdsCalls: boolean } 
     phone: () => ({ holdsCalls: opts.phone ? opts.phone.holdsCalls : true, holdsTexts: true, connected: true }),
     line: new PhoneLine(),
     callbacks: () => null,
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     callsToOaiy: async () => true,
     rules: async () => ({ quietStart: 0, quietEnd: 0, maxDailyDials: 20, outboundEnabled: true }),
     sessions: () => sessions.forOutreach(),
@@ -194,7 +194,7 @@ export function runnerOf(w: ReturnType<typeof world>, extra: Partial<Constructor
     engine: () => w.outreach,
     origin: () => ({ kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' }),
     ready: async () => '',
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     approve: async () => true,
   });
   return agent('runner', { sessionTools: tools, waitingOnCall: () => w.outreach.callLiveFor('front-desk'), ...extra });

@@ -419,6 +419,7 @@ export function withNodeCalls(own: SessionTool[], listed: ControlTool[], session
         const vfs = files?.();
         if (status !== 'succeeded' || !vfs || !result.images?.length) return text || 'Done.';
         const saved = keepPictures(vfs, String(input.id ?? 'flow'), result.images);
+        if (!saved.length) return text || 'Done.';
         return `${text}\n\nSaved in the project: ${saved.join(', ')} (look at a picture with view_image; show it to the person with present_file)`;
       },
     };
@@ -432,11 +433,17 @@ function keepPictures(vfs: Vfs, flow: string, images: Array<{ mimeType: string; 
   const name = flow.replace(/[^A-Za-z0-9_-]+/g, '_') || 'flow';
   const saved: string[] = [];
   for (const image of images) {
+    if (!image || typeof image.mimeType !== 'string' || typeof image.data !== 'string') continue;
     const ext = PICTURE_TYPES[image.mimeType.toLowerCase()];
     if (!ext) continue;
+    let bin: string;
+    try {
+      bin = atob(image.data);
+    } catch {
+      continue;
+    }
     let path = `flows/${name}/${name}-${saved.length + 1}.${ext}`;
     for (let n = 2; vfs.exists(`/${path}`); n++) path = `flows/${name}/${name}-${saved.length + 1}-${n}.${ext}`;
-    const bin = atob(image.data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     vfs.writeFile(`/${path}`, bytes, { parents: true });

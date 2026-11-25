@@ -416,6 +416,7 @@ pub struct Inkling2Translator {
     header_buf: String,
     tool_buf: String,
     pending_calls: Vec<String>,
+    tool_error: Option<String>,
     closed_thinking: bool,
     pending_bytes: Vec<u8>,
 }
@@ -428,9 +429,14 @@ impl Inkling2Translator {
             header_buf: String::new(),
             tool_buf: String::new(),
             pending_calls: Vec::new(),
+            tool_error: None,
             closed_thinking: false,
             pending_bytes: Vec::new(),
         }
+    }
+
+    pub fn tool_error(&self) -> Option<&str> {
+        self.tool_error.as_deref()
     }
 
     pub fn in_thinking(&self) -> bool {
@@ -463,6 +469,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_thinking {
             self.flush_pending_utf8(&mut out);
+            self.flush_segment_close(&mut out);
             self.flush_tool_calls(&mut out);
             self.seg = Segment::Thinking;
             self.closed_thinking = false;
@@ -472,6 +479,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_text {
             self.flush_pending_utf8(&mut out);
+            self.flush_segment_close(&mut out);
             self.flush_tool_calls(&mut out);
             if !self.closed_thinking {
                 out.push("</think>".into());
@@ -483,6 +491,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_invoke_tool {
             self.flush_pending_utf8(&mut out);
+            self.flush_segment_close(&mut out);
             if !self.closed_thinking {
                 out.push("</think>".into());
                 self.closed_thinking = true;
@@ -558,16 +567,26 @@ impl Inkling2Translator {
                 self.closed_thinking = true;
             }
             Segment::ToolJson => {
-                if let Some(dsml_invoke) = format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
-                    self.pending_calls.push(dsml_invoke);
+                match format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
+                    Ok(dsml_invoke) => self.pending_calls.push(dsml_invoke),
+                    Err(e) => {
+                        if self.tool_error.is_none() {
+                            self.tool_error = Some(e);
+                        }
+                    }
                 }
                 self.tool_buf.clear();
+                self.header_buf.clear();
             }
             _ => {}
         }
     }
 
     fn flush_tool_calls(&mut self, out: &mut Vec<String>) {
+        if self.tool_error.is_some() {
+            self.pending_calls.clear();
+            return;
+        }
         if self.pending_calls.is_empty() {
             return;
         }
@@ -577,14 +596,25 @@ impl Inkling2Translator {
     }
 }
 
+fn valid_dsml_attr(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains(DSML)
+        && !s
+            .chars()
+            .any(|c| matches!(c, '"' | '\'' | '<' | '>' | '\n' | '\r' | '\0'))
+}
+
 /// Convert one Inkling-2 JSON tool invocation (`{"name":"fn","args":{...}}`) into a single
 /// OAIY DSML `<｜DSML｜ invoke>` block.
-fn format_tool_call_as_dsml(header_name: &str, json_str: &str) -> Option<String> {
+fn format_tool_call_as_dsml(header_name: &str, json_str: &str) -> std::result::Result<String, String> {
     let trimmed = json_str.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err("empty Inkling-2 tool call".into());
     }
-    let parsed = Json::parse(trimmed.as_bytes()).ok()?;
+    let parsed = Json::parse(trimmed.as_bytes()).map_err(|e| format!("invalid JSON tool call: {e}"))?;
+    if !matches!(parsed, Json::Obj(_)) {
+        return Err("Inkling-2 tool call must be a JSON object".into());
+    }
     let name = parsed
         .get("name")
         .and_then(Json::as_str)
@@ -592,25 +622,51 @@ fn format_tool_call_as_dsml(header_name: &str, json_str: &str) -> Option<String>
         .or_else(|| {
             let h = header_name.trim();
             (!h.is_empty()).then_some(h)
-        })?;
-    let args = parsed
-        .get("args")
-        .or_else(|| parsed.get("arguments"))
-        .and_then(Json::as_object)
-        .unwrap_or(&[]);
+        })
+        .ok_or_else(|| "missing Inkling-2 tool name".to_string())?;
+    if !valid_dsml_attr(name) {
+        return Err("invalid Inkling-2 tool name".into());
+    }
+    let args: Vec<(String, Json)> = match parsed.get("args").or_else(|| parsed.get("arguments")) {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Obj(obj)) => obj.clone(),
+        Some(Json::Str(s)) => {
+            let trimmed_args = s.trim();
+            if trimmed_args.is_empty() {
+                Vec::new()
+            } else {
+                match Json::parse(trimmed_args.as_bytes()) {
+                    Ok(Json::Obj(obj)) => obj,
+                    Ok(_) => return Err("Inkling-2 tool arguments must be a JSON object".into()),
+                    Err(e) => return Err(format!("invalid JSON tool arguments: {e}")),
+                }
+            }
+        }
+        Some(_) => return Err("Inkling-2 tool arguments must be a JSON object".into()),
+    };
 
+    let mut seen = std::collections::BTreeSet::new();
     let mut params = Vec::with_capacity(args.len());
     for (k, v) in args {
+        if !valid_dsml_attr(&k) {
+            return Err("invalid Inkling-2 parameter name".into());
+        }
+        if !seen.insert(k.clone()) {
+            return Err("duplicate Inkling-2 parameter".into());
+        }
         let (is_str, rendered) = match v {
-            Json::Str(s) => ("true", s.clone()),
+            Json::Str(s) => ("true", s),
             other => ("false", other.to_json()),
         };
+        if rendered.contains(DSML) {
+            return Err("unexpected DSML in Inkling-2 tool argument".into());
+        }
         params.push(format!(
             "<{DSML} parameter name=\"{k}\" string=\"{is_str}\">{rendered}</{DSML} parameter>"
         ));
     }
     let inner = params.join("\n");
-    Some(format!("<{DSML} invoke name=\"{name}\">\n{inner}\n</{DSML} invoke>"))
+    Ok(format!("<{DSML} invoke name=\"{name}\">\n{inner}\n</{DSML} invoke>"))
 }
 
 const SOFT_KEPT: usize = 4;
@@ -1393,6 +1449,13 @@ impl Inkling2Engine {
         for chunk in translator.finish(&self.tok) {
             let _ = job.events.send(Event::Text(chunk));
         }
+        if let Some(err) = translator.tool_error() {
+            if !job.cancel.load(Ordering::Relaxed) {
+                return Err(oaiy_engine::Error::Arg(format!(
+                    "tool_contract_error: {err}; no tool from this batch was executed"
+                )));
+            }
+        }
 
         let decode_s = decode_start.elapsed().as_secs_f64();
         if self.log {
@@ -1788,5 +1851,75 @@ mod tests {
         assert!(c1.is_empty());
         let tail = tr.finish(&tok);
         assert_eq!(tail.join(""), "\u{FFFD}");
+    }
+
+    #[test]
+    fn translator_handles_missing_end_message_string_arguments_dsml_rejection_and_malformed_json() {
+        let tok = test_tokenizer();
+        let ids = SpecialIds::from_tokenizer(&tok);
+
+        // 1. Back-to-back tool calls without `<|end_message|>` plus JSON-encoded string `"arguments"`.
+        let raw = format!(
+            "{MSG_MODEL}add{CONTENT_INVOKE_TOOL_JSON}{{\"name\":\"add\",\"arguments\":\"{{\\\"a\\\":1,\\\"b\\\":2}}\"}}\
+             {CONTENT_INVOKE_TOOL_JSON}{{\"name\":\"say\",\"args\":{{\"msg\":\"hi\"}}}}{CONTENT_TEXT}Done.{END_SAMPLING}"
+        );
+        let mut tr = Inkling2Translator::new(ids);
+        let mut p = StreamParser::new(Mode::Chat);
+        for id in tok.encode(&raw, false).unwrap() {
+            let (chunks, stop) = tr.push(id, &tok);
+            for c in chunks {
+                p.push(&c);
+            }
+            if stop {
+                break;
+            }
+        }
+        assert_eq!(tr.tool_error(), None);
+        let (_, calls) = p.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "add");
+        assert_eq!(
+            Json::parse(calls[0].arguments.as_bytes()).unwrap(),
+            Json::parse(br#"{"a":1,"b":2}"#).unwrap()
+        );
+        assert_eq!(calls[1].name, "say");
+        assert_eq!(
+            Json::parse(calls[1].arguments.as_bytes()).unwrap(),
+            Json::parse(br#"{"msg":"hi"}"#).unwrap()
+        );
+
+        // 2. Malformed tool JSON must surface `tool_error()` and suppress emitting partial calls.
+        let malformed = format!(
+            "{MSG_MODEL}add{CONTENT_INVOKE_TOOL_JSON}{{\"name\":\"add\",\"args\":{{\"a\":1}}}}{END_MESSAGE}\
+             {MSG_MODEL}bad{CONTENT_INVOKE_TOOL_JSON}{{not valid json{END_MESSAGE}{END_SAMPLING}"
+        );
+        let mut tr_bad = Inkling2Translator::new(ids);
+        let mut out_bad = String::new();
+        for id in tok.encode(&malformed, false).unwrap() {
+            let (chunks, stop) = tr_bad.push(id, &tok);
+            for c in chunks {
+                out_bad.push_str(&c);
+            }
+            if stop {
+                break;
+            }
+        }
+        assert!(tr_bad.tool_error().is_some(), "malformed tool JSON must set tool_error");
+        assert!(!out_bad.contains(DSML), "broken batch must not emit partial DSML calls: {out_bad}");
+
+        // 3. Reject DSML (including Unicode-escaped `\uFF5C`) and quotes in name/key/rendered.
+        for (hdr, payload) in [
+            ("", r#"{"name":"evil\" x=\"1","args":{}}"#),
+            ("", r#"{"name":"ok","args":{"bad\"k":"v"}}"#),
+            ("", r#"{"name":"ok","args":{"x":"\uFF5CDSML\uFF5C"}}"#),
+            ("", r#"{"name":"ok","arguments":"not json"}"#),
+            ("", r#"{"name":"ok","args":[1,2]}"#),
+            ("evil\"hdr", r#"{"args":{}}"#),
+        ] {
+            assert!(
+                format_tool_call_as_dsml(hdr, payload).is_err(),
+                "expected error for header={hdr:?} payload={payload}"
+            );
+        }
     }
 }

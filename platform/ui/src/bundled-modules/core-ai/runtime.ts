@@ -965,26 +965,35 @@ async function chat(
   validateContentLength(systemPrompt, 'System prompt');
   validateContentLength(userPrompt, 'User prompt');
 
-  // Auto-start local services (Wan2GP, Ollama, etc.) if needed
-  if (ctx.tauri && endpoint.includes('127.0.0.1')) {
-    const portMatch = endpoint.match(/:(\d+)/);
-    if (portMatch) {
-      const port = parseInt(portMatch[1], 10);
-      try {
-        const result = await ctx.tauri.invoke<{
-          success: boolean;
-          port?: number;
-          error?: string;
-          already_running: boolean;
-        }>('ensure_service_ready_by_port', { port });
-        if (result.success && result.port && result.port !== port) {
-          endpoint = endpoint.replace(`:${port}`, `:${result.port}`);
-        }
-      } catch {
-        // Service auto-start not available
+  // Auto-start local services (Wan2GP, Ollama, etc.) if needed — parse URL strictly
+  // so an attacker URL like https://evil.com/?x=127.0.0.1:8080 cannot spoof loopback.
+  let parsedEndpoint: URL | null = null;
+  try {
+    parsedEndpoint = new URL(endpoint);
+  } catch {
+    parsedEndpoint = null;
+  }
+  const isLoopbackEndpoint =
+    parsedEndpoint !== null &&
+    (parsedEndpoint.hostname === '127.0.0.1' || parsedEndpoint.hostname === 'localhost');
+  const endpointPort = parsedEndpoint?.port ? parseInt(parsedEndpoint.port, 10) : NaN;
+
+  if (ctx.tauri && isLoopbackEndpoint && parsedEndpoint && Number.isFinite(endpointPort) && endpointPort > 0) {
+    try {
+      const result = await ctx.tauri.invoke<{
+        success: boolean;
+        port?: number;
+        error?: string;
+        already_running: boolean;
+      }>('ensure_service_ready_by_port', { port: endpointPort });
+      if (result.success && result.port && result.port !== endpointPort) {
+        parsedEndpoint.port = String(result.port);
+        endpoint = parsedEndpoint.toString();
       }
+    } catch {
+      // Service auto-start not available
     }
-  } else if (!ctx.tauri && endpoint.includes('127.0.0.1') && mayAskDesktop()) {
+  } else if (!ctx.tauri && isLoopbackEndpoint && Number.isFinite(endpointPort) && endpointPort > 0 && mayAskDesktop()) {
     // Browser build (oaiy-web), in a page that may ask the desktop (a tab nobody
     // linked never does): no Tauri, but the OAIY Desktop may own
     // this port. Ask it to start the matching service if it's stopped —
@@ -992,44 +1001,29 @@ async function chat(
     // works" without manually starting it first (Phase 3.5). Fire-and-
     // forget: OAIY Desktop returns as soon as the spawn kicks off and
     // the 503/connection-refused retry loop below rides out the warm-up.
-    const portMatch = endpoint.match(/:(\d+)/);
-    if (portMatch) {
-      const port = parseInt(portMatch[1], 10);
-      try {
-        // OAIY Desktop's API is where OAIY's window says it is, else at the
-        // engine address in Settings (desktopAccess; http://127.0.0.1:17972
-        // unless the person changed it), read now so a change is followed
-        // without a reload.
-        // Plain fetch is fine — the companion sets permissive CORS.
-        // Hard 2s cap: ensure-by-port returns as soon as the spawn kicks
-        // off, so a healthy companion answers in <100ms. The timeout keeps
-        // a wedged companion (accepting connections but not responding)
-        // from hanging an otherwise-fine flow run — on abort we fall
-        // through to the direct request just like OAIY Desktop-absent case.
-        const ctrl = new AbortController();
-        const abortTimer = setTimeout(() => ctrl.abort(), 2000);
-        // (where OAIY's window says the desktop is, with its credential: desktopAccess)
-        const desktop = desktopAccess();
-        const r = await fetch(`${desktop.origin}/api/services/ensure-by-port`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...(desktop.token ? { Authorization: `Bearer ${desktop.token}` } : {}) },
-          body: JSON.stringify({ port }),
-          credentials: 'omit',
-          signal: ctrl.signal,
-        }).finally(() => clearTimeout(abortTimer));
-        if (r.ok) {
-          const res = (await r.json().catch(() => null)) as
-            | { found?: boolean; started?: boolean; name?: string }
-            | null;
-          if (res?.found && res.started) {
-            ctx.log('info', `[AI] companion started "${res.name ?? 'service'}" on :${port} for this run`);
-          }
+    try {
+      const ctrl = new AbortController();
+      const abortTimer = setTimeout(() => ctrl.abort(), 2000);
+      const desktop = desktopAccess();
+      const r = await fetch(`${desktop.origin}/api/services/ensure-by-port`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(desktop.token ? { Authorization: `Bearer ${desktop.token}` } : {}) },
+        body: JSON.stringify({ port: endpointPort }),
+        credentials: 'omit',
+        signal: ctrl.signal,
+      }).finally(() => clearTimeout(abortTimer));
+      if (r.ok) {
+        const res = (await r.json().catch(() => null)) as
+          | { found?: boolean; started?: boolean; name?: string }
+          | null;
+        if (res?.found && res.started) {
+          ctx.log('info', `[AI] companion started "${res.name ?? 'service'}" on :${endpointPort} for this run`);
         }
-      } catch {
-        // OAIY Desktop not running / not reachable — fall through and let
-        // the request hit the endpoint directly (it may be a non-
-        // companion local server the user started themselves).
       }
+    } catch {
+      // OAIY Desktop not running / not reachable — fall through and let
+      // the request hit the endpoint directly (it may be a non-
+      // companion local server the user started themselves).
     }
   }
 

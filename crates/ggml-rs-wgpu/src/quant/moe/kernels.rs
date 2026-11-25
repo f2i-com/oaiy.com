@@ -625,7 +625,7 @@ fn few_source(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups: bool
         each(&|i| job_ids(i, rows, skip))
     };
     let rb_eff = if rows == 1 {
-        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+        "    var rb_eff = rb;\n    if (down_gu) { rb_eff = (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw; }\n"
     } else {
         "    let rb_eff = rb;\n"
     };
@@ -700,7 +700,7 @@ fn few_source_32(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups: b
         each(&|i| job_ids(i, rows, skip))
     };
     let rb_eff = if rows == 1 {
-        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+        "    var rb_eff = rb;\n    if (down_gu) { rb_eff = (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw; }\n"
     } else {
         "    let rb_eff = rb;\n"
     };
@@ -884,7 +884,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let row = (wg.x + wg.y * 65535u) * {per}u + slot;
     let live = on0 && row < n;
     let rb = jobs[2u * select(j0, 0u, !on0)] * p[1].x + min(row, n - 1u) * rw;
-    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);
+    var rb_eff = rb;
+    if (down_gu) {{ rb_eff = (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw; }}
     let k32 = k / 32u;
     let k16 = k / 16u;
     if (live) {{
@@ -1093,7 +1094,7 @@ fn few_source_grid(kind: Kind, rows: usize, lanes: usize, skip: bool, subgroups:
         each(&|i| job_ids(i, rows, skip))
     };
     let rb_eff = if rows == 1 {
-        "    let rb_eff = select(rb, (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw, down_gu);\n"
+        "    var rb_eff = rb;\n    if (down_gu) { rb_eff = (jobs[4u * blk] >> 1u) * p[1].x + min(row, n - 1u) * rw; }\n"
     } else {
         "    let rb_eff = rb;\n"
     };

@@ -126,22 +126,44 @@ final class Fs
     private static function resolveLoose(string $path): ?string
     {
         $cur = str_replace('\\', '/', $path);
-        $tail = [];
-        for ($i = 0; $i < 64; $i++) {
-            $real = @realpath($cur);
-            if ($real !== false) {
-                $real = rtrim(str_replace('\\', '/', $real), '/');
-                return $tail ? $real . '/' . implode('/', array_reverse($tail)) : $real;
-            }
-            $parent = dirname($cur);
-            $name = basename($cur);
-            if ($parent === $cur || $name === '..' || $name === '.') {
+        if (preg_match('#^([A-Za-z]:)?/#', $cur) !== 1) {
+            $cwd = getcwd();
+            if ($cwd === false) {
                 return null;
             }
-            $tail[] = $name;
-            $cur = $parent;
+            $cur = str_replace('\\', '/', $cwd) . '/' . $cur;
         }
-        return null;
+        $prefix = '';
+        if (preg_match('#^([A-Za-z]:)#', $cur, $m) === 1) {
+            $prefix = $m[1];
+            $cur = substr($cur, 2);
+        }
+        $parts = [];
+        foreach (explode('/', $cur) as $seg) {
+            if ($seg === '' || $seg === '.') {
+                continue;
+            }
+            if ($seg === '..') {
+                array_pop($parts);
+                continue;
+            }
+            $parts[] = $seg;
+        }
+        $tail = [];
+        while ($parts) {
+            $real = @realpath($prefix . '/' . implode('/', $parts));
+            if ($real !== false) {
+                $real = rtrim(str_replace('\\', '/', $real), '/');
+                return $tail ? $real . '/' . implode('/', $tail) : $real;
+            }
+            array_unshift($tail, array_pop($parts));
+        }
+        $root = @realpath($prefix . '/');
+        if ($root !== false) {
+            $root = rtrim(str_replace('\\', '/', $root), '/');
+            return $tail ? $root . '/' . implode('/', $tail) : $root;
+        }
+        return $prefix . '/' . implode('/', $tail);
     }
 
     /** True when $inner is $outer or inside it (both resolved; symlinks followed; $inner may not exist yet). */

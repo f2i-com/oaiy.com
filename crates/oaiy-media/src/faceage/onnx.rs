@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 /// The largest file read: a face detector is a fraction of this.
-const MAX_FILE: usize = 64 << 20;
+pub const MAX_FILE: usize = 64 << 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attr {
@@ -215,11 +215,17 @@ fn tensor(bytes: &[u8]) -> R<(String, Initializer)> {
         }
     }
     t.dims = dims.iter().map(|&d| usize::try_from(d).map_err(|_| format!("{name}: a negative dimension"))).collect::<R<_>>()?;
-    let count: usize = t.dims.iter().product();
+    let nonzero = t
+        .dims
+        .iter()
+        .filter(|&&d| d != 0)
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| format!("{name}: shape size overflow"))?;
+    let count = if t.dims.contains(&0) { 0 } else { nonzero };
     if let Some(raw) = raw {
         match kind {
-            FLOAT if raw.len() == count * 4 => t.floats = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-            INT64 if raw.len() == count * 8 => t.ints = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().expect("eight bytes"))).collect(),
+            FLOAT if count.checked_mul(4) == Some(raw.len()) => t.floats = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            INT64 if count.checked_mul(8) == Some(raw.len()) => t.ints = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().expect("eight bytes"))).collect(),
             FLOAT | INT64 => return Err(format!("{name}: its data is not its shape's size")),
             _ => {}
         }

@@ -53,17 +53,20 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     if !data.starts_with(SIGNATURE) {
         return Err(bad("not a PNG file"));
     }
-    let mut pos = 8;
+    let mut pos: usize = 8;
     let mut hdr: Option<Header> = None;
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut idat = Vec::new();
     // chunks until IEND; Pillow ignores the ones it does not know, and does
     // not check CRCs of image data, so neither do we
-    while pos + 8 <= data.len() {
+    while pos.checked_add(8).is_some_and(|end| end <= data.len()) {
         let len = u32::from_be_bytes(data[pos..pos + 4].try_into().expect("4 bytes")) as usize;
         let kind = &data[pos + 4..pos + 8];
-        let body = data.get(pos + 8..pos + 8 + len).ok_or_else(|| bad("truncated chunk"))?;
-        pos += 12 + len;
+        let body_start = pos + 8;
+        let body_end = body_start.checked_add(len).ok_or_else(|| bad("truncated chunk"))?;
+        let next_pos = body_end.checked_add(4).ok_or_else(|| bad("truncated chunk"))?;
+        let body = data.get(body_start..body_end).ok_or_else(|| bad("truncated chunk"))?;
+        pos = next_pos;
         match kind {
             b"IHDR" => {
                 if body.len() < 13 {

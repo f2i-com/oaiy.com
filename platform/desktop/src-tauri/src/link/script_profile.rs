@@ -642,7 +642,7 @@ fn fetch(
     spec: &ScriptProfileSpec,
     etag: Option<&str>,
 ) -> Result<Fetched, String> {
-    let http = reqwest::blocking::Client::builder()
+    let http = super::creds::client_builder(super::net::Keep::Never)
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the script-profile client: {e}"))?;
@@ -1261,5 +1261,16 @@ mod tests {
                 "{forbidden:?} must not appear outside the tests"
             );
         }
+    }
+
+    #[test]
+    fn script_profile_fetch_does_not_follow_redirects() {
+        use crate::link::testkit::{Provider, Reply};
+        let elsewhere = Provider::start(|_| Reply::ok(&doc("var x = 1;").to_string()));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let err = fetch(&account(origin.base.clone()), &spec(), None).err().unwrap();
+        assert!(err.contains("HTTP 307"), "{err}");
+        assert!(elsewhere.requests().is_empty(), "redirect must not be followed");
     }
 }

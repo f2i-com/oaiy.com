@@ -224,8 +224,17 @@ impl fmt::Debug for Tensor {
 pub fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = bits & 0x8000_0000;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
     let mant = bits & 0x7f_ffff;
+    if raw_exp == 0xff {
+        let sign16 = (sign >> 16) as u16;
+        return if mant != 0 {
+            sign16 | 0x7e00 | ((mant >> 13) as u16)
+        } else {
+            sign16 | 0x7c00
+        };
+    }
+    let exp = raw_exp as i32 - 127 + 15;
     let h: u32 = if exp >= 31 {
         (sign >> 16) | 0x7c00
     } else if exp <= 0 {
@@ -281,4 +290,25 @@ pub fn unpack_f16(words: &[f32]) -> Vec<f32> {
         let b = w.to_bits();
         [f16_bits_to_f32(b as u16), f16_bits_to_f32((b >> 16) as u16)]
     }).collect()
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+
+    #[test]
+    fn f32_to_f16_preserves_nan_and_inf() {
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+        let qnan = f32_to_f16_bits(f32::NAN);
+        assert_eq!(qnan & 0x7e00, 0x7e00);
+        assert!(f16_bits_to_f32(qnan).is_nan());
+        // signaling NaN with payload only in low bits still becomes quiet NaN, never Inf
+        let snan = f32_to_f16_bits(f32::from_bits(0x7f80_0001));
+        assert_eq!(snan, 0x7e00);
+        assert!(f16_bits_to_f32(snan).is_nan());
+        let neg_nan = f32_to_f16_bits(f32::from_bits(0xffc0_2000));
+        assert_eq!(neg_nan, 0xfe01);
+        assert!(f16_bits_to_f32(neg_nan).is_nan());
+    }
 }

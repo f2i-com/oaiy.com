@@ -40,11 +40,27 @@ impl Voice {
             .ok_or("voice: missing ref_codes")?
             .iter()
             .map(|f| {
-                let v: Vec<u32> = f.as_array().unwrap_or(&[]).iter().filter_map(|c| c.as_i64()).map(|c| c as u32).collect();
-                <[u32; 16]>::try_from(v).map_err(|_| "voice: every frame needs 16 codes".to_string())
+                let arr = f.as_array().ok_or_else(|| "voice: every frame needs 16 codes".to_string())?;
+                if arr.len() != 16 {
+                    return Err("voice: every frame needs 16 codes".to_string());
+                }
+                let mut frame = [0u32; 16];
+                for (slot, c) in frame.iter_mut().zip(arr) {
+                    let raw = c.as_i64().ok_or_else(|| "voice: frame code must be an integer".to_string())?;
+                    *slot = u32::try_from(raw).map_err(|_| "voice: frame code out of range".to_string())?;
+                }
+                Ok(frame)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let speaker: Vec<f32> = j.get("speaker").and_then(Json::as_array).ok_or("voice: missing speaker")?.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+        let speaker_arr = j.get("speaker").and_then(Json::as_array).ok_or("voice: missing speaker")?;
+        let mut speaker = Vec::with_capacity(speaker_arr.len());
+        for v in speaker_arr {
+            let f = v.as_f64().ok_or_else(|| "voice: speaker entry must be numeric".to_string())? as f32;
+            if !f.is_finite() {
+                return Err("voice: non-finite speaker value".into());
+            }
+            speaker.push(f);
+        }
         if !matches!(speaker.len(), 0 | 1024 | 2048) || ref_codes.is_empty() || ref_codes.iter().flatten().any(|&c| c >= AUDIO_CODES) {
             return Err("voice: needs valid reference codes (and a 1024- or 2048-value speaker embedding, or none)".into());
         }
@@ -52,13 +68,43 @@ impl Voice {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
         }
-        // Written aside and renamed, so a reader never sees half a file.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, self.to_json().to_json())?;
-        std::fs::rename(&tmp, path)
+        // Written aside with a unique exclusive temp file and renamed, so a reader
+        // never sees half a file and concurrent writers never collide.
+        let pid = std::process::id();
+        let (mut file, tmp) = loop {
+            let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+            let mut tmp_name = path.as_os_str().to_os_string();
+            tmp_name.push(format!(".tmp.{pid}.{n}"));
+            let candidate = PathBuf::from(tmp_name);
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                Ok(f) => break (f, candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        struct Cleanup(Option<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(p) = self.0.take() {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let mut guard = Cleanup(Some(tmp.clone()));
+        file.write_all(self.to_json().to_json().as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        guard.0 = None;
+        Ok(())
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -116,6 +162,19 @@ mod tests {
         bad.ref_codes[0][3] = 2048;
         assert!(Voice::from_json(&bad.to_json()).is_err());
         assert!(Voice::from_json(&voice(512).to_json()).is_err());
+        // Wrapped u32 code (1 << 32) and non-finite / f32-overflowing speaker must be rejected.
+        let wrapped = Json::obj([
+            ("oaiy_voice", Json::Int(1)),
+            ("ref_codes", Json::Arr(vec![Json::Arr(vec![Json::Int(1i64 << 32); 16])])),
+            ("speaker", Json::Arr(vec![])),
+        ]);
+        assert!(Voice::from_json(&wrapped).is_err());
+        let inf_spk = Json::obj([
+            ("oaiy_voice", Json::Int(1)),
+            ("ref_codes", Json::Arr(vec![Json::Arr(vec![Json::Int(1); 16])])),
+            ("speaker", Json::Arr(vec![Json::Num(1e300); 1024])),
+        ]);
+        assert!(Voice::from_json(&inf_spk).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

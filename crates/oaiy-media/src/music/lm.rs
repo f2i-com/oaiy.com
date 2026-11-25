@@ -508,6 +508,9 @@ impl Rng {
 /// The `k`-th largest value.
 fn kth_largest(v: &[f32], k: usize) -> f32 {
     let mut s: Vec<f32> = v.iter().copied().filter(|x| !x.is_nan()).collect();
+    if s.is_empty() {
+        return f32::NEG_INFINITY;
+    }
     let k = k.min(s.len()).max(1);
     s.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
     s[k - 1]
@@ -546,13 +549,23 @@ pub(crate) fn guide(c: &[f32], u: &[f32]) -> Vec<f32> {
 /// song, else the code. Guidance is limited to the conditional row's top 50.
 pub fn pick_semantic(logits: &Tensor, rng: Option<&mut Rng>) -> Result<Option<u32>> {
     let rows = logits.to_vec2::<f32>()?;
+    if rows.len() < 2 {
+        candle_core::bail!("expected 2 semantic logit rows, got {}", rows.len());
+    }
     Ok(pick_semantic_rows(&rows[0], &rows[1], rng))
 }
 
 /// [`pick_semantic`] of the conditional and unconditional rows' logits.
 pub fn pick_semantic_rows(c: &[f32], u: &[f32], rng: Option<&mut Rng>) -> Option<u32> {
+    if c.is_empty() || u.is_empty() {
+        return None;
+    }
     let threshold = kth_largest(c, TOP_K);
-    let guided: Vec<f32> = guide(c, u).into_iter().zip(c).map(|(g, &c)| if c < threshold { f32::NEG_INFINITY } else { g }).collect();
+    let guided: Vec<f32> = guide(c, u)
+        .into_iter()
+        .zip(c)
+        .map(|(g, &c)| if c.is_nan() || c < threshold || g.is_nan() { f32::NEG_INFINITY } else { g })
+        .collect();
     let i = sample_top_k(&guided, rng);
     if i == 0 { None } else { Some((i - 1) as u32) }
 }
@@ -747,6 +760,19 @@ mod tests {
         *total += 1;
         if ours == want as usize + 1 { *agree += 1 } else { *worst = worst.max(guided[ours] - guided[want as usize + 1]) }
         Ok(want)
+    }
+
+    #[test]
+    fn kth_largest_and_pick_semantic_handle_empty_and_nans() {
+        assert_eq!(kth_largest(&[], 50), f32::NEG_INFINITY);
+        assert_eq!(kth_largest(&[f32::NAN, f32::NAN], 50), f32::NEG_INFINITY);
+        assert_eq!(kth_largest(&[f32::NAN, 3.0, 1.0, 2.0], 2), 2.0);
+        assert_eq!(pick_semantic_rows(&[], &[], None), None);
+        assert_eq!(pick_semantic_rows(&[f32::NAN; 4], &[f32::NAN; 4], None), None);
+        // NaN conditional entry must be masked out, not pass through as top-k candidate.
+        let c = [f32::NAN, -10.0, 5.0];
+        let u = [0.0, 0.0, 0.0];
+        assert_eq!(pick_semantic_rows(&c, &u, None), Some(1));
     }
 }
 

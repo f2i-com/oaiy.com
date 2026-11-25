@@ -569,8 +569,12 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             }
         };
         let seed = r.seed + i as u64;
-        dev.set_seed(seed)?;
-        let mut x = scheduler::build_initial_noise(1, r.height / 8, r.width / 8, sigmas[0], &dev)?;
+        let (lh, lw) = (r.height / 8, r.width / 8);
+        let init: Vec<f32> = crate::common::job::noise(seed, 4 * lh * lw)
+            .into_iter()
+            .map(|v| (v as f64 * sigmas[0]) as f32)
+            .collect();
+        let mut x = Tensor::from_vec(init, (1, 4, lh, lw), &dev)?;
         let mut state = scheduler::SamplerState::default();
         let staged_unet = if models.is_none() {
             event(Json::obj([("stage", Json::str("loading_unet")), ("image", Json::Int(i as i64 + 1))]));

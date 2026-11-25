@@ -21,6 +21,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The largest picture `upscale` takes, in pixels.
 pub const MAX_UPSCALE_PIXELS: u64 = 4 << 20;
+/// The largest picture `remove_background` takes, in pixels (36 megapixels).
+pub const MAX_REMOVE_BG_PIXELS: u64 = 36 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -121,13 +123,45 @@ fn device(index: usize) -> Result<Device> {
     Ok(Device::Cpu)
 }
 
+fn decode_image_bounded(path: &std::path::Path, op: Op) -> Result<RgbaImage> {
+    let (max_pixels, max_side, max_alloc) = match op {
+        Op::Upscale => (MAX_UPSCALE_PIXELS, 8192u32, 96 * 1024 * 1024u64),
+        Op::RemoveBackground => (MAX_REMOVE_BG_PIXELS, 16384u32, 256 * 1024 * 1024u64),
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_side);
+    limits.max_image_height = Some(max_side);
+    limits.max_alloc = Some(max_alloc);
+
+    let mut dim_reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    dim_reader.limits(limits.clone());
+    let (dw, dh) = dim_reader.into_dimensions().map_err(candle_core::Error::wrap)?;
+    if u64::from(dw) * u64::from(dh) > max_pixels {
+        match op {
+            Op::Upscale => candle_core::bail!("picture: {dw}×{dh} is more than 4 megapixels to enlarge; make it smaller first"),
+            Op::RemoveBackground => candle_core::bail!("picture: {dw}×{dh} exceeds the background-removal pixel limit ({MAX_REMOVE_BG_PIXELS})"),
+        }
+    }
+
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    reader.limits(limits);
+    let rgba = reader.decode().map_err(candle_core::Error::wrap)?.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    if u64::from(w) * u64::from(h) > max_pixels {
+        match op {
+            Op::Upscale => candle_core::bail!("picture: {w}×{h} is more than 4 megapixels to enlarge; make it smaller first"),
+            Op::RemoveBackground => candle_core::bail!("picture: {w}×{h} exceeds the background-removal pixel limit ({MAX_REMOVE_BG_PIXELS})"),
+        }
+    }
+    Ok(rgba)
+}
+
 pub fn run(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
     // (no Candle device for a WebGPU job: a CUDA context on the card would keep its memory)
     let dev = if r.webgpu { Device::Cpu } else { device(r.device)? };
-    let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
-    let rgba = img.to_rgba8();
+    let rgba = decode_image_bounded(&r.image, r.op)?;
     let (w, h) = rgba.dimensions();
     let rgb: Vec<u8> = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();

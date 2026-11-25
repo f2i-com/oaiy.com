@@ -133,7 +133,7 @@ function world(provider: ProviderConfig = ENGINE) {
     phone: () => ({ holdsCalls: true, holdsTexts: true, connected: true }),
     line,
     callbacks: () => null,
-    screening: async () => null,
+    screening: async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }),
     callsToOaiy: async () => true,
     rules: async () => ({ quietStart: 0, quietEnd: 0, maxDailyDials: 20, outboundEnabled: true }),
     sessions: () => sessions.forOutreach(),
@@ -350,7 +350,7 @@ describe('the engine reads a call before it is answered', () => {
     const order: string[] = [];
     const desktop = { command: async (_c: string, command: string) => void order.push(command) };
     const settings: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, callBack: true, callBackFilter: 'any' };
-    const callbacks = new Callbacks({ loadCallbacks: async () => saved, saveCallbacks: async (l: Callback[]) => void (saved = l) } as never, () => settings, () => desktop as unknown as Desktop, () => true, async () => null, () => {}, async () => true, () => false, (number, purpose) => order.push(`warm ${number}: ${purpose.split(':')[0]}`));
+    const callbacks = new Callbacks({ loadCallbacks: async () => saved, saveCallbacks: async (l: Callback[]) => void (saved = l) } as never, () => settings, () => desktop as unknown as Desktop, () => true, async () => ({ acceptPattern: '', blockedNumbers: '', rejectPrivate: false }), () => {}, async () => true, () => false, (number, purpose) => order.push(`warm ${number}: ${purpose.split(':')[0]}`));
     const t0 = Date.now();
     await callbacks.missed('0412345678', t0);
     await callbacks.tick(t0 + 120_000);

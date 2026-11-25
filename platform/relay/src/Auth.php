@@ -100,8 +100,10 @@ final class Auth
                 $db->exec('UPDATE tokid_fail SET fails = 1, first_at = ?, locked_until = NULL WHERE id = ? AND addr = ?', [$now, $tokenId, $addr]);
                 return;
             }
+            $until = $row['locked_until'] === null ? null : (int)$row['locked_until'];
+            $activeLock = $until !== null && $until > $now && $until <= $now + 900;
             $fails = $row['fails'] + 1;
-            $lock = $fails >= 20 ? $now + 900 : $row['locked_until'];
+            $lock = $activeLock ? $until : ($fails >= 20 ? $now + 900 : $until);
             $db->exec('UPDATE tokid_fail SET fails = ?, locked_until = ? WHERE id = ? AND addr = ?', [$fails, $lock, $tokenId, $addr]);
         });
     }

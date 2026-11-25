@@ -68,7 +68,24 @@ export const UNTRUSTED_WORKER_SOURCE = `
   // the flow's data past the permission-gated/DNS-pinned host broker. (We deliberately
   // do NOT shadow Blob/URL.createObjectURL: legit flow code uses Blob for data sizing,
   // and severing the worker constructors already closes the fresh-realm spawn.)
-  var egress = ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'BroadcastChannel', 'importScripts', 'Request', 'Response', 'Headers', 'navigator', 'Worker', 'SharedWorker'];
+  var egress = [
+    'fetch', 'XMLHttpRequest', 'WebSocket', 'WebTransport', 'EventSource', 'BroadcastChannel',
+    'importScripts', 'Request', 'Response', 'Headers', 'caches', 'indexedDB',
+    'LockManager', 'locks', 'storage', 'navigator', 'Worker', 'SharedWorker',
+  ];
+  // Neutralize navigator.storage / navigator.locks / sendBeacon across navigator's full
+  // prototype chain BEFORE neutralizing navigator on self (mirrors compiler-sandbox-worker.ts).
+  try {
+    var nav = self.navigator;
+    if (nav) {
+      var navBlocked = ['storage', 'locks', 'sendBeacon', 'serviceWorker', 'clipboard', 'credentials'];
+      for (var np = nav; np && np !== Object.prototype; np = Object.getPrototypeOf(np)) {
+        for (var ni = 0; ni < navBlocked.length; ni++) {
+          try { Object.defineProperty(np, navBlocked[ni], { value: undefined, configurable: false, writable: false }); } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
   // Walk the FULL prototype chain, not just [self, parent]: per WebIDL, [Global] interface
   // members are installed on the interface PROTOTYPE objects, not flattened onto the global
   // instance. In a real DedicatedWorkerGlobalScope the WindowOrWorkerGlobalScope mixin members —

@@ -44,6 +44,9 @@ impl Linear {
 
     /// A 1x1 convolution's weight `(out, in, 1)` (or `(out, in, 1, 1)`) as a linear layer.
     pub fn load_pointwise(w: &mut Weights, prefix: &str, out: usize, inp: usize, dims: usize, p: Precision, dev: &Device) -> Result<Self> {
+        if dims < 2 {
+            return Err(bad(format!("{prefix}: pointwise conv rank must be >= 2, got {dims}")));
+        }
         let shape: Vec<usize> = [out, inp].into_iter().chain(std::iter::repeat_n(1, dims - 2)).collect();
         let weight = w.tensor(&format!("{prefix}.weight"), &shape, p.weights, dev)?.reshape((out, inp))?;
         let bias = w.optional(&format!("{prefix}.bias"), &[out], p.act, dev)?;
@@ -214,7 +217,11 @@ struct Subsampling {
 
 impl Subsampling {
     fn load(w: &mut Weights, n_mels: usize, d_model: usize, p: Precision, dev: &Device) -> Result<Self> {
-        let channels = w.shape("encoder.pre_encode.conv.0.weight")?[0];
+        let s0 = w.shape("encoder.pre_encode.conv.0.weight")?;
+        if s0.len() != 4 || s0[0] == 0 {
+            return Err(bad(format!("encoder.pre_encode.conv.0.weight: expected 4-D non-empty shape, got {s0:?}")));
+        }
+        let channels = s0[0];
         let conv0 = Stride2Conv::load(w, "encoder.pre_encode.conv.0", channels, false, dev)?;
         let mut stages = Vec::new();
         let mut freq = Stride2Conv::out_len(n_mels);
@@ -280,6 +287,9 @@ struct Attention {
 
 impl Attention {
     fn load(w: &mut Weights, p: &str, d: usize, heads: usize, prec: Precision, dev: &Device) -> Result<Self> {
+        if heads == 0 || d == 0 || d % heads != 0 {
+            return Err(bad(format!("{p}: invalid attention dims d={d}, heads={heads}")));
+        }
         let dk = d / heads;
         let scale = 1.0 / (dk as f64).sqrt();
         let (wq, _) = w.f32_shaped(&format!("{p}.linear_q.weight"), &[d, d])?;
@@ -398,16 +408,25 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn load(w: &mut Weights, n_mels: usize, xscaling: bool, prec: Precision, dev: &Device) -> Result<Self> {
-        let d_model = w.shape("encoder.layers.0.self_attn.linear_q.weight")?[0];
-        let heads = w.shape("encoder.layers.0.self_attn.pos_bias_u")?[0];
-        let ff = w.shape("encoder.layers.0.feed_forward1.linear1.weight")?[0];
-        let kernel = w.shape("encoder.layers.0.conv.depthwise_conv.weight")?[2];
+        let q_shape = w.shape("encoder.layers.0.self_attn.linear_q.weight")?;
+        let u_shape = w.shape("encoder.layers.0.self_attn.pos_bias_u")?;
+        let ff_shape = w.shape("encoder.layers.0.feed_forward1.linear1.weight")?;
+        let dw_shape = w.shape("encoder.layers.0.conv.depthwise_conv.weight")?;
+        if q_shape.len() != 2 || u_shape.len() != 2 || ff_shape.len() != 2 || dw_shape.len() != 3 {
+            return Err(bad(format!(
+                "unexpected encoder tensor ranks: q={q_shape:?}, pos_bias_u={u_shape:?}, ff={ff_shape:?}, dw={dw_shape:?}"
+            )));
+        }
+        let d_model = q_shape[0];
+        let heads = u_shape[0];
+        let ff = ff_shape[0];
+        let kernel = dw_shape[2];
         let mut layers_n = 0;
         while w.has(&format!("encoder.layers.{layers_n}.norm_out.weight")) {
             layers_n += 1;
         }
-        if layers_n == 0 || heads == 0 || d_model % heads != 0 || kernel % 2 == 0 {
-            return Err(bad(format!("not a FastConformer encoder ({layers_n} layers, d_model {d_model}, {heads} heads, kernel {kernel})")));
+        if layers_n == 0 || d_model == 0 || ff == 0 || n_mels == 0 || heads == 0 || d_model % heads != 0 || kernel == 0 || kernel % 2 == 0 {
+            return Err(bad(format!("not a FastConformer encoder ({layers_n} layers, d_model {d_model}, ff {ff}, {heads} heads, kernel {kernel}, n_mels {n_mels})")));
         }
         let shape = EncoderShape { layers: layers_n, d_model, heads, ff, kernel, n_mels };
         let sub = Subsampling::load(w, n_mels, d_model, prec, dev)?;
@@ -449,6 +468,9 @@ impl Encoder {
     }
 
     fn frame(&self, t: usize) -> Result<Frame> {
+        if t == 0 {
+            return Err(bad("encoder received zero frames"));
+        }
         let s = &self.shape;
         let dk = s.d_model / s.heads;
         let pe = rel_pos_emb(t, s.d_model, &self.dev)?.to_dtype(self.precision.act)?;
@@ -497,6 +519,9 @@ fn load_depthwise(w: &mut Weights, prefix: &str, d: usize, kernel: usize, act: D
 /// NeMo's `RelPositionalEncoding` for `t` frames: sinusoids of the relative
 /// positions t-1 down to -(t-1), `(2t - 1, d)`, computed in f32 as torch does.
 pub fn rel_pos_emb(t: usize, d: usize, dev: &Device) -> Result<Tensor> {
+    if t == 0 || d == 0 {
+        return Err(bad(format!("rel_pos_emb requires t > 0 and d > 0, got t={t}, d={d}")));
+    }
     let n = 2 * t - 1;
     let scale = -(10000f64.ln() / d as f64) as f32;
     let div: Vec<f32> = (0..d / 2).map(|i| ((2 * i) as f32 * scale).exp()).collect();

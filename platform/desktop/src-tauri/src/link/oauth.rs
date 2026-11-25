@@ -64,6 +64,56 @@ pub fn join(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
+/// Validate and safely format a single URL path segment (such as `{id}` or `{formId}`) before
+/// substituting it into a provider endpoint path template.
+///
+/// Rejects empty values, `.`, `..`, path separators (`/`, `\`), query/fragment/percent
+/// delimiters (`?`, `#`, `%`), whitespace, and control characters so untrusted provider/flow
+/// values cannot traverse to other endpoints or smuggle query/fragment components. Any
+/// remaining non-unreserved bytes are RFC 3986 percent-encoded.
+pub fn path_segment(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value == "."
+        || value.contains("..")
+        || value.chars().any(|c| {
+            matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_whitespace() || c.is_control()
+        })
+    {
+        return Err(format!("invalid {label} for URL path segment: {value:?}"));
+    }
+    Ok(q(value))
+}
+
+/// Whether `url` is an HTTP(S) address at the provider's exact origin (scheme, host, port)
+/// and under `base_url`'s path, with no embedded userinfo. Used before attaching the account's
+/// bearer credential to a persisted URL loaded from disk.
+pub fn at_provider(url: &str, base_url: &str) -> bool {
+    let (Ok(target), Ok(base)) = (reqwest::Url::parse(url), reqwest::Url::parse(base_url)) else {
+        return false;
+    };
+    if !matches!(target.scheme(), "http" | "https") || !matches!(base.scheme(), "http" | "https") {
+        return false;
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return false;
+    }
+    if target.scheme() != base.scheme()
+        || target.host_str() != base.host_str()
+        || target.port_or_known_default() != base.port_or_known_default()
+    {
+        return false;
+    }
+    if !url.starts_with(&format!("{}/", base_url.trim_end_matches('/'))) {
+        return false;
+    }
+    let base_prefix = base.path().trim_end_matches('/');
+    if base_prefix.is_empty() {
+        target.path().starts_with('/')
+    } else {
+        target.path() == base_prefix || target.path().starts_with(&format!("{base_prefix}/"))
+    }
+}
+
 /// The URL to open in the user's browser.
 pub fn authorize_url(
     descriptor: &ConnectorDescriptor,
@@ -684,5 +734,49 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(err, "cancelled", "{err}");
         assert!(started.elapsed() < Duration::from_secs(5), "it must return promptly");
+    }
+
+    #[test]
+    fn path_segment_rejects_traversal_delimiters_and_control_chars() {
+        for good in ["form-a", "r1", "cmd_1", "67c1382d-c318-4ee5-a94c-a4f3d0cf1227", "v1.2~ok"] {
+            assert_eq!(path_segment(good, "id").unwrap(), good, "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../admin",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "id?admin=1",
+            "id#frag",
+            "id%2fadmin",
+            "id with space",
+            "id\nnewline",
+            "id\r\nheader",
+            "id\u{0000}nul",
+        ] {
+            assert!(path_segment(bad, "id").is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn at_provider_requires_exact_origin_no_userinfo_and_base_path() {
+        let base = "https://provider.example/app";
+        assert!(at_provider("https://provider.example/app/runs/r1", base));
+        for bad in [
+            "http://provider.example/app/runs/r1",
+            "https://provider.example:8443/app/runs/r1",
+            "https://evil.example/app/runs/r1",
+            "https://provider.example.evil.test/app/runs/r1",
+            "https://provider.example@evil.test/app/runs/r1",
+            "https://user:pass@provider.example/app/runs/r1",
+            "https://provider.example/other/runs/r1",
+            "https://provider.example/app/../other/runs/r1",
+            "not-a-url",
+        ] {
+            assert!(!at_provider(bad, base), "{bad:?} must be rejected");
+        }
     }
 }

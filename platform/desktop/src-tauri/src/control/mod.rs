@@ -54,6 +54,7 @@ pub mod audit;
 pub mod engines;
 mod mcp;
 mod tools;
+pub(crate) use tools::McpDispatch;
 #[cfg(test)]
 mod tests;
 

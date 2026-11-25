@@ -342,7 +342,10 @@ fn causal_conv2d(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// torchaudio's `functional.resample` (Hann-windowed sinc, 6 zero crossings,
 /// rolloff 0.99) for one channel, `from` Hz to `to` Hz.
 pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
-    if from == to || x.is_empty() {
+    if from == 0 || to == 0 || x.is_empty() {
+        return Vec::new();
+    }
+    if from == to {
         return x.to_vec();
     }
     fn gcd(a: usize, b: usize) -> usize {
@@ -353,26 +356,47 @@ pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
     let (zeros, rolloff) = (6f64, 0.99f64);
     let base = orig.min(new) as f64 * rolloff;
     let width = (zeros * orig as f64 / base).ceil() as usize;
-    let taps = 2 * width + orig;
+    let taps = width.saturating_mul(2).saturating_add(orig);
+    let target = (new as u128 * x.len() as u128).div_ceil(orig as u128) as usize;
+    let scale = base / orig as f64;
+    let weight = |phase: usize, i_minus_w: isize| -> f32 {
+        let idx = i_minus_w as f64 / orig as f64;
+        let t = ((-(phase as f64) / new as f64 + idx) * base).clamp(-zeros, zeros);
+        let window = (t * std::f64::consts::PI / zeros / 2.).cos().powi(2);
+        let t = t * std::f64::consts::PI;
+        let sinc = if t == 0. { 1. } else { t.sin() / t };
+        (sinc * window * scale) as f32
+    };
+    // Coprime / large-ratio rates would otherwise allocate gigabytes for `new * taps` kernels;
+    // compute only the `~2 * width` non-zero windowed-sinc taps directly per output sample in O(1) extra RAM.
+    if new.saturating_mul(taps) > 1_000_000 {
+        let mut out = Vec::with_capacity(target);
+        let half = width as isize;
+        let x_len = x.len() as isize;
+        for out_idx in 0..target {
+            let b = out_idx / new;
+            let phase = out_idx % new;
+            let center = (b as f64) * (orig as f64) + (phase as f64) * (orig as f64) / (new as f64);
+            let j_lo = (center.floor() as isize - half).max(0) as usize;
+            let j_hi = (center.ceil() as isize + half).min(x_len - 1);
+            let mut sum = 0.0f32;
+            if j_hi >= j_lo as isize {
+                let b_orig = (b * orig) as isize;
+                for j in j_lo..=(j_hi as usize) {
+                    sum += x[j] * weight(phase, j as isize - b_orig);
+                }
+            }
+            out.push(sum);
+        }
+        return out;
+    }
     // One kernel per output phase, computed in F64 and applied in F32.
     let kernels: Vec<Vec<f32>> = (0..new)
-        .map(|phase| {
-            (0..taps)
-                .map(|i| {
-                    let idx = (i as f64 - width as f64) / orig as f64;
-                    let t = ((-(phase as f64) / new as f64 + idx) * base).clamp(-zeros, zeros);
-                    let window = (t * std::f64::consts::PI / zeros / 2.).cos().powi(2);
-                    let t = t * std::f64::consts::PI;
-                    let sinc = if t == 0. { 1. } else { t.sin() / t };
-                    (sinc * window * base / orig as f64) as f32
-                })
-                .collect()
-        })
+        .map(|phase| (0..taps).map(|i| weight(phase, i as isize - width as isize)).collect())
         .collect();
     // Zeros: `width` before, `width + orig` after.
     let padded: Vec<f32> = std::iter::repeat_n(0f32, width).chain(x.iter().copied()).chain(std::iter::repeat_n(0f32, width + orig)).collect();
     let blocks = (padded.len() - taps) / orig + 1;
-    let target = (new as u128 * x.len() as u128).div_ceil(orig as u128) as usize;
     let mut out = Vec::with_capacity(target);
     'outer: for b in 0..blocks {
         let window = &padded[b * orig..b * orig + taps];
@@ -494,14 +518,36 @@ impl AudioEncoder {
             let t = store.tensor_f32(&k, dev)?;
             w.insert(k, t);
         }
+        let sample_rate_raw = params.and_then(|p| p.get("sampling_rate")).and_then(Json::as_i64).unwrap_or(16_000);
+        let sample_rate = usize::try_from(sample_rate_raw)
+            .ok()
+            .filter(|&r| r > 0)
+            .ok_or_else(|| msg(format!("invalid audio VAE sampling_rate {sample_rate_raw}")))?;
+        let hop_f = num("stft", "hop_length", 160.);
+        let n_fft_f = num("stft", "filter_length", 1024.);
+        let f_max = num("mel", "mel_fmax", 8000.);
+        if !hop_f.is_finite() || hop_f < 1.0 || hop_f > (i64::MAX as f64) {
+            candle_core::bail!("invalid audio VAE hop_length {hop_f}");
+        }
+        if !n_fft_f.is_finite() || n_fft_f < 2.0 || n_fft_f > (1u64 << 20) as f64 {
+            candle_core::bail!("invalid audio VAE filter_length {n_fft_f}");
+        }
+        let hop = hop_f as usize;
+        let n_fft = n_fft_f as usize;
+        if hop == 0 || !n_fft.is_power_of_two() || n_fft < 2 {
+            candle_core::bail!("invalid audio VAE STFT params: hop={hop}, n_fft={n_fft}");
+        }
+        if !f_max.is_finite() || f_max <= 0.0 {
+            candle_core::bail!("invalid audio VAE mel_fmax {f_max}");
+        }
         Ok(Self {
             w,
             levels,
-            sample_rate: params.and_then(|p| p.get("sampling_rate")).and_then(Json::as_i64).unwrap_or(16_000) as usize,
-            hop: num("stft", "hop_length", 160.) as usize,
-            n_fft: num("stft", "filter_length", 1024.) as usize,
+            sample_rate,
+            hop,
+            n_fft,
             mel_bins: 64,
-            f_max: num("mel", "mel_fmax", 8000.),
+            f_max,
         })
     }
 
@@ -702,6 +748,24 @@ mod tests {
             assert!((y[i] - want).abs() < 0.02, "sample {i}: {} vs {want}", y[i]);
         }
         assert_eq!(resample(&x[..441], 44_100, 16_000).len(), 160);
+    }
+
+    #[test]
+    fn resampling_coprime_rates_stays_bounded_and_accurate() {
+        // 44101 and 48000 are coprime (gcd = 1), so a dense polyphase table would be ~20+ GB.
+        let from = 44_101;
+        let to = 48_000;
+        let x: Vec<f32> = (0..4_410)
+            .map(|i| (2. * std::f32::consts::PI * 440. * i as f32 / from as f32).sin())
+            .collect();
+        let y = resample(&x, from, to);
+        assert_eq!(y.len(), ((x.len() as u128 * to as u128).div_ceil(from as u128)) as usize);
+        for i in 200..y.len() - 200 {
+            let want = (2. * std::f32::consts::PI * 440. * i as f32 / to as f32).sin();
+            assert!((y[i] - want).abs() < 0.02, "sample {i}: {} vs {want}", y[i]);
+        }
+        assert!(resample(&x, 0, to).is_empty());
+        assert!(resample(&x, from, 0).is_empty());
     }
 
     #[test]

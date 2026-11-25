@@ -84,8 +84,13 @@ async function readJson<T>(dir: FileSystemDirectoryHandle, name: string): Promis
 async function writeBytes(dir: FileSystemDirectoryHandle, name: string, data: Uint8Array | string): Promise<void> {
   const handle = await dir.getFileHandle(name, { create: true });
   const writable = await handle.createWritable();
-  await writable.write(typeof data === 'string' ? data : new Blob([data as BlobPart]));
-  await writable.close();
+  try {
+    await writable.write(typeof data === 'string' ? data : new Blob([data as BlobPart]));
+    await writable.close();
+  } catch (error) {
+    await writable.abort?.().catch(() => {});
+    throw error;
+  }
 }
 
 /**
@@ -409,12 +414,13 @@ export class OpenProject {
    */
   private async write(batch: VfsChange[]): Promise<Array<{ change: VfsChange; label: string; error: string }>> {
     const failed: Array<{ change: VfsChange; label: string; error: string }> = [];
-    const files = await this.dir.getDirectoryHandle('files', { create: true });
+    let files = await this.dir.getDirectoryHandle('files', { create: true });
     for (const change of batch) {
       try {
         if (change.type === 'reset') {
           await this.dir.removeEntry('files', { recursive: true }).catch(() => {});
           const fresh = await this.dir.getDirectoryHandle('files', { create: true });
+          files = fresh;
           for (const [path, data] of this.vfs.files()) {
             const slash = path.lastIndexOf('/');
             await writeBytes(await dirAt(fresh, slash < 0 ? '' : path.slice(0, slash), true), path.slice(slash + 1), data);

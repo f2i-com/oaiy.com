@@ -108,6 +108,8 @@ export interface Session extends SessionInfo {
   justTexted?: boolean;
   /** What the run going on was given to answer: no longer waiting, and a turn only once the run has read the person's contact and begun. */
   answering?: string;
+  /** End-of-call bookkeeping deferred until an aborting run settles so turns are never mutated mid-run. */
+  afterEnd?: { note: () => void; outreach: () => void };
 }
 
 /**
@@ -1029,6 +1031,8 @@ export class Sessions {
   private orders = new Map<string, { turns: Turn[]; has: Set<Turn> }>();
   /** Each conversation's file being written: one write at a time, each with all its lanes' turns as they are then. */
   private writing = new Map<string, Promise<void>>();
+  /** In-flight SMS idempotency keys/handles recorded before awaiting textArrived so concurrent duplicates never double-process. */
+  private readonly seenSms = new Set<string>();
 
   constructor(
     private readonly project: OpenProject,
@@ -1546,7 +1550,7 @@ export class Sessions {
 
   /** An answer for a call's agent (a lookup's): at once, or with the caller's words when they are speaking. */
   private answered(session: Session, callId: string, text: string): void {
-    if (session.callId !== callId) return;
+    if (!this.list.includes(session) || session.callId !== callId) return;
     if (session.callerSpeaking) (session.held ??= []).push(text);
     else this.deliver(session, text, true);
   }
@@ -1923,6 +1927,13 @@ export class Sessions {
       // A call of an outreach: one we placed (by its id, kept across a reload), or someone on a list who rang in. Its person's name names the conversation.
       const outreach = !hidden ? this.outreach?.forCall(callId, from) : undefined;
       session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? '') || outreach?.person || '', 'call', hidden);
+      // Wait for any previous run on this session to settle before mutating turns or starting a fresh call.
+      if (session.running) {
+        const prev = session.running;
+        if (!session.controller?.signal.aborted) this.stop(session);
+        await prev;
+        if (!this.list.includes(session)) return null;
+      }
       // Their last contact before this call (their texts, their last call), from what the conversation holds now.
       const history = this.turnsOf(session.thread);
       const lastContact = Math.max(0, ...history.map((t) => t.at ?? 0), ...this.list.filter((s) => s.thread === session!.thread && s !== session && s.agent.turns.length).map((s) => s.lastAt), session.agent.turns.length ? session.lastAt : 0);
@@ -2209,20 +2220,36 @@ export class Sessions {
     session.callerSpeaking = false;
     session.unsaid = undefined;
     session.speech?.hush();
+    const running = session.running;
     this.stop(session);
     session.callId = undefined;
     // A call that failed (the phone's voice link broke, say) says why: the person sees it in the call's record.
     const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
-    this.addNote(session, failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.');
+    const endNote = failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.';
+    const finishOutreach = () => {
+      const link = session.outreach;
+      if (link && this.outreach?.callEnded(link, conversationLines(session.agent.view()).slice(-8))) this.queueRun(session, OUTREACH_AFTER_CALL);
+    };
+    if (running) {
+      // Wait until the aborting run settles before appending the call-ended note or evaluating outreach lines.
+      session.afterEnd = {
+        note: () => this.addNote(session, endNote),
+        outreach: finishOutreach,
+      };
+      this.hooks.changed();
+      return;
+    }
+    if (!this.list.includes(session)) return;
+    this.addNote(session, endNote);
     await this.save(session);
     // An outreach call that ended before its result was recorded: its agent records it now, from what was said (nothing is spoken).
-    const link = session.outreach;
-    if (link && this.outreach?.callEnded(link, conversationLines(session.agent.view()).slice(-8))) this.queueRun(session, OUTREACH_AFTER_CALL);
+    finishOutreach();
     this.hooks.changed();
   }
 
   /** A run for a lane after the one it has now (never read into that one: a call's run that was stopped as it ended reads nothing more). */
   private queueRun(session: Session, text: string): void {
+    if (!this.list.includes(session)) return;
     session.waiting.push(text);
     session.waitingSince ??= Date.now();
     const lane = session.kind === 'call' ? this.callQueue : this.queue;
@@ -2308,7 +2335,7 @@ export class Sessions {
     clearTimeout(session.speakingTimer);
     session.callerSpeaking = false;
     const held = (session.held ?? []).splice(0);
-    if (held.length && session.callId) this.deliver(session, held.join('\n'), true);
+    if (held.length && session.callId && this.list.includes(session)) this.deliver(session, held.join('\n'), true);
   }
 
   /** send_text_message: through the desktop to Aokie's sms.send (a test conversation's replies are only shown). */
@@ -2473,7 +2500,7 @@ export class Sessions {
     const settles = ({ own, texts }: { own: boolean; texts: string[] }): boolean => {
       if (own) return true;
       if (!texts.length) return false;
-      if (opener === null) opener = texts[0];
+      if (opener === null) opener = texts.join('\n');
       else if (answered && !texts.some(hasLink)) return true;
       return false;
     };
@@ -2571,16 +2598,24 @@ export class Sessions {
     // known by the phone's handle alone: Android gives a deleted text's handle to a new one, which Aokie sends under a key
     // of its own. The handle only when the event has no key; with neither, nothing tells it from a new one, so it is one.
     const seen = String(event.idempotencyKey ?? '').trim() || String(event.data.handle ?? '').trim();
+    const person = phoneKey(from) || from;
+    const seenKey = seen ? `${person}\0${seen}` : '';
     if (seen) {
-      const existing = this.list.find((s) => s.kind === 'sms' && this.isPerson(s, phoneKey(from) || from));
+      if (this.seenSms.has(seenKey)) return null;
+      const existing = this.list.find((s) => s.kind === 'sms' && this.isPerson(s, person));
       if (existing?.handles?.includes(seen)) return null;
+      this.seenSms.add(seenKey);
     }
-    const session = await this.textArrived(from, String(event.data.name ?? ''), body);
-    if (seen) {
-      session.handles = [...(session.handles ?? []), seen].slice(-100);
-      await this.saveIndex();
+    try {
+      const session = await this.textArrived(from, String(event.data.name ?? ''), body);
+      if (seen && this.list.includes(session)) {
+        session.handles = [...(session.handles ?? []), seen].slice(-100);
+        await this.saveIndex();
+      }
+      return session;
+    } finally {
+      if (seenKey) this.seenSms.delete(seenKey);
     }
-    return session;
   }
 
   /** A text message from `number`: shown in its conversation, and answered when answering is on. */
@@ -2695,6 +2730,7 @@ export class Sessions {
 
   /** A message for a lane: to its running agent, or its next run. */
   private deliver(session: Session, text: string, first = false): void {
+    if (!this.list.includes(session)) return;
     // A flow's task is its own run (its answer is what that run says), never added to another. Nor is what comes after a
     // goodbye on a call left open (see leftOpen): that run says nothing more, and this is answered aloud.
     if (session.kind !== 'task' && session.running && !session.leftOpen && session.agent.interject(text)) {
@@ -2734,6 +2770,7 @@ export class Sessions {
   }
 
   private async run(session: Session, prompt: string): Promise<void> {
+    if (!this.list.includes(session)) return;
     const controller = new AbortController();
     session.controller = controller;
     let finish!: () => void;
@@ -2746,13 +2783,6 @@ export class Sessions {
     session.leftOpen = undefined;
     session.answering = prompt;
     this.hooks.changed();
-    // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can
-    // wait that long; a call's agent never waits, see callEvent).
-    if (session.kind === 'sms') {
-      const reading = this.freshen(session.key);
-      if (reading) await Promise.race([reading, new Promise((r) => setTimeout(r, TEXT_CONTACT_WAIT_MS))]);
-    }
-    session.speech?.begin();
     // The call this run answers, if it is a call's: once that call has ended, what is left for the run is not answered.
     const onCall = session.callId;
     // What the run says last (a flow's task is answered with it), or why it failed.
@@ -2777,18 +2807,26 @@ export class Sessions {
       clearTimeout(session.holdWord);
       session.holdWord = undefined;
     };
-    if (session.speech && onCall && heardAt !== undefined) {
-      stopHoldWord();
-      session.holdWord = setTimeout(() => {
-        session.holdWord = undefined;
-        if (replying || goodbye || ending || session.parting || session.callerSpeaking || session.callId !== onCall || controller.signal.aborted) return;
-        if (session.speech?.holdWord(HOLD_WORDS[this.holdWords % HOLD_WORDS.length])) this.holdWords++;
-      }, Math.max(0, heardAt + this.holdWordAfterMs - Date.now()));
-    }
     // When the messages it answers came: the time its first turn is kept with (the rest, as they come).
     let arrived = session.waitingSince;
     session.waitingSince = session.waiting.length ? Date.now() : undefined;
     try {
+      // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can
+      // wait that long; a call's agent never waits, see callEvent).
+      if (session.kind === 'sms') {
+        const reading = this.freshen(session.key);
+        if (reading) await Promise.race([reading, new Promise((r) => setTimeout(r, TEXT_CONTACT_WAIT_MS))]);
+      }
+      if (!this.list.includes(session) || controller.signal.aborted) return;
+      session.speech?.begin();
+      if (session.speech && onCall && heardAt !== undefined) {
+        stopHoldWord();
+        session.holdWord = setTimeout(() => {
+          session.holdWord = undefined;
+          if (replying || goodbye || ending || session.parting || session.callerSpeaking || session.callId !== onCall || controller.signal.aborted || !this.list.includes(session)) return;
+          if (session.speech?.holdWord(HOLD_WORDS[this.holdWords % HOLD_WORDS.length])) this.holdWords++;
+        }, Math.max(0, heardAt + this.holdWordAfterMs - Date.now()));
+      }
       await session.agent.run(prompt, (event) => {
         this.stamp(session, arrived);
         arrived = undefined;
@@ -2859,17 +2897,26 @@ export class Sessions {
       session.running = null;
       session.controller = null;
       session.answering = undefined;
-      finish();
+      const alive = this.list.includes(session);
+      const afterEnd = session.afterEnd;
+      session.afterEnd = undefined;
+      if (!alive) {
+        finish();
+        this.hooks.changed();
+        return;
+      }
       session.lastAt = Date.now();
       // Messages that came as it finished: its next turn.
       const unread = session.agent.takeUnread();
-      // Its call has ended: what came for it (the caller's last words) is kept, and no one is answered
-      // (kept before the save, which has it). A call begun since has its own words.
+      // Its call has ended: append any deferred end note now that agent.run() and heard… settled, then keep any last unread words.
       const callOver = !!onCall && session.callId !== onCall;
+      if (afterEnd && !session.callId) afterEnd.note();
       if (callOver && unread.length && !session.callId) session.agent.turns.push({ role: 'user', text: unread.join('\n\n'), at: Date.now() });
+      finish();
       await this.save(session);
       await this.saveIndex();
       this.hooks.finished?.(session);
+      if (afterEnd && !session.callId) afterEnd.outreach();
       // A booking promised but not requested: the agent is told once, and requests it.
       if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
         session.bookingNudged = true;
@@ -2910,10 +2957,29 @@ export class Sessions {
   async remove(target: Thread | Session): Promise<void> {
     const thread = 'lanes' in target ? target.id : target.thread;
     const lanes = this.list.filter((s) => s.thread === thread);
-    for (const s of lanes) this.stop(s);
+    for (const s of lanes) {
+      clearTimeout(s.transferTimer);
+      s.transferTimer = undefined;
+      s.transferRequest = undefined;
+      clearTimeout(s.speakingTimer);
+      s.speakingTimer = undefined;
+      clearTimeout(s.holdWord);
+      s.holdWord = undefined;
+      s.afterEnd = undefined;
+      s.callId = undefined;
+      s.speech?.hush();
+      this.stop(s);
+    }
     this.list = this.list.filter((s) => s.thread !== thread);
     this.orders.delete(thread);
-    await this.project.saveSessionChat(thread, []);
+    const clear = (this.writing.get(thread) ?? Promise.resolve()).then(() => this.project.saveSessionChat(thread, []));
+    const settled = clear.catch(() => {});
+    this.writing.set(thread, settled);
+    try {
+      await clear;
+    } finally {
+      if (this.writing.get(thread) === settled) this.writing.delete(thread);
+    }
     await this.saveIndex();
     this.hooks.changed();
   }
@@ -2938,7 +3004,11 @@ export class Sessions {
     });
     const settled = write.catch(() => {});
     this.writing.set(thread, settled);
-    await write;
+    try {
+      await write;
+    } finally {
+      if (this.writing.get(thread) === settled) this.writing.delete(thread);
+    }
   }
 
   private sort(): void {
@@ -2980,6 +3050,10 @@ export class DesktopEvents {
   private stopped = false;
   /** The desktop did not answer at the last look: it may have restarted since, its events numbered from 0 again. */
   private lapsed = false;
+  /** Bumped in stop()/forget() so any in-flight tick from an earlier epoch bails after its await. */
+  private epoch = 0;
+  /** In-flight tick lock for the active epoch so concurrent tick() calls never overlap. */
+  private inFlight: { epoch: number; promise: Promise<void> } | null = null;
   /** The last problem reaching the desktop (cleared when it answers). */
   problem = '';
 
@@ -3003,20 +3077,34 @@ export class DesktopEvents {
 
   stop(): void {
     this.stopped = true;
+    this.epoch++;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
 
   /** Start over at the stream's end (another desktop paired: its events are numbered its own way). */
   forget(): void {
+    this.epoch++;
     this.since = null;
     this.lapsed = false;
   }
 
   /** Look now (a test, or right after pairing). */
-  async tick(): Promise<void> {
+  tick(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.inFlight && this.inFlight.epoch === this.epoch) return this.inFlight.promise;
+    const epoch = this.epoch;
+    const run = this.runTick(epoch).finally(() => {
+      if (this.inFlight?.promise === run) this.inFlight = null;
+    });
+    this.inFlight = { epoch, promise: run };
+    return run;
+  }
+
+  private async runTick(epoch: number): Promise<void> {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    const stale = () => this.stopped || this.epoch !== epoch;
     const desktop = this.desktop();
     let wait = this.every;
     if (desktop) {
@@ -3026,6 +3114,7 @@ export class DesktopEvents {
           let since = 0;
           for (;;) {
             const page = await desktop.events(since);
+            if (stale()) return;
             if (!page.events.length || page.next <= since) break;
             since = page.next;
             try {
@@ -3033,7 +3122,9 @@ export class DesktopEvents {
             } catch {
               /* what could not be settled from it is settled later (outreach looks at a lost call itself) */
             }
+            if (stale()) return;
           }
+          if (stale()) return;
           this.since = since;
         } else {
           // Back after the desktop did not answer: a desktop that restarted numbers its events from 0 again, and
@@ -3044,27 +3135,34 @@ export class DesktopEvents {
             let latest = 0;
             for (let pages = 0; pages < 10; pages++) {
               const page = await desktop.events(latest);
+              if (stale()) return;
               if (!page.events.length || page.next <= latest) break;
               latest = page.next;
             }
+            if (stale()) return;
             if (latest < this.since) this.since = 0;
           }
           const { events } = await desktop.events(this.since);
+          if (stale()) return;
           // (each handled on its own: one that fails does not take the rest of its page with it)
           for (const e of events) {
+            if (stale()) return;
             try {
               await this.handle(e);
             } catch (error) {
               console.error('a desktop event could not be handled', e.name, error);
             }
+            if (stale()) return;
             this.since = Math.max(this.since ?? 0, e.seq);
           }
         }
+        if (stale()) return;
         if (this.problem) {
           this.problem = '';
           this.status('');
         }
       } catch (error) {
+        if (stale()) return;
         const message = (error as Error).message || 'OAIY Desktop did not answer';
         this.lapsed = true;
         if (message !== this.problem) {
@@ -3074,7 +3172,7 @@ export class DesktopEvents {
         wait = this.every * 5;
       }
     }
-    if (!this.stopped) this.timer = setTimeout(() => void this.tick(), wait);
+    if (!stale()) this.timer = setTimeout(() => void this.tick(), wait);
   }
 }
 

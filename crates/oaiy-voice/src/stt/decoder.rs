@@ -133,6 +133,9 @@ impl Decoder {
     pub fn load(w: &mut Weights, d_model: usize, dev: &Device) -> Result<Self> {
         let e = w.shape("decoder.prediction.embed.weight")?;
         let [tokens, hidden] = e[..] else { return Err(bad("decoder.prediction.embed.weight is not 2-D")) };
+        if tokens == 0 || hidden == 0 {
+            return Err(bad(format!("decoder.prediction.embed.weight has zero dimension: {e:?}")));
+        }
         let (embed, _) = w.f32_shaped("decoder.prediction.embed.weight", &[tokens, hidden])?;
         let mut lstm = Vec::new();
         while w.has(&format!("decoder.prediction.dec_rnn.lstm.weight_ih_l{}", lstm.len())) {
@@ -157,8 +160,15 @@ impl Decoder {
         if lstm.is_empty() {
             return Err(bad("no prediction LSTM in the checkpoint"));
         }
-        let joint = w.shape("joint.pred.weight")?[0];
-        let outputs = w.shape("joint.joint_net.2.weight")?[0];
+        let jp = w.shape("joint.pred.weight")?;
+        let jo = w.shape("joint.joint_net.2.weight")?;
+        let ([joint, _], [outputs, _]) = (jp.as_slice(), jo.as_slice()) else {
+            return Err(bad(format!("joint weights must be 2-D, got pred={jp:?}, out={jo:?}")));
+        };
+        let (joint, outputs) = (*joint, *outputs);
+        if joint == 0 || outputs == 0 {
+            return Err(bad(format!("joint dimensions must be > 0, got joint={joint}, outputs={outputs}")));
+        }
         let f32 = Precision::f32();
         let pred = Linear::load(w, "joint.pred", joint, hidden, f32, dev)?;
         let enc = Linear::load(w, "joint.enc", joint, d_model, f32, dev)?;
@@ -205,8 +215,13 @@ impl Decoder {
     /// and a gather.
     pub fn next(&self, state: &PredState, token: u32) -> Result<PredState> {
         let h = self.shape.hidden;
-        let at = token as usize * h;
-        let row = self.embed.get(at..at + h).ok_or_else(|| bad(format!("token {token} is past the embedding")))?;
+        let at = (token as usize)
+            .checked_mul(h)
+            .ok_or_else(|| bad(format!("token {token} offset overflow")))?;
+        let end = at
+            .checked_add(h)
+            .ok_or_else(|| bad(format!("token {token} range overflow")))?;
+        let row = self.embed.get(at..end).ok_or_else(|| bad(format!("token {token} is past the embedding")))?;
         let x = Tensor::from_slice(row, (1, h), &self.dev)?;
         self.predict(&x, Some(state))
     }

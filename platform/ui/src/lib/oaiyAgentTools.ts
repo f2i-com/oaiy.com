@@ -105,7 +105,13 @@ export async function agentUse(flow: Flow): Promise<{ tool?: { name: string; des
 export async function withdrawHook(flow: Flow): Promise<void> {
   const desktop = oaiyDesktop();
   if (!desktop) return;
-  await fetch(`${desktop.origin}/api/bridge/flows/${encodeURIComponent(hookFlowId(flow))}`, { method: 'DELETE', headers: { authorization: `Bearer ${desktop.token}` } });
+  const resp = await fetch(`${desktop.origin}/api/bridge/flows/${encodeURIComponent(hookFlowId(flow))}`, {
+    method: 'DELETE',
+    headers: { authorization: `Bearer ${desktop.token}` },
+  });
+  if (!resp.ok) {
+    throw new Error(`OAIY could not withdraw the hook (HTTP ${resp.status}): ${(await resp.text()).slice(0, 200)}`);
+  }
 }
 
 /** Store `flow` on the desktop as a tool for the agent (again: the tool is updated). */
@@ -130,8 +136,11 @@ export async function publishAsTool(flow: Flow, tool: AgentTool): Promise<void> 
 export async function withdrawTool(flow: Flow): Promise<void> {
   const desktop = oaiyDesktop();
   if (!desktop) return;
-  await fetch(`${desktop.origin}/api/bridge/flows/${encodeURIComponent(toolFlowId(flow))}`, {
+  const resp = await fetch(`${desktop.origin}/api/bridge/flows/${encodeURIComponent(toolFlowId(flow))}`, {
     method: 'DELETE',
     headers: { authorization: `Bearer ${desktop.token}` },
   });
+  if (!resp.ok) {
+    throw new Error(`OAIY could not withdraw the tool (HTTP ${resp.status}): ${(await resp.text()).slice(0, 200)}`);
+  }
 }

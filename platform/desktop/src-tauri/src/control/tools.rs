@@ -1025,6 +1025,12 @@ const MAX_FLOW_BYTES: usize = 200 * 1024;
 const MAX_PICTURES: usize = 4;
 const MAX_PICTURE: usize = 3_500_000;
 
+/// In-process marker extension attached EXCLUSIVELY by [`Desk::send`] and [`Desk::bytes`] on
+/// MCP tool subrequests. The private unit field prevents construction outside `control::tools`,
+/// and [`crate::auth::guard::Guard`] honors it ONLY when `peer == Peer::InProcess`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct McpDispatch(());
+
 /// The desktop's own router, called in-process with this process's bearer:
 /// the same gate, validation and module checks as any other caller.
 pub(crate) struct Desk {
@@ -1048,7 +1054,7 @@ impl Desk {
     pub async fn send(&self, method: Method, path: &str, body: Option<String>, wait: Duration) -> Result<Reply, String> {
         let mut request = Request::builder().method(method.clone()).uri(path);
         if let Some(p) = self.principal.as_ref().filter(|p| p.kind != PrincipalKind::Legacy) {
-            request = request.extension(p.clone());
+            request = request.extension(p.clone()).extension(McpDispatch(()));
         } else {
             request = request.header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
         }
@@ -1097,7 +1103,7 @@ impl Desk {
     async fn bytes(&self, path: &str) -> Result<Vec<u8>, String> {
         let mut request = Request::builder().method(Method::GET).uri(path);
         if let Some(p) = self.principal.as_ref().filter(|p| p.kind != PrincipalKind::Legacy) {
-            request = request.extension(p.clone());
+            request = request.extension(p.clone()).extension(McpDispatch(()));
         } else {
             request = request.header(header::AUTHORIZATION, format!("Bearer {}", crate::internal_token()));
         }

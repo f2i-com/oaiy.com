@@ -342,6 +342,46 @@ test('4.18.8 bin/relay import: refuses an installed relay, a damaged or changed 
     eq(1, $fresh()->run(['import', $r->dir . '/nothing-here', '--yes']));
 });
 
+test('4.18.8 bin/relay import: requires every core and secret file in manifest, rejects duplicates, traversal and extra secrets, and writes web guards', function () {
+    Relay::sqliteOnly();
+    $r = Relay::make();
+    $dir = $r->dir . '/export-strict';
+    eq(0, cli_run($r, 'export', $dir)[0]);
+    $origManifest = (string)file_get_contents($dir . '/MANIFEST.txt');
+    $runFresh = function (string $targetDir = '') use ($dir): array {
+        $d = $targetDir !== '' ? $targetDir : Tmp::dir('imp-strict') . '/data';
+        $out = '';
+        $err = '';
+        $cli = new Cli($d, function (string $s) use (&$out): void { $out .= $s; }, function (string $s) use (&$err): void { $err .= $s; });
+        return [$cli->run(['import', $dir, '--yes']), $out, $err, $d];
+    };
+    // Empty manifest must be rejected (no unverified copy).
+    file_put_contents($dir . '/MANIFEST.txt', '');
+    eq(1, $runFresh()[0], 'empty manifest rejected');
+    // Duplicate entry must be rejected.
+    $lines = array_values(array_filter(explode("\n", $origManifest)));
+    file_put_contents($dir . '/MANIFEST.txt', implode("\n", array_merge($lines, [$lines[0]])) . "\n");
+    eq(1, $runFresh()[0], 'duplicate manifest entry rejected');
+    // Missing required file (config.json omitted from manifest) must be rejected.
+    $withoutConfig = array_values(array_filter($lines, fn(string $l): bool => substr($l, -11) !== 'config.json'));
+    file_put_contents($dir . '/MANIFEST.txt', implode("\n", $withoutConfig) . "\n");
+    eq(1, $runFresh()[0], 'missing required manifest entry rejected');
+    // Unlisted extra file in secrets/ must be rejected.
+    file_put_contents($dir . '/MANIFEST.txt', $origManifest);
+    file_put_contents($dir . '/secrets/extra.key', 'rogue');
+    eq(1, $runFresh()[0], 'unlisted secret file rejected');
+    unlink($dir . '/secrets/extra.key');
+    // Traversal into public/ must be rejected even with .. segments.
+    [$c, , $e] = $runFresh(dirname(__DIR__, 2) . '/public/sub/../imported-data');
+    eq(1, $c, 'data folder resolving inside public/ rejected');
+    contains('web root', $e);
+    // Clean import writes .htaccess and web.config guards.
+    [$c, , $e, $imported] = $runFresh();
+    eq(0, $c, $e);
+    ok(is_file($imported . '/.htaccess'), '.htaccess guard written on import');
+    ok(is_file($imported . '/web.config'), 'web.config guard written on import');
+});
+
 test('4.18.8 bin/relay export: refuses an existing folder and a folder inside the web root', function () {
     Relay::sqliteOnly();
     $r = Relay::make();

@@ -82,34 +82,46 @@ final class CalibrationApi
      */
     public static function streamProbe(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
+        self::admitHold($ctx, $p, 3);
+        $hold = $ctx->holds->acquire('admin', 'tok:' . $p->tokenId, 'core', 3, $ctx->holds->adminCap());
+        if ($hold === null) {
+            throw ApiError::make('unavailable', 2);
+        }
+        $ctx->db->close();
         $res = new Response(200, '', [
             'Content-Type' => 'text/event-stream; charset=utf-8',
             'Cache-Control' => 'no-store',
             'X-Accel-Buffering' => 'no',
             'X-OAIY-Time' => (string)Clock::now(),
         ]);
-        $res->stream = static function (): void {
-            ignore_user_abort(false);
-            @ini_set('zlib.output_compression', '0');
-            if (function_exists('apache_setenv')) {
-                @apache_setenv('no-gzip', '1');
-            }
-            while (ob_get_level() > 0) {
-                @ob_end_clean();
-            }
-            @ob_implicit_flush(true);
-            echo "retry: 2000\n\n: connected\n\n";
-            flush();
-            for ($i = 1; $i <= 3; $i++) {
-                usleep(1000000);
-                echo ': keepalive ' . $i . "\n\n";
-                flush();
-                if (connection_aborted()) {
-                    return;
+        $res->stream = static function () use ($ctx, $hold): void {
+            try {
+                $ctx->db->close();
+                ignore_user_abort(false);
+                @ini_set('zlib.output_compression', '0');
+                if (function_exists('apache_setenv')) {
+                    @apache_setenv('no-gzip', '1');
                 }
+                while (ob_get_level() > 0) {
+                    @ob_end_clean();
+                }
+                @ob_implicit_flush(true);
+                echo "retry: 2000\n\n: connected\n\n";
+                flush();
+                for ($i = 1; $i <= 3; $i++) {
+                    usleep(1000000);
+                    $hold->refresh();
+                    echo ': keepalive ' . $i . "\n\n";
+                    flush();
+                    if (connection_aborted()) {
+                        return;
+                    }
+                }
+                echo "id: 0\nevent: end\ndata: {}\n\n";
+                flush();
+            } finally {
+                $hold->release();
             }
-            echo "id: 0\nevent: end\ndata: {}\n\n";
-            flush();
         };
         return $res;
     }

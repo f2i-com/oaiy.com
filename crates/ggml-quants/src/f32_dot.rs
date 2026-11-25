@@ -58,7 +58,7 @@ pub fn dot_fast(a: &[f32], b: &[f32]) -> f32 {
 /// Batches 4 output rows per `x` load on AVX-512 (2 rows on AVX2) to maximize FMA utilization.
 #[inline]
 pub fn dot_rows_fast(w: &[f32], x: &[f32], n_rows: usize, k: usize, out: &mut [f32]) {
-    assert_eq!(w.len(), n_rows * k, "f32_dot::dot_rows_fast: w length mismatch");
+    assert_eq!(n_rows.checked_mul(k), Some(w.len()), "f32_dot::dot_rows_fast: w length mismatch");
     assert_eq!(x.len(), k, "f32_dot::dot_rows_fast: x length mismatch");
     assert_eq!(out.len(), n_rows, "f32_dot::dot_rows_fast: out length mismatch");
     match simd_level() {
@@ -381,5 +381,12 @@ mod tests {
                 assert!((dst[i] - want).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "w length mismatch")]
+    fn dot_rows_fast_rejects_overflowing_dims() {
+        let x = [0.0f32; 2];
+        dot_rows_fast(&[], &x, 1usize << (usize::BITS - 1), 2, &mut []);
     }
 }

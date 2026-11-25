@@ -53,7 +53,7 @@ impl Config {
             candle_core::bail!("not FLUX 3 Image Klein's transformer: txt_in {txt:?}, emb_in.image {img:?}");
         };
         let head_dim = shape("single_blocks.0.norm.query_norm.scale")?.iter().product::<usize>();
-        if h2 != hidden || head_dim % 8 != 0 || hidden % head_dim != 0 || channels != 128 {
+        if h2 != hidden || hidden == 0 || head_dim == 0 || head_dim % 8 != 0 || hidden % head_dim != 0 || channels != 128 {
             candle_core::bail!("not FLUX 3 Image Klein's transformer: hidden {hidden}, heads {head_dim} wide, latent channels {channels}");
         }
         let count = |p: &str| (0..).take_while(|i| w.has(&format!("{p}.{i}.q_proj.weight"))).count();

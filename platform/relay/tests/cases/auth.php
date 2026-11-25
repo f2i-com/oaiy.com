@@ -261,6 +261,30 @@ test('4.7.1 tokid.fail: 20 wrong secrets an hour lock that token id for that add
     eq(200, $r->call($d, 'GET', '/v1/poll')['status']);
 });
 
+test('4.7.1 tokid.fail: retries during an active lock do not extend locked_until', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    for ($i = 1; $i <= 20; $i++) {
+        eq(401, $r->call(auth_wrong_secret($d), 'GET', '/v1/poll')['status'], "wrong secret $i");
+        Tmp::setClock(Relay::T0 + $i * 10);
+        if ($i % 5 === 0) {
+            Tmp::setClock(Relay::T0 + $i * 10 + 65 * ($i / 5));
+        }
+    }
+    $lockedAt = Tmp::clock();
+    [$tid] = Auth::parseToken($d->token);
+    $initialUntil = (int)$r->ctx()->db->val('SELECT locked_until FROM tokid_fail WHERE id = ?', [$tid]);
+    ok($initialUntil > $lockedAt - 100 && $initialUntil <= $lockedAt + 900, 'active lock was set');
+    // Halfway through the 15-minute lock, retries with the real or wrong token must NOT push locked_until forward.
+    Tmp::setClock($initialUntil - 300);
+    eq(401, $r->call($d, 'GET', '/v1/poll')['status']);
+    eq(401, $r->call(auth_wrong_secret($d), 'GET', '/v1/poll')['status']);
+    eq($initialUntil, (int)$r->ctx()->db->val('SELECT locked_until FROM tokid_fail WHERE id = ?', [$tid]), 'locked_until was not extended');
+    // Immediately after the original lock expires, the valid credential works again.
+    Tmp::setClock($initialUntil + 1);
+    eq(200, $r->call($d, 'GET', '/v1/poll')['status']);
+});
+
 test('4.7.1 tokid.fail: an unknown token id never creates lock rows', function () {
     $r = Relay::make();
     $r->call(Relay::unknownToken(), 'GET', '/v1/poll');

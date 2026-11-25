@@ -38,29 +38,89 @@ impl ModelConfig {
         Self { mel: MelConfig::parakeet(128), head: Head::Tdt { durations: vec![0, 1, 2, 3, 4] }, max_symbols: 10, xscaling: false, att_context: [-1, -1] }
     }
 
+    /// Validate front-end and decoding settings so malformed configs fail cleanly instead of panicking.
+    pub fn validate(&self) -> Result<()> {
+        let m = &self.mel;
+        if m.sample_rate == 0 {
+            return Err(bad("sample_rate must be > 0"));
+        }
+        if m.n_fft < 2 || !m.n_fft.is_power_of_two() {
+            return Err(bad(format!("n_fft must be a power of two >= 2, got {}", m.n_fft)));
+        }
+        if m.win_length == 0 || m.win_length > m.n_fft {
+            return Err(bad(format!("win_length must be in 1..={}, got {}", m.n_fft, m.win_length)));
+        }
+        if m.hop_length == 0 {
+            return Err(bad("hop_length must be > 0"));
+        }
+        if m.n_mels == 0 {
+            return Err(bad("n_mels must be > 0"));
+        }
+        if !m.log_guard.is_finite() || m.log_guard <= 0.0 {
+            return Err(bad(format!("log_guard must be finite and > 0, got {}", m.log_guard)));
+        }
+        if m.preemph.is_some_and(|p| !p.is_finite()) {
+            return Err(bad("preemph must be finite"));
+        }
+        if self.max_symbols == 0 {
+            return Err(bad("max_symbols must be > 0"));
+        }
+        if let Head::Tdt { durations } = &self.head {
+            if durations.is_empty() {
+                return Err(bad("a TDT model without durations"));
+            }
+        }
+        Ok(())
+    }
+
     /// From a `.nemo`'s `model_config.yaml`.
     pub fn from_nemo_yaml(text: &str) -> Result<Self> {
         let y = Yaml::parse(text);
         let mut cfg = Self::parakeet();
         let num = |k: &str| y.scalar(k).and_then(|v| v.parse::<f64>().ok());
-        let sr = num("preprocessor.sample_rate").or(num("sample_rate")).unwrap_or(16_000.0) as usize;
-        let win = num("preprocessor.window_size").unwrap_or(0.025);
-        let hop = num("preprocessor.window_stride").unwrap_or(0.01);
-        let win_length = (win * sr as f64).round() as usize;
-        let n_fft = num("preprocessor.n_fft").map(|v| v as usize).unwrap_or_else(|| win_length.next_power_of_two());
+        let pos_f64 = |val: f64, name: &str| -> Result<f64> {
+            if !val.is_finite() || val <= 0.0 {
+                return Err(bad(format!("{name}: must be finite and > 0, got {val}")));
+            }
+            Ok(val)
+        };
+        let pos_usize = |val: f64, name: &str| -> Result<usize> {
+            let v = pos_f64(val, name)?;
+            if v > (i64::MAX as f64) {
+                return Err(bad(format!("{name}: value {val} out of range")));
+            }
+            usize::try_from(v.round() as i64)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| bad(format!("{name}: must be > 0, got {val}")))
+        };
+        let sr = pos_usize(num("preprocessor.sample_rate").or(num("sample_rate")).unwrap_or(16_000.0), "sample_rate")?;
+        let win = pos_f64(num("preprocessor.window_size").unwrap_or(0.025), "preprocessor.window_size")?;
+        let hop = pos_f64(num("preprocessor.window_stride").unwrap_or(0.01), "preprocessor.window_stride")?;
+        let win_length = pos_usize(win * sr as f64, "win_length")?;
+        let n_fft = match num("preprocessor.n_fft") {
+            Some(v) => pos_usize(v, "preprocessor.n_fft")?,
+            None => win_length.checked_next_power_of_two().ok_or_else(|| bad("n_fft overflow"))?,
+        };
         let preemph = match y.scalar("preprocessor.preemph") {
             None => Some(0.97),
             Some("null") | Some("None") => None,
-            Some(v) => Some(v.parse::<f32>().map_err(|_| bad(format!("preprocessor.preemph: {v:?}")))?),
+            Some(v) => {
+                let p = v.parse::<f32>().map_err(|_| bad(format!("preprocessor.preemph: {v:?}")))?;
+                if !p.is_finite() {
+                    return Err(bad(format!("preprocessor.preemph: non-finite {v:?}")));
+                }
+                Some(p)
+            }
         };
         cfg.mel = MelConfig {
             sample_rate: sr,
             n_fft,
             win_length,
-            hop_length: (hop * sr as f64).round() as usize,
-            n_mels: num("preprocessor.features").map(|v| v as usize).unwrap_or(128),
+            hop_length: pos_usize(hop * sr as f64, "hop_length")?,
+            n_mels: pos_usize(num("preprocessor.features").unwrap_or(128.0), "preprocessor.features")?,
             preemph,
-            log_guard: num("preprocessor.log_zero_guard_value").unwrap_or(2f64.powi(-24)),
+            log_guard: pos_f64(num("preprocessor.log_zero_guard_value").unwrap_or(2f64.powi(-24)), "preprocessor.log_zero_guard_value")?,
         };
         check_front_end(&y)?;
         let durations = y.list("model_defaults.tdt_durations").or_else(|| y.list("decoding.durations")).unwrap_or_default();
@@ -75,7 +135,7 @@ impl ModelConfig {
             Head::Rnnt
         };
         if let Some(m) = num("decoding.greedy.max_symbols") {
-            cfg.max_symbols = m as usize;
+            cfg.max_symbols = pos_usize(m, "decoding.greedy.max_symbols")?;
         }
         cfg.xscaling = y.scalar("encoder.xscaling").is_some_and(|v| v == "true");
         match y.scalar("encoder.self_attention_model") {
@@ -93,6 +153,7 @@ impl ModelConfig {
                 cfg.att_context = [v[0], v[1]];
             }
         }
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -100,47 +161,76 @@ impl ModelConfig {
     pub fn from_hf(config: &[u8], processor: Option<&[u8]>) -> Result<Self> {
         let c = Json::parse(config).map_err(|e| bad(format!("config.json: {e}")))?;
         let mut cfg = Self::parakeet();
+        let pos_usize = |obj: &Json, k: &str| -> Result<Option<usize>> {
+            let Some(v) = obj.get(k) else { return Ok(None) };
+            if matches!(v, Json::Null) {
+                return Ok(None);
+            }
+            let i = v.as_i64().ok_or_else(|| bad(format!("{k}: expected integer")))?;
+            let u = usize::try_from(i)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| bad(format!("{k}: must be > 0, got {i}")))?;
+            Ok(Some(u))
+        };
         match c.get("model_type").and_then(Json::as_str) {
             Some("parakeet_tdt") | None => {
                 if let Some(d) = c.get("durations").and_then(Json::as_array) {
-                    cfg.head = Head::Tdt { durations: d.iter().map(|x| x.as_i64().map(|v| v as usize).ok_or_else(|| bad("config.json: a bad duration"))).collect::<Result<Vec<_>>>()? };
+                    let durs = d
+                        .iter()
+                        .map(|x| {
+                            x.as_i64()
+                                .and_then(|v| usize::try_from(v).ok())
+                                .ok_or_else(|| bad("config.json: a bad duration"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    cfg.head = Head::Tdt { durations: durs };
                 }
             }
             Some("parakeet_rnnt") => cfg.head = Head::Rnnt,
             Some(other) => return Err(bad(format!("config.json: model_type {other} is not a Parakeet transducer"))),
         }
-        if let Some(m) = c.get("max_symbols_per_step").and_then(Json::as_i64) {
-            cfg.max_symbols = m.max(1) as usize;
+        if let Some(m) = pos_usize(&c, "max_symbols_per_step")? {
+            cfg.max_symbols = m;
         }
         if let Some(enc) = c.get("encoder_config") {
             cfg.xscaling = enc.get("scale_input").and_then(Json::as_bool).unwrap_or(false);
-            if let Some(n) = enc.get("num_mel_bins").and_then(Json::as_i64) {
-                cfg.mel.n_mels = n as usize;
+            if let Some(n) = pos_usize(enc, "num_mel_bins")? {
+                cfg.mel.n_mels = n;
             }
         }
         if let Some(p) = processor {
             let p = Json::parse(p).map_err(|e| bad(format!("processor_config.json: {e}")))?;
             let fe = p.get("feature_extractor").unwrap_or(&p);
-            let int = |k: &str| fe.get(k).and_then(Json::as_i64).map(|v| v as usize);
-            if let Some(v) = int("feature_size") {
+            if let Some(v) = pos_usize(fe, "feature_size")? {
                 cfg.mel.n_mels = v;
             }
-            if let Some(v) = int("sampling_rate") {
+            if let Some(v) = pos_usize(fe, "sampling_rate")? {
                 cfg.mel.sample_rate = v;
             }
-            if let Some(v) = int("n_fft") {
+            if let Some(v) = pos_usize(fe, "n_fft")? {
                 cfg.mel.n_fft = v;
             }
-            if let Some(v) = int("win_length") {
+            if let Some(v) = pos_usize(fe, "win_length")? {
                 cfg.mel.win_length = v;
             }
-            if let Some(v) = int("hop_length") {
+            if let Some(v) = pos_usize(fe, "hop_length")? {
                 cfg.mel.hop_length = v;
             }
             if let Some(v) = fe.get("preemphasis") {
-                cfg.mel.preemph = v.as_f64().map(|x| x as f32);
+                cfg.mel.preemph = match v {
+                    Json::Null => None,
+                    _ => {
+                        let x = v.as_f64().ok_or_else(|| bad("processor_config.json: bad preemphasis"))? as f32;
+                        if !x.is_finite() {
+                            return Err(bad("processor_config.json: non-finite preemphasis"));
+                        }
+                        Some(x)
+                    }
+                };
             }
         }
+        cfg.validate()?;
         Ok(cfg)
     }
 }
@@ -293,5 +383,10 @@ mod tests {
         let c = ModelConfig::from_hf(config, Some(processor)).unwrap();
         assert_eq!(c.mel, MelConfig::parakeet(128));
         assert_eq!(c.head, Head::Tdt { durations: vec![0, 1, 2, 3, 4] });
+        // Negative / zero / non-power-of-two configs must fail validation cleanly.
+        assert!(ModelConfig::from_hf(br#"{"durations":[-1],"model_type":"parakeet_tdt"}"#, None).is_err());
+        assert!(ModelConfig::from_hf(config, Some(br#"{"n_fft":500}"#)).is_err());
+        assert!(ModelConfig::from_hf(config, Some(br#"{"hop_length":0}"#)).is_err());
+        assert!(ModelConfig::from_nemo_yaml(&NEMO.replace("sample_rate: 16000", "sample_rate: 0")).is_err());
     }
 }

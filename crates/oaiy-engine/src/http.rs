@@ -118,12 +118,40 @@ impl Refusal {
 /// it, which browsers keep on loopback whatever DNS says) or a loopback address.
 pub fn loopback_name(host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
-    let name = match host.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or(""),
-        None if host.parse::<std::net::IpAddr>().is_ok() => host.as_str(),
-        None => host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(name, _)| name),
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_ok = after.is_empty()
+            || after
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok());
+        return port_ok
+            && inner
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.to_canonical().is_loopback();
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.parse::<u16>().is_ok() => name,
+        Some(_) => return false,
+        None => host.as_str(),
     };
-    name == "localhost" || name.ends_with(".localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+    if let Ok(ip) = name.parse::<std::net::Ipv4Addr>() {
+        return ip.is_loopback();
+    }
+    if name == "localhost" {
+        return true;
+    }
+    if let Some(prefix) = name.strip_suffix(".localhost") {
+        return !prefix.is_empty()
+            && !prefix.starts_with('.')
+            && !prefix.ends_with('.')
+            && prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    }
+    false
 }
 
 /// Whether an `Origin` is a page served from this computer's loopback.
@@ -578,15 +606,19 @@ impl Response {
         match self.header("content-length").map(str::parse::<usize>) {
             Some(Ok(n)) if n > limit => Err(bad("response body too large")),
             Some(Ok(n)) => {
-                let mut body = vec![0; n];
-                self.reader.read_exact(&mut body)?;
+                let mut body = Vec::with_capacity(n.min(1 << 20));
+                (&mut self.reader).take(n as u64).read_to_end(&mut body)?;
+                if body.len() < n {
+                    return Err(bad("connection closed inside the body"));
+                }
                 Ok(body)
             }
             Some(Err(_)) => Err(bad("bad Content-Length")),
             None => {
                 let mut body = Vec::new();
-                self.reader.take(limit as u64 + 1).read_to_end(&mut body)?;
-                if body.len() > limit {
+                (&mut self.reader).take(limit as u64).read_to_end(&mut body)?;
+                let mut extra = [0u8; 1];
+                if self.reader.read(&mut extra)? > 0 {
                     return Err(bad("response body too large"));
                 }
                 Ok(body)
@@ -610,8 +642,11 @@ impl Response {
                 if size > 64 << 20 {
                     return Err(bad("chunk larger than 64 MiB"));
                 }
-                let mut chunk = vec![0; size];
-                self.reader.read_exact(&mut chunk)?;
+                let mut chunk = Vec::with_capacity(size.min(1 << 20));
+                (&mut self.reader).take(size as u64).read_to_end(&mut chunk)?;
+                if chunk.len() < size {
+                    return Err(bad("connection closed inside the body"));
+                }
                 line(&mut self.reader).map_err(|_| bad("chunk end"))?;
                 each(&chunk)?;
             }
@@ -649,6 +684,18 @@ pub fn fetch(
     body: &[u8],
     timeout: Duration,
 ) -> io::Result<Response> {
+    let has_ctl = |s: &str| s.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'));
+    if method.is_empty() || has_ctl(method) || method.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP method"));
+    }
+    if has_ctl(addr) || has_ctl(path) || path.bytes().any(|b| b == b' ') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP request target or host"));
+    }
+    for (k, v) in headers {
+        if k.is_empty() || has_ctl(k) || has_ctl(v) || k.bytes().any(|b| b == b':' || b.is_ascii_whitespace()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP header"));
+        }
+    }
     let target: SocketAddr = addr
         .to_socket_addrs()?
         .next()
@@ -770,7 +817,22 @@ mod tests {
         for host in ["localhost", "localhost:8783", "127.0.0.1:1", "[::1]:80", "::1", "a.localhost:5", "[::ffff:127.0.0.1]:9"] {
             assert!(loopback_name(host), "{host}");
         }
-        for host in ["evil.example", "evil.example:8783", "localhost.evil.example", "192.168.1.5:80", "0.0.0.0", ""] {
+        for host in [
+            "evil.example",
+            "evil.example:8783",
+            "localhost.evil.example",
+            "192.168.1.5:80",
+            "0.0.0.0",
+            "",
+            "[::1].evil.com",
+            "[127.0.0.1]evil.com",
+            "[127.0.0.1]:80",
+            "[localhost",
+            "[localhost]:80",
+            "[::1]:99999",
+            "localhost:",
+            ".localhost",
+        ] {
             assert!(!loopback_name(host), "{host}");
         }
         assert!(loopback_origin("http://localhost:5173") && loopback_origin("https://127.0.0.1") && loopback_origin("http://tauri.localhost"));
@@ -910,5 +972,15 @@ mod tests {
         }).unwrap();
         assert_eq!(chunks, vec![b"data: 1\n\n".to_vec(), b"data: 2\n\n".to_vec()]);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_rejects_crlf_and_nul_injection() {
+        let t = Duration::from_secs(1);
+        assert!(fetch("127.0.0.1:80\r\nX-Injected: 1", "GET", "/", &[], b"", t).is_err());
+        assert!(fetch("127.0.0.1:80", "GET", "/\r\nEvil: 1", &[], b"", t).is_err());
+        assert!(fetch("127.0.0.1:80", "GET", "/\0", &[], b"", t).is_err());
+        assert!(fetch("127.0.0.1:80", "GET", "/", &[("X-Test", "ok\r\nEvil: 1")], b"", t).is_err());
+        assert!(fetch("127.0.0.1:80", "GET", "/", &[("X-Bad\n", "ok")], b"", t).is_err());
     }
 }

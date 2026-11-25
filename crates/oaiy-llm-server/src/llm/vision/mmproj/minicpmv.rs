@@ -21,19 +21,32 @@ fn round_even(x: f64) -> f64 {
 
 /// `ensure_divide`: `length` rounded to a multiple of `divisor`, at least one.
 fn ensure_divide(length: f64, divisor: usize) -> usize {
-    ((round_even(length / divisor as f64) as usize) * divisor).max(divisor)
+    (round_even(length / divisor as f64).max(0.0) as usize)
+        .saturating_mul(divisor)
+        .max(divisor)
 }
 
 /// `find_best_resize`: a tile's size (height, width) for a picture of `(h, w)` pixels, scaled to about
 /// `scale` x `scale` where it is larger (or always, `upscale`), each side a multiple of four patches.
 fn best_resize(h: f64, w: f64, scale: usize, upscale: bool) -> (usize, usize) {
-    let (mut height, mut width) = (h, w);
-    if h * w > (scale * scale) as f64 || upscale {
-        let ratio = w / h;
+    let unit = PATCH * 4;
+    let (mut height, mut width) = (h.max(1.0), w.max(1.0));
+    if height * width > (scale * scale) as f64 || upscale {
+        let ratio = width / height;
         height = (scale as f64 / ratio.sqrt()).trunc();
         width = (height * ratio).trunc();
     }
-    (ensure_divide(height, PATCH * 4), ensure_divide(width, PATCH * 4))
+    let mut out_h = ensure_divide(height, unit);
+    let mut out_w = ensure_divide(width, unit);
+    let max_area = (scale * scale).max(unit * unit);
+    if (out_h == unit || out_w == unit) && out_h.saturating_mul(out_w) > max_area {
+        if out_h == unit {
+            out_w = ((max_area / out_h) / unit).max(1) * unit;
+        } else {
+            out_h = ((max_area / out_w) / unit).max(1) * unit;
+        }
+    }
+    (out_h, out_w)
 }
 
 /// `get_sliced_grid`: the (rows, columns) a picture is cut into, None where it is small enough whole: the count of
@@ -828,5 +841,41 @@ mod tests {
         }
         assert_eq!(spread(4, 7), vec![0, 2, 4, 6]);
         assert_eq!(spread(3, 4), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn extreme_aspect_ratios_cap_tile_area() {
+        let max_area = (SCALE_RESOLUTION * SCALE_RESOLUTION).max((PATCH * 4) * (PATCH * 4));
+        for (h, w) in [
+            (1usize, 1_000_000usize),
+            (1_000_000, 1),
+            (1, 200_000),
+            (200_000, 1),
+            (2, 2_000_000),
+            (2_000_000, 2),
+        ] {
+            for upscale in [false, true] {
+                let (oh, ow) = best_resize(h as f64, w as f64, SCALE_RESOLUTION, upscale);
+                assert_eq!((oh % (PATCH * 4), ow % (PATCH * 4)), (0, 0));
+                assert!(
+                    oh * ow <= max_area,
+                    "best_resize({h}, {w}, upscale={upscale}) = ({oh}, {ow}), area {} > {max_area}",
+                    oh * ow
+                );
+            }
+            let p = plan(h, w, MAX_SLICES);
+            assert!(
+                p.overview.0 * p.overview.1 <= max_area,
+                "plan({h}, {w}) overview {:?} exceeds {max_area}",
+                p.overview
+            );
+            if p.grid.is_some() {
+                let (sh, sw) = p.slice();
+                assert!(
+                    sh * sw <= max_area,
+                    "plan({h}, {w}) slice ({sh}, {sw}) exceeds {max_area}"
+                );
+            }
+        }
     }
 }

@@ -432,6 +432,23 @@ mod tests {
         assert_eq!(e.ask(&a.prompt(), 4).reuse.unwrap().0, 0);
     }
 
+    /// An incognito request (with or without a session) never reuses a non-incognito conversation
+    /// that was set aside, and clears it so a subsequent normal request starts clean.
+    #[test]
+    fn an_incognito_request_never_reuses_a_public_aside_conversation() {
+        for session in [None, Some("s")] {
+            let e = Engine::start_aside();
+            let (a, b) = (Chat::new(10, 3_000), Chat::new(20, 1_500));
+            e.ask(&a.prompt(), 4);
+            e.ask(&b.prompt(), 4); // sets public `a` aside
+            let priv_a = e.ask_private(&a.prompt(), session, 4);
+            assert_eq!((priv_a.reuse.unwrap().0, priv_a.reuse.unwrap().1), (0, "none"), "session={session:?}: {priv_a:?}");
+            // And after returning to normal traffic, public `a` is gone too.
+            let pub_a = e.ask(&a.prompt(), 4);
+            assert_eq!((pub_a.reuse.unwrap().0, pub_a.reuse.unwrap().1), (0, "none"), "session={session:?}: {pub_a:?}");
+        }
+    }
+
     #[test]
     fn shared_system_prompt_ending_at_a_boundary_is_set_aside_as_a_copy_in_the_real_engine() {
         let script = |e: &Engine| {

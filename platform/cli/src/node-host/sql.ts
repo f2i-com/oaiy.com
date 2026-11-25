@@ -30,9 +30,107 @@ function fileFromConn(conn: string): string {
   return within(DATA_DIR, raw.replace(/^[./\\]+/, ''));
 }
 
-/** plugin-sql positional `$1` → SQLite indexed `?1`. Leaves `$.jsonPath` alone. */
-function normalizeSql(sql: string): string {
-  return sql.replace(/\$(\d+)/g, '?$1');
+const isIdentChar = (ch: string | undefined): boolean =>
+  ch !== undefined && /[A-Za-z0-9_$\x80-\uFFFF]/.test(ch);
+
+const isAsciiDigit = (ch: string | undefined): boolean =>
+  ch !== undefined && ch >= '0' && ch <= '9';
+
+/**
+ * Lexer-aware rewrite of plugin-sql positional `$1` → SQLite indexed `?1`.
+ * Skips single-quoted strings (`'...'` with `''` escapes), double/backtick/bracket-quoted
+ * identifiers (`"..."`, `` `...` ``, `[...]`), line (`--`) and block (`/* ... *\/`) comments,
+ * and preserves JSON paths (`$.foo`) as well as named/embedded identifiers (`$1name`, `col$1`).
+ */
+export function normalizeSql(sql: string): string {
+  const len = sql.length;
+  let out = '';
+  let i = 0;
+
+  while (i < len) {
+    const ch = sql[i];
+
+    // Single-quoted string literal, double-quoted identifier, or backtick-quoted identifier
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch;
+      out += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        out += c;
+        i++;
+        if (c === quote) {
+          if (i < len && sql[i] === quote) {
+            out += sql[i];
+            i++;
+          } else {
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    // Bracket-quoted identifier: [...]
+    if (ch === '[') {
+      out += ch;
+      i++;
+      while (i < len) {
+        const c = sql[i];
+        out += c;
+        i++;
+        if (c === ']') break;
+      }
+      continue;
+    }
+
+    // Line comment: -- ... \n
+    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      out += '--';
+      i += 2;
+      while (i < len) {
+        const c = sql[i];
+        out += c;
+        i++;
+        if (c === '\n') break;
+      }
+      continue;
+    }
+
+    // Block comment: /* ... */
+    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
+      out += '/*';
+      i += 2;
+      while (i < len) {
+        if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
+          out += '*/';
+          i += 2;
+          break;
+        }
+        out += sql[i];
+        i++;
+      }
+      continue;
+    }
+
+    // Positional placeholder `$N` outside strings/identifiers/comments with identifier boundaries
+    if (ch === '$' && (i === 0 || !isIdentChar(sql[i - 1])) && isAsciiDigit(sql[i + 1])) {
+      let j = i + 1;
+      while (j < len && isAsciiDigit(sql[j])) j++;
+      if (!isIdentChar(sql[j])) {
+        out += '?' + sql.slice(i + 1, j);
+      } else {
+        out += sql.slice(i, j);
+      }
+      i = j;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
 }
 
 /**

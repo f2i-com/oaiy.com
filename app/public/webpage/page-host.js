@@ -163,6 +163,8 @@
   let port = null;
   let engine = null;
   let dead = false;
+  let facadeBooting = false;
+  let windowIssued = false;
   let files = {};
   let pagePath = '';
   let storage = { local: Object.create(null), session: Object.create(null) };
@@ -679,9 +681,28 @@
 
   const BLOCKED_WIN_PROPS = new Set([
     'parent', 'top', 'opener', 'frames', 'frameElement', 'location',
-    'eval', 'Function', 'postMessage', 'open', 'close',
+    'history', 'navigation', 'globalThis', 'self', 'window',
+    'eval', 'Function', 'Object', 'Reflect', 'Proxy',
+    'postMessage', 'open', 'close',
     'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker',
     '__oaiyAgentListening', '__oaiyAgentBridge',
+  ]);
+  /** Only these on* window event handlers may be written or deleted through the host window handle. */
+  const ALLOWED_WIN_SET_PROPS = new Set([
+    'onload', 'onresize', 'onscroll', 'onkeydown', 'onkeyup', 'onhashchange', 'onpopstate',
+    'onerror', 'onbeforeunload', 'onmessage', 'onpointerdown', 'onpointermove', 'onpointerup',
+    'onmousedown', 'onmousemove', 'onmouseup', 'onclick', 'onfocus', 'onblur', 'onwheel',
+    'ontouchstart', 'ontouchmove', 'ontouchend', 'onDOMContentLoaded',
+  ]);
+  /** Explicit allowlist of DOM/Web API constructors exposed to guest scripts via zippDom.guest.js. */
+  const ALLOWED_CTORS = new Set([
+    'Image', 'Audio', 'Option', 'Event', 'CustomEvent', 'KeyboardEvent', 'MouseEvent', 'PointerEvent',
+    'FocusEvent', 'InputEvent', 'WheelEvent', 'TouchEvent', 'SubmitEvent', 'AnimationEvent', 'TransitionEvent',
+    'PopStateEvent', 'MutationObserver', 'ResizeObserver', 'IntersectionObserver', 'FormData', 'URL',
+    'URLSearchParams', 'DOMParser', 'XMLSerializer', 'Path2D', 'ImageData', 'OffscreenCanvas', 'Blob', 'File',
+    'FileReader', 'Range', 'DocumentFragment', 'Text', 'Comment', 'TextEncoder', 'TextDecoder', 'AbortController',
+    'Headers', 'DOMMatrix', 'DOMPoint', 'DOMRect', 'AudioContext', 'OfflineAudioContext', 'Notification',
+    'BroadcastChannel', 'MessageChannel', 'ReadableStream', 'Request', 'Response', 'CSSStyleSheet', 'FontFace',
   ]);
   const isBlockedProp = (obj, prop) => {
     const p = String(prop);
@@ -708,7 +729,11 @@
   const isForbiddenHostVal = (val) => val === parentWindow || (window.top && window.top !== window && val === window.top);
 
   const OPS = Object.assign(Object.create(null), {
-    window: () => ({ $h: handle(window), c: ['Window'] }),
+    window: () => {
+      if (!facadeBooting || windowIssued) throw new TypeError('window is not allowed');
+      windowIssued = true;
+      return { $h: handle(window), c: ['Window'] };
+    },
     document: () => document,
     get(id, prop) {
       const obj = target(id);
@@ -736,6 +761,7 @@
     set(id, prop, value) {
       const obj = target(id);
       if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return undefined;
+      if (obj === window && !ALLOWED_WIN_SET_PROPS.has(String(prop))) return undefined;
       let v = fromGuest(value);
       if (obj instanceof CSSStyleDeclaration) v = cssValue(v);
       else v = refValue(obj, prop, v);
@@ -758,11 +784,15 @@
     del(id, prop) {
       const obj = target(id);
       if (isBlockedProp(obj, prop) || isHostPrototype(obj)) return;
+      if (obj === window && !ALLOWED_WIN_SET_PROPS.has(String(prop))) return;
       delete obj[prop];
     },
     call(id, method, args) {
       const obj = target(id);
       if (isBlockedProp(obj, method)) throw new TypeError(`${method} is not allowed`);
+      if (obj instanceof Document && (method === 'write' || method === 'writeln' || method === 'open')) {
+        throw new TypeError(`document.${method} is not allowed`);
+      }
       let list = (args || []).map(fromGuest);
       if (typeof obj[method] !== 'function') throw new TypeError(`${method} is not a function`);
       if (method === 'addEventListener' && typeof list[0] === 'string') markListener(obj, list[0].toLowerCase());
@@ -786,15 +816,17 @@
       }
       if (method === 'click' && emitBlobDownload(obj)) return undefined;
       const result = obj[method](...list);
-      if (HTML_METHODS.has(method) && result instanceof Node) harvest(result);
+      if (method === 'setHTMLUnsafe') harvest(obj);
+      else if (HTML_METHODS.has(method) && result instanceof Node) harvest(result);
       if (INSERTS.has(method)) for (const arg of list) if (arg instanceof HTMLScriptElement) setTimeout(() => runInserted(arg));
       if (method === 'getContext' && result === null) note('warn', `canvas.getContext(${JSON.stringify(list[0])}) is not available here.`);
       return result;
     },
     new(name, args) {
-      if (isBlockedProp(window, name)) throw new TypeError(`${name} is not allowed`);
-      const C = window[name];
-      if (typeof C !== 'function') throw new TypeError(`${name} is not available in the preview`);
+      const ctorName = String(name);
+      if (!ALLOWED_CTORS.has(ctorName) || isBlockedProp(window, ctorName)) throw new TypeError(`${ctorName} is not allowed`);
+      const C = window[ctorName];
+      if (typeof C !== 'function') throw new TypeError(`${ctorName} is not available in the preview`);
       return new C(...(args || []).map(fromGuest));
     },
     iter: (id) => Array.from(target(id)),
@@ -1081,11 +1113,14 @@
     engine.setLocalStorageBridge({ getItem: answer, setItem() {}, removeItem() {}, clear() {} });
     engine.setSyncHostCapabilities(['ls.getItem']);
     engine.setInstructionBudget(BUDGET);
+    facadeBooting = true;
     try {
       engine.initScript(message.facade);
     } catch (error) {
       stop(`the preview's DOM did not start on Zipp: ${error && error.message ? error.message : error}`);
       return;
+    } finally {
+      facadeBooting = false;
     }
     // The page's on* attributes, then its scripts in order, each on its own as a browser runs them.
     if (handlers.length) enter(() => engine.callFunction('__zdom_inline', [handlers.map(([el, name, code]) => [toGuest(el), name, code])]));

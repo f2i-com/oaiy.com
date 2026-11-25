@@ -32,6 +32,50 @@ import { metrics } from '../metrics';
 
 const logger = createLogger('JobManager');
 
+const UNTRUSTED_PACKAGE_ID = '__untrusted_imported__';
+const UNTRUSTED_FLOW_PERMISSIONS: readonly string[] = ['network', 'constants:read'];
+
+function currentProjectIsUntrusted(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const raw = localStorage.getItem('oaiy_project');
+    if (!raw) return false;
+    return (JSON.parse(raw) as { untrusted?: unknown })?.untrusted === true;
+  } catch {
+    return false;
+  }
+}
+
+function reachesUntrustedFlow(
+  flowId: string | undefined,
+  graph: { nodes?: unknown[] } | undefined,
+  flows: readonly Flow[],
+): boolean {
+  const byId = new Map(flows.map((f) => [f.id, f]));
+  const isUntrusted = (f: Flow | undefined): boolean =>
+    Boolean(f && (f as { untrusted?: unknown }).untrusted === true);
+  if (flowId && isUntrusted(byId.get(flowId))) return true;
+  const seen = new Set<string>(flowId ? [flowId] : []);
+  const queue: Array<{ nodes?: unknown[] } | undefined> = [graph ?? byId.get(flowId ?? '')?.graph];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || !Array.isArray(current.nodes)) continue;
+    for (const rawNode of current.nodes) {
+      const data = (rawNode as { data?: Record<string, unknown> } | null)?.data;
+      if (!data) continue;
+      for (const field of ['flowId', 'targetFlowId', '_macroWorkflowId', 'macroWorkflowId', 'macroId']) {
+        const ref = data[field];
+        if (typeof ref !== 'string' || !ref || seen.has(ref)) continue;
+        seen.add(ref);
+        const target = byId.get(ref);
+        if (isUntrusted(target)) return true;
+        if (target?.graph) queue.push(target.graph);
+      }
+    }
+  }
+  return false;
+}
+
 // Extended module registry interface that includes getAllModules
 // This is implemented by ModuleLoader but not in the base interface
 export interface ExtendedModuleRegistry extends ModuleRegistry {
@@ -744,16 +788,37 @@ export class JobManager {
       }
 
       // Set flow context for per-flow database operations + package
-      // permission gating. When the job carries a packageId we route the
-      // runtime into hardened mode and apply the granted-permission
-      // subset; trusted local flows continue to run with full privileges.
+      // permission gating. When the job carries a packageId, OR when a non-package
+      // job targets/reaches an untrusted flow (shared link / imported project),
+      // route the runtime into hardened mode with least-privilege permissions so
+      // UI Run, MacroRunnerModal, API bridge, remote dispatcher, and CLI ALL
+      // enforce sandboxing uniformly.
+      const allKnownFlows = this.packageMacros.length > 0
+        ? [...this.availableFlows, ...this.packageMacros]
+        : this.availableFlows;
+      const untrustedImplicit =
+        !job.packageId &&
+        (currentProjectIsUntrusted() || reachesUntrustedFlow(job.flowId, job.graph, allKnownFlows));
+      const effectivePackageId = job.packageId ?? (untrustedImplicit ? UNTRUSTED_PACKAGE_ID : null);
+      const effectivePermissions = job.packageId
+        ? (job.grantedPermissions ?? [])
+        : (untrustedImplicit ? [...UNTRUSTED_FLOW_PERMISSIONS] : null);
+
       logger.debug(
         ` Setting flow context: flowId=${job.flowId}` +
-          (job.packageId ? `, packageId=${job.packageId}` : ''),
+          (effectivePackageId ? `, packageId=${effectivePackageId}` : ''),
       );
-      runtime.setFlowContext(job.flowId, job.packageId ?? null);
-      if (job.packageId) {
-        runtime.setPackagePermissions(job.grantedPermissions ?? []);
+      runtime.setFlowContext(job.flowId, effectivePackageId);
+      if (effectivePackageId) {
+        runtime.setPackagePermissions(effectivePermissions ?? []);
+      }
+      if (untrustedImplicit) {
+        this.addJobLog(job.id, {
+          source: 'Security',
+          message:
+            'A shared or imported untrusted flow (or one it calls) — running sandboxed: code blocks and saved secrets are disabled.',
+          type: 'info',
+        });
       }
 
       if (this.moduleRegistry) {

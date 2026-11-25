@@ -1011,6 +1011,8 @@ export class Outreach {
       return;
     }
     if (route === null) return wait('the phone to answer');
+    let screeningRead = false;
+    let screening: Screening | null = null;
     for (const { c, p } of due) {
       const timing = this.timing(c, now, rules);
       if (timing) {
@@ -1018,8 +1020,13 @@ export class Outreach {
         continue;
       }
       // Screened again: they may have been blocked, or asked not to be called, since.
-      const screening = await this.deps.screening().catch(() => null);
-      const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'call') ? NOT_ALLOWED : !callsBack(p.number, 'answered', screening) ? 'not a number the phone answers (its filter)' : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
+      // Fail closed: never dial without reading the phone's screening rules.
+      if (!screeningRead) {
+        screeningRead = true;
+        screening = await this.deps.screening().catch(() => null);
+      }
+      if (!screening) return wait("the phone's screening settings");
+      const why = isBlocked(p.number, screening.blockedNumbers) ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'call') ? NOT_ALLOWED : !callsBack(p.number, 'answered', screening) ? 'not a number the phone answers (its filter)' : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
       if (why) {
         p.why = why;
         this.settlePerson(c, p, 'skipped', now);
@@ -1146,6 +1153,8 @@ export class Outreach {
       return;
     }
     const rules = await this.deps.rules().catch(() => null);
+    let screeningRead = false;
+    let screening: Screening | null = null;
     for (const { c, p } of queued) {
       const timing = this.timing(c, now, rules);
       if (timing) {
@@ -1153,8 +1162,15 @@ export class Outreach {
         continue;
       }
       if (p.number !== TEST) {
-        const screening = await this.deps.screening().catch(() => null);
-        const why = isBlocked(p.number, screening?.blockedNumbers ?? '') ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'text') ? NOT_ALLOWED : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
+        if (!screeningRead) {
+          screeningRead = true;
+          screening = await this.deps.screening().catch(() => null);
+        }
+        if (!screening) {
+          this.setWaiting(c, "the phone's screening settings");
+          continue;
+        }
+        const why = isBlocked(p.number, screening.blockedNumbers) ? "on the phone's blocked list" : !isAllowed(p.number, screening, 'text') ? NOT_ALLOWED : this.doNotContact.some((d) => samePerson(d.number, p.number)) ? 'asked not to be contacted' : '';
         if (why) {
           p.why = why;
           this.settlePerson(c, p, 'skipped', now);
@@ -1685,6 +1701,7 @@ export class Outreach {
     const reports: Campaign[] = [];
     for (const c of this.campaigns) {
       if (c.origin.projectId !== projectId) continue;
+      if (this.unstarted(c)) continue;
       for (const l of c.lines) {
         if (l.posted) continue;
         l.posted = true;

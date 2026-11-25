@@ -17,7 +17,27 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { MODULE_CLEANUP } from 'oaiy-core/src/module-types';
+import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import { desktopAccess } from '../core-service/contractRuntime';
+
+function sanitizeUrlForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    const sensitive = /^(?:api[_-]?key|key|token|access[_-]?token|auth|secret|password|passwd|sig|signature|session|cookie)$/i;
+    for (const k of Array.from(u.searchParams.keys())) {
+      if (sensitive.test(k)) {
+        u.searchParams.set(k, '[REDACTED]');
+      }
+    }
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/:\/\/[^/@\s]+@/, '://[REDACTED]@');
+  }
+}
 import { inOaiyWindow } from '../../lib/oaiyWindow';
 import {
   extractEmailsScript,
@@ -523,7 +543,7 @@ async function request(
   validateRequestBody(body);
 
   ctx.onNodeStatus?.(nodeId, 'running');
-  ctx.log('info', `[Browser] ${method} request to ${url}`);
+  ctx.log('info', `[Browser] ${method} request to ${sanitizeUrlForLog(url)}`);
 
   // Get session if provided
   const session = sessionId ? sessions.get(sessionId) : undefined;
@@ -886,7 +906,7 @@ async function control(
       // This handles the case where browser_request was used (HTTP mode) but browser_control
       // needs to interact with the webview
       if (session.currentUrl) {
-        ctx.log('info', `[Browser] Auto-navigating webview to ${session.currentUrl}`);
+        ctx.log('info', `[Browser] Auto-navigating webview to ${sanitizeUrlForLog(session.currentUrl)}`);
         const navResult = await ctx.tauri.invoke<WebViewResult>('plugin:oaiy-browser|webview_navigate', {
           sessionId: session.id,
           url: session.currentUrl,
@@ -917,7 +937,7 @@ async function control(
     } else if (action === 'get_html') {
       // Auto-navigate to the session's currentUrl if webview hasn't been navigated yet
       if (session.currentUrl) {
-        ctx.log('info', `[Browser] Auto-navigating webview to ${session.currentUrl} (before get_html)`);
+        ctx.log('info', `[Browser] Auto-navigating webview to ${sanitizeUrlForLog(session.currentUrl)} (before get_html)`);
         const navResult = await ctx.tauri.invoke<WebViewResult>('plugin:oaiy-browser|webview_navigate', {
           sessionId: session.id,
           url: session.currentUrl,
@@ -1422,6 +1442,13 @@ async function httpImpersonateRequest(args: {
   proxy?: string;
   timeoutMs?: number;
 }): Promise<{ status: number; finalUrl: string; headers: Record<string, string>; body: string }> {
+  if (ctx.abortSignal?.aborted) {
+    throw new Error('Operation aborted by user');
+  }
+  validateUrl(args.url);
+  if (isLocalNetworkUrl(args.url) && ctx.currentPackageId && !ctx.hasPermission?.('network:local')) {
+    throw new Error('[Browser] Local network access requires network:local permission');
+  }
   const tauri = requireTauri('httpRequest');
   const result = (await tauri.invoke('plugin:oaiy-browser|browser_v2_http_request', {
     request: {
@@ -1458,6 +1485,9 @@ async function gotoV2(
   validateUrl(url);
 
   if (session.mode === 'chromium') {
+    if (isLocalNetworkUrl(url) && ctx.currentPackageId && !ctx.hasPermission?.('network:local')) {
+      throw new Error('[Browser] Local network access requires network:local permission');
+    }
     if (isWebShim()) {
       const result = await companionBrowser.goto(sessionId, url, options);
       session.currentUrl = result.finalUrl;
@@ -1507,7 +1537,7 @@ async function gotoV2(
       html: r.body,
     };
   }
-  const response = await ctx.fetch(url);
+  const response = await ctx.fetch(url, { signal: ctx.abortSignal });
   session.currentUrl = url;
   return {
     finalUrl: response.url || url,

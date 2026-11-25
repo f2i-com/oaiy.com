@@ -250,7 +250,10 @@ export class Callbacks {
         await this.save();
         return;
       }
-      if (!callsBack(next.number, settings.callBackFilter, await this.screening())) {
+      const screening = await this.screening().catch(() => null);
+      // Cannot read the phone's screening now (the phone away): asked again at the next look, never dialled unscreened.
+      if (!screening) return;
+      if (!callsBack(next.number, settings.callBackFilter, screening)) {
         Object.assign(next, { state: 'dropped', note: 'Not one of the numbers you call back.' });
         await this.save();
         return;

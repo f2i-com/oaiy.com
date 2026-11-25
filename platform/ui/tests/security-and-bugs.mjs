@@ -88,15 +88,27 @@ await esbuild.build({
 export { default as BrowserRuntime } from './src/bundled-modules/core-browser/runtime.ts';
 export { default as ServiceRuntime } from './src/bundled-modules/core-service/runtime.ts';
 export { default as AIRuntime } from './src/bundled-modules/core-ai/runtime.ts';
-export { default as AudioRuntime } from './src/bundled-modules/core-audio/runtime.ts';
+export { default as AudioRuntime, sanitizeAudioFilename, sanitizeAudioFormat, resolveLocalMediaUrl, redactMediaToken } from './src/bundled-modules/core-audio/runtime.ts';
 export { default as ImageRuntime } from './src/bundled-modules/core-image/runtime.ts';
-export { default as VideoRuntime } from './src/bundled-modules/core-video/runtime.ts';
+export { default as VideoRuntime, sanitizeVideoFilename, sanitizeVideoFormat, sanitizeFfmpegColor } from './src/bundled-modules/core-video/runtime.ts';
 export { default as SubflowRuntime } from './src/bundled-modules/core-flow-control/runtime.ts';
 export { default as Model3DRuntime } from './src/bundled-modules/core-3d/runtime.ts';
-export { default as AgentRuntime } from './src/bundled-modules/core-agent/runtime.ts';
-export { OAIYRuntime, getModuleLoader } from 'oaiy-core';
-export { parseImportedProject, stripUnsafeImportedSettings, sanitizeProjectRecord, looksLikeSecret, UNSAFE_IMPORTED_SETTING_KEYS } from './src/utils/ProjectIO.ts';
+export { default as AgentRuntime, taskText } from './src/bundled-modules/core-agent/runtime.ts';
+export { default as FilesystemRuntime, validatePath } from './src/bundled-modules/core-filesystem/runtime.ts';
+export { default as FilesystemCompiler } from './src/bundled-modules/core-filesystem/compiler.ts';
+export { default as DatabaseRuntime } from './src/bundled-modules/core-database/runtime.ts';
+export { default as DatabaseCompiler } from './src/bundled-modules/core-database/compiler.ts';
+export { default as UtilityRuntime } from './src/bundled-modules/core-utility/runtime.ts';
+export { default as UtilityCompiler } from './src/bundled-modules/core-utility/compiler.ts';
+export { default as Core3DCompiler } from './src/bundled-modules/core-3d/compiler.ts';
+export { desktopCredential, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
+export { OAIYRuntime, OAIYCompiler, JobManager, getModuleLoader } from 'oaiy-core';
+export { isLocalNetworkUrl, matchesWhitelistEntry, getHostPort } from 'oaiy-core/src/runtime/NetworkUtils.ts';
+export { convertSelectionToMacro, analyzeSelection } from 'oaiy-core/src/macro/selection-analyzer.ts';
+export { parseImportedProject, sanitizeProjectForExport, stripUnsafeImportedSettings, sanitizeProjectRecord, looksLikeSecret, isSecretConstant, UNSAFE_IMPORTED_SETTING_KEYS } from './src/utils/ProjectIO.ts';
 export { filterNodeData, prepareWorkflowForExport } from './src/utils/WorkflowIO.ts';
+export { sanitizeDataForSandbox, sanitizeSandboxUpdates } from './src/lib/sandboxData.ts';
+export { withdrawTool, withdrawHook } from './src/lib/oaiyAgentTools.ts';
 export { isReadOnlySql } from './src/lib/sqlReadOnly.ts';
 export { normalizeSql } from './src/tauri-shim/sql.ts';
 export { PermissionRequestQueue } from './src/lib/permissionQueue.ts';
@@ -897,6 +909,605 @@ await check('13. QuickConnectPopup clamps coordinates >= 8px on narrow viewports
   const sandboxSrc = fs.readFileSync(path.join(UI, 'src/components/SandboxedCustomNodeUI.tsx'), 'utf8');
   assert.equal(sandboxSrc.includes('#e5e7eb'), false, 'SandboxedCustomNodeUI must not hardcode dark-only #e5e7eb');
   assert.ok(sandboxSrc.includes('--color-text-primary'), 'SandboxedCustomNodeUI must sync host theme tokens');
+});
+
+// ===========================================================================
+// Wave-2 Security & Bug Regressions (14..24)
+// ===========================================================================
+
+await check('14. JobManager enforces hardened sandbox on untrusted flows and transitive subflows/macros', async () => {
+  store.clear();
+  const seenLogs = [];
+  const jm = new M.JobManager({
+    config: { maxConcurrency: 1 },
+    databaseHandler: async () => ({ success: true, data: [] }),
+    moduleRegistry: {
+      nodes: new Map([['subflow', { id: 'subflow', name: 'Subflow', inputs: [], outputs: [], compiler: {} }]]),
+      nodeToModule: new Map([['subflow', 'core-flow-control']]),
+      getAllModules: () => [],
+      getAllNodeDefinitions: () => [],
+      getNodeDefinition: (t) => (t === 'subflow' ? { id: 'subflow', name: 'Subflow', inputs: [], outputs: [], compiler: {} } : undefined),
+      getModuleForNode: (type) => (
+        type === 'subflow'
+          ? { manifest: { id: 'core-flow-control', name: 'FlowControl', version: '1.0.0', nodes: ['subflow'] }, nodes: new Map(), compiler: { name: 'FlowControl', compileNode: () => 'let node_s1_out = null;' } }
+          : undefined
+      ),
+      getCompiler: (type) => (type === 'subflow' ? { name: 'FlowControl', compileNode: () => 'let node_s1_out = null;' } : undefined),
+    },
+  });
+  jm.setAvailableFlows([
+    {
+      id: 'untrusted-child',
+      name: 'Untrusted Child',
+      untrusted: true,
+      createdAt: '',
+      updatedAt: '',
+      graph: { nodes: [], edges: [] },
+    },
+    {
+      id: 'caller-flow',
+      name: 'Caller',
+      createdAt: '',
+      updatedAt: '',
+      graph: {
+        nodes: [{ id: 's1', type: 'subflow', position: { x: 0, y: 0 }, data: { flowId: 'untrusted-child' } }],
+        edges: [],
+      },
+    },
+  ]);
+  jm.onLog((_jobId, entry) => seenLogs.push(entry));
+  const jobId = jm.submit('caller-flow', 'Caller', {
+    nodes: [{ id: 's1', type: 'subflow', position: { x: 0, y: 0 }, data: { flowId: 'untrusted-child' } }],
+    edges: [],
+  });
+  // Wait for job to settle
+  const finalJob = await new Promise((resolve) => {
+    const unsub = jm.onStateChange((jobs) => {
+      const j = jobs.find((x) => x.id === jobId);
+      if (j && (j.status === 'completed' || j.status === 'failed' || j.status === 'aborted')) {
+        unsub();
+        resolve(j);
+      }
+    });
+  });
+  assert.equal(finalJob.status, 'failed');
+  assert.match(String(finalJob.error || ''), /Refusing to run untrusted package code in-thread/, `JobManager must engage hardened mode for flow reaching untrusted subflow (got: ${finalJob.error})`);
+  assert.ok(seenLogs.some((l) => l.source === 'Security' && /sandboxed/i.test(l.message)), 'must log Security sandbox notice');
+
+  // Verify App.tsx sanitizes flowJson.settings & CliWorkflowRunner passes packageContext for .oaiy
+  const appSrc = fs.readFileSync(path.join(UI, 'src/App.tsx'), 'utf8');
+  assert.ok(appSrc.includes('stripUnsafeImportedSettings('), 'App.tsx must sanitize shared flowJson.settings');
+  const cliSrc = fs.readFileSync(path.join(UI, 'src/components/CliWorkflowRunner.tsx'), 'utf8');
+  assert.ok(cliSrc.includes('packageTrustLevel') && cliSrc.includes('cli-package:'), 'CliWorkflowRunner must pass hardened packageContext for .oaiy packages');
+});
+
+await check('15. untrusted-executor.ts neutralizes WebTransport, caches, indexedDB, LockManager, locks, storage & navigator.storage', () => {
+  const src = fs.readFileSync(path.join(UI, 'vendor/oaiy-core/src/untrusted-executor.ts'), 'utf8');
+  for (const name of ['WebTransport', 'caches', 'indexedDB', 'LockManager', 'locks', 'storage']) {
+    assert.ok(src.includes(`'${name}'`), `untrusted-executor egress must block ${name}`);
+  }
+  assert.ok(src.includes("var nav = self.navigator"), 'untrusted-executor must neutralize navigator properties across prototypes');
+});
+
+await check('16. buildModuleInvokeBroker enforces per-command permissions, drops 3 admin commands, allows calculate_file_chunks, and gates browser URLs', async () => {
+  const invoked = [];
+  const prompted = [];
+  const rt = new M.OAIYRuntime({
+    useWorkerForUntrusted: false,
+    callbacks: {
+      onLocalNetworkPermission: async (req) => {
+        prompted.push(req);
+        return { allowed: false, remember: false };
+      },
+    },
+  });
+  rt.setTauriInvoke(async (cmd, args) => {
+    invoked.push({ cmd, args });
+    return { ok: true };
+  });
+  let broker;
+  await rt.registerDynamicModule({
+    manifest: { id: 'probe', name: 'Probe', version: '1.0.0', nodes: [] },
+    runtime: {
+      name: 'Probe',
+      createMethods(ctx) {
+        broker = ctx.tauri;
+        return {};
+      },
+      methods: {},
+    },
+  });
+
+  // 3 admin commands removed from allowlist even in trusted mode
+  for (const removed of [
+    'plugin:oaiy-browser|browser_engine_set_custom_path',
+    'plugin:oaiy-agent|agent_call_tool',
+    'plugin:oaiy-agent|agent_set_api_base',
+  ]) {
+    await assert.rejects(() => broker.invoke(removed, {}), /not on the allowlist/, `must reject removed command ${removed}`);
+  }
+
+  // calculate_file_chunks allowed in trusted mode
+  await broker.invoke('plugin:oaiy-filesystem|calculate_file_chunks', { path: '/tmp/a', chunkSize: 100, overlap: 0 });
+  assert.equal(invoked.at(-1).cmd, 'plugin:oaiy-filesystem|calculate_file_chunks');
+
+  // Per-command package permission enforcement
+  rt.setFlowContext('f1', 'pkg-test');
+  rt.setPackagePermissions(['network']);
+  await assert.rejects(() => broker.invoke('plugin:oaiy-filesystem|read_file', { path: '/tmp/a' }), /filesystem:read/);
+  await assert.rejects(() => broker.invoke('plugin:oaiy-filesystem|calculate_file_chunks', { path: '/tmp/a' }), /filesystem:read/);
+  await assert.rejects(() => broker.invoke('plugin:oaiy-filesystem|write_file', { path: '/tmp/a' }), /filesystem/);
+  await assert.rejects(() => broker.invoke('plugin:oaiy-filesystem|run_command', { command: 'ffmpeg' }), /process:execute/);
+  await assert.rejects(() => broker.invoke('ensure_service_ready_by_port', { port: 8188 }), /service:start/);
+
+  // Browser local-network URL interception (both browser_v2_http_request and browser_v2_goto)
+  rt.setPackagePermissions(['browser', 'network']);
+  await assert.rejects(
+    () => broker.invoke('plugin:oaiy-browser|browser_v2_http_request', { request: { url: 'http://127.0.0.1:8188/api' } }),
+    /Local network access denied/,
+  );
+  await assert.rejects(
+    () => broker.invoke('plugin:oaiy-browser|browser_v2_goto', { sessionId: 's1', url: 'http://localhost:11434/' }),
+    /Local network access denied/,
+  );
+  assert.equal(prompted.length, 2, 'must prompt local-network consent for browser_v2_http_request & browser_v2_goto');
+
+  // Package with browser but WITHOUT network/network:local is rejected outright for local URLs
+  rt.setPackagePermissions(['browser']);
+  await assert.rejects(
+    () => broker.invoke('plugin:oaiy-browser|browser_v2_goto', { sessionId: 's1', url: 'http://127.0.0.1:8188/' }),
+    /network:local/,
+  );
+});
+
+await check('17. NetworkUtils detects trailing dots, *.localhost, 127/8, 0/8, 100.64/10, IPv4-mapped IPv6, and parses [::1]:8080 whitelist', () => {
+  for (const local of [
+    'http://localhost./',
+    'http://api.localhost:3000/v1',
+    'http://sub.localhost./',
+    'http://127.0.0.2:8080/',
+    'http://127.255.255.254/',
+    'http://0.0.0.1/',
+    'http://100.64.0.1:8080/',
+    'http://100.127.255.254/',
+    'http://[::ffff:127.0.0.1]:8080/',
+    'http://[::ffff:7f00:1]/',
+    'http://[::ffff:10.0.0.5]/',
+    'http://[::ffff:169.254.169.254]/latest/meta-data/',
+    'http://[fe80::1]/',
+    'http://[fd12:3456::1]/',
+  ]) {
+    assert.equal(M.isLocalNetworkUrl(local), true, `expected local/private: ${local}`);
+  }
+  for (const pub of [
+    'https://example.com/',
+    'http://100.63.255.255/',
+    'http://100.128.0.1/',
+    'http://[::ffff:8.8.8.8]/',
+    'http://[2606:4700:4700::1111]/',
+  ]) {
+    assert.equal(M.isLocalNetworkUrl(pub), false, `expected public: ${pub}`);
+  }
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', '[::1]'), true);
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', '[::1]:*'), true);
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', '::1'), true);
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', '[::1]:8080'), true);
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', '[::1]:9000'), false);
+  assert.equal(M.matchesWhitelistEntry('[::1]:8080', ''), false, 'empty whitelist entry must not match IPv6');
+});
+
+await check('18. desktopCredential blocks encoded/backslash traversal and anchors /api/voice/transcribe; keepFile sanitizes ext', async () => {
+  const desktop = { origin: 'http://127.0.0.1:17972', token: 'secret-tok' };
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/voice/transcribe', desktop), 'secret-tok');
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/voice/transcribe/v1', desktop), 'secret-tok');
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/voice/transcribe-admin', desktop), undefined);
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/ai/engine/%2e%2e/secrets', desktop), undefined);
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/ai/engine/a%2fb', desktop), undefined);
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/ai/engine/a%5cb', desktop), undefined);
+  assert.equal(M.desktopCredential('http://127.0.0.1:17972/api/ai/engine/a\\..\\secrets', desktop), undefined);
+
+  let writtenPath = '';
+  const kept = await M.keepFile(
+    {
+      log() {},
+      tauri: {
+        invoke: async (cmd, args) => {
+          if (cmd === 'plugin:oaiy-filesystem|get_temp_dir') return '/tmp';
+          if (cmd === 'plugin:oaiy-filesystem|write_file') { writtenPath = args.path; return ''; }
+          if (cmd === 'get_media_url') return args.filePath;
+          return '';
+        },
+      },
+    },
+    new Uint8Array([1, 2, 3]),
+    'wav/../../evil.sh',
+    '../clip',
+  );
+  assert.equal(writtenPath.includes('..'), false, `keepFile must sanitize ext & base: ${writtenPath}`);
+  assert.match(kept.path, /^\/tmp\/oaiy-media\/_clip_\d+\.[A-Za-z0-9]{1,12}$/);
+});
+
+await check('19. FileSystem mints unforgeable file_ref tokens, validates Windows device paths, and clamps text_chunker overlap', async () => {
+  const statuses = [];
+  const tauriCalls = [];
+  const ac = new AbortController();
+  const fsMod = M.FilesystemRuntime.createMethods({
+    log() {},
+    abortSignal: ac.signal,
+    onNodeStatus: (id, s) => statuses.push({ id, s }),
+    tauri: {
+      invoke: async (cmd, args) => {
+        tauriCalls.push({ cmd, args });
+        if (cmd === 'plugin:oaiy-filesystem|read_file') {
+          return { content: '', size: 50_000_000, path: '/tmp/big.txt', name: 'big.txt', nameWithoutExt: 'big', ext: 'txt', isLargeFile: true };
+        }
+        if (cmd === 'plugin:oaiy-filesystem|calculate_file_chunks') {
+          return [{ path: args.path, start: 0, length: 10, index: 0, total: 1 }];
+        }
+        if (cmd === 'plugin:oaiy-filesystem|read_chunk_content') {
+          return 'chunk-body';
+        }
+        return null;
+      },
+    },
+  });
+
+  // Forged raw path or bogus token rejected
+  await assert.rejects(() => fsMod.calculateFileChunks('/etc/passwd', 100, 0, 'n1'), /Invalid or unissued file reference token/);
+  await assert.rejects(() => fsMod.readChunkContent('/etc/passwd', 0, 10, 'text'), /Invalid or unissued file reference token/);
+
+  // Real readFile issues opaque token & emits completed status
+  const refJson = await fsMod.readFile('/tmp/big.txt', 'text', 'read1');
+  const parsedRef = JSON.parse(refJson);
+  assert.equal(parsedRef.__type, 'file_ref');
+  assert.equal(typeof parsedRef.token, 'string');
+  assert.equal('path' in parsedRef, false, 'file_ref must not expose raw path');
+  assert.ok(statuses.some((e) => e.id === 'read1' && e.s === 'completed'), 'large-file readFile must emit completed status');
+
+  const chunks = await fsMod.calculateFileChunks(parsedRef.token, 100, 10, 'chunk1');
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].token, parsedRef.token);
+  assert.equal('path' in chunks[0], false);
+  const text = await fsMod.readChunkContent(chunks[0].token, 0, 10, 'text');
+  assert.equal(text, 'chunk-body');
+
+  // Abort check
+  ac.abort();
+  await assert.rejects(() => fsMod.calculateFileChunks(parsedRef.token, 100, 10, 'chunk2'), /aborted/i);
+  await assert.rejects(() => fsMod.readChunkContent(parsedRef.token, 0, 10, 'text'), /aborted/i);
+
+  // Windows path validation (unconditional)
+  for (const bad of ['//./COM1', '//?/C:/secret', '\\\\.\\PhysicalDrive0', '/tmp/CON.txt', '/tmp/nul/file.txt', 'C:relative.txt']) {
+    assert.throws(() => M.validatePath(bad, 'test'), `validatePath must reject ${bad}`);
+  }
+  assert.doesNotThrow(() => M.validatePath('/tmp/report..final.txt', 'test'));
+  assert.doesNotThrow(() => M.validatePath('C:\\Users\\demo\\file.txt', 'test'));
+
+  // text_chunker compiler clamps negative & NaN overlap
+  const compiled = M.FilesystemCompiler.compileNode('text_chunker', {
+    node: { id: 'tc1', type: 'text_chunker', data: { chunkSize: 100, overlap: -50 } },
+    inputs: new Map([['default', 'node_a_out']]),
+    outputVar: 'node_tc1_out',
+    sanitizedId: 'tc1',
+    skipVarDeclaration: false,
+    escapeString: (s) => s,
+    sanitizeId: (s) => s,
+    isInLoop: false,
+  });
+  assert.ok(compiled.includes('_ref_tc1.token'), 'text_chunker compiler must use file_ref.token');
+  assert.equal(compiled.includes('-50'), false, 'negative overlap must be clamped to >= 0');
+});
+
+await check('20. OAIYCompiler validates edge handles, logic_block validates handleId, and loops hoist multi-output vars', () => {
+  const compiler = new M.OAIYCompiler();
+  assert.throws(
+    () => compiler.compile({
+      nodes: [
+        { id: 'a', type: 'input_text', position: { x: 0, y: 0 }, data: {} },
+        { id: 'b', type: 'logic_block', position: { x: 100, y: 0 }, data: { code: 'input' } },
+      ],
+      edges: [{ id: 'e1', source: 'a', sourceHandle: 'text', target: 'b', targetHandle: 'x=1;evil()' }],
+    }),
+    /Invalid edge targetHandle/,
+  );
+  assert.throws(
+    () => compiler.compile({
+      nodes: [
+        { id: 'a', type: 'input_text', position: { x: 0, y: 0 }, data: {} },
+        { id: 'b', type: 'output', position: { x: 100, y: 0 }, data: {} },
+      ],
+      edges: [{ id: 'e1', source: 'a', sourceHandle: 'bad handle', target: 'b', targetHandle: 'result' }],
+    }),
+    /Invalid edge sourceHandle/,
+  );
+
+  // logic_block skips JS reserved words / non-identifier handleIds
+  const lbCode = M.UtilityCompiler.compileNode('logic_block', {
+    node: { id: 'lb1', type: 'logic_block', data: { code: 'input' } },
+    inputs: new Map([['input', 'v0'], ['class', 'v1'], ['bad-name', 'v2'], ['goodVar', 'v3']]),
+    outputVar: 'node_lb1_out',
+    sanitizedId: 'lb1',
+    skipVarDeclaration: false,
+    escapeString: (s) => s,
+    sanitizeId: (s) => s,
+    isInLoop: false,
+  });
+  assert.equal(lbCode.includes('let class ='), false, 'must not emit let for JS reserved word handle');
+  assert.equal(lbCode.includes('let bad-name ='), false, 'must not emit let for invalid identifier handle');
+  assert.ok(lbCode.includes('let goodVar = v3;'), 'valid handle identifier must still be bound');
+
+  // Multi-output node inside a loop pre-declares suffixed vars outside the loop and assigns inside
+  const fakeRegistry = {
+    getNodeDefinition: (type) => {
+      if (type === 'model_3d') {
+        return {
+          id: 'model_3d',
+          name: '3D',
+          inputs: [{ id: 'prompt', name: 'prompt', type: 'string' }],
+          outputs: [{ id: 'model', name: 'model', type: 'any' }, { id: 'path', name: 'path', type: 'string' }, { id: 'picture', name: 'picture', type: 'any' }],
+          compiler: {},
+        };
+      }
+      return undefined;
+    },
+    getModuleForNode: (type) => (type === 'model_3d' ? { compiler: M.Core3DCompiler, manifest: { id: 'core-3d' } } : undefined),
+    getCompiler: (type) => (type === 'model_3d' ? M.Core3DCompiler : undefined),
+    getAllNodeDefinitions: () => [],
+  };
+  const loopCompiler = new M.OAIYCompiler({ moduleRegistry: fakeRegistry });
+  const script = loopCompiler.compile({
+    nodes: [
+      { id: 'ls', type: 'loop_start', position: { x: 0, y: 0 }, data: { iterations: 2, loopMode: 'count' } },
+      { id: 'm1', type: 'model_3d', position: { x: 100, y: 0 }, data: { prompt: 'chair' } },
+      { id: 'le', type: 'loop_end', position: { x: 200, y: 0 }, data: {} },
+    ],
+    edges: [
+      { id: 'e1', source: 'ls', sourceHandle: 'item', target: 'm1', targetHandle: 'prompt' },
+      { id: 'e2', source: 'm1', sourceHandle: 'path', target: 'le', targetHandle: 'input' },
+      { id: 'e3', source: 'ls', sourceHandle: 'loop', target: 'le', targetHandle: 'loop' },
+    ],
+  });
+  assert.ok(script.includes('let node_m1_out_path = null;'), 'loop must pre-declare suffixed output at outer scope');
+  assert.equal(/\n  let node_m1_out_path = node_m1_out\.path;/.test(script), false, 'loop body must assign without re-declaring let');
+  assert.ok(/\n  node_m1_out_path = node_m1_out\.path;/.test(script), 'loop body must assign pre-declared suffixed var');
+});
+
+await check('21. SandboxedCustomNodeUI sanitization & ProjectIO macro preservation + secret constant redaction', () => {
+  const safeData = M.sanitizeDataForSandbox({
+    label: 'My Node',
+    count: 3,
+    nested: { ok: true, fn: () => 1 },
+    onChange: () => {},
+    onDataChange: () => {},
+    _status: 'running',
+    projectConstants: [{ key: 'OPENAI_API_KEY', value: 'sk-secret', isSecret: true }],
+    projectSettings: { apiKey: 'secret' },
+    llmEndpoints: [{ id: 'x' }],
+    availableFlows: [{ id: 'f1' }],
+  });
+  assert.deepEqual(safeData, { label: 'My Node', count: 3, nested: { ok: true } });
+  // Must be structured-cloneable (no DataCloneError)
+  assert.deepEqual(structuredClone(safeData), safeData);
+
+  const cleanUpdates = M.sanitizeSandboxUpdates(
+    JSON.parse('{"text":"hi","__proto__":{"polluted":true},"constructor":"bad","_status":"error","onChange":"x","projectConstants":[]}'),
+  );
+  assert.deepEqual(cleanUpdates, { text: 'hi' });
+  assert.equal(M.sanitizeSandboxUpdates(['not-an-object']), null);
+  assert.equal(M.sanitizeSandboxUpdates(new Date()), null);
+
+  // ProjectIO preserves _macro* & _collapsed and redacts api_key / looksLikeSecret constants even if isSecret:false
+  const fakeKey = `sk-${'z'.repeat(30)}`;
+  const proj = {
+    version: '1.0',
+    name: 'Test',
+    createdAt: '',
+    updatedAt: '',
+    flows: [{
+      id: 'f1',
+      name: 'F1',
+      createdAt: '',
+      updatedAt: '',
+      graph: {
+        nodes: [{
+          id: 'm1',
+          type: 'macro',
+          position: { x: 0, y: 0 },
+          data: {
+            _macroWorkflowId: 'wf-1',
+            _macroName: 'MyMacro',
+            _macroInputs: [{ id: 'in1', name: 'x', type: 'text' }],
+            _macroOutputs: [{ id: 'out1', name: 'y', type: 'text' }],
+            _collapsed: true,
+            _status: 'running',
+            _temp: 'drop-me',
+          },
+        }],
+        edges: [],
+      },
+    }],
+    constants: [
+      { id: 'c1', key: 'API_KEY_UNFLAGGED', value: 'plain-api-key', category: 'api_key', isSecret: false },
+      { id: 'c2', key: 'LOOKS_SECRET', value: fakeKey, category: 'custom', isSecret: false },
+      { id: 'c3', key: 'NORMAL', value: 'hello', category: 'custom', isSecret: false },
+    ],
+  };
+  const exported = M.sanitizeProjectForExport(proj);
+  const macroData = exported.flows[0].graph.nodes[0].data;
+  assert.equal(macroData._macroWorkflowId, 'wf-1');
+  assert.equal(macroData._macroName, 'MyMacro');
+  assert.deepEqual(macroData._macroInputs, [{ id: 'in1', name: 'x', type: 'text' }]);
+  assert.deepEqual(macroData._macroOutputs, [{ id: 'out1', name: 'y', type: 'text' }]);
+  assert.equal(macroData._collapsed, true);
+  assert.equal('_status' in macroData, false);
+  assert.equal('_temp' in macroData, false);
+  assert.equal(exported.constants[0].value, '', 'category=api_key constant must be cleared on export');
+  assert.equal(exported.constants[1].value, '', 'looksLikeSecret constant must be cleared on export');
+  assert.equal(exported.constants[2].value, 'hello');
+
+  const imported = M.parseImportedProject(JSON.stringify(proj));
+  assert.equal(imported.flows[0].untrusted, true, 'imported project flows must be marked untrusted');
+  const c1 = imported.constants.find((c) => c.key === 'API_KEY_UNFLAGGED');
+  const c2 = imported.constants.find((c) => c.key === 'LOOKS_SECRET');
+  assert.equal(c1.isSecret, true);
+  assert.equal(c2.isSecret, true);
+});
+
+await check('22. core-audio & core-video sanitize paths/colors, parse tokenized media URLs, and drop network protocols from FFmpeg appendVideos', async () => {
+  assert.equal(
+    M.resolveLocalMediaUrl('http://127.0.0.1:8765/media/tok_secret_abcdef123456/oaiy-output/clip.wav', '/data/app'),
+    '/data/app/output/clip.wav',
+  );
+  assert.equal(
+    M.resolveLocalMediaUrl('http://127.0.0.1:8765/media/oaiy-output/sub/clip.wav', '/data/app'),
+    '/data/app/output/sub/clip.wav',
+  );
+  assert.throws(
+    () => M.resolveLocalMediaUrl('http://127.0.0.1:8765/media/tok/oaiy-output/%2e%2e/secret.txt', '/data/app'),
+    /path traversal/,
+  );
+  assert.equal(
+    M.redactMediaToken('http://127.0.0.1:8765/media/tok_secret_abcdef123456/oaiy-output/clip.wav').includes('tok_secret'),
+    false,
+  );
+
+  assert.equal(M.sanitizeAudioFilename('../../etc/evil', 'clip').includes('..'), false);
+  assert.equal(M.sanitizeAudioFormat('wav;rm -rf /', 'wav'), 'wav');
+  assert.equal(M.sanitizeVideoFilename('../out/bad', 'vid').includes('..'), false);
+  assert.equal(M.sanitizeVideoFormat('mp4/../../x', 'mp4'), 'mp4');
+  assert.equal(M.sanitizeFfmpegColor("white:text='injected'", 'white'), 'white');
+  assert.equal(M.sanitizeFfmpegColor('rgba(255, 0, 128, 0.5)', 'black@0.7'), '0xff0080@0.5');
+
+  // appendVideos stages remote http(s) URL via secureFetch and passes -protocol_whitelist file ONLY
+  const secureFetched = [];
+  let ffmpegArgs = null;
+  const vidMod = M.VideoRuntime.createMethods({
+    log() {},
+    secureFetch: async (url) => {
+      secureFetched.push(url);
+      return mockResp(200, 'video-bytes', { 'content-type': 'video/mp4' });
+    },
+    tauri: {
+      invoke: async (cmd, args) => {
+        if (cmd === 'plugin:oaiy-filesystem|get_app_data_dir') return '/app';
+        if (cmd === 'plugin:oaiy-filesystem|get_temp_dir') return '/tmp';
+        if (cmd === 'plugin:oaiy-filesystem|run_command') {
+          ffmpegArgs = args.args;
+          return { code: 0, stdout: '', stderr: '' };
+        }
+        return null;
+      },
+    },
+  });
+  await vidMod.appendVideos(['https://cdn.example.com/a.mp4', '/app/b.mp4'], '../evil', 'mp4;bad', 'v1');
+  assert.deepEqual(secureFetched, ['https://cdn.example.com/a.mp4'], 'remote video must be fetched through ctx.secureFetch');
+  const wlIdx = ffmpegArgs.indexOf('-protocol_whitelist');
+  assert.equal(ffmpegArgs[wlIdx + 1], 'file', 'FFmpeg -protocol_whitelist must only allow file (no http/https/tcp/tls)');
+});
+
+await check('23. core-database, core-agent, core-flow-control, core-utility, sql.ts, oaiyAgentTools, selection-analyzer & TrustDialog fixes', async () => {
+  // core-database: abort returns __ABORT__, missing db throws, compiler avoids double-stringify
+  const abortedAc = new AbortController();
+  abortedAc.abort();
+  const dbAborted = M.DatabaseRuntime.createMethods({ log() {}, abortSignal: abortedAc.signal });
+  assert.equal(await dbAborted.execute('query', 'items', null, '{}', 'd1'), '__ABORT__');
+  const dbMissing = M.DatabaseRuntime.createMethods({ log() {} });
+  await assert.rejects(() => dbMissing.execute('query', 'items', null, '{}', 'd2'), /Database not available/);
+  const dbCode = M.DatabaseCompiler.compileNode('database_query', {
+    node: { id: 'q1', type: 'database_query', data: { collectionName: 'c' } },
+    inputs: new Map([['filter', 'node_f_out']]),
+    outputVar: 'node_q1_out',
+    sanitizedId: 'q1',
+    skipVarDeclaration: false,
+    escapeString: (s) => s,
+    sanitizeId: (s) => s,
+    isInLoop: false,
+  });
+  assert.ok(dbCode.includes('typeof node_f_out === "string" ? node_f_out : JSON.stringify'));
+
+  // core-agent: $& preserved literally; ask sets error status on failure
+  assert.equal(M.taskText('cost is $& and $$10', 'Check: {{input}}', null), 'Check: cost is $& and $$10');
+  const agentStatuses = [];
+  const agentMod = M.AgentRuntime.createMethods({
+    log() {},
+    onNodeStatus: (id, s) => agentStatuses.push({ id, s }),
+  });
+  await assert.rejects(() => agentMod.ask('hi', '', null, 'main', 5, 'a1'));
+  assert.deepEqual(agentStatuses, [{ id: 'a1', s: 'running' }, { id: 'a1', s: 'error' }]);
+
+  // core-flow-control: missing callback throws, abort throws, self-recursion from currentFlowId caught
+  const subNoCb = M.SubflowRuntime.createMethods({ log() {}, currentFlowId: 'flow-self' });
+  await assert.rejects(() => subNoCb.execute('child', {}, 's1'), /No subflow callback/);
+  const subSelf = M.SubflowRuntime.createMethods({
+    log() {},
+    currentFlowId: 'flow-self',
+    runSubflow: async () => ({}),
+  });
+  await assert.rejects(() => subSelf.execute('flow-self', {}, 's2'), /Recursive subflow/);
+  const subAbort = M.SubflowRuntime.createMethods({
+    log() {},
+    abortSignal: abortedAc.signal,
+    runSubflow: async () => ({}),
+  });
+  await assert.rejects(() => subAbort.execute('child', {}, 's3'), /aborted/i);
+
+  // core-utility: URL-encodes serviceId in getServiceUrl / ensureService
+  const utilUrls = [];
+  const utilMod = M.UtilityRuntime.createMethods({
+    log() {},
+    secureFetch: async (url) => {
+      utilUrls.push(url);
+      return mockResp(404, {});
+    },
+  });
+  await utilMod.getServiceUrl('../admin?x=1');
+  await utilMod.ensureService('../admin#hash');
+  assert.ok(utilUrls[0].includes('%2Fadmin%3Fx%3D1'), `expected encoded serviceId: ${utilUrls[0]}`);
+  assert.ok(utilUrls[1].includes('%2Fadmin%23hash'), `expected encoded serviceId: ${utilUrls[1]}`);
+
+  // sql.ts: $1name is not rewritten while $1 is
+  assert.equal(M.normalizeSql('SELECT $1name, $1, $2_col, $2 FROM t'), 'SELECT $1name, ?1, $2_col, ?2 FROM t');
+
+  // oaiyAgentTools: withdrawTool / withdrawHook throw on !resp.ok
+  const origFetch = globalThis.fetch;
+  globalThis.window.__OAIY_DESKTOP__ = { origin: 'http://127.0.0.1:17972', token: 'tok' };
+  globalThis.fetch = async () => mockResp(500, 'server error');
+  try {
+    const fakeFlow = { id: 'f1', name: 'F1', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] } };
+    await assert.rejects(() => M.withdrawTool(fakeFlow), /HTTP 500/);
+    await assert.rejects(() => M.withdrawHook(fakeFlow), /HTTP 500/);
+  } finally {
+    globalThis.fetch = origFetch;
+    delete globalThis.window.__OAIY_DESKTOP__;
+  }
+
+  // selection-analyzer: populates _macroName, _macroInputs, _macroOutputs & unique parentEdges IDs
+  const graph = {
+    nodes: [
+      { id: 'src', type: 'input_text', position: { x: 0, y: 0 }, data: {} },
+      { id: 'mid', type: 'template', position: { x: 200, y: 0 }, data: {} },
+      { id: 'dst', type: 'output', position: { x: 400, y: 0 }, data: {} },
+    ],
+    edges: [
+      { id: 'e1', source: 'src', sourceHandle: 'text', target: 'mid', targetHandle: 'input' },
+      { id: 'e2', source: 'src', sourceHandle: 'text', target: 'mid', targetHandle: 'input2' },
+      { id: 'e3', source: 'mid', sourceHandle: 'result', target: 'dst', targetHandle: 'result' },
+    ],
+  };
+  const analysis = M.analyzeSelection(graph.nodes, graph.edges, ['mid']);
+  const created = M.convertSelectionToMacro(analysis, 'macro-1', 'MyMacro', {}, {});
+  assert.equal(created.macroNode.data._macroName, 'MyMacro');
+  assert.equal(created.macroNode.data._macroInputs.length, 2);
+  assert.equal(created.macroNode.data._macroOutputs.length, 1);
+  const edgeIds = created.parentEdges.map((e) => e.id);
+  assert.equal(new Set(edgeIds).size, edgeIds.length, 'parentEdges IDs must be unique');
+
+  // customNodeCompiler blocks all @tauri-apps/* & TrustDialog high-risk + diffusion
+  const compilerSrc = fs.readFileSync(path.join(UI, 'src/services/customNodeCompiler.ts'), 'utf8');
+  assert.ok(compilerSrc.includes('/^@tauri-apps(?:\\/|$)/'), 'customNodeCompiler must block all @tauri-apps/* imports');
+  const trustSrc = fs.readFileSync(path.join(UI, 'src/components/PackageManager/TrustDialog.tsx'), 'utf8');
+  assert.ok(trustSrc.includes("'filesystem:read'") && trustSrc.includes("'network:local'"), 'TrustDialog must include filesystem:read & network:local in HIGH_RISK_PERMISSIONS');
+  assert.ok(/diffusion\s*:/.test(trustSrc), 'TrustDialog must define PERMISSION_INFO entry for diffusion');
 });
 
 finish();

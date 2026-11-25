@@ -28,6 +28,7 @@ pub fn sample(logits: &[f32], temperature: f64, top_k: usize, top_p: f64, greedy
     }
     // Only the top k need ordering; ties go to the lower id, as a stable sort
     // (and the reference's argmax) would have it.
+    let greedy = greedy || !temperature.is_finite() || temperature <= 0.0;
     let k = if greedy { 1 } else { top_k.max(1).min(order.len()) };
     let by_logit = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
     if k < order.len() {
@@ -41,6 +42,9 @@ pub fn sample(logits: &[f32], temperature: f64, top_k: usize, top_p: f64, greedy
     let top = logits[order[0]] as f64;
     let weights: Vec<f64> = order.iter().map(|&i| ((logits[i] as f64 - top) / temperature).exp()).collect();
     let total: f64 = weights.iter().sum();
+    if !(total > 0.0 && total.is_finite()) {
+        return order[0] as u32;
+    }
     let mut kept = order.len();
     if top_p < 1.0 {
         let mut acc = 0.;
@@ -74,7 +78,7 @@ pub fn gumbel(rng: &mut Rng, n: usize) -> Vec<f32> {
 /// U32 tensor, still on the device. Greedy (or k = 1) is the plain argmax.
 pub fn pick(logits: &Tensor, top_k: usize, temperature: f64, noise: &Tensor, greedy: bool) -> Result<Tensor> {
     let k = top_k.clamp(1, logits.dim(1)?);
-    if greedy || k == 1 {
+    if greedy || k == 1 || !temperature.is_finite() || temperature <= 0.0 {
         return logits.argmax(1);
     }
     let top = logits.arg_sort_last_dim(false)?.narrow(1, 0, k)?.contiguous()?;
@@ -126,6 +130,10 @@ mod tests {
         }
         // Everything masked but one.
         assert_eq!(sample(&[f32::NEG_INFINITY, 2.0], 1.0, 50, 1.0, false, &mut rng), 1);
+        // Zero, negative, or non-finite temperature falls back to greedy argmax.
+        for bad_t in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(sample(&logits, bad_t, 50, 1.0, false, &mut rng), 1);
+        }
     }
 
     #[test]

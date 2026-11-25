@@ -1130,6 +1130,24 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       runtime.setProjectSettings(projectSettings);
     }
 
+    // SECURITY: run an imported/shared (untrusted) project HARDENED — set flow context
+    // BEFORE registering modules so every module context immediately sees currentPackageId.
+    // A synthetic package context engages Web Worker isolation + the permission gate,
+    // granting only benign capabilities so a malicious logic_block can't run arbitrary JS /
+    // steal API keys in this origin. The user's own flows (no marker) stay trusted/unchanged.
+    if (runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
+      runtime.setFlowContext(flowIdRef.current || 'imported-flow', UNTRUSTED_PACKAGE_ID);
+      runtime.setPackagePermissions(UNTRUSTED_FLOW_PERMISSIONS);
+      addLog({
+        source: 'Security',
+        message:
+          'A shared flow (or one it calls) — running sandboxed: code blocks and saved secrets are disabled.',
+        type: 'info',
+      });
+    } else if (flowIdRef.current) {
+      runtime.setFlowContext(flowIdRef.current, null);
+    }
+
     // Connect module loader for dynamic node support
     const moduleLoader = getModuleLoader();
     runtime.setModuleRegistry(moduleLoader);
@@ -1139,21 +1157,6 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
       if (loadedModule.runtime) {
         await runtime.registerDynamicModule(loadedModule);
       }
-    }
-
-    // SECURITY: run an imported/shared (untrusted) project HARDENED — a synthetic package context
-    // engages Web Worker isolation + the permission gate, granting only benign capabilities so a
-    // malicious logic_block can't run arbitrary JS / steal API keys in this origin. The user's own
-    // flows (no marker) stay trusted/unchanged. See engine-security review finding #2.
-    if (runIsUntrusted(flowIdRef.current, graph, availableFlowsRef.current)) {
-      runtime.setFlowContext('imported-flow', UNTRUSTED_PACKAGE_ID);
-      runtime.setPackagePermissions(UNTRUSTED_FLOW_PERMISSIONS);
-      addLog({
-        source: 'Security',
-        message:
-          'A shared flow (or one it calls) — running sandboxed: code blocks and saved secrets are disabled.',
-        type: 'info',
-      });
     }
 
     try {
