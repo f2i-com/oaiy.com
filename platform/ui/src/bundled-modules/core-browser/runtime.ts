@@ -1098,6 +1098,19 @@ const desktopAuth = (): Record<string, string> => {
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
+/**
+ * The key OAIY's window gave this page for the Playwright server (`window.__OAIY_DESKTOP__.browserKey`), as the
+ * `Authorization` the server is sent. On Windows the window's origin is `http://oaiyflows.localhost`, a name any web
+ * server on this computer's port 80 serves pages under too, so the server believes that origin only with this key.
+ * Sent to the Playwright server and nowhere else (the desktop's own API is sent the desktop's token, `desktopAuth`); a
+ * page outside OAIY's window has none and sends none.
+ */
+const browserServiceAuth = (): Record<string, string> => {
+  const given = (globalThis as { __OAIY_DESKTOP__?: { browserKey?: unknown } }).__OAIY_DESKTOP__;
+  const key = given?.browserKey;
+  return typeof key === 'string' && /^[\x21-\x7e]{16,512}$/.test(key) ? { Authorization: `Bearer ${key}` } : {};
+};
+
 /** Resolved base URL of OAIY Desktop's Playwright server; cached per load. */
 let companionBrowserBase: string | null = null;
 
@@ -1133,6 +1146,12 @@ async function companionFetchJson<T = unknown>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** `companionFetchJson` for a request to the Playwright server itself: with the key OAIY's window gave the page. */
+function browserFetchJson<T = unknown>(url: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
+  const headers = { ...browserServiceAuth(), ...((init?.headers as Record<string, string> | undefined) || {}) };
+  return companionFetchJson<T>(url, { ...init, headers }, timeoutMs);
 }
 
 /**
@@ -1212,7 +1231,7 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 60; attempt++) {
     try {
-      const h = await companionFetchJson<{ ok?: boolean; error?: string }>(
+      const h = await browserFetchJson<{ ok?: boolean; error?: string }>(
         `${base}/health`,
         { method: 'GET' },
         2000
@@ -1293,7 +1312,7 @@ const companionBrowser = {
     }
     try {
       const base = await resolveDesktopBrowserBase();
-      const r = await companionFetchJson<{ sessionId?: string }>(
+      const r = await browserFetchJson<{ sessionId?: string }>(
         `${base}/session`,
         { method: 'POST', body: JSON.stringify({ config }) },
         30000
@@ -1314,7 +1333,7 @@ const companionBrowser = {
       throw new Error('[Browser] Local network access requires network:local permission');
     }
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ url?: string; title?: string; status?: number }>(
+    const r = await browserFetchJson<{ url?: string; title?: string; status?: number }>(
       `${base}/session/${sessionId}/goto`,
       { method: 'POST', body: JSON.stringify({ url, waitUntil: options.waitUntil }) },
       (options.timeoutMs ?? 30000) + 5000
@@ -1327,7 +1346,7 @@ const companionBrowser = {
   },
   async evaluate(sessionId: string, script: string): Promise<unknown> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ result?: unknown }>(
+    const r = await browserFetchJson<{ result?: unknown }>(
       `${base}/session/${sessionId}/evaluate`,
       { method: 'POST', body: JSON.stringify({ script }) },
       30000
@@ -1336,22 +1355,22 @@ const companionBrowser = {
   },
   async getHtml(sessionId: string): Promise<string> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ html?: string }>(`${base}/session/${sessionId}/html`, { method: 'GET' });
+    const r = await browserFetchJson<{ html?: string }>(`${base}/session/${sessionId}/html`, { method: 'GET' });
     return r.html ?? '';
   },
   async getTitle(sessionId: string): Promise<string> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ title?: string }>(`${base}/session/${sessionId}/title`, { method: 'GET' });
+    const r = await browserFetchJson<{ title?: string }>(`${base}/session/${sessionId}/title`, { method: 'GET' });
     return r.title ?? '';
   },
   async getUrl(sessionId: string): Promise<string> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ url?: string }>(`${base}/session/${sessionId}/url`, { method: 'GET' });
+    const r = await browserFetchJson<{ url?: string }>(`${base}/session/${sessionId}/url`, { method: 'GET' });
     return r.url ?? '';
   },
   async waitForSelector(sessionId: string, selector: string, timeoutMs: number): Promise<void> {
     const base = await resolveDesktopBrowserBase();
-    await companionFetchJson(
+    await browserFetchJson(
       `${base}/session/${sessionId}/wait`,
       { method: 'POST', body: JSON.stringify({ selector, timeoutMs }) },
       timeoutMs + 5000
@@ -1359,7 +1378,7 @@ const companionBrowser = {
   },
   async screenshot(sessionId: string, options: BrowserScreenshotOptions): Promise<BrowserScreenshotResult> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ dataUrl?: string }>(
+    const r = await browserFetchJson<{ dataUrl?: string }>(
       `${base}/session/${sessionId}/screenshot`,
       { method: 'POST', body: JSON.stringify({ fullPage: options.fullPage }) },
       30000
@@ -1368,7 +1387,7 @@ const companionBrowser = {
   },
   async getCookies(sessionId: string, domain?: string): Promise<BrowserCookieV2[]> {
     const base = await resolveDesktopBrowserBase();
-    const r = await companionFetchJson<{ cookies?: BrowserCookieV2[] }>(
+    const r = await browserFetchJson<{ cookies?: BrowserCookieV2[] }>(
       `${base}/session/${sessionId}/cookies`,
       { method: 'GET' }
     );
@@ -1379,14 +1398,14 @@ const companionBrowser = {
   },
   async setCookies(sessionId: string, cookies: BrowserCookieV2[], merge: boolean): Promise<void> {
     const base = await resolveDesktopBrowserBase();
-    await companionFetchJson(
+    await browserFetchJson(
       `${base}/session/${sessionId}/cookies`,
       { method: 'POST', body: JSON.stringify({ cookies, merge }) }
     );
   },
   async close(sessionId: string): Promise<void> {
     const base = await resolveDesktopBrowserBase();
-    await companionFetchJson(`${base}/session/${sessionId}`, { method: 'DELETE' }, 4000).catch(() => {});
+    await browserFetchJson(`${base}/session/${sessionId}`, { method: 'DELETE' }, 4000).catch(() => {});
   },
 };
 

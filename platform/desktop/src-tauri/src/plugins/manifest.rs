@@ -1268,6 +1268,9 @@ impl PluginManifest {
 /// gated because the holder decides which devices the owner is even asked to
 /// approve, and a plugin that could enrol its own devices would make the
 /// owner's confirmation ceremonial.
+/// `oaiy.browser.open` lets a plugin have OAIY open a web page in the person's
+/// browser (`oaiy.browser.open`, see `host.rs`): a browser a plugin starts itself
+/// is in the job its process is (Windows), and ends when OAIY does.
 pub const HOST_CAPABILITIES: &[&str] = &[
     "oaiy.ai.complete",
     "oaiy.voice.session",
@@ -1275,6 +1278,7 @@ pub const HOST_CAPABILITIES: &[&str] = &[
     "oaiy.events.publish",
     "oaiy.services.read",
     "oaiy.companion.admission",
+    "oaiy.browser.open",
 ];
 
 /// Pre-OAIY spellings of host capabilities, mapped to their canonical names.

@@ -759,6 +759,27 @@ test('4.18.2 installer web: it asks the web at the public address whether data/ 
     ok(is_file($root . '/INSTALL_ENABLED'), 'the flag stays for another try');
 });
 
+test('4.18.2 installer web: a data folder in which the relay cannot count its own hold markers is refused in words about that folder, not with the advice to set the document root, which would change nothing', function () {
+    [$root, $srv] = inst_web();
+    $data = $root . '/data';
+    mkdir($data . '/holds', 0700, true);
+    file_put_contents($data . '/holds/addr-doctor', 'a file where the self test needs a folder');
+    $r = inst_post($srv, ['token' => INST_TOKEN, 'public_url' => 'https://relay.example.com']);
+    eq(409, $r['status'], $r['body']);
+    contains('Not installed', $r['body']);
+    contains('hold marker could not be made', $r['body']);
+    not_contains('document root', $r['body'], 'data/ is not served here: the document root is right already');
+    contains('create, list and delete files', $r['body'], 'what to look at: the folder');
+    contains('<code>' . htmlspecialchars($data, ENT_QUOTES) . '</code>', $r['body'], 'and which folder');
+    foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'installed.lock', 'secrets/relay.key'] as $f) {
+        ok(!file_exists($data . '/' . $f), "$f was not written");
+    }
+    ok(is_file($root . '/INSTALL_ENABLED'), 'the flag stays for another try');
+    // The other refusals keep their advice (the two tests above), and the same form installs once nothing is in the way.
+    unlink($data . '/holds/addr-doctor');
+    eq(200, inst_post($srv, ['token' => INST_TOKEN, 'public_url' => 'https://relay.example.com'])['status']);
+});
+
 test('4.18.2 installer web: an address that serves public/ passes the probe and the page says it was checked; one that cannot be reached, or a skipped check, is said out loud', function () {
     [$root, $srv] = inst_web();
     $pub = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);

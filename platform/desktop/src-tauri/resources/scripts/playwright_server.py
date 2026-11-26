@@ -19,6 +19,10 @@ Config (env):
                           Agent and Flows windows). Unset or empty: no web page
                           may. Programs that send no Origin header (the desktop,
                           curl, scripts) are not affected.
+  OAIY_BROWSER_KEY        the key OAIY hands its flow editor's window in this run
+                          (never logged). An allowed origin that is a `.localhost`
+                          name is believed only with it (below). Unset or empty:
+                          no such origin is believed.
 
 Who may call it: it drives a real browser (goto, evaluate, cookies), and loopback
 is no boundary against the user's own browser, where any open web page can send
@@ -28,17 +32,21 @@ requests to 127.0.0.1. Every request, of any method, is checked before it is rea
   - a request that carries `Origin`, or `Sec-Fetch-Site` other than same-origin
     or none (cross-site, same-site), is 403 unless its Origin is in
     OAIY_ALLOWED_ORIGINS;
+  - an allowed Origin that is a name under `localhost` (`http://oaiyflows.localhost`,
+    the form Windows gives OAIY's windows) is a name, not proof of who holds it: a
+    browser sends every *.localhost name to this computer, so a program listening
+    on 127.0.0.1:80 that answers it (a local web server, WAMP for one) can serve a
+    page with exactly that Origin. Such a request is 403 unless it also carries
+    `Authorization: Bearer <OAIY_BROWSER_KEY>`, which OAIY gives its window and
+    nobody else. A preflight (OPTIONS) is answered without it, since a browser
+    sends no credentials on one, and runs nothing. A custom-scheme Origin
+    (`oaiyflows://localhost`, a Mac's and Linux's) is one no browser page can have,
+    and an origin the person listed themselves (a dev server's) is their choice:
+    both are believed by the list alone, as before;
   - `Access-Control-Allow-Origin` echoes such an allowed origin and is never
     `*`; nothing answers a Private Network Access preflight.
 To let another page in (a `vite dev` tab, say), set OAIY_ALLOWED_ORIGINS in your
 copy of the service's template (`run.env`); see platform/desktop/README.md.
-
-Known residual: an origin is a name, not proof of who holds it. On Windows OAIY's
-windows are http://oaiy.localhost and http://oaiyflows.localhost, and a browser
-resolves any *.localhost name to this machine, so a program listening on
-127.0.0.1:80 that answers such a name (a local web server, WAMP for one) can serve a
-page whose Origin is allowed. OAIY's own API guard has the same limit; a token in a
-header instead was declined in the design (access model A5).
 
 API (all JSON; the checks above come first):
   GET    /health                       -> { ok, browser, headless }
@@ -56,6 +64,7 @@ API (all JSON; the checks above come first):
   POST   /session/<id>/cookies {cookies,merge?} -> { ok, count }
 """
 import base64
+import hmac
 import json
 import os
 import re
@@ -108,6 +117,31 @@ def parse_allowed_origins(raw):
 
 ALLOWED_ORIGINS = parse_allowed_origins(os.environ.get("OAIY_ALLOWED_ORIGINS", ""))
 
+# The key OAIY gave its window in this run (see the module docstring); never logged.
+BROWSER_KEY = (os.environ.get("OAIY_BROWSER_KEY") or "").strip()
+
+# http(s)://<a name under localhost>[:port]: what is left of an allowed origin to look at.
+_NAME_ONLY = re.compile(r"^https?://([a-z0-9][a-z0-9.\-_]*)\.localhost(:[0-9]+)?$")
+
+
+def is_name_only(origin):
+    """Is `origin` (lowercased) a name under `localhost` (`http://oaiyflows.localhost`)?
+
+    That is the form Windows gives OAIY's windows, and a name every browser sends
+    to this computer: whatever listens on its port 80 or 443 can serve a page with
+    exactly this Origin. A custom scheme (`oaiyflows://localhost`) is no such name."""
+    return isinstance(origin, str) and _NAME_ONLY.match(origin) is not None
+
+
+def bearer_is(authorizations, key):
+    """Does the one Authorization header (a list of the values received) carry `key`
+    as a bearer token? Compared in a time that does not depend on the guess; an
+    empty key is never matched, and two headers are no answer."""
+    if not key or len(authorizations) != 1:
+        return False
+    scheme, _, given = authorizations[0].strip().partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(given.strip().encode("utf-8"), key.encode("utf-8"))
+
 
 def host_is_own(host_header, port):
     """Is `Host` one of 127.0.0.1:<port>, localhost:<port>, [::1]:<port>?
@@ -125,9 +159,10 @@ def host_is_own(host_header, port):
 _OWN_FETCH_SITES = ("same-origin", "none")
 
 
-def judge_request(hosts, origins, fetch_sites, port, allowed):
-    """Decide one request from its Host, Origin and Sec-Fetch-Site header values
-    (each a list of the values received, empty when the header is absent).
+def judge_request(hosts, origins, fetch_sites, port, allowed, authorizations=(), key="", method="GET"):
+    """Decide one request from its Host, Origin, Sec-Fetch-Site and Authorization
+    header values (each a list of the values received, empty when the header is
+    absent), the key OAIY gave its window (`key`) and the request's method.
 
     Returns (status, reason, cors_origin): 200 to serve it, else 421 or 403 and
     why; cors_origin is the origin to echo in Access-Control-Allow-Origin, or
@@ -138,9 +173,15 @@ def judge_request(hosts, origins, fetch_sites, port, allowed):
         return 403, "more than one Origin or Sec-Fetch-Site header", None
     if origins:
         origin = origins[0].strip().lower()
-        if origin in allowed:
-            return 200, None, origin
-        return 403, f"the origin {ascii(origin[:80])} may not call this server (OAIY_ALLOWED_ORIGINS)", None
+        if origin not in allowed:
+            return 403, f"the origin {ascii(origin[:80])} may not call this server (OAIY_ALLOWED_ORIGINS)", None
+        # (a preflight carries no credentials in any browser, and runs nothing: the request it clears is judged here)
+        if is_name_only(origin) and method != "OPTIONS" and not bearer_is(list(authorizations), key):
+            return 403, (
+                f"the origin {ascii(origin[:80])} is a name any web server on this computer can serve a page under: "
+                "it may call this server only with the key OAIY gives its window (OAIY_BROWSER_KEY)"
+            ), None
+        return 200, None, origin
     if fetch_sites and fetch_sites[0].strip().lower() not in _OWN_FETCH_SITES:
         return 403, "a web page on another site may not call this server (OAIY_ALLOWED_ORIGINS)", None
     return 200, None, None
@@ -288,6 +329,9 @@ class Handler(BaseHTTPRequestHandler):
             self.headers.get_all("Sec-Fetch-Site") or [],
             self.server.server_address[1],
             ALLOWED_ORIGINS,
+            self.headers.get_all("Authorization") or [],
+            BROWSER_KEY,
+            self.command,
         )
         if status != 200:
             self._refuse(status, reason)
@@ -344,7 +388,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", self._cors_origin)
             if self.command == "OPTIONS":
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                # (Authorization: the key OAIY's window sends with each request, which a `.localhost` origin needs)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
                 self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -490,6 +535,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     log(f"starting on 127.0.0.1:{PORT} (headless={HEADLESS})")
     log("web pages allowed to call it: " + (", ".join(sorted(ALLOWED_ORIGINS)) or "none (OAIY_ALLOWED_ORIGINS is empty)"))
+    named = sorted(o for o in ALLOWED_ORIGINS if is_name_only(o))
+    if named:
+        log(", ".join(named) + (": only with the key OAIY gave its window" if BROWSER_KEY else ": never (no OAIY_BROWSER_KEY was given)"))
     try:
         # Launch eagerly so a failure surfaces immediately in the logs +
         # the companion's health check, rather than on first use.

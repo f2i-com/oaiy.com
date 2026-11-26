@@ -150,7 +150,7 @@ MUTATIONS = [
     ("E02", "admission relay advertisement", "a URL with credentials is taken for usable", C + "admission.rs",
      "if authority.is_empty() || authority.contains('@') {", "if authority.is_empty() {", "own"),
     ("E03", "admission relay advertisement", "a URL with a fragment is taken for usable", C + "admission.rs",
-     "if url.contains('#') {", "if false {", "own"),
+     " || b == b'#') {", ") {", "own"),
     ("E04", "admission members", "a phone admission must have an iceServers member (the shipped phone defaults it)", C + "admission.rs",
      'filter(|m| !matches!(*m, "iceServers" | "relay"))', 'filter(|m| !matches!(*m, "relay"))', "own"),
     # ---------------------------------------------------------------------------------------------------------------- base64url strictness

@@ -68,6 +68,7 @@ import { ProjectPicker } from './ui/projectPicker';
 import { icon } from './ui/icons';
 import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, SETUP_NOTE, SETUP_PROJECT, SETUP_README, clearIncognito, createProject, deleteProject, listProjects, renameProject, setupProject, type ProjectMeta } from './vfs/projects';
 import { addOaiyOrigin, setIncognito } from './privacy';
+import { addEnginesGateway, useEnginesKey } from './desktop/enginesKey';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import { normalizePath, type Vfs } from './vfs/vfs';
@@ -125,6 +126,10 @@ function embeddedDesktop(): { origin: string; token: string; backupToken?: strin
 const HOST = pageHost();
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
 const IN_OAIY = HOST.kind === 'oaiy-window';
+// OAIY's window gives the page the key of the engines it runs in the same line: from now on it goes with each request to
+// their gateway, which answers this page's origin (on Windows `http://oaiy.localhost`, a name any web server here has too)
+// only with it (desktop/enginesKey.ts).
+useEnginesKey((window as unknown as { __OAIY_DESKTOP__?: { enginesKey?: unknown } }).__OAIY_DESKTOP__?.enginesKey);
 // Inside OAIY's window the page takes the window's look (styles.css, `.in-oaiy`).
 if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 // Light or dark: OAIY's (the dashboard's choice), or the system's.
@@ -1250,10 +1255,16 @@ async function main(): Promise<void> {
 
   /** Where OAIY answers, so an incognito project's requests to it say so (and only to it). */
   const registerOaiy = () => {
-    for (const p of providers) if (p.serverKind === 'oaiy') addOaiyOrigin(p.baseUrl);
+    for (const p of providers) {
+      if (p.serverKind !== 'oaiy') continue;
+      addOaiyOrigin(p.baseUrl);
+      // (an OAIY on this computer at an address of its own: the engines' key goes there too, and never off it)
+      addEnginesGateway(p.baseUrl);
+    }
     if (media.discovered) {
       addOaiyOrigin(media.discovered.origin);
       addOaiyOrigin(media.baseUrl);
+      addEnginesGateway(media.discovered.origin);
     }
   };
 
@@ -2777,7 +2788,11 @@ A project can hold several apps, each in its own folder (any folder whose manife
   async function followGateway(): Promise<string | null> {
     const d = desktop;
     if (!d || HOST.automated) return null;
-    const gateway = await d.gatewayUrl(AbortSignal.timeout(3000)).catch(() => null);
+    const engines = await d.engines(AbortSignal.timeout(3000)).catch(() => null);
+    const gateway = engines?.gatewayUrl ?? null;
+    // (the key the engines' gateway asks of this page, and where it is now: a page paired with the desktop is told both)
+    addEnginesGateway(gateway);
+    useEnginesKey(engines?.gatewayKey);
     const move = movedGateway(media.discovered?.origin, gateway);
     if (move) {
       const moved = moveOaiy(media, providers, move.from, move.to);

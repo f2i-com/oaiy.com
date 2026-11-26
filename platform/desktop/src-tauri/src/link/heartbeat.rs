@@ -165,7 +165,15 @@ pub fn spawn(store: LinkHandle) {
             // seeds the schedule promptly and this runs on the second — the
             // beat that first says something then says something true.
             let prelude = poll_prelude(&store, &account, descriptor.script_profile.as_ref());
-            let tokens = capability_tokens(&spec, probe.as_ref(), &health, prelude, Instant::now());
+            // What the app-logic lane runs with the prelude held now, where this provider has that lane: a language
+            // the beat names is deferred here for app scripts as well as for flows.
+            let held = ProfileCache::global().current();
+            let app_logic = descriptor
+                .app_logic
+                .as_ref()
+                .map(|lane| super::app_logic::languages_run(lane, held.as_deref().map(|p| p.document())));
+            let declared = declared_languages(probe.as_ref(), app_logic.as_deref());
+            let tokens = capability_tokens(&spec, &declared, probe.as_ref(), &health, prelude, Instant::now());
 
             if !beat_due(interval, last_beat.as_ref(), last_tokens.as_deref(), &tokens, Instant::now())
             {
@@ -175,7 +183,7 @@ pub fn spawn(store: LinkHandle) {
             let sent = send(&account, &spec, &store.instance_id(), &tokens);
             match sent {
                 Ok(()) => {
-                    store.note_heartbeat(None);
+                    store.note_heartbeat(&account, None);
                     // What the provider now holds. Recorded only on success:
                     // a beat that never arrived left the OLD tokens standing
                     // there, and remembering the new ones would count the
@@ -189,7 +197,7 @@ pub fn spawn(store: LinkHandle) {
                 // make a bad moment worse. The status carries the reason so the
                 // panel can say why it looks offline.
                 Err(e) => {
-                    store.note_heartbeat(Some(e));
+                    store.note_heartbeat(&account, Some(e));
                     // The next beat is on a new client, not one that has seen
                     // the trouble.
                     HTTP.start_afresh();
@@ -272,7 +280,8 @@ fn runs_scripts(probe: &EngineProbe) -> bool {
     matches!(probe, EngineProbe::Ready(id) if id.protocols.get("script") == Some(&1))
 }
 
-/// The capability tokens this beat declares.
+/// The capability tokens this beat declares, `languages` being the logic
+/// languages it says this desktop runs ([`declared_languages`]).
 ///
 /// Pure, so every state is pinned without a provider, an engine or a clock. A
 /// provider that names no capabilities field gets no tokens and no field: it is
@@ -280,6 +289,7 @@ fn runs_scripts(probe: &EngineProbe) -> bool {
 /// assertion it never asked for.
 pub fn capability_tokens(
     spec: &HeartbeatSpec,
+    languages: &[String],
     probe: Option<&EngineProbe>,
     host: &HealthSnapshot,
     prelude: PreludeState,
@@ -290,7 +300,7 @@ pub fn capability_tokens(
     }
     let mut tokens = Vec::new();
     if let Some(prefix) = &spec.language_capability_prefix {
-        for language in languages(probe) {
+        for language in languages {
             tokens.push(format!("{prefix}{language}"));
         }
     }
@@ -340,7 +350,7 @@ fn poll_prelude(
     }
 }
 
-/// The logic languages this desktop declares.
+/// The logic languages the CLI runs as flows.
 ///
 /// The probe's answer when there is one, because that is what the CLI actually
 /// runs and it is what gains a second language without a line changing here.
@@ -348,12 +358,9 @@ fn poll_prelude(
 /// this desktop cannot reach must not make it look like a build from before the
 /// vocabulary.
 ///
-/// A language is declared for the whole desktop: a provider that reads one
-/// here defers that language's flows AND its app scripts to this machine. The
-/// flow lane takes the first ([`logic_languages`]). The app-logic lane does not
-/// take the second: it asks for, and runs, JavaScript alone. So a CLI that
-/// reports another language must not ship before that lane can run it, or the
-/// app scripts in it are deferred here and run nowhere.
+/// Not yet what the beat declares ([`declared_languages`]): a language is
+/// declared for the whole desktop, and a provider that reads one defers that
+/// language's app scripts here as well as its flows.
 fn languages(probe: Option<&EngineProbe>) -> Vec<String> {
     let declared = match probe {
         Some(EngineProbe::Ready(id)) => id
@@ -371,16 +378,47 @@ fn languages(probe: Option<&EngineProbe>) -> Vec<String> {
     declared
 }
 
-/// The logic languages this desktop runs, for a lane that says them in its own
-/// requests as well as in the beat ([`languages`], from the same probe).
+/// The logic languages this desktop's beat declares: of those the CLI runs as
+/// flows ([`languages`]), the ones the app-logic lane runs too, where the
+/// provider has that lane (`app_logic`, [`super::app_logic::languages_run`]).
+///
+/// One list for the whole desktop, and the provider reads it for both kinds of
+/// work: a language named here has its flows AND its app scripts deferred to
+/// this machine, by the provider's browser, which then runs neither. A language
+/// only one lane runs is therefore not named: the CLI reporting Python for its
+/// flows, while the app-logic lane could not unfold a Python script, would have
+/// had the provider's Python app scripts deferred here to run nowhere. Left
+/// out, they are run by the provider's browser, with the Python flows (which
+/// the provider then hides from this desktop's requests too, since it counts a
+/// language only where the beat names it).
+///
+/// Never empty: [`ZIPP_ERA_LANGUAGE`] is the floor, as in [`languages`], and the
+/// app-logic lane always runs it.
+pub(crate) fn declared_languages(probe: Option<&EngineProbe>, app_logic: Option<&[String]>) -> Vec<String> {
+    let flows = languages(probe);
+    let Some(app_logic) = app_logic else {
+        return flows;
+    };
+    let both: Vec<String> = flows.into_iter().filter(|l| app_logic.contains(l)).collect();
+    if both.is_empty() {
+        return vec![ZIPP_ERA_LANGUAGE.to_string()];
+    }
+    both
+}
+
+/// The logic languages this desktop runs as flows, for the flow lane, which
+/// says them in its own requests as well as in the beat ([`languages`], from the
+/// same probe).
 ///
 /// A provider weighs the two against each other and a language counts only
 /// where both name it, so the request that names none is read as coming from a
 /// runtime with one language, whatever the beat said: the flow lane, whose
 /// graphs the CLI runs in every language it reports, says them on its queue,
-/// its claim and its graphs. The app-logic lane does NOT, on purpose: it runs
-/// each script it is handed as JavaScript, and a provider told of a second
-/// language would hand it scripts in that one.
+/// its claim and its graphs. Saying one the beat leaves out (one the app-logic
+/// lane does not run) is harmless: the provider counts it nowhere. The app-logic
+/// lane asks for the beat's own list instead
+/// ([`super::app_logic::languages_asked`]), because its provider hands over
+/// what that request names without weighing it against the beat.
 ///
 /// Held to what a request can carry: a short plain word each, and a handful of
 /// them. A provider refuses the whole request over one id it cannot read, and
@@ -598,12 +636,15 @@ mod tests {
         tokens_with(probe, host, PreludeState::NotRequired)
     }
 
+    /// The tokens of a beat that declares what the CLI runs as flows, as for a
+    /// provider with no app-logic lane to narrow it ([`declared_languages`] is
+    /// pinned on its own below).
     fn tokens_with(
         probe: Option<&EngineProbe>,
         host: &HealthSnapshot,
         prelude: PreludeState,
     ) -> Vec<String> {
-        capability_tokens(&spec(), probe, host, prelude, Instant::now())
+        capability_tokens(&spec(), &declared_languages(probe, None), probe, host, prelude, Instant::now())
     }
 
     #[test]
@@ -699,6 +740,47 @@ mod tests {
     }
 
     #[test]
+    fn a_language_only_the_flows_run_is_not_declared_for_the_whole_desktop() {
+        // The provider reads the beat's languages for flows AND app scripts. A CLI that runs Python flows, beside an
+        // app-logic lane that cannot unfold a Python script, had the provider's Python app scripts deferred here to
+        // run nowhere (its browser leaves a language the beat names to the desktop).
+        let python = EngineProbe::Ready(identity(&["javascript", "python"], &[("run", 1), ("script", 1)]));
+        let js_only = vec!["javascript".to_string()];
+        let both = vec!["javascript".to_string(), "python".to_string()];
+        assert_eq!(declared_languages(Some(&python), Some(&js_only)), ["javascript"]);
+        assert_eq!(declared_languages(Some(&python), Some(&both)), ["javascript", "python"]);
+        // A provider with no app-logic lane: what the CLI runs, as it was.
+        assert_eq!(declared_languages(Some(&python), None), ["javascript", "python"]);
+        // An app-logic lane that could unfold Python is no reason to declare it either: the provider would defer
+        // Python flows here that the CLI does not run.
+        assert_eq!(declared_languages(Some(&ready_probe()), Some(&both)), ["javascript"]);
+        // The floor stays, whatever the engine is doing.
+        assert_eq!(declared_languages(None, Some(&js_only)), [ZIPP_ERA_LANGUAGE]);
+        let odd = EngineProbe::Ready(identity(&["python"], &[("run", 1), ("script", 1)]));
+        assert_eq!(declared_languages(Some(&odd), Some(&js_only)), [ZIPP_ERA_LANGUAGE]);
+    }
+
+    #[test]
+    fn the_shipped_connector_declares_python_only_once_its_app_scripts_can_be_unfolded_too() {
+        // The beat as `spawn` makes it for FormLogic, whose app-logic lane runs a Python script through the
+        // `applogic` mode of the profile it serves: a CLI reporting Python flows is declared a Python desktop only
+        // while the profile held here defines that mode.
+        let lane = descriptor::builtin().remove(0).app_logic.expect("the shipped connector has an app-logic lane");
+        let python = EngineProbe::Ready(identity(&["javascript", "python"], &[("run", 1), ("script", 1)]));
+        let beat = |profile: Option<&serde_json::Value>| {
+            let app_logic = crate::link::app_logic::languages_run(&lane, profile);
+            let declared = declared_languages(Some(&python), Some(&app_logic));
+            capability_tokens(&spec(), &declared, Some(&python), &settled(Health::Ready), PreludeState::Held, Instant::now())
+        };
+        let without_python = vec!["logic-language:javascript".to_string(), "logic-engine:zipp".to_string()];
+        assert_eq!(beat(None), without_python, "no profile held");
+        let other_mode = serde_json::json!({ "python": { "modes": [{ "name": "flowModule" }] } });
+        assert_eq!(beat(Some(&other_mode)), without_python, "a profile without the app-logic mode");
+        let app_mode = serde_json::json!({ "python": { "modes": [{ "name": "flowModule" }, { "name": "applogic" }] } });
+        assert_eq!(beat(Some(&app_mode)), ["logic-language:javascript", "logic-language:python", "logic-engine:zipp"]);
+    }
+
+    #[test]
     fn a_provider_that_reads_no_capabilities_is_told_none() {
         // Not an empty list: a provider outside this vocabulary never asked,
         // and the field is left out of the body entirely.
@@ -706,7 +788,8 @@ mod tests {
         s.capabilities_field = None;
         s.language_capability_prefix = None;
         s.engine_capability = None;
-        assert!(capability_tokens(&s, Some(&ready_probe()), &settled(Health::Ready), PreludeState::Held, Instant::now()).is_empty());
+        let probe = ready_probe();
+        assert!(capability_tokens(&s, &declared_languages(Some(&probe), None), Some(&probe), &settled(Health::Ready), PreludeState::Held, Instant::now()).is_empty());
     }
 
 
@@ -736,10 +819,12 @@ mod tests {
 
     #[test]
     fn a_profile_does_not_make_this_desktop_claim_a_language_it_cannot_run() {
-        // The profile carries a Python contract with its modes. Nothing on this
-        // desktop unfolds one yet, so the languages come from the PROBE and
-        // from nowhere else — a token for python here would have the provider
-        // hand over work that has no runner (O1).
+        // The profile carries a Python contract with its modes. The app-logic
+        // lane unfolds a Python script through them, but a profile can only
+        // narrow what the beat declares (`declared_languages`), never widen it:
+        // the languages come from the PROBE — a token for python here, from a
+        // CLI that runs no Python flows, would have the provider hand over work
+        // that has no runner (O1).
         for state in [PreludeState::Held, PreludeState::NotRequired, PreludeState::Missing] {
             let out = tokens_with(Some(&ready_probe()), &settled(Health::Ready), state);
             assert!(

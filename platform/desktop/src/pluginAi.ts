@@ -1,4 +1,5 @@
 import { PluginCommandError } from './pluginRpc';
+import { windowFetch } from './windowKey';
 
 export interface PluginAiCompletionRequest {
   requestId: string;
@@ -114,7 +115,8 @@ export class PluginAiSession {
     // body from keeping the screen's promise and concurrency slot alive.
     const operation = (async () => {
       fence();
-      const response = await fetch(`${this.base}/${method}`, {
+      // (with the dashboard's own key, which the plugin's screen never sees: the request is made here, not in its frame)
+      const response = await windowFetch(`${this.base}/${method}`, {
         method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal,
       });

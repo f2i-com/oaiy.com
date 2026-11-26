@@ -449,14 +449,25 @@ fn serve_agent_http(root: Option<&Path>, uri_path: &str, fetch_site: Option<&str
 }
 
 /// What each embedded page knows from its first line: where the desktop is, a token for it, and the theme.
-/// The Agent's page also gets the secret its restore hand-over asks for (`backupToken`): no other page
-/// has it, and no route returns it.
+/// The Agent's page also gets the secret its restore hand-over asks for (`backupToken`) and the engines' gateway's key
+/// (`enginesKey`, `engines::gateway_key`), and the flow editor's the key of the browser service (`browserKey`,
+/// `services::registry::browser_service_key`: its `browser_*` nodes drive that service, which believes the page's
+/// `.localhost` origin on Windows only with it): no other page has any of them, and no route returns the first and the
+/// last (`GET /api/engines` says the engines' key to whoever may read the engines).
 ///
 /// Only the page at its own address is told: the script runs in whatever the webview loads, and a popup the page opens
 /// (a blob or a blank page of its own, let through by `on_new_window`) shares it but has no navigation guard, so a link
 /// followed there would hand the token to that site.
 fn desktop_script(theme: &str, page: Page) -> String {
-    let backup = if page == Page::Agent { format!(", backupToken: {:?}", crate::backup::agent::page_token()) } else { String::new() };
+    let backup = match page {
+        // (and the engines' gateway's key: on Windows the page's origin is `http://oaiy.localhost`, a name any web server
+        // on this computer's port 80 serves pages under, and the engines this desktop runs answer it only with this)
+        Page::Agent => format!(", backupToken: {:?}, enginesKey: {:?}", crate::backup::agent::page_token(), crate::engines::gateway_key()),
+        Page::Flows if !crate::services::registry::browser_service_key().is_empty() => {
+            format!(", browserKey: {:?}", crate::services::registry::browser_service_key())
+        }
+        _ => String::new(),
+    };
     let url = page.url();
     let own = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default()) + &url.port().map(|p| format!(":{p}")).unwrap_or_default();
     let app = match page {
@@ -1658,6 +1669,35 @@ mod tests {
         assert!(desktop_script("dark", Page::Agent).contains(&format!("backupToken: {secret:?}")), "the Agent's page has it");
         assert!(!desktop_script("dark", Page::Flows).contains("backupToken") && !desktop_script("dark", Page::Flows).contains(secret));
         assert!(!desktop_script("dark", Page::Engines).contains(secret));
+    }
+
+    /// The browser service's key is the flow editor's alone (its `browser_*` nodes call that service): the Agent's page
+    /// and the engines' are not given it, and it is the very key the service is started with.
+    #[test]
+    fn only_the_flow_editors_page_is_given_the_browser_services_key() {
+        let key = crate::services::registry::browser_service_key();
+        assert!(key.len() >= 32, "a real secret");
+        assert!(desktop_script("dark", Page::Flows).contains(&format!("browserKey: {key:?}")), "the flow editor's page has it");
+        for page in [Page::Agent, Page::Engines] {
+            let script = desktop_script("dark", page);
+            assert!(!script.contains("browserKey") && !script.contains(key), "{page:?}");
+        }
+        assert!(!desktop_script("dark", Page::Flows).contains(crate::backup::agent::page_token()));
+    }
+
+    /// The engines' gateway's key is the Agent's (its chat and its pictures go to the engines): the flow editor's page
+    /// and the engines' own are not given it.
+    #[test]
+    fn only_the_agents_page_is_given_the_engines_key() {
+        let key = crate::engines::gateway_key();
+        assert!(key.len() >= 32, "a real secret");
+        assert!(desktop_script("dark", Page::Agent).contains(&format!("enginesKey: {key:?}")), "the Agent's page has it");
+        for page in [Page::Flows, Page::Engines] {
+            let script = desktop_script("dark", page);
+            assert!(!script.contains("enginesKey") && !script.contains(key), "{page:?}");
+        }
+        assert_ne!(key, crate::services::registry::browser_service_key(), "a key of its own");
+        assert_ne!(key, crate::internal_token(), "not the desktop's own token");
     }
 
     #[test]

@@ -736,7 +736,9 @@ pub fn is_embedded_origin(origin: &str) -> bool {
 const UPDATE_STATUS_PATH: &str = "/api/update/status";
 
 fn is_allowed_origin(origin: &str) -> bool {
-    // Dev + locally-served oaiy-web (any loopback port).
+    // Dev + locally-served oaiy-web (any loopback port). (The old guard's rule, held to its frozen copy: on a release
+    // build the desktop believes only the loopback pages `LoopbackPages` says, and `tighten` answers any other as a
+    // website nobody trusts before this is asked.)
     if is_loopback_origin(origin) {
         return true;
     }
@@ -895,6 +897,10 @@ async fn engines_status() -> axum::response::Response {
         // (where the gateway is, as the engines say: the port they have, which is not their configuration's where another
         // program held that one; the Agent's page looks for OAIY here)
         "gatewayUrl": state.get("gateway_url"),
+        // (the key the gateway of the engines this desktop started asks of a page at one of this computer's own names: a
+        // restricted read, so OAIY's own pages, a page paired with the Agent's access and a token holder are told it, and
+        // no other website)
+        "gatewayKey": engines_gateway_key(),
         "llm": {
             "state": llm.get("state"),
             "resident": llm.get("resident"),
@@ -905,6 +911,19 @@ async fn engines_status() -> axum::response::Response {
         "gpus": system.get("gpus"),
     }))
     .into_response()
+}
+
+/// The key the engines' gateway asks of a page at one of this computer's own names, where the engines are this
+/// desktop's own (`engines::gateway_key_if_hosted`); none on the headless server, whose engines are another program's.
+fn engines_gateway_key() -> Option<&'static str> {
+    #[cfg(feature = "gui")]
+    {
+        crate::engines::gateway_key_if_hosted()
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        None
+    }
 }
 
 // ------- the engines' catalog and downloads, relayed -------
@@ -1393,6 +1412,9 @@ struct AuthConfig {
     /// production path for an untrusted-origin consumer like FormLogic Web. The
     /// guard checks it alongside the single configured `token`.
     pairing: Option<crate::bridge::PairingHandle>,
+    /// Which pages at this computer's loopback addresses are believed by their origin ([`LoopbackPages`], applied by
+    /// [`tighten`]; the old guard itself believes every one of them).
+    loopback: LoopbackPages,
 }
 
 impl AuthConfig {
@@ -1558,7 +1580,9 @@ async fn origin_guard(
 pub(crate) struct PublicView;
 
 /// Marks a request from the desktop's own window (its webview's origin, which a web page cannot send, on a desktop
-/// with a window): the person at this computer, whose flow runs are theirs (`bridge::routes::create_run`).
+/// with a window; on Windows, where a page on this computer's port 80 can send it, that origin with the token the
+/// window was handed: [`is_name_only_origin`]): the person at this computer, whose flow runs are theirs
+/// (`bridge::routes::create_run`).
 #[derive(Clone, Copy)]
 pub(crate) struct OwnWindow;
 
@@ -1627,6 +1651,136 @@ fn is_impostor_origin(origin: &str) -> bool {
     false
 }
 
+/// One of OAIY's own pages' origins in the form Windows gives it: WebView2 serves a custom scheme as
+/// `http(s)://<scheme>.localhost`, so there the dashboard is `http://tauri.localhost`, the Agent `http://oaiy.localhost`
+/// and the flow editor `http://oaiyflows.localhost`.
+///
+/// Such an origin is a name, and no proof of who holds it: every browser resolves `*.localhost` to this computer, so a
+/// page served by whatever program listens on its port 80 or 443 (a development web server, serving something another
+/// site had a hand in) and opened as `http://oaiy.localhost/...` in the person's ordinary browser has exactly this
+/// origin. A custom-scheme origin (`oaiy://localhost`, a Mac's and Linux's) is not one of these: no browser page can
+/// have it. The windows that are OAIY's own say so with the token they were handed ([`tighten`]).
+pub(crate) fn is_name_only_origin(origin: &str) -> bool {
+    ["oaiy", "oaiyflows", "tauri"].iter().any(|s| origin == format!("http://{s}.localhost") || origin == format!("https://{s}.localhost"))
+}
+
+/// What a request with such an origin and no token is told, where it is refused ([`tighten`]).
+const NAME_ONLY_REFUSAL: &str = "origin not allowed without the token OAIY gives its own windows";
+
+/// The variable that names the development servers a release build believes ([`LoopbackPages`]).
+pub(crate) const DEV_ORIGINS_ENV: &str = "OAIY_DEV_ORIGINS";
+
+/// Which pages at this computer's loopback addresses the desktop believes by their origin: `http://` or `https://` with
+/// `localhost`, `127.0.0.1` or `[::1]`, on any port, which the old guard's broad allow-list takes ([`is_allowed_origin`])
+/// and [`tighten`] holds to this.
+///
+/// Such an origin is a port, and no proof of who holds it: whatever program listens on one (a development server
+/// running a package somebody else wrote, a local wiki or notebook that shows other people's pages) serves its pages
+/// under it, to the person's ordinary browser. A debug build is a developer's, whose development servers are such pages
+/// (the dashboard's on 17973, the flow editor's, the Agent's on 5317), and believes every one of them, as it always did.
+/// A release build believes three kinds alone, and answers any other exactly as it answers a website nobody trusts:
+/// - a page OAIY serves itself, while it serves it: the Agent's, from its own port on a Mac and Linux, while this
+///   desktop holds the port ([`agent_http_origin`]);
+/// - an origin the person named in `OAIY_DEV_ORIGINS` to let a development server in (exact origins, comma-separated:
+///   `http://localhost:5173,http://127.0.0.1:5317`): believed as every loopback page was before, which is the broad
+///   allow-list's trust (restricted reads, and the changes that are not privileged), never the privileged routes';
+/// - the linked provider's, where it is at such an address ([`crate::link::linked_origin`]): the person linked it.
+///
+/// A page that presents a token is judged by the token, wherever it is: the owner's, or a paired app's that reaches the
+/// route from the origin it was granted to. A request with no `Origin` is not a page's, and is not asked about here.
+#[derive(Clone)]
+pub(crate) struct LoopbackPages {
+    /// Every one: a debug build's.
+    every: bool,
+    /// The origins `OAIY_DEV_ORIGINS` names, as a browser writes them.
+    dev: Arc<[String]>,
+    /// The loopback origin of the page OAIY serves itself now, if any.
+    served: fn() -> Option<&'static str>,
+}
+
+impl LoopbackPages {
+    /// What this build believes, `OAIY_DEV_ORIGINS` read from `env`.
+    pub(crate) fn of_this_build(env: &dyn Fn(&str) -> Option<String>) -> Self {
+        Self::of_build(cfg!(debug_assertions), env)
+    }
+
+    /// What a debug build (`debug`) or a release build believes.
+    fn of_build(debug: bool, env: &dyn Fn(&str) -> Option<String>) -> Self {
+        let (dev, _) = parse_dev_origins(env(DEV_ORIGINS_ENV).as_deref().unwrap_or(""));
+        LoopbackPages { every: debug, dev: dev.into(), served: agent_http_origin }
+    }
+
+    /// A release build's, for the tests: the development servers `dev` names, and `served` for the page OAIY serves.
+    #[cfg(test)]
+    pub(crate) fn release(dev: &[&str], served: fn() -> Option<&'static str>) -> Self {
+        LoopbackPages { every: false, dev: dev.iter().map(|d| d.to_string()).collect::<Vec<_>>().into(), served }
+    }
+
+    /// This build's, with no `OAIY_DEV_ORIGINS`: what the tests' listeners have unless a test says otherwise.
+    #[cfg(test)]
+    pub(crate) fn as_built() -> Self {
+        Self::of_this_build(&|_| None)
+    }
+
+    /// A debug build's (`debug`) or a release build's, with no `OAIY_DEV_ORIGINS`, whichever this test is built as.
+    #[cfg(test)]
+    pub(crate) fn of_build_for_tests(debug: bool) -> Self {
+        Self::of_build(debug, &|_| None)
+    }
+
+    /// Whether a page at `origin`, one of this computer's loopback addresses, is believed by its origin.
+    fn believes(&self, origin: &str) -> bool {
+        self.every
+            || (self.served)() == Some(origin)
+            || self.dev.iter().any(|d| d == origin)
+            || crate::link::linked_origin().is_some_and(|linked| linked == origin)
+    }
+}
+
+/// This process's [`LoopbackPages`]: this build's, with `OAIY_DEV_ORIGINS` as the process was started with. What the
+/// listener believes ([`serve`]) and what the engines' gateway the desktop runs believes without its key
+/// ([`believed_loopback_page`]).
+fn this_process_loopback_pages() -> &'static LoopbackPages {
+    static PAGES: std::sync::OnceLock<LoopbackPages> = std::sync::OnceLock::new();
+    PAGES.get_or_init(|| LoopbackPages::of_this_build(&|name| std::env::var(name).ok()))
+}
+
+/// Whether a page at `origin` is one of this computer's loopback addresses' that this build believes by its origin
+/// ([`LoopbackPages`]): the engines' gateway the desktop runs answers such a page without the key it gives the Agent too
+/// (`engines::host_pages`). A name under `localhost` (`http://oaiy.localhost`) is no loopback address, and is not one.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn believed_loopback_page(origin: &str) -> bool {
+    is_loopback_origin(origin) && this_process_loopback_pages().believes(origin)
+}
+
+/// The origins `OAIY_DEV_ORIGINS` names (`raw`: comma-separated), each as a browser writes it, and the entries that are
+/// not the origin of a page at one of this computer's loopback addresses: those are left out, for the variable lets a
+/// development server on this computer in and nothing else (it never widens what a website elsewhere is trusted with).
+fn parse_dev_origins(raw: &str) -> (Vec<String>, Vec<String>) {
+    let (mut kept, mut ignored) = (Vec::new(), Vec::new());
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match dev_origin(entry) {
+            Some(origin) if !kept.contains(&origin) => kept.push(origin),
+            Some(_) => {}
+            None => ignored.push(entry.chars().take(80).collect()),
+        }
+    }
+    (kept, ignored)
+}
+
+/// `entry` as the `Origin` a browser sends for a page there, when it is an `http://` or `https://` address of one of this
+/// computer's loopback addresses with nothing after its port: the scheme and the host in lower case, and the port only
+/// where it is not the scheme's own (`http://LocalHost:5173/` is `http://localhost:5173`).
+fn dev_origin(entry: &str) -> Option<String> {
+    let url = url::Url::parse(entry).ok()?;
+    let bare = url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() && url.path() == "/";
+    if !matches!(url.scheme(), "http" | "https") || !bare {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    is_loopback_origin(&origin).then_some(origin)
+}
+
 /// Whether a paired app's token reaches this request: the route's row in the access table (`auth/routes.rs`) is open, or
 /// names a scope the grant holds ([`crate::bridge::pairing::PairingAccess::reaches`]). A route with no row, or one for a
 /// login, the console or the desk, is no paired app's.
@@ -1661,6 +1815,16 @@ pub(super) fn paired_reaches(access: crate::bridge::pairing::PairingAccess, req:
 ///   `GET /api/services` is marked for the [`PublicView`].
 /// - A caller of `GET /api/bridge/capabilities` with neither a token nor a trusted origin is marked for the [`PublicView`].
 /// - A request from the desktop's own window is marked [`OwnWindow`].
+/// - On the desktop, an origin that is one of OAIY's own pages' by name only ([`is_name_only_origin`]: the form Windows
+///   gives them, which a page served from this computer's port 80 has too) is OAIY's own only with the owner's token,
+///   which the desktop hands each of its windows and nobody else. Without it (and without a paired token that reaches
+///   the route) the request is another website's: it changes nothing, reads no restricted or export read, sees the
+///   [`PublicView`] of the services and of discovery, and is not the [`OwnWindow`]. (A request to pair is let through
+///   here as any website's is, and refused by the route itself under these names: `bridge::routes::create_pairing`.)
+/// - On the desktop, a page at one of this computer's loopback addresses that the build does not believe
+///   ([`LoopbackPages`]: on a release build, any but a page OAIY serves itself, a development server the person named in
+///   `OAIY_DEV_ORIGINS` and the linked provider), with no token that is the owner's and none of a paired app's that
+///   reaches the route, is another website too, and is answered exactly as one is, in the same words.
 fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::response::Response> {
     let refuse = || (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "origin not allowed" }))).into_response();
     let m = req.method().clone();
@@ -1693,16 +1857,48 @@ fn tighten(auth: &AuthConfig, mut req: Request) -> Result<Request, axum::respons
             }
         }
     }
-    if auth.gui_mode && origin.as_deref().is_some_and(is_own_window_origin) {
+    // An own page's origin that anything on this computer's port 80 could have, on a request that does not say whose it
+    // is: with the owner's token it is OAIY's window, and without it another website (which a paired one may be).
+    let named = origin.as_deref().is_some_and(is_name_only_origin);
+    let name_only = auth.gui_mode && named && !owner && !paired;
+    // A page at a port of this computer's that whatever program listens on it serves, on a request that does not say
+    // whose it is: the old guard believes every such page (a debug build's development servers); this build believes the
+    // ones `LoopbackPages` says, and the others are another website.
+    let stray = auth.gui_mode && !owner && !paired && origin.as_deref().is_some_and(|o| is_loopback_origin(o) && !auth.loopback.believes(o));
+    if auth.gui_mode && origin.as_deref().is_some_and(is_own_window_origin) && (owner || !named) {
         req.extensions_mut().insert(OwnWindow);
     }
-    let trusted = origin.as_deref().is_some_and(is_allowed_origin);
+    let trusted = !name_only && !stray && origin.as_deref().is_some_and(is_allowed_origin);
     // Before the step below: a headless server answers discovery to anyone too, and it has no trusted origin to go by.
     if read && path == "/api/bridge/capabilities" && !owner && !paired && !(auth.gui_mode && trusted) {
         req.extensions_mut().insert(PublicView);
     }
     if !auth.gui_mode || owner || paired {
         return Ok(req);
+    }
+    // What the old guard lets an origin it trusts do, it lets these names and these pages do, and it is held to its frozen
+    // copy: so what it refuses a website that is not OAIY's is refused here. Every change (asking to pair is discovery,
+    // and the route's own to refuse), the restricted reads, the exports, on the desktop the update's status, and the reads
+    // the steps below keep for a trusted origin (it is not one: they would refuse it too, in the words of any other
+    // refusal).
+    if (name_only || stray) && !discovery {
+        let changes = matches!(m, Method::POST | Method::PUT | Method::PATCH | Method::DELETE);
+        let kept = read
+            && (is_export_path(&path)
+                || is_restricted_read_path(&path)
+                || path == UPDATE_STATUS_PATH
+                || is_page_gated_read_path(&path)
+                || path.starts_with("/api/bridge/flows/")
+                || is_plugin_screen_file(&path));
+        if (changes || kept) && stray {
+            // (in the words any other website is refused in: a page OAIY does not serve is told nothing more)
+            return Err(refuse());
+        }
+        if changes || kept {
+            // (said apart from the other refusals, so that a window of OAIY's own that left its token off a request
+            // can be told from a stranger by whoever reads the answer; it tells a stranger nothing it can use)
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": NAME_ONLY_REFUSAL }))).into_response());
+        }
     }
     if read && is_page_gated_read_path(&path) && from_a_page(&req) && !trusted {
         return Err(refuse());
@@ -2164,10 +2360,23 @@ pub async fn serve(
     // Inside the unchanged access/CORS guards, so qualification never grants
     // an otherwise unauthorized caller access to plugin installation or commands.
     let app = if isolated { app.layer(middleware::from_fn(crate::isolated_policy::guard)) } else { app };
+    // Which pages on this computer's loopback addresses the desktop's window believes (`LoopbackPages`): said once, with
+    // the development servers the person let in.
+    let env = |name: &str| std::env::var(name).ok();
+    let loopback = this_process_loopback_pages().clone();
+    if gui_mode && !bind_all && !cfg!(debug_assertions) {
+        let (dev, ignored) = parse_dev_origins(&env(DEV_ORIGINS_ENV).unwrap_or_default());
+        for entry in ignored {
+            log::warn!("{DEV_ORIGINS_ENV}: {entry:?} is not the origin of a page on this computer (http://localhost:<port>, http://127.0.0.1:<port> or http://[::1]:<port>, nothing after the port): ignored");
+        }
+        if !dev.is_empty() {
+            log::info!("{DEV_ORIGINS_ENV}: the pages at {} are believed by their origin, as a development server's", dev.join(", "));
+        }
+    }
     let access_state = AccessState {
         // A network listener must never trust a forgeable Origin, even
         // when launched by the GUI. Its clients must present a credential.
-        legacy: AuthConfig { token: auth_token, gui_mode: gui_mode && !bind_all, pairing: Some(pairing_for_auth) },
+        legacy: AuthConfig { token: auth_token, gui_mode: gui_mode && !bind_all, pairing: Some(pairing_for_auth), loopback },
         guard: guard.clone(),
     };
     let app = if access.mode.is_enforcing() {
@@ -2265,14 +2474,22 @@ pub(crate) fn cors_layer() -> CorsLayer {
 /// tests of other modules (the control tools' in-process calls go through it).
 #[cfg(test)]
 pub(crate) fn guarded_for_tests(router: Router, token: Option<String>, gui_mode: bool) -> Router {
-    router.layer(middleware::from_fn_with_state(AuthConfig { token, gui_mode, pairing: None }, origin_guard))
+    router.layer(middleware::from_fn_with_state(AuthConfig { token, gui_mode, pairing: None, loopback: LoopbackPages::as_built() }, origin_guard))
 }
 
 /// [`guarded_for_tests`] with [`tighten`] in front, as the listener has it in `legacy` mode (what marks [`OwnWindow`]).
 #[cfg(test)]
 pub(crate) fn tightened_for_tests(router: Router, token: Option<String>, gui_mode: bool) -> Router {
-    let auth = AuthConfig { token, gui_mode, pairing: None };
+    let auth = AuthConfig { token, gui_mode, pairing: None, loopback: LoopbackPages::as_built() };
     router.layer(middleware::from_fn_with_state(auth.clone(), origin_guard)).layer(middleware::from_fn_with_state(auth, tightened))
+}
+
+/// For tests: the `Authorization` each of OAIY's own windows sends, the token the desktop handed it (`window_token`
+/// for the dashboard, `embed::desktop_script` for the Agent and the flow editor: this process's own in `legacy` mode).
+#[cfg(test)]
+pub(crate) fn own_window_bearer_for_tests() -> &'static str {
+    static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BEARER.get_or_init(|| format!("Bearer {}", crate::internal_token()))
 }
 
 /// A frozen copy of the guard as it was before the access model, and the differential test that holds the live
@@ -2325,7 +2542,7 @@ mod tests {
             let app = Router::new()
                 .fallback(any(|| async { "allowed" }))
                 .layer(middleware::from_fn_with_state(
-                    AuthConfig { token, gui_mode: false, pairing: None },
+                    AuthConfig { token, gui_mode: false, pairing: None, loopback: super::LoopbackPages::as_built() },
                     super::origin_guard,
                 ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2672,6 +2889,10 @@ mod tests {
                     "{verb} is sent by {files:?} but the layer allows only {allowed:?}: the browser refuses the request after the preflight"
                 );
                 assert!(response.headers().get("access-control-allow-origin").is_some(), "{origin}");
+                // Every request of OAIY's own windows carries `Authorization` (on Windows the API believes their origin
+                // only with it): a preflight that did not allow the header would stop each of them in the browser.
+                let headers = response.headers().get("access-control-allow-headers").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+                assert!(headers.split(',').any(|h| h.trim() == "authorization"), "{verb} from {origin}: the preflight allows {headers:?}");
             }
         }
     }
@@ -2857,7 +3078,7 @@ mod tests {
         use axum::{body::Body, http::Request, middleware, routing::any, Router};
         use tower::ServiceExt;
         let app = Router::new().fallback(any(|| async { "called" })).layer(middleware::from_fn_with_state(
-            AuthConfig { token:Some("test-owner".into()), gui_mode:true, pairing:None }, super::origin_guard));
+            AuthConfig { token:Some("test-owner".into()), gui_mode:true, pairing:None, loopback: super::LoopbackPages::as_built() }, super::origin_guard));
         for (method,path) in [("POST","/api/plugins/%70robe/ai/complete"),("POST","/api/plugins/probe/ai/cancel"),
             ("GET","/api/plugins/%70robe/ai/sources"),("HEAD","/api/plugins/probe/ai/sources"),
             ("GET","/api/plugins/%70robe/voice/status"),("HEAD","/api/plugins/probe/voice/status"),
@@ -2891,7 +3112,7 @@ mod tests {
             let id = m.request("formlogic", None, None).pairing_id;
             m.approve(&id).unwrap().token.unwrap()
         };
-        let auth = AuthConfig { token: None, gui_mode: false, pairing: Some(mgr) };
+        let auth = AuthConfig { token: None, gui_mode: false, pairing: Some(mgr), loopback: super::LoopbackPages::as_built() };
         assert!(auth.token_matches(&token), "a paired token authenticates");
         assert!(!auth.token_matches("oaiypat_wrong"), "a non-granted token does not");
         // And a configured token still works alongside pairing.
@@ -2899,6 +3120,7 @@ mod tests {
             token: Some("cfg".into()),
             gui_mode: false,
             pairing: Some(std::sync::Arc::new(std::sync::Mutex::new(PairingManager::new()))),
+            loopback: super::LoopbackPages::as_built(),
         };
         assert!(auth2.token_matches("cfg"));
         assert!(!auth2.token_matches("nope"));
@@ -3043,7 +3265,14 @@ mod tests {
     #[tokio::test]
     async fn a_stranger_cannot_reach_the_backup_routes_and_the_agents_page_can() {
         let dir = crate::secret_file::testing::TempDir::new("backup-guard");
-        let app = super::guarded_for_tests(crate::backup::routes::router(dir.0.clone()), Some("desk-token".into()), true);
+        let app = super::tightened_for_tests(crate::backup::routes::router(dir.0.clone()), Some("desk-token".into()), true);
+        // The Agent's page and the dashboard, as they ask on this system: by their origin, and on Windows (where the origin
+        // is a name a page on this computer's port 80 has too) with the token the desktop handed them.
+        let (agent, dashboard) = if cfg!(windows) { ("http://oaiy.localhost", "http://tauri.localhost") } else { ("oaiy://localhost", "tauri://localhost") };
+        let own = |request: reqwest::RequestBuilder, origin: &str| {
+            let request = request.header("Origin", origin);
+            if cfg!(windows) { request.header("Authorization", super::own_window_bearer_for_tests()) } else { request }
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3062,13 +3291,21 @@ mod tests {
             assert_eq!(status.send().await.unwrap().status(), 403, "GET status {origin:?}");
         }
         // The Agent's page (its own scheme) passes the gate; the session does not exist, so the answer is the route's own.
-        let own = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).header("Origin", "http://oaiy.localhost").body("x").send().await.unwrap();
-        assert_eq!(own.status(), 404);
+        let part = own(client.post(format!("{base}/api/backup/agent/abc/part?seq=0")), agent).body("x").send().await.unwrap();
+        assert_eq!(part.status(), 404);
         // ... but the description of an import needs the secret the desktop gave the Agent's window as well: the origin alone gets 403.
-        let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").send().await.unwrap();
+        let import = own(client.get(format!("{base}/api/backup/agent-import")), agent).send().await.unwrap();
         assert_eq!(import.status(), 403, "an origin is not enough");
-        let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").header("X-Backup-Token", crate::backup::agent::page_token()).send().await.unwrap();
+        let import = own(client.get(format!("{base}/api/backup/agent-import")), agent).header("X-Backup-Token", crate::backup::agent::page_token()).send().await.unwrap();
         assert_eq!(import.status(), 200);
+        if cfg!(windows) {
+            // The Agent's name with the import's secret and without the window's token: a page on this computer's port 80
+            // has the name, and is stopped at the gate whatever else it sends.
+            let named = client.get(format!("{base}/api/backup/agent-import")).header("Origin", agent).header("X-Backup-Token", crate::backup::agent::page_token()).send().await.unwrap();
+            assert_eq!(named.status(), 403, "the name alone");
+            let named = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).header("Origin", agent).body("x").send().await.unwrap();
+            assert_eq!(named.status(), 403, "the name alone");
+        }
         // A paired or configured token, and the linked provider's own site, pass the guard but are not the Agent's page.
         let token_only = client.get(format!("{base}/api/backup/agent-import")).bearer_auth("desk-token").send().await.unwrap();
         assert_eq!(token_only.status(), 403, "a token with no origin");
@@ -3077,7 +3314,7 @@ mod tests {
         let provider = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "https://oaiy.com").send().await.unwrap();
         assert_eq!(provider.status(), 403, "the provider's site");
         // The dashboard reads the status.
-        let status = client.get(format!("{base}/api/backup/status")).header("Origin", "http://tauri.localhost").send().await.unwrap();
+        let status = own(client.get(format!("{base}/api/backup/status")), dashboard).send().await.unwrap();
         assert_eq!(status.status(), 200);
         // A token holder gets in too.
         let token = client.get(format!("{base}/api/backup/status")).bearer_auth("desk-token").send().await.unwrap();
@@ -3087,13 +3324,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_mcp_endpoint_is_closed_to_a_stranger_and_open_to_the_token() {
-        use axum::{middleware, routing::post, Router};
-        let app = Router::new()
-            .route("/api/mcp", post(|| async { "answered" }))
-            .layer(middleware::from_fn_with_state(
-                AuthConfig { token: Some("desk-token".into()), gui_mode: true, pairing: None },
-                super::origin_guard,
-            ));
+        use axum::{routing::post, Router};
+        let app = super::tightened_for_tests(Router::new().route("/api/mcp", post(|| async { "answered" })), Some("desk-token".into()), true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3109,12 +3341,76 @@ mod tests {
             let status = request.send().await.unwrap().status();
             assert_eq!(status, 403, "{origin:?}");
         }
-        // The Agent's page (its own scheme) and a token holder get in.
-        let own = client.post(format!("{base}/api/mcp")).header("Origin", "http://oaiy.localhost").body("{}").send().await.unwrap();
+        // The Agent's page (its own scheme; on Windows, where that is a name a page on this computer's port 80 has too, with
+        // the token the desktop handed it) and a token holder get in.
+        let own = if cfg!(windows) {
+            let named = client.post(format!("{base}/api/mcp")).header("Origin", "http://oaiy.localhost").body("{}").send().await.unwrap();
+            assert_eq!(named.status(), 403, "the name alone");
+            client.post(format!("{base}/api/mcp")).header("Origin", "http://oaiy.localhost").header("Authorization", super::own_window_bearer_for_tests())
+        } else {
+            client.post(format!("{base}/api/mcp")).header("Origin", "oaiy://localhost")
+        };
+        let own = own.body("{}").send().await.unwrap();
         assert_eq!(own.status(), 200);
         let token = client.post(format!("{base}/api/mcp")).bearer_auth("desk-token").body("{}").send().await.unwrap();
         assert_eq!(token.status(), 200);
         server.abort();
+    }
+
+    /// The dashboard's own sources (`platform/desktop/src`, tests left out), by file name.
+    fn dashboard_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("src");
+        let mut files: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("the dashboard's sources")
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let source = (name.ends_with(".ts") || name.ends_with(".tsx")) && !name.contains(".test.") && !name.contains(".testTransport.") && !name.ends_with(".d.ts");
+                source.then(|| (name, std::fs::read_to_string(entry.path()).unwrap_or_default()))
+            })
+            .collect();
+        files.sort();
+        assert!(files.len() > 60, "the dashboard's sources were not found in {dir:?}: {} files", files.len());
+        files
+    }
+
+    /// On Windows the dashboard's origin is a name a page on this computer's port 80 has too, so this API answers it as
+    /// OAIY's window only with the window's key ([`super::tighten`]). The dashboard therefore asks this API through one
+    /// `fetch` and no other: `windowFetch` (`windowKey.ts`), which adds the key. Read from its sources at test time, so a
+    /// request added to a page later, by a `fetch` of its own or by something no header can go with, fails here and not
+    /// as a page that shows nothing on Windows.
+    #[test]
+    fn every_request_the_dashboard_makes_to_this_api_goes_with_its_windows_key() {
+        let call = regex::Regex::new(r"(?:^|[^A-Za-z0-9_$.])fetch\s*\(").unwrap();
+        let headerless = regex::Regex::new(r"\b(?:EventSource|WebSocket|XMLHttpRequest|sendBeacon)\b").unwrap();
+        let mut keyed = 0;
+        for (name, text) in dashboard_sources() {
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
+                    continue;
+                }
+                if name != "windowKey.ts" {
+                    keyed += line.matches("windowFetch(").count();
+                    // (the one other `fetch`: the dashboard's own fonts, from the page's own address, for a plugin's screen)
+                    let own_fonts = name == "PluginScreenPage.tsx" && line.contains("fetch(`/fonts/");
+                    assert!(!call.is_match(line) || own_fonts, "{name}:{}: a request that does not go through windowFetch: {}", n + 1, line.trim());
+                }
+                assert!(!headerless.is_match(line), "{name}:{}: a request no key can go with: {}", n + 1, line.trim());
+            }
+        }
+        // The JSON requests of every page (one `request`), the modules, a voice heard, the contacts' file, a run's picture,
+        // health, a plugin screen's files and its two bounded sessions.
+        assert!(keyed >= 9, "{keyed} requests through windowFetch");
+
+        // The page's half of the key: it knows the refusal by the words this guard says it in, asks the desktop's command
+        // for the key, and keeps it nowhere but in memory.
+        let (_, key) = dashboard_sources().into_iter().find(|(name, _)| name == "windowKey.ts").expect("windowKey.ts");
+        assert!(key.contains(&format!("'{}'", super::NAME_ONLY_REFUSAL)), "windowKey.ts and this guard say the refusal in the same words");
+        assert!(key.contains("invoke('window_token'"), "it asks the command that hands the key over");
+        for kept in ["localStorage", "sessionStorage", "indexedDB", "document.cookie", "console.", "postMessage", "searchParams", "location."] {
+            assert!(!key.contains(kept), "windowKey.ts must not use {kept}: the key is kept in memory and goes in one header");
+        }
     }
 
     /// A stand-in for the engines' control port: their catalog with one model
@@ -3263,7 +3559,7 @@ mod tests {
 /// The step the old guard was tightened by after the third review ([`tighten`]), through the listener's own guard.
 #[cfg(test)]
 mod tightened_tests {
-    use super::{access_guard, AccessState, AuthConfig, PublicView};
+    use super::{access_guard, AccessState, AuthConfig, LoopbackPages, OwnWindow, PublicView};
     use crate::bridge::pairing::{PairingAccess, PairingManager};
     use axum::body::Body;
     use axum::http::Request;
@@ -3277,10 +3573,21 @@ mod tightened_tests {
     }
 
     fn router(pairing: crate::bridge::PairingHandle) -> Router {
+        router_with(None, pairing)
+    }
+
+    /// The desktop's listener, with the token an install set for its CLI (`token`) or with none.
+    fn router_with(token: Option<&str>, pairing: crate::bridge::PairingHandle) -> Router {
+        router_believing(token, pairing, LoopbackPages::as_built())
+    }
+
+    /// [`router_with`], believing the pages at this computer's loopback addresses that `loopback` says.
+    fn router_believing(token: Option<&str>, pairing: crate::bridge::PairingHandle, loopback: LoopbackPages) -> Router {
         let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
-        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &|_| None)
+        let token = token.map(str::to_owned);
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, token.clone(), &|_| None)
             .expect("a legacy guard");
-        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(pairing) }, guard };
+        let state = AccessState { legacy: AuthConfig { token, gui_mode: true, pairing: Some(pairing), loopback }, guard };
         Router::new()
             .route("/api/health", get(ok))
             .route("/api/models", get(ok))
@@ -3302,6 +3609,14 @@ mod tightened_tests {
             .route("/api/network/settings", put(ok))
             .route("/api/voice/calls", get(ok))
             .route("/api/mcp", post(ok))
+            .route("/api/config", get(ok))
+            .route("/api/update/status", get(ok))
+            .route("/api/services/:id/start", post(ok))
+            .route("/api/services/:id/export", get(ok))
+            .route(
+                "/api/bridge/runs",
+                post(|own: Option<Extension<OwnWindow>>| async move { if own.is_some() { "the window" } else { "a caller" } }),
+            )
             .layer(middleware::from_fn_with_state(state, access_guard))
     }
 
@@ -3328,6 +3643,17 @@ mod tightened_tests {
 
     const OWN: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
 
+    /// What one of OAIY's own windows sends from `origin`: the origin, and where that origin is only a name (the form
+    /// Windows gives it) the token the desktop handed the window. A Mac's and Linux's custom-scheme origin goes bare, as
+    /// it always did: no browser page can send it.
+    fn window(origin: &'static str) -> Vec<(&'static str, &'static str)> {
+        let mut headers = vec![("origin", origin)];
+        if super::is_name_only_origin(origin) {
+            headers.push(("authorization", super::own_window_bearer_for_tests()));
+        }
+        headers
+    }
+
     #[tokio::test]
     async fn the_reads_with_paths_in_them_are_not_for_a_web_page() {
         let app = router(pairing());
@@ -3336,7 +3662,7 @@ mod tightened_tests {
             // A page served from this computer sends no Origin on a same-origin GET, but its browser says where it is.
             // (One on a name rebound to this computer is sent no such header: its `Host` turns it away, below.)
             assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "same-origin")]).await.0, 403, "{path}: a page of this port");
-            assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await.0, 200, "{path}: the dashboard");
+            assert_eq!(ask(&app, "GET", path, &window(OWN)).await.0, 200, "{path}: the dashboard");
             assert_eq!(ask(&app, "GET", path, &[]).await.0, 200, "{path}: the CLI, which sends neither");
             assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "none")]).await.0, 200, "{path}: the person opening it");
         }
@@ -3381,7 +3707,8 @@ mod tightened_tests {
                 assert_eq!(ask_over_a_socket(&app, "GET", path, &[("host", name)]).await.0, 200, "{path} asked as {name}");
             }
             assert_eq!(ask_over_a_socket(&app, "GET", "/api/services", &[("host", name)]).await, (200, "full".into()), "{name}: the CLI");
-            assert_eq!(ask_over_a_socket(&app, "GET", "/api/models", &[("host", name), ("origin", OWN)]).await.0, 200, "{name}: the dashboard");
+            let dashboard = [vec![("host", name)], window(OWN)].concat();
+            assert_eq!(ask_over_a_socket(&app, "GET", "/api/models", &dashboard).await.0, 200, "{name}: the dashboard");
             assert_eq!(ask_over_a_socket(&app, "GET", "/api/models", &[("host", name), ("origin", "https://evil.example")]).await.0, 403, "{name}: another site, as before");
         }
         // A probe is answered whatever it calls this computer, as the new guard answers it.
@@ -3398,7 +3725,7 @@ mod tightened_tests {
         // `OAIY_ALLOWED_HOSTS`: the names the new guard answers to on every install, a desktop too.
         let named = |name: &str| (name == "OAIY_ALLOWED_HOSTS").then(|| "desk.internal:17972".to_string());
         let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &named).expect("a legacy guard");
-        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(pairing()) }, guard };
+        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(pairing()), loopback: LoopbackPages::as_built() }, guard };
         let desktop = routes().layer(middleware::from_fn_with_state(state, access_guard));
         assert_eq!(ask_over_a_socket(&desktop, "GET", "/api/models", &[("host", "desk.internal:17972")]).await.0, 200);
         assert_eq!(ask_over_a_socket(&desktop, "GET", "/api/models", &[("host", "desk.internal:8080")]).await.0, 421, "the name with its port, as it was given");
@@ -3407,7 +3734,7 @@ mod tightened_tests {
         // A headless server on this computer may be reached through a proxy beside it, by whatever name that has, and
         // it believes its token alone: a missing header opens nothing there, so a rebound page reads nothing.
         let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, false, Some("the-token".into()), &|_| None).expect("a legacy guard");
-        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()) }, guard };
+        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()), loopback: LoopbackPages::as_built() }, guard };
         let headless = routes().layer(middleware::from_fn_with_state(state, access_guard));
         for name in ["192.168.1.50:17972", "oaiy.example.com", "127.0.0.1:17972"] {
             assert_eq!(ask_over_a_socket(&headless, "GET", "/api/models", &[("host", name), ("authorization", "Bearer the-token")]).await.0, 200, "{name}");
@@ -3420,8 +3747,8 @@ mod tightened_tests {
         let app = router(pairing());
         assert_eq!(ask(&app, "GET", "/api/services", &[("origin", "https://evil.example")]).await, (200, "public".into()));
         assert_eq!(ask(&app, "GET", "/api/services", &[("sec-fetch-site", "cross-site")]).await, (200, "public".into()));
-        for headers in [&[("origin", OWN)][..], &[("origin", "https://oaiy.com")], &[]] {
-            assert_eq!(ask(&app, "GET", "/api/services", headers).await, (200, "full".into()), "{headers:?}");
+        for headers in [window(OWN), vec![("origin", "https://oaiy.com")], vec![]] {
+            assert_eq!(ask(&app, "GET", "/api/services", &headers).await, (200, "full".into()), "{headers:?}");
         }
     }
 
@@ -3436,7 +3763,7 @@ mod tightened_tests {
         let path = "/api/plugins/demo/ui/main/ui/app.js";
         assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await.0, 403, "another site");
         assert_eq!(ask(&app, "GET", path, &[]).await.0, 403, "as the other restricted reads: an origin or a token");
-        assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await.0, 200, "the dashboard");
+        assert_eq!(ask(&app, "GET", path, &window(OWN)).await.0, 200, "the dashboard");
         assert_eq!(ask(&app, "GET", path, &[("origin", "https://oaiy.com")]).await.0, 200);
         assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://formlogic.com")]).await.0, 200, "a token's plugins.read");
     }
@@ -3454,7 +3781,7 @@ mod tightened_tests {
         assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await, (200, "public".into()));
         assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "cross-site")]).await, (200, "public".into()));
         assert_eq!(ask(&app, "GET", path, &[]).await, (200, "public".into()), "a program with no token");
-        assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await, (200, "full".into()));
+        assert_eq!(ask(&app, "GET", path, &window(OWN)).await, (200, "full".into()));
         assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://formlogic.com")]).await, (200, "full".into()), "a paired app");
         assert_eq!(ask(&app, "GET", path, &[("authorization", bearer.as_str()), ("origin", "https://evil.example")]).await, (200, "public".into()), "its token, from another page");
     }
@@ -3464,7 +3791,7 @@ mod tightened_tests {
     async fn on_a_headless_server_discovery_is_public_without_the_token() {
         let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
         let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, false, Some("the-token".into()), &|_| None).expect("a legacy guard");
-        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()) }, guard };
+        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()), loopback: LoopbackPages::as_built() }, guard };
         let app = Router::new()
             .route("/api/bridge/capabilities", get(|public: Option<Extension<PublicView>>| async move { if public.is_some() { "public" } else { "full" } }))
             .layer(middleware::from_fn_with_state(state, access_guard));
@@ -3490,9 +3817,13 @@ mod tightened_tests {
         }
         assert_eq!(ask(&app, "POST", path, &[("authorization", apps.as_str()), ("origin", "https://formlogic.com")]).await.0, 403, "an app's grant");
         assert_eq!(ask(&app, "POST", path, &[("authorization", agent.as_str()), ("origin", "https://agent.example")]).await.0, 200, "the Agent in a browser tab");
-        assert_eq!(ask(&app, "POST", path, &[("origin", OWN)]).await.0, 200, "the dashboard's window");
+        assert_eq!(ask(&app, "POST", path, &window(OWN)).await.0, 200, "the dashboard's window");
         let embedded = if cfg!(windows) { "http://oaiy.localhost" } else { "oaiy://localhost" };
-        assert_eq!(ask(&app, "POST", path, &[("origin", embedded)]).await.0, 200, "the Agent in OAIY's own window");
+        assert_eq!(ask(&app, "POST", path, &window(embedded)).await.0, 200, "the Agent in OAIY's own window");
+        if cfg!(windows) {
+            // There the Agent's origin is a name a page on this computer's port 80 has too: the name alone answers no phone.
+            assert_eq!(ask(&app, "POST", path, &[("origin", embedded)]).await.0, 403, "a page that only has the Agent's name");
+        }
     }
 
     #[tokio::test]
@@ -3500,7 +3831,7 @@ mod tightened_tests {
         let app = router(pairing());
         assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[("origin", "https://evil.example")]).await.0, 403);
         assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[]).await.0, 403, "as the flows' list: an origin or a token");
-        assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &[("origin", OWN)]).await.0, 200);
+        assert_eq!(ask(&app, "GET", "/api/bridge/flows/x", &window(OWN)).await.0, 200);
     }
 
     #[tokio::test]
@@ -3517,7 +3848,7 @@ mod tightened_tests {
             assert_eq!(ask(&app, "POST", "/api/bridge/pairing", &[("origin", origin)]).await.0, 200, "{origin}: so does asking to pair");
         }
         for origin in ["https://oaiy.com", "https://www.oaiy.com", OWN] {
-            assert_eq!(ask(&app, "GET", "/api/services", &[("origin", origin)]).await, (200, "full".into()), "{origin}");
+            assert_eq!(ask(&app, "GET", "/api/services", &window(origin)).await, (200, "full".into()), "{origin}");
         }
     }
 
@@ -3564,7 +3895,7 @@ mod tightened_tests {
         let control = crate::control::Control::with_navigator(&dir, None);
         let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
         let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &|_| None).expect("a legacy guard");
-        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(p) }, guard };
+        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(p), loopback: LoopbackPages::as_built() }, guard };
         let app = Router::new()
             .route("/api/plugins/install", post(ok))
             .route("/api/bridge/connectors/:id/request", post(ok))
@@ -3610,19 +3941,278 @@ mod tightened_tests {
 
     #[tokio::test]
     async fn the_dashboards_own_origin_still_passes_with_a_token_it_does_not_reach() {
-        // A paired token taken off a request leaves the request as one without it: OAIY's own page passes by its origin.
+        // A paired token taken off a request leaves the request as one without it: OAIY's own page passes by its origin,
+        // where its origin is one no browser page can send. On Windows it is a name, and a paired app's token does not make
+        // the name the window's: only the token the window was handed does.
         let p = pairing();
         let token = grant(&p, None, PairingAccess::Apps);
         let app = router(p);
         let bearer = format!("Bearer {token}");
-        assert_eq!(ask(&app, "PUT", "/api/network/settings", &[("authorization", bearer.as_str()), ("origin", OWN)]).await.0, 200);
+        let passes = if cfg!(windows) { 403 } else { 200 };
+        assert_eq!(ask(&app, "PUT", "/api/network/settings", &[("authorization", bearer.as_str()), ("origin", OWN)]).await.0, passes);
+        assert_eq!(ask(&app, "PUT", "/api/network/settings", &window(OWN)).await.0, 200, "the window itself");
     }
 
     #[tokio::test]
     async fn clearing_the_pairing_requests_takes_the_privileged_gate() {
         let app = router(pairing());
         assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &[]).await.0, 403, "not a program without a token");
-        assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &[("origin", OWN)]).await.0, 200);
+        assert_eq!(ask(&app, "DELETE", "/api/bridge/pairing", &window(OWN)).await.0, 200);
+    }
+
+    /// The origins Windows gives OAIY's own pages: the dashboard's, the Agent's, the flow editor's. On a Mac and Linux
+    /// they are nobody's (an impostor's, [`super::is_impostor_origin`]), with a token or without.
+    const NAMES: [&str; 3] = ["http://tauri.localhost", "http://oaiy.localhost", "http://oaiyflows.localhost"];
+
+    /// What only a page OAIY trusts is answered, one of each kind: privileged changes, a change of the broad kind (starting
+    /// a service a person defined), the pairing and lease changes this guard keeps, an export, restricted reads, the
+    /// update's status, and the reads this guard keeps from web pages.
+    const KEPT: [(&str, &str); 17] = [
+        ("POST", "/api/bridge/connectors/x/request"),
+        ("POST", "/api/mcp"),
+        ("POST", "/api/bridge/runs"),
+        ("PUT", "/api/network/settings"),
+        ("POST", "/api/services/x/start"),
+        ("DELETE", "/api/bridge/pairing"),
+        ("POST", "/api/bridge/leases/answer-calls"),
+        ("GET", "/api/services/x/export"),
+        ("GET", "/api/config"),
+        ("GET", "/api/voice/calls"),
+        ("GET", "/api/bridge/pairing"),
+        ("GET", "/api/plugins/demo/logs"),
+        ("GET", "/api/update/status"),
+        ("GET", "/api/models"),
+        ("GET", "/api/python"),
+        ("GET", "/api/bridge/flows/x"),
+        ("GET", "/api/plugins/demo/ui/main/ui/app.js"),
+    ];
+
+    /// On Windows the dashboard, the Agent and the flow editor have the origins `http://<name>.localhost`, and
+    /// `*.localhost` is this computer in every browser: a page served by whatever program listens on its port 80, opened
+    /// in the person's ordinary browser as `http://oaiy.localhost/...`, sends exactly the Agent's origin. The name alone
+    /// was OAIY's own window (a service defined and started: any program run as the person). It is now what any other
+    /// website is.
+    #[tokio::test]
+    async fn a_page_that_only_has_the_name_of_one_of_oaiys_windows_is_another_website() {
+        for app in [router(pairing()), router_with(Some("desk-token"), pairing())] {
+            for name in NAMES {
+                let bare = [("origin", name)];
+                for (method, path) in KEPT {
+                    let (status, body) = ask(&app, method, path, &bare).await;
+                    assert_eq!(status, 403, "{method} {path} from {name}: {body}");
+                    assert_eq!(status, ask(&app, method, path, &[("origin", "https://evil.example")]).await.0, "{method} {path}: as a stranger");
+                    // A wrong token, an empty one, and one that only looks like a paired app's are no better.
+                    for bearer in ["Bearer wrong", "Bearer ", "Bearer oaiypat_wrong"] {
+                        let status = ask(&app, method, path, &[("origin", name), ("authorization", bearer)]).await.0;
+                        assert_eq!(status, 403, "{method} {path} from {name} with {bearer:?}");
+                    }
+                }
+                // What every website is answered, it is answered: discovery (its public view), and the services without
+                // this machine's details. Asking to pair passes this guard as any website's request does (the route
+                // itself refuses one under these names: `bridge::routes`).
+                assert_eq!(ask(&app, "GET", "/api/health", &bare).await.0, 200, "{name}");
+                assert_eq!(ask(&app, "GET", "/api/bridge/capabilities", &bare).await, (200, "public".into()), "{name}");
+                assert_eq!(ask(&app, "POST", "/api/bridge/pairing", &bare).await.0, 200, "{name}");
+                if cfg!(windows) {
+                    assert_eq!(ask(&app, "GET", "/api/services", &bare).await, (200, "public".into()), "{name}");
+                    // It is told why: a window of OAIY's own that left its token off is not mistaken for a stranger.
+                    let (_, body) = ask(&app, "GET", "/api/config", &bare).await;
+                    assert!(body.contains(super::NAME_ONLY_REFUSAL), "{name}: {body}");
+                } else {
+                    assert_eq!(ask(&app, "GET", "/api/services", &bare).await.0, 403, "{name}: not even that, where the name is nobody's");
+                }
+            }
+        }
+    }
+
+    /// The same windows, sending the token the desktop handed them, are OAIY's own: everything above is answered, in
+    /// full, and the dashboard's is the window ([`OwnWindow`]). Where the name is nobody's (a Mac, Linux) no token makes
+    /// it one.
+    #[tokio::test]
+    async fn with_the_token_the_desktop_handed_it_a_window_is_oaiys_own() {
+        let app = router(pairing());
+        let answered = if cfg!(windows) { 200 } else { 403 };
+        for name in NAMES {
+            let own = window(name);
+            assert_eq!(own.len(), 2, "{name}: its origin and its token");
+            for (method, path) in KEPT {
+                assert_eq!(ask(&app, method, path, &own).await.0, answered, "{method} {path} from {name}");
+            }
+            if cfg!(windows) {
+                assert_eq!(ask(&app, "GET", "/api/services", &own).await, (200, "full".into()), "{name}");
+                assert_eq!(ask(&app, "GET", "/api/bridge/capabilities", &own).await, (200, "full".into()), "{name}");
+            }
+        }
+        // The window's mark is the dashboard's origin's: on Windows with the token, and never the name alone.
+        assert_eq!(ask(&app, "POST", "/api/bridge/runs", &window(OWN)).await, (200, "the window".into()));
+        if cfg!(windows) {
+            assert_eq!(ask(&app, "POST", "/api/bridge/runs", &[("origin", OWN)]).await.0, 403, "the name alone");
+            assert_eq!(ask(&app, "POST", "/api/bridge/runs", &window("http://oaiy.localhost")).await, (200, "a caller".into()), "the Agent's page is not the dashboard");
+        }
+        // An install that set a token for its CLI: that token is the owner's too, and with the dashboard's origin it is
+        // the window; by itself it is a program's (the CLI), which is no window.
+        let app = router_with(Some("desk-token"), pairing());
+        let configured = [("origin", OWN), ("authorization", "Bearer desk-token")];
+        assert_eq!(ask(&app, "POST", "/api/bridge/runs", &configured).await, (200, "the window".into()));
+        assert_eq!(ask(&app, "POST", "/api/bridge/runs", &[("authorization", "Bearer desk-token")]).await, (200, "a caller".into()));
+        assert_eq!(ask(&app, "POST", "/api/bridge/runs", &window(OWN)).await, (200, "the window".into()), "the token it was handed, as before");
+    }
+
+    /// A Mac's and Linux's own pages have origins no browser page can send (`tauri://localhost`, `oaiy://localhost`,
+    /// `oaiyflows://localhost`): they are OAIY's by the origin alone, as they always were. So is `https://oaiy.com`, on
+    /// every system. (On Windows the custom schemes are another system's: nobody's.)
+    #[tokio::test]
+    async fn an_origin_no_browser_page_can_send_is_oaiys_own_without_a_token() {
+        let app = router(pairing());
+        let answered = if cfg!(windows) { 403 } else { 200 };
+        for origin in ["tauri://localhost", "oaiy://localhost", "oaiyflows://localhost"] {
+            assert!(!super::is_name_only_origin(origin), "{origin}");
+            for (method, path) in KEPT {
+                assert_eq!(ask(&app, method, path, &[("origin", origin)]).await.0, answered, "{method} {path} from {origin}");
+            }
+        }
+        if !cfg!(windows) {
+            assert_eq!(ask(&app, "POST", "/api/bridge/runs", &[("origin", "tauri://localhost")]).await, (200, "the window".into()));
+            assert_eq!(ask(&app, "GET", "/api/services", &[("origin", "oaiy://localhost")]).await, (200, "full".into()));
+        }
+        for (method, path) in KEPT {
+            assert_eq!(ask(&app, method, path, &[("origin", "https://oaiy.com")]).await.0, 200, "{method} {path} from https://oaiy.com");
+        }
+    }
+
+    #[test]
+    fn the_names_are_the_six_forms_windows_can_give_the_three_pages_and_nothing_near_them() {
+        for origin in [
+            "http://tauri.localhost", "https://tauri.localhost", "http://oaiy.localhost", "https://oaiy.localhost", "http://oaiyflows.localhost",
+            "https://oaiyflows.localhost",
+        ] {
+            assert!(super::is_name_only_origin(origin), "{origin}");
+        }
+        for origin in [
+            "tauri://localhost", "oaiy://localhost", "oaiyflows://localhost", "http://localhost", "http://127.0.0.1:17974", "https://oaiy.com",
+            "http://oaiy.localhost:8080", "http://oaiy.localhost/", "http://x.oaiy.localhost", "http://oaiy.localhost.evil.example", "http://evil.localhost",
+            "null", "",
+        ] {
+            assert!(!super::is_name_only_origin(origin), "{origin}");
+        }
+    }
+
+    /// A release build's rule for the pages at this computer's loopback addresses: nothing OAIY serves, and nobody named.
+    fn release() -> LoopbackPages {
+        LoopbackPages::release(&[], || None)
+    }
+
+    /// What only a page OAIY trusts was answered, from a page at a port of this computer's that whatever program listens
+    /// on it serves: a debug build believes it, as the old guard believed every loopback page; a release build answers it
+    /// as another website. (Before this, a release build believed it too, on all but the privileged routes and the
+    /// exports: a page on the machine's port 3000 read the calls, the configuration and the plugins' logs, started the
+    /// services the person had defined, and saw the services and discovery in full.)
+    #[tokio::test]
+    async fn a_page_at_a_loopback_port_oaiy_does_not_serve_is_believed_by_a_debug_build_alone() {
+        let debug = router_believing(None, pairing(), LoopbackPages::of_build_for_tests(true));
+        let release_build = router_believing(None, pairing(), release());
+        for page in ["http://localhost:3000", "http://127.0.0.1:5173", "http://[::1]:8080", "https://localhost", "http://127.0.0.1:17972"] {
+            let bare = [("origin", page)];
+            // (the broad routes: the old guard's privileged ones took no loopback page on a release build already)
+            for (method, path) in [
+                ("POST", "/api/services/x/start"),
+                ("GET", "/api/config"),
+                ("GET", "/api/voice/calls"),
+                ("GET", "/api/bridge/pairing"),
+                ("GET", "/api/plugins/demo/logs"),
+                ("GET", "/api/update/status"),
+                ("GET", "/api/models"),
+                ("GET", "/api/python"),
+                ("GET", "/api/bridge/flows/x"),
+                ("GET", "/api/plugins/demo/ui/main/ui/app.js"),
+            ] {
+                assert_eq!(ask(&debug, method, path, &bare).await.0, 200, "{method} {path} from {page}: a debug build's development server");
+                let (status, body) = ask(&release_build, method, path, &bare).await;
+                assert_eq!((status, body.as_str()), (403, r#"{"error":"origin not allowed"}"#), "{method} {path} from {page}");
+            }
+            assert_eq!(ask(&debug, "GET", "/api/services", &bare).await, (200, "full".into()), "{page}");
+            assert_eq!(ask(&release_build, "GET", "/api/services", &bare).await, (200, "public".into()), "{page}: without this machine's details");
+            assert_eq!(ask(&release_build, "GET", "/api/bridge/capabilities", &bare).await, (200, "public".into()), "{page}");
+            // What any website is answered, it is: health, and asking to pair (the person approves it, or not).
+            assert_eq!(ask(&release_build, "GET", "/api/health", &bare).await.0, 200, "{page}");
+            assert_eq!(ask(&release_build, "POST", "/api/bridge/pairing", &bare).await.0, 200, "{page}");
+        }
+        // A program sends no Origin and is not a page: what it was answered, it still is.
+        assert_eq!(ask(&release_build, "POST", "/api/services/x/start", &[]).await.0, 200);
+        assert_eq!(ask(&release_build, "GET", "/api/services", &[]).await, (200, "full".into()));
+    }
+
+    /// The page OAIY serves itself at a loopback address (a Mac's and Linux's Agent, from its own port while this desktop
+    /// holds it) and a development server the person named in `OAIY_DEV_ORIGINS` are believed on a release build as every
+    /// loopback page was; the same port's other spellings and its neighbours are not.
+    #[tokio::test]
+    async fn a_release_build_believes_the_page_it_serves_and_the_development_servers_the_person_named() {
+        let app = router_believing(None, pairing(), LoopbackPages::release(&["http://localhost:5173"], || Some("http://127.0.0.1:17974")));
+        for page in ["http://127.0.0.1:17974", "http://localhost:5173"] {
+            for (method, path) in [("POST", "/api/services/x/start"), ("GET", "/api/config"), ("GET", "/api/voice/calls"), ("GET", "/api/models")] {
+                assert_eq!(ask(&app, method, path, &[("origin", page)]).await.0, 200, "{method} {path} from {page}");
+            }
+            assert_eq!(ask(&app, "GET", "/api/services", &[("origin", page)]).await, (200, "full".into()), "{page}");
+        }
+        for page in ["http://localhost:17974", "http://[::1]:17974", "https://127.0.0.1:17974", "http://127.0.0.1:17975", "http://127.0.0.1:5173", "http://localhost:5174", "https://localhost:5173"] {
+            assert_eq!(ask(&app, "GET", "/api/config", &[("origin", page)]).await.0, 403, "{page}");
+            assert_eq!(ask(&app, "POST", "/api/services/x/start", &[("origin", page)]).await.0, 403, "{page}");
+        }
+        // While this desktop does not hold the Agent's port, a page there is whatever program holds it: another website.
+        let not_held = router_believing(None, pairing(), release());
+        assert_eq!(ask(&not_held, "GET", "/api/config", &[("origin", "http://127.0.0.1:17974")]).await.0, 403);
+    }
+
+    /// A paired app on this computer (FormLogic on `http://localhost:8080`, say) is judged by its token, not by the port
+    /// its page is on: on a release build it reaches what its grant does from the page it was granted to, as any paired
+    /// page does, and nothing more; the same token from another loopback page is taken off, and that page is another
+    /// website.
+    #[tokio::test]
+    async fn on_a_release_build_a_paired_app_on_a_loopback_page_reaches_what_its_grant_does() {
+        let p = pairing();
+        let token = grant(&p, Some("http://localhost:8080"), PairingAccess::Apps);
+        let bearer = format!("Bearer {token}");
+        let app = router_believing(None, p, release());
+        let paired = [("origin", "http://localhost:8080"), ("authorization", bearer.as_str())];
+        for (method, path) in [("POST", "/api/bridge/connectors/x/request"), ("POST", "/api/services/x/start")] {
+            assert_eq!(ask(&app, method, path, &paired).await.0, 200, "{method} {path}: its grant");
+            assert_eq!(ask(&app, method, path, &[("origin", "http://localhost:8080")]).await.0, 403, "{method} {path}: the page without its token");
+            assert_eq!(ask(&app, method, path, &[("origin", "http://localhost:3000"), ("authorization", bearer.as_str())]).await.0, 403, "{method} {path}: its token from another page");
+        }
+        assert_eq!(ask(&app, "GET", "/api/services", &paired).await, (200, "full".into()), "services.read is in its grant");
+        // What the grant does not reach, the page does not get by being on this computer (the old guard's broad list let
+        // every loopback page read the configuration, the calls and the plugins' logs).
+        for path in ["/api/config", "/api/voice/calls", "/api/plugins/demo/logs"] {
+            assert_eq!(ask(&app, "GET", path, &paired).await.0, 403, "{path}: not in its grant");
+        }
+        assert_eq!(ask(&app, "PUT", "/api/network/settings", &paired).await.0, 403, "never a paired app's");
+    }
+
+    #[test]
+    fn the_development_servers_are_named_by_exact_origins_on_this_computer_alone() {
+        let (kept, ignored) = super::parse_dev_origins(" http://localhost:5173 ,HTTP://LocalHost:5174/, http://127.0.0.1:5317,https://[::1]:8443,http://127.0.0.1:80,,http://localhost:5173 ");
+        assert_eq!(kept, ["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5317", "https://[::1]:8443", "http://127.0.0.1"]);
+        assert!(ignored.is_empty(), "{ignored:?}");
+        // Nothing but a page's origin on this computer: another computer's, a name, a path, a wildcard, another scheme.
+        for entry in [
+            "https://evil.example", "http://oaiy.localhost", "http://192.168.1.20:5173", "http://localhost.evil.example:5173", "http://localhost:5173/app",
+            "http://localhost:5173?x", "http://user@localhost:5173", "*", "null", "localhost:5173", "tauri://localhost", "file:///tmp", "http://127.0.0.2:5173",
+            "http://localhost.:5173",
+        ] {
+            let (kept, ignored) = super::parse_dev_origins(entry);
+            assert!(kept.is_empty(), "{entry}: {kept:?}");
+            assert_eq!(ignored.len(), 1, "{entry}");
+        }
+        assert_eq!(super::parse_dev_origins(""), (Vec::<String>::new(), Vec::<String>::new()));
+        // What a release build is given to believe is what the variable says, and a debug build believes every page.
+        let env = |name: &str| (name == super::DEV_ORIGINS_ENV).then(|| "http://localhost:5173, https://evil.example".to_string());
+        let release_build = LoopbackPages::of_build(false, &env);
+        assert!(release_build.believes("http://localhost:5173"));
+        for page in ["http://localhost:5174", "http://localhost:3000", "http://127.0.0.1:5173"] {
+            assert!(!release_build.believes(page), "{page}");
+        }
+        assert!(LoopbackPages::of_build(true, &|_| None).believes("http://localhost:3000"));
+        assert_eq!(LoopbackPages::of_this_build(&|_| None).believes("http://localhost:3000"), cfg!(debug_assertions));
     }
 }
 

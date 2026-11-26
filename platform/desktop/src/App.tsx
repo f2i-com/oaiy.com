@@ -58,6 +58,8 @@ import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
+import WindowKeyBanner from './WindowKeyBanner';
+import { windowFetch } from './windowKey';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel, { BackupSettings, StorageSettings } from './SettingsPanel';
 import EmbeddedPage from './EmbeddedPage';
@@ -585,7 +587,7 @@ export default function App() {
     let id: number | undefined;
     const tick = async () => {
       try {
-        const resp = await fetch(`${API_BASE}/api/health`);
+        const resp = await windowFetch(`${API_BASE}/api/health`);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const body: HealthResponse = await resp.json();
         // A 200 from this port is NOT proof it's OUR server. Sibling apps built
@@ -1097,6 +1099,8 @@ export default function App() {
         </header>
 
         <section className={`view view-${view}`}>
+          {/* OAIY's API is refusing this window (it could not be given its key): said here once, on every page. */}
+          <WindowKeyBanner />
           {isolated && (
             <div className="banner banner-pending" role="status">
               <span><strong>Isolated local qualification.</strong> Only plugins and their screens are available. AI, accounts, engines, flows and setup are unavailable.</span>

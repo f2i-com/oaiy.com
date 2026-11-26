@@ -224,3 +224,75 @@ describe.skipIf(!HAVE_ZIPP)("Zipp's own refusal of a module it already has", () 
     if (typeof ours?.modules === 'number') expect(ours.modules).toBe(ALL.length - 2);
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A module the package brings that Zipp has too
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Zipp v0.0.41 refuses a module another package brought, but takes one named like a module of its own without a word,
+// and the package's is then the one a program imports. OAIY's `types` hid Zipp's fuller one that way: the sandbox had
+// no types.ModuleType, CoroutineType, GenericAlias, UnionType, CodeType, TracebackType or prepare_class.
+
+it('does not bring `types`, which Zipp has more of', () => {
+  expect(ALL).not.toContain('types');
+});
+
+interface ZippPython extends ZippGlue {
+  Engine: new () => {
+    setInstructionBudget(steps: number): boolean;
+    initPythonProject(files: unknown, entry: string, argv: unknown): unknown;
+    takeConsole(): unknown;
+    dispose(): void;
+    free(): void;
+  };
+}
+
+/** Each module's public names as a program in a new engine of this glue imports it, or null where it cannot. */
+function publicNames(glue: ZippPython, modules: string[]): Record<string, string[] | null> {
+  const program = [
+    'import json',
+    'out = {}',
+    `for name in ${JSON.stringify(modules)}:`,
+    '    try:',
+    "        out[name] = sorted(n for n in dir(__import__(name)) if not n.startswith('_'))",
+    '    except ImportError:',
+    '        out[name] = None',
+    "print('NAMES ' + json.dumps(out))",
+  ].join('\n');
+  const engine = new glue.Engine();
+  try {
+    engine.setInstructionBudget(50_000_000);
+    engine.initPythonProject({ 'main.py': program }, 'main.py', []);
+    const printed = (engine.takeConsole() as Array<{ text?: string }>).map((line) => String(line.text ?? ''));
+    const names = printed.find((text) => text.startsWith('NAMES '));
+    if (names === undefined) throw new Error(`the program printed no names: ${JSON.stringify(printed)}`);
+    return JSON.parse(names.slice('NAMES '.length)) as Record<string, string[] | null>;
+  } finally {
+    engine.dispose();
+    engine.free();
+  }
+}
+
+describe.skipIf(!HAVE_ZIPP)("a module of OAIY's package that Zipp has too", () => {
+  it("hides nothing of Zipp's own, and `types` is Zipp's", async () => {
+    // (its own copy of the engine: the one above has another package's modules in it)
+    const glue = (await load(`${new URL('zipp_wasm.js', ZIPP).href}?own-modules`)) as ZippPython;
+    glue.initSync({ module: fs.readFileSync(new URL('zipp_wasm_bg.wasm', ZIPP)) });
+    expect((JSON.parse(glue.pythonPackages()) as { installed: unknown[] }).installed).toEqual([]);
+    const modules = [...new Set([...ALL, 'types'])];
+
+    const own = publicNames(glue, modules);
+    expect(await installPythonPackage(glue)).toBeUndefined();
+    const packed = publicNames(glue, modules);
+
+    // A module of the package replaces Zipp's whole: it stays only while it has every name Zipp's has (`shutil` does,
+    // and `which`, `disk_usage`, `make_archive` and `ignore_patterns` besides). When this names a module after a move
+    // to another Zipp, compare the two and drop OAIY's if Zipp's is the fuller.
+    const hidden = ALL.flatMap((name) => (own[name] ?? []).filter((n) => !packed[name]?.includes(n)).map((n) => `${name}.${n}`));
+    expect(hidden).toEqual([]);
+
+    expect(own.types).toEqual(expect.arrayContaining(['SimpleNamespace', 'MappingProxyType', 'FunctionType', 'new_class']));
+    expect(packed.types).toEqual(own.types);
+    expect(packed.types).toEqual(expect.arrayContaining(['ModuleType', 'CoroutineType', 'GenericAlias', 'UnionType', 'CodeType', 'TracebackType', 'prepare_class']));
+  });
+});

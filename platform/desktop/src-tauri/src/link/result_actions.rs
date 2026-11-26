@@ -608,7 +608,14 @@ pub struct Live<'a> {
     pub connector: Option<&'a super::relay::Dispatcher>,
     /// The provider's id for the run these actions follow.
     pub run_id: &'a str,
+    /// Whether the link the run was taken for is still the one this desktop
+    /// holds: asked before each action that writes, and none is performed once
+    /// it is not (a link forgotten or replaced while the actions were under way).
+    pub linked: &'a dyn Fn() -> bool,
 }
+
+/// Why an action was not performed: its link went while the run's actions were under way.
+const LINK_WENT: &str = "not performed: the link this run was taken for was forgotten or replaced";
 
 impl Live<'_> {
     fn client() -> Result<reqwest::blocking::Client, String> {
@@ -632,6 +639,9 @@ impl Live<'_> {
 
 impl Perform for Live<'_> {
     fn submit(&self, form_id: &str, record: &Value, idempotency_key: &str) -> Result<Option<String>, String> {
+        if !(self.linked)() {
+            return Err(LINK_WENT.to_string());
+        }
         let form_seg = super::oauth::path_segment(form_id, "form id")?;
         let url = super::oauth::join(
             &self.account.base_url,
@@ -669,6 +679,9 @@ impl Perform for Live<'_> {
     }
 
     fn update(&self, form_id: &str, record_id: &str, record: &Value, idempotency_key: &str) -> Result<(), String> {
+        if !(self.linked)() {
+            return Err(LINK_WENT.to_string());
+        }
         let form_seg = super::oauth::path_segment(form_id, "form id")?;
         let id_seg = super::oauth::path_segment(record_id, "record id")?;
         let url = super::oauth::join(
@@ -712,6 +725,9 @@ impl Perform for Live<'_> {
                 "this runtime has no plugin host, so the command was not run".to_string()
             );
         };
+        if !(self.linked)() {
+            return Err(LINK_WENT.to_string());
+        }
         dispatch(connector_id, command, payload, idempotency_key)
     }
 }
@@ -754,7 +770,7 @@ mod tests {
             instance_id: Some("oaiy-test".into()),
         };
         let spec = spec();
-        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-7f3a" };
+        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-7f3a", linked: &|| true };
         let record = serde_json::json!({ "f_name": "written by the binding" });
         assert_eq!(live.submit("form-a", &record, "k1").unwrap().as_deref(), Some("r1"));
         live.update("form-a", "r1", &record, "k2").unwrap();
@@ -790,7 +806,7 @@ mod tests {
             instance_id: Some("oaiy-test".into()),
         };
         let spec = spec();
-        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-1" };
+        let live = Live { account: &account, spec: &spec, connector: None, run_id: "run-1", linked: &|| true };
         let record = json!({ "a": 1 });
 
         // Traversal / delimiter IDs are rejected before any request is sent.

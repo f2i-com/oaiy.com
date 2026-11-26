@@ -284,7 +284,8 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
             false
         }
     });
-    let running = oaiy_studio::launch(&args, true)?;
+    // (told before their listeners start which pages at this computer's own names the desktop vouches for: `host_pages`)
+    let running = oaiy_studio::launch_hosted(&args, true, Some(host_pages()))?;
     if hosts_folder {
         running.studio.keep_downloads_dir_in_host();
     }
@@ -303,6 +304,37 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     }
     *started = Some(running);
     Ok(url)
+}
+
+/// The key this run hands the Agent's page for the engines' gateway (`window.__OAIY_DESKTOP__.enginesKey`,
+/// `embed::desktop_script`), and a page paired with the desktop that may read the engines (`GET /api/engines`, its
+/// `gatewayKey`: the Agent in a browser tab, or in the OAIY Agent app): the engines this desktop starts answer a page at
+/// one of this computer's own names only with it ([`host_pages`]). Made once per run from the system's randomness and
+/// never written down; empty when the system gave none (then no such page is answered).
+pub fn gateway_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        match getrandom::getrandom(&mut bytes) {
+            Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            Err(_) => String::new(),
+        }
+    })
+}
+
+/// What the engines this desktop starts are told it vouches for (`oaiy_studio::HostPages`): its key, and the pages at
+/// this computer's loopback addresses it believes without one (`http::believed_loopback_page`: the Agent's own port
+/// while this desktop serves the Agent there, a development server the person named in `OAIY_DEV_ORIGINS`, and any in a
+/// debug build). A page at a name under `localhost` (the Agent's window in OAIY and the OAIY Agent app, on Windows) is
+/// never believed by its name: it carries the key, or is not answered.
+fn host_pages() -> oaiy_studio::HostPages {
+    oaiy_studio::HostPages { key: gateway_key().to_string(), serves: std::sync::Arc::new(crate::http::believed_loopback_page) }
+}
+
+/// The gateway's key, where the engines are this desktop's own (started here); none for engines found running, which
+/// were told nothing by this desktop and answer by their list.
+pub fn gateway_key_if_hosted() -> Option<&'static str> {
+    (started_here() && !gateway_key().is_empty()).then(gateway_key)
 }
 
 /// Where the engines' control pages are, once found or started.
@@ -832,8 +864,31 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         let reply = resp.text().unwrap();
         assert!(reply.contains("config_path"), "{}", &reply[..reply.len().min(200)]);
+        // Their gateway answers a page at one of this computer's own names (the Agent's window on Windows, which a web
+        // server on this computer's port 80 has too; the Agent served on port 5317) only with the key this desktop hands
+        // the Agent's page; the origins no page can have by name are answered by the list, as before.
+        let gateway = RUNNING.lock().unwrap().as_ref().map(|r| r.gateway_url.clone()).unwrap();
+        let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+        let ask = |origin: &str, key: Option<&str>| {
+            let request = client.get(format!("{gateway}/v1/models")).header("Origin", origin);
+            let request = match key {
+                Some(key) => request.bearer_auth(key),
+                None => request,
+            };
+            request.send().unwrap().status().as_u16()
+        };
+        for origin in ["http://oaiy.localhost", "http://oaiyagent.localhost", "http://localhost:5317"] {
+            let believed = cfg!(debug_assertions) && origin == "http://localhost:5317";
+            assert_eq!(ask(origin, None), if believed { 200 } else { 403 }, "{origin}: a debug build believes a loopback address, never a name");
+            assert_eq!(ask(origin, Some("wrong")), if believed { 200 } else { 403 }, "{origin}");
+            assert_eq!(ask(origin, Some(gateway_key())), 200, "{origin} with the key");
+        }
+        assert_eq!(ask("oaiy://localhost", None), 200);
+        assert_eq!(ask("https://evil.example", Some(gateway_key())), 403, "the key opens nothing the list does not");
+        assert_eq!(gateway_key_if_hosted(), Some(gateway_key()), "the engines are this desktop's: their key is said");
         stop();
         assert!(RUNNING.lock().unwrap().is_none());
+        assert_eq!(gateway_key_if_hosted(), None, "and not once they are gone");
         let _ = std::fs::remove_dir_all(&data);
     }
 

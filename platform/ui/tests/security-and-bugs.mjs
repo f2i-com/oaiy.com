@@ -116,7 +116,7 @@ export { default as UtilityRuntime } from './src/bundled-modules/core-utility/ru
 export { default as UtilityCompiler } from './src/bundled-modules/core-utility/compiler.ts';
 export { default as Core3DCompiler } from './src/bundled-modules/core-3d/compiler.ts';
 export { resolveService } from './src/bundled-modules/core-service/contract.ts';
-export { desktopCredential, desktopFileBytes, listOaiyServices, runContract, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
+export { desktopCredential, desktopFileBytes, desktopFileHeaders, listOaiyServices, runContract, keepFile } from './src/bundled-modules/core-service/contractRuntime.ts';
 export { OAIYRuntime, OAIYCompiler, JobManager, getModuleLoader, createTemplateCompiler } from 'oaiy-core';
 export { escapeString } from 'oaiy-core/src/compiler/utils.ts';
 export { detectSandboxEscape, stripCommentsAndStringsFromCode } from 'oaiy-core/src/runtime.ts';
@@ -2826,6 +2826,94 @@ await check('40. Wave-5: UI/UX fixes — QuickConnectPopup truncation, TrustDial
   assert.ok(flowsSrc.includes('className="oaiy-rail-scrim" aria-hidden="true"'));
   assert.ok(flowsSrc.includes('className="oaiy-flow-select"'));
   assert.ok(flowsSrc.includes('oaiy-node-status-dot'));
+});
+
+// In OAIY's own window on Windows the page's origin (`http://oaiyflows.localhost`) is a name a page on this computer's
+// port 80 has too, so OAIY Desktop answers it only with the credential it handed the page. A step that reads a file the
+// engines made by its address (to upload it, save it, join it) asked with none and was answered for the origin alone.
+await check("41. A step's own read of a file OAIY's engines made carries the desktop's credential, and no other request does", async () => {
+  const origDesktop = globalThis.__OAIY_DESKTOP__;
+  const desktop = 'http://127.0.0.1:17972';
+  globalThis.__OAIY_DESKTOP__ = { origin: desktop, token: 'desktop-secret' };
+  try {
+    const own = { Authorization: 'Bearer desktop-secret' };
+    const local = { currentPackageId: 'pkg', hasPermission: (p) => p === 'network:local' };
+    const noLocal = { currentPackageId: 'pkg', hasPermission: () => false };
+    // The desktop's file-serving routes, and nothing else of the desktop's.
+    for (const file of ['/api/ai/engine/gateway/files/a.png', '/files/a.png', '/api/files/a.mp4', '/api/network/nodes/abc123/gateway/files/a.png']) {
+      assert.deepEqual(M.desktopFileHeaders(desktop + file), own, file);
+      assert.deepEqual(M.desktopFileHeaders(desktop + file, local), own, `${file}: a package with network:local`);
+      assert.deepEqual(M.desktopFileHeaders(desktop + file, noLocal), {}, `${file}: a package without network:local`);
+    }
+    for (const other of [
+      `${desktop}/api/services`,
+      `${desktop}/api/config`,
+      `${desktop}/api/ai/providers`,
+      `${desktop}/api/ai/engine/services`,
+      `${desktop}/api/bridge/flows/x`,
+      `${desktop}/api/contacts/export.csv`,
+      `${desktop}/api/ai/engine/gateway/files/..%2f..%2f..%2fconfig`,
+      `${desktop}/files/%2e%2e/api/config`,
+      'http://127.0.0.1:17973/files/a.png',
+      'http://localhost:17972/files/a.png',
+      'https://127.0.0.1:17972/files/a.png',
+      'http://127.0.0.1.evil.example:17972/files/a.png',
+      'https://example.com/api/ai/engine/gateway/files/a.png',
+      'not an address',
+      '',
+    ]) {
+      assert.deepEqual(M.desktopFileHeaders(other), {}, `${other}: the credential must not go there`);
+    }
+    // A page that was given no credential sends none (and is answered, or not, as its origin is).
+    globalThis.__OAIY_DESKTOP__ = { origin: desktop, token: '' };
+    assert.deepEqual(M.desktopFileHeaders(`${desktop}/files/a.png`), {});
+    globalThis.__OAIY_DESKTOP__ = { origin: desktop, token: 'desktop-secret' };
+
+    // A step that reads by address: joining videos stages each one through ctx.secureFetch.
+    const asked = [];
+    const video = M.VideoRuntime.createMethods({
+      log() {},
+      secureFetch: async (url, init) => {
+        asked.push([url, init?.headers ?? {}]);
+        return mockResp(200, 'video-bytes', { 'content-type': 'video/mp4' });
+      },
+      tauri: {
+        invoke: async (cmd) => {
+          if (cmd === 'plugin:oaiy-filesystem|get_app_data_dir') return '/app';
+          if (cmd === 'plugin:oaiy-filesystem|get_temp_dir') return '/tmp';
+          if (cmd === 'plugin:oaiy-filesystem|run_command') return { code: 0, stdout: '', stderr: '' };
+          return null;
+        },
+      },
+    });
+    await video.appendVideos([`${desktop}/api/ai/engine/gateway/files/a.mp4`, 'https://cdn.example.com/b.mp4', `${desktop}/api/config`], 'joined', 'mp4', 'v1');
+    assert.deepEqual(asked, [
+      [`${desktop}/api/ai/engine/gateway/files/a.mp4`, own],
+      ['https://cdn.example.com/b.mp4', {}],
+      [`${desktop}/api/config`, {}],
+    ]);
+  } finally {
+    if (origDesktop === undefined) delete globalThis.__OAIY_DESKTOP__;
+    else globalThis.__OAIY_DESKTOP__ = origDesktop;
+  }
+  // Every step that reads a picture or a video by its address passes those headers: read from the sources, so a step
+  // added later that reads an engine's file with none is found here and not as a 403 in OAIY's window on Windows.
+  const modules = path.join(UI, 'src/bundled-modules');
+  const reads = [
+    ['core-image/runtime.ts', ['ctx.secureFetch(imageData,', 'ctx.secureFetch(source.url,']],
+    ['core-video/runtime.ts', ['ctx.secureFetch(imageData,', 'ctx.secureFetch(imageDataToUpload,', 'ctx.secureFetch(videoUrl,', 'ctx.secureFetch(video,']],
+    ['core-ai/runtime.ts', ['ctx.secureFetch(s,', 'ctx.secureFetch!(videoPath,']],
+  ];
+  for (const [file, calls] of reads) {
+    const src = fs.readFileSync(path.join(modules, file), 'utf8');
+    for (const call of calls) {
+      const at = src.indexOf(call);
+      assert.ok(at >= 0, `${file}: ${call} is still there`);
+      assert.equal(src.indexOf(call, at + 1), -1, `${file}: ${call} is one read`);
+      const value = call.slice(call.indexOf('(') + 1, -1);
+      assert.ok(src.slice(at, src.indexOf(');', at)).includes(`headers: desktopFileHeaders(${value}, ctx)`), `${file}: ${call} sends desktopFileHeaders`);
+    }
+  }
 });
 
 finish();

@@ -91,6 +91,31 @@ pub struct Studio {
     /// Where each of its listeners listens, and the thread that takes its connections ([`serve`]): ended by
     /// [`Studio::shutdown`], so the ports are free for the next studio.
     listeners: std::sync::Mutex<Vec<(std::net::SocketAddr, std::thread::JoinHandle<()>)>>,
+    /// What the program it runs in (OAIY Desktop) vouches for among the web pages at this computer's own names
+    /// ([`HostPages`]); `None` for a studio of its own.
+    host_pages: Option<HostPages>,
+}
+
+/// What the program a studio runs in (OAIY Desktop: [`launch_hosted`]) vouches for among the web pages that come to its
+/// gateway from this computer's own names.
+///
+/// Without an API key the gateway answers the pages whose origin `gateway.cors_origins` lists. An origin there that is
+/// one of this computer's own names (a name under `localhost`, which is what the Agent's window in OAIY Desktop and the
+/// OAIY Agent app have on Windows, `http://oaiy.localhost` and `http://oaiyagent.localhost`; or a loopback address and
+/// port, `http://localhost:5317`) is a name, and no proof of who holds it: every browser sends such a name to this
+/// computer, so a page served by whatever program listens on its port 80 (or on that port), opened in the person's
+/// ordinary browser, has exactly that origin. In a studio its host runs, such a page is answered only when it carries
+/// the host's key (`Authorization: Bearer`, handed by the host to its own pages and to the pages paired with it), or
+/// its origin is one the host says it serves itself at that moment (`serves`). An origin no page can have by its name
+/// alone (a custom scheme such as `oaiy://localhost`; `https://oaiy.com`) is the list's to decide, as before, and a
+/// preflight and a program (which sends no `Origin`) are not asked about.
+#[derive(Clone)]
+pub struct HostPages {
+    /// The key the host hands its pages. Empty: no page at such a name is answered.
+    pub key: String,
+    /// Whether the host serves the page at this origin itself now (or the person let it in by name), so that it is
+    /// answered without the key. Given the origin as a browser writes it (lower case).
+    pub serves: Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 /// How long a studio that stops waits for the eGPU's server to let the card go ([`Studio::shutdown`]): an ordinary quit
@@ -123,6 +148,16 @@ const SECRETS: [(&str, &str); 2] = [("downloads", "hf_token"), ("gateway", "api_
 impl Studio {
     pub fn config(&self) -> Json {
         self.config.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Whether a web page that `gateway.cors_origins` lets in is turned away because its host does not vouch for it
+    /// ([`HostPages`]): its origin is one of this computer's own names, the host does not serve it, and the request does
+    /// not carry the host's key.
+    fn unvouched_page(&self, origin: &str, authorization: Option<&str>) -> bool {
+        let Some(host) = &self.host_pages else { return false };
+        let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+        let keyed = !host.key.is_empty() && oaiy_engine::http::key_matches(authorization, &host.key);
+        oaiy_engine::http::loopback_origin(&origin) && !(host.serves)(&origin) && !keyed
     }
 
     /// Whether the studio has stopped for good ([`Studio::shutdown`]).
@@ -564,7 +599,14 @@ impl Studio {
             port_overrides: (None, None),
             closed: std::sync::atomic::AtomicBool::new(false),
             listeners: std::sync::Mutex::new(Vec::new()),
+            host_pages: None,
         }
+    }
+
+    /// [`Studio::for_test`], run by a host that vouches for `pages`.
+    pub(crate) fn hosted_by(mut self, pages: HostPages) -> Studio {
+        self.host_pages = Some(pages);
+        self
     }
 }
 
@@ -819,6 +861,16 @@ fn gateway_gate(studio: &Studio, req: &oaiy_engine::http::Request) -> Option<oai
             if !allowed {
                 return refuse(403, &format!("requests from {origin} are not allowed; add it to gateway.cors_origins, or set an API key"), "permission_error", "origin_not_allowed");
             }
+            // (a page at one of this computer's own names, which any program listening here serves pages under: in the
+            // engines OAIY Desktop runs, answered with the key it gives its own pages and the ones paired with it)
+            if studio.unvouched_page(origin, req.header("authorization")) {
+                return refuse(
+                    403,
+                    &format!("requests from {origin} are answered with the key OAIY Desktop gives its own pages, or an API key: {origin} is a name any web server on this computer can serve a page under"),
+                    "permission_error",
+                    "origin_not_allowed",
+                );
+            }
         }
         return None;
     }
@@ -1017,6 +1069,12 @@ fn running_at(args: &Args) -> Option<String> {
 /// Load the configuration, bind both listeners and start the supervisors.
 /// Returns once the UI and API serve; `quiet` keeps it off stdout (the tray).
 pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
+    launch_hosted(args, quiet, None)
+}
+
+/// [`launch`], by a program that runs the studio and vouches for some of the web pages at this computer's own names
+/// (OAIY Desktop: [`HostPages`]). Said before the listeners start, so no request is answered before it.
+pub fn launch_hosted(args: &Args, quiet: bool, host_pages: Option<HostPages>) -> Result<Running, String> {
     let cfg = effective_config(args)?;
     let root = args.config.parent().filter(|p| !p.as_os_str().is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     // Absolute but not canonical: on Windows canonical paths are `\\?\`-prefixed,
@@ -1041,6 +1099,7 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         port_overrides: (args.ui_port, args.port),
         closed: std::sync::atomic::AtomicBool::new(false),
         listeners: std::sync::Mutex::new(Vec::new()),
+        host_pages,
     });
     // (a model entry the check refused was set aside as the settings were read, the rest used: said where the Engines
     // page shows the log)
@@ -1374,6 +1433,75 @@ mod tests {
         assert_eq!(status(&keyed, &req("GET", "/v1/models", &[("Host", "evil.example")])), Some(403));
         assert_eq!(status(&keyed, &req("GET", "/.well-known/oaiy.json", &[("Host", "127.0.0.1:8080")])), None);
         assert_eq!(status(&keyed, &req("GET", "/", &[("Host", "127.0.0.1:8080")])), None);
+    }
+
+    /// The engines OAIY Desktop runs: a page whose origin the list lets in by one of this computer's own names (a name
+    /// under `localhost`, the form Windows gives the Agent's window in OAIY and the OAIY Agent app; a loopback address and
+    /// port, the Agent served on this computer) is any program's that listens there, and is answered only with the key
+    /// the desktop gives its pages, or where the desktop serves that page itself. On every route, and the same with a
+    /// wrong key, an empty one and another scheme; the origins no page can have by name, a preflight and a program are
+    /// answered as before. (Before this, the default list let every such page chat with the model, make pictures and
+    /// read the jobs and the files the engines had made.)
+    #[test]
+    fn in_oaiy_desktop_a_page_at_one_of_this_computers_names_is_answered_with_the_desktops_key_alone() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-host-pages-{}", std::process::id()));
+        let pages = HostPages { key: "k".repeat(64), serves: Arc::new(|origin: &str| origin == AGENT_HTTP_ORIGIN) };
+        // (the defaults, and the Agent's own port, which a Mac's and Linux's settings list)
+        let mut listed = config::default_json();
+        let mut g = listed.get("gateway").unwrap().clone();
+        if let Some((_, Json::Arr(origins))) = match &mut g { Json::Obj(fields) => fields.iter_mut().find(|(k, _)| k == "cors_origins"), _ => None } {
+            origins.push(Json::str(AGENT_HTTP_ORIGIN));
+        }
+        util::set(&mut listed, "gateway", g);
+        let hosted = Studio::for_test(&root, listed.clone()).hosted_by(pages.clone());
+        let alone = Studio::for_test(&root, listed);
+        let req = |method: &str, path: &str, h: &[(&str, &str)]| oaiy_engine::http::Request::new(method, path, h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), Vec::new());
+        let status = |s: &Studio, r: &oaiy_engine::http::Request| gateway_gate(s, r).map(|r| r.status);
+        let with_key = format!("Bearer {}", pages.key);
+        let named = ["http://oaiy.localhost", "http://oaiyagent.localhost", "http://localhost:5317", "http://127.0.0.1:5317"];
+        let routes = [("POST", "/v1/chat/completions"), ("GET", "/v1/models"), ("GET", "/v1/videos"), ("GET", "/files/images/a.png"), ("POST", "/files"), ("GET", "/v1/discovery"), ("GET", "/health")];
+        for origin in named {
+            for (method, path) in routes {
+                let page = |auth: Option<&str>| {
+                    let mut h = vec![("Host", "127.0.0.1:8080"), ("Origin", origin)];
+                    h.extend(auth.map(|a| ("Authorization", a)));
+                    req(method, path, &h)
+                };
+                assert_eq!(status(&alone, &page(None)), None, "{method} {path} from {origin}: a studio of its own, by its list");
+                for auth in [None, Some("Bearer "), Some("Bearer wrong"), Some("Basic kkkk")] {
+                    assert_eq!(status(&hosted, &page(auth)), Some(403), "{method} {path} from {origin} with {auth:?}");
+                }
+                assert_eq!(status(&hosted, &page(Some(with_key.as_str()))), None, "{method} {path} from {origin} with the key");
+                // A preflight carries no credentials, and runs nothing.
+                assert_eq!(status(&hosted, &req("OPTIONS", path, &[("Host", "127.0.0.1:8080"), ("Origin", origin)])), None);
+            }
+        }
+        let refusal = gateway_gate(&hosted, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "http://oaiy.localhost")])).unwrap();
+        assert!(refusal.body.contains("origin_not_allowed") && !refusal.body.contains(&pages.key), "{}", refusal.body);
+        // What the desktop serves itself (a Mac's and Linux's Agent, from its own port), the origins no page has by name,
+        // and a program are answered as before.
+        for headers in [
+            vec![("Host", "127.0.0.1:8080"), ("Origin", AGENT_HTTP_ORIGIN)],
+            vec![("Host", "127.0.0.1:8080"), ("Origin", "oaiy://localhost")],
+            vec![("Host", "127.0.0.1:8080"), ("Origin", "oaiyagent://localhost")],
+            vec![("Host", "127.0.0.1:8080"), ("Origin", "https://oaiy.com")],
+            vec![("Host", "127.0.0.1:8080")],
+        ] {
+            assert_eq!(status(&hosted, &req("POST", "/v1/chat/completions", &headers)), None, "{headers:?}");
+        }
+        // An origin off the list is refused by the list, key or no key; with an API key set, the API key is what is asked.
+        assert_eq!(status(&hosted, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "http://evil.localhost"), ("Authorization", with_key.as_str())])), Some(403));
+        let mut cfg = config::default_json();
+        let mut g = cfg.get("gateway").unwrap().clone();
+        util::set(&mut g, "api_key", Json::str("sk-test"));
+        util::set(&mut cfg, "gateway", g);
+        let keyed = Studio::for_test(&root, cfg).hosted_by(pages.clone());
+        assert_eq!(status(&keyed, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "http://oaiy.localhost"), ("Authorization", "Bearer sk-test")])), None);
+        // A host that has no key to give answers no page at such a name.
+        let keyless = Studio::for_test(&root, config::default_json()).hosted_by(HostPages { key: String::new(), serves: Arc::new(|_: &str| false) });
+        for auth in ["Bearer ", "Bearer"] {
+            assert_eq!(status(&keyless, &req("POST", "/v1/chat/completions", &[("Host", "127.0.0.1:8080"), ("Origin", "http://oaiy.localhost"), ("Authorization", auth)])), Some(403), "{auth:?}");
+        }
     }
 
     #[test]

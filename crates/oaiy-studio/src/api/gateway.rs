@@ -16,7 +16,7 @@
 use crate::media::{self, Job, Kind};
 use crate::util::{base64_encode, bool_or, error_json, int_or, now, str_or};
 use crate::Studio;
-use oaiy_engine::http::{fetch, respond, respond_with, Request, Stream};
+use oaiy_engine::http::{fetch, fetch_while, respond, respond_with, Request, Stream};
 use oaiy_engine::json::Json;
 use std::io;
 use std::net::TcpStream;
@@ -273,8 +273,17 @@ fn egpu_chat(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, cfg: &Json,
     if let Some(session) = req.header("x-oaiy-session") {
         headers.push(("X-OAIY-Session", session));
     }
-    let response = match fetch(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ) {
+    // (the caller watched until the answer begins, as `proxy` watches it)
+    let caller = w.try_clone().ok();
+    let wanted = || caller.as_ref().is_none_or(|c| !caller_gone(c));
+    let response = match fetch_while(&endpoint.addr, "POST", "/v1/chat/completions", &headers, &body, UPSTREAM_READ, &wanted) {
         Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionAborted && !wanted() => {
+            // (withdrawn, not unanswered: nothing is asked of this computer's engine in its place)
+            drop(lease);
+            studio.log.push("a chat for the eGPU was withdrawn from tinygrad's server: its caller hung up before the answer");
+            return Some(Ok(false));
+        }
         Err(e) => {
             // Nothing has been sent to the client yet. A server whose process has gone is the case this computer's
             // engine is there for. One that is still there keeps its model (it gives no reply to a request it
@@ -392,8 +401,16 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     if let Some(session) = req.header("x-oaiy-session") {
         headers.push(("X-OAIY-Session", session));
     }
-    let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &body, UPSTREAM_READ) {
+    // (until the answer begins, the caller is watched: a reply asked for whole is written only when the model is done, and
+    // one whose caller hung up is withdrawn from the model then, as a stream is at its next chunk, not minutes later)
+    let caller = w.try_clone().ok();
+    let wanted = || caller.as_ref().is_none_or(|c| !caller_gone(c));
+    let response = match fetch_while(&endpoint.addr, &req.method, upstream, &headers, &body, UPSTREAM_READ, &wanted) {
         Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionAborted && !wanted() => {
+            studio.log.push(format!("a request to {upstream} was withdrawn from the language model: its caller hung up before the answer"));
+            return Ok(false);
+        }
         Err(e) => return send(w, Err(fail(502, format!("the language model did not answer: {e}")))),
     };
     let result = relay(w, response);
@@ -1664,6 +1681,105 @@ mod tests {
         assert!(head.starts_with("POST /v1/completions "), "{head}");
         assert_eq!(sent.get("model").and_then(Json::as_str), Some("small"));
         assert_eq!(tinygrad.requests().len(), 2, "tinygrad's server was not asked again");
+    }
+
+    /// A language model's server that takes one request and writes nothing back, as `oaiy-llm-server` writes a whole
+    /// answer only once it is done: `asked` is told when the request is in, and `let_go` when the gateway closed its
+    /// connection (or after two minutes, when no gateway would have).
+    fn a_model_that_thinks() -> (String, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<std::time::Instant>) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (asked, asked_rx) = std::sync::mpsc::channel();
+        let (let_go, let_go_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else { return };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+            let mut reader = BufReader::new(stream);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let _ = asked.send(());
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = let_go.send(std::time::Instant::now());
+        });
+        (addr, asked_rx, let_go_rx)
+    }
+
+    /// A chat asked for whole (no `stream`) is answered when the model is done; its caller hung up before that, so the
+    /// model is let go then, as a stream's is at its next chunk, and the engine is not kept at an answer nobody will read.
+    #[test]
+    fn a_chat_asked_for_whole_is_withdrawn_from_the_model_when_its_caller_hangs_up() {
+        use std::io::Write;
+        let root = std::env::temp_dir();
+        let cfg = br#"{"llm": {"enabled": true, "server": "no-such/oaiy-llm-server", "server_webgpu": "no-such/oaiy-llm-server-webgpu", "models": [{"name": "small", "path": "small.gguf"}]}, "media": {"llm_policy": "coexist"}}"#;
+        for (target, path, body) in [
+            ("chat", "/v1/chat/completions", r#"{"model": "small", "messages": [{"role": "user", "content": "a long essay, please"}]}"#),
+            ("completions", "/v1/completions", r#"{"model": "small", "prompt": "Once upon a time"}"#),
+        ] {
+            let studio = Arc::new(Studio::for_test(&root, Json::parse(cfg).unwrap()));
+            let (model, asked, let_go) = a_model_that_thinks();
+            studio.llm.adopt(&model, "sk-studio-test");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let gateway = listener.local_addr().unwrap().to_string();
+            let served = Arc::clone(&studio);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                oaiy_engine::http::serve(stream, |req, w| handle(&served, req, w, Matched { target: target.into(), spec: "openai".into(), rest: String::new() }, true));
+            });
+            let mut client = std::net::TcpStream::connect(&gateway).unwrap();
+            write!(client, "POST {path} HTTP/1.1\r\nHost: {gateway}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            asked.recv_timeout(Duration::from_secs(30)).expect("the model was asked");
+            let hung_up = std::time::Instant::now();
+            drop(client);
+            let closed = let_go.recv_timeout(Duration::from_secs(20)).unwrap_or_else(|_| panic!("{target}: the model was still at the answer 20 seconds after its caller hung up"));
+            assert!(closed.duration_since(hung_up) < Duration::from_secs(5), "{target}: let go {:?} after", closed.duration_since(hung_up));
+            // (said by the gateway's thread just after it let the model go)
+            let said = (0..50).any(|_| {
+                let found = studio.log.tail(10).contains("its caller hung up before the answer");
+                if !found {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                found
+            });
+            assert!(said, "{target}: {}", studio.log.tail(10));
+        }
+
+        // A Mac's eGPU (tinygrad's server) likewise; and the request withdrawn is not answered by this computer's engine
+        // in its place, as one the card left unanswered would be.
+        let studio = egpu_studio(&root, "small");
+        let (card, asked, let_go) = a_model_that_thinks();
+        let engine = StandIn::new(ENGINE_SAYS);
+        studio.egpu.adopt(&card, "sk-egpu-test", "big", None);
+        studio.llm.adopt(&engine.addr, "sk-studio-test");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = listener.local_addr().unwrap().to_string();
+        let served = Arc::clone(&studio);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            oaiy_engine::http::serve(stream, |req, w| handle(&served, req, w, Matched { target: "chat".into(), spec: "openai".into(), rest: String::new() }, true));
+        });
+        let body = r#"{"model": "big", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let mut client = std::net::TcpStream::connect(&gateway).unwrap();
+        write!(client, "POST /v1/chat/completions HTTP/1.1\r\nHost: {gateway}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        asked.recv_timeout(Duration::from_secs(30)).expect("the card was asked");
+        let hung_up = std::time::Instant::now();
+        drop(client);
+        let closed = let_go.recv_timeout(Duration::from_secs(20)).expect("the card was let go when its caller hung up");
+        assert!(closed.duration_since(hung_up) < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(engine.requests().is_empty(), "this computer's engine was not asked in the card's place");
+        studio.egpu.stop();
     }
 
     /// Something that stands for a server's process and stays for a minute.

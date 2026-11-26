@@ -1,4 +1,4 @@
-import { Bot, CalendarDays, Cpu, Mail, MessageSquare, Phone, Puzzle, type LucideIcon } from 'lucide-react';
+import { Archive, Bot, CalendarDays, Cpu, Mail, MessageSquare, Phone, Puzzle, type LucideIcon } from 'lucide-react';
 import type { ModulesSnapshot, PageContribution, SectionContribution } from './api';
 
 /**
@@ -74,6 +74,8 @@ export const PLUGIN_ICONS: Record<string, LucideIcon> = {
   mail: Mail,
   bot: Bot,
   gpu: Cpu,
+  // (FormLogic Backups' page: sealed copies kept on this computer)
+  archive: Archive,
 };
 
 export function pluginIcon(name?: string): LucideIcon {

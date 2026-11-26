@@ -76,6 +76,24 @@ struct UnlinkQuery {
     copies_only: bool,
 }
 
+/// Whether [`open_in_browser`] opens `url`: a web address, and nothing a shell or
+/// a protocol handler could read as more.
+pub fn opens_in_browser(url: &str) -> Result<(), String> {
+    // Same rule as the address itself: https anywhere, plain http only for
+    // loopback or a .local name. If these two disagreed, a link could start and
+    // then silently fail to open the page it was waiting for. (No user name
+    // either: `host_of` takes none, so `https://good@evil` is not a host.)
+    if !crate::origin::may_carry_credential(url) {
+        return Err("refusing to open that URL".into());
+    }
+    // Control characters and quotes could still break out of argv quoting on
+    // Windows, where the command line is a single string the callee re-parses.
+    if url.chars().any(|c| c.is_ascii_control() || c == '"' || c == '\'') {
+        return Err("the authorize URL contains characters that cannot be passed safely".into());
+    }
+    Ok(())
+}
+
 /// Hand an authorize URL to the user's browser.
 ///
 /// Deliberately NOT the GUI's `open_url` command. That one rejects `&` as a
@@ -85,18 +103,12 @@ struct UnlinkQuery {
 /// Safe because nothing here goes through a shell: the URL is one argv element,
 /// so `&` has no special meaning. What IS still checked is the scheme — this
 /// must never become a way to launch `file:` or a custom protocol handler.
+///
+/// Started from this process, which no job holds: also what a plugin's
+/// `oaiy.browser.open` is answered with (`plugins::host`), since a browser a
+/// plugin starts itself is in the job its process is, and ends with OAIY.
 pub fn open_in_browser(url: &str) -> Result<(), String> {
-    // Same rule as the address itself: https anywhere, plain http only for
-    // loopback or a .local name. If these two disagreed, a link could start and
-    // then silently fail to open the page it was waiting for.
-    if !crate::origin::may_carry_credential(url) {
-        return Err("refusing to open that URL".into());
-    }
-    // Control characters and quotes could still break out of argv quoting on
-    // Windows, where the command line is a single string the callee re-parses.
-    if url.chars().any(|c| c.is_ascii_control() || c == '"' || c == '\'') {
-        return Err("the authorize URL contains characters that cannot be passed safely".into());
-    }
+    opens_in_browser(url)?;
 
     #[cfg(target_os = "windows")]
     {

@@ -42,6 +42,22 @@ OAIY does not support, leaves the plugin disabled with the reason shown, never s
 missing. A bad `ui` entry is dropped with a warning instead: presentation never stops a
 plugin from loading.
 
+**What a plugin may ask of OAIY.** `plugin.init` carries `hostCalls`, the requests this
+OAIY answers (`flow.run`, `companion.admission`, `oaiy.ring.plan`, `oaiy.ring.opened`,
+`oaiy.browser.open`); a plugin uses one it finds there and keeps its own way where it does
+not, as an older OAIY announces nothing of it. Each is still held to its capability, and a
+refusal comes back as a JSON-RPC error whose `data.code` says why (`capability_denied`,
+`invalid_request`, `unavailable`).
+
+- `oaiy.browser.open {url}` → `{ok: true}` opens a web page in the person's browser, for a
+  plugin that declares the capability `oaiy.browser.open` by that name (the host wildcard
+  `oaiy.*` does not reach it). OAIY opens it from its own process: on Windows a plugin runs
+  inside the job that ends with OAIY, so a browser the plugin starts itself is ended with
+  OAIY, with every tab in it. The address is held to the rule OAIY's own sign-in pages are:
+  https to any host, plain http only to this computer or a `.local` name, no user name in
+  it, no quote or control character, at most 4096 bytes. No list of hosts: a plugin
+  declares none, and one that signs a person in does it at whichever server they name.
+
 ## Package trust
 
 A plugin is native code that runs with your permissions, so its folder is part of what

@@ -1,8 +1,8 @@
 // Where plugin pages go in the sidebar and in a section's tabs.
 import { describe, expect, it } from 'vitest';
-import { BookUser, Bot, CalendarDays, Cpu, LayoutDashboard, Phone, Plug, Puzzle, Settings2, Workflow } from 'lucide-react';
+import { Archive, BookUser, Bot, CalendarDays, Cpu, LayoutDashboard, Phone, Plug, Puzzle, Settings2, Workflow } from 'lucide-react';
 import type { ModulesSnapshot, PageContribution, SectionContribution } from './api';
-import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf, type BuiltinSection } from './sections';
+import { PLUGIN_ICONS, arrangeSections, buildSections, newBadge, pluginIcon, pluginPageOf, sectionOf, type BuiltinSection } from './sections';
 
 const BUILTINS: BuiltinSection[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'Home', tabs: ['overview'] },
@@ -127,6 +127,22 @@ describe('the sidebar with what plugins add', () => {
   it('leaves out a section with no pages', () => {
     const s = buildSections(BUILTINS, [{ id: 'plugin-section:acme:empty', builtin: false, label: 'Empty', pages: [] }], page);
     expect(ids(s)).toEqual(ids(BUILTINS));
+  });
+
+  it("draws the icon a plugin's page names, and the plugin piece for a name it does not know: never nothing", () => {
+    // FormLogic Backups names `archive` (its manifest's ui.nav): a page of sealed copies is not a puzzle piece.
+    const backups = pageOf('formlogic', 'formlogic-backups', { icon: 'archive', label: 'FormLogic Backups', pluginName: 'FormLogic' });
+    const section = buildSections(BUILTINS, [lone(backups)], page).find((x) => x.id === backups.view)!;
+    expect(section.icon).toBe(Archive);
+    expect(section.tabs[0].icon).toBe(Archive);
+    for (const [name, icon] of Object.entries(PLUGIN_ICONS)) expect(pluginIcon(name)).toBe(icon);
+    // Any other name, and none: the plugin piece. A name every object has (`constructor`) is not an icon either.
+    for (const unknown of [undefined, '', 'nothing-we-know', 'Archive', 'constructor', 'toString', '__proto__']) {
+      expect(pluginIcon(unknown)).toBe(Puzzle);
+      const drawn = buildSections(BUILTINS, [lone(pageOf('acme', 'tools', { icon: unknown }))], page).find((x) => x.id === 'plugin:acme:tools')!;
+      expect(drawn.icon).toBe(Puzzle);
+      expect(drawn.tabs[0].icon).toBe(Puzzle);
+    }
   });
 });
 

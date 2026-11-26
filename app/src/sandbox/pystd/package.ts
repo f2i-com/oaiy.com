@@ -14,6 +14,12 @@
  * A module's file is `<dotted name>.py`; its imports are listed as Zipp's
  * build lists its bundled modules' (`i|a.b,c` or `<level>|<module>|x,y`,
  * `;` between statements, `-` for none).
+ *
+ * Zipp takes a module named like one of its own without refusing it, and a
+ * program then imports the package's, not Zipp's. So a module belongs here
+ * only while Zipp has none, or a smaller one: `shutil` stays (Zipp v0.0.41's
+ * has no which, disk_usage, make_archive or ignore_patterns), and `types`
+ * went when Zipp's own had more in it (ModuleType, GenericAlias, ...).
  */
 import RUNTIME from './runtime.js?raw';
 

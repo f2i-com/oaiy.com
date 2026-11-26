@@ -377,7 +377,7 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
         let identity = match E2eIdentity::load_or_create(store.data_dir()) {
             Ok(identity) => identity,
             Err(error) => {
-                store.note_sealed_flow(Some(error.clone()));
+                store.note_sealed_flow_down(error.clone());
                 log::error!("sealed flow identity unavailable: {error}");
                 return;
             }
@@ -430,9 +430,7 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                 last_kept = waiting;
             }
             if kept.held.is_some() {
-                if store.account().as_ref() == Some(&account) {
-                    store.note_sealed_flow(kept.held);
-                }
+                store.note_sealed_flow(&account, kept.held);
                 drop(http);
                 lane.start_afresh();
                 std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds).max(asked));
@@ -467,9 +465,7 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
             // would hold the connection the lane lets go of there (and the one it
             // starts afresh after a failure) open until the next poll.
             drop(http);
-            if store.account().as_ref() == Some(&account) {
-                store.note_sealed_flow(result.as_ref().err().cloned());
-            }
+            store.note_sealed_flow(&account, result.as_ref().err().cloned());
             match result {
                 Ok(worked) => {
                     last_warned = None;

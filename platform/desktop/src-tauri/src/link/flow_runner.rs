@@ -7,7 +7,7 @@
 //! CLI, which is the same engine the browser uses.
 //!
 //! ```text
-//!   GET {queuedPath} ──► POST {claimPath}  (409 = somebody else got it)
+//!   GET {queuedPath} ──► POST {claimPath}  (409 naming no reason = somebody else got it)
 //!                          └─► GET {graphPath} ──► graph.json
 //!                                                  inputs.json
 //!                                                  connector.json ──► oaiy run … --connector
@@ -255,6 +255,11 @@ impl FailureCode {
 struct Failure {
     code: FailureCode,
     message: String,
+    /// What the provider said is about this DESKTOP, not about the flow: it
+    /// handed this desktop no flow at all. The run is reported with `code` like
+    /// any other, and the lane says it too (the link's status, and a pause), since
+    /// every run this desktop takes while it is so ends the same way.
+    of_this_desktop: bool,
 }
 
 impl Failure {
@@ -262,11 +267,18 @@ impl Failure {
         Self {
             code,
             message: message.into(),
+            of_this_desktop: false,
         }
+    }
+
+    /// The same, said of this desktop rather than of the flow.
+    fn of_this_desktop(self) -> Self {
+        Self { of_this_desktop: true, ..self }
     }
 }
 
-/// The four paths that together make a claim lane, resolved once.
+/// The four paths that together make a claim lane, resolved once, and the link
+/// they were resolved for.
 ///
 /// Held as a type so the worker cannot get half way in and discover the
 /// completion path is missing — which would be a claimed run it has no way to
@@ -276,6 +288,16 @@ struct Lane<'a> {
     claim: &'a str,
     complete: &'a str,
     graph: &'a str,
+    /// Whether the link this pass was begun for is still the one this desktop
+    /// holds ([`super::LinkStore::holds`]), asked before each thing the pass
+    /// writes: the claim, the run itself (stopped when it is no longer so), the
+    /// binding's actions, the report and the outcome kept when the report could
+    /// not be made. A pass is minutes long, and a link forgotten or replaced
+    /// meanwhile went on being written for: its result reported with a key the
+    /// person had asked this desktop to forget, and an outcome kept for it after
+    /// the forget had cleared what was kept, to be sent to the next link. None:
+    /// always (a test's pass, or a sealed run, whose own lane answers for it).
+    link: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> Lane<'a> {
@@ -285,9 +307,24 @@ impl<'a> Lane<'a> {
             claim: spec.claim_path.as_deref()?,
             complete: spec.complete_path.as_deref()?,
             graph: spec.graph_path.as_deref()?,
+            link: None,
         })
     }
+
+    /// This lane, for the link `held` says is still held.
+    fn while_held(self, held: &'a dyn Fn() -> bool) -> Self {
+        Lane { link: Some(held), ..self }
+    }
+
+    /// Whether the link this pass is for is still the one this desktop holds.
+    fn linked(&self) -> bool {
+        self.link.is_none_or(|held| held())
+    }
 }
+
+/// What a pass says when its link went while it was at work: nothing more is written for that link, here or at
+/// the provider.
+const LINK_WENT: &str = "the link this run was taken for was forgotten or replaced while it ran, so nothing more was written for it";
 
 /// Poll, claim, run, report — forever, while a link with a claimable flow lane
 /// exists.
@@ -335,11 +372,14 @@ fn spawn_inner(
             std::thread::sleep(Duration::from_secs(5));
             continue;
         };
+        // What this pass writes is written for this link alone: it is asked before each write whether the link is
+        // still the one this desktop holds (see `Lane::link`).
+        let held = || store.holds(&account);
         // Outcomes this desktop could not report before are told first: until
         // they are, those runs look as though they were still running.
         if std::time::Instant::now() >= pending_at {
             if let Some(dir) = PENDING_DIR.get() {
-                resend_pending(dir, &account);
+                resend_pending(dir, &account, &held);
             }
             pending_at = std::time::Instant::now() + PENDING_EVERY;
         }
@@ -357,7 +397,7 @@ fn spawn_inner(
         }
         // A provider that only wants runs QUEUED names no claim lane, and this
         // desktop then does nothing here — which is correct, not an error.
-        let Some(lane) = Lane::of(&spec) else {
+        let Some(lane) = Lane::of(&spec).map(|lane| lane.while_held(&held)) else {
             std::thread::sleep(Duration::from_secs(30));
             continue;
         };
@@ -365,16 +405,22 @@ fn spawn_inner(
         // Resolved on the way IN to the poll, so a run is never claimed that
         // this desktop could not prepare (a claimed run is one no other runtime
         // will touch).
-        let held = super::script_profile::resolve(&account, store.data_dir());
+        let prelude = super::script_profile::resolve(&account, store.data_dir());
 
         // Counted BEFORE the queue is read: a run reserved just after the listing
         // was made is answered by the wait below at once, not when the timer
         // comes round.
         let mut seen = wake.count();
-        match poll_once(&account, &spec, &lane, &instance, node.as_ref(), &held) {
+        let polled = poll_once(&account, &spec, &lane, &instance, node.as_ref(), &prelude);
+        // The link went while this pass was at work: what it came to is not said (it is about a link no longer
+        // held), and the next pass, for the next link, is not kept waiting behind a back-off that was this one's.
+        if !held() {
+            continue;
+        }
+        match polled {
             Ok((handled, trouble)) => {
                 let stumbled = trouble.is_some();
-                store.note_flow_run(trouble);
+                store.note_flow_run(&account, trouble);
                 if stumbled {
                     // The try after a failure is on a new client, not one that
                     // has seen the trouble.
@@ -390,7 +436,7 @@ fn spawn_inner(
                 }
             }
             Err(e) => {
-                store.note_flow_run(Some(e));
+                store.note_flow_run(&account, Some(e));
                 HTTP.start_afresh();
                 std::thread::sleep(ERROR_BACKOFF);
             }
@@ -542,6 +588,10 @@ fn serve(
     if let Held::Missing(why) = held {
         return Err(why.clone());
     }
+    // A link forgotten since the queue was read takes nothing more: the run stays queued for another runtime.
+    if !lane.linked() {
+        return Ok(false);
+    }
     let http = HTTP.get()?;
 
     // Claim FIRST — before fetching the graph, before writing a file, before
@@ -574,16 +624,28 @@ fn serve(
             return Err(format!("could not claim the run: {e}"));
         }
     };
-    // Only the status is wanted; the rest is read out so the connection can carry
-    // what follows.
+    // Only the status is wanted, and what a conflict says; the rest is read out
+    // so the connection can carry what follows.
     let claim_status = claimed.status();
-    super::net::drain(claimed);
+    let conflict: Option<Value> = if claim_status.as_u16() == 409 {
+        Some(super::net::read_json(claimed).unwrap_or(Value::Null))
+    } else {
+        super::net::drain(claimed);
+        None
+    };
     if !claim_status.is_success() {
         let code = claim_status.as_u16();
         // 409 is "somebody else got there first", which is the exactly-once
-        // gate working, not a fault worth showing anyone.
-        if code == 409 {
-            return Ok(false);
+        // gate working, not a fault worth showing anyone, when that is what it
+        // says. One that names a reason of its own is the provider refusing THIS
+        // desktop the run, and nothing moved: it was taken for the race and
+        // swallowed, and the run waited for a runtime that never came while
+        // nothing on this side said why.
+        if let Some(said) = conflict {
+            return match refused_by_name(&run.id, &said) {
+                None => Ok(false),
+                Some(why) => Err(why),
+            };
         }
         // A 5xx is the same ambiguity as a lost connection: the provider may
         // have transitioned the row and then failed on its way back. A 4xx did
@@ -595,7 +657,12 @@ fn serve(
     }
 
     // From here the run is OURS and the provider has it marked running. Every
-    // path below ends at report().
+    // path below ends at report(), but for one: a link that went while the claim
+    // was answered has nothing more done or said for it (left claimed, the run
+    // is ended by the provider's sweep of stale runs).
+    if !lane.linked() {
+        return Err(format!("{LINK_WENT}: run {} was claimed and not started", run.id));
+    }
     let outcome = execute(account, spec, lane, node, run, held);
     if let Err(f) = &outcome {
         log::info!("flow run {} failed ({:?}): {}", run.id, f.code, f.message);
@@ -615,11 +682,40 @@ fn serve(
     // the request that is sent twice inside the one execution (its answer lost
     // on the way back).
     let outcome = match outcome {
-        Ok(result) => cap_result(result).map(|result| apply_result_actions(account, spec, run, result)),
+        Ok(result) => cap_result(result).map(|result| apply_result_actions(account, spec, lane, run, result)),
         other => other,
     };
+    // A failure the provider said of this desktop (it handed it no flow) is the lane's as well as the run's: said
+    // in the link's status once the run is reported, where a flow's own failure is not.
+    let of_this_desktop = outcome.as_ref().err().filter(|f| f.of_this_desktop).map(|f| f.message.clone());
     report(account, lane, instance, &run.id, outcome)?;
-    Ok(true)
+    match of_this_desktop {
+        Some(why) => Err(why),
+        None => Ok(true),
+    }
+}
+
+/// What a 409 to a claim says when it is not the exactly-once gate at work: a
+/// reason of the provider's own, which it names with a `code` (the race is a 409
+/// that names none). Said in the provider's code and words, with the languages
+/// it names when it names any (a flow whose code is in one this desktop does not
+/// run), for the log and the link's status. None: the race, said by nobody.
+fn refused_by_name(run_id: &str, said: &Value) -> Option<String> {
+    // (the race said by name: what a provider that names it as its claim does internally would call it)
+    let code = said.get("code").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty() && *c != "already_claimed")?;
+    let mut why = format!("the provider will not let this desktop take run {run_id} ({code})");
+    let languages: Vec<&str> = said
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|listed| listed.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !languages.is_empty() {
+        why.push_str(&format!(": its flow has code in {}, which this desktop does not run", languages.join(", ")));
+    }
+    if let Some(message) = said.get("message").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()) {
+        why.push_str(&format!(" — {}", clip(message, MAX_MESSAGE_BYTES)));
+    }
+    Some(why)
 }
 
 /// Perform the binding's post-run actions and fold their failures into the
@@ -633,6 +729,7 @@ fn serve(
 fn apply_result_actions(
     account: &LinkedAccount,
     spec: &FlowsSpec,
+    lane: &Lane,
     run: &QueuedRun,
     result: Value,
 ) -> Value {
@@ -641,6 +738,10 @@ fn apply_result_actions(
     let Some(actions_spec) = spec.result_actions.as_ref() else {
         return result;
     };
+    // (the link went while the run was at work: no action is performed for it, and the report is not made either)
+    if !lane.linked() {
+        return result;
+    }
     let Some(selectors) = spec.selectors.as_ref() else {
         return result;
     };
@@ -691,11 +792,13 @@ fn apply_result_actions(
         .as_deref()
         .filter(|k| !k.is_empty())
         .unwrap_or(&run.id);
+    let linked = || lane.linked();
     let doer = result_actions::Live {
         account,
         spec: actions_spec,
         connector,
         run_id: &run.id,
+        linked: &linked,
     };
     let errors =
         result_actions::perform_all(actions_spec, selectors, &actions, &scope, run_key, &doer);
@@ -737,7 +840,7 @@ fn release_if_claimed(
 
 /// What a sealed run has of a claim lane: the graph, and nothing of the queue.
 fn sealed_lane(graph: &str) -> Lane<'_> {
-    Lane { queued: "", claim: "", complete: "", graph }
+    Lane { queued: "", claim: "", complete: "", graph, link: None }
 }
 
 /// Fetch the graph, hand it to the CLI, and turn the result into an outcome.
@@ -922,8 +1025,9 @@ fn run_in(
             profile_path: profile_path.as_deref(),
             node,
         },
-        // Nothing cancels a provider's run from this side; the budget does.
-        &|| false,
+        // Nothing cancels a provider's run from this side but the link going (its nodes write with the link's key,
+        // which the person has asked this desktop to forget); otherwise the budget ends it.
+        &|| !lane.linked(),
     );
 
     match outcome {
@@ -1078,23 +1182,29 @@ fn fetch_graph(
     };
     let found = match select_flow(&reply.flows, run) {
         Some(f) => f,
-        // An EMPTY listing is not "this flow does not exist". A provider lists
-        // what the CALLER can run, and one that has decided this desktop cannot
-        // run logic right now hands it nothing at all — every flow, not just
-        // the ones with code. Reading that as a broken graph would file a
-        // permanent failure against an automation that is fine and send its
-        // author looking for a step to fix, when the fix is on this machine and
-        // another runtime would have run the flow as it stands. (This run is
-        // ended either way: a claimed run that is reported failed is not
-        // queued again.)
+        // An EMPTY listing is not "this flow is broken". A provider lists what
+        // the CALLER can run, so the listing says there is nothing this desktop
+        // may run: the provider has stopped counting its engine since the claim
+        // (it then hands the caller nothing at all, every flow and not just the
+        // ones with code), or this run's flow has gone with every other this
+        // desktop could run. Either way the flow this run needs was not available
+        // to this runtime, which is the provider's own `runner_unavailable`
+        // ("nothing was available to run it", what its browser reports of a run
+        // it holds and has no flow for), not `invalid_flow`, which would send the
+        // author looking for a step to fix in a flow that is fine. And it is said
+        // of this desktop, not only of this run: the lane shows it, because every
+        // run taken while it is so ends the same way. (This run is ended either
+        // way: a claimed run cannot be handed back to the queue.)
         None if reply.flows.is_empty() => {
             return Err(Failure::new(
                 FailureCode::RunnerUnavailable,
                 format!(
-                    "the provider listed no flows for this desktop, so the graph for {} could                      not be fetched — this desktop may not be reporting an engine the provider                      will hand work to",
+                    "the provider listed no flow at all for this desktop, so there was nothing to run for {}: it may \
+                     no longer count this desktop's engine, or the flow has gone",
                     named()
                 ),
-            ))
+            )
+            .of_this_desktop())
         }
         None => {
             return Err(Failure::new(
@@ -1147,6 +1257,19 @@ fn report(
     run_id: &str,
     outcome: Result<Value, Failure>,
 ) -> Result<(), String> {
+    report_keeping_in(PENDING_DIR.get().map(PathBuf::as_path), account, lane, instance, run_id, outcome)
+}
+
+/// [`report`], keeping an outcome it could not report in `keep_in` (none: nowhere, as on a runtime that started no
+/// lane to send it later).
+fn report_keeping_in(
+    keep_in: Option<&Path>,
+    account: &LinkedAccount,
+    lane: &Lane,
+    instance: &str,
+    run_id: &str,
+    outcome: Result<Value, Failure>,
+) -> Result<(), String> {
     let body = match outcome.and_then(cap_result) {
         Ok(result) => json!({
             "instanceId": instance,
@@ -1166,6 +1289,11 @@ fn report(
     for attempt in 0..COMPLETE_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(2));
+        }
+        // Not with a key the person has asked this desktop to forget, and nothing is kept for the link either: the
+        // provider's sweep of stale runs ends the run.
+        if !lane.linked() {
+            return Err(format!("{LINK_WENT}: run {run_id} was not reported"));
         }
         let http = match HTTP.get() {
             Ok(c) => c,
@@ -1206,10 +1334,23 @@ fn report(
     // Kept, and told when the provider can be reached (a lost network after the
     // run must not leave it marked running for good). Loud all the same: until
     // then the run looks as though it were still working.
-    match PENDING_DIR.get().map(|dir| keep_pending(dir, account, run_id, &url, &body)) {
+    //
+    // For the link still held alone, and decided under the lock a forget clears
+    // what is kept under: an outcome is kept before the forget, and goes with
+    // it, or is not kept. (Kept after it, it outlived the link it was for and
+    // was sent to the next one.)
+    let kept = keep_in.map(|dir| {
+        let _forget_waits = PENDING_KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if !lane.linked() {
+            return Err(LINK_WENT.to_string());
+        }
+        keep_pending(dir, account, run_id, &url, &body)
+    });
+    match kept {
         Some(Ok(())) => Err(format!(
             "{last} — run {run_id} looks stuck at running until then: its outcome is kept and will be sent when the provider answers"
         )),
+        Some(Err(went)) if went == LINK_WENT => Err(format!("{last} — {LINK_WENT}: the outcome of run {run_id} was not kept")),
         _ => Err(format!(
             "{last} — run {run_id} was claimed by this desktop and may be stuck at running"
         )),
@@ -1228,8 +1369,12 @@ struct PendingCompletion {
     kept_at: String,
 }
 
+/// Held while an outcome is kept, and while what is kept is forgotten: see [`report`].
+static PENDING_KEPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Forget the outcomes kept for the provider (the account is unlinked: they are its, and no other account takes them).
 pub(crate) fn forget_pending() {
+    let _keeping_waits = PENDING_KEPT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = PENDING_DIR.get() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
@@ -1258,11 +1403,16 @@ fn keep_pending(dir: &Path, account: &LinkedAccount, run_id: &str, url: &str, bo
 /// Tell the provider the outcomes kept for it: each goes once it is taken, or the
 /// provider says it is final already (409) or no longer there to finish (404,
 /// 410). While the provider cannot be reached the rest wait for the next try.
-fn resend_pending(dir: &Path, account: &LinkedAccount) {
+/// `linked` is asked before each: none is sent once `account` is no longer the
+/// link this desktop holds.
+fn resend_pending(dir: &Path, account: &LinkedAccount, linked: &dyn Fn() -> bool) {
     const PENDING_KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let Ok(http) = HTTP.get() else { return };
     for entry in entries.flatten() {
+        if !linked() {
+            return;
+        }
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -2065,10 +2215,13 @@ mod tests {
         // for a step to fix, when the fix is on this machine.
         //
         // `runner_unavailable` is the provider's own word for "nothing was
-        // available to run it", which is exactly what happened.
+        // available to run it", which is exactly what happened. And what it says
+        // is about this desktop, not the flow: the lane says it too, where a
+        // flow's own failure is not, or the panel shows a desktop that is fine
+        // while every run it takes ends this way.
         const NO_FLOWS: &str = r#"{"flows":[]}"#;
         let (base, rx) = stub_provider(ONE_RUN, NO_FLOWS, "200 OK", "200 OK");
-        let (handled, _) =
+        let (handled, trouble) =
             poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 1);
@@ -2079,19 +2232,25 @@ mod tests {
             .1;
         assert!(complete_raw.contains("runner_unavailable"), "{complete_raw}");
         assert!(!complete_raw.contains("invalid_flow"), "{complete_raw}");
-        assert!(complete_raw.contains("listed no flows"), "{complete_raw}");
+        assert!(complete_raw.contains("listed no flow at all"), "{complete_raw}");
+        let said = trouble.expect("said of this desktop in the link's status");
+        assert!(said.contains("listed no flow at all") && said.contains("f1"), "{said}");
+        assert!(!said.contains("  "), "one sentence, not a run of spaces: {said:?}");
 
         // A list that HAS flows and does not have this one is still a broken
         // run: that flow really is gone, and saying "runner unavailable" would
-        // hide it behind a retry that can never work.
+        // hide it behind a retry that can never work. That is the flow's, and
+        // the lane says nothing of it.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
-        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
+        let (_, trouble) =
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
         let complete_raw = rx
             .iter()
             .find(|(line, _)| line.starts_with("PATCH /runs/r1 "))
             .expect("the run is reported")
             .1;
         assert!(complete_raw.contains("invalid_flow"), "{complete_raw}");
+        assert_eq!(trouble, None);
     }
 
     #[test]
@@ -2113,6 +2272,51 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "nothing may follow a lost claim — no graph fetch, no run, no completion"
         );
+    }
+
+    #[test]
+    fn a_claim_the_provider_refuses_this_desktop_by_name_is_said_and_one_another_runtime_won_is_not() {
+        // FormLogic answers a claim 409 three ways: the run was taken already (no code), the flow's code is in a
+        // language this desktop did not say it runs (`language_unsupported`, with the languages), and its last beat
+        // carried no engine (`engine_unavailable`). Every 409 was read as the first, so the other two left the run
+        // waiting for a runtime that never came, with nothing here saying why.
+        let answered = |reply: &'static str| {
+            let served = AtomicBool::new(false);
+            let server = Provider::start(move |req| {
+                if req.target.starts_with("/runs/queued") {
+                    if served.swap(true, Ordering::SeqCst) { Reply::ok(r#"{"runs":[]}"#) } else { Reply::ok(ONE_RUN) }
+                } else if req.target.ends_with("/claim") {
+                    Reply::status(409, reply)
+                } else {
+                    Reply::ok(NO_MATCHING_FLOW)
+                }
+            });
+            let polled = poll_once(&account(server.base.clone()), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
+                .unwrap();
+            (polled, server.lines())
+        };
+
+        let (polled, asked) = answered(
+            r#"{"error":true,"code":"language_unsupported","languages":["python"],"message":"This flow has Python code this runtime cannot run."}"#,
+        );
+        let (taken, trouble) = polled;
+        let why = trouble.expect("said, for the panel");
+        assert_eq!(taken, 1);
+        assert!(why.contains("r1") && why.contains("language_unsupported") && why.contains("code in python"), "{why}");
+        assert!(why.contains("This flow has Python code"), "the provider's own words: {why}");
+        assert_eq!(asked, ["GET /runs/queued", "POST /runs/r1/claim"], "nothing moved, so nothing follows");
+
+        let (polled, _) = answered(r#"{"error":true,"code":"engine_unavailable","message":"This runtime's engine is not reporting healthy."}"#);
+        assert!(polled.1.is_some_and(|why| why.contains("engine_unavailable") && why.contains("not reporting healthy")));
+        let (polled, _) = answered(r#"{"code":"a_reason_this_desktop_has_not_heard_of"}"#);
+        assert!(polled.1.is_some_and(|why| why.contains("a_reason_this_desktop_has_not_heard_of")));
+
+        // The race, as FormLogic says it, and a 409 that says nothing at all: the exactly-once gate, said by nobody.
+        for reply in [r#"{"error":true,"message":"This run was already claimed"}"#, "", r#"{"code":""}"#, r#"{"code":"already_claimed"}"#] {
+            let (polled, asked) = answered(reply);
+            assert_eq!(polled, (0, None), "{reply:?}");
+            assert_eq!(asked.len(), 2, "{asked:?}");
+        }
     }
 
     #[test]
@@ -2289,12 +2493,12 @@ mod tests {
         drop(away);
         let body = json!({"instanceId": "oaiy-test", "status": "done", "result": {"ok": true}});
         keep_pending(&dir, &account(away_url.clone()), "r/1", &format!("{away_url}/runs/r1"), &body).unwrap();
-        resend_pending(&dir, &account(away_url));
+        resend_pending(&dir, &account(away_url), &|| true);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "kept while the provider is away");
 
         // Another provider's kept outcome is never sent to this one.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
-        resend_pending(&dir, &account(base.clone()));
+        resend_pending(&dir, &account(base.clone()), &|| true);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 
@@ -2304,7 +2508,7 @@ mod tests {
         kept.base_url = base.clone();
         kept.url = format!("{base}/runs/r1");
         std::fs::write(&file, serde_json::to_string(&kept).unwrap()).unwrap();
-        resend_pending(&dir, &account(base));
+        resend_pending(&dir, &account(base), &|| true);
         let (line, raw) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(line.starts_with("PATCH") && line.contains("/runs/r1"), "{line}");
         assert!(raw.contains("\"status\":\"done\""), "{raw}");
@@ -2329,6 +2533,101 @@ mod tests {
             }
         }
         assert_eq!(patches, 1);
+    }
+
+    /// One pass of the queue check against a stand-in provider that forgets the link the moment it answers the
+    /// request whose path begins `forgotten_at` (as a person who disconnects then would): the pass as the lane's own
+    /// loop makes it, asking the store before each write. What the pass came to, and the requests it made.
+    fn a_pass_whose_link_is_forgotten_at(forgotten_at: &'static str, tag: &str) -> (Result<(usize, Option<String>), String>, Vec<String>) {
+        let slot: std::sync::Arc<std::sync::Mutex<Option<LinkHandle>>> = Default::default();
+        let forget = slot.clone();
+        let served = AtomicBool::new(false);
+        let server = Provider::start(move |req| {
+            let reply = if req.target.starts_with("/runs/queued") {
+                if served.swap(true, Ordering::SeqCst) { Reply::ok(r#"{"runs":[]}"#) } else { Reply::ok(ONE_RUN) }
+            } else if req.target.ends_with("/claim") {
+                Reply::ok(r#"{"claimed":true}"#)
+            } else if req.method == "GET" && req.target.starts_with("/flows") {
+                Reply::ok(NO_MATCHING_FLOW)
+            } else {
+                Reply::ok("{}")
+            };
+            if req.target.starts_with(forgotten_at) {
+                if let Some(store) = forget.lock().unwrap().as_ref() {
+                    store.drop_account_for_tests();
+                }
+            }
+            reply
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| d.script_profile = None);
+        *slot.lock().unwrap() = Some(store.clone());
+        let linked = store.account().unwrap();
+        let held = || store.holds(&linked);
+        let flows = spec();
+        let lane = Lane::of(&flows).unwrap().while_held(&held);
+        let polled = poll_once(&linked, &flows, &lane, "oaiy-test", None, &Held::NotRequired);
+        let _ = std::fs::remove_dir_all(dir);
+        (polled, server.lines())
+    }
+
+    #[test]
+    fn a_run_whose_link_is_forgotten_while_it_is_at_work_writes_nothing_more_for_it() {
+        // A person who disconnects while this desktop holds a claimed run: the run went on, and its outcome was
+        // reported with the key they had asked this desktop to forget (or, refused once that key was revoked, kept
+        // and sent to the next link). Forgotten as the claim is answered, it is neither started nor reported.
+        let (polled, asked) = a_pass_whose_link_is_forgotten_at("/runs/r1/claim", "run-link-went-claimed");
+        assert_eq!(asked, ["GET /runs/queued", "POST /runs/r1/claim"], "nothing after the claim");
+        let (taken, trouble) = polled.unwrap();
+        assert_eq!(taken, 1);
+        assert!(trouble.is_some_and(|why| why.contains("forgotten or replaced")));
+
+        // Forgotten as the queue is answered: the run is not claimed, and stays for another runtime.
+        let (polled, asked) = a_pass_whose_link_is_forgotten_at("/runs/queued", "run-link-went-queued");
+        assert_eq!(asked, ["GET /runs/queued"]);
+        assert_eq!(polled.unwrap(), (0, None));
+
+        // And forgotten as the graph is read: the run is reported to nobody.
+        let (_, asked) = a_pass_whose_link_is_forgotten_at("/flows", "run-link-went-graph");
+        assert_eq!(asked, ["GET /runs/queued", "POST /runs/r1/claim", "GET /flows"], "no report");
+    }
+
+    #[test]
+    fn an_outcome_is_kept_only_for_a_link_still_held_when_it_is_kept() {
+        // An outcome the provider would not take was kept after the link it was for had been forgotten, and the
+        // forget, which clears what is kept, had already been: it was sent to the next link. Decided under the lock
+        // the forget clears them under, so it is kept before the forget, and goes with it, or not at all.
+        let server = Provider::start(|_| Reply::status(500, r#"{"message":"down"}"#));
+        let dir = crate::test_dirs::temp_path("oaiy-fr-kept-for-a-link");
+        let flows = spec();
+        // Held through the tries, and gone when the outcome would be kept.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let held = || asked.fetch_add(1, Ordering::SeqCst) < COMPLETE_ATTEMPTS;
+        let lane = Lane::of(&flows).unwrap().while_held(&held);
+        let said = report_keeping_in(Some(&dir), &account(server.base.clone()), &lane, "oaiy-test", "r1", Ok(json!({})))
+            .unwrap_err();
+        assert!(said.contains("forgotten or replaced") && said.contains("not kept"), "{said}");
+        assert_eq!(server.lines().len(), COMPLETE_ATTEMPTS, "{:?}", server.lines());
+        assert!(!pending_file(&dir, "r1").exists(), "nothing is kept for a link that went");
+
+        // Held throughout: kept, as it always was.
+        let lane = Lane::of(&flows).unwrap();
+        let said = report_keeping_in(Some(&dir), &account(server.base.clone()), &lane, "oaiy-test", "r2", Ok(json!({})))
+            .unwrap_err();
+        assert!(said.contains("its outcome is kept"), "{said}");
+        assert!(pending_file(&dir, "r2").exists());
+
+        // A link that went before the tries is not reported at all.
+        let gone = || false;
+        let before = server.lines().len();
+        let lane = Lane::of(&flows).unwrap().while_held(&gone);
+        let said = report_keeping_in(Some(&dir), &account(server.base.clone()), &lane, "oaiy-test", "r3", Ok(json!({})))
+            .unwrap_err();
+        assert!(said.contains("was not reported"), "{said}");
+        assert_eq!(server.lines().len(), before);
+        // Nor are the outcomes kept for it sent.
+        resend_pending(&dir, &account(server.base.clone()), &gone);
+        assert_eq!(server.lines().len(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2471,7 +2770,7 @@ mod tests {
         };
         let file = dir.join("r-evil.json");
         std::fs::write(&file, serde_json::to_string(&tampered).unwrap()).unwrap();
-        resend_pending(&dir, &acc);
+        resend_pending(&dir, &acc, &|| true);
         assert!(elsewhere.requests().is_empty(), "off-origin kept url must not receive bearer");
         assert!(!file.exists(), "off-origin kept completion must be put aside");
         let _ = std::fs::remove_dir_all(&dir);

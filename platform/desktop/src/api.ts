@@ -8,6 +8,7 @@
 
 import { visibleText } from './visibleText';
 import { desktopLaunch } from './nativeLaunch';
+import { KEY_REFUSAL, WINDOW_KEY_ERROR, windowFetch } from './windowKey';
 
 /** The native bootstrap is validated once before any API client can run. */
 export const DESKTOP_LAUNCH = desktopLaunch(typeof window === 'undefined' ? undefined : window);
@@ -61,7 +62,8 @@ async function request<T>(
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), waitMs);
   try {
-    const resp = await fetch(`${API_BASE}${path}`, {
+    // (with this window's key, as every request to the API is: windowKey.ts)
+    const resp = await windowFetch(`${API_BASE}${path}`, {
       headers: { 'Content-Type': 'application/json' },
       ...init,
       signal: ac.signal,
@@ -80,7 +82,9 @@ async function request<T>(
         // Two error shapes in this API: the plain `{ error: "msg" }` the
         // services/models/python routes use, and the taxonomy `{ error: { code,
         // message } }` the bridge + AI gateway routes use. Surface either.
-        if (typeof body?.error === 'string') detail = body.error;
+        // (refused for the lack of this window's key: said for a person, the same on every page and in the banner)
+        if (body?.error === KEY_REFUSAL) detail = WINDOW_KEY_ERROR;
+        else if (typeof body?.error === 'string') detail = body.error;
         else if (typeof body?.error?.message === 'string') detail = body.error.message;
       } catch {
         /* not JSON — ignore */
@@ -657,7 +661,7 @@ export const modules = {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 15000);
     try {
-      const resp = await fetch(`${API_BASE}/api/modules`, {
+      const resp = await windowFetch(`${API_BASE}/api/modules`, {
         headers: etag ? { 'If-None-Match': etag } : {},
         cache: 'no-store',
         signal: ac.signal,
@@ -1899,7 +1903,7 @@ export const voices = {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 90_000);
     try {
-      const resp = await fetch(`${API_BASE}/api/voice/voices/${encodeURIComponent(name)}/try`, {
+      const resp = await windowFetch(`${API_BASE}/api/voice/voices/${encodeURIComponent(name)}/try`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(text ? { text } : {}),
@@ -2011,7 +2015,7 @@ export const contacts = {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 30_000);
     try {
-      const resp = await fetch(`${API_BASE}/api/contacts/export.csv`, { signal: ac.signal });
+      const resp = await windowFetch(`${API_BASE}/api/contacts/export.csv`, { signal: ac.signal });
       if (!resp.ok) {
         const body = await resp.json().catch(() => null);
         throw new ApiError(resp.status, body?.error?.message ?? statusWords(resp));
@@ -2587,7 +2591,7 @@ export const network = {
    *  address may name the desktop's port when the run was made), as a Blob to show. */
   picture: async (address: string): Promise<Blob> => {
     const path = new URL(address, API_BASE).pathname;
-    const resp = await fetch(`${API_BASE}${path}`);
+    const resp = await windowFetch(`${API_BASE}${path}`);
     if (!resp.ok) throw new ApiError(resp.status, statusWords(resp));
     return resp.blob();
   },

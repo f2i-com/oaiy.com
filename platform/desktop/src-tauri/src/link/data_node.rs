@@ -223,9 +223,9 @@ pub fn spawn(store: LinkHandle) {
                 schedule.registered(&registered, spec.interval_seconds, now);
                 // (a provider that does not offer a node shows nothing as wrong)
                 match registered {
-                    Ok(Some(status)) => store.note_data_node(Ok(status)),
-                    Ok(None) => store.note_data_node_off(),
-                    Err(e) => store.note_data_node(Err(e)),
+                    Ok(Some(status)) => store.note_data_node(&account, Ok(status)),
+                    Ok(None) => store.note_data_node_off(&account),
+                    Err(e) => store.note_data_node(&account, Err(e)),
                 }
                 continue;
             }
@@ -236,7 +236,7 @@ pub fn spawn(store: LinkHandle) {
             // which reads as the approval not having worked.
             if schedule.refresh_due(now) {
                 match refresh(&account, &spec) {
-                    Some(status) => store.note_data_node(Ok(status)),
+                    Some(status) => store.note_data_node(&account, Ok(status)),
                     None => HTTP.start_afresh(),
                 }
                 schedule.refreshed(now);

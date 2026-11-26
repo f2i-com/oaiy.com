@@ -14,7 +14,7 @@
     pairing math   the arithmetic of the pairing equals an independent recomputation (the driver asserts)
     sealed         libsodium's boxes open here, the crate's boxes open in libsodium (the driver asserts, and seal_check.php exits 1 when one does not)
     poll           the poll decision core agrees with the reviewer's independent implementation of the README on every generated case (zero disagreements)
-    admission      the readers agree with the Python port of the shipped decoders except for the known, documented differences (the count is pinned at 1005 for the default corpus; see -ExpectedAdmissionDisagreements)
+    admission      the readers agree with the Python port of the shipped decoders except for the known, documented differences (the count is pinned at 1008 for the default corpus; see -ExpectedAdmissionDisagreements)
     encoding       base64url, JSON and the text rules against PHP, Node, Python and serde_json: the comparison scripts print their counts; the lines that must be zero are checked
 
   A tool that is not installed makes its pipeline SKIPPED, loudly, and the exit status 3 (unless nothing else failed and -AllowSkips is given); it is never a silent pass.
@@ -208,14 +208,16 @@ Pipeline 'admission' @('python') {
     $line = $report | Where-Object { $_ -match '^(\d+) cases; (\d+) both accept; (\d+) both refuse; (\d+) disagree; (\d+) python crashes' } | Select-Object -First 1
     if (-not $line) { Fail 'cmp_adm.py printed no summary' }
     $disagree = [int]$Matches[4]
-    # With the default 2000 copies per recorded case (20,000 cases, seed 1) the count is 1005 and was already 1005 when the crate was reviewed: 516 where the crate accepts and the
-    # shipped decoder refuses, 485 the other way, and 4 where the relay advertisement is usable in one and not the other. A change in the count is a change in a reader, and is looked at.
-    if ($ExpectedAdmissionDisagreements -lt 0 -and $AdmissionCases -eq 2000) { $ExpectedAdmissionDisagreements = 1005 }
+    # With the default 2000 copies per recorded case (20,000 cases, seed 1) the count is 1008: 516 where the crate accepts and the shipped decoder refuses, 488 the other way, and 4
+    # where the relay advertisement is usable in one and not the other. It was 1005 (485 the other way) when the crate was reviewed; the 3 more are damaged copies whose ICE URL is a
+    # scheme with nothing after it (`turn:`, `turns:`), which the crate now refuses as ice-server.schema.json and the relay do (a URL with white space in it too: the corpus has none).
+    # A change in the count is a change in a reader, and is looked at.
+    if ($ExpectedAdmissionDisagreements -lt 0 -and $AdmissionCases -eq 2000) { $ExpectedAdmissionDisagreements = 1008 }
     if ([int]$Matches[5] -ne 0) { Fail 'the python port crashed on a case' }
     if ($ExpectedAdmissionDisagreements -ge 0 -and $disagree -ne $ExpectedAdmissionDisagreements) {
         Fail "expected $ExpectedAdmissionDisagreements known disagreements, got $disagree (see $d\disagree.txt)"
     }
-    Write-Host "    $disagree cases where the crate and the shipped decoders differ (stricter on the bearer and the scopes; looser on the echoed endpoint key of a plugin admission, the phone's device record, the content of an ICE credential and the gateway and relayOnly values): see the README of the crate"
+    Write-Host "    $disagree cases where the crate and the shipped decoders differ (stricter on the bearer, the scopes and the URL of an ICE server; looser on the echoed endpoint key of a plugin admission, the phone's device record, the content of an ICE credential and the gateway and relayOnly values): see the README of the crate"
 }
 
 # ---- Encoding: base64url

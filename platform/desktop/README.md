@@ -44,7 +44,7 @@ config dir on first run; edit there to customise without rebuilding):
 |---|---|
 | **OAIY Voice** | OAIY's own voice for calls: speech-to-text and text-to-speech in one resident process on the GPU. Its program ships with OAIY. Serves on `:8783`. |
 | **Aokie Speech-to-Text** / **Aokie Text-to-Speech** | The Aokie receptionist's ears and voice; their program lives in the Aokie plugin. Serve on `:8781` / `:8782`. |
-| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`, and answers only its own `Host` and OAIY's own windows (the Agent and the Flows page, named in `OAIY_ALLOWED_ORIGINS`) or programs that send no `Origin`; any other web page gets 403 or 421. |
+| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`, and answers only its own `Host` and OAIY's own windows (the Agent and the Flows page, named in `OAIY_ALLOWED_ORIGINS`; on Windows, where their origins are `.localhost` names, only with the key OAIY gives the Flows page, `OAIY_BROWSER_KEY`) or programs that send no `Origin`; any other web page gets 403 or 421. |
 
 ### Who may call the Playwright Browser server
 
@@ -60,6 +60,13 @@ port, so it answers by rule (`resources/scripts/playwright_server.py`):
   (`${allowedOrigins}` in the template); the reply echoes that origin, never `*`, and
   no Private Network Access answer is given. Programs that send no `Origin` (OAIY
   itself, `curl`, scripts, `oaiy run`) need no entry.
+- An allowed `Origin` that is a name under `localhost` (Windows' form of the windows,
+  `http://oaiyflows.localhost`) is also `403` unless the request carries
+  `Authorization: Bearer <OAIY_BROWSER_KEY>`. OAIY makes that key for each run, passes it
+  to the service (always its own: a value in an edited copy of the template is replaced) and
+  gives it to the Flows page alone (`window.__OAIY_DESKTOP__.browserKey`), which sends it with
+  every request to the service. A preflight is answered without it (a browser sends no
+  credentials on one); a service started without a key believes no such name at all.
 - To let another page call it (say a `vite dev` tab of the flow editor at
   `http://localhost:5173`), edit your copy of the template on disk
   (`templates/playwright-browser.json` in the data folder; OAIY leaves an edited copy
@@ -71,14 +78,30 @@ port, so it answers by rule (`resources/scripts/playwright_server.py`):
 - The headless `oaiy-server` has no windows and passes an empty list: no web page may
   call the service there.
 
-**Known residual.** An origin is a name, not a proof of who holds it. On Windows the
+**Why the key.** An origin is a name, not a proof of who holds it. On Windows the
 windows' origins are `http://oaiy.localhost` and `http://oaiyflows.localhost`, and
 `*.localhost` names resolve to the machine itself in a browser, so any program
 listening on `127.0.0.1:80` that answers such a name (a local web server such as WAMP,
 which can be installed on this machine) can serve a page whose `Origin` is allowed.
-OAIY's own guard for its API on port 17972 has the same limit. The design considered
-sending a token in a header instead (access model A5) and declined it, so it is not
-done here; a local program can also call the server directly, as it always could.
+OAIY's guard for its API on port 17972 takes those origins (and the dashboard's,
+`http://tauri.localhost`) for OAIY's windows only with a token the desktop hands each
+window; the browser service now takes them only with the key above. A local program can
+still call the server directly, with no `Origin`, as it always could.
+
+**Pages at a loopback address.** The desktop's API (port 17972) believes a page at
+`http://localhost:<port>`, `http://127.0.0.1:<port>` or `http://[::1]:<port>` by its origin
+only in a debug build. A release build believes only the Agent's own page on its port on a
+Mac and Linux (17974, while it holds it), the exact origins named in `OAIY_DEV_ORIGINS`
+(comma-separated, read when the desktop starts: say
+`OAIY_DEV_ORIGINS=http://localhost:5173,http://localhost:17973` to work on the flow editor
+and the dashboard against an installed OAIY), and the linked provider's origin; any other
+loopback page is answered exactly as a website nobody trusts, unless it sends a token (a
+paired app's reaches what its grant does). The engines' gateway OAIY starts (port 8080)
+believes the same loopback pages by name, and any other page at one of this computer's own
+names (the OAIY Agent app's `http://oaiyagent.localhost` on Windows, the Agent served by
+`npm start` on 5317) only with the key the desktop gives the Agent's window and the pages
+paired with it (`GET /api/engines`, `gatewayKey`), or the gateway's API key (see *Auth*
+under [docs/ecosystem/OAIY_PLATFORM.md](../../docs/ecosystem/OAIY_PLATFORM.md)).
 
 Models are not services: OAIY's own engine runs them (OAIY → **Engines**). Krea-2
 Turbo, Lance, Llama.cpp Server, Ollama and LTX-2.3 Video used to be built in; at

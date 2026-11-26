@@ -13,7 +13,7 @@ import {
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import { ask } from './ask';
-import { accessName, pairingCalls, pairingGrants, pairingWho } from './pairingWords';
+import { accessName, pairingCalled, pairingCalls, pairingGrants, pairingWho } from './pairingWords';
 import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
 import LoadError from './LoadError';
@@ -485,14 +485,16 @@ export default function ConnectionsPanel() {
   );
 
   const revoke = async (app: PairedApp) => {
-    const name = app.label ?? app.product;
+    // (named as the list names it: where it asked from, then what it calls itself)
+    const who = pairingWho(app.origin);
+    const called = pairingCalled(app.product, app.label, app.origin);
     if (
       !(await ask(
-        `Revoke access for “${name}”? Its token stops working immediately and it will have to pair again.`,
+        `Revoke access for ${who}, which calls itself ${called}? Its token stops working immediately and it will have to pair again.`,
       ))
     )
       return;
-    void act(app.id, () => pairing.revoke(app.id), `Revoked ${name}`);
+    void act(app.id, () => pairing.revoke(app.id), `Revoked ${who} (${called})`);
   };
 
   return (
@@ -570,23 +572,22 @@ export default function ConnectionsPanel() {
             {paired.map((app) => (
               <li key={app.id}>
                 <span className="pairing-app">
-                  <ShieldCheck size={14} aria-hidden /> <strong>{app.label ?? app.product}</strong>
+                  {/* Which connection this is: where it asked from, the address the browser gave for it (or a
+                      program here, which gives none). It is the one part the app did not write, the grant works
+                      from that page alone, and it is what a revoke decision needs: so it leads, as it does in the
+                      request that was approved. What the app calls itself comes after, as its own words, and
+                      without the characters a person cannot see (a connection made before the desktop took them
+                      out of a label is kept as it was written). */}
+                  <ShieldCheck size={14} aria-hidden /> <strong className="pairing-from">{pairingWho(app.origin)}</strong>
                   <span className="pairing-product">
-                    {accessName(app.access)} · {app.product}
+                    {accessName(app.access)} · calls itself {pairingCalled(app.product, app.label, app.origin)}
                     {app.lastUsedMs ? ` · last used ${agoWords(new Date(app.lastUsedMs).toISOString())}` : ''}
                   </span>
-                  {/* The name and product are whatever the consumer called
-                      itself; the origin is the only part that says which site
-                      this actually is — which is what a revoke decision needs.
-                      Said once when the app already goes by it. */}
-                  {app.origin && app.origin !== app.label && <code className="pairing-origin">{app.origin}</code>}
                 </span>
                 <button
                   className="btn-tiny btn-danger"
                   disabled={busy.has(app.id)}
-                  aria-label={`Revoke access for ${app.label ?? app.product}${
-                    app.origin ? ` at ${app.origin}` : ''
-                  }`}
+                  aria-label={`Revoke access for ${pairingWho(app.origin)}, which calls itself ${pairingCalled(app.product, app.label, app.origin)}`}
                   onClick={() => void revoke(app)}
                 >
                   Revoke

@@ -105,25 +105,33 @@ const FETCH_RETRY_AFTER: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct AppEntry {
     doc: Value,
-    /// The sources whose events the account gave to this app and no other, as
-    /// the provider keeps that choice ([`fetch`] reads it with the list). It is
-    /// not in the app's own document, which only says what the app could take.
-    chosen_for: Vec<String>,
 }
 
 /// One script, once the catalogue names have been resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptRef<'a> {
     pub id: &'a str,
-    /// The JavaScript itself, defining `run(ctx)`.
+    /// The source itself, defining `run(ctx)` in the language below.
     pub source: &'a str,
+    /// The logic language it is in, as the engine names languages: [`JAVASCRIPT`]
+    /// for a script that names none, or where the provider says nothing of it.
+    pub language: &'a str,
 }
 
+/// The engine's names for the two logic languages this lane can run a script
+/// in. Not a provider's vocabulary: a leaf-script job is OAIY's own protocol
+/// (`protocol/v1/script-request.schema.json`), and these are its language ids.
+pub const JAVASCRIPT: &str = "javascript";
+pub const PYTHON: &str = "python";
+
+/// What a script that names a language in something other than words is said
+/// to be in: not JavaScript, so never run as it.
+const UNREADABLE_LANGUAGE: &str = "(a language named in something other than words)";
+
 impl AppEntry {
-    /// An app as the provider listed it, which the account has chosen for no
-    /// source.
+    /// An app as the provider listed it.
     fn listed(doc: Value) -> Self {
-        Self { doc, chosen_for: Vec::new() }
+        Self { doc }
     }
 
     /// The sources this app says it takes events from, where the provider's
@@ -185,6 +193,7 @@ impl AppEntry {
                         Some(ScriptRef {
                             id: s.get(&c.script_id).and_then(Value::as_str).unwrap_or("").trim(),
                             source,
+                            language: script_language(c, s),
                         })
                     })
                     .collect()
@@ -224,48 +233,155 @@ impl AppEntry {
     }
 }
 
-// --- which app an event is for ---------------------------------------------
-
-/// Which of the account's apps takes the events of one source.
-///
-/// Two apps built on one plugin (the same pack installed twice, say) both
-/// carry scripts for its events. Run for both, every call wrote its records
-/// twice, once into each app, and started the flows of both. The provider's
-/// rule is that a source's events go to ONE app: the one the account chose for
-/// it, or the only one that could take them, and to none while several could
-/// and none is chosen.
-///
-/// The rule is applied only as far as the provider says who takes what. The
-/// `candidates` are the apps that carry scripts for an event AND say they take
-/// this source. With none of those (a provider that publishes no such list, an
-/// account whose apps list nothing) nothing is known, and every app's scripts
-/// run as they did before this was read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Route<'a> {
-    source: &'a str,
-    candidates: Vec<&'a str>,
-    chosen: Option<&'a str>,
+/// The language a script says it is in, where the catalogue says what that field is called: absent, null or blank
+/// is JavaScript, as the provider's own runtime reads it.
+fn script_language<'a>(c: &AppLogicCatalogue, script: &'a Value) -> &'a str {
+    let Some(field) = c.script_language.as_deref() else {
+        return JAVASCRIPT;
+    };
+    match script.get(field) {
+        None | Some(Value::Null) => JAVASCRIPT,
+        Some(Value::String(language)) if language.trim().is_empty() => JAVASCRIPT,
+        Some(Value::String(language)) => language.trim(),
+        Some(_) => UNREADABLE_LANGUAGE,
+    }
 }
 
-impl Route<'_> {
-    /// Whether `app`'s scripts run for the event: every app's while nothing is
-    /// known, and otherwise those of the one app that takes it.
-    fn runs(&self, app: &str) -> bool {
-        self.candidates.is_empty() || self.chosen == Some(app)
+// --- which languages this lane runs ----------------------------------------
+
+/// The logic languages this lane can run an app script in, with `profile` as the
+/// prelude the batch would carry.
+///
+/// JavaScript always: an `entry` job. Python where the provider names the modes
+/// of its own profile a Python script is unfolded through
+/// ([`AppLogicLanguages::python_modes`]) and `profile` defines every one of
+/// them — the runner builds the project from those modes, as the provider's own
+/// runtime does, so a script's `run(ctx)` returns its effects here just as it
+/// does there. A job that names a mode the request's profile does not define is
+/// refused with the WHOLE request, its JavaScript neighbours included, so a mode
+/// that is not there is a language this lane does not run.
+///
+/// What this lane can run is not yet what it is handed: the heartbeat declares
+/// a language for the whole desktop, and only one that every lane runs
+/// ([`super::heartbeat::declared_languages`]); this lane asks for those alone
+/// ([`languages_asked`]).
+///
+/// [`AppLogicLanguages::python_modes`]: super::descriptor::AppLogicLanguages::python_modes
+pub fn languages_run(spec: &AppLogicSpec, profile: Option<&Value>) -> Vec<String> {
+    let mut out = vec![JAVASCRIPT.to_string()];
+    if python_modes(spec, profile).is_some() {
+        out.push(PYTHON.to_string());
+    }
+    out
+}
+
+/// The modes a Python script is unfolded through, when the provider names them
+/// and `profile` defines each one.
+fn python_modes<'a>(spec: &'a AppLogicSpec, profile: Option<&Value>) -> Option<&'a [String]> {
+    let modes = spec.languages.as_ref().map(|l| l.python_modes.as_slice()).filter(|m| !m.is_empty())?;
+    let defined: std::collections::BTreeSet<&str> = profile?
+        .pointer("/python/modes")?
+        .as_array()?
+        .iter()
+        .filter_map(|mode| mode.get("name").and_then(Value::as_str))
+        .collect();
+    modes.iter().all(|mode| defined.contains(mode.as_str())).then_some(modes)
+}
+
+/// The languages this lane asks the provider for scripts in, and runs, for one
+/// event: those the heartbeat declares for this desktop, worked out the way the
+/// beat works them out, from the CLI's report and what [`languages_run`] says of
+/// `prelude`.
+///
+/// No more than the beat says, and the reason is the provider's: it hands this
+/// desktop the scripts in whatever languages the request names, without weighing
+/// them against the beat, and its browser keeps every script in a language the
+/// beat does not name. A language asked for here and not declared there would be
+/// run in both places.
+pub fn languages_asked(spec: &AppLogicSpec, prelude: Prelude<'_>) -> Vec<String> {
+    let probe = crate::bridge::script_host::ScriptHost::global().engine_probe();
+    super::heartbeat::declared_languages(probe.as_ref(), Some(&languages_run(spec, prelude.profile())))
+}
+
+// --- which app an event is for ---------------------------------------------
+
+/// What the provider keeps of who takes which source's events
+/// ([`AppLogicSpec::routing`]): the app the account gave each source to, and the
+/// apps it counts as able to take each (where its reply says).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assignments {
+    /// Source → the app the account assigned its events to.
+    chosen: BTreeMap<String, String>,
+    /// Source → the apps the provider counts as able to take its events, with
+    /// scripts or without.
+    candidates: BTreeMap<String, Vec<String>>,
+}
+
+/// Which of the account's apps takes the events of one source, for one event.
+///
+/// Two apps built on one plugin (the same pack installed twice, say) both
+/// act on its events. Run for both, every call wrote its records twice, once
+/// into each app, and started the flows of both. The provider's rule is that a
+/// source's events go to ONE app, and its account's choice decides:
+///
+/// * where the account assigned the source to an app, the events are that
+///   app's and no other's, however many could take them, one included: the
+///   scripts of no other app run, and the flows of no other app start;
+/// * where it did not, they go to the only app that could take them, and to
+///   none while several could (said once);
+/// * where nothing says who takes the source (a provider that publishes no
+///   such rule, an event no app could take), every app's work runs, as it did
+///   before the rule was read.
+///
+/// The apps that could take an event (its `candidates`) are those that
+/// would act on it, and that the provider says take its source: an app with
+/// scripts for the event, or a flow bound to it, that lists the source or that
+/// the provider counts as a candidate for it. An app that would act on the
+/// event and takes none of its source is not one of them, and does not act on
+/// it while one of them is chosen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Route {
+    source: String,
+    assigned: Option<String>,
+    candidates: Vec<String>,
+}
+
+impl Route {
+    /// A route that says nothing: every app's work runs, as for a provider that
+    /// keeps no such rule.
+    pub fn unknown() -> Self {
+        Self::default()
     }
 
-    /// Whether the other work `app` has on the event (a flow of its own) is
-    /// held back: the app is one of those that could take the source's events
-    /// and is not the one that does. An app nothing is known of is never held
-    /// back, which is what its flows did before.
+    /// The app the event goes to, when one does.
+    fn chosen(&self) -> Option<&str> {
+        self.assigned.as_deref().or(match self.candidates.as_slice() {
+            [only] => Some(only.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Whether `app`'s scripts run for the event: those of the app the account
+    /// assigned it to alone, where it did; otherwise those of the one app that
+    /// could take it, and every app's while none could.
+    fn runs(&self, app: &str) -> bool {
+        if self.assigned.is_none() && self.candidates.is_empty() {
+            return true;
+        }
+        self.chosen() == Some(app)
+    }
+
+    /// Whether the flows `app` has bound to the event are held back: every app's
+    /// but the one the event goes to, wherever that is decided (an assignment,
+    /// or candidates), and nobody's while nothing says who takes the source.
     pub fn holds_back(&self, app: &str) -> bool {
-        self.candidates.contains(&app) && self.chosen != Some(app)
+        !self.runs(app)
     }
 
     /// Why no app takes the event, when several could and the account has
     /// chosen none of them: in words for the one who can choose.
     pub fn unchosen(&self) -> Option<String> {
-        if self.chosen.is_some() || self.candidates.is_empty() {
+        if self.chosen().is_some() || self.candidates.is_empty() {
             return None;
         }
         Some(format!(
@@ -277,41 +393,54 @@ impl Route<'_> {
             self.source
         ))
     }
+
+    /// The app the account assigned the source to, when it is not `app`: for a
+    /// line that says why `app`'s work on the event did not run.
+    pub fn assigned_elsewhere(&self, app: &str) -> Option<&str> {
+        self.assigned.as_deref().filter(|chosen| *chosen != app)
+    }
 }
 
-/// Decide which app takes the events of `source`: see [`Route`].
-pub fn route<'a>(spec: &AppLogicSpec, apps: &'a [AppEntry], source: &'a str) -> Route<'a> {
+/// Whether any of the account's apps would act on an event: one in `apps` with
+/// scripts for events, or one that has a flow bound to it (`bound`). Only then
+/// is there anything for the account's assignment to decide, and it is asked for.
+pub fn concerns_an_app(spec: &AppLogicSpec, apps: &[AppEntry], bound: &[&str]) -> bool {
+    !bound.is_empty()
+        || apps
+            .iter()
+            .any(|app| app.key(&spec.catalogue).is_some() && !app.event_scripts(&spec.catalogue, &spec.event_hook).is_empty())
+}
+
+/// Decide which app takes the events of `source`: see [`Route`]. `bound` are the
+/// apps with a flow bound to the event; `assignments` what the provider keeps
+/// of who takes what, where it was read (none: no app concerns the event, or the
+/// provider keeps no such thing).
+pub fn route(spec: &AppLogicSpec, apps: &[AppEntry], assignments: Option<&Assignments>, bound: &[&str], source: &str) -> Route {
     let c = &spec.catalogue;
-    // One entry an app, however often the provider listed it (a second copy is
-    // refused where the scripts are collected, and must not make an app look
-    // like two that could take the event).
-    let mut could: Vec<&AppEntry> = Vec::new();
-    for app in apps {
-        let Some(key) = app.key(c) else { continue };
-        if app.sources(c).contains(&source)
-            && !app.event_scripts(c, &spec.event_hook).is_empty()
-            && !could.iter().any(|other| other.key(c) == Some(key))
-        {
-            could.push(app);
+    let counted = assignments.and_then(|a| a.candidates.get(source));
+    let takes = |app: &str| {
+        counted.is_some_and(|counted| counted.iter().any(|a| a == app))
+            || apps.iter().any(|entry| entry.key(c) == Some(app) && entry.sources(c).contains(&source))
+    };
+    // One entry an app, however often the provider listed it or bound it (a
+    // second copy is refused where the scripts are collected, and must not make
+    // an app look like two that could take the event).
+    let mut candidates: Vec<String> = Vec::new();
+    let acting = apps
+        .iter()
+        .filter(|app| !app.event_scripts(c, &spec.event_hook).is_empty())
+        .filter_map(|app| app.key(c))
+        .chain(bound.iter().copied());
+    for app in acting {
+        if !source.is_empty() && takes(app) && !candidates.iter().any(|known| known == app) {
+            candidates.push(app.to_string());
         }
     }
-    let chosen = match could.as_slice() {
-        [only] => Some(*only),
-        several => several.iter().copied().find(|app| app.chosen_for.iter().any(|s| s == source)),
-    };
     Route {
-        source,
-        candidates: could.iter().filter_map(|app| app.key(c)).collect(),
-        chosen: chosen.and_then(|app| app.key(c)),
+        source: source.to_string(),
+        assigned: assignments.and_then(|a| a.chosen.get(source)).cloned(),
+        candidates,
     }
-}
-
-/// Whether two of `apps` could take the same source's events: only then does
-/// the account's choice between them decide anything.
-fn contested(spec: &AppLogicSpec, apps: &[AppEntry]) -> bool {
-    let listed: std::collections::BTreeSet<&str> =
-        apps.iter().flat_map(|app| app.sources(&spec.catalogue)).collect();
-    listed.into_iter().any(|source| route(spec, apps, source).candidates.len() > 1)
 }
 
 // --- what this module reports --------------------------------------------
@@ -405,12 +534,25 @@ pub type ConnectorFn<'a> =
 /// not point at the network at all.
 pub struct Catalog {
     inner: Mutex<CatalogState>,
+    /// What the provider keeps of who takes which source's events ([`Catalog::assignments`]), beside the list and
+    /// kept as long, but asked for only when an event concerns an app.
+    assignments: Mutex<AssignmentsState>,
+}
+
+#[derive(Default)]
+struct AssignmentsState {
+    /// The account they are of ([`account_key`]).
+    account: Option<String>,
+    fetched: Option<(Instant, Assignments)>,
+    retry_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct CatalogState {
-    /// The account the scripts below are of ([`account_key`]): another account's are never run, nor fallen back on.
-    account: Option<String>,
+    /// The account the scripts below are of ([`account_key`]), and the languages they were asked for in: another
+    /// account's are never run, nor fallen back on, and a list asked for in other languages is not this one (its
+    /// scripts in a language this desktop no longer declares are the browser's again).
+    account: Option<(String, Vec<String>)>,
     fetched: Option<(Instant, Vec<AppEntry>)>,
     /// When a failed fetch may be tried again. Without it a provider that is
     /// down costs every single event a full HTTP timeout ON THE EVENT THREAD,
@@ -440,19 +582,75 @@ impl Catalog {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CatalogState::default()),
+            assignments: Mutex::new(AssignmentsState::default()),
         }
     }
 
+    /// What the provider keeps of who takes which source's events
+    /// ([`fetch_assignments`]), for an event that concerns one of the account's
+    /// apps ([`concerns_an_app`]): an account none of whose apps acts on an event
+    /// never asks. Kept as long as the app list is; a refresh that fails is
+    /// answered with the last one read, as the list's is, and with none to fall
+    /// back on it is an error, and the event waits: run without the account's
+    /// choice, an event could be given to an app the account gave it away from.
+    pub fn assignments(&self, account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Assignments, String> {
+        let key = account_key(account);
+        {
+            let mut state = self.assignments.lock().unwrap_or_else(|e| e.into_inner());
+            if state.account.as_deref() != Some(key.as_str()) {
+                *state = AssignmentsState { account: Some(key.clone()), ..AssignmentsState::default() };
+            }
+            match state.fetched.as_ref() {
+                Some((at, held)) if at.elapsed() < CATALOG_TTL => return Ok(held.clone()),
+                Some((_, held)) if state.retry_at.is_some_and(|t| Instant::now() < t) => return Ok(held.clone()),
+                None if state.retry_at.is_some_and(|t| Instant::now() < t) => {
+                    return Err("which of the account's apps takes which events could not be read, and there is no \
+                                earlier answer to fall back on"
+                        .to_string())
+                }
+                _ => {}
+            }
+        }
+        let fetched = fetch_assignments(account, spec);
+        let mut state = self.assignments.lock().unwrap_or_else(|e| e.into_inner());
+        if state.account.as_deref() != Some(key.as_str()) {
+            *state = AssignmentsState { account: Some(key), ..AssignmentsState::default() };
+        }
+        match fetched {
+            Ok(held) => {
+                state.fetched = Some((Instant::now(), held.clone()));
+                state.retry_at = None;
+                Ok(held)
+            }
+            Err(e) => {
+                state.retry_at = Some(Instant::now() + FETCH_RETRY_AFTER);
+                match state.fetched.as_ref() {
+                    Some((at, held)) => {
+                        log::warn!(
+                            "app logic: could not refresh which app takes which events ({e}); going by what was \
+                             read {}s ago",
+                            at.elapsed().as_secs()
+                        );
+                        Ok(held.clone())
+                    }
+                    None => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The account's apps, with their scripts in `languages` ([`languages_asked`]).
     pub fn load(
         &self,
         account: &LinkedAccount,
         spec: &AppLogicSpec,
+        languages: &[String],
     ) -> Result<Vec<AppEntry>, String> {
-        let key = account_key(account);
+        let key = (account_key(account), languages.to_vec());
         {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            // (linked to another account since: what was kept was the other one's)
-            if state.account.as_deref() != Some(key.as_str()) {
+            // (linked to another account since, or asked in other languages: what was kept was another list)
+            if state.account.as_ref() != Some(&key) {
                 *state = CatalogState { account: Some(key.clone()), ..CatalogState::default() };
             }
             if let Some((at, apps)) = state.fetched.as_ref() {
@@ -478,7 +676,7 @@ impl Catalog {
                 );
             }
         }
-        match fetch(account, spec) {
+        match fetch(account, spec, languages) {
             Ok(apps) => {
                 let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 // (the account changed while this was fetched: kept for the account it was fetched for)
@@ -487,7 +685,7 @@ impl Catalog {
             }
             Err(e) => {
                 let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if state.account.as_deref() != Some(key.as_str()) {
+                if state.account.as_ref() != Some(&key) {
                     *state = CatalogState { account: Some(key), ..CatalogState::default() };
                 }
                 state.retry_at = Some(Instant::now() + FETCH_RETRY_AFTER);
@@ -514,12 +712,14 @@ impl Catalog {
     /// different account entirely, whose scripts would write the wrong records.
     pub fn invalidate(&self) {
         *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = CatalogState::default();
+        *self.assignments.lock().unwrap_or_else(|e| e.into_inner()) = AssignmentsState::default();
     }
 
     /// Let the next load ask the provider again at once, keeping what is
     /// held: the outbox, which spaces its own tries, is trying again.
     pub fn retry_now(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retry_at = None;
+        self.assignments.lock().unwrap_or_else(|e| e.into_inner()).retry_at = None;
     }
 }
 
@@ -530,50 +730,99 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("could not build the app-logic client: {e}"))
 }
 
-/// The account's apps, and which of them the account chose where two could
-/// take the same source's events.
+/// The account's apps, with their scripts in `languages`.
 ///
-/// The list is asked for without saying which logic languages this desktop
-/// runs, on purpose, though the flow lane says them on its own requests
-/// ([`super::heartbeat::logic_languages`]). A provider lists the scripts in the
-/// languages its caller names, and every script this lane is handed is run as
-/// JavaScript ([`script_job`]): named a second language, it would be handed
-/// scripts in that one and run them as the first. Saying nothing is read as
-/// one language, which is what this lane has.
-fn fetch(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Vec<AppEntry>, String> {
-    let c = &spec.catalogue;
-    let mut apps: Vec<AppEntry> = fetch_list(account, &spec.path, &c.apps, "app list")?
+/// The languages are said where the provider reads them
+/// ([`AppLogicSpec::languages`]): it lists the scripts in the languages its
+/// caller names, and only those, and a caller that names none is handed its
+/// JavaScript ones. `languages` is what the heartbeat declares
+/// ([`languages_asked`]), so that every script this desktop is handed is one the
+/// provider's browser leaves to it, and every one it leaves to it is handed over.
+fn fetch(account: &LinkedAccount, spec: &AppLogicSpec, languages: &[String]) -> Result<Vec<AppEntry>, String> {
+    let said = spec.languages.as_ref().map(|l| (l.param.as_str(), languages.join(",")));
+    Ok(fetch_list(account, &spec.path, said, &spec.catalogue.apps, "app list")?
         .into_iter()
         .map(AppEntry::listed)
-        .collect();
-    // Which app the account chose is asked only when two of them could take
-    // the same source's events. An account with one such app runs it whatever
-    // was chosen, so it is not made to wait on a second request, or to fail
-    // with it. Where it is asked and cannot be read, neither can the list be
-    // used: run without the choice, both apps would write the event.
-    if let Some(routing) = spec.routing.as_ref().filter(|_| contested(spec, &apps)) {
-        let choices = fetch_list(account, &routing.path, &routing.list, "list of which app takes which events")?;
-        for choice in &choices {
-            let (Some(source), Some(app)) = (
-                choice.get(&routing.source).and_then(Value::as_str),
-                choice.get(&routing.app).and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            // (an app that is not in the list has no scripts to be chosen for)
-            for entry in apps.iter_mut().filter(|entry| entry.key(c) == Some(app)) {
-                entry.chosen_for.push(source.to_string());
+        .collect())
+}
+
+/// What the provider keeps of who takes which source's events: the account's
+/// choices, and the apps it counts as able to take each source, where its reply
+/// says ([`super::descriptor::AppLogicRouting::candidates`]; a reply without
+/// them is one that counts none, as a map the provider leaves empty is).
+fn fetch_assignments(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Assignments, String> {
+    let Some(routing) = spec.routing.as_ref() else {
+        return Ok(Assignments::default());
+    };
+    let what = "list of which app takes which events";
+    let mut reply = fetch_reply(account, &routing.path, None, what)?;
+    let mut out = Assignments::default();
+    for choice in &take_list(&mut reply, &routing.list, what)? {
+        let (Some(source), Some(app)) = (
+            choice.get(&routing.source).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()),
+            choice.get(&routing.app).and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()),
+        ) else {
+            continue;
+        };
+        out.chosen.insert(source.to_string(), app.to_string());
+    }
+    if let (Some(key), Some(field)) = (routing.candidates.as_deref(), routing.candidate_app.as_deref()) {
+        // (an empty map can come as an empty list, from a provider whose maps and lists are one thing)
+        if let Some(map) = reply.get(key).and_then(Value::as_object) {
+            for (source, apps) in map {
+                let apps: Vec<String> = apps
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|entry| entry.get(field).and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|app| !app.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                out.candidates.insert(source.clone(), apps);
             }
         }
     }
-    Ok(apps)
+    Ok(out)
 }
 
 /// GET one of the lane's lists: the array the reply at `path` holds under
-/// `key`. `what` is the list in words, for the reasons it could not be read.
-fn fetch_list(account: &LinkedAccount, path: &str, key: &str, what: &str) -> Result<Vec<Value>, String> {
-    let resp = client()?
-        .get(super::oauth::join(&account.base_url, path))
+/// `key`, with `query` (a parameter and its value) said when there is one.
+/// `what` is the list in words, for the reasons it could not be read.
+fn fetch_list(account: &LinkedAccount, path: &str, query: Option<(&str, String)>, key: &str, what: &str) -> Result<Vec<Value>, String> {
+    let mut reply = fetch_reply(account, path, query, what)?;
+    take_list(&mut reply, key, what)
+}
+
+/// The array `reply` holds under `key`, or why it holds none.
+fn take_list(reply: &mut Value, key: &str, what: &str) -> Result<Vec<Value>, String> {
+    // A missing array is NOT an account with no apps: it is a reply this
+    // descriptor does not describe, and treating the two the same would leave
+    // an install recording nothing with nothing to show for it.
+    let list = reply.get_mut(key).ok_or_else(|| {
+        format!(
+            "the app-logic lane's reply carries no {key:?}, so this connector's descriptor does not \
+             describe it"
+        )
+    })?;
+    match list.take() {
+        Value::Array(list) => Ok(list),
+        other => Err(format!(
+            "the app-logic lane returned {key:?} as a {} rather than the {what}",
+            type_name(&other)
+        )),
+    }
+}
+
+/// GET one of the lane's replies, whole.
+fn fetch_reply(account: &LinkedAccount, path: &str, query: Option<(&str, String)>, what: &str) -> Result<Value, String> {
+    let request = client()?.get(super::oauth::join(&account.base_url, path));
+    let request = match query {
+        Some((name, value)) => request.query(&[(name, value)]),
+        None => request,
+    };
+    let resp = request
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the app-logic lane: {e}"))?;
@@ -593,24 +842,8 @@ fn fetch_list(account: &LinkedAccount, path: &str, key: &str, what: &str) -> Res
         }
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    let mut reply: Value = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
-        .map_err(|e| format!("the app-logic lane returned an unreadable {what}: {e}"))?;
-    // A missing array is NOT an account with no apps: it is a reply this
-    // descriptor does not describe, and treating the two the same would leave
-    // an install recording nothing with nothing to show for it.
-    let list = reply.get_mut(key).ok_or_else(|| {
-        format!(
-            "the app-logic lane's reply carries no {key:?}, so this connector's descriptor does not \
-             describe it"
-        )
-    })?;
-    match list.take() {
-        Value::Array(list) => Ok(list),
-        other => Err(format!(
-            "the app-logic lane returned {key:?} as a {} rather than the {what}",
-            type_name(&other)
-        )),
-    }
+    super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
+        .map_err(|e| format!("the app-logic lane returned an unreadable {what}: {e}"))
 }
 
 // --- the storage a script dedups on ---------------------------------------
@@ -779,8 +1012,9 @@ impl StorageStore {
 // --- running the scripts ---------------------------------------------------
 
 /// Every script of every app, run against one event, with its effects performed.
-/// "Every app" is every app the event is for: where the provider says which of
-/// the account's apps take its source, that is one of them ([`Route`]).
+/// "Every app" is every app the event is for (`route`): where the provider says
+/// which of the account's apps take its source, that is one of them ([`Route`],
+/// which the caller decides once for the event, for this lane and the flows').
 ///
 /// Returns what happened, most useful first for a log: one [`Outcome`] per
 /// effect attempted plus one for anything that went wrong before the effects
@@ -792,15 +1026,30 @@ impl StorageStore {
 /// pass is the only one that touches the engine, and an event whose apps carry
 /// no event scripts never reaches it — which is what keeps a quiet account from
 /// spawning a script host it has no use for.
+///
+/// A script is run in the language it says it is in, and only where that is
+/// one of `languages` (what this desktop declares, [`languages_asked`]): one in
+/// another is said and left alone, never run as JavaScript.
+///
+/// `linked` says whether `account` is still the link this desktop holds, and is
+/// asked before each effect: once it is not (the link was forgotten or replaced
+/// while the event was handled), nothing more is written for it, here or at the
+/// provider, and that is said once as a write that can be tried again, so the
+/// event is kept for the next link to the same provider (whose markers and
+/// record keys make the second time do only what the first did not).
+#[allow(clippy::too_many_arguments)]
 pub fn handle_event(
     account: &LinkedAccount,
     spec: &AppLogicSpec,
     apps: &[AppEntry],
+    route: &Route,
     storage: &StorageStore,
     envelope: &Value,
     host: &dyn ScriptBatch,
     prelude: Prelude<'_>,
+    languages: &[String],
     connector: &ConnectorFn,
+    linked: &dyn Fn() -> bool,
 ) -> Vec<Outcome> {
     let mut out = Vec::new();
     let event_key = envelope
@@ -809,7 +1058,7 @@ pub fn handle_event(
         .unwrap_or("")
         .to_string();
 
-    let runs = collect(spec, apps, storage, envelope, &mut out);
+    let runs = collect(spec, apps, route, storage, &mut out, envelope);
     if runs.is_empty() {
         return out;
     }
@@ -844,7 +1093,7 @@ pub fn handle_event(
         return out;
     }
 
-    let replies = run_on_host(host, spec, entry_function, &runs, prelude);
+    let replies = run_on_host(host, spec, entry_function, &runs, prelude, languages);
 
     for (i, run) in runs.iter().enumerate() {
         if let Some(why) = replies.lane.get(&i) {
@@ -886,12 +1135,36 @@ pub fn handle_event(
             if effects.is_empty() {
                 continue;
             }
-            out.extend(apply_effects(
-                account, spec, run.entry, run.app, name, effects, storage, &event_key, connector,
-            ));
+            let applied = apply_effects(
+                account, spec, run.entry, run.app, name, effects, storage, &event_key, connector, linked,
+            );
+            let went = applied.last().is_some_and(|o| o.effect == LINK_WENT_EFFECT);
+            out.extend(applied);
+            if went {
+                return out;
+            }
         }
     }
     out
+}
+
+/// What an [`Outcome`] names as its effect when the link went while the event was handled.
+const LINK_WENT_EFFECT: &str = "link";
+
+/// The outcome that says the link went while `app`'s effects were being performed: nothing more is written for
+/// it, and the event is tried again (a write that can be).
+fn link_went(app: &str, script: &str) -> Outcome {
+    Outcome {
+        app: app.to_string(),
+        script: script.to_string(),
+        effect: LINK_WENT_EFFECT.to_string(),
+        detail: Err(
+            "the link this event was being handled for was forgotten or replaced, so nothing more was written for it; \
+             the event is kept for the next link to this provider"
+                .to_string(),
+        ),
+        transient: true,
+    }
 }
 
 /// One app's scripts and the context they run against.
@@ -911,13 +1184,12 @@ struct AppRun<'a> {
 fn collect<'a>(
     spec: &AppLogicSpec,
     apps: &'a [AppEntry],
+    routed: &Route,
     storage: &StorageStore,
-    envelope: &Value,
     out: &mut Vec<Outcome>,
+    envelope: &Value,
 ) -> Vec<AppRun<'a>> {
     let mut runs = Vec::new();
-    let source = envelope.get("source").and_then(Value::as_str).unwrap_or("");
-    let routed = route(spec, apps, source);
     // Several apps could take it and the account has chosen none: run for all
     // of them it would be written into each, so it is run for none, and that
     // is said ONCE, for the event, not once an app.
@@ -1050,6 +1322,50 @@ fn script_job(id: &str, spec: &AppLogicSpec, entry_function: &str, script: &Scri
     job
 }
 
+/// One Python script as a `python-project` job that names the provider's own
+/// modes (`modes`, [`python_modes`]): the runner unfolds the author's source
+/// through the request's profile into the project the provider's runtime builds,
+/// and calls what the mode calls with the context as its one argument, so a
+/// script's `run(ctx)` returns the same effects it returns there. The two budgets
+/// are a JavaScript job's.
+fn python_job(id: &str, spec: &AppLogicSpec, modes: &[String], script: &ScriptRef, ctx: &Value) -> Value {
+    let mut job = json!({
+        "id": id,
+        "language": PYTHON,
+        "mode": "python-project",
+        "modes": modes,
+        "source": script.source,
+        "args": [ctx],
+    });
+    if let Some(ms) = spec.budget_ms {
+        job["budgetMs"] = json!(ms);
+    }
+    if let Some(steps) = spec.instruction_budget {
+        job["instructionSteps"] = json!(steps);
+    }
+    job
+}
+
+/// Why a Python script was not run by a desktop that declares Python, when the
+/// profile this event was given does not define the modes it is unfolded through.
+fn not_unfoldable(spec: &AppLogicSpec) -> String {
+    let modes = spec.languages.as_ref().map(|l| l.python_modes.join(", ")).unwrap_or_default();
+    format!(
+        "this script is in {PYTHON}, and the provider's script profile this event was given does not define the \
+         modes it is unfolded through ({modes}), so it was not run: a job naming one would have had every script of \
+         the event refused with it"
+    )
+}
+
+/// Why a script in `language` was not run, when it is not one of `languages`.
+fn not_run_in(language: &str, languages: &[String]) -> String {
+    format!(
+        "this script is in {language}, and this desktop runs this provider's app scripts in {} alone, so it was \
+         not run here: it is the provider's own runtime's to run",
+        languages.join(" and ")
+    )
+}
+
 /// What the host said about one event's scripts.
 #[derive(Debug, Default)]
 struct Replies {
@@ -1059,22 +1375,40 @@ struct Replies {
     lane: BTreeMap<usize, String>,
 }
 
-/// Run every script of this event on the host, in as few batches as fit.
+/// Run every script of this event on the host, in as few batches as fit, each
+/// in its own language where that is one of `languages`.
 fn run_on_host(
     host: &dyn ScriptBatch,
     spec: &AppLogicSpec,
     entry_function: &str,
     runs: &[AppRun],
     prelude: Prelude<'_>,
+    languages: &[String],
 ) -> Replies {
     let mut replies = Replies::default();
     let mut jobs: Vec<Value> = Vec::new();
     // Which app each job belongs to, so a batch that is never served can be
     // reported once per app rather than once per script.
     let mut owner: Vec<usize> = Vec::new();
+    // Asked of THIS batch's profile, not only of the one the languages were worked out from: a job naming a mode
+    // the request's profile does not define refuses the whole request, every JavaScript job in it as well.
+    let declares_python = languages.iter().any(|l| l == PYTHON);
+    let python = declares_python.then(|| python_modes(spec, prelude.profile())).flatten();
     for (i, run) in runs.iter().enumerate() {
         for (j, script) in run.scripts.iter().enumerate() {
             let id = job_id(i, j);
+            let job = match (script.language, python) {
+                (JAVASCRIPT, _) => script_job(&id, spec, entry_function, script, &run.ctx),
+                (PYTHON, Some(modes)) => python_job(&id, spec, modes, script, &run.ctx),
+                (PYTHON, None) if declares_python => {
+                    replies.by_job.insert(id, Err(not_unfoldable(spec)));
+                    continue;
+                }
+                (other, _) => {
+                    replies.by_job.insert(id, Err(not_run_in(other, languages)));
+                    continue;
+                }
+            };
             if script.source.len() > MAX_SCRIPT_SOURCE_BYTES {
                 replies.by_job.insert(
                     id,
@@ -1088,7 +1422,7 @@ fn run_on_host(
                 );
                 continue;
             }
-            jobs.push(script_job(&id, spec, entry_function, script, &run.ctx));
+            jobs.push(job);
             owner.push(i);
         }
     }
@@ -1198,12 +1532,19 @@ fn apply_effects(
     storage: &StorageStore,
     event_key: &str,
     connector: &ConnectorFn,
+    linked: &dyn Fn() -> bool,
 ) -> Vec<Outcome> {
     let f = &spec.fields;
     let mut out = Vec::new();
     let mut record_write_failed = false;
 
     for (index, effect) in effects.iter().enumerate() {
+        // Asked before each, as each is a write (a record, a marker, a command a plugin carries out): one performed
+        // after the link went was written with a key the person had asked this desktop to forget.
+        if !linked() {
+            out.push(link_went(app, script));
+            return out;
+        }
         let kind = effect
             .get(&f.kind)
             .and_then(Value::as_str)
@@ -1718,6 +2059,11 @@ mod tests {
         |_, _, _, _| Err("no plugin host in this test".to_string())
     }
 
+    /// What a desktop that declares JavaScript alone runs its app scripts in.
+    fn js() -> Vec<String> {
+        vec![JAVASCRIPT.to_string()]
+    }
+
     // --- the descriptor is the whole vocabulary ----------------------------
 
 
@@ -1750,11 +2096,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::Profile(&doc),
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert!(out.is_empty(), "{out:?}");
         let request = host.only_request();
@@ -1792,11 +2141,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::Missing("the prelude could not be read".into()),
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(host.calls(), 0, "no batch is sent at all");
         assert_eq!(out.len(), 2, "one line per app, not one per script: {out:?}");
@@ -1917,7 +2269,7 @@ mod tests {
         // EVERY script of EVERY app.
         let s = spec();
         let source = "function run(ctx) {\n  return { effects: [] }; // ; and a \"quote\"\n}";
-        let script = ScriptRef { id: "one", source };
+        let script = ScriptRef { id: "one", source, language: JAVASCRIPT };
         let ctx = json!({ "event": { "name": "x" }, "storage": {} });
         let job = script_job("a0s0", &s, "run", &script, &ctx);
         assert_eq!(job["source"], json!(source), "verbatim, not re-encoded");
@@ -1936,7 +2288,7 @@ mod tests {
         let mut s = spec();
         s.budget_ms = None;
         s.instruction_budget = None;
-        let job = script_job("a0s0", &s, "run", &ScriptRef { id: "one", source: "x" }, &json!({}));
+        let job = script_job("a0s0", &s, "run", &ScriptRef { id: "one", source: "x", language: JAVASCRIPT }, &json!({}));
         assert!(job.get("budgetMs").is_none(), "{job}");
         assert!(job.get("instructionSteps").is_none(), "{job}");
     }
@@ -1964,11 +2316,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert!(out.is_empty(), "{out:?}");
         let request = host.only_request();
@@ -2003,11 +2358,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert!(out.is_empty());
         assert_eq!(host.calls(), 0, "no scripts, no batch, no host");
@@ -2058,11 +2416,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].script, "huge");
@@ -2162,11 +2523,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::down("no engine on this machine"),
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].effect, "lane");
@@ -2201,11 +2565,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].script, "throws");
@@ -2245,11 +2612,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].app, "app-1");
@@ -2275,6 +2645,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1);
         let why = out[0].detail.clone().unwrap_err();
@@ -2308,6 +2679,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out[0].detail.clone().unwrap_err().contains("no form keyed"));
         assert!(out[0].detail.clone().unwrap_err().contains("calls"));
@@ -2337,6 +2709,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out[0].detail.is_err(), "the write must fail in this test");
         let why = out[1].detail.clone().unwrap_err();
@@ -2371,6 +2744,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out[0].detail.is_ok() && out[1].detail.is_ok());
         assert!(out[2].detail.clone().unwrap_err().contains("names no key"));
@@ -2616,6 +2990,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out[0].detail.is_ok(), "{:?}", out[0].detail);
 
@@ -2653,6 +3028,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out[0].detail.clone().unwrap(), "updated record resp-1");
 
@@ -2690,6 +3066,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out.iter().all(|o| o.detail.clone().unwrap().contains("nothing changed")), "{out:?}");
         let mut lists = Vec::new();
@@ -2750,6 +3127,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         assert!(out[0].detail.clone().unwrap().contains("nothing changed"));
         assert!(out[1].detail.clone().unwrap().contains("was created"));
@@ -2788,6 +3166,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         let why = out[0].detail.clone().unwrap_err();
         assert!(why.contains("equal nothing"), "{why}");
@@ -2814,6 +3193,7 @@ mod tests {
             &storage,
             "evt-1",
             &no_connector(),
+            &|| true,
         );
         let why = out[0].detail.clone().unwrap_err();
         assert!(why.contains("422"), "the code is the diagnosis: {why}");
@@ -2893,11 +3273,11 @@ mod tests {
         // console with nothing in it.
         let s = spec();
         let (base, _rx) = stub(r#"{"data":[]}"#, "200 OK");
-        let why = fetch(&account(base), &s).unwrap_err();
+        let why = fetch(&account(base), &s, &js()).unwrap_err();
         assert!(why.contains("does not describe it"), "{why}");
 
         let (base, _rx) = stub(r#"{"apps":[]}"#, "200 OK");
-        assert!(fetch(&account(base), &s).unwrap().is_empty(), "an empty account is fine");
+        assert!(fetch(&account(base), &s, &js()).unwrap().is_empty(), "an empty account is fine");
     }
 
     #[test]
@@ -2917,11 +3297,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1);
         assert!(out[0].detail.clone().unwrap_err().contains("nowhere to remember"));
@@ -3248,7 +3631,7 @@ mod tests {
             "function run(ctx) {{ /* {} */ return {{}}; }}",
             "x".repeat(MAX_SCRIPT_SOURCE_BYTES)
         );
-        let script = ScriptRef { id: "huge", source: &big };
+        let script = ScriptRef { id: "huge", source: &big, language: JAVASCRIPT };
         let job = script_job("a0s0", &spec(), "run", &script, &json!({}));
         let response = host.evaluate(&batch_request_with(vec![job], None)).expect("the batch is served");
         let outcome = response.result("a0s0").expect("answered").outcome.clone();
@@ -3293,11 +3676,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         let duplicate = out
             .iter()
@@ -3325,11 +3711,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert_eq!(out.len(), 1);
         let why = out[0].detail.clone().unwrap_err();
@@ -3357,11 +3746,14 @@ mod tests {
             &account("http://provider.invalid".into()),
             &s,
             &apps,
+            &Route::unknown(),
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         assert!(out.is_empty());
         assert!(!storage.path().exists(), "nothing was written");
@@ -3386,27 +3778,47 @@ mod tests {
         AppEntry::listed(doc)
     }
 
-    /// The same, chosen by the account for the events of `source`.
-    fn chosen_for(mut app: AppEntry, source: &str) -> AppEntry {
-        app.chosen_for.push(source.to_string());
-        app
+    /// What the provider keeps of who takes `source`: the account's choice of
+    /// `chosen` (none: it made none), and the apps it counts as candidates (none:
+    /// its reply names none for the source).
+    fn kept(source: &str, chosen: Option<&str>, candidates: &[&str]) -> Assignments {
+        let mut out = Assignments::default();
+        if let Some(app) = chosen {
+            out.chosen.insert(source.to_string(), app.to_string());
+        }
+        if !candidates.is_empty() {
+            out.candidates.insert(source.to_string(), candidates.iter().map(|a| a.to_string()).collect());
+        }
+        out
     }
 
     /// The apps whose scripts one event from the plugin `aokie` was run for (by
     /// what each job's source says; none when no batch was sent at all), and
-    /// what was said of it.
-    fn run_for(s: &AppLogicSpec, apps: &[AppEntry], tag: &str) -> (Vec<String>, Vec<Outcome>) {
+    /// what was said of it: `assignments` is what the provider keeps of who
+    /// takes the plugin's events (none: it was not read), and `bound` the apps
+    /// with a flow bound to the event.
+    fn run_for(
+        s: &AppLogicSpec,
+        apps: &[AppEntry],
+        assignments: Option<&Assignments>,
+        bound: &[&str],
+        tag: &str,
+    ) -> (Vec<String>, Vec<Outcome>) {
+        let routed = route(s, apps, assignments, bound, "aokie");
         let (storage, dir) = store(tag);
         let host = FakeHost::always(json!({}));
         let out = handle_event(
             &account("http://provider.invalid".into()),
             s,
             apps,
+            &routed,
             &storage,
             &json!({ "name": "aokie.call.ended", "source": "aokie", "idempotencyKey": "evt-1" }),
             &host,
             Prelude::None,
+            &js(),
             &no_connector(),
+            &|| true,
         );
         let ran = match host.calls() {
             0 => Vec::new(),
@@ -3424,9 +3836,10 @@ mod tests {
     #[test]
     fn the_shipped_connector_reads_who_takes_a_sources_events_and_whom_the_account_chose() {
         // FormLogic's names, as data: an app lists the plugins it holds grants
-        // for under `connectors` (FlowService::getOwnerAppLogic), and the
-        // account's choice of one app for a plugin is a row of `assignments`
-        // (FlowService::getConnectorAssignments).
+        // for under `connectors` (FlowService::getOwnerAppLogic), the account's
+        // choice of one app for a plugin is a row of `assignments`, and the apps
+        // that hold a plugin's grants, with scripts or without, are its
+        // `candidates` (FlowService::getConnectorAssignments).
         let s = spec();
         assert_eq!(s.catalogue.sources.as_deref(), Some("connectors"));
         let routing = s.routing.expect("the shipped connector says where the choice is read");
@@ -3434,6 +3847,7 @@ mod tests {
             (routing.path.as_str(), routing.list.as_str(), routing.source.as_str(), routing.app.as_str()),
             ("/api/v1/connector-assignments", "assignments", "connectorId", "appId")
         );
+        assert_eq!((routing.candidates.as_deref(), routing.candidate_app.as_deref()), (Some("candidates"), Some("appId")));
     }
 
     #[test]
@@ -3446,9 +3860,11 @@ mod tests {
             app_taking("app-fleet", Some(json!(["vehicle"]))),
             app_taking("app-notes", Some(json!([]))),
         ];
-        let (ran, out) = run_for(&spec(), &apps, "route-one");
-        assert_eq!(ran, ["app-phone"], "{out:?}");
-        assert!(out.is_empty(), "an app the event is not for is not a failure: {out:?}");
+        for (assignments, tag) in [(None, "route-one"), (Some(Assignments::default()), "route-one-read")] {
+            let (ran, out) = run_for(&spec(), &apps, assignments.as_ref(), &[], tag);
+            assert_eq!(ran, ["app-phone"], "{out:?}");
+            assert!(out.is_empty(), "an app the event is not for is not a failure: {out:?}");
+        }
     }
 
     #[test]
@@ -3456,20 +3872,42 @@ mod tests {
         // The same pack installed twice: every call was written into both.
         let apps = [
             app_taking("app-old", Some(json!(["aokie"]))),
-            chosen_for(app_taking("app-new", Some(json!(["aokie"]))), "aokie"),
+            app_taking("app-new", Some(json!(["aokie"]))),
             app_taking("app-notes", None),
         ];
-        let (ran, out) = run_for(&spec(), &apps, "route-chosen");
+        let (ran, out) = run_for(&spec(), &apps, Some(&kept("aokie", Some("app-new"), &[])), &[], "route-chosen");
         assert_eq!(ran, ["app-new"], "{out:?}");
         assert!(out.is_empty(), "{out:?}");
 
         // Chosen for another source's events is not chosen for this one's.
         let apps = [
             app_taking("app-old", Some(json!(["aokie", "vehicle"]))),
-            chosen_for(app_taking("app-new", Some(json!(["aokie", "vehicle"]))), "vehicle"),
+            app_taking("app-new", Some(json!(["aokie", "vehicle"]))),
         ];
-        let (ran, out) = run_for(&spec(), &apps, "route-chosen-elsewhere");
+        let (ran, out) = run_for(&spec(), &apps, Some(&kept("vehicle", Some("app-new"), &[])), &[], "route-chosen-elsewhere");
         assert!(ran.is_empty() && out.len() == 1, "{ran:?} {out:?}");
+    }
+
+    #[test]
+    fn an_assignment_decides_even_where_one_app_alone_could_take_the_source() {
+        // The account gave the plugin's events to another of its apps (one with
+        // flows and no scripts, say). The one app with scripts for them ran all
+        // the same, because it was the only one that could, and wrote records of
+        // calls that were not its.
+        let apps = [app_taking("app-phone", Some(json!(["aokie"]))), app_taking("app-notes", None)];
+        let away = kept("aokie", Some("app-crm"), &[]);
+        let (ran, out) = run_for(&spec(), &apps, Some(&away), &[], "route-assigned-away");
+        assert!(ran.is_empty(), "no batch is sent at all: {ran:?}");
+        assert!(out.is_empty(), "an event that is another app's is not a failure: {out:?}");
+        let routed = route(&spec(), &apps, Some(&away), &[], "aokie");
+        assert!(routed.holds_back("app-phone") && routed.holds_back("app-notes") && !routed.holds_back("app-crm"));
+        assert_eq!(routed.assigned_elsewhere("app-phone"), Some("app-crm"));
+        assert_eq!(routed.assigned_elsewhere("app-crm"), None);
+        assert!(routed.unchosen().is_none());
+
+        // The same app assigned runs, as it would have alone.
+        let (ran, out) = run_for(&spec(), &apps, Some(&kept("aokie", Some("app-phone"), &[])), &[], "route-assigned-here");
+        assert_eq!(ran, ["app-phone"], "{out:?}");
     }
 
     #[test]
@@ -3480,7 +3918,7 @@ mod tests {
             // (not one that could take it, and not run either: the event is not known to be its)
             app_taking("app-notes", None),
         ];
-        let (ran, out) = run_for(&spec(), &apps, "route-unchosen");
+        let (ran, out) = run_for(&spec(), &apps, Some(&Assignments::default()), &[], "route-unchosen");
         assert!(ran.is_empty(), "no batch is sent at all: {ran:?}");
         assert_eq!(out.len(), 1, "once for the event, not once an app: {out:?}");
         assert_eq!((out[0].effect.as_str(), out[0].transient), ("lane", false));
@@ -3489,11 +3927,45 @@ mod tests {
     }
 
     #[test]
+    fn two_apps_with_flows_alone_on_a_source_are_told_apart_as_apps_with_scripts_are() {
+        // Two apps built on the plugin that carry flows and no scripts are not in
+        // the app list, so nothing told them apart, and both started their flows
+        // for every call. The provider counts both as able to take its events.
+        let s = spec();
+        let none: [AppEntry; 0] = [];
+        let both = ["app-a", "app-b"];
+        let routed = route(&s, &none, Some(&kept("aokie", None, &both)), &both, "aokie");
+        assert!(routed.holds_back("app-a") && routed.holds_back("app-b"), "{routed:?}");
+        let why = routed.unchosen().expect("said, once");
+        assert!(why.contains("app-a, app-b"), "{why}");
+        // Assigned: that one's flows start, and the other's do not.
+        let routed = route(&s, &none, Some(&kept("aokie", Some("app-b"), &both)), &both, "aokie");
+        assert!(routed.holds_back("app-a") && !routed.holds_back("app-b") && routed.unchosen().is_none());
+
+        // One app with scripts and one with flows alone, both counted: as
+        // ambiguous as two with scripts, so neither the scripts nor the flows run.
+        let apps = [app_taking("app-a", Some(json!(["aokie"])))];
+        let (ran, out) = run_for(&s, &apps, Some(&kept("aokie", None, &both)), &["app-b"], "route-flows-and-scripts");
+        assert!(ran.is_empty() && out.len() == 1, "{ran:?} {out:?}");
+
+        // A flow of an app the provider does not count as taking the plugin (it
+        // holds none of its grants) makes the one that does no less the event's:
+        // that one runs, and the other's flow waits, as its scripts would.
+        let (ran, out) = run_for(&s, &apps, Some(&kept("aokie", None, &["app-a"])), &["app-crm"], "route-outsider");
+        assert_eq!(ran, ["app-a"], "{out:?}");
+        let routed = route(&s, &apps, Some(&kept("aokie", None, &["app-a"])), &["app-crm"], "aokie");
+        assert!(routed.holds_back("app-crm") && !routed.holds_back("app-a"));
+    }
+
+    #[test]
     fn where_nothing_says_who_takes_a_source_every_apps_scripts_run_as_they_did() {
-        // No app lists the plugin: nothing is known, and nothing changes.
+        // No app lists the plugin, and the provider counts none: nothing is
+        // known, and nothing changes, for scripts or for flows.
         let unlisted = [app_taking("app-1", None), app_taking("app-2", Some(json!([]))), app_taking("app-3", Some(json!(["vehicle"])))];
-        let (ran, out) = run_for(&spec(), &unlisted, "route-unlisted");
+        let (ran, out) = run_for(&spec(), &unlisted, Some(&Assignments::default()), &[], "route-unlisted");
         assert_eq!(ran, ["app-1", "app-2", "app-3"], "{out:?}");
+        let routed = route(&spec(), &unlisted, Some(&Assignments::default()), &["app-9"], "aokie");
+        assert!(!routed.holds_back("app-9") && !routed.holds_back("app-1"), "{routed:?}");
 
         // A connector that does not name the list: the same apps that would
         // have been told apart are all run, as before the rule was read.
@@ -3501,111 +3973,126 @@ mod tests {
         legacy.catalogue.sources = None;
         legacy.routing = None;
         let both = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
-        let (ran, out) = run_for(&legacy, &both, "route-unnamed");
+        let (ran, out) = run_for(&legacy, &both, None, &[], "route-unnamed");
         assert_eq!(ran, ["app-old", "app-new"], "{out:?}");
 
         // An event that names no source is no plugin's, so it is nobody's in particular.
         let (storage, dir) = store("route-no-source");
         let host = FakeHost::always(json!({}));
-        handle_event(&account("http://provider.invalid".into()), &spec(), &both, &storage, &json!({ "name": "x", "idempotencyKey": "evt-1" }), &host, Prelude::None, &no_connector());
+        let routed = route(&spec(), &both, Some(&kept("aokie", Some("app-old"), &[])), &[], "");
+        handle_event(&account("http://provider.invalid".into()), &spec(), &both, &routed, &storage, &json!({ "name": "x", "idempotencyKey": "evt-1" }), &host, Prelude::None, &js(), &no_connector(), &|| true);
         assert_eq!(host.only_request()["jobs"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn only_an_app_with_scripts_for_the_event_counts_as_one_that_could_take_it() {
+    fn only_an_app_that_would_act_on_the_event_counts_as_one_that_could_take_it() {
         // An app that holds the plugin's grants and runs nothing on its events
-        // (its scripts are for other moments, or switched off) does not make the
-        // one that does ambiguous: that one ran alone before, and still does.
+        // (its scripts are for other moments, or switched off, and no flow of it
+        // is bound to the event) does not make the one that does ambiguous: that
+        // one ran alone before, and still does, though the provider counts both.
         let mut idle = app_taking("app-idle", Some(json!(["aokie"])));
         idle.doc["customLogic"]["scripts"][0]["enabled"] = json!(false);
         let apps = [idle, app_taking("app-phone", Some(json!(["aokie"])))];
         let s = spec();
-        let routed = route(&s, &apps, "aokie");
-        assert_eq!((routed.candidates.clone(), routed.chosen), (vec!["app-phone"], Some("app-phone")));
-        let (ran, out) = run_for(&s, &apps, "route-idle");
+        let counted = kept("aokie", None, &["app-idle", "app-phone"]);
+        let routed = route(&s, &apps, Some(&counted), &[], "aokie");
+        assert_eq!((routed.candidates.clone(), routed.chosen()), (vec!["app-phone".to_string()], Some("app-phone")));
+        let (ran, out) = run_for(&s, &apps, Some(&counted), &[], "route-idle");
         assert_eq!(ran, ["app-phone"], "{out:?}");
 
-        // Nor does an app the provider listed twice count as two.
+        // Nor does an app the provider listed twice, or bound twice, count as two.
         let twice = [app_taking("app-phone", Some(json!(["aokie"]))), app_taking("app-phone", Some(json!(["aokie"])))];
-        assert_eq!(route(&s, &twice, "aokie").chosen, Some("app-phone"));
+        assert_eq!(route(&s, &twice, None, &["app-phone", "app-phone"], "aokie").chosen(), Some("app-phone"));
+
+        // Whether there is anything to ask the provider about at all.
+        assert!(concerns_an_app(&s, &apps, &[]));
+        let quiet = [apps[0].clone()];
+        assert!(!concerns_an_app(&s, &quiet, &[]), "scripts that do not run on events concern no event");
+        assert!(concerns_an_app(&s, &quiet, &["app-b"]), "a flow bound to the event does");
     }
 
     #[test]
-    fn a_flow_of_an_app_is_held_back_only_when_the_app_could_have_taken_the_event_and_does_not() {
+    fn a_flow_of_an_app_the_event_is_not_for_is_held_back() {
         let s = spec();
         let apps = [
             app_taking("app-old", Some(json!(["aokie"]))),
-            chosen_for(app_taking("app-new", Some(json!(["aokie"]))), "aokie"),
+            app_taking("app-new", Some(json!(["aokie"]))),
             app_taking("app-notes", None),
         ];
-        let routed = route(&s, &apps, "aokie");
+        let routed = route(&s, &apps, Some(&kept("aokie", Some("app-new"), &[])), &[], "aokie");
         assert!(routed.holds_back("app-old"));
         assert!(!routed.holds_back("app-new"), "the one the events go to");
-        assert!(!routed.holds_back("app-notes") && !routed.holds_back("app-unheard-of"), "nothing is known of these: as before");
+        // The account gave the plugin's events to one app, so no other app's
+        // flows start for them, those of apps nothing says take it among them.
+        assert!(routed.holds_back("app-notes") && routed.holds_back("app-unheard-of"));
         assert!(routed.unchosen().is_none());
 
-        // No choice: both are held back, and why is said.
+        // No choice: every app's are held back, and why is said.
         let apps = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
-        let routed = route(&s, &apps, "aokie");
-        assert!(routed.holds_back("app-old") && routed.holds_back("app-new") && !routed.holds_back("app-notes"));
+        let routed = route(&s, &apps, Some(&Assignments::default()), &[], "aokie");
+        assert!(routed.holds_back("app-old") && routed.holds_back("app-new") && routed.holds_back("app-notes"));
         assert!(routed.unchosen().is_some());
         // Another plugin's events are not these apps' to take, so nothing of theirs is held back for them.
-        let other = route(&s, &apps, "vehicle");
+        let other = route(&s, &apps, Some(&Assignments::default()), &[], "vehicle");
         assert!(!other.holds_back("app-old") && other.unchosen().is_none());
     }
 
     #[test]
-    fn the_accounts_choice_is_read_with_the_app_list_and_only_when_two_apps_could_take_a_source() {
+    fn the_accounts_choice_and_the_providers_candidates_are_read_from_one_reply_kept_and_fallen_back_on() {
         use crate::link::testkit::{Provider, Reply};
-        let listing = |apps: &[AppEntry]| json!({ "apps": apps.iter().map(|a| a.doc.clone()).collect::<Vec<_>>() }).to_string();
-        let serve = |apps: String, choices: Reply| {
-            let choices = std::sync::Mutex::new(Some(choices));
-            Provider::start(move |req| match req.target.as_str() {
-                "/api/v1/app-logic" => Reply::ok(&apps),
-                "/api/v1/connector-assignments" => choices.lock().unwrap().take().unwrap_or_else(|| Reply::status(500, "{}")),
-                _ => Reply::status(404, "{}"),
-            })
-        };
         let s = spec();
-        let two = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
-
-        // Two apps take the plugin's events: the choice is asked for, with the link's key, and kept on the app.
-        let server = serve(
-            listing(&two),
-            Reply::ok(r#"{"assignments":[{"connectorId":"aokie","appId":"app-new","appName":"New"},{"connectorId":"vehicle","appId":"app-gone"},{"appId":"app-old"}],"candidates":{},"desktops":[]}"#),
+        let reply = r#"{"assignments":[{"connectorId":"aokie","appId":"app-new","appName":"New"},{"connectorId":"vehicle","appId":"app-gone"},{"appId":"app-old"},{"connectorId":" ","appId":"x"}],"candidates":{"aokie":[{"appId":"app-old","appName":"Old"},{"appId":"app-new"},{"appName":"no id"}],"vehicle":[]},"desktops":[]}"#;
+        let server = Provider::start(move |_| Reply::ok(reply));
+        let read = fetch_assignments(&account(server.base.clone()), &s).unwrap();
+        assert_eq!(server.lines(), ["GET /api/v1/connector-assignments"]);
+        assert_eq!(server.requests()[0].header("authorization"), Some("Bearer flk_secret"));
+        assert_eq!(
+            read.chosen,
+            BTreeMap::from([("aokie".to_string(), "app-new".to_string()), ("vehicle".to_string(), "app-gone".to_string())])
         );
-        let apps = fetch(&account(server.base.clone()), &s).unwrap();
-        assert_eq!(server.lines(), ["GET /api/v1/app-logic", "GET /api/v1/connector-assignments"]);
-        assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_secret")));
-        assert_eq!(route(&s, &apps, "aokie").chosen, Some("app-new"));
-        assert!(apps[0].chosen_for.is_empty() && apps[1].chosen_for == ["aokie"], "{apps:?}");
+        assert_eq!(read.candidates.get("aokie"), Some(&vec!["app-old".to_string(), "app-new".to_string()]));
+        assert_eq!(read.candidates.get("vehicle"), Some(&Vec::new()));
 
-        // One app takes them: there is nothing to choose between, and nothing more is asked.
-        let one = [app_taking("app-phone", Some(json!(["aokie"]))), app_taking("app-fleet", Some(json!(["vehicle"]))), app_taking("app-notes", None)];
-        let server = serve(listing(&one), Reply::status(500, "{}"));
-        let apps = fetch(&account(server.base.clone()), &s).unwrap();
-        assert_eq!(server.lines(), ["GET /api/v1/app-logic"]);
-        assert_eq!(route(&s, &apps, "aokie").chosen, Some("app-phone"));
+        // An account with none: its maps come as empty lists.
+        let server = Provider::start(|_| Reply::ok(r#"{"assignments":[],"candidates":[],"desktops":[]}"#));
+        assert_eq!(fetch_assignments(&account(server.base.clone()), &s).unwrap(), Assignments::default());
 
-        // Two apps and a choice that cannot be read: the list is not used without it (both would run), and why is said.
+        // A reply the descriptor does not describe is not "nobody chose anything".
         for (refusal, says) in [
             (Reply::status(503, r#"{"message":"busy"}"#), "HTTP 503: busy"),
             (Reply::ok(r#"{"data":[]}"#), "carries no \"assignments\""),
             (Reply::ok(r#"{"assignments":{}}"#), "rather than the list of which app takes which events"),
         ] {
-            let server = serve(listing(&two), refusal);
-            let why = fetch(&account(server.base.clone()), &s).unwrap_err();
+            let refusal = std::sync::Mutex::new(Some(refusal));
+            let server = Provider::start(move |_| refusal.lock().unwrap().take().unwrap_or_else(|| Reply::status(500, "{}")));
+            let why = fetch_assignments(&account(server.base.clone()), &s).unwrap_err();
             assert!(why.contains(says), "{why}");
         }
 
-        // A connector that names no such rule asks for nothing more, whatever the apps list.
+        // Kept as long as the app list is, and the last one read stands when a
+        // refresh fails; another account's is never this one's.
+        let answers = std::sync::Mutex::new(vec![Reply::status(503, r#"{"message":"busy"}"#), Reply::ok(reply)]);
+        let server = Provider::start(move |_| answers.lock().unwrap().pop().unwrap_or_else(|| Reply::status(500, "{}")));
+        let catalog = Catalog::new();
+        let linked = account(server.base.clone());
+        let first = catalog.assignments(&linked, &s).unwrap();
+        assert_eq!(catalog.assignments(&linked, &s).unwrap(), first, "kept");
+        assert_eq!(server.lines().len(), 1, "asked once: {:?}", server.lines());
+        let aged = Instant::now().checked_sub(CATALOG_TTL + Duration::from_secs(1)).expect("a clock older than two minutes");
+        catalog.assignments.lock().unwrap().fetched.as_mut().unwrap().0 = aged;
+        assert_eq!(catalog.assignments(&linked, &s).unwrap(), first, "the refresh failed, and the last one read stands");
+        assert_eq!(server.lines().len(), 2);
+        let other = LinkedAccount { account_id: Some("another".into()), ..account(server.base.clone()) };
+        assert!(catalog.assignments(&other, &s).is_err(), "nothing of another account's is fallen back on");
+
+        // A connector that keeps no such rule asks nothing.
         let mut legacy = spec();
         legacy.catalogue.sources = None;
         legacy.routing = None;
-        let server = serve(listing(&two), Reply::status(500, "{}"));
-        assert_eq!(fetch(&account(server.base.clone()), &legacy).unwrap().len(), 2);
-        assert_eq!(server.lines(), ["GET /api/v1/app-logic"]);
+        let server = Provider::start(|_| Reply::status(500, "{}"));
+        assert_eq!(fetch_assignments(&account(server.base.clone()), &legacy).unwrap(), Assignments::default());
+        assert!(server.lines().is_empty());
     }
 
     #[test]
@@ -3618,7 +4105,7 @@ mod tests {
         let s = spec();
 
         // Redirects on catalogue fetch and record submit must NOT be followed.
-        let err = fetch(&acc, &s).unwrap_err();
+        let err = fetch(&acc, &s, &js()).unwrap_err();
         assert!(err.contains("HTTP 307"), "{err}");
         let ok_app = entry(json!([{ "id": "form-1", "packFormId": "calls" }]), json!([]));
         let sub_err = submit(
@@ -3652,5 +4139,335 @@ mod tests {
         )
         .is_err());
         assert_eq!(origin.requests().len(), before, "traversal IDs must not reach the network");
+    }
+
+    // --- the language a script is in -------------------------------------------
+
+    /// A profile whose Python contract has the modes `modes` (none: a contract
+    /// without modes), each unfolding a script as the provider's app-logic mode
+    /// does: the contract's helpers in scope, and `run(ctx)`'s value the answer.
+    fn profile_with_modes(modes: &[&str]) -> Value {
+        let preamble = "var helper = 1;";
+        let mut python = json!({
+            "contract": "test-python/1",
+            "files": { "helpers.py": "def twice(n):\n    return n * 2\n" },
+            "entry": "main",
+            "call": "__run__",
+        });
+        if !modes.is_empty() {
+            python["modes"] = modes
+                .iter()
+                .map(|name| {
+                    json!({
+                        "name": name,
+                        "files": { "main.py": "def __run__(ctx):\n    import logic_block\n    run = getattr(logic_block, 'run', None)\n    return run(ctx) if callable(run) else None\n" },
+                        "block": "logic_block.py",
+                        "before": "from helpers import *\n",
+                        "after": "",
+                        "lineOffset": 1,
+                    })
+                })
+                .collect();
+        }
+        json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "python": python,
+        })
+    }
+
+    /// An app with `scripts`, and nothing else of note.
+    fn app_with(scripts: Value) -> AppEntry {
+        AppEntry::listed(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": scripts }, "forms": [] }))
+    }
+
+    fn js_and_python() -> Vec<String> {
+        vec![JAVASCRIPT.to_string(), PYTHON.to_string()]
+    }
+
+    const PY_SOURCE: &str = "def run(ctx):\n    return {}\n";
+
+    #[test]
+    fn the_shipped_connector_reads_a_scripts_language_and_unfolds_python_through_its_app_logic_mode() {
+        // FormLogic's names, as data: a script says `language` (CustomLogicSanitizer, absent being JavaScript),
+        // GET /api/v1/app-logic takes `?languages=` (FlowController::ownerAppLogic), and the profile it serves
+        // unfolds an app script through the Python mode `applogic` (formlogic-script-profile.json).
+        let s = spec();
+        assert_eq!(s.catalogue.script_language.as_deref(), Some("language"));
+        let languages = s.languages.as_ref().expect("the shipped connector says which languages it asks for");
+        assert_eq!((languages.param.as_str(), languages.python_modes.as_slice()), ("languages", ["applogic".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn a_python_app_script_is_unfolded_through_the_providers_own_modes_beside_the_javascript_ones() {
+        // FormLogic hands Python app scripts to a desktop whose beat names Python. They were run as JavaScript
+        // `entry` jobs, which is to say not at all; they go to the runner as Python projects it builds from the
+        // provider's own mode, the way the provider's browser builds them.
+        let s = spec();
+        let doc = profile_with_modes(&["applogic"]);
+        let apps = vec![app_with(json!([
+            { "id": "js", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+            { "id": "py", "hook": "onConnectorEvent", "language": "python", "source": PY_SOURCE },
+            { "id": "named-js", "hook": "onConnectorEvent", "language": " javascript ", "source": "function run(ctx) { return {}; }" },
+        ]))];
+        let (storage, dir) = store("python-modes");
+        let host = FakeHost::always(json!({}));
+        let event = json!({ "name": "x", "idempotencyKey": "evt-1" });
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &Route::unknown(),
+            &storage,
+            &event,
+            &host,
+            Prelude::Profile(&doc),
+            &js_and_python(),
+            &no_connector(),
+            &|| true,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let request = host.only_request();
+        assert_eq!(request["profile"], doc, "the modes travel in the profile, beside the jobs");
+        let jobs = request["jobs"].as_array().unwrap();
+        assert_eq!((jobs[0]["mode"].as_str(), jobs[2]["mode"].as_str()), (Some("entry"), Some("entry")), "{jobs:?}");
+        assert_eq!(
+            jobs[1],
+            json!({
+                "id": "a0s1",
+                "language": "python",
+                "mode": "python-project",
+                "modes": ["applogic"],
+                "source": PY_SOURCE,
+                "args": [{ "event": event, "storage": {} }],
+                "budgetMs": s.budget_ms.unwrap(),
+                "instructionSteps": s.instruction_budget.unwrap(),
+            }),
+            "the author's source as written, the same context and the same two budgets as a JavaScript script"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_in_a_language_this_desktop_does_not_declare_is_said_and_never_run_as_javascript() {
+        // The beat declares JavaScript alone, so the provider's browser runs the Python scripts: one handed over
+        // anyway (a provider that does not read the languages asked for) is not this desktop's to run, and is
+        // never run as JavaScript, which is what every script used to be.
+        let s = spec();
+        let doc = profile_with_modes(&["applogic"]);
+        let apps = vec![app_with(json!([
+            { "id": "js", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+            { "id": "py", "hook": "onConnectorEvent", "language": "python", "source": PY_SOURCE },
+            { "id": "rb", "hook": "onConnectorEvent", "language": "ruby", "source": "def run(ctx) end" },
+            { "id": "odd", "hook": "onConnectorEvent", "language": 3, "source": "function run(ctx) { return {}; }" },
+        ]))];
+        let (storage, dir) = store("python-undeclared");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &Route::unknown(),
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::Profile(&doc),
+            &js(),
+            &no_connector(),
+            &|| true,
+        );
+        let request = host.only_request();
+        let jobs = request["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1, "only the JavaScript script is sent: {jobs:?}");
+        assert_eq!(jobs[0]["mode"], "entry");
+        let said: Vec<(&str, String)> = out.iter().map(|o| (o.script.as_str(), o.detail.clone().unwrap_err())).collect();
+        assert_eq!(said.iter().map(|(script, _)| *script).collect::<Vec<_>>(), ["py", "rb", "odd"], "{out:?}");
+        for ((_, why), language) in said.iter().zip(["python", "ruby", "something other than words"]) {
+            assert!(why.contains(language) && why.contains("not run here") && why.contains("javascript alone"), "{why}");
+        }
+        assert!(out.iter().all(|o| o.effect == "script" && !o.transient), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_is_run_only_where_the_profile_defines_every_mode_the_provider_names() {
+        let s = spec();
+        assert_eq!(languages_run(&s, None), [JAVASCRIPT], "no profile, nothing to unfold a Python script through");
+        assert_eq!(languages_run(&s, Some(&profile_with_modes(&[]))), [JAVASCRIPT], "a contract without modes");
+        assert_eq!(languages_run(&s, Some(&profile_with_modes(&["flowModule"]))), [JAVASCRIPT], "without the mode named");
+        assert_eq!(languages_run(&s, Some(&profile_with_modes(&["flowModule", "applogic"]))), [JAVASCRIPT, PYTHON]);
+        let mut names_none = spec();
+        names_none.languages.as_mut().unwrap().python_modes.clear();
+        assert_eq!(languages_run(&names_none, Some(&profile_with_modes(&["applogic"]))), [JAVASCRIPT]);
+        let mut legacy = spec();
+        legacy.languages = None;
+        assert_eq!(languages_run(&legacy, Some(&profile_with_modes(&["applogic"]))), [JAVASCRIPT]);
+
+        // And asked again of the profile the batch carries: a job naming a mode the request's profile does not
+        // define has the WHOLE request refused, the JavaScript scripts in it too, so the Python one stays behind.
+        let apps = vec![app_with(json!([
+            { "id": "js", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+            { "id": "py", "hook": "onConnectorEvent", "language": "python", "source": PY_SOURCE },
+        ]))];
+        let (storage, dir) = store("python-no-mode");
+        let host = FakeHost::always(json!({}));
+        let other = profile_with_modes(&["flowModule"]);
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &Route::unknown(),
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::Profile(&other),
+            &js_and_python(),
+            &no_connector(),
+            &|| true,
+        );
+        let request = host.only_request();
+        assert_eq!(request["jobs"].as_array().unwrap().len(), 1, "{request}");
+        assert_eq!(out.len(), 1, "{out:?}");
+        let why = out[0].detail.clone().unwrap_err();
+        assert!(out[0].script == "py" && why.contains("does not define the modes") && why.contains("applogic"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_app_list_is_asked_for_in_the_languages_this_desktop_declares_and_kept_for_those_alone() {
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
+        let s = spec();
+        let catalog = Catalog::new();
+        let linked = account(server.base.clone());
+        catalog.load(&linked, &s, &js_and_python()).unwrap();
+        catalog.load(&linked, &s, &js_and_python()).unwrap();
+        // Python no longer declared: a list that holds Python scripts the browser is running again is not kept.
+        catalog.load(&linked, &s, &js()).unwrap();
+        assert_eq!(
+            server.lines(),
+            ["GET /api/v1/app-logic?languages=javascript%2Cpython", "GET /api/v1/app-logic?languages=javascript"]
+        );
+
+        // A connector that names no languages asks with none, as it did.
+        let server = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
+        let mut legacy = spec();
+        legacy.languages = None;
+        fetch(&account(server.base.clone()), &legacy, &js_and_python()).unwrap();
+        assert_eq!(server.lines(), ["GET /api/v1/app-logic"]);
+    }
+
+    #[test]
+    fn what_this_lane_asks_for_is_what_the_beat_declares_and_never_more() {
+        // FormLogic hands over the scripts in whatever languages the request names, without weighing them against
+        // the beat, and its browser keeps every script in a language the beat leaves out. So the lane asks for what
+        // the beat declares: with this machine's CLI, which runs JavaScript flows alone, that is JavaScript, though
+        // the lane itself could unfold a Python script.
+        let s = spec();
+        let doc = profile_with_modes(&["applogic"]);
+        assert_eq!(languages_run(&s, Some(&doc)), [JAVASCRIPT, PYTHON]);
+        let probe = crate::bridge::script_host::ScriptHost::global().engine_probe();
+        let flows = crate::link::heartbeat::declared_languages(probe.as_ref(), None);
+        let asked = languages_asked(&s, Prelude::Profile(&doc));
+        assert!(asked.iter().all(|l| flows.contains(l)), "asked {asked:?} beyond what the CLI runs {flows:?}");
+        assert!(asked.iter().any(|l| l == JAVASCRIPT), "{asked:?}");
+        assert_eq!(languages_asked(&s, Prelude::None), [JAVASCRIPT]);
+    }
+
+    #[test]
+    fn a_python_app_script_runs_on_the_real_engine_and_its_effects_are_performed() {
+        // The contract end to end, on the runner this desktop ships: a Python script unfolded through a profile's
+        // mode is handed the same context a JavaScript one is, answers its effects the same way, and has them
+        // performed; one that raises says where, in the author's own lines, and takes nothing down with it.
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
+        };
+        let host = crate::bridge::script_host::ScriptHost::with_cli(
+            crate::bridge::worker::CliInvocation::Node { script: cli },
+            Some(node),
+        );
+        let s = spec();
+        let doc = profile_with_modes(&["applogic"]);
+        let apps = vec![app_with(json!([
+            { "id": "py", "hook": "onConnectorEvent", "language": "python", "source":
+              "def run(ctx):\n    ev = ctx['event']\n    key = 'seen:' + ev['idempotencyKey']\n    if ctx['storage'].get(key):\n        return None\n    return {'effects': [{'type': 'storage.set', 'key': key, 'value': twice(ev['data']['n'])}]}\n" },
+            { "id": "py-throws", "hook": "onConnectorEvent", "language": "python", "source":
+              "def run(ctx):\n    return nothing_at_all\n" },
+            { "id": "js", "hook": "onConnectorEvent", "source":
+              "function run(ctx) { return { effects: [{ type: 'ui.toast', message: 'js ' + ctx.event.data.n }] }; }" },
+        ]))];
+        let (storage, dir) = store("python-real");
+        let event = json!({ "name": "aokie.call.ended", "idempotencyKey": "evt-7", "data": { "n": 21 } });
+        let deliver = || {
+            handle_event(
+                &account("http://provider.invalid".into()),
+                &s,
+                &apps,
+                &Route::unknown(),
+                &storage,
+                &event,
+                &host,
+                Prelude::Profile(&doc),
+                &js_and_python(),
+                &no_connector(),
+                &|| true,
+            )
+        };
+        let out = deliver();
+        assert_eq!(storage.values("app-1").unwrap().get("seen:evt-7"), Some(&json!(42)), "{out:?}");
+        let threw = out.iter().find(|o| o.script == "py-throws").expect("the one that raises is said");
+        let why = threw.detail.clone().unwrap_err();
+        assert!(why.contains("threw") && why.contains("NameError") && why.contains("logic_block.py:2"), "{why}");
+        assert!(out.iter().any(|o| o.script == "js" && o.detail == Ok("[info] js 21".to_string())), "{out:?}");
+        // Delivered again, the Python script reads its own marker and asks for nothing.
+        let again = deliver();
+        assert!(!again.iter().any(|o| o.script == "py"), "{again:?}");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- a link that goes while an event is handled ------------------------------
+
+    #[test]
+    fn the_effects_of_an_event_whose_link_goes_while_they_are_performed_stop_and_the_event_is_kept() {
+        // A person who disconnects while an event's effects were being performed: the rest were written all the same,
+        // records with the key they had asked this desktop to forget, markers for a link that was no more. Now the
+        // link is asked before each effect, and once it has gone nothing more is written and the event is kept.
+        let s = spec();
+        let apps = vec![app_with(json!([
+            { "id": "first", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+            { "id": "second", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+        ]))];
+        let host = FakeHost::always(json!({ "effects": [
+            { "type": "storage.set", "key": "a" },
+            { "type": "storage.set", "key": "b" },
+        ] }));
+        let (storage, dir) = store("link-went-effects");
+        // Held for the first effect, and gone from the second on.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let linked = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &Route::unknown(),
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::None,
+            &js(),
+            &no_connector(),
+            &linked,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].detail, Ok("remembered \"a\"".to_string()));
+        assert_eq!((out[1].script.as_str(), out[1].effect.as_str(), out[1].transient), ("first", LINK_WENT_EFFECT, true));
+        assert!(out[1].detail.clone().unwrap_err().contains("forgotten or replaced"), "{out:?}");
+        let kept = storage.values("app-1").unwrap();
+        assert!(kept.contains_key("a") && !kept.contains_key("b"), "{kept:?}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "asked before each effect, and of nothing after");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

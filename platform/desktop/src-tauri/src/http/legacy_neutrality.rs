@@ -23,8 +23,11 @@
 //! Routes the model adds are not compared (the new guard judges them, by design); unknown paths are.
 //!
 //! The step the guard was tightened by after the third review (`http::tighten`: impostor origins, what a paired token
-//! reaches and from where, the reads with paths in them that no web page reads) runs in front of the old guard, not inside
-//! it, and the frozen guard is compared with that same step in front of it: what is compared is still the old guard.
+//! reaches and from where, the reads with paths in them that no web page reads, and the origins Windows gives OAIY's own
+//! pages, which are names a page on this computer's port 80 has too and are OAIY's only with the token its windows are
+//! handed) runs in front of the old guard, not inside it, and the frozen guard is compared with that same step in front
+//! of it: what is compared is still the old guard. The last of those is held to its own two comparisons below (such a
+//! name with no token is answered as a site nobody trusts; with the token, as the token).
 
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +39,7 @@ use axum::Router;
 use tower::ServiceExt;
 
 use super::frozen_guard;
-use super::{access_guard, AccessState, AuthConfig};
+use super::{access_guard, AccessState, AuthConfig, LoopbackPages};
 use crate::auth::routes::{Verb, ROUTES};
 use crate::auth::{AccessMode, AccessSettings};
 use crate::bridge::pairing::PairingManager;
@@ -167,6 +170,12 @@ const STATIC_TOKEN: &str = "desk-token";
 
 /// The live listener's guard in `legacy` mode, over the stub routes.
 fn live(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle) -> Router {
+    live_believing(gui, token, pairing, LoopbackPages::as_built())
+}
+
+/// [`live`], believing the pages at this computer's loopback addresses that `loopback` says (a release build's rule, in a
+/// test built in debug).
+fn live_believing(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle, loopback: LoopbackPages) -> Router {
     let unused = std::env::temp_dir().join("oaiy-legacy-neutrality-nothing-is-made-here");
     let guard = crate::auth::build_guard(
         &AccessSettings::legacy(),
@@ -184,6 +193,7 @@ fn live(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle) -
             token: token.map(str::to_owned),
             gui_mode: gui,
             pairing: Some(pairing),
+            loopback,
         },
         guard,
     };
@@ -197,7 +207,7 @@ fn frozen(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle)
         gui_mode: gui,
         pairing: Some(pairing.clone()),
     };
-    let tightened = AuthConfig { token: token.map(str::to_owned), gui_mode: gui, pairing: Some(pairing) };
+    let tightened = AuthConfig { token: token.map(str::to_owned), gui_mode: gui, pairing: Some(pairing), loopback: LoopbackPages::as_built() };
     stub_routes()
         .layer(middleware::from_fn_with_state(state, frozen_guard::origin_guard))
         .layer(middleware::from_fn_with_state(tightened, super::tightened))
@@ -440,12 +450,227 @@ async fn the_matrix_would_notice_a_guard_that_answered_differently() {
     let gui = live(true, Some(STATIC_TOKEN), pairing.clone());
     let headless = frozen(false, Some(STATIC_TOKEN), pairing);
     let (method, path) = (Method::POST, "/api/services");
-    let a = ask(&gui, &method, path, None, Some(OWN_WEBVIEW)).await;
-    let b = ask(&headless, &method, path, None, Some(OWN_WEBVIEW)).await;
+    // (an origin the desktop takes for its own with no credential on every system: its window's is one on a Mac and
+    // Linux only, since on Windows that origin is a name and needs the window's token, which a headless server takes too)
+    let a = ask(&gui, &method, path, None, Some("https://oaiy.com")).await;
+    let b = ask(&headless, &method, path, None, Some("https://oaiy.com")).await;
+    assert_eq!((a.status, b.status), (200, 403));
     assert_ne!(
         a, b,
         "a guard in another mode answers differently, and the comparison sees it"
     );
+}
+
+/// What the desktop's own window sends beside its origin: nothing where the origin is one no browser page can send (a
+/// Mac, Linux), and on Windows, where it is a name a page on this computer's port 80 has too, the token it was handed.
+fn window_credential() -> Option<&'static str> {
+    cfg!(windows).then(crate::http::own_window_bearer_for_tests)
+}
+
+/// The origins Windows gives OAIY's own pages (`http::is_name_only_origin`).
+const NAMES: [&str; 3] = ["http://tauri.localhost", "http://oaiy.localhost", "http://oaiyflows.localhost"];
+
+/// Such a name with no token that is the owner's is another website: on the desktop, every request of the matrix (every
+/// method to every path the table knows, and paths that do not exist) is answered to it as it is answered to a site
+/// nobody trusts. Where an answer is not a refusal the two are the same answer; a refusal says why in its own words
+/// (`http::NAME_ONLY_REFUSAL`). On a Mac and Linux the names are nobody's and are refused more than a stranger is, never
+/// less.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_of_one_of_oaiys_windows_with_no_token_is_answered_as_a_site_nobody_trusts() {
+    const STRANGER: &str = "https://evil.example";
+    let (pairing, paired) = a_paired_token();
+    // No credential, wrong ones, and a paired app's from a page it was not granted to (which is taken off the request).
+    let credentials: Arc<Vec<Option<String>>> = Arc::new(vec![
+        None,
+        Some("Bearer wrong-token".into()),
+        Some(format!("Bearer {paired}")),
+        Some("Bearer oaiypat_wrong".into()),
+        Some("Bearer ".into()),
+        Some(format!("bearer {STATIC_TOKEN}")),
+    ]);
+    let requests = Arc::new(requests());
+    let mut tasks = Vec::new();
+    for token in [Some(STATIC_TOKEN), None] {
+        let app = live(true, token, pairing.clone());
+        let (requests, credentials) = (requests.clone(), credentials.clone());
+        tasks.push(tokio::spawn(async move {
+            let (mut compared, mut answered, mut differences) = (0usize, 0usize, Vec::new());
+            for (method, path) in requests.iter() {
+                for credential in credentials.iter() {
+                    let stranger = ask(&app, method, path, credential.as_deref(), Some(STRANGER)).await;
+                    for name in NAMES {
+                        let named = ask(&app, method, path, credential.as_deref(), Some(name)).await;
+                        compared += 1;
+                        let same = if named.status == 403 {
+                            // (a Mac and Linux refuse the name everything but discovery: more than a stranger, never less)
+                            stranger.status == 403 || !cfg!(windows)
+                        } else {
+                            answered += 1;
+                            named == stranger
+                        };
+                        if !same && differences.len() < 20 {
+                            differences.push(format!("token={token:?} {method} {path} auth={credential:?}: {name} {} {:?} / a stranger {} {:?}", named.status, String::from_utf8_lossy(&named.body), stranger.status, String::from_utf8_lossy(&stranger.body)));
+                        }
+                    }
+                }
+            }
+            (compared, answered, differences)
+        }));
+    }
+    let (mut compared, mut answered, mut differences) = (0usize, 0usize, Vec::new());
+    for task in tasks {
+        let (c, a, d) = task.await.unwrap();
+        compared += c;
+        answered += a;
+        differences.extend(d);
+    }
+    assert!(differences.is_empty(), "{} of {compared} answers differ; the first:\n{}", differences.len(), differences.join("\n"));
+    assert!(compared > 50_000, "{compared} answers compared");
+    // It is not two refusals that are compared: discovery, the services' public view and the paths that do not exist answer.
+    assert!(answered > 1_000, "{answered} of them were not refusals");
+}
+
+/// With the token the desktop hands its windows, the same names are answered on Windows as the token alone is (which
+/// is everything): the window is let in by what it holds.
+#[tokio::test]
+async fn a_name_of_one_of_oaiys_windows_with_its_token_is_answered_as_the_token_is() {
+    let (pairing, _) = a_paired_token();
+    let app = live(true, None, pairing);
+    let bearer = crate::http::own_window_bearer_for_tests();
+    let (mut compared, mut let_in) = (0usize, 0usize);
+    for (method, path) in requests() {
+        let token = ask(&app, &method, &path, Some(bearer), None).await;
+        for name in NAMES {
+            let named = ask(&app, &method, &path, Some(bearer), Some(name)).await;
+            compared += 1;
+            if cfg!(windows) {
+                assert_eq!(named, token, "{method} {path} from {name}");
+            } else {
+                assert!(named.status == 403 || named == token, "{method} {path} from {name}: {named:?}");
+            }
+            let_in += usize::from(named.status == 200);
+        }
+    }
+    assert!(compared > 4_000, "{compared} answers compared");
+    if cfg!(windows) {
+        assert!(let_in > 500, "{let_in} of them were let in");
+    }
+}
+
+/// Pages at this computer's loopback addresses that OAIY does not serve: development servers' and anything else's on a
+/// port (the API's own port among them: OAIY serves no page there; and the Agent's own port while OAIY does not hold it).
+const STRAY_LOOPBACK: [&str; 7] = [
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://[::1]:8080",
+    "http://localhost",
+    "https://localhost:8443",
+    "http://127.0.0.1:17972",
+    "http://127.0.0.1:17974",
+];
+
+/// What a release build believes of loopback pages, with the Agent's own port not held (no page OAIY serves).
+fn a_release_build() -> LoopbackPages {
+    LoopbackPages::release(&[], || None)
+}
+
+/// On a release build a page at one of this computer's loopback addresses that OAIY does not serve, with no token that
+/// is the owner's, is another website: every request of the matrix (every method to every path the table knows, and
+/// paths that do not exist), with no credential, wrong ones and a paired app's from a page it was not granted to, is
+/// answered to it exactly as it is answered to a site nobody trusts: the same status, headers and body, refusals in the
+/// same words. (The old guard believed every such page on the broad routes: a stranger on the machine's port 3000 read
+/// the calls, the contacts and the logs, and started the services the person had defined.)
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_release_build_a_loopback_page_oaiy_does_not_serve_is_answered_as_a_site_nobody_trusts() {
+    const STRANGER: &str = "https://evil.example";
+    let (pairing, paired) = a_paired_token();
+    let credentials: Arc<Vec<Option<String>>> = Arc::new(vec![
+        None,
+        Some("Bearer wrong-token".into()),
+        Some(format!("Bearer {paired}")),
+        Some("Bearer oaiypat_wrong".into()),
+        Some("Bearer ".into()),
+        Some(format!("bearer {STATIC_TOKEN}")),
+    ]);
+    let requests = Arc::new(requests());
+    let mut tasks = Vec::new();
+    for token in [Some(STATIC_TOKEN), None] {
+        let app = live_believing(true, token, pairing.clone(), a_release_build());
+        let (requests, credentials) = (requests.clone(), credentials.clone());
+        tasks.push(tokio::spawn(async move {
+            let (mut compared, mut answered, mut differences) = (0usize, 0usize, Vec::new());
+            for (method, path) in requests.iter() {
+                for credential in credentials.iter() {
+                    let stranger = ask(&app, method, path, credential.as_deref(), Some(STRANGER)).await;
+                    for page in STRAY_LOOPBACK {
+                        let at = ask(&app, method, path, credential.as_deref(), Some(page)).await;
+                        compared += 1;
+                        answered += usize::from(at.status != 403);
+                        if at != stranger && differences.len() < 20 {
+                            differences.push(format!("token={token:?} {method} {path} auth={credential:?}: {page} {} {:?} / a stranger {} {:?}", at.status, String::from_utf8_lossy(&at.body), stranger.status, String::from_utf8_lossy(&stranger.body)));
+                        }
+                    }
+                }
+            }
+            (compared, answered, differences)
+        }));
+    }
+    let (mut compared, mut answered, mut differences) = (0usize, 0usize, Vec::new());
+    for task in tasks {
+        let (c, a, d) = task.await.unwrap();
+        compared += c;
+        answered += a;
+        differences.extend(d);
+    }
+    assert!(differences.is_empty(), "{} of {compared} answers differ; the first:\n{}", differences.len(), differences.join("\n"));
+    assert!(compared > 100_000, "{compared} answers compared");
+    // It is not two refusals that are compared: discovery, the services' public view and the paths that do not exist answer.
+    assert!(answered > 5_000, "{answered} of them were not refusals");
+}
+
+/// The pages a release build believes are answered exactly as every loopback page was before: the Agent's own port while
+/// OAIY serves the Agent there (a Mac's and Linux's window), and a development server the person named in
+/// `OAIY_DEV_ORIGINS`. Nothing they could do is taken from them, and nothing is added.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_a_release_build_a_loopback_page_oaiy_serves_or_the_person_named_keeps_what_it_had() {
+    const AGENT: &str = "http://127.0.0.1:17974";
+    const DEV: &str = "http://localhost:5173";
+    let (pairing, paired) = a_paired_token();
+    let credentials: Arc<Vec<Option<String>>> = Arc::new(vec![None, Some("Bearer wrong-token".into()), Some(format!("Bearer {paired}"))]);
+    let requests = Arc::new(requests());
+    let mut tasks = Vec::new();
+    for token in [Some(STATIC_TOKEN), None] {
+        // (the old guard's own rule, and a debug build's: every loopback page believed)
+        let before = live_believing(true, token, pairing.clone(), LoopbackPages::of_build_for_tests(true));
+        let now = live_believing(true, token, pairing.clone(), LoopbackPages::release(&[DEV], || Some(AGENT)));
+        let (requests, credentials) = (requests.clone(), credentials.clone());
+        tasks.push(tokio::spawn(async move {
+            let (mut compared, mut let_in, mut differences) = (0usize, 0usize, Vec::new());
+            for (method, path) in requests.iter() {
+                for credential in credentials.iter() {
+                    for page in [AGENT, DEV] {
+                        let (a, b) = (ask(&now, method, path, credential.as_deref(), Some(page)).await, ask(&before, method, path, credential.as_deref(), Some(page)).await);
+                        compared += 1;
+                        let_in += usize::from(a.status == 200);
+                        if a != b && differences.len() < 20 {
+                            differences.push(format!("token={token:?} {method} {path} auth={credential:?} {page}: now {} {:?} / before {} {:?}", a.status, String::from_utf8_lossy(&a.body), b.status, String::from_utf8_lossy(&b.body)));
+                        }
+                    }
+                }
+            }
+            (compared, let_in, differences)
+        }));
+    }
+    let (mut compared, mut let_in, mut differences) = (0usize, 0usize, Vec::new());
+    for task in tasks {
+        let (c, l, d) = task.await.unwrap();
+        compared += c;
+        let_in += l;
+        differences.extend(d);
+    }
+    assert!(differences.is_empty(), "{} of {compared} answers differ; the first:\n{}", differences.len(), differences.join("\n"));
+    assert!(compared > 15_000, "{compared} answers compared");
+    assert!(let_in > 2_000, "{let_in} of them were let in: the broad routes are theirs");
 }
 
 /// The routes of the receptionist's transfers and messages: `(method, pattern)`, each with a `since: 1` row in the table.
@@ -482,10 +707,15 @@ async fn the_routes_of_the_receptionists_transfers_and_messages_are_in_the_compa
         for (name, guarded) in [("live", live(true, Some(STATIC_TOKEN), pairing.clone())), ("frozen", frozen(true, Some(STATIC_TOKEN), pairing.clone()))] {
             let stranger = ask(&guarded, &method, &path, None, Some("http://evil.example")).await;
             assert_eq!(stranger.status, 403, "{name}: {method} {path} from a page that is not the window");
-            // (this system's own: on a Mac `http://oaiy.localhost` is whatever holds port 80, not the window)
+            // (this system's own: on a Mac `http://oaiy.localhost` is whatever holds port 80, not the window; and on
+            // Windows, where it is the window's name and such a page's too, the window sends the token it was handed)
             let own = if cfg!(windows) { "http://oaiy.localhost" } else { "oaiy://localhost" };
-            let window = ask(&guarded, &method, &path, None, Some(own)).await;
+            let window = ask(&guarded, &method, &path, window_credential(), Some(own)).await;
             assert_eq!(window.status, 200, "{name}: {method} {path} from the desktop's own window");
+            if cfg!(windows) {
+                let named = ask(&guarded, &method, &path, None, Some(own)).await;
+                assert_eq!(named.status, 403, "{name}: {method} {path} from a page that only has the window's name");
+            }
             let token = ask(&guarded, &method, &path, Some(&format!("Bearer {STATIC_TOKEN}")), None).await;
             assert_eq!(token.status, 200, "{name}: {method} {path} with the configured token");
         }
@@ -530,14 +760,22 @@ async fn the_old_guards_bodies_and_statuses_are_still_what_they_were() {
         &gui,
         &Method::POST,
         "/api/services",
-        None,
+        window_credential(),
         Some(OWN_WEBVIEW),
     )
     .await;
     assert_eq!(
         a.status, 200,
-        "the desktop's own webview passes with no credential, as it always did"
+        "the desktop's own webview passes: by its origin alone where no browser page can send it, as it always did, and on Windows with the token it was handed"
     );
+    if cfg!(windows) {
+        let a = ask(&gui, &Method::POST, "/api/services", None, Some(OWN_WEBVIEW)).await;
+        assert_eq!(
+            (a.status, String::from_utf8_lossy(&a.body).into_owned()),
+            (403, format!(r#"{{"error":"{}"}}"#, super::NAME_ONLY_REFUSAL)),
+            "there the origin is a name a page on this computer's port 80 has too"
+        );
+    }
     let a = ask(&gui, &Method::GET, "/api/services", None, None).await;
     assert_eq!(
         a.status, 200,
@@ -578,6 +816,7 @@ async fn a_handler_that_reads_the_principal_gets_the_legacy_owner_in_legacy_mode
             token: Some(STATIC_TOKEN.into()),
             gui_mode: false,
             pairing: Some(pairing),
+            loopback: LoopbackPages::as_built(),
         },
         guard,
     };
@@ -627,6 +866,7 @@ async fn health_gains_access_and_storage_only_with_the_guard_in_front_and_nothin
             token: None,
             gui_mode: true,
             pairing: Some(pairing),
+            loopback: LoopbackPages::as_built(),
         },
         guard,
     };
@@ -733,6 +973,7 @@ async fn a_wide_token_the_rule_refuses_is_the_old_guards_on_old_routes_and_a_400
                 token: Some(WIDE.into()),
                 gui_mode: gui,
                 pairing: Some(pairing.clone()),
+                loopback: LoopbackPages::as_built(),
             },
             guard: guard.clone(),
         };
@@ -782,6 +1023,7 @@ async fn a_route_the_model_adds_is_judged_by_the_new_guard_even_in_legacy_mode()
                 token: Some(STATIC_TOKEN.into()),
                 gui_mode: gui,
                 pairing: Some(pairing.clone()),
+                loopback: LoopbackPages::as_built(),
             },
             guard: guard.clone(),
         };

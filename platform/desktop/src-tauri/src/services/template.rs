@@ -12,7 +12,10 @@
 //!   ${allowedOrigins} — the exact origins of OAIY's own windows (the Agent and
 //!                    the flow editor), comma-separated: what a service that
 //!                    drives a browser (`playwright-browser`) is told as
-//!                    `OAIY_ALLOWED_ORIGINS`; empty in the headless server
+//!                    `OAIY_ALLOWED_ORIGINS`; empty in the headless server.
+//!                    (That service is also given this run's key as
+//!                    `OAIY_BROWSER_KEY`, by the registry itself: it believes a
+//!                    `.localhost` origin only with it.)
 //!
 //! A template can be fully self-contained ("plug-and-play"): set `files` to a
 //! map of `filename -> contents` and those scripts are written into

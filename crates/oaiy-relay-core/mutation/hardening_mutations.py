@@ -21,7 +21,7 @@ MUTATIONS = [
      "    /// The first header called `name`, whatever the case of either.\n    pub fn header(&self, name: &str) -> Option<&str> {\n        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name))",
      "    /// The first header called `name`, whatever the case of either.\n    pub fn header(&self, name: &str) -> Option<&str> {\n        self.headers.iter().find(|(k, _)| k == name)", "own"),
     ("H05", "header names", "the client does not normalise the names of an adapter's response headers", C + "client/relay.rs",
-     "let response = self.http.send(&request)?.normalised();", "let response = self.http.send(&request)?;", "own"),
+     "Ok(self.http.send(&request)?.normalised())", "Ok(self.http.send(&request)?)", "own"),
     ("H06", "info proof", "a 200 with no proof in it is `not who it was` and stops the loop instead of being retried", C + "client/relay.rs",
      'return Err(ProveError::NoAnswer(ClientError::BadAnswer("the answer carries no proof")));',
      'return Err(ProveError::Invalid(Error::Invalid("the answer carries no proof")));', "own"),

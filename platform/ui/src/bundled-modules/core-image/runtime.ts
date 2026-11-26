@@ -8,7 +8,7 @@
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from '../core-service/examples';
-import { imageDataUrl as pictureDataUrl, runContract } from '../core-service/contractRuntime';
+import { desktopFileHeaders, imageDataUrl as pictureDataUrl, runContract } from '../core-service/contractRuntime';
 import { validatePath } from '../core-filesystem/runtime';
 
 function isLoopbackHost(hostname: string): boolean {
@@ -395,7 +395,8 @@ async function uploadImageToComfyUI(
     blob = new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
   } else if (imageData.startsWith('http')) {
     // Fetch the image from URL
-    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI' });
+    // (a picture OAIY's engines made is read from the desktop with its credential: desktopFileHeaders)
+    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI', headers: desktopFileHeaders(imageData, ctx) });
     blob = await response.blob();
     mimeType = blob.type || 'image/png';
   } else {
@@ -608,7 +609,7 @@ async function generateComfyUI(
       } else if (source.url) {
         // Fetch URL and convert to base64
         try {
-          const response = await ctx.secureFetch(source.url, { purpose: 'Fetch image for ComfyUI' });
+          const response = await ctx.secureFetch(source.url, { purpose: 'Fetch image for ComfyUI', headers: desktopFileHeaders(source.url, ctx) });
           const blob = await response.blob();
           const arrayBuffer = await blob.arrayBuffer();
           const bytes = new Uint8Array(arrayBuffer);

@@ -115,7 +115,7 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
                 // answered (the provider half down) backs off like a failed
                 // poll, rather than going straight round again.
                 let backoff = trouble.is_some();
-                store.note_relay(trouble);
+                store.note_relay(&account, trouble);
                 // A batch that did work is likely followed by more; go straight
                 // back. An empty one already waited server-side.
                 if backoff {
@@ -131,12 +131,12 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
             // nothing to ask for again until the link is another.
             Err(Refused::NotGranted(why)) => {
                 log::info!("relay: the provider routes no commands to this link ({why}); not asked again while it is linked so");
-                store.note_relay_not_used(why);
+                store.note_relay_not_used(&account, why);
                 lane.start_afresh();
                 parked = Some(account);
             }
             Err(Refused::Trouble(e)) => {
-                store.note_relay(Some(e));
+                store.note_relay(&account, Some(e));
                 // The try after a failure is on a new client, not one that has
                 // seen the trouble.
                 lane.start_afresh();

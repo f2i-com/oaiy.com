@@ -635,7 +635,20 @@ pub struct PluginHost {
     /// The ring a phone plugin's `oaiy.ring.*` requests and call events reach: this one, else the desktop's own
     /// ([`crate::ring::shared`]). A test gives its own, so it does not share a process-wide one with the others.
     ring: Mutex<Option<Arc<crate::ring::Ring>>>,
+    /// What a plugin's `oaiy.browser.open` opens its address with: OAIY's own launcher, unless a test has given its
+    /// own (a suite that opened a real browser at every run would be one nobody runs).
+    browser: Mutex<BrowserOpener>,
 }
+
+/// Opens a web address in the person's browser ([`PluginHost::handle_browser_open`]).
+type BrowserOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// The plugin-initiated request that has OAIY open a web page in the person's browser, and the capability it needs.
+pub(crate) const BROWSER_OPEN: &str = "oaiy.browser.open";
+
+/// The longest web address `oaiy.browser.open` opens. Far over an OAuth page's (some hundreds of bytes), and short of
+/// what a command line takes.
+const MAX_BROWSER_ADDRESS_BYTES: usize = 4096;
 
 /// A screen's capability belongs to the exact process the host started from a
 /// verified package. Holding the Arc prevents an old process's identity being
@@ -734,6 +747,7 @@ impl PluginHost {
             app_logic: crate::link::app_logic::Catalog::new(),
             scripts: Mutex::new(std::sync::Arc::new(crate::bridge::script_host::GlobalHost)),
             ring: Mutex::new(None),
+            browser: Mutex::new(Arc::new(crate::link::routes::open_in_browser)),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -1476,6 +1490,14 @@ impl PluginHost {
         }
         let (mut later, mut refused) = (None, Vec::new());
         for binding in selection.fire {
+            // A link forgotten or replaced while this event was being decided reserves nothing more with its key: the
+            // event is kept for the next link to the provider, and what was reserved already is not reserved twice.
+            if !link.holds(&account) {
+                later.get_or_insert_with(|| {
+                    "the link was forgotten or replaced while this event's flows were being started".to_string()
+                });
+                break;
+            }
             match crate::link::flows::reserve(
                 &account,
                 &spec,
@@ -1512,15 +1534,16 @@ impl PluginHost {
     ///
     /// The provider gives a source's events to ONE of the account's apps
     /// (`app_logic::Route`), and with two apps built on the same plugin a call
-    /// started the flows of both. Asked only when bindings of two apps or more
-    /// wait on this event, so an account with one app does not read its apps
-    /// before its flows are started, and is not made to wait on them. Where
-    /// the provider names no such rule the bindings are left as they are.
+    /// started the flows of both. Decided as the app-logic lane decides it
+    /// ([`Self::route_event`]), and only where a flow of an app waits on this
+    /// event: one with none has nothing to hold back, so it reads nothing more
+    /// before its flows (the account's own) are started. Where the provider names
+    /// no such rule the bindings are left as they are.
     ///
-    /// Err when two apps' bindings wait and the apps cannot be read: started
-    /// for both, the event would be given to two apps while the app-logic lane,
-    /// which cannot go on without the apps either, keeps it for another try.
-    /// So nothing is started, and that try starts them (a run is reserved
+    /// Err when what decides it cannot be read: started for every app, the event
+    /// could be given to an app the account gave it away from, while the
+    /// app-logic lane, which cannot go on without it either, keeps it for another
+    /// try. So nothing is started, and that try starts them (a run is reserved
     /// under the event's own key, so trying again is harmless).
     fn bindings_of_the_app_that_takes(
         &self,
@@ -1530,13 +1553,7 @@ impl PluginHost {
         envelope: &Value,
         bindings: Vec<crate::link::flows::Binding>,
     ) -> Result<Vec<crate::link::flows::Binding>, String> {
-        let apps_waiting = {
-            let mut owners: Vec<&str> = bindings.iter().filter(|b| b.event == event_name).filter_map(|b| b.app_id.as_deref()).collect();
-            owners.sort_unstable();
-            owners.dedup();
-            owners.len()
-        };
-        if apps_waiting < 2 {
+        if crate::link::flows::apps_bound_to(&bindings, event_name).is_empty() {
             return Ok(bindings);
         }
         let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
@@ -1545,21 +1562,66 @@ impl PluginHost {
         else {
             return Ok(bindings);
         };
-        let apps = self.app_logic.load(account, &spec)?;
-        // The same source the app-logic lane reads, so the two lanes give one event to one app.
+        // The list the app-logic lane reads for the same event, in the same languages, so the two share one fetch.
+        let held = crate::link::script_profile::resolve(account, link.data_dir());
+        let apps = self.app_logic.load(account, &spec, &crate::link::app_logic::languages_asked(&spec, held.prelude()))?;
+        let route = self.route_event(account, &spec, &apps, &bindings, event_name, envelope)?;
         let source = envelope.get("source").and_then(Value::as_str).unwrap_or("");
-        let route = crate::link::app_logic::route(&spec, &apps, source);
         let (kept, held) = crate::link::flows::without_held_back(bindings, event_name, |app| route.holds_back(app));
         match route.unchosen() {
             // Once for the event: the same words the app-logic lane says of it.
             Some(why) if !held.is_empty() => log::warn!("{} flow binding(s) did not fire for {event_name}: {why}", held.len()),
             _ => {
                 for binding in &held {
-                    log::info!("flow binding {} did not fire for {event_name}: events from {source:?} go to another of the account's apps", binding.id);
+                    match route.assigned_elsewhere(binding.app_id.as_deref().unwrap_or_default()) {
+                        Some(chosen) => log::info!(
+                            "flow binding {} did not fire for {event_name}: the account assigned events from {source:?} to the app {chosen}",
+                            binding.id
+                        ),
+                        None => log::info!(
+                            "flow binding {} did not fire for {event_name}: events from {source:?} go to another of the account's apps",
+                            binding.id
+                        ),
+                    }
                 }
             }
         }
         Ok(kept)
+    }
+
+    /// Which of the account's apps takes this event (`app_logic::Route`): one
+    /// answer for the flows of an app and for its scripts, so that one event is
+    /// one app's. `bindings` are the account's flow bindings (an app with flows
+    /// and no scripts is not in `apps`); `Route::unknown()` where the provider
+    /// keeps no such rule.
+    ///
+    /// The account's choice is asked for only when one of its apps would act on
+    /// the event — scripts for events, or a flow bound to it — and is kept as
+    /// long as the app list is: an account none of whose apps acts on the event
+    /// makes no request for it. Err when it cannot be read and none was read
+    /// before: the event waits for another try.
+    fn route_event(
+        &self,
+        account: &crate::link::LinkedAccount,
+        spec: &crate::link::descriptor::AppLogicSpec,
+        apps: &[crate::link::app_logic::AppEntry],
+        bindings: &[crate::link::flows::Binding],
+        event_name: &str,
+        envelope: &Value,
+    ) -> Result<crate::link::app_logic::Route, String> {
+        use crate::link::app_logic;
+        if spec.routing.is_none() {
+            return Ok(app_logic::Route::unknown());
+        }
+        let bound = crate::link::flows::apps_bound_to(bindings, event_name);
+        let assignments = if app_logic::concerns_an_app(spec, apps, &bound) {
+            Some(self.app_logic.assignments(account, spec)?)
+        } else {
+            None
+        };
+        // The source the envelope names: the plugin's own id, and the connector the provider assigns.
+        let source = envelope.get("source").and_then(Value::as_str).unwrap_or("");
+        Ok(app_logic::route(spec, apps, assignments.as_ref(), &bound, source))
     }
 
     /// Run the linked account's app LOGIC SCRIPTS against this event.
@@ -1592,14 +1654,38 @@ impl PluginHost {
         else {
             return Delivery::Done;
         };
-        let apps = match self.app_logic.load(&account, &spec) {
+        let held = crate::link::script_profile::resolve(&account, link.data_dir());
+        // The languages the beat declares, and so the ones the provider's browser leaves to this desktop: asked for,
+        // and run, and no other.
+        let languages = crate::link::app_logic::languages_asked(&spec, held.prelude());
+        let apps = match self.app_logic.load(&account, &spec, &languages) {
             Ok(a) => a,
             Err(e) => {
                 // Not "no apps": the event waits until they can be read.
                 return Delivery::Later(format!("the account's app logic could not be read: {e}"));
             }
         };
-        let held = crate::link::script_profile::resolve(&account, link.data_dir());
+        // Whose the event is, decided as the flows lane decides it, and only where some app has scripts to run on it
+        // (none: nothing runs, and nothing more is read).
+        let route = if spec.routing.is_some() && crate::link::app_logic::concerns_an_app(&spec, &apps, &[]) {
+            let bindings = match crate::link::descriptor::find(link.data_dir(), &account.connector_id).and_then(|d| d.flows) {
+                Some(flows) => match self.flow_bindings.load(&account, &flows) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Delivery::Later(format!(
+                            "which of the account's apps this event is for could not be read: its flow triggers could not be read: {e}"
+                        ))
+                    }
+                },
+                None => Vec::new(),
+            };
+            match self.route_event(&account, &spec, &apps, &bindings, &event.name, envelope) {
+                Ok(route) => route,
+                Err(e) => return Delivery::Later(format!("which of the account's apps this event is for could not be read: {e}")),
+            }
+        } else {
+            crate::link::app_logic::Route::unknown()
+        };
         let storage = crate::link::app_logic::StorageStore::open(link.data_dir());
         let connector = |connector_id: &str,
                          command: &str,
@@ -1625,11 +1711,15 @@ impl PluginHost {
             &account,
             &spec,
             &apps,
+            &route,
             &storage,
             envelope,
             self.script_evaluator().as_ref(),
             held.prelude(),
+            &languages,
             &connector,
+            // Asked before each effect: nothing more is written for a link forgotten or replaced meanwhile.
+            &|| link.holds(&account),
         ) {
             // Every outcome, always. A script that quietly records nothing is
             // the hardest kind of failure to find — the install looks fine and
@@ -2021,7 +2111,56 @@ impl PluginHost {
         }
     }
 
-    /// Answer a plugin-initiated request (`flow.run`, `companion.admission`, `oaiy.ring.plan`, `oaiy.ring.opened`).
+    /// A plugin asks OAIY to open a web page in the person's browser (`oaiy.browser.open {url}`), for a plugin that
+    /// declares `oaiy.browser.open` by that name (a host wildcard declared before it existed does not reach it).
+    ///
+    /// OAIY opens it from its own process, which no job holds. A plugin runs inside the job that ends with OAIY
+    /// (Windows, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, no breakaway), so a browser a plugin starts itself is a
+    /// process of that job: when OAIY exited it took the browser with it, and every tab the person had opened in it
+    /// since. The address is held to the rule OAIY holds the pages it opens itself to
+    /// ([`crate::link::routes::opens_in_browser`]): https to any host, plain http only to this computer or a
+    /// `.local` name, no user name in it, and nothing a command line could read as more than the address. Any host:
+    /// a plugin declares none, and the plugin this was made for signs in to whichever server the person names.
+    fn handle_browser_open(&self, plugin_id: &str, params: Value) -> Result<Value, (String, String)> {
+        let declared = self
+            .registry
+            .lock()
+            .map(|reg| {
+                reg.grants(plugin_id, BROWSER_OPEN)
+                    && reg
+                        .get(plugin_id)
+                        .and_then(|rec| rec.manifest.as_ref())
+                        .is_some_and(|manifest| manifest.capabilities.iter().any(|declared| declared == BROWSER_OPEN))
+            })
+            .unwrap_or(false);
+        if !declared {
+            return Err(("capability_denied".into(), format!("{plugin_id} does not declare the {BROWSER_OPEN} capability")));
+        }
+        let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+        if url.is_empty() || url.len() > MAX_BROWSER_ADDRESS_BYTES {
+            return Err((
+                "invalid_request".into(),
+                format!("{BROWSER_OPEN} needs a url of 1 to {MAX_BROWSER_ADDRESS_BYTES} bytes"),
+            ));
+        }
+        crate::link::routes::opens_in_browser(url).map_err(|why| {
+            (
+                "invalid_request".to_string(),
+                format!("{BROWSER_OPEN} opens a web address alone (https, or plain http to this computer or a .local name): {why}"),
+            )
+        })?;
+        let opener = self.browser.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        opener(url).map(|()| json!({ "ok": true })).map_err(|why| ("unavailable".into(), why))
+    }
+
+    /// Open web addresses with `opener` instead of OAIY's launcher, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_browser_opener(&self, opener: BrowserOpener) {
+        *self.browser.lock().unwrap_or_else(|e| e.into_inner()) = opener;
+    }
+
+    /// Answer a plugin-initiated request (`flow.run`, `companion.admission`, `oaiy.ring.plan`, `oaiy.ring.opened`,
+    /// `oaiy.browser.open`: [`super::process::HOST_CALLS`]).
     fn handle_plugin_request(
         &self,
         plugin_id: &str,
@@ -2037,12 +2176,13 @@ impl PluginHost {
         if method == "oaiy.ring.plan" || method == "oaiy.ring.opened" {
             return self.handle_ring_request(plugin_id, method, params);
         }
+        if method == BROWSER_OPEN {
+            return self.handle_browser_open(plugin_id, params);
+        }
         if method != "flow.run" {
             return Err((
                 "invalid_request".into(),
-                format!(
-                    "unknown method {method:?}; this host answers flow.run, companion.admission, oaiy.ring.plan and oaiy.ring.opened"
-                ),
+                format!("unknown method {method:?}; this host answers {}", super::process::HOST_CALLS.join(", ")),
             ));
         }
 
@@ -3316,6 +3456,62 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_has_oaiy_open_a_web_page_in_the_browser_only_with_the_capability_and_a_web_address() {
+        // A plugin that opens the person's browser itself does it from inside the job that ends with OAIY, so a
+        // browser it started went when OAIY did, with every tab in it. OAIY opens it instead, from its own process.
+        let (sb, host) = host_with("browser-open", vec![]);
+        install_plugin(&sb, "backups", &["oaiy.browser.open"]);
+        install_plugin(&sb, "silent", &["oaiy.flow.run"]);
+        install_plugin(&sb, "broad", &["oaiy.*"]);
+        host.registry.lock().unwrap().scan();
+        let opened: Arc<Mutex<Vec<String>>> = Default::default();
+        let seen = opened.clone();
+        host.set_browser_opener(Arc::new(move |url: &str| {
+            seen.lock().unwrap().push(url.to_string());
+            Ok(())
+        }));
+        let open = |plugin: &str, url: Value| host.handle_plugin_request(plugin, "oaiy.browser.open", json!({ "url": url }));
+
+        // The page, exactly as asked for: an OAuth address carries `&`, which no shell may read.
+        let page = "https://forms.example.com/oauth/authorize?response_type=code&state=a-b_c&redirect_uri=http%3A%2F%2F127.0.0.1%3A5111%2Fcallback";
+        assert_eq!(open("backups", json!(page)).unwrap(), json!({ "ok": true }));
+        assert_eq!(open("backups", json!("http://127.0.0.1:8091/oauth/authorize")).unwrap(), json!({ "ok": true }), "this computer");
+        assert_eq!(*opened.lock().unwrap(), [page, "http://127.0.0.1:8091/oauth/authorize"]);
+
+        // Only for a plugin that declares it by name: not one that did not, and not a host wildcard declared before
+        // the capability existed.
+        for plugin in ["silent", "broad", "nosuch"] {
+            let (code, message) = open(plugin, json!(page)).unwrap_err();
+            assert_eq!(code, "capability_denied", "{plugin}: {message}");
+        }
+        // And a web address alone: no file, script, other handler, plain http across the network, user name, quote or
+        // control character, and not an address that is no address.
+        let refused = [
+            json!("file:///C:/Windows/System32/calc.exe"),
+            json!("javascript:alert(1)"),
+            json!("ms-settings:privacy"),
+            json!("HTTPS://forms.example.com"),
+            json!("http://forms.example.com/oauth/authorize"),
+            json!("https://forms.example.com@evil.example/"),
+            json!("https://forms.example.com/\" --new-window"),
+            json!("https://forms.example.com/\nx"),
+            json!(""),
+            json!(42),
+            json!(format!("https://forms.example.com/{}", "x".repeat(4096))),
+        ];
+        for url in refused {
+            let (code, _) = open("backups", url.clone()).unwrap_err();
+            assert_eq!(code, "invalid_request", "{url}");
+        }
+        assert_eq!(opened.lock().unwrap().len(), 2, "nothing refused was opened");
+
+        // A launcher that fails says so, as the host's own state, not as the plugin's request.
+        host.set_browser_opener(Arc::new(|_: &str| Err("could not open the browser: no launcher".into())));
+        let (code, message) = open("backups", json!(page)).unwrap_err();
+        assert_eq!((code.as_str(), message.as_str()), ("unavailable", "could not open the browser: no launcher"));
+    }
+
+    #[test]
     fn a_ring_request_is_refused_to_a_plugin_that_did_not_declare_the_capability() {
         let (sb, host) = host_with("ring-nocap", vec![]);
         install_plugin(&sb, "aokie", &["flow.run"]);
@@ -4549,41 +4745,58 @@ sleep 300
         assert!(outbox.status().last_error.is_none());
     }
 
-    /// What the flows lane reserved at a stand-in FormLogic for one `aokie.call.ended` from the plugin `aokie`: an
-    /// account with two apps built on that plugin (`app-old`, `app-new`), each with a flow bound to the event, and a
-    /// flow of the account's own. `assignments` is what the account has chosen (none: that list cannot be read); what
-    /// the lane answered and the requests made are handed back too.
-    fn flows_reserved_for_a_call(tag: &str, assignments: Option<Value>) -> (crate::link::outbox::Delivery, Vec<String>, Vec<String>) {
-        use crate::link::testkit::{Provider, Reply};
-        let app = |id: &str| json!({
+    /// One app of a stand-in FormLogic's app list: one script for events, and the plugin `aokie` among its connectors.
+    fn aokie_app(id: &str) -> Value {
+        json!({
             "app": { "id": id },
             "customLogic": { "scripts": [{ "id": "s", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }] },
             "forms": [],
             "connectors": ["aokie"],
-        });
-        let apps = json!({ "apps": [app("app-old"), app("app-new")] }).to_string();
-        let assignments = assignments.map(|chosen| json!({ "assignments": chosen, "candidates": {}, "desktops": [] }).to_string());
+        })
+    }
+
+    /// A flow binding to `aokie.call.ended`, of the app `app` (none: the account's own).
+    fn call_binding(id: &str, app: Option<&str>) -> Value {
+        json!({ "id": id, "appId": app, "event": "aokie.call.ended", "flow": "summary", "enabled": true })
+    }
+
+    /// What a stand-in FormLogic says of who takes which events: `assignments`, and `candidates` (`[]`, as it writes
+    /// an empty map, when none).
+    fn who_takes(assignments: Value, candidates: Value) -> Option<Value> {
+        Some(json!({ "assignments": assignments, "candidates": candidates, "desktops": [] }))
+    }
+
+    /// A stand-in FormLogic with `apps` as its app list, `bindings` as its flow bindings and `routing` as its reply on
+    /// who takes which events (none: that reply cannot be read), and a host linked to it with no prelude to read.
+    fn host_linked_to_formlogic(
+        tag: &str,
+        apps: Value,
+        bindings: Value,
+        routing: Option<Value>,
+    ) -> (crate::link::testkit::Provider, Arc<PluginHost>, Sandbox, std::path::PathBuf) {
+        use crate::link::testkit::{Provider, Reply};
+        let apps = json!({ "apps": apps }).to_string();
+        let bindings = json!({ "bindings": bindings }).to_string();
+        let routing = routing.map(|r| r.to_string());
         let server = Provider::start(move |req| match req.line().as_str() {
-            "GET /api/v1/flow-bindings" => Reply::ok(
-                &json!({ "bindings": [
-                    { "id": "b-old", "appId": "app-old", "event": "aokie.call.ended", "flow": "summary", "enabled": true },
-                    { "id": "b-new", "appId": "app-new", "event": "aokie.call.ended", "flow": "summary", "enabled": true },
-                    { "id": "b-own", "appId": null, "event": "aokie.call.ended", "flow": "summary", "enabled": true },
-                ] })
-                .to_string(),
-            ),
-            "GET /api/v1/app-logic" => Reply::ok(&apps),
-            "GET /api/v1/connector-assignments" => match &assignments {
-                Some(list) => Reply::ok(list),
+            "GET /api/v1/flow-bindings" => Reply::ok(&bindings),
+            "GET /api/v1/app-logic?languages=javascript" => Reply::ok(&apps),
+            "GET /api/v1/connector-assignments" => match &routing {
+                Some(reply) => Reply::ok(reply),
                 None => Reply::status(503, r#"{"message":"busy"}"#),
             },
             "POST /api/v1/flow-runs" => Reply::ok(r#"{"created":true,"run":{"runId":"run-1"}}"#),
             _ => Reply::status(404, "{}"),
         });
-        let (_sb, host) = host_with(tag, vec![]);
-        // No prelude to read, so the lane asks the stand-in for nothing but its own lists.
+        let (sb, host) = host_with(tag, vec![]);
+        // No prelude to read, so the lanes ask the stand-in for nothing but their own lists.
         let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| d.script_profile = None);
         *host.link.lock().unwrap() = Some(store);
+        (server, host, sb, dir)
+    }
+
+    /// One `aokie.call.ended` from the plugin `aokie`, as the event and as its envelope.
+    fn a_call_ended() -> (Event, Value) {
         let envelope = json!({ "name": "aokie.call.ended", "source": "aokie", "idempotencyKey": "evt-1", "correlationId": "call-1", "data": {} });
         let event = Event {
             name: "aokie.call.ended".into(),
@@ -4593,6 +4806,14 @@ sleep 300
             data: json!({}),
             origin_run: None,
         };
+        (event, envelope)
+    }
+
+    /// What the flows lane reserved at a stand-in FormLogic for one `aokie.call.ended` (see
+    /// [`host_linked_to_formlogic`]): what it answered, the bindings it reserved runs for, and the requests it made.
+    fn flows_reserved(tag: &str, apps: Value, bindings: Value, routing: Option<Value>) -> (crate::link::outbox::Delivery, Vec<String>, Vec<String>) {
+        let (server, host, _sb, dir) = host_linked_to_formlogic(tag, apps, bindings, routing);
+        let (event, envelope) = a_call_ended();
         let delivered = host.fan_out_to_linked_flows(&event, &envelope);
         let reserved = server
             .requests()
@@ -4602,6 +4823,165 @@ sleep 300
             .collect();
         let _ = std::fs::remove_dir_all(dir);
         (delivered, reserved, server.lines())
+    }
+
+    /// [`flows_reserved`] for an account with two apps built on the plugin (`app-old`, `app-new`), each with scripts
+    /// and a flow bound to the event, and a flow of the account's own. `assignments` is what the account has chosen
+    /// (none: that list cannot be read).
+    fn flows_reserved_for_a_call(tag: &str, assignments: Option<Value>) -> (crate::link::outbox::Delivery, Vec<String>, Vec<String>) {
+        flows_reserved(
+            tag,
+            json!([aokie_app("app-old"), aokie_app("app-new")]),
+            json!([call_binding("b-old", Some("app-old")), call_binding("b-new", Some("app-new")), call_binding("b-own", None)]),
+            assignments.and_then(|chosen| who_takes(chosen, json!({}))),
+        )
+    }
+
+    #[test]
+    fn a_call_starts_no_flow_of_an_app_it_was_not_given_to_whether_the_app_has_scripts_or_none() {
+        use crate::link::outbox::Delivery;
+        // Two apps with flows on the call and no scripts are not in the app list, so nothing told them apart and the
+        // flows of both started. FormLogic counts both as able to take the plugin's events (`candidates`).
+        let bindings = json!([call_binding("b-old", Some("app-old")), call_binding("b-new", Some("app-new")), call_binding("b-own", None)]);
+        let counted = json!({ "aokie": [{ "appId": "app-old" }, { "appId": "app-new" }] });
+        let (delivered, reserved, asked) = flows_reserved("flows-only-unchosen", json!([]), bindings.clone(), who_takes(json!([]), counted.clone()));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-own".to_string()]), "{asked:?}");
+        let chose_new = json!([{ "connectorId": "aokie", "appId": "app-new" }]);
+        let (delivered, reserved, asked) = flows_reserved("flows-only-chosen", json!([]), bindings, who_takes(chose_new, counted));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-new".to_string(), "b-own".to_string()]), "{asked:?}");
+
+        // One app alone takes the plugin, and the account gave its events to another (one with no flow on the call):
+        // that one app's flow started all the same. It does not now.
+        let away = json!([{ "connectorId": "aokie", "appId": "app-crm" }]);
+        let one = json!([call_binding("b-old", Some("app-old")), call_binding("b-own", None)]);
+        let (delivered, reserved, asked) = flows_reserved("assigned-away", json!([aokie_app("app-old")]), one.clone(), who_takes(away, json!([])));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-own".to_string()]), "{asked:?}");
+        // Given to it, or to nobody: it is the only app that takes them, and its flow starts.
+        let (delivered, reserved, asked) = flows_reserved("alone-unchosen", json!([aokie_app("app-old")]), one, who_takes(json!([]), json!([])));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-old".to_string(), "b-own".to_string()]), "{asked:?}");
+    }
+
+    /// A stand-in FormLogic answering `route` with `reply`, which forgets the link this desktop holds the moment it
+    /// answers a request whose line begins `forgotten_at`, and a host linked to it: as a person who disconnects then.
+    fn host_whose_link_is_forgotten_at(
+        tag: &str,
+        forgotten_at: &'static str,
+        route: impl Fn(&str) -> crate::link::testkit::Reply + Send + Sync + 'static,
+    ) -> (crate::link::testkit::Provider, Arc<PluginHost>, Sandbox, std::path::PathBuf) {
+        let slot: Arc<Mutex<Option<crate::link::LinkHandle>>> = Default::default();
+        let forget = slot.clone();
+        let server = crate::link::testkit::Provider::start(move |req| {
+            let reply = route(&req.line());
+            if req.line().starts_with(forgotten_at) {
+                if let Some(store) = forget.lock().unwrap().as_ref() {
+                    store.drop_account_for_tests();
+                }
+            }
+            reply
+        });
+        let (sb, host) = host_with(tag, vec![]);
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| d.script_profile = None);
+        *slot.lock().unwrap() = Some(store.clone());
+        *host.link.lock().unwrap() = Some(store);
+        (server, host, sb, dir)
+    }
+
+    #[test]
+    fn an_event_whose_link_is_forgotten_while_it_is_sent_starts_and_writes_no_more_for_it_and_is_kept() {
+        use crate::link::outbox::Delivery;
+        use crate::link::testkit::Reply;
+        // The flows: forgotten while the first of two runs is reserved, the second is not reserved with the key the
+        // person asked this desktop to forget. The event is kept for the next link to the provider (a run is
+        // reserved under the event's own key, so the first is not reserved twice).
+        let bindings = json!({ "bindings": [call_binding("b-1", None), call_binding("b-2", None)] }).to_string();
+        let (server, host, _sb, dir) = host_whose_link_is_forgotten_at("link-went-flows", "POST /api/v1/flow-runs", move |line| match line {
+            "GET /api/v1/flow-bindings" => Reply::ok(&bindings),
+            "POST /api/v1/flow-runs" => Reply::ok(r#"{"created":true,"run":{"runId":"run-1"}}"#),
+            _ => Reply::status(404, "{}"),
+        });
+        let (event, envelope) = a_call_ended();
+        let delivered = host.fan_out_to_linked_flows(&event, &envelope);
+        assert!(matches!(&delivered, Delivery::Later(why) if why.contains("forgotten or replaced")), "{delivered:?}");
+        let reserved = server.lines().iter().filter(|l| l.as_str() == "POST /api/v1/flow-runs").count();
+        assert_eq!(reserved, 1, "{:?}", server.lines());
+        let _ = std::fs::remove_dir_all(dir);
+
+        // The app logic: forgotten while the record is written, the marker that follows it is not, and the event
+        // is kept (its record key makes the next link's try find the record this one made).
+        let apps = json!({ "apps": [{
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [{ "id": "s", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }] },
+            "forms": [{ "id": "form-1", "packFormId": "calls" }],
+        }] })
+        .to_string();
+        let (server, host, _sb, dir) =
+            host_whose_link_is_forgotten_at("link-went-logic", "POST /api/v1/forms/form-1/responses", move |line| match line {
+                "GET /api/v1/app-logic?languages=javascript" => Reply::ok(&apps),
+                "GET /api/v1/flow-bindings" => Reply::ok(r#"{"bindings":[]}"#),
+                "GET /api/v1/connector-assignments" => Reply::ok(r#"{"assignments":[],"candidates":[],"desktops":[]}"#),
+                "POST /api/v1/forms/form-1/responses" => Reply::ok(r#"{"response":{"id":"r1"}}"#),
+                _ => Reply::status(404, "{}"),
+            });
+        host.set_script_evaluator(Arc::new(FakeHost::always(json!({ "effects": [
+            { "type": "formlogic.submitResponse", "formKey": "calls", "answers": { "call_id": "c1" } },
+            { "type": "storage.set", "key": "seen" },
+        ] }))));
+        let (event, envelope) = a_call_ended();
+        let delivered = host.fan_out_to_app_logic(&event, &envelope);
+        assert!(matches!(&delivered, Delivery::Later(why) if why.contains("forgotten or replaced")), "{delivered:?}");
+        assert_eq!(server.lines().iter().filter(|l| l.starts_with("POST")).count(), 1, "{:?}", server.lines());
+        let markers = crate::link::app_logic::StorageStore::open(&dir).values("app-1").unwrap();
+        assert!(!markers.contains_key("seen"), "no marker for a link that went: {markers:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_call_whose_flows_are_the_accounts_own_asks_nothing_of_its_apps() {
+        use crate::link::outbox::Delivery;
+        // No flow of an app waits on the event: there is nothing to hold back, and nothing but the bindings is read
+        // before the account's own flow is started.
+        let (delivered, reserved, asked) = flows_reserved("own-flows-only", json!([aokie_app("app-old")]), json!([call_binding("b-own", None)]), None);
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-own".to_string()]));
+        assert_eq!(asked, ["GET /api/v1/flow-bindings", "POST /api/v1/flow-runs"]);
+    }
+
+    #[test]
+    fn the_scripts_of_an_app_a_call_was_not_given_to_do_not_run_and_are_asked_about_only_when_there_are_some() {
+        use crate::link::outbox::Delivery;
+        // The app-logic lane routes as the flows lane does: one app has scripts for the call, and the account gave
+        // the plugin's events to another app. Its scripts ran, because it was the only one that could take them.
+        let scripts_run = |tag: &str, routing: Option<Value>| {
+            let (server, host, _sb, dir) =
+                host_linked_to_formlogic(tag, json!([aokie_app("app-old")]), json!([call_binding("b-own", None)]), routing);
+            let scripts = Arc::new(FakeHost::always(json!({})));
+            host.set_script_evaluator(scripts.clone());
+            let (event, envelope) = a_call_ended();
+            let delivered = host.fan_out_to_app_logic(&event, &envelope);
+            let _ = std::fs::remove_dir_all(dir);
+            (delivered, scripts.calls(), server.lines())
+        };
+        let away = json!([{ "connectorId": "aokie", "appId": "app-crm" }]);
+        let (delivered, batches, asked) = scripts_run("scripts-assigned-away", who_takes(away, json!([])));
+        assert_eq!((delivered, batches), (Delivery::Done, 0), "{asked:?}");
+        assert!(asked.contains(&"GET /api/v1/connector-assignments".to_string()), "{asked:?}");
+        let here = json!([{ "connectorId": "aokie", "appId": "app-old" }]);
+        let (delivered, batches, asked) = scripts_run("scripts-assigned-here", who_takes(here, json!([])));
+        assert_eq!((delivered, batches), (Delivery::Done, 1), "{asked:?}");
+        // Whose the call is cannot be read: nothing is run, and the event is kept for another try.
+        let (delivered, batches, _) = scripts_run("scripts-unread", None);
+        assert!(matches!(&delivered, Delivery::Later(why) if why.contains("HTTP 503")) && batches == 0, "{delivered:?}");
+
+        // An account whose apps have no scripts for events asks nothing about who takes them.
+        let (server, host, _sb, dir) = host_linked_to_formlogic(
+            "scripts-none",
+            json!([{ "app": { "id": "app-old" }, "customLogic": { "scripts": [] }, "forms": [], "connectors": ["aokie"] }]),
+            json!([call_binding("b-old", Some("app-old"))]),
+            None,
+        );
+        let (event, envelope) = a_call_ended();
+        assert_eq!(host.fan_out_to_app_logic(&event, &envelope), Delivery::Done);
+        assert_eq!(server.lines(), ["GET /api/v1/app-logic?languages=javascript"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

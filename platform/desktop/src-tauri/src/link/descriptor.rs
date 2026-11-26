@@ -266,6 +266,17 @@ pub struct AppLogicSpec {
     /// before the provider's rule was read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<AppLogicRouting>,
+    /// Which logic languages this lane asks the provider for scripts in, and how
+    /// it runs one that is not JavaScript, for a provider whose scripts say what
+    /// they are in ([`AppLogicCatalogue::script_language`], which this needs).
+    ///
+    /// The heartbeat declares languages for the whole desktop, and a provider
+    /// that reads one there defers that language's app scripts to this machine
+    /// as well as its flows. Asked for none on this lane, it lists the scripts in
+    /// one language only, so the rest ran nowhere. Absent: nothing is asked, and
+    /// every script this lane is handed is run as JavaScript, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<AppLogicLanguages>,
     /// The effect types this provider's scripts emit, and what each one means
     /// in terms this desktop can actually perform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -299,13 +310,13 @@ fn default_app_logic_scan() -> u32 {
     200
 }
 
-/// The account's choice of one app for a source of events, where two of its
-/// apps could take them.
+/// The account's choice of one app for a source of events.
 ///
 /// A provider that lets an account build two apps on one plugin has to say
 /// which of them a call or a text belongs to: run for both, every event writes
 /// its records twice, once into each. The choice is the account's and is kept
-/// by the provider, so it is read from there, with the app list.
+/// by the provider, so it is read from there, and it decides whenever it is
+/// made: an event goes to the app it names, however many apps could take it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppLogicRouting {
@@ -317,6 +328,45 @@ pub struct AppLogicRouting {
     /// id [`AppLogicCatalogue::app_id`] names on an app).
     pub source: String,
     pub app: String,
+    /// In the same reply: the map from a source to the apps the provider counts
+    /// as able to take its events (an app that holds its grants), whether or not
+    /// they carry scripts, and the field of an app's id in each entry. With it,
+    /// two apps that would start flows on one event and carry no scripts (and so
+    /// are not in the app list) are told apart too. Named together or not at
+    /// all; absent, only the app list says which apps take a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_app: Option<String>,
+}
+
+/// How the app-logic lane says which languages it runs scripts in, and unfolds
+/// one in Python ([`AppLogicSpec::languages`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicLanguages {
+    /// The query parameter of [`AppLogicSpec::path`] naming the languages this
+    /// desktop runs app scripts in, the ids joined by commas: the provider lists
+    /// the scripts in those and in no other.
+    pub param: String,
+    /// The modes of the provider's script profile (its `python.modes`) a Python
+    /// script is unfolded through, by name and in the order they are tried. The
+    /// runner wraps the author's source as the provider's own runtime does, so
+    /// `run(ctx)` means the same thing here as there. Empty: this desktop runs no
+    /// app script in Python, and does not ask for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub python_modes: Vec<String>,
+}
+
+/// The most modes one leaf-script job may name (`protocol/v1/script-request.schema.json`).
+const MAX_JOB_PYTHON_MODES: usize = 8;
+
+/// Whether `s` is a name a profile's Python mode may have (`script-profile.schema.json`, `pythonModeName`).
+fn is_python_mode_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    s.len() <= 64
+        && bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 /// One effect type a provider's scripts emit.
@@ -445,12 +495,19 @@ pub struct AppLogicCatalogue {
     pub form_label: Option<String>,
     /// On an app: the list of the sources whose events the app takes (a
     /// plugin's id, as an event's envelope names its source). With it, an
-    /// event goes to the one app that takes its source, or to the one the
-    /// account chose among several ([`AppLogicSpec::routing`]). Absent, or on
-    /// an app that lists nothing: nothing is known of who takes what, and
-    /// every app's scripts run.
+    /// event goes to the app the account chose for its source
+    /// ([`AppLogicSpec::routing`]), or else to the one app that takes it.
+    /// Absent, or on an app that lists nothing: nothing is known of who takes
+    /// what, and every app's scripts run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<String>,
+    /// On one script: the field naming the logic language it is in (an id the
+    /// engine knows: `javascript`, `python`). Absent from a script, null or
+    /// blank, it is JavaScript. With it a script in a language this desktop does
+    /// not run is said and left alone, never run as JavaScript. Absent from the
+    /// catalogue: every script is taken to be JavaScript, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_language: Option<String>,
 }
 
 impl AppLogicCatalogue {
@@ -1653,6 +1710,45 @@ impl ConnectorDescriptor {
             if a.catalogue.sources.as_ref().is_some_and(|name| name.trim().is_empty()) {
                 return Err(format!("connector {:?} appLogic catalogue.sources is blank", self.id));
             }
+            if a.catalogue.script_language.as_ref().is_some_and(|name| name.trim().is_empty()) {
+                return Err(format!("connector {:?} appLogic catalogue.scriptLanguage is blank", self.id));
+            }
+            if let Some(l) = &a.languages {
+                // Asking for a second language is safe only where a script says
+                // which one it is in: a script handed over in Python and read as
+                // JavaScript is the very thing the request exists to prevent.
+                if a.catalogue.script_language.is_none() {
+                    return Err(format!(
+                        "connector {:?} appLogic names languages without catalogue.scriptLanguage, so the scripts \
+                         it would ask for could not be told apart",
+                        self.id
+                    ));
+                }
+                // A NAME, written into a query: nothing a query could be bent with.
+                if l.param.is_empty() || !l.param.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+                    return Err(format!(
+                        "connector {:?} appLogic languages.param {:?} must be a plain parameter name",
+                        self.id, l.param
+                    ));
+                }
+                // The CLI refuses a whole request over one mode list it cannot take, the JavaScript jobs in it too.
+                if l.python_modes.len() > MAX_JOB_PYTHON_MODES {
+                    return Err(format!(
+                        "connector {:?} appLogic languages.pythonModes names {} modes; a job may name at most {MAX_JOB_PYTHON_MODES}",
+                        self.id,
+                        l.python_modes.len()
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for mode in &l.python_modes {
+                    if !is_python_mode_name(mode) || !seen.insert(mode.as_str()) {
+                        return Err(format!(
+                            "connector {:?} appLogic languages.pythonModes holds {mode:?}, which is not a mode name or is named twice",
+                            self.id
+                        ));
+                    }
+                }
+            }
             if let Some(r) = &a.routing {
                 if !r.path.starts_with('/') || r.path.contains('{') {
                     return Err(format!(
@@ -1667,6 +1763,17 @@ impl ConnectorDescriptor {
                              key called \"\" in the account's choices",
                             self.id
                         ));
+                    }
+                }
+                if r.candidates.is_some() != r.candidate_app.is_some() {
+                    return Err(format!(
+                        "connector {:?} appLogic routing names one of candidates/candidateApp without the other",
+                        self.id
+                    ));
+                }
+                for (label, name) in [("candidates", &r.candidates), ("candidateApp", &r.candidate_app)] {
+                    if name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+                        return Err(format!("connector {:?} appLogic routing.{label} is blank", self.id));
                     }
                 }
             }
@@ -2308,6 +2415,61 @@ mod tests {
         for bad in ["api/v1/connector-assignments", "https://evil.example/x", "/api/v1/apps/{id}/assignments"] {
             assert!(with(&|a| a.routing.as_mut().unwrap().path = bad.into()).unwrap_err().contains("routing.path"), "{bad}");
         }
+
+        // The provider's own count of who takes a source: the map and the field of an app's id in it, together.
+        let routing = a.routing.as_ref().unwrap();
+        assert_eq!((routing.candidates.as_deref(), routing.candidate_app.as_deref()), (Some("candidates"), Some("appId")));
+        assert!(with(&|a| a.routing.as_mut().unwrap().candidate_app = None).unwrap_err().contains("candidates/candidateApp"));
+        assert!(with(&|a| a.routing.as_mut().unwrap().candidates = None).unwrap_err().contains("candidates/candidateApp"));
+        assert!(with(&|a| a.routing.as_mut().unwrap().candidates = Some(" ".into())).unwrap_err().contains("routing.candidates"));
+        with(&|a| {
+            let r = a.routing.as_mut().unwrap();
+            r.candidates = None;
+            r.candidate_app = None;
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_languages_an_app_script_is_asked_for_in_need_a_script_to_say_its_own() {
+        let base: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let a = base.app_logic.as_ref().unwrap();
+        assert_eq!(a.catalogue.script_language.as_deref(), Some("language"));
+        assert_eq!(a.languages, Some(AppLogicLanguages { param: "languages".into(), python_modes: vec!["applogic".into()] }));
+
+        let with = |edit: &dyn Fn(&mut AppLogicSpec)| {
+            let mut d = base.clone();
+            edit(d.app_logic.as_mut().unwrap());
+            d.validate()
+        };
+        // Asking for a second language where a script cannot say which one it is in would run it as the first.
+        assert!(with(&|a| a.catalogue.script_language = None).unwrap_err().contains("catalogue.scriptLanguage"));
+        assert!(with(&|a| a.catalogue.script_language = Some(" ".into())).unwrap_err().contains("scriptLanguage is blank"));
+        // A plain parameter name, and mode names a job may carry: no more than eight, none twice.
+        for bad in ["", "lang uages", "languages&x=1", "a=b"] {
+            assert!(with(&|a| a.languages.as_mut().unwrap().param = bad.into()).unwrap_err().contains("languages.param"), "{bad:?}");
+        }
+        for bad in [vec!["app logic"], vec!["9mode"], vec![""], vec!["applogic", "applogic"]] {
+            let modes: Vec<String> = bad.iter().map(|m| m.to_string()).collect();
+            assert!(with(&|a| a.languages.as_mut().unwrap().python_modes = modes.clone()).unwrap_err().contains("pythonModes"), "{modes:?}");
+        }
+        let nine: Vec<String> = (0..9).map(|i| format!("m{i}")).collect();
+        assert!(with(&|a| a.languages.as_mut().unwrap().python_modes = nine.clone()).unwrap_err().contains("at most 8"));
+        with(&|a| a.languages.as_mut().unwrap().python_modes = vec!["app-logic_2".into(), "flowModule".into()]).unwrap();
+
+        // Without the block: nothing is asked, and a script's language is still read, so one in a language this
+        // desktop does not run is said rather than run as JavaScript. Written out and read back without the keys.
+        let mut neither = base.clone();
+        let logic = neither.app_logic.as_mut().unwrap();
+        logic.languages = None;
+        logic.catalogue.script_language = None;
+        neither.validate().unwrap();
+        let written = serde_json::to_value(&neither).unwrap();
+        assert!(written["appLogic"].get("languages").is_none() && written["appLogic"]["catalogue"].get("scriptLanguage").is_none());
+        assert_eq!(serde_json::from_value::<ConnectorDescriptor>(written).unwrap(), neither);
+        let mut reads_only = base.clone();
+        reads_only.app_logic.as_mut().unwrap().languages = None;
+        reads_only.validate().unwrap();
     }
 
     #[test]

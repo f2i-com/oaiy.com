@@ -210,7 +210,7 @@ impl PluginRequest {
 /// `Debug` prints that there is one and nothing of it, so neither does the `Debug` of an admission, which holds these; the credential is wiped when the entry is dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IceServer {
-    /// 1 to 8 URLs of at most 2,048 bytes beginning `stun:`, `stuns:`, `turn:` or `turns:`, none mixing STUN and TURN.
+    /// 1 to 8 URLs of at most 2,048 bytes beginning `stun:`, `stuns:`, `turn:` or `turns:`, with something after the scheme and no white space, none mixing STUN and TURN.
     pub urls: Vec<String>,
     /// A TURN entry's username (`<expiry>:<opaque id>`); empty for STUN.
     pub username: String,
@@ -245,6 +245,16 @@ impl IceServer {
     }
 }
 
+/// One URL of an ICE entry, as `ice-server.schema.json` has it (`^stuns?:[^\s]+$`, `^turns?:[^\s]+$`, at most 2,048 long) and as the relay writes it (`Ice::urls`): the scheme in
+/// lower case, something after it, and no white space anywhere. The shipped decoders refuse control characters only, so a URL with a space in it, or a scheme with nothing after
+/// it, was read here and refused by the schema and the relay. White space is `\s` of the schema's pattern in either reading of it: Unicode's, and the byte order mark that
+/// ECMA-262 adds; the control characters are refused as before.
+fn ice_url_ok(url: &str) -> bool {
+    url.len() <= 2048
+        && ["stun:", "stuns:", "turn:", "turns:"].iter().any(|p| url.len() > p.len() && url.starts_with(p))
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\u{feff}')
+}
+
 fn parse_ice(servers: &Json, relay_only: bool, now: i64) -> Result<(Vec<IceServer>, Option<u64>)> {
     let bad = Error::Invalid("iceServers");
     let list = servers.as_array().ok_or(bad.clone())?;
@@ -260,16 +270,7 @@ fn parse_ice(servers: &Json, relay_only: bool, now: i64) -> Result<(Vec<IceServe
             .filter(|u| (1..=8).contains(&u.len()))
             .ok_or(bad.clone())?
             .iter()
-            .map(|u| {
-                u.as_str()
-                    .filter(|t| {
-                        t.len() <= 2048
-                            && !t.chars().any(|c| c.is_control())
-                            && ["stun:", "stuns:", "turn:", "turns:"].iter().any(|p| t.starts_with(p))
-                    })
-                    .map(str::to_string)
-                    .ok_or(bad.clone())
-            })
+            .map(|u| u.as_str().filter(|t| ice_url_ok(t)).map(str::to_string).ok_or(bad.clone()))
             .collect::<Result<_>>()?;
         let username = s.get_str("username").ok_or(bad.clone())?.to_string();
         let mut credential = Zeroizing::new(s.get_str("credential").ok_or(bad.clone())?.to_string());
@@ -754,5 +755,59 @@ mod tests {
         assert_eq!(origin_of("http://localhost:8080?q=1", true), Some(("http", "localhost".into(), 8080)));
         assert_eq!(origin_of("http://127.0.0.1:0/a", true), None);
         assert_eq!(origin_of("http://127.0.0.1?q=1", false), None);
+    }
+
+    #[test]
+    fn an_ice_url_is_read_as_the_schema_has_it_a_scheme_something_after_it_and_no_white_space() {
+        const NOW: i64 = 1_790_000_000;
+        // `ice-server.schema.json`: `^stuns?:[^\s]+$` and `^turns?:[^\s]+$`. The relay writes no other (`Ice::urls` of the PHP relay refuses a space and a lone scheme).
+        let stun = |urls: &[&str]| {
+            let urls = Json::Arr(urls.iter().map(|u| Json::str(*u)).collect());
+            Json::Arr(vec![Json::obj([("urls", urls), ("username", Json::str("")), ("credential", Json::str(""))])])
+        };
+        let turn = |url: &str| {
+            Json::Arr(vec![Json::obj([
+                ("urls", Json::Arr(vec![Json::str(url)])),
+                ("username", Json::str("1790000600:0123456789abcdef0123456789abcdef")),
+                ("credential", Json::str("AAAAAAAAAAAAAAAAAAAAAAAAAAA=")),
+                ("expiresAt", Json::int(NOW + 600)),
+            ])])
+        };
+        for good in ["stun:stun.example.com:3478", "stuns:stun.example.com", "stun:[2001:db8::1]:3478", "stun:x"] {
+            let (servers, earliest) = parse_ice(&stun(&[good]), false, NOW).unwrap_or_else(|e| panic!("refused {good:?}: {e:?}"));
+            assert_eq!((servers[0].urls.as_slice(), earliest), ([good.to_string()].as_slice(), None));
+        }
+        for good in ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:5349?transport=tcp"] {
+            let (servers, earliest) = parse_ice(&turn(good), true, NOW).unwrap_or_else(|e| panic!("refused {good:?}: {e:?}"));
+            assert_eq!((servers[0].urls.as_slice(), earliest), ([good.to_string()].as_slice(), Some(NOW as u64 + 600)));
+        }
+        // White space anywhere, as `\s` of the schema's pattern has it (and the byte order mark, which `\s` of ECMA-262 counts in).
+        for bad in [
+            "stun:stun.example.com 3478",
+            "stun:stun.example.com:3478 ",
+            " stun:stun.example.com:3478",
+            "stun: ",
+            "stun:a\tb",
+            "stun:a\nb",
+            "stun:stun.example.com:3478\n",
+            "stun:a\u{a0}b",
+            "stun:a\u{2003}b",
+            "stun:a\u{2028}b",
+            "stun:a\u{3000}b",
+            "stun:a\u{feff}b",
+        ] {
+            assert!(parse_ice(&stun(&[bad]), false, NOW).is_err(), "accepted {bad:?}");
+            assert!(parse_ice(&stun(&["stun:stun.example.com:3478", bad]), false, NOW).is_err(), "accepted {bad:?} as a second url");
+        }
+        for bad in ["turn:turn.example.com:3478 ?transport=udp", "turns:turn.example.com:5349?transport=tcp ", "turn:a\u{a0}b"] {
+            assert!(parse_ice(&turn(bad), true, NOW).is_err(), "accepted {bad:?}");
+        }
+        // A scheme and nothing after it names no server.
+        for bad in ["stun:", "stuns:"] {
+            assert!(parse_ice(&stun(&[bad]), false, NOW).is_err(), "accepted {bad:?}");
+        }
+        for bad in ["turn:", "turns:"] {
+            assert!(parse_ice(&turn(bad), true, NOW).is_err(), "accepted {bad:?}");
+        }
     }
 }

@@ -284,13 +284,20 @@
       "formId": "id",
       "formKey": "packFormId",
       "formLabel": "displayName",
-      "sources": "connectors"
+      "sources": "connectors",
+      "scriptLanguage": "language"
     },
     "routing": {
       "path": "/api/v1/connector-assignments",
       "list": "assignments",
       "source": "connectorId",
-      "app": "appId"
+      "app": "appId",
+      "candidates": "candidates",
+      "candidateApp": "appId"
+    },
+    "languages": {
+      "param": "languages",
+      "pythonModes": ["applogic"]
     },
     "effects": [
       {

@@ -418,8 +418,19 @@ export class Desktop {
    * configuration's where another program held that one. Null when they are not running or do not say.
    */
   async gatewayUrl(signal?: AbortSignal): Promise<string | null> {
+    return (await this.engines(signal)).gatewayUrl;
+  }
+
+  /**
+   * Where OAIY's engines serve their gateway (`gatewayUrl`, as above), and the key their gateway asks of this page when
+   * the engines are the desktop's own (`gatewayKey`: a page at one of this computer's own names, as the Agent's window
+   * and the OAIY Agent app are on Windows, is answered there only with it; see `enginesKey.ts`). Each null when the
+   * desktop does not say.
+   */
+  async engines(signal?: AbortSignal): Promise<{ gatewayUrl: string | null; gatewayKey: string | null }> {
     const body = await reply(await fetch(`${this.origin}/api/engines`, { headers: this.headers(), signal }));
-    return isRecord(body) && typeof body.gatewayUrl === 'string' && body.gatewayUrl ? body.gatewayUrl : null;
+    const text = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
+    return isRecord(body) ? { gatewayUrl: text(body.gatewayUrl), gatewayKey: text(body.gatewayKey) } : { gatewayUrl: null, gatewayKey: null };
   }
 
   /** Choose the language model OAIY's engines run, as their Engines page does (it loads when it is first asked). */

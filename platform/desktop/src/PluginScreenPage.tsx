@@ -20,6 +20,7 @@ import { PluginVoiceControls } from './PluginVoiceControls';
 import { PluginScreenDocument } from './pluginScreenRpc';
 import { useVisiblePoll } from './useVisiblePoll';
 import PluginRunNote from './PluginRunNote';
+import { windowFetch } from './windowKey';
 
 /**
  * Host for a plugin-contributed screen.
@@ -634,7 +635,8 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     (async () => {
       const base = `${API_BASE}/api/plugins/${encodeURIComponent(pluginId)}/ui/${encodeURIComponent(screen.id!)}`;
       const fetchText = async (rel: string) => {
-        const resp = await fetch(`${base}/${rel.split('/').map(encodeURIComponent).join('/')}`, {
+        // (read here with the dashboard's key and handed to the frame as text: the frame is given no key and no address)
+        const resp = await windowFetch(`${base}/${rel.split('/').map(encodeURIComponent).join('/')}`, {
           cache: 'no-store',
           signal: controller.signal,
         });

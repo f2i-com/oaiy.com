@@ -98,7 +98,12 @@ The bridge's exec routes (running a flow, connector commands) are privileged —
 a loopback port is not a trust boundary. Two ways to reach them:
 
 - **From a browser** served by `oaiy.com` or OAIY Desktop's own webview: the
-  browser sends an `Origin` the runtime trusts. Nothing to configure.
+  browser sends an `Origin` the runtime trusts. Nothing to configure on a Mac
+  or Linux. On Windows the desktop's own windows have `.localhost` origins,
+  which any local web server can serve a page under, so there the runtime
+  trusts them only together with the token the desktop hands each of its
+  windows (`window.__OAIY_DESKTOP__.token` in the Agent and the flow editor):
+  pass it as `token`.
 - **From Node / a co-located worker**: pass a `token` (the desktop's
   `OAIY_SERVER_TOKEN`). It is sent as a bearer on every request.
 

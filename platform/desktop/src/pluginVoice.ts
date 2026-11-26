@@ -1,4 +1,5 @@
 import { PluginCommandError } from './pluginRpc';
+import { windowFetch } from './windowKey';
 import { BrowserVoiceMedia, voiceBase64, type VoiceMedia, type VoiceRecording } from './pluginVoiceMedia';
 
 export type VoiceEventType = 'enabled' | 'recording' | 'transcribing' | 'transcript' | 'speaking' | 'finished' | 'cancelled' | 'closed' | 'failed';
@@ -218,7 +219,7 @@ export class PluginVoiceSession {
     let rejectAbort!:()=>void;
     const aborted = new Promise<never>((_resolve,reject) => {rejectAbort=()=>{void reader?.cancel().catch(()=>{});reject(cancelled());};controller.signal.addEventListener('abort',rejectAbort,{once:true});});
     const operation = (async () => {
-      fence(); const response = await fetch(`${this.base}/${method}`,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal});
+      fence(); const response = await windowFetch(`${this.base}/${method}`,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal});
       if (controller.signal.aborted) {void response.body?.cancel().catch(()=>{});fence();}
       if (!response.body) throw fail('voice_invalid_response','The desktop returned no voice response.');
       if (pcm && response.ok && (response.headers.get('Content-Type')?.split(';')[0] !== 'audio/pcm' || response.headers.get('X-Sample-Rate') !== '24000')) {void response.body.cancel().catch(()=>{});throw fail('voice_invalid_response','The desktop returned invalid speech audio.');}

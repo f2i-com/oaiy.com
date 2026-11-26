@@ -3,8 +3,13 @@
 
 pub const REFUSAL: &str = "This operation is unavailable in an isolated local plugin qualification launch.";
 
+/// `window_token` is the one command here that hands the page a credential: the dashboard's key for this process's
+/// own API, which answers on the launch's reserved port only and behind [`guard`]. The isolated dashboard's origin is
+/// `http://tauri.localhost` like the ordinary one's, a name a page on this computer's port 80 has too, so its API
+/// takes the origin for the window only with that key (`http::tighten`). The launch context itself still carries a
+/// port and nothing else (`isolated::Launch::initialization_script`).
 pub fn ipc_allowed(command: &str) -> bool {
-    matches!(command, "get_config" | "log_path" | "list_model_dirs" | "get_hf_token_status" | "hide_embedded")
+    matches!(command, "get_config" | "log_path" | "list_model_dirs" | "get_hf_token_status" | "hide_embedded" | "window_token")
 }
 
 pub fn http_allowed(method: &str, path: &str) -> bool {
@@ -93,6 +98,21 @@ mod tests {
                 assert_eq!(value["error"]["code"], "isolated_capability_unavailable");
             }
         }
+    }
+
+    /// The isolated dashboard's origin is `http://tauri.localhost` like the ordinary one's, which its API takes for the
+    /// window only with the window's key: the command that hands the key over is one it may call (without it every page
+    /// of the qualification window would be refused), and it is the only one of them that hands over a credential.
+    #[test]
+    fn the_isolated_dashboard_may_ask_for_its_own_windows_key() {
+        assert!(ipc_allowed("window_token"));
+        for near in ["window_token ", "Window_token", "window_tokens", "token", "internal_token", "get_hf_token", "set_hf_token"] {
+            assert!(!ipc_allowed(near), "{near}");
+        }
+        // The command is one the application registers (a name allowed here and registered nowhere would be refused as
+        // unknown, and the window left without its key).
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("async fn window_token(") && lib.contains("            window_token,"), "window_token is registered in the handler");
     }
 
     #[test]

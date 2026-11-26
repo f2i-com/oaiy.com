@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -38,6 +39,12 @@ if (!program) {
 const base = 'http://127.0.0.1:17972';
 // The window's own origin: what the app's pages are served from on this system.
 const origin = process.platform === 'win32' ? 'http://tauri.localhost' : 'tauri://localhost';
+// On Windows that origin is a name any local web server can serve a page under, so the app takes it for its window
+// only with a token. The window is handed one by the app itself, which a program outside cannot ask for: this run
+// gives the app a token of its own instead (OAIY_SERVER_TOKEN, what a CLI is given to drive the desktop) and sends it
+// with the origin, which is who the window is to the app. Elsewhere the origin is one no page can send and is taken
+// alone, as it always was.
+const token = process.platform === 'win32' ? randomBytes(32).toString('base64url') : null;
 
 async function health() {
   try {
@@ -60,6 +67,7 @@ const env = {
   XDG_DATA_HOME: path.join(home, '.local', 'share'), XDG_CONFIG_HOME: path.join(home, '.config'), XDG_CACHE_HOME: path.join(home, '.cache'),
   APPDATA: path.join(home, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
 };
+if (token) env.OAIY_SERVER_TOKEN = token;
 const ownNode = process.env.SMOKE_OWN_NODE === '1';
 if (ownNode) {
   env.PATH = process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32') : '/usr/bin:/bin:/usr/sbin:/sbin';
@@ -71,7 +79,7 @@ const dataDir = process.platform === 'win32' ? path.join(env.APPDATA, 'com.oaiy.
 
 async function request(route, body, method = body ? 'POST' : 'GET') {
   const response = await fetch(base + route, {
-    method, headers: { Origin: origin, 'Content-Type': 'application/json' },
+    method, headers: { Origin: origin, 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(20000),
   });
   const text = await response.text();

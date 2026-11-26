@@ -49,6 +49,13 @@ use crate::services::runner::LogBuffer;
 /// transfers off the call's `ready` says nothing of it, so a plugin that offers the tool because of this still never puts it on the wire.
 pub const HOST_FEATURES: [&str; 2] = ["eventAck", "ringPlan"];
 
+/// The plugin-initiated requests this host answers, announced in `plugin.init` as `hostCalls`: a plugin uses one it
+/// finds there and keeps its own way where it does not, as a host from before a call announces nothing of it. What
+/// this host answers, not what a plugin may ask: each is still held to its capability (`plugins::host`). A list of
+/// its own beside [`HOST_FEATURES`], whose members a contract fixture names exactly
+/// (`docs/contracts/transfer/transfer-v1.ring-plan.fixture.json`).
+pub const HOST_CALLS: [&str; 5] = ["flow.run", "companion.admission", "oaiy.ring.plan", "oaiy.ring.opened", "oaiy.browser.open"];
+
 /// RAII guard for the in-flight plugin request counter so a panic inside a request handler
 /// still releases its slot cleanly.
 struct AnsweringGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -593,6 +600,8 @@ impl PluginProcess {
             // a legacy host, so a plugin must tolerate an empty list.
             // See [`HOST_FEATURES`].
             "features": HOST_FEATURES,
+            // The requests the plugin may make of this host ([`HOST_CALLS`]).
+            "hostCalls": HOST_CALLS,
         });
         // Sent only when there is one. An explicit null is accepted by the
         // decoder, but omitting it keeps the handshake of every ordinary plugin
@@ -1006,7 +1015,7 @@ process.stdin.on("data", (chunk) => {
     if (!line.trim()) continue;
     let msg; try { msg = JSON.parse(line); } catch { continue; }
     if (msg.method === "plugin.init") {
-      send({ jsonrpc: "2.0", id: msg.id, result: { ok: true, features: msg.params.features } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { ok: true, features: msg.params.features, hostCalls: msg.params.hostCalls } });
       // A declared event...
       send({ jsonrpc: "2.0", method: "event.emit", params: { event: {
         schemaVersion: 1, source: "fake", name: "fake.thing.happened",
@@ -1130,6 +1139,9 @@ process.stdin.on("data", (chunk) => {
             // The host advertises eventAck and ringPlan; the fixture echoes what it received.
             assert_eq!(init["features"][0], "eventAck");
             assert_eq!(init["features"], json!(HOST_FEATURES));
+            // And the requests it answers, the browser among them: what a plugin looks for before it asks.
+            assert_eq!(init["hostCalls"], json!(HOST_CALLS));
+            assert!(HOST_CALLS.contains(&crate::plugins::host::BROWSER_OPEN));
 
             let health = p.health().expect("plugin.health must answer");
             assert_eq!(health["status"], "ok");

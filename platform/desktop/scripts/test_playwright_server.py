@@ -8,7 +8,10 @@ requests to a loopback port, and a page on a DNS name rebound to 127.0.0.1
 sends its own name as Host. So: Host must be the server's own; a request that
 carries an Origin, or a Sec-Fetch-Site of another site, is refused unless the
 Origin is one of OAIY's windows (OAIY_ALLOWED_ORIGINS); nothing but such an
-origin is ever echoed in Access-Control-Allow-Origin.
+origin is ever echoed in Access-Control-Allow-Origin. A window's origin that is
+a name under `localhost` (Windows': http://oaiyflows.localhost, which a web
+server on this computer's port 80 has too) is believed only with the key OAIY
+gives its window (OAIY_BROWSER_KEY, sent as `Authorization: Bearer`).
 
 Two layers:
   - the rules, as pure functions of header values;
@@ -55,6 +58,10 @@ OAIY_WINDOW_ORIGINS = [
 
 # The live machine's ports, which no test may bind or contact.
 LIVE_PORTS = {17972, 17872, 17973, 7860, 8080, 9333, 17880}
+
+# The key the tests' servers are given, as OAIY gives its run's (OAIY_BROWSER_KEY), and what a window sends with it.
+TEST_KEY = "5f1c0e9a" * 8
+WITH_THE_KEY = f"Bearer {TEST_KEY}"
 
 
 def load_module():
@@ -150,9 +157,12 @@ class JudgeRequest(unittest.TestCase):
     PORT = 41234
     ALLOWED = frozenset({"http://oaiy.localhost", "oaiyflows://localhost"})
 
-    def judge(self, hosts=("127.0.0.1:41234",), origins=(), sites=(), allowed=None):
+    def judge(self, hosts=("127.0.0.1:41234",), origins=(), sites=(), allowed=None, auths=None, key=TEST_KEY, method="GET"):
+        # (a window of OAIY's sends its key: a `.localhost` origin is let in with it alone, below)
+        if auths is None:
+            auths = [WITH_THE_KEY] if any(server_module.is_name_only(o.strip().lower()) for o in origins) else []
         return server_module.judge_request(
-            list(hosts), list(origins), list(sites), self.PORT, self.ALLOWED if allowed is None else allowed
+            list(hosts), list(origins), list(sites), self.PORT, self.ALLOWED if allowed is None else allowed, list(auths), key, method
         )
 
     def status(self, **kw):
@@ -216,6 +226,63 @@ class JudgeRequest(unittest.TestCase):
         self.assertEqual(self.status(origins=["http://oaiy.localhost", "http://evil.example"]), 403)
         self.assertEqual(self.status(origins=["http://evil.example", "http://oaiy.localhost"]), 403)
         self.assertEqual(self.status(origins=["http://oaiy.localhost"], sites=["cross-site", "same-origin"]), 403)
+
+    def test_a_windows_name_under_localhost_is_believed_only_with_the_key(self):
+        # http://oaiy.localhost is what any web server on this computer's port 80 serves pages under, to any browser
+        # here: on the list, it is let in with the key OAIY gave its window and with nothing less.
+        for site in [(), ("cross-site",), ("same-site",)]:
+            with self.subTest(site=site):
+                self.assertEqual(self.status(origins=["http://oaiy.localhost"], sites=site, auths=[]), 403)
+        for auths in [
+            [],
+            ["Bearer"],
+            ["Bearer "],
+            ["Bearer wrong"],
+            [f"Bearer {TEST_KEY[:-1]}"],
+            [f"Bearer {TEST_KEY}x"],
+            [f"Basic {TEST_KEY}"],
+            [TEST_KEY],
+            [WITH_THE_KEY, WITH_THE_KEY],
+            [WITH_THE_KEY, "Bearer wrong"],
+        ]:
+            with self.subTest(auths=auths):
+                self.assertEqual(self.status(origins=["http://oaiy.localhost"], auths=auths), 403)
+        for auths in [[WITH_THE_KEY], [f"bearer {TEST_KEY}"], [f"  Bearer  {TEST_KEY}  "]]:
+            with self.subTest(auths=auths):
+                self.assertEqual(self.judge(origins=["http://oaiy.localhost"], auths=auths), (200, None, "http://oaiy.localhost"))
+        # A server given no key believes no such name, whatever is sent.
+        for auths in [[], ["Bearer "], [WITH_THE_KEY]]:
+            with self.subTest(no_key=auths):
+                self.assertEqual(self.status(origins=["http://oaiy.localhost"], auths=auths, key=""), 403)
+        # The refusal says why, and never what the key is.
+        status, reason, cors = self.judge(origins=["http://oaiy.localhost"], auths=["Bearer wrong"])
+        self.assertEqual((status, cors), (403, None))
+        self.assertIn("OAIY_BROWSER_KEY", reason)
+        self.assertNotIn(TEST_KEY, reason)
+
+    def test_a_preflight_is_answered_without_the_key_and_runs_nothing(self):
+        # A browser sends no credentials on a preflight: the window's would fail without this. What it clears is judged
+        # again, with its key.
+        self.assertEqual(self.judge(origins=["http://oaiy.localhost"], auths=[], method="OPTIONS"), (200, None, "http://oaiy.localhost"))
+        self.assertEqual(self.status(origins=["http://evil.example"], auths=[], method="OPTIONS"), 403, "an origin off the list is still refused")
+
+    def test_an_origin_no_page_can_have_by_name_and_one_the_person_listed_need_no_key(self):
+        # A custom scheme (a Mac's and Linux's windows) is no browser page's; a dev server the person listed is theirs.
+        allowed = frozenset({"oaiyflows://localhost", "http://localhost:5173", "http://127.0.0.1:17974"})
+        for origin in ["oaiyflows://localhost", "http://localhost:5173", "http://127.0.0.1:17974"]:
+            with self.subTest(origin=origin):
+                self.assertEqual(self.judge(origins=[origin], allowed=allowed, auths=[], key=""), (200, None, origin))
+
+    def test_the_names_under_localhost_are_names_and_nothing_else_is(self):
+        for origin in ["http://oaiy.localhost", "https://oaiyflows.localhost", "http://tauri.localhost", "http://x.y.localhost:8080"]:
+            with self.subTest(origin=origin):
+                self.assertTrue(server_module.is_name_only(origin))
+        for origin in [
+            "oaiy://localhost", "oaiyflows://localhost", "http://localhost", "http://localhost:5173", "http://127.0.0.1:17974",
+            "https://oaiy.com", "http://oaiy.localhost.evil.example", "http://.localhost", "http://oaiy.localhost/", "null", "", None,
+        ]:
+            with self.subTest(origin=origin):
+                self.assertFalse(server_module.is_name_only(origin))
 
 
 class RefusalLog(unittest.TestCase):
@@ -437,9 +504,9 @@ def raw_request(port, method, path, headers, body=None, version="HTTP/1.1", time
 
 
 class RunningServer:
-    """playwright_server.py as a child process on a free loopback port."""
+    """playwright_server.py as a child process on a free loopback port, given `key` as OAIY gives its run's."""
 
-    def __init__(self, allowed_origins):
+    def __init__(self, allowed_origins, key=TEST_KEY):
         self.dir = tempfile.TemporaryDirectory(prefix="oaiy-pw-test-")
         root = pathlib.Path(self.dir.name)
         (root / "stub" / "playwright").mkdir(parents=True)
@@ -457,6 +524,9 @@ class RunningServer:
         env.pop("OAIY_ALLOWED_ORIGINS", None)
         if allowed_origins is not None:
             env["OAIY_ALLOWED_ORIGINS"] = allowed_origins
+        env.pop("OAIY_BROWSER_KEY", None)
+        if key is not None:
+            env["OAIY_BROWSER_KEY"] = key
         last_error = None
         for _ in range(3):
             self.port = free_port()
@@ -519,8 +589,16 @@ class Personas:
         return [self.host(host)]
 
     def window(self, origin):
-        """One of OAIY's windows: a cross-site page in the browser's eyes, with its Origin."""
-        return [self.host(), ("Origin", origin), ("Sec-Fetch-Site", "cross-site"), ("Sec-Fetch-Mode", "cors")]
+        """One of OAIY's windows: a cross-site page in the browser's eyes, with its Origin, and where that origin is a
+        name under `localhost` (Windows'), the key OAIY gave it."""
+        key = [("Authorization", WITH_THE_KEY)] if server_module.is_name_only(origin) else []
+        return [self.host(), ("Origin", origin), ("Sec-Fetch-Site", "cross-site"), ("Sec-Fetch-Mode", "cors")] + key
+
+    def page_with_a_windows_name(self, origin, authorization=None):
+        """A page a web server on this computer's port 80 serves under one of the windows' names, opened in the
+        person's own browser: it has the window's Origin exactly, and not the key (or a guess at it)."""
+        key = [("Authorization", authorization)] if authorization is not None else []
+        return [self.host(), ("Origin", origin), ("Sec-Fetch-Site", "cross-site"), ("Sec-Fetch-Mode", "cors")] + key
 
     def page_on_another_loopback_port(self):
         """A hostile page at http://127.0.0.1:<other>: same-site as the server (ports do not make a site)."""
@@ -675,6 +753,24 @@ class EndToEnd(unittest.TestCase):
         headers = [self.who.host(), ("Origin", "http://oaiy.localhost"), ("Origin", "http://attacker.example")]
         self.assert_refused(self.call("GET", "/health", headers), 403, "two Origins")
 
+    def test_a_page_with_only_a_windows_name_is_403_on_every_route_and_reaches_nothing(self):
+        # The windows' names on Windows are what a web server on this computer's port 80 serves its pages under: such a
+        # page has the Origin exactly. Without the key OAIY gave its window it drives nothing, reads nothing.
+        sid = self.new_session()
+        before = self.side_effects()
+        for origin in ["http://oaiy.localhost", "http://oaiyflows.localhost"]:
+            for authorization in [None, "Bearer ", "Bearer wrong", f"Bearer {TEST_KEY[:32]}", f"Basic {TEST_KEY}"]:
+                for method, path, body in self.routes(sid):
+                    with self.subTest(origin=origin, authorization=authorization, route=f"{method} {path}"):
+                        reply = self.call(method, path, self.who.page_with_a_windows_name(origin, authorization), body)
+                        self.assert_refused(reply, 403, f"{origin} with {authorization!r}")
+                        self.assertNotIn(TEST_KEY.encode(), reply.body, "the refusal does not say the key")
+        self.assertEqual(self.side_effects(), before, "nothing reached the browser")
+        # The control: with the key, the same name is the window, and its goto runs.
+        ok = self.call("POST", f"/session/{sid}/goto", self.who.page_with_a_windows_name("http://oaiyflows.localhost", WITH_THE_KEY), {"url": "https://example.test/"})
+        self.assertEqual(ok.status, 200, ok.body)
+        self.assertEqual([c for c in self.server.calls() if c["call"] == "goto"][-1]["url"], "https://example.test/")
+
     def test_every_method_is_judged_before_the_server_looks_at_it(self):
         # http.server answers an unknown method with 501 from its own code; the guard runs first.
         for method in ["HEAD", "PUT", "PATCH", "TRACE", "CONNECT"]:
@@ -752,6 +848,8 @@ class EndToEnd(unittest.TestCase):
                     self.assertIn("origin", reply.get("vary").lower())
                     self.assertIn("POST", reply.get("access-control-allow-methods"))
                     self.assertIn("Content-Type", reply.get("access-control-allow-headers"))
+                    # (the key goes in Authorization: a preflight that did not allow it would stop every request of the window)
+                    self.assertIn("Authorization", reply.get("access-control-allow-headers"))
                     self.assertIsNone(reply.get("access-control-allow-private-network"))
                     self.assertIsNone(reply.get("access-control-allow-credentials"))
                     self.assertNotIn("*", [v for k, v in reply.headers if k.startswith("access-control-")])
@@ -776,7 +874,7 @@ class EndToEnd(unittest.TestCase):
 
     def test_a_window_is_served_whichever_fetch_site_it_reports(self):
         for site in ["cross-site", "same-site", "same-origin", None]:
-            headers = [self.who.host(), ("Origin", "http://oaiyflows.localhost")] + ([("Sec-Fetch-Site", site)] if site else [])
+            headers = [self.who.host(), ("Origin", "http://oaiyflows.localhost"), ("Authorization", WITH_THE_KEY)] + ([("Sec-Fetch-Site", site)] if site else [])
             with self.subTest(site=site):
                 reply = self.call("GET", "/health", headers)
                 self.assertEqual(reply.status, 200)
@@ -815,11 +913,14 @@ class EndToEnd(unittest.TestCase):
 
     def test_the_server_says_who_it_lets_in_and_what_it_refused(self):
         self.call("GET", "/health", self.who.hosted_editor())
+        self.call("GET", "/health", self.who.page_with_a_windows_name("http://oaiy.localhost", "Bearer wrong"))
         out = self.server.output()
         self.assertIn("web pages allowed to call it: ", out)
         for origin in OAIY_WINDOW_ORIGINS:
             self.assertIn(origin, out)
+        self.assertIn("only with the key OAIY gave its window", out)
         self.assertRegex(out, r"refused a [A-Z]+ request: (403|421) ")
+        self.assertNotIn(TEST_KEY, out, "the key is never written to the log")
 
 
 class ConnectionLimits(unittest.TestCase):
@@ -948,6 +1049,29 @@ class NoAllowList(unittest.TestCase):
 
     def test_a_wildcard_or_null_or_a_path_opens_nothing(self):
         self.run_with("*,null,http://oaiy.localhost/agent,oaiy.localhost")
+
+
+class NoKey(unittest.TestCase):
+    """Started with the windows' origins but no OAIY_BROWSER_KEY (a copy started by hand, say): a name under `localhost`
+    is believed by nothing, whatever it sends; an origin no page can have by name is believed by the list, as before."""
+
+    def test_a_name_is_never_believed_and_a_custom_scheme_is(self):
+        server = RunningServer(",".join(OAIY_WINDOW_ORIGINS), key=None)
+        self.addCleanup(server.close)
+        who = Personas(server.port, free_port())
+        for origin in ["http://oaiy.localhost", "http://oaiyflows.localhost"]:
+            for authorization in [None, "Bearer ", WITH_THE_KEY]:
+                with self.subTest(origin=origin, authorization=authorization):
+                    reply = raw_request(server.port, "POST", "/session", who.page_with_a_windows_name(origin, authorization), {"config": {}})
+                    self.assertEqual(reply.status, 403)
+                    self.assertEqual(reply.cors_headers(), [])
+        for origin in ["oaiy://localhost", "oaiyflows://localhost"]:
+            with self.subTest(origin=origin):
+                reply = raw_request(server.port, "GET", "/health", who.window(origin))
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.get("access-control-allow-origin"), origin)
+        self.assertEqual([c["call"] for c in server.calls()], ["launch"], "no session was made for a name")
+        self.assertIn("never (no OAIY_BROWSER_KEY was given)", server.output())
 
 
 if __name__ == "__main__":

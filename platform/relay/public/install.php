@@ -178,13 +178,31 @@ try {
             . ($mode === 'rekey' ? 'there was written just now (its time says so)' : 'is there beside <code>' . Installer::ADMIN_TOKEN_FILE . '</code>')
             . ', the other run finished and that file holds the key to paste into OAIY. If not, load this page again.</p>');
     }
-    $more = $e->kind === 'reachable'
-        ? '<p>A file the installer put in <code>data</code> could be fetched at your public address, so a key written there would be readable by anyone. Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>'
-        : '<p>Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>';
-    if ($e->kind === 'installed') {
-        $more = ''; // the other of two posts finished first: there is nothing to set and nothing to try again
+    // What to do about it, by what was refused. The advice to set the document root is for a data folder the web can reach, and
+    // for nothing else: it stood under every refusal this page had no words of its own for, and so under `holds`, where the
+    // document root is right already and setting it changes nothing.
+    switch ($e->kind) {
+        case 'reachable':
+            $more = '<p>A file the installer put in <code>data</code> could be fetched at your public address, so a key written there would be readable by anyone. Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>';
+            break;
+        case 'docroot':
+        case 'webroot':
+            $more = '<p>Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>';
+            break;
+        case 'holds':
+            // The relay could not make, or could not count, its own hold markers in data/holds/ (Doctor::holdAccounting): a matter of the folder.
+            $more = '<p>The relay limits how many requests one client can keep waiting by counting marker files that it writes in <code>data/holds</code>, and it could not write or count them in <code>'
+                . oaiy_web_esc($data) . '</code>. Check that PHP can create, list and delete files in that folder (its owner and permissions, the space left on the disk, and that nothing from an earlier attempt is in the way inside <code>holds</code>), and try again.</p>';
+            break;
+        default:
+            // `installed`: the other of two posts finished first, so there is nothing to set and nothing to try again. A kind this
+            // page does not know gets the installer's own message and no advice about something else.
+            $more = '';
     }
-    oaiy_web_page(409, $mode === 'rekey' ? 'No key written' : 'Not installed', '<p>' . oaiy_web_esc(ucfirst(Doctor::safe($e->getMessage()))) . '.</p>' . $more);
+    // A message that ends its own sentence (one of the hold-counting ones ends in a question) is not given a second full stop.
+    $said = ucfirst(Doctor::safe($e->getMessage()));
+    $stop = preg_match('/[.?!]$/', $said) === 1 ? '' : '.';
+    oaiy_web_page(409, $mode === 'rekey' ? 'No key written' : 'Not installed', '<p>' . oaiy_web_esc($said) . $stop . '</p>' . $more);
 } catch (\Throwable $e) {
     oaiy_web_page(500, 'Not finished', '<p>The installer stopped: ' . oaiy_web_esc(Doctor::safe($e->getMessage())) . '</p>');
 }

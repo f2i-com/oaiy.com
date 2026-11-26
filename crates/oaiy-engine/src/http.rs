@@ -684,6 +684,52 @@ pub fn fetch(
     body: &[u8],
     timeout: Duration,
 ) -> io::Result<Response> {
+    let stream = send_request(addr, method, path, headers, body, timeout)?;
+    read_response_head(stream)
+}
+
+/// How often [`fetch_while`] asks whether a reply is still wanted, while none of it has come.
+pub const WATCH_EVERY: Duration = Duration::from_millis(250);
+
+/// [`fetch`], for a reply that may be a long time coming (a language model's whole answer, which its server writes only
+/// when it is done): until the first byte of it comes, `wanted` is asked every [`WATCH_EVERY`], and once it says the reply
+/// is wanted no more (the client it was for has hung up), the connection is closed, which a server takes for the request
+/// withdrawn (`oaiy-llm-server` stops the work), and the error is `ConnectionAborted`. `timeout` bounds connecting and the
+/// wait for that first byte, as it bounds each read of [`fetch`], and each read after it.
+pub fn fetch_while(
+    addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout: Duration,
+    wanted: &dyn Fn() -> bool,
+) -> io::Result<Response> {
+    let stream = send_request(addr, method, path, headers, body, timeout)?;
+    let since = Instant::now();
+    stream.set_read_timeout(Some(WATCH_EVERY.min(timeout).max(Duration::from_millis(1))))?;
+    loop {
+        match stream.peek(&mut [0u8; 1]) {
+            // (a byte of the reply, or its end: either is read as `fetch` reads it)
+            Ok(_) => break,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {
+                if !wanted() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "the reply is wanted no more: the request was withdrawn"));
+                }
+                if since.elapsed() >= timeout {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no reply came in time"));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stream.set_read_timeout(Some(timeout))?;
+    read_response_head(stream)
+}
+
+/// [`fetch`]'s connection, made and with the request written on it.
+fn send_request(addr: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8], timeout: Duration) -> io::Result<TcpStream> {
     let has_ctl = |s: &str| s.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'));
     if method.is_empty() || has_ctl(method) || method.bytes().any(|b| b.is_ascii_whitespace()) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP method"));
@@ -713,6 +759,11 @@ pub fn fetch(
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()?;
+    Ok(stream)
+}
+
+/// The status and the headers of the reply on `stream`, its body left to be read.
+fn read_response_head(stream: TcpStream) -> io::Result<Response> {
     let mut reader = BufReader::new(stream);
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
     let status_line = loop {
@@ -982,5 +1033,65 @@ mod tests {
         assert!(fetch("127.0.0.1:80", "GET", "/\0", &[], b"", t).is_err());
         assert!(fetch("127.0.0.1:80", "GET", "/", &[("X-Test", "ok\r\nEvil: 1")], b"", t).is_err());
         assert!(fetch("127.0.0.1:80", "GET", "/", &[("X-Bad\n", "ok")], b"", t).is_err());
+        assert!(fetch_while("127.0.0.1:80", "GET", "/\r\nEvil: 1", &[], b"", t, &|| true).is_err());
+    }
+
+    /// A server that reads one request and then says nothing, as a language model's server does until its whole answer
+    /// is written: `asked` is told when the request is in, and `let_go` when the client closed its end (or after a minute).
+    fn a_server_that_thinks(answer_after: Option<Duration>) -> (String, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<Instant>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (asked, asked_rx) = std::sync::mpsc::channel();
+        let (let_go, let_go_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = line(&mut reader);
+            let _ = headers(&mut reader);
+            let _ = asked.send(());
+            if let Some(after) = answer_after {
+                std::thread::sleep(after);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                return;
+            }
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = let_go.send(Instant::now());
+        });
+        (addr, asked_rx, let_go_rx)
+    }
+
+    #[test]
+    fn a_reply_no_longer_wanted_is_let_go_while_it_is_awaited_and_one_that_comes_is_read() {
+        // Wanted no more a moment after it was asked: the connection is closed then, not when a reply would have come.
+        let (addr, asked, let_go) = a_server_that_thinks(None);
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&gone);
+        let waiting = std::thread::spawn(move || {
+            let r = fetch_while(&addr, "POST", "/v1/chat/completions", &[], b"{}", Duration::from_secs(60), &|| !flag.load(std::sync::atomic::Ordering::SeqCst));
+            (r.map(|r| r.status).map_err(|e| e.kind()), Instant::now())
+        });
+        asked.recv_timeout(Duration::from_secs(10)).expect("the request reached the server");
+        let withdrawn = Instant::now();
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (result, returned) = waiting.join().unwrap();
+        assert_eq!(result, Err(io::ErrorKind::ConnectionAborted));
+        assert!(returned.duration_since(withdrawn) < Duration::from_secs(3), "{:?}", returned.duration_since(withdrawn));
+        let closed = let_go.recv_timeout(Duration::from_secs(10)).expect("the server saw the connection closed");
+        assert!(closed.duration_since(withdrawn) < Duration::from_secs(5));
+
+        // Wanted all along: the reply that comes after some waits is read as `fetch` reads it.
+        let (addr, _asked, _) = a_server_that_thinks(Some(Duration::from_millis(700)));
+        let reply = fetch_while(&addr, "POST", "/v1/chat/completions", &[], b"{}", Duration::from_secs(60), &|| true).unwrap();
+        assert_eq!((reply.status, reply.header("content-type")), (200, Some("application/json")));
+        assert_eq!(reply.body(1024).unwrap(), b"{}");
+
+        // Nothing comes within the timeout: the wait ends, as a read of `fetch` would.
+        let (addr, _asked, _) = a_server_that_thinks(None);
+        let started = Instant::now();
+        let late = fetch_while(&addr, "POST", "/x", &[], b"", Duration::from_millis(600), &|| true).map(|r| r.status).map_err(|e| e.kind());
+        assert_eq!(late, Err(io::ErrorKind::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

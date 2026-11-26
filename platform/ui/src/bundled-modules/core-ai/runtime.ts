@@ -7,7 +7,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { mayAskDesktop } from '../../lib/desktopDetection';
-import { absoluteUrl, desktopAccess, desktopCredential, desktopFileBytes } from '../core-service/contractRuntime';
+import { absoluteUrl, desktopAccess, desktopCredential, desktopFileBytes, desktopFileHeaders } from '../core-service/contractRuntime';
 import { validatePath } from '../core-filesystem/runtime';
 import { NO_MESSAGE, answerIn, answerOf, endedInError, errorIn, holdsChoices, noMessage, turnWithoutText, whyNoAnswer } from './reply';
 
@@ -580,6 +580,8 @@ async function materializeImageInputToPath(value: unknown): Promise<string | nul
       const response = await ctx.secureFetch(s, {
         method: 'GET',
         purpose: 'Fetch image for AI vision (plugin-llm mmproj)',
+        // (a picture OAIY's engines made is read from the desktop with its credential)
+        headers: desktopFileHeaders(s, ctx),
       });
       if (!response.ok) return null;
       const blob = await response.blob();
@@ -1729,6 +1731,7 @@ async function extractVideoFrames(videoInput: unknown, numFrames: number): Promi
       method: 'GET',
       purpose: 'Fetch video for AI frame extraction',
       signal: ctx.abortSignal,
+      headers: desktopFileHeaders(videoPath, ctx),
     });
     if (!resp.ok) {
       ctx?.log?.('warn', `[AI] video fetch failed: HTTP ${resp.status}`);

@@ -694,6 +694,18 @@ A configuration written before that gains them once (`origins_version`);
 remove any you do not want and they stay removed. oaiy-llm-server is always started with `--local-images off`, so nothing
 reaching the gateway can have the vision model read files from this machine.
 
+An origin there that is one of this computer's own names (a name under `localhost`, such as
+`http://oaiyagent.localhost` or OAIY Desktop's Agent window `http://oaiy.localhost`, or a
+loopback address and port, such as `http://localhost:5317`) is a name and no proof of who holds
+it: whatever program listens on this computer's port 80 (or on that port) serves pages under it
+to any browser here. In the engines OAIY Desktop starts (`launch_hosted`, `HostPages`) such a page
+is answered only with the key the desktop gives its Agent window and the pages paired with it
+(`Authorization: Bearer`), or where it is a page the desktop serves itself or the person named in
+`OAIY_DEV_ORIGINS`; set an API key for any other. A studio run on its own answers by the list.
+A chat or completion asked for whole (no `stream`) whose caller hangs up before the answer is
+withdrawn from the model: the gateway closes the model's connection, as it does at a stream's
+next chunk.
+
 `oaiy-llm-server` runs on a private loopback port with a random key (32 bytes of the
 system's randomness, passed in its environment as `OAIY_LLM_API_KEY`, not on its command
 line where `ps` would show it) and is started with `--watch-stdin`. The studio holds that pipe, so if the studio dies,

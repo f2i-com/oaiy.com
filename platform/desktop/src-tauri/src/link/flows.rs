@@ -291,16 +291,41 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
     Ok(reply.bindings)
 }
 
+/// The app a binding belongs to: none for one of the account's own (no app id,
+/// or a blank one).
+fn app_of(binding: &Binding) -> Option<&str> {
+    binding.app_id.as_deref().map(str::trim).filter(|app| !app.is_empty())
+}
+
+/// The apps whose flows this event would start, each once and in binding
+/// order: those with a binding to it that can fire (enabled, not manual, naming
+/// a flow). A binding of the account's own belongs to no app and is not one.
+///
+/// What the account's assignment is asked about ([`super::app_logic::route`]):
+/// an app with flows on an event and no scripts at all is not in the app list,
+/// so without this two such apps were never told apart, and both started.
+pub fn apps_bound_to<'a>(bindings: &'a [Binding], event_name: &str) -> Vec<&'a str> {
+    let mut apps: Vec<&str> = Vec::new();
+    let can_fire = |b: &&Binding| {
+        b.event == event_name && b.enabled && b.mode.as_deref() != Some("manual") && !b.flow_slug.as_deref().unwrap_or("").is_empty()
+    };
+    for app in bindings.iter().filter(can_fire).filter_map(app_of) {
+        if !apps.contains(&app) {
+            apps.push(app);
+        }
+    }
+    apps
+}
+
 /// The bindings without those this event would fire for an app that
 /// `held_back` names, which are handed back apart, to be said.
 ///
 /// The provider gives a source's events to ONE of the account's apps
-/// ([`super::app_logic::Route`]), and a flow of another app that could have
-/// taken them is not started by them. They are taken out before anything else
-/// is decided, not after: [`MAX_BINDINGS_PER_EVENT`] counts the bindings that
-/// fire, and one that is held back must not take the place of one that does.
-/// A binding that belongs to no app is the account's own and is never held
-/// back.
+/// ([`super::app_logic::Route`]), and a flow of another app is not started by
+/// them. They are taken out before anything else is decided, not after:
+/// [`MAX_BINDINGS_PER_EVENT`] counts the bindings that fire, and one that is
+/// held back must not take the place of one that does. A binding that belongs
+/// to no app is the account's own and is never held back.
 pub fn without_held_back(
     bindings: Vec<Binding>,
     event_name: &str,
@@ -308,7 +333,7 @@ pub fn without_held_back(
 ) -> (Vec<Binding>, Vec<Binding>) {
     bindings
         .into_iter()
-        .partition(|b| !(b.event == event_name && b.app_id.as_deref().is_some_and(&held_back)))
+        .partition(|b| !(b.event == event_name && app_of(b).is_some_and(&held_back)))
 }
 
 /// One matched binding, on its way to a decision.

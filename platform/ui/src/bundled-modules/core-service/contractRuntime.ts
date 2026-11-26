@@ -297,23 +297,44 @@ function reference(value: unknown): string | null {
  * `/api/ai/engine/gateway/files/`), read with the desktop's credential when
  * permitted; null for any other URL, which the caller reads via normal fetch.
  */
-export async function desktopFileBytes(
-  url: string,
-  signal?: AbortSignal,
-  ctx?: RuntimeContext,
-): Promise<{ bytes: Uint8Array; mime: string } | null> {
-  const desktop = desktopAccess();
+/** Whether `url` is a file on the desktop's own file-serving routes: what `desktopFileBytes` reads. */
+function isDesktopFile(url: string, desktop: Desktop): boolean {
   let u: URL;
   let desktopOrigin: string;
   try {
     u = new URL(url);
     desktopOrigin = new URL(desktop.origin).origin;
   } catch {
-    return null;
+    return false;
   }
-  if (u.origin !== desktopOrigin) return null;
-  if (hasEncodedOrBackslashTraversal(url, u)) return null;
-  if (!DESKTOP_FILE_PATH_RE.test(u.pathname)) return null;
+  return u.origin === desktopOrigin && !hasEncodedOrBackslashTraversal(url, u) && DESKTOP_FILE_PATH_RE.test(u.pathname);
+}
+
+/**
+ * What a step's own read of `url` sends with it: the desktop's credential when `url` is a file on the desktop's own
+ * file-serving routes (a picture, a recording or a video its engines made, handed from one step to the next by its
+ * address) and the flow may use the credential, and nothing for any other address.
+ *
+ * A step that reads such a file itself (to upload it to ComfyUI, to save it, to join videos) asked with no credential,
+ * and in OAIY's own window was answered because of the page's origin. On Windows that origin is a name a page on this
+ * computer's port 80 has too, so the desktop answers it only with the credential it gave the page; and a page on an
+ * origin the desktop never trusted (a tab connected to it) was refused all along. The same rule as `desktopFileBytes`:
+ * a file route of this desktop and no other route of it, never another address, and not for a package without
+ * `network:local`.
+ */
+export function desktopFileHeaders(url: string, ctx?: RuntimeContext): Record<string, string> {
+  const desktop = desktopAccess();
+  if (!desktop.token || !isDesktopFile(url, desktop) || packageLacksLocalNetwork(ctx)) return {};
+  return { Authorization: `Bearer ${desktop.token}` };
+}
+
+export async function desktopFileBytes(
+  url: string,
+  signal?: AbortSignal,
+  ctx?: RuntimeContext,
+): Promise<{ bytes: Uint8Array; mime: string } | null> {
+  const desktop = desktopAccess();
+  if (!isDesktopFile(url, desktop)) return null;
 
   const lacksLocal = packageLacksLocalNetwork(ctx);
   if (lacksLocal && !ctx?.secureFetch) {

@@ -1441,6 +1441,62 @@ fn set_hf_token(
     Ok(())
 }
 
+/// The origin of the dashboard's own page, when `url` is its address: where the window serves its bundled page from
+/// (`http://tauri.localhost` on Windows, `tauri://localhost` on a Mac and Linux) or, in a development build, the dev
+/// server it loads (`dev`, the config's `devUrl`). `None` for anything else the `main` webview could be showing: an
+/// embedded page's address, a local web server answering `tauri.localhost` on a port of its own, any other site.
+pub(super) fn dashboard_origin(url: &tauri::Url, dev: Option<&tauri::Url>) -> Option<String> {
+    let host = url.host_str()?;
+    let bundled = url.port().is_none() && matches!((url.scheme(), host), ("http" | "https", "tauri.localhost") | ("tauri", "localhost"));
+    let served = dev.is_some_and(|dev| {
+        matches!(url.scheme(), "http" | "https") && dev.scheme() == url.scheme() && dev.host_str() == Some(host) && dev.port_or_known_default() == url.port_or_known_default()
+    });
+    (bundled || served).then(|| format!("{}://{host}", url.scheme()) + &url.port().map(|p| format!(":{p}")).unwrap_or_default())
+}
+
+/// The credential the dashboard at `origin` sends: made once and kept, so a page that loads again is given the same.
+fn window_credential(origin: &str) -> Result<String, String> {
+    static MADE: Mutex<Option<(String, String)>> = Mutex::new(None);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, token)) = made.as_ref().filter(|(of, _)| of == origin) {
+        return Ok(token.clone());
+    }
+    let token = crate::auth::desk_credential(crate::auth::presets::App::Dash, origin).unwrap_or_else(|| crate::internal_token().to_string());
+    if token.is_empty() {
+        // (no randomness from the system, so no token was made: an empty one is nobody's, and the API refuses it)
+        return Err("OAIY could not make the key its own window uses for its local API. Restart OAIY.".to_string());
+    }
+    *made = Some((origin.to_string(), token.clone()));
+    Ok(token)
+}
+
+/// Tauri command: the credential the dashboard's own page sends with each request to OAIY's local API
+/// (`Authorization: Bearer`).
+///
+/// On Windows the dashboard's origin is `http://tauri.localhost`: a name, which a page served from this computer's
+/// port 80 has too, so the API takes that origin for OAIY's window only with this (`http::tighten`). In `legacy` mode
+/// it is this process's own token, which is never written down and ends with the process; in `scoped` and `shadow` a
+/// `desk` credential made for the dashboard and bound to its origin, as the embedded pages are given
+/// (`embed::desktop_script`).
+///
+/// It is the dashboard's own page's alone. The handler refuses every webview but `main` before a command runs and
+/// this asks again; it also asks what `main` is showing, since an embedded page's address there would be a local
+/// address to Tauri too. Handed over this way and not by an initialization script: WebView2 runs such a script in
+/// every frame of a webview, and a plugin's screen is a frame of the dashboard. Never logged, never part of an address.
+#[tauri::command]
+async fn window_token(webview: tauri::Webview) -> Result<String, String> {
+    dashboard_only(&webview)?;
+    let refused = || "Only OAIY's own window can do that.".to_string();
+    let url = webview.url().map_err(|_| refused())?;
+    let dev = if tauri::is_dev() { webview.app_handle().config().build.dev_url.clone() } else { None };
+    let Some(origin) = dashboard_origin(&url, dev.as_ref()) else {
+        log::warn!("refused the window's token to the dashboard's webview while it shows another page");
+        return Err(refused());
+    };
+    // (off the runtime's own threads: in `scoped` and `shadow` this waits for the guard to be there, as the embedded pages' does)
+    tauri::async_runtime::spawn_blocking(move || window_credential(&origin)).await.map_err(|e| e.to_string())?
+}
+
 pub fn run() {
     // On Linux, shared memory for the agent's code sandbox: an environment variable WebKitGTK's web processes read,
     // set while this process has no other thread to read the environment.
@@ -1508,6 +1564,7 @@ pub fn run() {
             migration_status,
             get_hf_token_status,
             set_hf_token,
+            window_token,
             crate::update::gui::update_check,
             crate::update::gui::update_download,
             crate::update::gui::update_install,
@@ -2298,6 +2355,53 @@ mod config_pointer_tests {
         assert!(config_obj_for_change(&p).unwrap().is_empty());
         let aside = p.with_file_name(format!("{}.corrupt", p.file_name().unwrap().to_string_lossy()));
         assert_eq!(std::fs::read_to_string(aside).unwrap(), typo, "what was in it is kept");
+    }
+
+    /// `window_token` hands the dashboard's key to the dashboard's own page and to nothing else its webview could be
+    /// showing: the bundled page's address on each system, or in a development build the dev server's.
+    #[test]
+    fn the_windows_token_is_for_the_dashboards_own_page_and_no_other_address() {
+        use super::gui::dashboard_origin;
+        let url = |s: &str| s.parse::<tauri::Url>().unwrap();
+        // The bundled page: Windows (WebView2 serves the `tauri` scheme as a `.localhost` name), a Mac and Linux.
+        for (address, origin) in [
+            ("http://tauri.localhost/", "http://tauri.localhost"),
+            ("http://tauri.localhost/index.html?x=1#top", "http://tauri.localhost"),
+            ("https://tauri.localhost/", "https://tauri.localhost"),
+            ("tauri://localhost", "tauri://localhost"),
+            ("tauri://localhost/index.html", "tauri://localhost"),
+        ] {
+            assert_eq!(dashboard_origin(&url(address), None).as_deref(), Some(origin), "{address}");
+        }
+        // Anything else `main` could be made to show: the embedded pages' addresses (local addresses to Tauri too),
+        // a web server answering the dashboard's name on a port of its own, look-alikes, and any other site.
+        let dev = url("http://localhost:17973");
+        for address in [
+            "http://oaiy.localhost/",
+            "http://oaiyflows.localhost/",
+            "oaiy://localhost/",
+            "oaiyflows://localhost/",
+            "http://127.0.0.1:17974/",
+            "http://tauri.localhost:8080/",
+            "http://tauri.localhost.evil.example/",
+            "http://x.tauri.localhost/",
+            "tauri://evil.example/",
+            "tauri://localhost:8080/",
+            "https://oaiy.com/",
+            "http://127.0.0.1:17972/api/health",
+            "http://localhost:17973/",
+            "about:blank",
+            "data:text/html,hi",
+        ] {
+            assert_eq!(dashboard_origin(&url(address), None), None, "{address}");
+        }
+        // A development build's page is the dev server's (`devUrl`), at that address exactly.
+        assert_eq!(dashboard_origin(&url("http://localhost:17973/"), Some(&dev)).as_deref(), Some("http://localhost:17973"));
+        assert_eq!(dashboard_origin(&url("http://localhost:17973/src/main.tsx"), Some(&dev)).as_deref(), Some("http://localhost:17973"));
+        for address in ["http://localhost:17974/", "http://localhost/", "https://localhost:17973/", "http://127.0.0.1:17973/", "http://localhost.evil.example:17973/", "http://oaiy.localhost/"] {
+            assert_eq!(dashboard_origin(&url(address), Some(&dev)), None, "{address}");
+        }
+        assert_eq!(dashboard_origin(&url("http://tauri.localhost/"), Some(&dev)).as_deref(), Some("http://tauri.localhost"));
     }
 
     #[test]

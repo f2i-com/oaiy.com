@@ -1983,6 +1983,14 @@ async fn create_pairing(
         Ok(origin) => origin,
         Err(why) => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", why.into()),
     };
+    // OAIY's own windows are handed their token and never ask to pair. A request under one of their names (the form
+    // Windows gives them: `http://oaiy.localhost`, which a page served from this computer's port 80 has too) comes from
+    // something else that has the name, and its prompt would read "From http://oaiy.localhost": OAIY itself, to
+    // whoever reads it, with a grant for that page at the end of it.
+    if origin.as_deref().is_some_and(crate::http::is_name_only_origin) {
+        let why = "a page under the name of one of OAIY's own windows cannot be paired: OAIY's windows are not paired, and nothing else may ask as one";
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", why.into());
+    }
     match st.pairing.lock() {
         Ok(mut mgr) => match mgr.request_for(&body.product, label, origin, access) {
             Ok(req) => (
@@ -2702,8 +2710,22 @@ mod tests {
             let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", "http://127.0.0.1:3000")], run()).await;
             assert!(status == StatusCode::BAD_REQUEST && refused(&body), "{status} {body}");
             // The window itself: taken (the flow is then looked for).
-            let (status, body) = send(&gui, "/api/bridge/runs", &[("Origin", OWN_WINDOW)], run()).await;
+            let (status, body) = send(&gui, "/api/bridge/runs", &own_window(), run()).await;
             assert!(status == StatusCode::CREATED && !refused(&body), "{status} {body}");
+            // On Windows the window's origin is a name a page on this computer's port 80 has too: the name alone is not
+            // the window, and is let through no more than any other website.
+            if cfg!(windows) {
+                let (status, _) = send(&gui, "/api/bridge/runs", &[("Origin", OWN_WINDOW)], run()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "the window's name with no token");
+            }
+            // An install with a token set for its CLI: the token from the window's origin is the window, and the token
+            // alone is a program, which is not.
+            let keyed = crate::http::tightened_for_tests(router(st.clone()), Some("t".into()), true);
+            // (the same run asked for again, so it is answered with the one already made: taken, as the window's)
+            let (status, body) = send(&keyed, "/api/bridge/runs", &[("Origin", OWN_WINDOW), ("Authorization", "Bearer t")], run()).await;
+            assert!(status == StatusCode::OK && !refused(&body), "{status} {body}");
+            let (status, body) = send(&keyed, "/api/bridge/runs", &[("Authorization", "Bearer t")], run()).await;
+            assert!(status == StatusCode::BAD_REQUEST && refused(&body), "{status} {body}");
             // A headless server has no window, and an Origin there is anyone's to send.
             let headless = crate::http::tightened_for_tests(router(st), Some("t".into()), false);
             let (status, body) = send(&headless, "/api/bridge/runs", &[("Origin", OWN_WINDOW), ("Authorization", "Bearer t")], run()).await;
@@ -2712,6 +2734,16 @@ mod tests {
 
         /// The desktop's own window's origin on this system (`tauri://localhost` elsewhere is an impostor's on Windows).
         const OWN_WINDOW: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
+
+        /// What the desktop's own window sends: its origin, and on Windows (where that origin is only a name) the token
+        /// the desktop handed it.
+        fn own_window() -> Vec<(&'static str, &'static str)> {
+            let mut headers = vec![("Origin", OWN_WINDOW)];
+            if cfg!(windows) {
+                headers.push(("Authorization", crate::http::own_window_bearer_for_tests()));
+            }
+            headers
+        }
 
         /// Run again of a run with outside input (a text's, a webhook's) runs on that input, so it is confined as that run
         /// was, whatever the page says: the server reads the run's record for its flow, input, time limit and
@@ -2723,7 +2755,7 @@ mod tests {
             let outside = kept_run(&st, "oaiy-trigger:aokie", "evt", json!({ "path": "~/.ssh/id_rsa" }));
             let mine = kept_run(&st, "oaiy-agent", "mine", json!({ "path": "notes.txt" }));
             let gui = crate::http::tightened_for_tests(router(st.clone()), None, true);
-            let window = [("Origin", OWN_WINDOW)];
+            let window = own_window();
             let again = |of: &str, key: &str, extra: Value| {
                 let mut body = json!({"protocol": "oaiy-bridge/1", "caller": {"product": "oaiy-desktop", "label": "You, from Run history"},
                     "flowId": "not-a-flow", "mode": "async", "correlationId": key, "idempotencyKey": key, "again": of});
@@ -3506,6 +3538,26 @@ done
                 assert_eq!(raise(&st, Some(origin), json!({ "product": "formlogic" })).await.0, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(origin));
             }
             assert_eq!(st.pairing.lock().unwrap().pending().len(), 3, "a refused request raises no prompt");
+        }
+
+        /// OAIY's own windows are handed their token and never ask to pair. On Windows their origins are names
+        /// (`http://oaiy.localhost`) that a page served from this computer's port 80 has too: such a page's request was
+        /// shown as "From http://oaiy.localhost", which reads as OAIY itself asking, and approving it granted that page.
+        #[tokio::test]
+        async fn nothing_asks_to_pair_under_the_name_of_one_of_oaiys_own_windows() {
+            let (_sb, st) = release_state("pairing-own-names", Publishers::default());
+            for origin in ["http://oaiy.localhost", "http://oaiyflows.localhost", "http://tauri.localhost", "https://oaiy.localhost", "https://oaiyflows.localhost", "https://tauri.localhost"] {
+                for access in ["apps", "agent"] {
+                    let (status, body) = raise(&st, Some(origin.as_bytes()), json!({ "product": "oaiy-app", "label": "OAIY Agent", "access": access })).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{origin} {access}: {body}");
+                    assert_eq!(body["error"]["code"], "invalid_request");
+                }
+            }
+            assert!(st.pairing.lock().unwrap().pending().is_empty(), "no prompt was raised");
+            // Names near them are other pages, asked about as any page is (by their own address).
+            for origin in ["http://oaiy.localhost:8080", "http://my.oaiy.localhost", "http://localhost", "https://oaiy.example"] {
+                assert_eq!(raise(&st, Some(origin.as_bytes()), json!({ "product": "an-app" })).await.0, StatusCode::CREATED, "{origin}");
+            }
         }
 
         #[tokio::test]

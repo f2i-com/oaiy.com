@@ -25,18 +25,41 @@ const BROWSER_SERVICE_ID: &str = "playwright-browser";
 /// need no entry.
 const ALLOWED_ORIGINS_ENV: &str = "OAIY_ALLOWED_ORIGINS";
 
+/// The variable that hands it this run's key ([`browser_service_key`]).
+const BROWSER_KEY_ENV: &str = "OAIY_BROWSER_KEY";
+
 /// What `OAIY_ALLOWED_ORIGINS` holds: in an app with windows, the exact origins
 /// of the Agent's window and the flow editor's (`http::embedded_window_origins`);
 /// in the headless server, which has none, nothing, so no web page may call the
-/// browser service there at all. (An origin is a name, not proof of who holds
-/// it: a local web server answering `oaiy.localhost` on port 80 could serve a
-/// page with one of these, as for the API guard; see the desktop README.)
+/// browser service there at all. An origin is a name, not proof of who holds it:
+/// on Windows these are `http://oaiy.localhost` and `http://oaiyflows.localhost`,
+/// which a local web server on port 80 serves pages under too, so the service
+/// believes such a name only with [`browser_service_key`].
 fn allowed_origins_env(has_windows: bool, on_windows: bool) -> String {
     if has_windows {
         crate::http::embedded_window_origins(on_windows).join(",")
     } else {
         String::new()
     }
+}
+
+/// The key this run hands the browser service (`OAIY_BROWSER_KEY`) and the flow editor's window, the one page of
+/// OAIY's that calls it (`embed::desktop_script`, `window.__OAIY_DESKTOP__.browserKey`): the service believes an origin
+/// that is a `.localhost` name (Windows' form of OAIY's windows, which any web server on this computer's port 80 can
+/// serve a page under) only when the request carries it as `Authorization: Bearer`.
+///
+/// Made once per run from the system's randomness and never written down; a new start of the service is given the
+/// key of the run that starts it. Empty when the system gave no randomness: none is passed then, and the service
+/// believes no such name.
+pub(crate) fn browser_service_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        match getrandom::getrandom(&mut bytes) {
+            Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            Err(_) => String::new(),
+        }
+    })
 }
 
 /// Built-in templates embedded at compile time. Seeded to disk on first
@@ -2058,6 +2081,12 @@ impl Registry {
         if id == BROWSER_SERVICE_ID {
             env.entry(ALLOWED_ORIGINS_ENV.to_string())
                 .or_insert_with(|| allowed_origins_env(cfg!(feature = "gui"), cfg!(windows)));
+            // And this run's key, which the window of OAIY's that calls it was given: always this run's (a key a copy
+            // of the template names would be one no window has). The headless server has no window to give one.
+            env.remove(BROWSER_KEY_ENV);
+            if cfg!(feature = "gui") && !browser_service_key().is_empty() {
+                env.insert(BROWSER_KEY_ENV.to_string(), browser_service_key().to_string());
+            }
         }
         // Pin to a chosen GPU if the user assigned one in the GPU picker — so e.g.
         // OAIY Voice runs on GPU 1 while a Python rig keeps GPU 0, instead of both
@@ -3813,12 +3842,34 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The browser service is given this run's key, the one the flow editor's window has (`embed::desktop_script`): on
+    /// Windows the windows' origins are names a web server on this computer's port 80 has too, and the service believes
+    /// them only with it. A key an edited copy of the template names is never the one passed; the headless server, which
+    /// has no window, passes none.
+    #[test]
+    fn the_browser_service_is_given_this_runs_key_and_no_other() {
+        let (dir, reg) = scratch_registry_with_browser("browser-key");
+        let svc = &reg.services["playwright-browser"];
+        let key = browser_service_key();
+        assert!(key.len() >= 32 && key.bytes().all(|b| b.is_ascii_hexdigit()), "a key from the system's randomness");
+        assert_eq!(key, browser_service_key(), "one for the run");
+        let env = env_of(&reg, "playwright-browser");
+        let expected = cfg!(feature = "gui").then_some(key);
+        assert_eq!(env.get("OAIY_BROWSER_KEY").map(String::as_str), expected);
+        let mut mine = svc.template.run.clone();
+        mine.env.insert("OAIY_BROWSER_KEY".into(), "a-key-no-window-has".into());
+        let env = reg.spawn_env("playwright-browser", &mine, &reg.ctx(svc.port));
+        assert_eq!(env.get("OAIY_BROWSER_KEY").map(String::as_str), expected, "this run's, not the copy's");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn no_other_service_is_given_the_origins() {
         // The voice services and the rest are not hardened here (N12): they get what their templates say.
         let (dir, reg) = scratch_registry("origins-others");
         for id in ["oaiy-voice"] {
             assert!(!env_of(&reg, id).contains_key("OAIY_ALLOWED_ORIGINS"), "{id}");
+            assert!(!env_of(&reg, id).contains_key("OAIY_BROWSER_KEY"), "{id}: nor the browser service's key");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

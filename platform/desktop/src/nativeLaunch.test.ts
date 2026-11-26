@@ -122,8 +122,11 @@ describe('the native desktop endpoint bootstrap', () => {
     expect(host.localStorage.getItem).not.toHaveBeenCalled();
   });
 
-  it('uses the isolated endpoint before the first imported API call', async () => {
+  it('uses the isolated endpoint before the first imported API call, and asks the desktop for nothing but the window’s key', async () => {
     const host = nativeHost(launch());
+    const invoke = (host as { __TAURI_INTERNALS__: { invoke: ReturnType<typeof vi.fn> } }).__TAURI_INTERNALS__.invoke;
+    const key = 'c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00';
+    invoke.mockImplementation(async (cmd: string) => (cmd === 'window_token' ? key : undefined));
     vi.stubGlobal('window', host);
     const fetch = vi.fn(async () => new Response(JSON.stringify({ services: [], dataDir: 'isolated' }), { status: 200 }));
     vi.stubGlobal('fetch', fetch);
@@ -131,9 +134,30 @@ describe('the native desktop endpoint bootstrap', () => {
     expect(api.API_BASE).toBe('http://127.0.0.1:48123');
     expect(api.DESKTOP_LAUNCH).toEqual({ apiBase: api.API_BASE, isolated: true });
     expect(Object.isFrozen(api.DESKTOP_LAUNCH)).toBe(true);
+    // The endpoint is the launch context's alone: nothing was asked of the desktop to find it.
+    expect(invoke).not.toHaveBeenCalled();
     await api.services.list();
-    expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:48123/api/services', expect.any(Object));
-    expect((host as { __TAURI_INTERNALS__: { invoke: ReturnType<typeof vi.fn> } }).__TAURI_INTERNALS__.invoke).not.toHaveBeenCalled();
+    // The isolated window's origin is `http://tauri.localhost` like the ordinary one's, a name a page on this computer's
+    // port 80 has too: its API answers it only with the window's key. That is the one thing the page asks the desktop
+    // for, and it goes to the isolated endpoint, in a header (the launch context still holds a port and no credential).
+    expect(invoke.mock.calls).toEqual([['window_token', {}]]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:48123/api/services');
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${key}`);
+  });
+
+  it('does not send an isolated window’s key to the ordinary installation’s endpoint', async () => {
+    const host = nativeHost(launch());
+    const invoke = (host as { __TAURI_INTERNALS__: { invoke: ReturnType<typeof vi.fn> } }).__TAURI_INTERNALS__.invoke;
+    invoke.mockResolvedValue('c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00');
+    vi.stubGlobal('window', host);
+    const fetch = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetch);
+    const { windowFetch } = await import('./windowKey');
+    await windowFetch(`${DEFAULT_API_BASE}/api/services`, { headers: { Accept: 'application/json' } });
+    expect(fetch).toHaveBeenCalledWith(`${DEFAULT_API_BASE}/api/services`, { headers: { Accept: 'application/json' } });
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it('keeps browser API imports on the normal endpoint even with an injected marker', async () => {

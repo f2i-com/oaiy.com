@@ -883,13 +883,30 @@ impl LinkStore {
         }
     }
 
-    /// Record the outcome of a relay poll.
+    /// Whether `account`, a link a lane read, is the link this store holds now: the same key, for the same
+    /// connector, at the same address. One forgotten since, or replaced by another, is not, and a lane whose work
+    /// outlived it writes nothing more for it, to the provider or here. Reads nothing from the disk.
+    pub fn holds(&self, account: &LinkedAccount) -> bool {
+        holds_link(&self.inner.lock().unwrap_or_else(|e| e.into_inner()), account)
+    }
+
+    /// Record the outcome of a relay poll made for `about`.
     ///
     /// The timestamp is what makes "no error" mean something: the lane is a long
     /// poll, so a clean return every few seconds is the only evidence it is
     /// alive. Without it, "never started" and "running fine" look identical.
-    pub fn note_relay(&self, error: Option<String>) {
+    ///
+    /// Every lane's note names the link it is about, and is dropped when that
+    /// link is no longer held (decided under the lock the note is written under):
+    /// a request in flight when its link was forgotten came back after the
+    /// forget had cleared what the lanes said, and its answer (a key refused, as
+    /// a key just revoked is) was shown against the next link until that link's
+    /// own first answer.
+    pub fn note_relay(&self, about: &LinkedAccount, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         if error.is_none() {
             inner.last_relay_at = Some(chrono::Utc::now());
         }
@@ -900,8 +917,11 @@ impl LinkStore {
 
     /// Record that the provider gives this link no commands (`why`, in its words): the command lane rests until the
     /// link changes. Neither an error nor a lane listening, so it clears both.
-    pub fn note_relay_not_used(&self, why: String) {
+    pub fn note_relay_not_used(&self, about: &LinkedAccount, why: String) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         inner.relay_error = None;
         inner.last_relay_at = None;
         inner.relay_not_used = Some(why);
@@ -912,23 +932,38 @@ impl LinkStore {
     /// The timestamp is what makes "no error" mean something: without it a lane
     /// that never started and one that is claiming and running flows every few
     /// seconds look identical from the panel.
-    pub fn note_flow_run(&self, error: Option<String>) {
+    pub fn note_flow_run(&self, about: &LinkedAccount, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         if error.is_none() {
             inner.last_flow_run_at = Some(chrono::Utc::now());
         }
         inner.flow_run_error = error;
     }
 
-    pub fn note_sealed_flow(&self, error: Option<String>) {
+    pub fn note_sealed_flow(&self, about: &LinkedAccount, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         if error.is_none() { inner.last_sealed_flow_at = Some(chrono::Utc::now()); }
         inner.sealed_flow_error = error;
     }
 
+    /// Record that the sealed flow lane could not start at all (`why`): of this desktop, whatever it is linked to,
+    /// and so said of whichever link there is or comes, until the next start.
+    pub fn note_sealed_flow_down(&self, why: String) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).sealed_flow_error = Some(why);
+    }
+
     /// Record the outcome of a node registration.
-    pub fn note_data_node(&self, outcome: Result<data_node::DataNodeStatus, String>) {
+    pub fn note_data_node(&self, about: &LinkedAccount, outcome: Result<data_node::DataNodeStatus, String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         match outcome {
             Ok(status) => {
                 inner.data_node = Some(status);
@@ -942,15 +977,21 @@ impl LinkStore {
     }
 
     /// The provider does not offer data nodes: nothing to show, and no error.
-    pub fn note_data_node_off(&self) {
+    pub fn note_data_node_off(&self, about: &LinkedAccount) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         inner.data_node = None;
         inner.data_node_error = None;
     }
 
     /// Record the outcome of a heartbeat.
-    pub fn note_heartbeat(&self, error: Option<String>) {
+    pub fn note_heartbeat(&self, about: &LinkedAccount, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !holds_link(&inner, about) {
+            return;
+        }
         if error.is_none() {
             inner.last_heartbeat_at = Some(chrono::Utc::now());
         }
@@ -1130,22 +1171,7 @@ impl LinkStore {
             inner.error = left_behind.err().map(copies_left);
             inner.retry = None;
             inner.attempt = LinkPhase::Idle;
-            inner.last_heartbeat_at = None;
-            inner.heartbeat_error = None;
-            // Both lanes, or a failure from the provider just disconnected
-            // would be shown against the next one that is linked.
-            inner.last_relay_at = None;
-            inner.relay_error = None;
-            inner.relay_not_used = None;
-            inner.last_flow_run_at = None;
-            inner.flow_run_error = None;
-            inner.last_sealed_flow_at = None;
-            inner.sealed_flow_error = None;
-            // The IDENTITY stays on disk: the same machine relinking is the
-            // same node, and re-minting would ask the owner to approve a device
-            // they already approved. Only the provider's answer is forgotten.
-            inner.data_node = None;
-            inner.data_node_error = None;
+            forget_lanes(&mut inner);
             forgotten
         };
         // The provider is told only now, of a link this machine no longer holds: one that could not be forgotten
@@ -1156,14 +1182,18 @@ impl LinkStore {
         // Withdrawn in the same action that forgot the link: a provider we are
         // no longer linked to must not keep reaching this machine.
         set_linked_origin(None);
-        // And the provider's PRELUDE goes with it. The next link may be another
-        // account on another deployment, whose standard library is its own —
-        // keeping this one would run one account's helpers inside another's
-        // scripts, which is worse than having none.
-        script_profile::ProfileCache::global().invalidate(&self.data_dir);
-        // And the run outcomes kept for it: another account must not be sent them, and nothing else clears them.
-        flow_runner::forget_pending();
+        self.forget_what_was_kept_for_the_link();
         self.status()
+    }
+
+    /// What is kept beside the store for a link, forgotten with it (by an unlink, or by a new link that takes its
+    /// place). The provider's PRELUDE: the next link may be another account on another deployment, whose standard
+    /// library is its own, and keeping this one would run one account's helpers inside another's scripts, which is
+    /// worse than having none. And the run outcomes kept for it: another link must not be sent them (they name the
+    /// instance that claimed them, which the next link is not), and nothing else clears them.
+    fn forget_what_was_kept_for_the_link(&self) {
+        script_profile::ProfileCache::global().invalidate(&self.data_dir);
+        flow_runner::forget_pending();
     }
 
     fn set_phase(&self, phase: LinkPhase) {
@@ -1209,6 +1239,37 @@ impl LinkStore {
     fn end(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).in_flight = false;
     }
+}
+
+/// Whether the store holds `account` ([`LinkStore::holds`]).
+fn holds_link(inner: &Inner, account: &LinkedAccount) -> bool {
+    inner.account.as_ref().is_some_and(|held| same_link(held, account))
+}
+
+/// Whether two stored links are the same link: a link is its key, for its connector, at its address. Every new link
+/// is a new key, so a link made again over a forgotten one, to the same account, is another link. (Not every field:
+/// the instance id is minted on a link already made, and what the provider said of the account is not the link.)
+fn same_link(a: &LinkedAccount, b: &LinkedAccount) -> bool {
+    a.credential == b.credential && a.base_url == b.base_url && a.connector_id == b.connector_id
+}
+
+/// What every lane last said of a link, forgotten with it: a failure from the provider just disconnected (or
+/// replaced) would be shown against the next one that is linked.
+fn forget_lanes(inner: &mut Inner) {
+    inner.last_heartbeat_at = None;
+    inner.heartbeat_error = None;
+    inner.last_relay_at = None;
+    inner.relay_error = None;
+    inner.relay_not_used = None;
+    inner.last_flow_run_at = None;
+    inner.flow_run_error = None;
+    inner.last_sealed_flow_at = None;
+    inner.sealed_flow_error = None;
+    // The IDENTITY stays on disk: the same machine relinking is the
+    // same node, and re-minting would ask the owner to approve a device
+    // they already approved. Only the provider's answer is forgotten.
+    inner.data_node = None;
+    inner.data_node_error = None;
 }
 
 /// How long the provider is given to answer that a link is over ([`tell_provider_unlinked`]).
@@ -1310,6 +1371,10 @@ fn device_label() -> Option<String> {
 /// Returns immediately with the URL to open; the caller polls `status()`.
 /// Blocking work — a loopback wait bounded by a human, then an HTTP exchange —
 /// has no business on the request path.
+///
+/// A link already held is replaced by the new one once that is made, and is
+/// ended at its provider as unlinking ends one ([`tell_provider_unlinked`]):
+/// after the new link is kept, so it waits on nothing the old provider does.
 pub fn start_link(
     store: LinkHandle,
     connector_id: &str,
@@ -1403,10 +1468,24 @@ pub fn start_link(
             Ok(account) => match for_thread.persist(&account) {
                 Ok(()) => {
                     set_linked_origin(Some(account.base_url.as_str()));
-                    let mut inner = for_thread.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    inner.account = Some(account);
-                    inner.error = None;
-                    inner.attempt = LinkPhase::Linked;
+                    let replaced = {
+                        let mut inner = for_thread.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        let replaced = inner.account.replace(account);
+                        inner.error = None;
+                        inner.attempt = LinkPhase::Linked;
+                        if replaced.is_some() {
+                            forget_lanes(&mut inner);
+                        }
+                        replaced
+                    };
+                    // A link this one took the place of is over, as one that was forgotten is: its key worked on at the
+                    // provider, and its connection stayed on the provider's pages, for every link made over another.
+                    // It is ended the way unlinking ends one, after the new link is kept and on a thread of its own,
+                    // so the new link waits on nothing and is refused by nothing it says.
+                    if let Some(old) = replaced {
+                        for_thread.forget_what_was_kept_for_the_link();
+                        tell_provider_unlinked(&for_thread.data_dir, old);
+                    }
                 }
                 Err(e) => for_thread.set_phase(LinkPhase::Failed { message: e }),
             },
@@ -1681,13 +1760,13 @@ mod tests {
         s.persist(&account()).unwrap();
         s.inner.lock().unwrap().account = Some(account());
 
-        s.note_heartbeat(Some("the provider no longer accepts this desktop's key".into()));
+        s.note_heartbeat(&account(), Some("the provider no longer accepts this desktop's key".into()));
         let status = s.status();
         assert!(status.linked);
         assert!(status.last_heartbeat_at.is_none());
         assert!(status.heartbeat_error.unwrap().contains("no longer accepts"));
 
-        s.note_heartbeat(None);
+        s.note_heartbeat(&account(), None);
         let ok = s.status();
         assert!(ok.last_heartbeat_at.is_some());
         assert!(ok.heartbeat_error.is_none(), "success must clear the error");
@@ -1708,12 +1787,12 @@ mod tests {
         let fresh = s.status();
         assert!(fresh.relay_error.is_none() && fresh.last_relay_at.is_none());
 
-        s.note_relay(Some("claim refused: HTTP 500".into()));
+        s.note_relay(&account(), Some("claim refused: HTTP 500".into()));
         let bad = s.status();
         assert!(bad.relay_error.unwrap().contains("500"));
         assert!(bad.last_relay_at.is_none(), "a failed poll is not a poll");
 
-        s.note_relay(None);
+        s.note_relay(&account(), None);
         let good = s.status();
         assert!(good.relay_error.is_none(), "success must clear the error");
         // The timestamp is what makes "no error" mean something: on a long poll,
@@ -1721,8 +1800,8 @@ mod tests {
         assert!(good.last_relay_at.is_some());
 
         // A link the provider gives no commands: not an error, and not a lane listening since some moment.
-        s.note_relay(Some("claim refused: HTTP 500".into()));
-        s.note_relay_not_used("This computer is linked for AI only.".into());
+        s.note_relay(&account(), Some("claim refused: HTTP 500".into()));
+        s.note_relay_not_used(&account(), "This computer is linked for AI only.".into());
         let unused = s.status();
         assert_eq!(unused.relay_not_used.as_deref(), Some("This computer is linked for AI only."));
         assert!(unused.relay_error.is_none() && unused.last_relay_at.is_none(), "{unused:?}");
@@ -1730,7 +1809,7 @@ mod tests {
         assert_eq!(wire["relayNotUsed"], "This computer is linked for AI only.", "the panel's name for it");
         assert!(wire.get("lastRelayAt").is_none(), "{wire}");
         // A poll that comes back (the link is another) is a lane in use again.
-        s.note_relay(None);
+        s.note_relay(&account(), None);
         let again = s.status();
         assert!(again.relay_not_used.is_none() && again.last_relay_at.is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1763,9 +1842,9 @@ mod tests {
         s.persist(&account()).unwrap();
         s.inner.lock().unwrap().account = Some(account());
         // A healthy poll first, so there is a timestamp to leak, then a failure.
-        s.note_relay(None);
-        s.note_relay(Some("the provider no longer accepts this desktop's key".into()));
-        s.note_heartbeat(Some("boom".into()));
+        s.note_relay(&account(), None);
+        s.note_relay(&account(), Some("the provider no longer accepts this desktop's key".into()));
+        s.note_heartbeat(&account(), Some("boom".into()));
         assert!(s.status().last_relay_at.is_some(), "the setup must have left one");
 
         let after = s.unlink();
@@ -1774,8 +1853,46 @@ mod tests {
         assert!(after.heartbeat_error.is_none());
         // Nor a lane the last link was not given.
         s.inner.lock().unwrap().account = Some(account());
-        s.note_relay_not_used("This computer is linked for AI only.".into());
+        s.note_relay_not_used(&account(), "This computer is linked for AI only.".into());
         assert!(s.unlink().relay_not_used.is_none(), "the next link's lane is not the last one's");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_a_lane_says_of_a_link_forgotten_or_replaced_is_not_said_of_the_next() {
+        // A request in flight when its link was forgotten came back after the forget had cleared what the lanes had
+        // said, and its answer (a key refused, as a key just revoked is) stood against the next link until that
+        // link's own first answer.
+        let (dir, s) = store("notes-for-a-link");
+        s.persist(&account()).unwrap();
+        s.inner.lock().unwrap().account = Some(account());
+        let old = account();
+        assert!(s.holds(&old));
+        s.unlink();
+        let refused = "the provider no longer accepts this desktop's key — link again";
+        s.note_heartbeat(&old, Some(refused.into()));
+        s.note_relay(&old, Some(refused.into()));
+        s.note_relay_not_used(&old, refused.into());
+        s.note_flow_run(&old, Some(refused.into()));
+        s.note_sealed_flow(&old, Some(refused.into()));
+        s.note_data_node(&old, Err(refused.into()));
+        let mut next = account();
+        next.credential = "flk_the_next_one".into();
+        s.set_account_for_tests(next.clone());
+        assert!(!s.holds(&old) && s.holds(&next));
+        let now = s.status();
+        assert!(now.linked);
+        let said = [&now.heartbeat_error, &now.relay_error, &now.relay_not_used, &now.flow_run_error, &now.sealed_flow_error, &now.data_node_error];
+        assert!(said.iter().all(|s| s.is_none()), "{now:?}");
+
+        // The same of a link replaced with no forget between them.
+        s.note_flow_run(&old, Some(refused.into()));
+        assert_eq!(s.status().flow_run_error, None);
+        // And what is said of the link held is said, whatever else of the account it carries.
+        let mut same = next.clone();
+        same.instance_id = Some("oaiy-minted-since".into());
+        s.note_flow_run(&same, Some("claim refused: HTTP 500".into()));
+        assert_eq!(s.status().flow_run_error.as_deref(), Some("claim refused: HTTP 500"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2971,6 +3088,87 @@ mod tests {
         assert!(!store.unlink().linked);
         server.wait_for(UNLINK_PATH, 1, std::time::Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The browser's part of a ceremony [`start_link`] began: the provider approved, and sends the person back to
+    /// this desktop's loopback with `code` and the ceremony's own `state`. On a thread of its own, as a browser is:
+    /// the loopback answers only once the ceremony's thread has opened the browser and gone to wait for it.
+    fn approve_in_the_browser(authorize_url: &str, code: &'static str) {
+        let params = oauth::parse_query(authorize_url.split_once('?').map(|(_, query)| query).unwrap_or_default());
+        let (redirect, state) = (params["redirect_uri"].clone(), params["state"].clone());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (host, path) = redirect.strip_prefix("http://").and_then(|rest| rest.split_once('/')).unwrap();
+            let mut stream = std::net::TcpStream::connect(host).unwrap();
+            write!(stream, "GET /{path}?code={code}&state={state} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut page = String::new();
+            let _ = stream.read_to_string(&mut page);
+        });
+    }
+
+    #[test]
+    fn a_link_made_over_another_ends_the_other_at_its_provider_and_is_not_kept_waiting_for_it() {
+        // `POST /api/link/start` on a linked desktop replaced the link, and the old link's key went on working at the
+        // provider, its connection listed on the provider's pages, exactly as forgetting a link used to leave it.
+        use testkit::{Provider, Reply};
+        // The provider takes its time to end the old link: it is let go only once the new link has been made.
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let server = Provider::start(move |req| match (req.method.as_str(), req.target.as_str()) {
+            ("POST", "/api/oauth/token") => {
+                Reply::ok(r#"{"formlogic_api_key":"flk_new","desktop_connection_id":"conn-new","device_name":"Reception PC","scope":"flows:read"}"#)
+            }
+            ("DELETE", UNLINK_PATH) => {
+                let _ = held.lock().unwrap().recv_timeout(std::time::Duration::from_secs(30));
+                Reply::ok("{}")
+            }
+            _ => Reply::status(404, "{}"),
+        });
+        let (store, dir) = testkit::linked_to(&server.base, "link-over-another", |_| {});
+        // What a lane said of the old link is not said of the new one.
+        store.inner.lock().unwrap().heartbeat_error = Some("the provider no longer accepts this desktop's key".into());
+
+        start_link(store.clone(), "formlogic", &server.base, |url| approve_in_the_browser(url, "code-1")).unwrap();
+        // Made within the time the old provider is given to answer, and while it has not.
+        let began = Instant::now();
+        while store.status().attempt != LinkPhase::Linked {
+            assert!(
+                began.elapsed() < UNLINK_TIMEOUT - std::time::Duration::from_secs(1),
+                "the new link waited on the old one's end: {:?}",
+                store.status().attempt
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let now = store.status();
+        assert_eq!(store.account().map(|a| a.credential), Some("flk_new".to_string()));
+        assert_eq!(now.heartbeat_error, None, "{now:?}");
+
+        let ended = server.wait_for(UNLINK_PATH, 1, std::time::Duration::from_secs(10));
+        assert_eq!(ended[0].line(), format!("DELETE {UNLINK_PATH}"));
+        assert_eq!(ended[0].header("authorization"), Some("Bearer flk_lane"), "ended with the old link's own key");
+        let_go.send(()).unwrap();
+        std::thread::sleep(NO_REQUEST_WITHIN);
+        assert!(
+            server.requests().iter().all(|r| r.header("authorization") != Some("Bearer flk_new")),
+            "the new link is not ended: {:?}",
+            server.lines()
+        );
+        assert_eq!(store.account().map(|a| a.credential), Some("flk_new".to_string()), "and stays made, whatever the old provider says");
+
+        // A link made where there was none ends nothing.
+        let (fresh, dir2) = testkit::linked_to(&server.base, "link-over-none", |_| {});
+        fresh.drop_account_for_tests();
+        start_link(fresh.clone(), "formlogic", &server.base, |url| approve_in_the_browser(url, "code-2")).unwrap();
+        let began = Instant::now();
+        while fresh.status().attempt != LinkPhase::Linked {
+            assert!(began.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(NO_REQUEST_WITHIN);
+        assert_eq!(server.lines().iter().filter(|l| l.starts_with("DELETE")).count(), 1, "{:?}", server.lines());
+        for dir in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

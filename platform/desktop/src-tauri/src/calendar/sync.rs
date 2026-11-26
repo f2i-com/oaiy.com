@@ -937,12 +937,28 @@ fn list(api: &Api, form: &str, cursor: Option<&str>) -> Result<Option<Pulled>, F
     let mut deleted = deleted_ids(&first);
     let mut n = records.len();
     let mut pages = 1;
+    // A form FormLogic keeps in an app's own table is not paged by `afterId`: it says so
+    // (`response_list_unsupported`) and to page by `offset`, from the same start. Read on by
+    // `afterId` alone, the second page was refused and no appointment past the first was read;
+    // and since such a form never says its deletions are whole, every sync reads it in full.
+    let mut by_offset = false;
+    let by_offset_from = |pages: usize| format!("{path}?updatedSince={}&limit={PAGE}&offset={}", enc(&since), pages * PAGE);
     while n == PAGE && pages < MAX_PAGES {
-        let (at, id) = match records.last() {
-            Some(r) => (r.get("updatedAt").and_then(Value::as_str).unwrap_or("").to_string(), r.get("id").and_then(Value::as_str).unwrap_or("").to_string()),
-            None => break,
+        let next = if by_offset {
+            page(api, &by_offset_from(pages))?
+        } else {
+            let (at, id) = match records.last() {
+                Some(r) => (r.get("updatedAt").and_then(Value::as_str).unwrap_or("").to_string(), r.get("id").and_then(Value::as_str).unwrap_or("").to_string()),
+                None => break,
+            };
+            match page_after(api, &format!("{path}?updatedSince={}&afterId={}&limit={PAGE}", enc(&at), enc(&id)))? {
+                Some(next) => next,
+                None => {
+                    by_offset = true;
+                    page(api, &by_offset_from(pages))?
+                }
+            }
         };
-        let next = page(api, &format!("{path}?updatedSince={}&afterId={}&limit={PAGE}", enc(&at), enc(&id)))?;
         let more = responses(&next);
         n = more.len();
         records.extend(more);
@@ -962,6 +978,18 @@ fn page(api: &Api, path: &str) -> Result<Value, Failure> {
     let reply = api.get(path)?;
     match reply.status {
         200 => Ok(reply.body),
+        404 => Err(Failure::FormGone),
+        s => Err(Failure::Refused(format!("FormLogic would not list the appointments: {}", said(&reply.body, s)))),
+    }
+}
+
+/// [`page`] for a listing paged by `afterId`: None where FormLogic answers that this form is not
+/// paged so (400 `response_list_unsupported`, a form it keeps in an app's own table).
+fn page_after(api: &Api, path: &str) -> Result<Option<Value>, Failure> {
+    let reply = api.get(path)?;
+    match reply.status {
+        200 => Ok(Some(reply.body)),
+        400 if reply.body.get("code").and_then(Value::as_str) == Some("response_list_unsupported") => Ok(None),
         404 => Err(Failure::FormGone),
         s => Err(Failure::Refused(format!("FormLogic would not list the appointments: {}", said(&reply.body, s)))),
     }

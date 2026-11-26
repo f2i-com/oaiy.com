@@ -231,7 +231,7 @@ corpora in a scratch copy of the generators (the repository stays clean), runs t
 | math | an independent recomputation of the pairing arithmetic | equal (300 cases, 95 typed-code variants, 13 SAS entries) |
 | sealed | libsodium's sealed boxes (430) and the crate's (12) | all open, both ways |
 | poll | the reviewer's second implementation of the README, 20,000 cases | 0 disagreements, with the readings the README fixes (a date that does not exist is no date, a `seq` above 2^53 - 1 dropped, `-0` not an integer, no `Retry-After` for a failure the client caused) |
-| admission | the Python port of the shipped decoders, 20,000 damaged copies of the recorded admissions | **1,005 differ, pinned**: the crate is stricter in 485 (the bearer and the scopes, and ICE servers, gateway URLs and the peer thumbprint where the damage is) and looser in 516 and 4 relay advertisements (see the last section) |
+| admission | the Python port of the shipped decoders, 20,000 damaged copies of the recorded admissions | **1,008 differ, pinned**: the crate is stricter in 488 (the bearer and the scopes, and ICE servers, gateway URLs and the peer thumbprint where the damage is) and looser in 516 and 4 relay advertisements (see the last section) |
 | b64 | PHP `B64.php`, a strict Python reference, Node, 1,010,908 inputs | 0 differences |
 | json | PHP `json_decode` and the relay's `Json::decode`, Python, Node, `serde_json`, 200,000 inputs | the general reader accepts exactly what the strict Python reference accepts and writes the same text (0 differences); it is stricter than the others on purpose (a duplicate member, a lone surrogate, more than 64 levels) and reads `1e999` as Python does and `serde_json` does not |
 | text | PHP `Ids.php`, `cleanName`, the typed-code and SAS rules, the schemas' patterns on relay URLs | 0 differences in 120,009 typed codes, 176,543 SAS entries, 144,144 ids and 40,018 names; 16 of 7,564 URLs differ from the schemas' pattern **on purpose** (an empty label, a trailing dot, a label that starts or ends with a hyphen, an over-long host, the default port) |
@@ -323,11 +323,13 @@ module for it), so a wasm build leaves it off. No feature gate was needed in thi
 ## Where the admission differs from the shipped decoders
 
 `MobileAdmission` and `PluginAdmission` follow `aokie_decoders.py` (the Python port of the shipped readers), including that an unusable `relay` advertisement degrades to the WebSocket
-gateway (`relay: None`) instead of failing the admission, and that a phone's `iceServers` may be absent. The differential above (1,005 of 20,000 damaged copies) shows where they
+gateway (`relay: None`) instead of failing the admission, and that a phone's `iceServers` may be absent. The differential above (1,008 of 20,000 damaged copies) shows where they
 differ, in both directions.
 
 **Stricter than the shipped decoders:** the bearer (its claims and their shape) and the scopes (they must be known grants, without a repeat), and, on the damaged copies, members of the
-phone's device record, the shape of an ICE server (a TURN server without a `username` or `credential`), `gatewayUrl` and the peer thumbprint.
+phone's device record, the shape of an ICE server (a TURN server without a `username` or `credential`), `gatewayUrl` and the peer thumbprint. The URL of an ICE server is read as
+`ice-server.schema.json` has it and as the relay writes it: a scheme with something after it and no white space anywhere, where the shipped decoders refuse control characters only
+(3 of the damaged copies: a URL cut down to `turn:` or `turns:`).
 
 **Looser than the shipped decoders** (the crate reads these as the shape of the schema and leaves the rest to the carrier, which has the information to compare):
 

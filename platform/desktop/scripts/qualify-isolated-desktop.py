@@ -23,6 +23,11 @@ import time
 FORBIDDEN = {17872, 17972, 17973}
 DIAGNOSTIC = "isolated dashboard requested plugin inventory"
 REFUSAL = "isolated_capability_unavailable"
+# What the API answers a request that says the dashboard's origin and does not carry the dashboard's token
+# (NAME_ONLY_REFUSAL in src-tauri/src/http.rs). The origin is `http://tauri.localhost`, a name any local web server can
+# serve a page under, so the API believes it only with the token the desktop hands its own window over IPC. This
+# harness is a program, not that window: it has no token, and saying the origin gets it nothing a website would not get.
+WINDOW_TOKEN_REFUSAL = "origin not allowed without the token OAIY gives its own windows"
 
 
 class CheckFailure(Exception):
@@ -106,7 +111,9 @@ def wait_ready(process, root, owners):
         text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
         match = re.search(r"OAIY API listening on http://127\.0\.0\.1:(\d+)\s", text)
         # This happens BEFORE this harness makes its first request to the app.
-        # The Windows dashboard alone uses the diagnostic's http://tauri origin.
+        # The Windows dashboard alone uses the diagnostic's http://tauri origin, and the diagnostic is written only
+        # for a request the API let in: one that carried the dashboard's token with that origin. So this line is also
+        # the evidence that the bundled dashboard was handed its token and sent it.
         if match and DIAGNOSTIC in text:
             port = int(match.group(1))
             owners.verify(process, port)
@@ -118,20 +125,16 @@ def wait_ready(process, root, owners):
 def inspect_instance(owners, process, port, root):
     status, health = request(owners, process, port, "GET", "/api/health")
     require(status == 200 and health.get("product") == "oaiy-desktop", "health_identity_failed")
-    status, config = request(owners, process, port, "GET", "/api/config")
-    require(status == 200, "config_failed")
-    canonical = root.resolve()
-    for key in ["activeDir", "defaultDir", "configuredDir", "modelsActiveDir",
-                "modelsDefaultDir", "modelsConfiguredDir"]:
-        value = config.get(key)
-        if value is not None:
-            require(isinstance(value, str) and Path(value).is_absolute(), "invalid_config_path")
-            require(".." not in Path(value).parts and Path(value).is_relative_to(canonical), "config_path_escaped_root")
-    require(Path(config["activeDir"]) == canonical / "data", "data_root_mismatch")
-    require(Path(config["modelsActiveDir"]) == canonical / "models", "model_root_mismatch")
-    status, plugins = request(owners, process, port, "GET", "/api/plugins")
-    require(status == 200 and plugins.get("plugins") == [], "unexpected_plugin_inventory")
-    require(Path(plugins["root"]) == canonical / "data" / "plugins", "plugin_root_mismatch")
+    # The instance's configuration and its plugins are read by its own window, which holds the window's token. A
+    # program that only says the dashboard's origin (this harness, or a page a local web server serves under that
+    # name) is answered as a website nobody trusts: neither is read. (These two reads used to succeed here, and with
+    # them the harness checked the configured folders and the empty plugin inventory through the API; those are
+    # held by the native tests of `isolated.rs` and by the dashboard's own request, which the diagnostic records.)
+    for route in ["/api/config", "/api/plugins"]:
+        status, body = request(owners, process, port, "GET", route)
+        require(status == 403 and body.get("error") == WINDOW_TOKEN_REFUSAL, "dashboard_origin_alone_not_refused:" + route)
+    for owned in ["config", "data", "models", "webview"]:
+        require((root / owned).is_dir(), "owned_directory_missing")
     marker = json.loads((root / ".oaiy-isolated.json").read_text(encoding="utf-8"))
     require(marker.get("version") == 1 and marker.get("kind") == "oaiy-desktop-isolated", "invalid_root_marker")
     require(re.fullmatch(r"com\.oaiy\.isolated\.[0-9a-f]{48}", marker.get("identifier", "")), "invalid_isolated_identity")
@@ -145,7 +148,7 @@ def inspect_instance(owners, process, port, root):
         require(not os.path.lexists(Path(appdata) / marker["identifier"]), "unexpected_isolated_appdata_directory")
     return {"root": root.name, "pid": process.pid, "port": port,
             "identifier": marker["identifier"], "dashboardReachedApiBeforeHarness": True,
-            "ownedConfigAndPluginRoots": True, "autoloadedPlugins": 0,
+            "dashboardOriginAloneRefused": True, "ownedDirectoriesPresent": True,
             "ownedWebViewProfilePopulated": True,
             "isolatedIdentifierAppDataAbsent": True if appdata else None}
 
@@ -208,13 +211,20 @@ def run(exe, output):
         owners.verify(a, a_port)
         report["checks"].append("different_roots_have_independent_identity_port_and_data")
         phase = "capability_refusals"
+        # Saying the dashboard's origin opens none of these: each is refused before the isolated policy is asked,
+        # for the lack of the window's token.
         for method, route in [("GET", "/api/ai/codex/status"), ("GET", "/api/engines/catalog"),
                 ("POST", "/api/setup/plugins/example/check/foo"), ("POST", "/api/services/example/start"),
                 ("POST", "/api/mcp"), ("POST", "/api/bridge/runs"), ("POST", "/api/update/check")]:
             status, body = request(owners, a, a_port, method, route)
-            require(status == 403 and isinstance(body.get("error"), dict)
-                    and body["error"].get("code") == REFUSAL, "capability_not_refused:" + route)
-            report["checks"].append({"route": route, "status": status, "code": REFUSAL})
+            require(status == 403 and body.get("error") == WINDOW_TOKEN_REFUSAL, "capability_not_refused:" + route)
+            report["checks"].append({"route": route, "status": status, "refusedFor": "window_token"})
+        # The isolated policy itself, on the one of them a program on this computer is let through to on an ordinary
+        # install (starting a service that is already defined, asked with no Origin): here the policy refuses it.
+        status, body = request(owners, a, a_port, "POST", "/api/services/example/start", origin=False)
+        require(status == 403 and isinstance(body.get("error"), dict)
+                and body["error"].get("code") == REFUSAL, "capability_not_refused_by_policy")
+        report["checks"].append({"route": "/api/services/example/start", "status": status, "code": REFUSAL})
         status, body = request(owners, a, a_port, "POST", "/api/plugins/install", origin=False)
         require(status == 403 and isinstance(body.get("error"), str), "origin_auth_not_preserved")
         report["checks"].append("plugin_install_without_origin_refused_by_auth")

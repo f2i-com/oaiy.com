@@ -379,7 +379,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_guard_lets_the_dashboard_check_and_turns_a_stranger_away_and_the_headless_status_needs_no_token() {
-        use crate::http::guarded_for_tests;
+        use crate::http::{own_window_bearer_for_tests, tightened_for_tests as guarded_for_tests};
+        // The desktop's own window's origin on this system, and the Agent's: the form the other system gives them is
+        // nobody's here. On Windows they are names a page on this computer's port 80 has too, so the window sends the
+        // token the desktop handed it (`None` elsewhere: an origin no browser page can send needs none).
+        let (dashboard, agent) = if cfg!(windows) { ("http://tauri.localhost", "http://oaiy.localhost") } else { ("tauri://localhost", "oaiy://localhost") };
+        let token = cfg!(windows).then(|| own_window_bearer_for_tests().trim_start_matches("Bearer "));
         let (address, _) = stub(Serve::Body(feed("0.2.0"))).await;
         let (inner, _) = app_at(&format!("{address}/latest.json"));
         let post = |origin: Option<&str>, bearer: Option<&str>| {
@@ -392,7 +397,10 @@ mod tests {
         let gui = guarded_for_tests(inner.clone(), None, true);
         assert_eq!(gui.clone().oneshot(post(Some("https://evil.example"), None)).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(gui.clone().oneshot(post(None, None)).await.unwrap().status(), StatusCode::FORBIDDEN);
-        assert_eq!(gui.clone().oneshot(post(Some("http://tauri.localhost"), None)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(gui.clone().oneshot(post(Some(dashboard), token)).await.unwrap().status(), StatusCode::OK);
+        if cfg!(windows) {
+            assert_eq!(gui.clone().oneshot(post(Some(dashboard), None)).await.unwrap().status(), StatusCode::FORBIDDEN, "the window's name alone");
+        }
         // The status says whether a call is live: on the desktop a page that is not OAIY's own may not read it.
         let read = |origin: Option<&str>, bearer: Option<&str>| {
             let mut r = Request::builder().method(Method::GET).uri("/api/update/status");
@@ -403,9 +411,13 @@ mod tests {
         for stranger in [Some("https://evil.example"), Some("http://evil.localhost:8080"), None] {
             assert_eq!(gui.clone().oneshot(read(stranger, None)).await.unwrap().status(), StatusCode::FORBIDDEN, "{stranger:?}");
         }
-        for own in ["http://tauri.localhost", "tauri://localhost", "http://oaiy.localhost", "https://oaiy.com"] {
-            assert_eq!(gui.clone().oneshot(read(Some(own), None)).await.unwrap().status(), StatusCode::OK, "{own}");
+        for own in [dashboard, agent] {
+            assert_eq!(gui.clone().oneshot(read(Some(own), token)).await.unwrap().status(), StatusCode::OK, "{own}");
+            if cfg!(windows) {
+                assert_eq!(gui.clone().oneshot(read(Some(own), None)).await.unwrap().status(), StatusCode::FORBIDDEN, "{own}: the name alone");
+            }
         }
+        assert_eq!(gui.clone().oneshot(read(Some("https://oaiy.com"), None)).await.unwrap().status(), StatusCode::OK);
         let with_token = guarded_for_tests(inner.clone(), Some("s3cret".into()), true);
         assert_eq!(with_token.oneshot(read(None, Some("s3cret"))).await.unwrap().status(), StatusCode::OK);
         // The headless server (no gui mode): the check needs the token, the status does not.

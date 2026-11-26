@@ -910,6 +910,69 @@ describe('ConnectionsPanel · Connected apps', () => {
     expect(container.textContent).not.toContain('Nothing is connected');
   });
 
+  it('names a connected app by where it asked from, and what it calls itself after that as its own words', async () => {
+    // The label led in bold with the address after it in grey: an app that called itself "https://formlogic.com" read
+    // as that site in the list a person revokes from, as it had in the request (PairingPrompt.test.tsx).
+    pairedMock.mockResolvedValue({
+      paired: [
+        { id: 't1', product: 'formlogic', label: 'https://formlogic.com', origin: 'https://evil.example', access: 'apps', createdAtMs: 1 },
+        { id: 't2', product: 'formlogic', label: 'https://formlogic.com', origin: 'https://formlogic.com', access: 'apps', createdAtMs: 2 },
+        { id: 't3', product: 'oaiy-app', label: 'OAIY on agent.example', origin: 'https://agent.example', access: 'agent', createdAtMs: 3 },
+        { id: 't4', product: 'oaiy-cli', origin: null, createdAtMs: 4 },
+      ],
+    });
+    await mount();
+    const rows = Array.from(container.querySelectorAll('.pairing-list li'));
+    // (the address first, then the line of what kind it is and what it calls itself)
+    const row = (i: number) => [rows[i].querySelector('.pairing-app > strong')!.textContent, rows[i].querySelector('.pairing-product')!.textContent];
+    expect(rows.every((li) => li.querySelector('.pairing-app')!.children[1].tagName === 'STRONG')).toBe(true);
+    expect(row(0)).toEqual(['https://evil.example', 'App · calls itself “https://formlogic.com” (formlogic)']);
+    // FormLogic gives its own address as its label: said once, as where it asked from.
+    expect(row(1)).toEqual(['https://formlogic.com', 'App · calls itself “formlogic”']);
+    expect(row(2)).toEqual(['https://agent.example', 'Agent · calls itself “OAIY on agent.example” (oaiy-app)']);
+    // A program on this computer has no address.
+    expect(row(3)).toEqual(['a program on this computer', 'App · calls itself “oaiy-cli”']);
+    // Only the address is in bold: nothing the app wrote is.
+    expect(rows.map((li) => Array.from(li.querySelectorAll('b, strong')).map((el) => el.textContent))).toEqual([
+      ['https://evil.example'],
+      ['https://formlogic.com'],
+      ['https://agent.example'],
+      ['a program on this computer'],
+    ]);
+    // Revoking says the same: which page, then its own name for itself.
+    const revoke = rows[0].querySelector('button')!;
+    expect(revoke.getAttribute('aria-label')).toBe('Revoke access for https://evil.example, which calls itself “https://formlogic.com” (formlogic)');
+    await act(async () => {
+      revoke.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    const asked = (globalThis.confirm as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(asked).toContain('Revoke access for https://evil.example, which calls itself “https://formlogic.com” (formlogic)?');
+  });
+
+  it('shows a name kept from before the desktop cleaned labels without the characters a person cannot see', async () => {
+    // The desktop takes these out of a label as a request comes in now; a connection made before it did is kept as it
+    // was written. A direction override made "evil.example for formlogic.com" read backwards; a zero-width space split a
+    // name a person would search for.
+    pairedMock.mockResolvedValue({
+      paired: [
+        { id: 't1', product: 'formlogic', label: 'A\u0000c\u0007m\u001be\r\n\tDental​⁦⁩﻿\u{e0041}', origin: 'https://acme.example', createdAtMs: 1 },
+        { id: 't2', product: 'form‮logic', label: '‮​⁩', origin: 'https://b.example', createdAtMs: 2 },
+        { id: 't3', product: '​', label: '  ', origin: 'https://c.example', createdAtMs: 3 },
+      ],
+    });
+    await mount();
+    const rows = Array.from(container.querySelectorAll('.pairing-list li'));
+    const text = (i: number) => rows[i].querySelector('.pairing-product')!.textContent;
+    expect(text(0)).toBe('App · calls itself “AcmeDental” (formlogic)');
+    // A label with nothing left is no label; a product's name is cleaned the same way.
+    expect(text(1)).toBe('App · calls itself “formlogic”');
+    expect(text(2)).toBe('App · calls itself “app”');
+    for (const li of rows) {
+      expect(li.textContent).not.toMatch(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/);
+      expect(li.querySelector('button')!.getAttribute('aria-label')).not.toMatch(/[\u0000-\u001f​-‏‪-‮⁦-⁩﻿]/);
+    }
+  });
+
   it('keeps the answer to an Approve on screen past the next reading of the list', async () => {
     pendingMock.mockResolvedValue({ pending: [{ pairingId: 'p1', product: 'Acme', code: 'ABCD', label: null, origin: null }] });
     approveMock.mockRejectedValue(new Error('The request expired: ask the app to connect again.'));

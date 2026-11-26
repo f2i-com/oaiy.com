@@ -47,8 +47,13 @@ globalThis.localStorage = {
   setItem: (k, v) => store.set(k, String(v)),
   removeItem: (k) => store.delete(k),
 };
-/** The page the editor runs in: the hosted editor by default. */
-function pageAt(origin, { inOaiy = false } = {}) {
+/** The key OAIY's window gives the flow editor for the Playwright service (`__OAIY_DESKTOP__.browserKey`). */
+const BROWSER_KEY = '5f1c0e9a'.repeat(8);
+
+/** The page the editor runs in: the hosted editor by default. In OAIY's window the desktop gave it its token and, unless
+ * `browserKey` says otherwise, the browser service's key. */
+function pageAt(origin, { inOaiy = false, browserKey = BROWSER_KEY } = {}) {
+  const given = { origin: 'http://127.0.0.1:17972', token: 'tok', ...(browserKey === undefined ? {} : { browserKey }) };
   globalThis.window = {
     setTimeout,
     clearTimeout,
@@ -57,8 +62,10 @@ function pageAt(origin, { inOaiy = false } = {}) {
     addEventListener() {},
     location: { protocol: origin.split(':')[0] + ':', origin },
     __OAIY_WEB_SHIM__: true,
-    ...(inOaiy ? { __OAIY_DESKTOP__: { origin: 'http://127.0.0.1:17972', token: 'tok' } } : {}),
+    ...(inOaiy ? { __OAIY_DESKTOP__: given } : {}),
   };
+  if (inOaiy) globalThis.__OAIY_DESKTOP__ = given;
+  else delete globalThis.__OAIY_DESKTOP__;
 }
 
 const json = (body, status = 200) => ({
@@ -77,9 +84,13 @@ const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
  * nobody listens on yet) or 'http503'.
  */
 function desktop({ status = 'running', startedAt = iso(HOUR), health }) {
-  const seen = { health: 0, ensured: 0 };
-  globalThis.fetch = async (url) => {
+  // (`sent`: the Authorization each request went with, by where it went: the desktop's API or the browser service)
+  const seen = { health: 0, ensured: 0, sent: [] };
+  globalThis.fetch = async (url, init) => {
     const u = String(url);
+    const headers = init?.headers ?? {};
+    const auth = Object.entries(headers).find(([k]) => k.toLowerCase() === 'authorization')?.[1] ?? null;
+    seen.sent.push({ to: u.includes(':17880/') ? 'service' : 'desktop', path: new URL(u).pathname, auth });
     if (u.endsWith('/api/services/ensure-by-port')) {
       seen.ensured++;
       return json({ found: true, started: true, alreadyRunning: false, name: 'svc' });
@@ -218,6 +229,42 @@ for (const origin of ['http://oaiyflows.localhost', 'oaiyflows://localhost']) {
     assert.equal(seen.health, 60);
   });
 }
+
+// ---------------------------------------------------------------------------
+// The key OAIY's window gives the editor for the service
+// ---------------------------------------------------------------------------
+await check("in OAIY's window every request to the service goes with the key the window was given, and none to the desktop's API", async () => {
+  pageAt('http://oaiyflows.localhost', { inOaiy: true });
+  const seen = desktop({ health: () => 'ok' });
+  const methods = methodsFor();
+  const session = await methods.createSessionV2({ mode: 'chromium' });
+  assert.equal(session.id, 's-1');
+  const toService = seen.sent.filter((r) => r.to === 'service');
+  assert.deepEqual(toService.map((r) => r.path), ['/health', '/session']);
+  for (const r of toService) assert.equal(r.auth, `Bearer ${BROWSER_KEY}`, r.path);
+  // The desktop's API is sent the desktop's token, and never the service's key.
+  const toDesktop = seen.sent.filter((r) => r.to === 'desktop');
+  assert.ok(toDesktop.length > 0);
+  for (const r of toDesktop) assert.equal(r.auth, 'Bearer tok', r.path);
+});
+
+await check('outside OAIY\'s window no key goes to the service (the page has none)', async () => {
+  pageAt('https://oaiy.com');
+  const seen = desktop({ health: () => 'ok' });
+  assert.equal((await open()).id, 's-1');
+  const toService = seen.sent.filter((r) => r.to === 'service');
+  assert.ok(toService.length >= 2);
+  for (const r of toService) assert.equal(r.auth, null, r.path);
+});
+
+await check('a key that is not one (empty, too short, with a space or a line break) is not sent', async () => {
+  for (const browserKey of ['', 'short', `${'a'.repeat(20)} b`, `${'a'.repeat(20)}\r\nX-Evil: 1`, 42, null]) {
+    pageAt('http://oaiyflows.localhost', { inOaiy: true, browserKey });
+    const seen = desktop({ health: () => 'ok' });
+    assert.equal((await open()).id, 's-1');
+    for (const r of seen.sent.filter((s) => s.to === 'service')) assert.equal(r.auth, null, `${JSON.stringify(browserKey)}: ${r.path}`);
+  }
+});
 
 await check("the desktop that is not running at all is still the message about starting OAIY Desktop", async () => {
   pageAt('https://oaiy.com');

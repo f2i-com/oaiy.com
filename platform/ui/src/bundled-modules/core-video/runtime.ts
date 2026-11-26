@@ -14,7 +14,7 @@
 import type { RuntimeContext, RuntimeModule } from 'oaiy-core';
 import { isLocalNetworkUrl } from 'oaiy-core/src/runtime/NetworkUtils';
 import type { CustomService } from '../core-service/examples';
-import { runContract } from '../core-service/contractRuntime';
+import { desktopFileHeaders, runContract } from '../core-service/contractRuntime';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
 import { validatePath } from '../core-filesystem/runtime';
 import { applyVideoOverrides, analyzeComfyUIVideoWorkflow } from './comfyui-video-analyzer';
@@ -618,7 +618,8 @@ async function uploadImageToComfyUI(
     ctx.log('info', `[VideoGen] Created blob: size=${blob.size}, type=${blob.type}`);
   } else if (imageData.startsWith('http')) {
     ctx.log('info', `[VideoGen] Fetching image from URL: ${sanitizeUrlForLog(imageData)}`);
-    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI', signal: ctx.abortSignal });
+    // (a picture OAIY's engines made is read from the desktop with its credential: desktopFileHeaders)
+    const response = await ctx.secureFetch(imageData, { purpose: 'Fetch image for ComfyUI', signal: ctx.abortSignal, headers: desktopFileHeaders(imageData, ctx) });
     ctx.log('info', `[VideoGen] Fetch response: status=${response.status}, content-type=${response.headers.get('content-type')}`);
 
     // Get ArrayBuffer and create Blob explicitly to ensure binary data
@@ -1123,7 +1124,7 @@ async function generate(
               node.inputs.image_base64 = imageDataToUpload;
             } else {
               // If it was a URL, we need to fetch and convert
-              const res = await ctx.secureFetch(imageDataToUpload, { purpose: 'Fetch image for base64', signal: ctx.abortSignal });
+              const res = await ctx.secureFetch(imageDataToUpload, { purpose: 'Fetch image for base64', signal: ctx.abortSignal, headers: desktopFileHeaders(imageDataToUpload, ctx) });
               const blob = await res.blob();
               const ab = await blob.arrayBuffer();
               const bytes = new Uint8Array(ab);
@@ -1265,7 +1266,7 @@ async function save(
       }
       blob = new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
     } else if (videoUrl.startsWith('http')) {
-      const response = await ctx.secureFetch(videoUrl, { purpose: 'Download video for save', signal: ctx.abortSignal });
+      const response = await ctx.secureFetch(videoUrl, { purpose: 'Download video for save', signal: ctx.abortSignal, headers: desktopFileHeaders(videoUrl, ctx) });
       if (!response.ok) throw new Error(`Failed to fetch video: ${response.status}`);
       blob = await response.blob();
     } else {
@@ -1509,6 +1510,7 @@ async function appendVideos(
           const resp = await ctx.secureFetch(video, {
             purpose: 'Download video for append',
             signal: ctx.abortSignal,
+            headers: desktopFileHeaders(video, ctx),
           });
           if (!resp.ok) {
             throw new Error(`Failed to fetch video ${sanitizeUrlForLog(video)}: HTTP ${resp.status}`);

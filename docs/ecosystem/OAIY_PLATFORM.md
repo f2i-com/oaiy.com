@@ -71,20 +71,48 @@ Two transports, neither a WebSocket.
 
 - `GET /api/health` → `{status:"ok", product:"oaiy-desktop", companion:"oaiy-desktop",
   protocol:"oaiy-bridge/1", version, apiVersion:1, pluginApiVersion:1}`.
-- Pairing (`bridge/pairing.rs`): `POST /api/bridge/pairing {product, label?, access?}` (open;
-  the Origin is recorded; `product` at most 64 characters, `label` 200) → `201
-  {pairingId:"pair_<32hex>", code:<6 of 23456789ABCDEFGHJKMNPQRSTUVWXYZ>, status:"pending",
-  access}`. `access` is what the client asks for, and the prompt says it: `apps` (the default:
-  run and keep flows and triggers, plugins' commands, start and stop plugins and services, the
-  AI gateway and speech) or `agent` (the OAIY Agent in a browser tab: an app's, and calls,
-  texts, the calendar and contacts, the engines' models and the Agent's control tools). The
-  person approves in the dashboard (`/approve` or `/deny`, from the desktop window only). The
-  client polls `GET /api/bridge/pairing/:id` until `{status:"approved", token:"oaiypat_<64hex>",
-  access}`. Pending requests last 5 minutes, at most 12, at most 3 from one origin (its oldest
-  makes room); an approved one waiting to be collected is never pushed out (a new request is
-  `429 rate_limited` then). Tokens persist in `<data>/pairings.json` (`GET /api/bridge/pairings`
-  with each one's `access` and `lastUsedMs`, `DELETE /api/bridge/pairings/:id`); one unused for
-  90 days is forgotten.
+- Pairing (`bridge/pairing.rs`): `POST /api/bridge/pairing {product, label?, access?}` (open)
+  → `201 {pairingId:"pair_<32hex>", code:<6 of 23456789ABCDEFGHJKMNPQRSTUVWXYZ>,
+  status:"pending", access}`. `access` is what the client asks for, and the prompt says it:
+  `apps` (the default: run and keep flows and triggers, plugins' commands, start and stop
+  plugins and services, the AI gateway and speech) or `agent` (the OAIY Agent in a browser
+  tab: an app's, and calls, texts, the calendar and contacts, the engines' models and the
+  Agent's control tools). The person approves in the dashboard (`/approve` or `/deny`, from
+  the desktop window only). The client polls `GET /api/bridge/pairing/:id` until
+  `{status:"approved", token:"oaiypat_<64hex>", access}`. Tokens persist in
+  `<data>/pairings.json` (`GET /api/bridge/pairings` with each one's `access` and
+  `lastUsedMs`, `DELETE /api/bridge/pairings/:id`); one unused for 90 days is forgotten.
+- What a pairing request must be (`create_pairing` in `bridge/routes.rs`; each refusal is
+  `400 {error:{code:"invalid_request", message}}`):
+  - **Who asks is the request's `Origin`**, the one part of the prompt the asker did not write
+    ("From `<origin>`", then "It calls itself “label” (product)"), and the grant then works
+    from that page alone. No `Origin` is a program on this computer. An `Origin` that is sent
+    must be a page's address as a browser writes one: `scheme://host[:port]`, lower case,
+    nothing after the port. `Origin: null` (a sandboxed frame, a `data:` page, a file opened
+    from the disk) is refused, and so is a header that cannot be read as text or is anything
+    else (a path, a name and password, upper case, a space). A grant kept from before for the
+    origin `null` no longer works from any page (`grant_for`); it is still listed and can be
+    revoked. Refused too is an `Origin` that is the name of one of OAIY's own windows
+    (`http://` or `https://` with `oaiy.localhost`, `oaiyflows.localhost` or
+    `tauri.localhost`): OAIY's windows are handed their token and never pair, so such a
+    request comes from something else that has the name (a page a local web server serves
+    under it), and its prompt would read as OAIY itself asking.
+  - **`product`** is required and is a short name: 1 to 64 of `a-z`, `0-9`, `.`, `_`, `-`
+    (`formlogic`, `oaiy-app`). Anything else is refused: it is shown beside the address, and
+    with a space or a `/` in it could be written to read as an address of its own.
+  - **`label`** is at most 200 characters (longer is refused) and is kept without the
+    characters a person cannot see: controls (a line break among them), zero-width characters
+    and the ones that turn the direction of the text around. What is left is trimmed; a label
+    with nothing left is no label. The dashboard cleans the names of connections made before
+    this the same way as it shows them (`shownName`, `desktop/src/pairingWords.ts`).
+  - **`access`**, when given, is `apps` or `agent`.
+- How many may wait: a pending request lasts 5 minutes; at most 12 wait at once and at most 3
+  from one origin (that origin's oldest makes room for its next). In a full list room is made
+  of a request the person turned down, then of the oldest request of the origin that holds
+  the most (two or more; the asker's own on a tie). Nobody's only request is put out for
+  another's, and an approved one waiting to be collected never is: while there is no such
+  room a new request is `429 {error:{code:"rate_limited", message}}`, for a few minutes at
+  most.
 - What a paired token reaches (`http.rs` `tighten`, in front of `origin_guard`): the routes whose
   scope in the access table (`auth/routes.rs`) its `access` holds, and only from the page it was
   granted to (a program's token, granted with no Origin, from no page). Pairing itself,
@@ -99,6 +127,72 @@ Two transports, neither a WebSocket.
   on a Mac, `http://oaiy.localhost` on Windows): the other system's, and any other subdomain of
   oaiy.com, are refused everything but the open routes. The linked FormLogic origin is trusted
   only for non-privileged calls. Headless mode denies all but the open routes.
+- **A page at one of this computer's loopback addresses is believed only where OAIY serves
+  it, or the person named it** (`http.rs` `tighten`, `LoopbackPages`). An origin of
+  `http://` or `https://` with `localhost`, `127.0.0.1` or `[::1]`, on any port, is a port and
+  no proof of who holds it: whatever program listens there (a development server running a
+  package somebody else wrote, a local wiki or notebook that shows other people's pages)
+  serves its pages under it, to the person's ordinary browser. The old guard took every such
+  page for a trusted one on the broad routes (the restricted reads: calls, contacts, the
+  calendar, runs, events, the configuration, the logs; and the changes that are not
+  privileged, such as starting, stopping and installing a service already defined). A
+  release build believes three kinds alone: the Agent's page on its own port on a Mac and
+  Linux while the desktop holds that port (`http://127.0.0.1:17974`, `agent_http_origin`),
+  the exact origins named in `OAIY_DEV_ORIGINS` (comma-separated, read at start:
+  `OAIY_DEV_ORIGINS=http://localhost:5173,http://localhost:5317`; an entry that is not the
+  origin of a page on this computer is ignored and logged), which get what every loopback
+  page got before (never a privileged route), and the linked provider's origin where it is
+  at such an address. Any other loopback page with no token that is the owner's and none of
+  a paired app's that reaches the route is answered exactly as `https://evil.example` is:
+  the open routes, the public views of `GET /api/services` and `GET /api/bridge/capabilities`,
+  and `403 {"error":"origin not allowed"}` for every change, restricted read and export (a
+  differential test, `legacy_neutrality.rs`, holds every method against every route to
+  that). A paired app on this computer (FormLogic on `http://localhost:8080`) is judged by its
+  token: what its grant reaches, from the origin it was granted to, and nothing more for being
+  on a loopback port. A request with no `Origin` (the CLI, a plugin, a script) is not a page's
+  and is answered as before. A debug build believes every loopback page, as before (its
+  developer's dev servers: the dashboard's on 17973, the flow editor's, the Agent's on 5317).
+- **On Windows OAIY's own windows are believed by their token, not by their origin**
+  (`http.rs` `tighten`, `is_name_only_origin`). WebView2 serves a custom scheme as
+  `http://<scheme>.localhost`, so there the dashboard is `http://tauri.localhost`, the Agent
+  `http://oaiy.localhost` and the flow editor `http://oaiyflows.localhost`: names, which every
+  browser resolves to this computer, so a page served by whatever program listens on its port
+  80 (a development web server) and opened as `http://oaiy.localhost/...` in the person's
+  ordinary browser has exactly that origin (as has the page of any other app built on the same
+  webview kit, for `tauri.localhost`). A request with one of those origins (the `https://`
+  forms too) is OAIY's own window only when it also carries the owner's token
+  (`Authorization: Bearer`): the process's own, which the desktop hands each of its windows
+  and nobody else, or the token configured for the CLI. Without it, and without a paired token
+  that reaches the route from that origin, the request is answered exactly as any website
+  nobody trusts is: the open routes above, `GET /api/services` and `GET
+  /api/bridge/capabilities` in their public views, and `403 {"error":"origin not allowed
+  without the token OAIY gives its own windows"}` for every change, every restricted read and
+  every export. A Mac's and Linux's own pages have custom-scheme origins no browser page can
+  send, and are believed by them as before (a Mac's Agent also by its own port, 17974); so is
+  `https://oaiy.com`. How each window gets the token:
+  - the dashboard asks the desktop's `window_token` command (`src-tauri/src/lib.rs`), which
+    answers the `main` webview alone, and only while it shows the dashboard's own page; the
+    page keeps it in memory and sends it on every request (`desktop/src/windowKey.ts`). In
+    `scoped` and `shadow` the command gives a `desk` credential made for the dashboard
+    instead;
+  - the Agent and the flow editor are given it in `window.__OAIY_DESKTOP__` by a script of
+    their own webview that runs only at the page's own address (`embed.rs` `desktop_script`),
+    and send it on every call but health and the pairing bootstrap. A flow's step sends it
+    only to the desktop's engine routes and to files the engines made (`contractRuntime.ts`
+    `desktopCredential`, `desktopFileHeaders`): a step pointed by hand at any other route of
+    the desktop carries no token, and in OAIY's window on Windows is refused now.
+  It is never in an address, never logged, and never given to a plugin's screen or to the
+  engines' page by the dashboard.
+- **A request that asks for another name is turned away** (`http.rs` `misdirected`): on the
+  desktop in `legacy` mode (`scoped` and `shadow` have the new guard's own `Host` rule,
+  `auth/host.rs`), a request whose `Host` is not `localhost`, `127.0.0.1` or `[::1]` (on any
+  port) or a name given in `OAIY_ALLOWED_HOSTS` (with its port, as given there), or that has
+  no `Host`, is `421 {error:{code:"misdirected_host", message}}` before anything else is
+  looked at. That stops a page on a name rebound to this computer, whose same-origin GET
+  carries no `Origin` and no `Sec-Fetch-Site` and so reads as a program's. `GET` and `HEAD
+  /api/health` are answered under any name (a probe), and a request the Agent's tools make
+  in-process has no `Host` to ask about. A headless server in `legacy` mode is not asked
+  this: it may sit behind a proxy under another name, and it believes its token alone.
 - Reads with this computer's paths in them (`/api/models`, `/api/models/downloads`,
   `/api/models/catalog`, `/api/python`) are for OAIY's own pages, programs (no Origin, no
   `Sec-Fetch-Site`) and token holders, never another web page; `/api/services` answers another
@@ -238,6 +332,40 @@ Two transports, neither a WebSocket.
   Voice, and no install needs a browser service until a flow of its own does): at startup
   the copies OAIY seeded are removed, and edited ones are kept. Those three templates are
   still in `resources/templates`: one copied into `<data>/templates` is a service again.
+- The Playwright browser service (`resources/scripts/playwright_server.py`, port 17880) drives
+  a real browser (any address, `file://` too; script in the page; its cookies). It answers a
+  web page only when its `Origin` is in `OAIY_ALLOWED_ORIGINS`, which OAIY sets to its Agent's
+  and flow editor's windows. On Windows those are `http://oaiy.localhost` and
+  `http://oaiyflows.localhost`, names a web server on this computer's port 80 serves pages
+  under too, so the service believes an allowed origin under `localhost` only with
+  `Authorization: Bearer <OAIY_BROWSER_KEY>`: a key the desktop makes for each run
+  (`services::registry::browser_service_key`), passes to the service and gives the flow
+  editor's window alone (`window.__OAIY_DESKTOP__.browserKey`), which sends it with each
+  request to the service (`core-browser/runtime.ts`). A preflight is answered without it; a
+  custom-scheme origin (a Mac's and Linux's windows) and an origin the person listed in their
+  copy of the template (a dev server's) are believed by the list, as before.
+- The engines' gateway (`oaiy-studio`, port 8080: chat, completions, pictures, video, speech,
+  music, 3D, their job lists and the files they made) answers a web page without an API key
+  when `gateway.cors_origins` lists its origin. Its defaults list names any program on this
+  computer can serve pages under: `http://oaiy.localhost` (the Agent in OAIY's window on
+  Windows), `http://oaiyagent.localhost` (the OAIY Agent app on Windows),
+  `http://localhost:5317` and `http://127.0.0.1:5317` (the Agent served by `npm start`), and on
+  a Mac and Linux `http://127.0.0.1:17974`. In the engines OAIY Desktop starts
+  (`engines.rs`, `oaiy_studio::launch_hosted` and `HostPages`) such a page is answered only
+  with the key the desktop makes for each run (`engines::gateway_key`), or where it is a
+  loopback page the desktop believes (the Agent's own port while it holds it, an origin in
+  `OAIY_DEV_ORIGINS`, any loopback address in a debug build). The Agent in OAIY's window is
+  given it in `window.__OAIY_DESKTOP__.enginesKey`; a page paired with the desktop is told it
+  by `GET /api/engines` (`gatewayKey`, a restricted read); the Agent sends it with every
+  request to the gateway on this computer that carries no API key of its own
+  (`app/src/desktop/enginesKey.ts`). The OAIY Agent app and the Agent on port 5317 that are not
+  paired with the desktop need the gateway's API key (Engines page, typed into the Agent's
+  Settings) to use OAIY Desktop's engines now. A studio run on its own (not by the desktop)
+  answers by its list, as before.
+- A chat or completion asked for whole (no `stream`) is withdrawn from the language model
+  when its caller hangs up before the answer (`api/gateway.rs` `proxy`, through
+  `oaiy_engine::http::fetch_while`): the gateway closes the model's connection, which
+  `oaiy-llm-server` takes as a cancel, as a stream's caller who leaves already did.
 - Downloads (`downloads.rs`): HF blob → resolve, Range resume, SHA-256 from `X-Linked-ETag`;
   a curated catalog (`catalog.rs`). Portable Python and venvs (`python.rs`), a pinned Node for
   the CLI (`node_runtime.rs`).

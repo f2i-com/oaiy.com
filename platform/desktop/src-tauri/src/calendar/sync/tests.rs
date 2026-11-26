@@ -26,6 +26,9 @@ struct Fake {
     form: String,
     /// Answers as a FormLogic from before `updatedSince`, tombstones and etags.
     old_api: bool,
+    /// Answers as FormLogic does for a form it keeps in an app's own table: `afterId` refused
+    /// (400 `response_list_unsupported`), paged by `offset`, its deletions never whole.
+    bound_table: bool,
     revoked: bool,
     clock: DateTime<Utc>,
     counter: u64,
@@ -52,6 +55,7 @@ impl Fake {
         Self {
             form: "F1".into(),
             old_api: false,
+            bound_table: false,
             revoked: false,
             clock: Utc::now().with_nanosecond(0).unwrap(),
             counter: 0,
@@ -171,15 +175,22 @@ impl Fake {
         if let (false, Some(since)) = (self.old_api, arg("updatedSince")) {
             let since = NaiveDateTime::parse_from_str(&since, "%Y-%m-%d %H:%M:%S").unwrap().and_utc();
             let after = arg("afterId");
+            if self.bound_table && after.is_some() {
+                return (400, json!({"error": true, "code": "response_list_unsupported", "message": "This form's records are kept in an app's table, which is not paged by `afterId`. Page what changed with `offset`."}));
+            }
             recs.retain(|r| match &after {
                 Some(a) => r.updated > since || (r.updated == since && r.id > *a),
                 None => r.updated >= since,
             });
             recs.sort_by(|a, b| (a.updated, &a.id).cmp(&(b.updated, &b.id)));
+            if self.bound_table {
+                let offset: usize = arg("offset").and_then(|o| o.parse().ok()).unwrap_or(0);
+                recs = recs.into_iter().skip(offset).collect();
+            }
             recs.truncate(limit);
             let deleted: Vec<Value> = self.tombstones.iter().filter(|(_, t)| *t >= since).map(|(id, t)| json!({"id": id, "deletedAt": fmt(*t)})).collect();
             let deleted_since = self.deleted_since_override.as_deref().unwrap_or(EPOCH);
-            return (200, json!({"responses": recs.iter().map(|r| self.json(r)).collect::<Vec<_>>(), "deleted": deleted, "deletedSince": deleted_since, "deletedComplete": true, "serverTime": fmt(self.clock)}));
+            return (200, json!({"responses": recs.iter().map(|r| self.json(r)).collect::<Vec<_>>(), "deleted": deleted, "deletedSince": deleted_since, "deletedComplete": !self.bound_table, "serverTime": fmt(self.clock)}));
         }
         // Newest first, by offset, as FormLogic lists without updatedSince.
         recs.sort_by(|a, b| b.born.cmp(&a.born));
@@ -781,6 +792,28 @@ fn after_the_first_sync_only_what_changed_is_read() {
     assert!(lists[0].contains("1970-01-01"), "{}", lists[0]);
     assert!(!lists[1].contains("1970-01-01"), "the second asks from the first: {}", lists[1]);
     assert_eq!(f.count("GET /api/v1/forms/F1/responses/"), 0, "and looks nothing up one by one");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_form_kept_in_an_apps_table_is_read_page_by_page_by_offset() {
+    // FormLogic refuses `afterId` for such a form and says to page by `offset`, and it never says its
+    // deletions are whole, so every sync reads it in full. Paged by `afterId` alone, the second page was
+    // refused and no appointment past the first page was ever read.
+    let (cal, dir) = calendar();
+    let (fake, base) = formlogic();
+    {
+        let mut f = fake.lock().unwrap();
+        f.bound_table = true;
+        for i in 0..(2 * PAGE + 3) {
+            f.add(formlogic_answers("Cut", "2026-10-02", "09:00", &format!("P{i}")));
+        }
+    }
+    let out = run(&cal, &base).unwrap();
+    assert_eq!(out.pulled, 2 * PAGE + 3);
+    assert_eq!(cal.list(None, None).len(), 2 * PAGE + 3);
+    let f = fake.lock().unwrap();
+    assert!(f.log.iter().any(|l| l.contains(&format!("&offset={}", 2 * PAGE))), "read on by offset from the same start");
     let _ = std::fs::remove_dir_all(dir);
 }
 
