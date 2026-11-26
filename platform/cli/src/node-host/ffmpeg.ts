@@ -1134,15 +1134,31 @@ export function buildRunCommandArgs(command: 'ffmpeg' | 'ffprobe', rawArgs: unkn
       continue;
     }
     // command === 'ffmpeg'
+    // An output path as ffmpeg is given it: stdout `-` and the platform's null sink as they
+    // are, anything else resolved and confined (relative, symlinked, `..`, a protocol).
+    const confinedOutput = (tok: string): string => {
+      const isNullSink =
+        tok === '-' ||
+        (process.platform !== 'win32' && tok === '/dev/null') ||
+        (process.platform === 'win32' && /^nul$/i.test(tok));
+      return isNullSink ? tok : confinePositionalOutput(resolveArg(tok));
+    };
+    if (rawTok === '--') {
+      // ffmpeg reads the ONE argument after `--` as an output file whatever it begins with
+      // (cmdutils' split_commandline). Left to the flag rules below, a name beginning with `-`
+      // was no positional and no known flag, went through unread, and ffmpeg wrote it wherever
+      // it pointed: `-- -a/../../../outside` left the sandbox. It is confined as any output is.
+      const outTok = raw[i + 1];
+      if (outTok === undefined) continue; // (a last `--` names nothing)
+      guarded.push('-protocol_whitelist', 'file,pipe', '--', confinedOutput(outTok));
+      outputWhitelistPending = false;
+      i++;
+      continue;
+    }
     if (rawTok === '-' || !rawTok.startsWith('-')) {
       // Positional output path (including stdout `-` and platform null sink):
       // enforce output protocol whitelist and confine relative/symlinked outputs.
-      const isNullSink =
-        rawTok === '-' ||
-        (process.platform !== 'win32' && rawTok === '/dev/null') ||
-        (process.platform === 'win32' && /^nul$/i.test(rawTok));
-      const outArg = isNullSink ? rawTok : confinePositionalOutput(resolveArg(rawTok));
-      guarded.push('-protocol_whitelist', 'file,pipe', outArg);
+      guarded.push('-protocol_whitelist', 'file,pipe', confinedOutput(rawTok));
       outputWhitelistPending = false;
       continue;
     }

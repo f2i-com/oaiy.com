@@ -91,7 +91,9 @@ A lost first key is re-armed, never re-issued over the network: create `INSTALL_
   relay to a name its folders do not have (an alias, a rewrite) is asked with `--probe-url=` followed by the address and path
   where the relay folder is served. An address that cannot be reached is
   never a silent pass: the installer says the exposure of `data/` was **not checked** and to run the doctor once the site is up.
-  `--no-probe` (and the web form's "do not ask" box) skips the probe on purpose, and says so. It refuses a second run.
+  `--no-probe` (and the web form's "do not ask" box) skips the probe on purpose, and says so. It refuses a second run, and
+  one that arrives while another is still at work (the web form sent twice): an install or a re-key holds
+  `data/install.claim` under a lock until it ends, and the second changes nothing.
 - The web installer works only while `INSTALL_ENABLED` exists and the relay is not installed; a wrong or missing token is a
   bare 403 after a 250 ms delay; every other request is a bare 404.
 - The call-features question (default **no**) is asked on a terminal, or set with `--call-features=yes|no`, or by the checkbox
@@ -264,7 +266,7 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `apps` | unset (any) | The app ids this relay issues admissions for (a list); another is `403` |
 | `compat.sse` | `auto` | `auto`/`on`: offer the framed stream only after the calibration proved the host flushes; `force`: offer it regardless; `off`: never |
 | `turn.urls`, `turn.secret`, `turn.ttl`, `turn.relay_only` | none, none, 600, false | The TURN server of your coturn (`turn:` and `turns:` urls, at most 8), its `static-auth-secret` (32 to 4,096 bytes, not a placeholder), the credential lifetime (60 to 3,600 s) and whether every route must use TURN |
-| `stun.urls` | none | STUN urls (`stun:`, `stuns:`, at most 8) |
+| `stun.urls` | none | STUN urls (`stun:`, `stuns:`, at most 8). In both lists the scheme is written in lower case: the urls go into every admission as they are, and the decoders know a TURN entry by `turn:` |
 | `limits.sigItems`, `limits.sigSenderShare` | 1024, 0.25 | Frames in one Aokie party mailbox (at most 1,024), and the share of a mailbox and of `limits.mailboxBytes` one phone may use in the plugin's |
 | `token_pepper` | none | Optional HMAC pepper (16 characters or more) for token hashes; set it before issuing tokens |
 | `wake.mode`, `wake.safety_ms` | `file`, 2000 | `file` (shard files, with a database fetch every `safety_ms`) or `db` (poll the database) |

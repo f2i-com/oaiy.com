@@ -1875,8 +1875,7 @@ async fn poll_events(
     State(st): State<BridgeState>,
     axum::extract::Query(q): axum::extract::Query<EventsQuery>,
 ) -> axum::response::Response {
-    let events = st.host.events_since(q.since, q.limit.unwrap_or(100).min(500));
-    let next = events.last().map(|e| e.seq).unwrap_or(q.since);
+    let (events, next) = st.host.events_page(q.since, q.limit.unwrap_or(100).min(500));
     (StatusCode::OK, Json(json!({ "events": events, "next": next }))).into_response()
 }
 
@@ -1951,7 +1950,7 @@ async fn create_pairing(
     headers: axum::http::HeaderMap,
     Json(body): Json<PairingRequestBody>,
 ) -> axum::response::Response {
-    use super::pairing::{PairingAccess, MAX_LABEL_CHARS, MAX_PRODUCT_CHARS};
+    use super::pairing::{asking_origin, is_product_name, shown_label, PairingAccess, MAX_LABEL_CHARS, MAX_PRODUCT_CHARS};
     if body.product.trim().is_empty() {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "product is required".into());
     }
@@ -1959,9 +1958,14 @@ async fn create_pairing(
     if body.product.chars().count() > MAX_PRODUCT_CHARS {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("product is longer than {MAX_PRODUCT_CHARS} characters"));
     }
+    // (the asker's own word, shown beside the address it really asks from: a short name cannot be written to read as an address)
+    if !is_product_name(&body.product) {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "product is a short name: lower-case letters, digits, '.', '_' and '-'".into());
+    }
     if body.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_CHARS) {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("label is longer than {MAX_LABEL_CHARS} characters"));
     }
+    let label = shown_label(body.label);
     let access = match body.access.as_deref() {
         None => PairingAccess::Apps,
         Some(name) => match PairingAccess::by_name(name) {
@@ -1969,12 +1973,18 @@ async fn create_pairing(
             None => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", format!("access {name:?} is not apps or agent")),
         },
     };
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|o| o.to_str().ok())
-        .map(str::to_string);
+    // A program on this computer sends no Origin and is asked about as one. A request that does send one names the
+    // page that asks, or is refused: `null` (a sandboxed frame, a file) and a header that is no page's address name none.
+    let origin = match headers.get(axum::http::header::ORIGIN) {
+        None => Ok(None),
+        Some(sent) => sent.to_str().map_err(|_| "the Origin of the request is not a page's address").and_then(|sent| asking_origin(Some(sent))),
+    };
+    let origin = match origin {
+        Ok(origin) => origin,
+        Err(why) => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", why.into()),
+    };
     match st.pairing.lock() {
-        Ok(mut mgr) => match mgr.request_for(&body.product, body.label, origin, access) {
+        Ok(mut mgr) => match mgr.request_for(&body.product, label, origin, access) {
             Ok(req) => (
                 StatusCode::CREATED,
                 Json(json!({ "pairingId": req.pairing_id, "code": req.code, "status": req.status, "access": req.access })),
@@ -3452,6 +3462,71 @@ done
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(st.ledger.lock().unwrap().get(&run_id).unwrap().status, RunStatus::Succeeded);
+        }
+    }
+
+    mod raising_a_pairing_request {
+        use super::super::*;
+        use super::trusting_a_plugin::release_state;
+        use crate::plugins::trust::Publishers;
+        use serde_json::Value;
+
+        /// `POST /api/bridge/pairing` with this body, from `origin` (none: a program on this computer).
+        async fn raise(st: &BridgeState, origin: Option<&[u8]>, body: Value) -> (StatusCode, Value) {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(origin) = origin {
+                headers.insert(axum::http::header::ORIGIN, axum::http::HeaderValue::from_bytes(origin).unwrap());
+            }
+            let response = create_pairing(State(st.clone()), headers, Json(serde_json::from_value(body).unwrap())).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        #[tokio::test]
+        async fn a_request_is_shown_with_the_page_that_really_asks_and_a_page_with_no_address_cannot_ask() {
+            let (_sb, st) = release_state("pairing-origin", Publishers::default());
+            // What FormLogic sends: its product's name, and its own address as the label, from that address.
+            let (status, body) = raise(&st, Some(b"https://formlogic.com"), json!({ "product": "formlogic", "label": "https://formlogic.com" })).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            // The Agent in a browser tab, and a program on this computer (no Origin: asked about as one).
+            assert_eq!(raise(&st, Some(b"http://localhost:5173"), json!({ "product": "oaiy-app", "label": "OAIY Agent", "access": "agent" })).await.0, StatusCode::CREATED);
+            assert_eq!(raise(&st, None, json!({ "product": "oaiy-cli" })).await.0, StatusCode::CREATED);
+            let pending = st.pairing.lock().unwrap().pending();
+            let origins: Vec<Option<&str>> = pending.iter().map(|r| r.origin.as_deref()).collect();
+            assert_eq!(origins, [Some("https://formlogic.com"), Some("http://localhost:5173"), None]);
+
+            // A sandboxed frame, a data: page, a file from the disk: "null" is every one of them, so a grant to it
+            // would be a grant to all of them, and the prompt would say "null" asks.
+            let (status, body) = raise(&st, Some(b"null"), json!({ "product": "formlogic" })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_request");
+            // Not a page's address and nothing more: it is what the prompt shows as who asks.
+            for origin in [&b"https://formlogic.com/"[..], b"https://formlogic.com evil.example", b"formlogic.com", b"", b"https://formlogic.com\xff", "https://formlogic.com\u{202e}".as_bytes()] {
+                assert_eq!(raise(&st, Some(origin), json!({ "product": "formlogic" })).await.0, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(origin));
+            }
+            assert_eq!(st.pairing.lock().unwrap().pending().len(), 3, "a refused request raises no prompt");
+        }
+
+        #[tokio::test]
+        async fn what_the_asker_calls_itself_cannot_be_written_to_read_as_an_address() {
+            let (_sb, st) = release_state("pairing-words", Publishers::default());
+            let from = Some(&b"https://evil.example"[..]);
+            // Shown in bold before the address on the same line, this read as "formlogic · https://formlogic.com".
+            for product in ["formlogic · https://formlogic.com", "https://formlogic.com", "FormLogic", "form logic", "formlogic\u{202e}", ""] {
+                let (status, body) = raise(&st, from, json!({ "product": product })).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{product:?}: {body}");
+            }
+            assert!(st.pairing.lock().unwrap().pending().is_empty());
+            // A label keeps its words and loses what a person cannot see: one that turned its own text around read as
+            // another address.
+            let (status, _) = raise(&st, from, json!({ "product": "evil", "label": "Acme\u{202e}moc.cigolmrof//:sptth\u{200b}\r\n" })).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(raise(&st, from, json!({ "product": "evil", "label": "\u{202e}\u{200b}" })).await.0, StatusCode::CREATED);
+            let pending = st.pairing.lock().unwrap().pending();
+            assert_eq!(pending[0].label.as_deref(), Some("Acmemoc.cigolmrof//:sptth"));
+            assert_eq!(pending[1].label, None, "a label of nothing a person can see is no label");
+            assert!(pending.iter().all(|r| r.origin.as_deref() == Some("https://evil.example")));
         }
     }
 }

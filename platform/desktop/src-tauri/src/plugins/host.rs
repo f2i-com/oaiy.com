@@ -1348,6 +1348,22 @@ impl PluginHost {
         }
     }
 
+    /// One poll of the events: those after `since`, and the position to ask from next.
+    ///
+    /// The sequence starts again with each start of this app, so a position past the newest number this process has
+    /// given out was learned from an earlier one. Taken as it was sent, that poller would be answered nothing until
+    /// this process had kept more events than the last one ever did, and a paired page that never noticed the
+    /// restart (its call screen, the bindings it runs) would go quiet for as long. Such a position is read as 0:
+    /// everything in the ring happened since this process began, so all of it is new to that poller, and the
+    /// position answered is this process's own. A poller that is simply up to date is answered nothing and the
+    /// position it sent, as before.
+    pub fn events_page(&self, since: u64, limit: usize) -> (Vec<ReceivedEvent>, u64) {
+        let since = if since > self.events.seq.load(Ordering::Relaxed) { 0 } else { since };
+        let events = self.events_since(since, limit);
+        let next = events.last().map(|e| e.seq).unwrap_or(since);
+        (events, next)
+    }
+
     // --- internals ---------------------------------------------------------
 
     /// Send one kept event to the linked account: its flows, then its apps'
@@ -1429,6 +1445,11 @@ impl PluginHost {
                 return Delivery::Later(format!("the account's flow triggers could not be read: {e}"));
             }
         };
+        let bindings = match self.bindings_of_the_app_that_takes(&link, &account, &event.name, envelope, bindings) {
+            Ok(b) => b,
+            // Not "every app's": the event waits until it is known whose it is.
+            Err(e) => return Delivery::Later(format!("which of the account's apps this event is for could not be read: {e}")),
+        };
         // The envelope, not the internal event: conditions are authored against
         // `event.data.*` as it appears on the wire. Nothing is locked here
         // either — this lane never held the ledger — so the batch simply runs.
@@ -1484,6 +1505,61 @@ impl PluginHost {
             (None, false) => crate::link::outbox::Delivery::Refused(refused.join("; ")),
             (None, true) => crate::link::outbox::Delivery::Done,
         }
+    }
+
+    /// The account's bindings, without those this event would fire for an app
+    /// it is not for.
+    ///
+    /// The provider gives a source's events to ONE of the account's apps
+    /// (`app_logic::Route`), and with two apps built on the same plugin a call
+    /// started the flows of both. Asked only when bindings of two apps or more
+    /// wait on this event, so an account with one app does not read its apps
+    /// before its flows are started, and is not made to wait on them. Where
+    /// the provider names no such rule the bindings are left as they are.
+    ///
+    /// Err when two apps' bindings wait and the apps cannot be read: started
+    /// for both, the event would be given to two apps while the app-logic lane,
+    /// which cannot go on without the apps either, keeps it for another try.
+    /// So nothing is started, and that try starts them (a run is reserved
+    /// under the event's own key, so trying again is harmless).
+    fn bindings_of_the_app_that_takes(
+        &self,
+        link: &crate::link::LinkHandle,
+        account: &crate::link::LinkedAccount,
+        event_name: &str,
+        envelope: &Value,
+        bindings: Vec<crate::link::flows::Binding>,
+    ) -> Result<Vec<crate::link::flows::Binding>, String> {
+        let apps_waiting = {
+            let mut owners: Vec<&str> = bindings.iter().filter(|b| b.event == event_name).filter_map(|b| b.app_id.as_deref()).collect();
+            owners.sort_unstable();
+            owners.dedup();
+            owners.len()
+        };
+        if apps_waiting < 2 {
+            return Ok(bindings);
+        }
+        let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
+            .and_then(|d| d.app_logic)
+            .filter(|spec| spec.routing.is_some())
+        else {
+            return Ok(bindings);
+        };
+        let apps = self.app_logic.load(account, &spec)?;
+        // The same source the app-logic lane reads, so the two lanes give one event to one app.
+        let source = envelope.get("source").and_then(Value::as_str).unwrap_or("");
+        let route = crate::link::app_logic::route(&spec, &apps, source);
+        let (kept, held) = crate::link::flows::without_held_back(bindings, event_name, |app| route.holds_back(app));
+        match route.unchosen() {
+            // Once for the event: the same words the app-logic lane says of it.
+            Some(why) if !held.is_empty() => log::warn!("{} flow binding(s) did not fire for {event_name}: {why}", held.len()),
+            _ => {
+                for binding in &held {
+                    log::info!("flow binding {} did not fire for {event_name}: events from {source:?} go to another of the account's apps", binding.id);
+                }
+            }
+        }
+        Ok(kept)
     }
 
     /// Run the linked account's app LOGIC SCRIPTS against this event.
@@ -3577,6 +3653,34 @@ mod tests {
         assert!(host.events_since(0, 10).is_empty());
     }
 
+    /// A page paired before this app was restarted polls on with the position the last process gave it. Echoed
+    /// back, it was answered nothing until this process had kept more events than that one ever did.
+    #[test]
+    fn a_position_from_before_a_restart_is_read_as_the_start_of_this_process() {
+        let (_sb, host) = host_with("events-restart", vec![]);
+        let seqs = |events: &[ReceivedEvent]| events.iter().map(|e| e.seq).collect::<Vec<_>>();
+        // Nothing kept yet: the position answered is this process's own, so the next poll asks from it.
+        let (events, next) = host.events_page(300, 500);
+        assert!(events.is_empty());
+        assert_eq!(next, 0, "the last process's position is not handed back");
+
+        for key in ["evt-1", "evt-2"] {
+            host.note_received(json!({ "name": "aokie.call.incoming", "idempotencyKey": key }), vec![]);
+        }
+        let (events, next) = host.events_page(300, 500);
+        assert_eq!(seqs(&events), [1, 2], "everything kept since the restart is new to that poller");
+        assert_eq!(next, 2);
+
+        // A poller that is up to date is answered nothing and the position it sent; one part-way, the rest.
+        let (events, next) = host.events_page(2, 500);
+        assert!(events.is_empty());
+        assert_eq!(next, 2);
+        let (events, next) = host.events_page(1, 500);
+        assert_eq!((seqs(&events), next), (vec![2], 2));
+        let (events, next) = host.events_page(0, 1);
+        assert_eq!((seqs(&events), next), (vec![1], 1), "a page is still the oldest first");
+    }
+
     /// What a run's end says: its state as the event's name, the run as its data and origin.
     #[test]
     fn a_runs_outcome_names_the_run_as_its_origin() {
@@ -4443,6 +4547,79 @@ sleep 300
         assert_eq!(runs[0]["bindingId"], "b1");
         assert!(runs[0]["idempotencyKey"].as_str().unwrap().contains("evt-9"), "keyed by the event, so a retry is harmless");
         assert!(outbox.status().last_error.is_none());
+    }
+
+    /// What the flows lane reserved at a stand-in FormLogic for one `aokie.call.ended` from the plugin `aokie`: an
+    /// account with two apps built on that plugin (`app-old`, `app-new`), each with a flow bound to the event, and a
+    /// flow of the account's own. `assignments` is what the account has chosen (none: that list cannot be read); what
+    /// the lane answered and the requests made are handed back too.
+    fn flows_reserved_for_a_call(tag: &str, assignments: Option<Value>) -> (crate::link::outbox::Delivery, Vec<String>, Vec<String>) {
+        use crate::link::testkit::{Provider, Reply};
+        let app = |id: &str| json!({
+            "app": { "id": id },
+            "customLogic": { "scripts": [{ "id": "s", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }] },
+            "forms": [],
+            "connectors": ["aokie"],
+        });
+        let apps = json!({ "apps": [app("app-old"), app("app-new")] }).to_string();
+        let assignments = assignments.map(|chosen| json!({ "assignments": chosen, "candidates": {}, "desktops": [] }).to_string());
+        let server = Provider::start(move |req| match req.line().as_str() {
+            "GET /api/v1/flow-bindings" => Reply::ok(
+                &json!({ "bindings": [
+                    { "id": "b-old", "appId": "app-old", "event": "aokie.call.ended", "flow": "summary", "enabled": true },
+                    { "id": "b-new", "appId": "app-new", "event": "aokie.call.ended", "flow": "summary", "enabled": true },
+                    { "id": "b-own", "appId": null, "event": "aokie.call.ended", "flow": "summary", "enabled": true },
+                ] })
+                .to_string(),
+            ),
+            "GET /api/v1/app-logic" => Reply::ok(&apps),
+            "GET /api/v1/connector-assignments" => match &assignments {
+                Some(list) => Reply::ok(list),
+                None => Reply::status(503, r#"{"message":"busy"}"#),
+            },
+            "POST /api/v1/flow-runs" => Reply::ok(r#"{"created":true,"run":{"runId":"run-1"}}"#),
+            _ => Reply::status(404, "{}"),
+        });
+        let (_sb, host) = host_with(tag, vec![]);
+        // No prelude to read, so the lane asks the stand-in for nothing but its own lists.
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| d.script_profile = None);
+        *host.link.lock().unwrap() = Some(store);
+        let envelope = json!({ "name": "aokie.call.ended", "source": "aokie", "idempotencyKey": "evt-1", "correlationId": "call-1", "data": {} });
+        let event = Event {
+            name: "aokie.call.ended".into(),
+            source: "aokie".into(),
+            correlation_id: "call-1".into(),
+            idempotency_key: "evt-1".into(),
+            data: json!({}),
+            origin_run: None,
+        };
+        let delivered = host.fan_out_to_linked_flows(&event, &envelope);
+        let reserved = server
+            .requests()
+            .iter()
+            .filter(|r| r.line() == "POST /api/v1/flow-runs")
+            .map(|r| serde_json::from_str::<Value>(&r.body).unwrap()["bindingId"].as_str().unwrap().to_string())
+            .collect();
+        let _ = std::fs::remove_dir_all(dir);
+        (delivered, reserved, server.lines())
+    }
+
+    #[test]
+    fn a_call_starts_the_flows_of_the_app_its_plugin_is_assigned_to_and_not_those_of_the_other() {
+        use crate::link::outbox::Delivery;
+        // Two apps built from one pack both carry a flow for the call. Both were started, so the caller was
+        // texted twice and two receptionists were configured for one call.
+        let (delivered, reserved, asked) = flows_reserved_for_a_call("routed-flows", Some(json!([{ "connectorId": "aokie", "appId": "app-new" }])));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-new".to_string(), "b-own".to_string()]), "{asked:?}");
+
+        // No app chosen: neither app's flow is started, and the account's own still is.
+        let (delivered, reserved, asked) = flows_reserved_for_a_call("unrouted-flows", Some(json!([])));
+        assert_eq!((delivered, reserved), (Delivery::Done, vec!["b-own".to_string()]), "{asked:?}");
+
+        // Whose it is cannot be read: nothing is started for anybody, and the event is kept for another try.
+        let (delivered, reserved, asked) = flows_reserved_for_a_call("unread-flows", None);
+        assert!(matches!(&delivered, Delivery::Later(why) if why.contains("HTTP 503")), "{delivered:?}");
+        assert!(reserved.is_empty(), "{asked:?}");
     }
 
     #[test]

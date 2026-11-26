@@ -87,8 +87,17 @@ test('9.1 contract: every response shape the relay produces validates against th
         file_put_contents($dir . '/20.' . bin2hex(random_bytes(6)), '');
     }
     $addRes('poll-response', $go($ph, 'GET', '/v1/poll', null, ['wait' => '3']), 'poll with a refused hold');
-    // A result and a ring, the two lanes with rules.
-    $addRes('post-response', $go($desk, 'POST', '/v1/items', ['items' => [['to' => $prov->inbox(), 'lane' => 'res', 'id' => 'res-c1', 'hdr' => ['re' => 'c1'], 'body' => 'r']]]), 'post: a result');
+    // A result and a ring, the two lanes with rules. The result goes to the provider's inbox (dev: and its prov- id): the request
+    // and the relay's answer about the item are held to the schemas as a command's are, which once refused that address.
+    $resDoc = ['items' => [['to' => $prov->inbox(), 'lane' => 'res', 'id' => 'res-c1', 'hdr' => ['re' => 'c1'], 'body' => 'r']]];
+    eq('dev:' . $prov->id, $prov->inbox());
+    $add('post-request', $resDoc, 'post request: a result to the provider that sent the command');
+    $resPost = $go($desk, 'POST', '/v1/items', $resDoc);
+    eq('queued', $resPost['json']['results'][0]['status'], $resPost['body']);
+    $addRes('post-response', $resPost, 'post: a result');
+    $resState = $go($desk, 'GET', '/v1/items/res-c1', null, ['to' => $prov->inbox(), 'lane' => 'res']);
+    eq(200, $resState['status'], $resState['body']);
+    $addRes('item-state', $resState, 'item state of a result in a provider\'s inbox');
     $ringBody = '{"aokieClass":"informational","schemaVersion":"1","eventId":"e","title":"t","body":"b","expiresAt":"1790000100"}';
     $ring = $go($desk, 'POST', '/v1/items', ['items' => [['to' => $ph->inbox(), 'lane' => 'ring', 'id' => 'r1', 'hdr' => ['sig' => B64::enc(random_bytes(64))], 'body' => $ringBody]]]);
     $addRes('post-response', $ring, 'post: a ring with a bad signature');

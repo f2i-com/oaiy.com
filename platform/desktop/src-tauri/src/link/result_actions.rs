@@ -576,6 +576,17 @@ fn action_key(run_key: &str, index: usize) -> String {
     format!("{run_key}:action{}", index + 1)
 }
 
+/// A write's key as a provider takes one in a body: kept to 128 characters, as providers
+/// cap keys (FormLogic reads a longer one as none at all), and the same for the same key.
+fn body_key(key: &str) -> String {
+    if key.len() <= 128 {
+        return key.to_string();
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    format!("action:{}", digest.iter().take(24).map(|b| format!("{b:02x}")).collect::<String>())
+}
+
 fn planned_name(action: &Planned, index: usize) -> String {
     let what = match action {
         Planned::Skipped => "action",
@@ -631,6 +642,12 @@ impl Perform for Live<'_> {
         // node doing it: the write names the run, or nothing can end the chain.
         if let Some(run) = &self.spec.fields.run {
             body[run] = json!(self.run_id);
+        }
+        // Where the provider reads the key from the body, it goes there as well as in the
+        // header: FormLogic reads `idempotencyKey` and no header, so the header alone made
+        // a write sent again a second record.
+        if let Some(field) = &self.spec.fields.write_key {
+            body[field] = json!(body_key(idempotency_key));
         }
         let resp = Self::client()?
             .post(&url)
@@ -744,8 +761,16 @@ mod tests {
 
         let seen = server.requests();
         let bodies: Vec<Value> = seen.iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
-        assert_eq!(bodies[0], serde_json::json!({ "answers": record, "flowRunId": "run-7f3a" }));
+        // The write also carries its key in the body, where FormLogic reads it (it reads no
+        // header): the same action sent again is then the record it made, not a second one.
+        assert_eq!(bodies[0], serde_json::json!({ "answers": record, "flowRunId": "run-7f3a", "idempotencyKey": "k1" }));
         assert_eq!(bodies[1], serde_json::json!({ "answers": record }));
+        assert_eq!(seen[0].headers.get("idempotency-key").map(String::as_str), Some("k1"));
+        // A key longer than a provider takes is fitted, the same way each time.
+        let long = format!("flow:{}:action1", "x".repeat(200));
+        let fitted = body_key(&long);
+        assert!(fitted.len() <= 128 && fitted == body_key(&long) && fitted != body_key(&format!("{long}2")), "{fitted}");
+        assert_eq!(body_key("k1"), "k1");
     }
 
     #[test]
@@ -1162,7 +1187,7 @@ mod tests {
         };
         let errors = perform_all(&s, &sel, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
         assert_eq!(spy.done.borrow().len(), 4, "every action still ran");
-        // (a record written or updated goes under its run's and its place's key too: a requeued run writes it once)
+        // (a record written or updated goes under its run's and its place's key too: the same action sent again writes it once)
         assert!(spy.record_keys.borrow().iter().all(|k| k.starts_with("flow:b1:call_x:ended:v1:action")), "{:?}", spy.record_keys.borrow());
         assert!(!spy.record_keys.borrow().is_empty());
         assert_eq!(errors.len(), 1);

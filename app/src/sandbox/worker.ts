@@ -129,12 +129,14 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   await glue.default({ module_or_path: message.module });
   const request = message.request;
   // OAIY's Python additions (standard modules, stdin, the working folder), before any Python engine exists.
-  let packageError: string | undefined;
+  let packageNote: string | undefined;
   if (request.lang === 'python' && glue.addPythonPackage && glue.pythonPackages) {
     try {
-      await installPythonPackage({ addPythonPackage: glue.addPythonPackage, pythonPackages: glue.pythonPackages });
+      const refusal = await installPythonPackage({ addPythonPackage: glue.addPythonPackage, pythonPackages: glue.pythonPackages });
+      // stdin and the working folder went in without the standard modules: said here, or a missing `csv` has no explanation.
+      if (refusal) packageNote = `OAIY's Python modules could not load: ${refusal}`;
     } catch (error) {
-      packageError = errorText(error);
+      packageNote = `OAIY's Python additions could not load: ${errorText(error)}`;
     }
   }
   const engine = new glue.Engine();
@@ -178,7 +180,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   engine.setInstructionBudget(request.limits.maxSteps);
 
   const result: RunResult = { console: [] };
-  if (packageError) result.console.push({ text: `[OAIY's Python additions could not load: ${packageError}]`, err: true });
+  if (packageNote) result.console.push({ text: `[${packageNote}]`, err: true });
   try {
     if (request.lang === 'python') {
       const entry = request.fileName ?? 'main.py';

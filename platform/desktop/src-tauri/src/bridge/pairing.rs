@@ -49,8 +49,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// user ignored should not sit around to be approved by accident later.
 const REQUEST_TTL_MS: u64 = 5 * 60 * 1000;
 /// Cap on simultaneous pending requests, so a page spamming pairing cannot grow
-/// the list without bound. Past it, the oldest request that was not approved is
-/// evicted: an approved one waits for its requester to collect the token.
+/// the list without bound. Past it, room is made of a request the person turned
+/// down, then of the oldest request of the origin that holds the most of them;
+/// never of an origin's only request, and never of an approved one, which waits
+/// for its requester to collect the token ([`PairingManager::request_for`]).
 const MAX_PENDING: usize = 12;
 /// Cap on the pending requests of one origin (a program's: those with none), so
 /// one page cannot push every other app's prompt out. Its own oldest goes first.
@@ -60,7 +62,10 @@ const MAX_PENDING_PER_ORIGIN: usize = 3;
 pub const MAX_PRODUCT_CHARS: usize = 64;
 pub const MAX_LABEL_CHARS: usize = 200;
 /// A paired token that has not been used for this long is forgotten: the app
-/// pairs again (FormLogic keeps its token for a browser session anyway).
+/// pairs again. FormLogic keeps its token for the signed-in account, across
+/// tabs and restarts of the browser (only a page with no sign-in keeps it for
+/// its tab alone), so this, and not the end of a browser session, is what ends
+/// a grant nobody revoked.
 pub const IDLE_EXPIRY_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 /// How stale the stored last use may get before a use writes the file again.
 const USE_PERSIST_MS: u64 = 24 * 60 * 60 * 1000;
@@ -270,9 +275,16 @@ impl PairingManager {
     ///
     /// Unauthenticated by design — see the module docs. Expired requests are
     /// swept first, and the list is capped: an origin's own oldest pending
-    /// request makes room for its next, then the oldest request that was not
-    /// approved for anyone's. Refused only while every one of them is approved
-    /// and waiting to be collected (a few minutes at most).
+    /// request makes room for its next. In a full list room is then made of a
+    /// request the person turned down (nobody waits on it), then of the oldest
+    /// request of the origin that holds the most ([`Self::most_crowded`]).
+    ///
+    /// Another origin's only request is never put out: the oldest request of
+    /// all used to be, so a page with four origins (three requests each fill
+    /// the list) removed every other app's prompt with its next request.
+    /// Refused while there is no such room: every request is approved and
+    /// waiting to be collected, or the only one of its origin (a few minutes
+    /// at most, until they are answered or run out).
     pub fn request_for(
         &mut self,
         product: &str,
@@ -287,10 +299,15 @@ impl PairingManager {
             self.pending.remove(oldest);
         }
         while self.pending.len() >= MAX_PENDING {
-            let Some(oldest) = self.pending.iter().position(|r| r.status != PairingStatus::Approved) else {
-                return Err("too many pairing requests were approved in the last few minutes: try again shortly".into());
+            let turned_down = self.pending.iter().position(|r| !matches!(r.status, PairingStatus::Pending | PairingStatus::Approved));
+            let Some(room) = turned_down.or_else(|| self.most_crowded(&origin)) else {
+                return Err(if self.pending.iter().all(|r| r.status == PairingStatus::Approved) {
+                    "too many pairing requests were approved in the last few minutes: try again shortly".into()
+                } else {
+                    "too many apps are asking to pair at once: answer the requests in OAIY, or try again in a few minutes".into()
+                });
             };
-            self.pending.remove(oldest);
+            self.pending.remove(room);
         }
         let req = PairingRequest {
             pairing_id: format!("pair_{}", token_hex(16)),
@@ -306,6 +323,27 @@ impl PairingManager {
         };
         self.pending.push(req.clone());
         Ok(req)
+    }
+
+    /// Where room is made in a full list for a request from `asking`: the oldest
+    /// waiting request of the origin that holds the most of them (the asker's
+    /// own, where it holds as many as any other). `None` where no origin holds
+    /// more than one: an origin always keeps its newest request, whoever asks.
+    fn most_crowded(&self, asking: &Option<String>) -> Option<usize> {
+        let waiting = |r: &&PairingRequest| r.status == PairingStatus::Pending;
+        let held_by = |origin: &Option<String>| self.pending.iter().filter(waiting).filter(|r| &r.origin == origin).count();
+        let mut most: Option<(&Option<String>, usize)> = None;
+        for r in self.pending.iter().filter(waiting) {
+            let held = held_by(&r.origin);
+            if most.is_none_or(|(of, n)| held > n || (held == n && of != asking && &r.origin == asking)) {
+                most = Some((&r.origin, held));
+            }
+        }
+        let (origin, held) = most?;
+        if held < 2 {
+            return None;
+        }
+        self.pending.iter().position(|r| r.status == PairingStatus::Pending && &r.origin == origin)
     }
 
     /// The consumer polls this. Returns the request WITH its token once approved.
@@ -393,7 +431,9 @@ impl PairingManager {
         let Some(t) = self.tokens.iter_mut().find(|t| ct_eq(&t.secret, token)) else {
             return Grant::Unknown;
         };
-        if origin.is_some() && origin != t.origin.as_deref() {
+        // (`null` is no page's own address: a grant written down for it, from before a request from such a page was
+        // refused, is not every sandboxed frame's and every opened file's to use)
+        if origin.is_some() && (origin != t.origin.as_deref() || origin == Some("null")) {
             return Grant::WrongOrigin;
         }
         let access = t.access;
@@ -471,6 +511,74 @@ impl Default for PairingManager {
 #[derive(Serialize, Deserialize)]
 struct PersistShape {
     tokens: Vec<PairedToken>,
+}
+
+/// Who a pairing request's `Origin` says is asking: a program on this computer (no header: `None`), or a page, by the
+/// address a browser gives it (`scheme://host[:port]`, as a browser writes one: lower case, nothing after the port).
+///
+/// The origin is the one thing in the prompt the asker did not write, and the grant works from that page alone
+/// ([`PairingManager::grant_for`]), so it has to name one page. `null` names none: it is what every sandboxed frame,
+/// `data:` page and file opened from the disk sends, so a grant to it would be a grant to all of them, shown to the
+/// person as the word "null". It is refused, and so is anything else that is not a page's address.
+pub fn asking_origin(header: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(origin) = header else { return Ok(None) };
+    if origin == "null" {
+        return Err("a page with no address of its own (a sandboxed frame, a data: page, a file opened from the disk) cannot be paired: open the app at its own address");
+    }
+    if !is_page_origin(origin) {
+        return Err("the Origin of the request is not a page's address (scheme://host or scheme://host:port)");
+    }
+    Ok(Some(origin.to_string()))
+}
+
+/// Whether `origin` is `scheme://host[:port]` as a browser serializes it, and nothing more: no path, no query, no
+/// name and password, no space, no upper case (a browser lowers the scheme and the host, and writes a name in
+/// another script as its ASCII form).
+fn is_page_origin(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
+    if !scheme.starts_with(|c: char| c.is_ascii_lowercase()) || !scheme.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.')) {
+        return false;
+    }
+    let (host_is_one, port) = match rest.strip_prefix('[') {
+        // (an IPv6 address, in its brackets)
+        Some(inner) => {
+            let Some((address, after)) = inner.split_once(']') else { return false };
+            let is_one = address.parse::<std::net::Ipv6Addr>().is_ok() && !address.chars().any(|c| c.is_ascii_uppercase());
+            match after.strip_prefix(':') {
+                Some(port) => (is_one, Some(port)),
+                None => (is_one && after.is_empty(), None),
+            }
+        }
+        None => {
+            let (host, port) = match rest.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (rest, None),
+            };
+            let named = host.chars().any(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'));
+            (named, port)
+        }
+    };
+    host_is_one && port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()) && p.parse::<u16>().is_ok())
+}
+
+/// Whether `product` is a product's short name: lower-case letters, digits, `.`, `_` and `-` (`formlogic`,
+/// `oaiy-app`). The prompt shows it beside the origin, and it is the asker's own word: with a space, a `·` or a `/` in
+/// it, it could be written to read as an address of its own.
+pub fn is_product_name(product: &str) -> bool {
+    !product.is_empty()
+        && product.chars().count() <= MAX_PRODUCT_CHARS
+        && product.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// A request's `label` as the prompt may show it: without the characters a person cannot see (controls, among them
+/// a line break; zero-width characters; the ones that turn the direction of the text around, with which a label
+/// reads as something it does not say). `None` where nothing is left.
+pub fn shown_label(label: Option<String>) -> Option<String> {
+    let label = label?;
+    let shown: String = label.chars().filter(|c| !c.is_control() && !crate::backup::parts::is_invisible(*c)).collect();
+    let shown = shown.trim();
+    (!shown.is_empty()).then(|| shown.to_string())
 }
 
 pub type PairingHandle = Arc<Mutex<PairingManager>>;
@@ -800,6 +908,168 @@ mod tests {
         let pending = m.pending();
         assert!(pending.iter().any(|r| r.pairing_id == real), "the real request is still there");
         assert_eq!(pending.iter().filter(|r| r.origin.as_deref() == Some("https://evil.example")).count(), MAX_PENDING_PER_ORIGIN);
+
+        // Nor can a page with several origins. Four of them fill the list with three requests each, and the next
+        // request used to put out the oldest request of all: the real one's, which the person never saw.
+        let mut m = PairingManager::new();
+        let real = m.request("formlogic", None, Some("https://formlogic.com".into())).pairing_id;
+        let script = m.request("oaiy-cli", None, None).pairing_id;
+        for round in 0..10 {
+            for site in 0..6 {
+                let asked = m.request_for(&format!("spam{round}"), None, Some(format!("https://evil{site}.example")), PairingAccess::Apps);
+                assert!(asked.is_ok(), "an origin that crowds the list makes room out of its own");
+            }
+        }
+        let pending = m.pending();
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.iter().any(|r| r.pairing_id == real), "the real request is still there");
+        assert!(pending.iter().any(|r| r.pairing_id == script), "and so is a program's");
+        // An app that comes late still gets its prompt: room is made of the origin that holds the most.
+        let late = m.request_for("late", None, Some("https://late.example".into()), PairingAccess::Apps).expect("room for it").pairing_id;
+        let pending = m.pending();
+        assert_eq!(pending.len(), MAX_PENDING);
+        for id in [&real, &script, &late] {
+            assert!(pending.iter().any(|r| &r.pairing_id == id), "{id}");
+        }
+    }
+
+    #[test]
+    fn nobodys_only_request_is_put_out_for_another() {
+        // Every origin holds one: there is no room that is not somebody's only prompt, so the newcomer is told to wait
+        // (the route answers 429), however many origins a page has.
+        let mut m = PairingManager::new();
+        let first: Vec<String> = (0..MAX_PENDING).map(|i| m.request("app", None, Some(format!("https://app{i}.example"))).pairing_id).collect();
+        let refused = m.request_for("late", None, Some("https://late.example".into()), PairingAccess::Apps);
+        assert!(refused.unwrap_err().contains("too many apps are asking"));
+        assert_eq!(m.pending().iter().map(|r| r.pairing_id.clone()).collect::<Vec<_>>(), first, "all twelve are as they were");
+        // One of the twelve asking again has no room either: it holds one, and room is made only of an origin's older request.
+        let again = m.request_for("app", None, Some("https://app3.example".into()), PairingAccess::Apps);
+        assert!(again.unwrap_err().contains("too many apps are asking"));
+        // A request the person turned down waits for nobody: it is the room.
+        m.deny(&first[5]).unwrap();
+        let late = m.request_for("late", None, Some("https://late.example".into()), PairingAccess::Apps).expect("room where a request was denied").pairing_id;
+        let pending = m.pending();
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.iter().any(|r| r.pairing_id == late));
+        assert!(first.iter().enumerate().all(|(i, id)| i == 5 || pending.iter().any(|r| &r.pairing_id == id)), "the other eleven are still asked about");
+        // An origin with two keeps its newest: where two hold as many, the asker's own older request goes first.
+        let mut m = PairingManager::new();
+        let theirs_old = m.request("theirs", None, Some("https://theirs.example".into())).pairing_id;
+        let theirs_new = m.request("theirs", None, Some("https://theirs.example".into())).pairing_id;
+        let mine_old = m.request("mine", None, Some("https://mine.example".into())).pairing_id;
+        let mine_new = m.request("mine", None, Some("https://mine.example".into())).pairing_id;
+        for i in 0..MAX_PENDING - 4 {
+            m.request("app", None, Some(format!("https://app{i}.example")));
+        }
+        m.request("mine", None, Some("https://mine.example".into()));
+        let ids: Vec<String> = m.pending().into_iter().map(|r| r.pairing_id).collect();
+        assert!(!ids.contains(&mine_old) && ids.contains(&mine_new) && ids.contains(&theirs_old) && ids.contains(&theirs_new));
+    }
+
+    #[test]
+    fn a_request_names_the_page_that_asks_or_a_program_and_null_names_nobody() {
+        // A program on this computer sends no Origin, and is asked about as one.
+        assert_eq!(asking_origin(None), Ok(None));
+        // A page, by the address a browser gives it.
+        for page in [
+            "https://formlogic.com",
+            "https://app.formlogic.com:8443",
+            "http://formlogic.local",
+            "http://localhost:5173",
+            "http://127.0.0.1:17973",
+            "http://[::1]:8080",
+            "http://[::1]",
+            "http://my_site.local",
+            "https://xn--mnchen-3ya.example",
+            "tauri://localhost",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        ] {
+            assert_eq!(asking_origin(Some(page)), Ok(Some(page.to_string())), "{page}");
+        }
+        // A sandboxed frame, a data: page, a file opened from the disk: every one of them is "null", so it names none.
+        assert!(asking_origin(Some("null")).is_err());
+        // Not an address of a page and nothing more: these would be shown in the prompt as who asks.
+        for not_one in [
+            "",
+            "Null",
+            "NULL",
+            "formlogic.com",
+            "https://",
+            "https:///",
+            "https://formlogic.com/",
+            "https://formlogic.com/path",
+            "https://formlogic.com?x=1",
+            "https://formlogic.com#x",
+            "https://user@formlogic.com",
+            "https://user:pw@formlogic.com",
+            "https://formlogic.com:",
+            "https://formlogic.com:port",
+            "https://formlogic.com:99999",
+            "https://formlogic.com:80:80",
+            "https://formlogic.com evil.example",
+            " https://formlogic.com",
+            "https://FormLogic.com",
+            "HTTPS://formlogic.com",
+            "https://formlogic.com\u{202e}moc.live",
+            "https://formlogіc.com",
+            "https://formlogic.com · approved",
+            "https://...",
+            "http://[::1",
+            "http://[::1]x",
+            "http://[not-an-address]",
+            "1https://formlogic.com",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///C:/page.html",
+        ] {
+            assert!(asking_origin(Some(not_one)).is_err(), "{not_one:?}");
+        }
+    }
+
+    #[test]
+    fn a_product_is_a_short_name_and_a_label_is_shown_without_what_a_person_cannot_see() {
+        let (longest, too_long) = ("a".repeat(MAX_PRODUCT_CHARS), "a".repeat(MAX_PRODUCT_CHARS + 1));
+        // What FormLogic and the Agent in a browser tab send, and what a script may call itself.
+        for product in ["formlogic", "oaiy-app", "oaiy-cli", "my_script.v2", "x", longest.as_str()] {
+            assert!(is_product_name(product), "{product}");
+        }
+        // Shown beside the address the request really came from: it cannot be written to read as one.
+        for product in ["", " ", "formlogic · https://formlogic.com", "https://formlogic.com", "FormLogic", "form logic", "formlogic\n", "formlogic\u{202e}", "formlogіc", too_long.as_str()] {
+            assert!(!is_product_name(product), "{product:?}");
+        }
+        // FormLogic's label is its own address: it is kept as it is.
+        assert_eq!(shown_label(Some("https://formlogic.com".into())).as_deref(), Some("https://formlogic.com"));
+        assert_eq!(shown_label(Some("Receptionist · Acme Dental".into())).as_deref(), Some("Receptionist · Acme Dental"));
+        assert_eq!(shown_label(Some("Zoë’s café 日本語".into())).as_deref(), Some("Zoë’s café 日本語"));
+        // Controls (a line break too), zero-width characters and the ones that turn the text's direction around.
+        assert_eq!(shown_label(Some("Acme\u{202e}moc.cigolmrof//:sptth".into())).as_deref(), Some("Acmemoc.cigolmrof//:sptth"));
+        assert_eq!(shown_label(Some("A\u{0}c\u{7}m\u{1b}e\r\n\tDental\u{200b}\u{2066}\u{2069}\u{feff}\u{e0041}".into())).as_deref(), Some("AcmeDental"));
+        assert_eq!(shown_label(Some("  Acme  ".into())).as_deref(), Some("Acme"));
+        // Nothing left is no label, as none sent is.
+        assert_eq!(shown_label(Some("\u{200b}\u{202e} \n".into())), None);
+        assert_eq!(shown_label(Some(String::new())), None);
+        assert_eq!(shown_label(None), None);
+    }
+
+    #[test]
+    fn a_grant_written_down_for_null_is_not_every_opaque_pages_to_use() {
+        // A file from before a request with `Origin: null` was refused: the grant was made to "null", which every
+        // sandboxed frame and every file opened from the disk says it is.
+        let dir = std::env::temp_dir().join(format!("oaiy-pairing-null-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pairings.json");
+        std::fs::write(&path, format!(r#"{{"tokens":[{{"id":"tok_1","product":"formlogic","label":null,"origin":"null","createdAtMs":{},"secret":"oaiypat_null"}}]}}"#, now_ms())).unwrap();
+        let mut m = PairingManager::open(path);
+        assert_eq!(m.grant_for("oaiypat_null", Some("null")), Grant::WrongOrigin);
+        assert_eq!(m.grant_for("oaiypat_null", Some("https://evil.example")), Grant::WrongOrigin);
+        // It is still listed, with the origin it was made to, so the person can see it and revoke it.
+        assert_eq!(m.paired()[0].origin.as_deref(), Some("null"));
+        // A grant to a page is as it was: that page's, and no opaque page's.
+        let id = m.request("formlogic", None, Some("https://formlogic.com".into())).pairing_id;
+        let token = m.approve(&id).unwrap().token.unwrap();
+        assert_eq!(m.grant_for(&token, Some("https://formlogic.com")), Grant::Paired(PairingAccess::Apps));
+        assert_eq!(m.grant_for(&token, Some("null")), Grant::WrongOrigin);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

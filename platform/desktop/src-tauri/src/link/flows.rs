@@ -291,6 +291,26 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
     Ok(reply.bindings)
 }
 
+/// The bindings without those this event would fire for an app that
+/// `held_back` names, which are handed back apart, to be said.
+///
+/// The provider gives a source's events to ONE of the account's apps
+/// ([`super::app_logic::Route`]), and a flow of another app that could have
+/// taken them is not started by them. They are taken out before anything else
+/// is decided, not after: [`MAX_BINDINGS_PER_EVENT`] counts the bindings that
+/// fire, and one that is held back must not take the place of one that does.
+/// A binding that belongs to no app is the account's own and is never held
+/// back.
+pub fn without_held_back(
+    bindings: Vec<Binding>,
+    event_name: &str,
+    held_back: impl Fn(&str) -> bool,
+) -> (Vec<Binding>, Vec<Binding>) {
+    bindings
+        .into_iter()
+        .partition(|b| !(b.event == event_name && b.app_id.as_deref().is_some_and(&held_back)))
+}
+
 /// One matched binding, on its way to a decision.
 #[derive(Debug)]
 pub enum Pending<'a> {
@@ -988,6 +1008,42 @@ mod tests {
         assert_eq!(sel.fire.len(), MAX_BINDINGS_PER_EVENT);
         assert!(sel.skipped.iter().all(|(_, s)| *s == Skip::TooManyBindings));
         assert_eq!(sel.skipped.len(), 9 - MAX_BINDINGS_PER_EVENT);
+    }
+
+    #[test]
+    fn the_bindings_of_an_app_the_event_is_not_for_are_taken_out_before_the_bound_is_counted() {
+        // Two apps built from one pack, three bindings each on the same event, and the account's own. Counted
+        // with the other app's, the bound of five was spent on bindings that do not fire and the last of the
+        // right app's was skipped as one too many.
+        let of = |id: &str, app: Option<&str>, event: &str| {
+            let mut b = binding(id, event);
+            b.app_id = app.map(str::to_string);
+            b
+        };
+        let all = vec![
+            of("old-1", Some("app-old"), "e"),
+            of("old-2", Some("app-old"), "e"),
+            of("old-3", Some("app-old"), "e"),
+            of("new-1", Some("app-new"), "e"),
+            of("new-2", Some("app-new"), "e"),
+            of("new-3", Some("app-new"), "e"),
+            of("own", None, "e"),
+            of("old-other", Some("app-old"), "another.event"),
+        ];
+        let ids = |list: &[Binding]| list.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
+        let (kept, held) = without_held_back(all.clone(), "e", |app| app == "app-old");
+        assert_eq!(ids(&held), ["old-1", "old-2", "old-3"]);
+        // What is not this event's is not looked at, and what is no app's is never held back.
+        assert_eq!(ids(&kept), ["new-1", "new-2", "new-3", "own", "old-other"]);
+        let host = answering(json!(true));
+        let sel = select(&host, &kept, "e", "aokie", &envelope(json!({})), Prelude::None);
+        assert_eq!(fire_ids(&sel), ["new-1", "new-2", "new-3", "own"]);
+        assert!(sel.skipped.is_empty(), "{:?}", sel.skipped);
+
+        // Nobody held back: the list as it came.
+        let (kept, held) = without_held_back(all.clone(), "e", |_| false);
+        assert!(held.is_empty());
+        assert_eq!(ids(&kept), ids(&all));
     }
 
     // -- on ZIPP ------------------------------------------------------------

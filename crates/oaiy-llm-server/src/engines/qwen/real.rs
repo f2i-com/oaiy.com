@@ -198,9 +198,14 @@ impl Engine {
     }
 
     fn send(&self, prompt: Vec<u32>, forget: bool, session: Option<&str>, wipe: bool, cancel: bool, max_tokens: usize) -> Reply {
+        self.send_with(vec![], prompt, forget, session, wipe, cancel, max_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_with(&self, tools: Vec<oaiy_engine::json::Json>, prompt: Vec<u32>, forget: bool, session: Option<&str>, wipe: bool, cancel: bool, max_tokens: usize) -> Reply {
         let (events, rx) = channel();
         let job = Job {
-            tools: vec![], tool_precision: false, observer_context: String::new(), prompt, images: vec![], max_tokens, think_budget: None, think_closing: vec![],
+            tools, tool_precision: false, observer_context: String::new(), prompt, images: vec![], max_tokens, think_budget: None, think_closing: vec![],
             sampling: Sampling { temperature: 0.0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0,
                 presence_penalty: 0.0, frequency_penalty: 0.0, top_p: 1.0, top_k: 0, seed: 1 },
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(cancel)), events, forget, session: session.map(str::to_owned), wipe,
@@ -226,6 +231,9 @@ impl Engine {
     }
 
     pub fn ask(&self, prompt: &[u32], max_tokens: usize) -> Reply { self.send(prompt.to_vec(), false, None, false, false, max_tokens) }
+    /// As `ask`, for a request that declares `tools`: the engine holds a call back from the reply's text and previews it.
+    /// (A request that declares none is a text-protocol caller's: what the model writes of a call stays in its text.)
+    pub fn ask_with_tools(&self, tools: Vec<oaiy_engine::json::Json>, prompt: &[u32], max_tokens: usize) -> Reply { self.send_with(tools, prompt.to_vec(), false, None, false, false, max_tokens) }
     pub fn ask_private(&self, prompt: &[u32], session: Option<&str>, max_tokens: usize) -> Reply { self.send(prompt.to_vec(), true, session, false, false, max_tokens) }
     pub fn ask_cancelled(&self, prompt: &[u32]) -> Reply { self.send(prompt.to_vec(), false, None, false, true, 4) }
     pub fn wipe(&self, session: &str) { self.send(vec![9], true, Some(session), true, false, 1); }
@@ -367,9 +375,15 @@ mod tests {
     #[test]
     fn a_reply_nesting_a_call_in_itself_in_a_tool_call_is_stopped_saying_what_it_wrote() {
         let prompt: Vec<u32> = std::iter::once(IM).chain(20..40).collect();
-        let reply = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST], END).ask(&prompt, 3_000);
+        // (the request declares a tool: the engine holds the call back from the text and previews it)
+        let tools = || vec![oaiy_engine::json::Json::parse(br#"{"function":{"name":"f","parameters":{"type":"object","properties":{}}}}"#).unwrap()];
+        let reply = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST], END).ask_with_tools(tools(), &prompt, 3_000);
         assert_eq!(reply.error.as_deref(), Some("generation_repetition: the reply went on repeating the same token (\"f(\", 128 times: 128 tokens) in a tool call and was stopped"));
         assert_eq!(reply.calls, format!("<tool_call>{}", "f(".repeat(127)), "the call as written, up to the run's 128th");
+        // a request that declares no tools is a text-protocol caller's: stopped the same, and the call it wrote is its text
+        let text = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST], END).ask(&prompt, 3_000);
+        assert_eq!(text.error, reply.error);
+        assert_eq!((text.calls.as_str(), text.text), ("", format!("<tool_call>{}", "f(".repeat(127))), "the call as written, in the text");
         // a turn of three tokens, whose limit (128) is no multiple of it: quoted as the run began, not as it was cut
         let three = Engine::start_stuck_after(prompt.len(), &[CALL], &[NEST, FIRST, FIRST + 1], END).ask(&prompt, 3_000);
         assert_eq!(three.error.as_deref(), Some("generation_repetition: the reply went on repeating the same 3 tokens (\"4.5.f(\", 42 times: 128 tokens) in a tool call and was stopped"));

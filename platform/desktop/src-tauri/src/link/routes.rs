@@ -49,12 +49,14 @@ async fn start(
     }
 }
 
-/// Forget the link on THIS machine.
+/// Forget the link on THIS machine, and tell the provider it is over.
 ///
-/// Deliberately local-only. Revoking the credential server-side is the
-/// provider's business and needs a route this descriptor does not describe;
-/// pretending otherwise would tell the user their key was dead when it was not.
-/// The UI says so.
+/// What this answers is the local half, which is the half this machine can
+/// vouch for. Ending the key at the provider is the provider's business: where
+/// its connector names a request for that (`auth.unlink`), it is sent once the
+/// link is forgotten here, without being waited for, and a provider that is
+/// away or refuses leaves its key working there. So the answer never says the
+/// key is dead; a connector that names no such request is forgotten here alone.
 ///
 /// With `?copiesOnly=true` it only tries again to remove the copies kept of an earlier key that a previous forget
 /// could not remove (`linkError.kind` is `copiesLeft`), which is the panel's "Remove copies". A link there is now is

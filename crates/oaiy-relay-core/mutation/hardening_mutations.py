@@ -91,7 +91,7 @@ MUTATIONS = [
      "if self.target.expires_at.is_some_and(|x| (x as i64).saturating_add(crate::pairing::offer::SKEW_S) <= now) {", "if false {", "own"),
     # ---------------------------------------------------------------------------------------------------------------- admission, ticket
     ("H33", "admission and receipt", "an admission whose scopes are not the grants the desktop signed is accepted", C + "admission.rs",
-     "if a != b {", "if false {", "own"),
+     "if self.scopes.iter().any(|s| !grants.contains(s)) {", "if false {", "own"),
     ("H34", "admission and receipt", "an admission that names another desktop than the pinned one is accepted", C + "admission.rs",
      "|| self.expected_peer_thumbprint != desktop_endpoint_thumbprint {", "|| false {", "own"),
     ("H35", "ticket", "a ticket's sub is counted in bytes, as a schema's maxLength does not", C + "ticket.rs",

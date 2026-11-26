@@ -273,8 +273,9 @@ fn a_request_a_client_would_send_is_checked_before_it_is_sent() {
 
 #[test]
 fn a_phones_admission_is_compared_with_the_grants_the_desktop_signed_and_the_desktop_the_phone_pinned() {
-    // `MobileAdmission::check_against`, on every recorded phone admission: the scopes are exactly the grants of the approval receipt (as a set), and the expected peer is the desktop
-    // that was pinned from the offer. More, fewer, a repeat, another peer and a thumbprint that is no thumbprint are each refused.
+    // `MobileAdmission::check_against`, on every recorded phone admission: every scope is one of the grants of the approval receipt, and the expected peer is the desktop that was
+    // pinned from the offer. A receipt that holds more than the scopes is a phone the desktop narrowed after the pairing (grants are patchable, and the relay's next admission
+    // carries what is left), which is accepted; a scope the receipt does not hold, another peer and a thumbprint that is no thumbprint are each refused.
     let mut checked = 0;
     for case in cases().into_iter().filter(|c| c.s("role") != "plugin") {
         let req = mobile_request(case.at("request.body"));
@@ -284,17 +285,25 @@ fn a_phones_admission_is_compared_with_the_grants_the_desktop_signed_and_the_des
         adm.check_against(&grants, &peer).unwrap_or_else(|e| panic!("{}: {e}", case.s("name")));
         let reversed: Vec<String> = grants.iter().rev().cloned().collect();
         adm.check_against(&reversed, &peer).expect("a set, not a list");
-        let mut more = grants.clone();
-        more.push("assistance_respond".to_string());
-        let fewer = grants[1..].to_vec();
+        // The receipt signed more than the admission carries: the desktop took a grant away since. Every known grant the scopes do not hold is tried as the one taken away.
+        let mut narrowed = 0;
+        for taken in oaiy_relay_core::ids::KNOWN_GRANTS.iter().filter(|k| !grants.iter().any(|g| g == *k)) {
+            let mut signed = grants.clone();
+            signed.push(taken.to_string());
+            adm.check_against(&signed, &peer).unwrap_or_else(|e| panic!("{}: narrowed by {taken}: {e}", case.s("name")));
+            narrowed += 1;
+        }
+        assert!(narrowed > 0, "{}: no recorded admission holds all fourteen grants", case.s("name"));
         let mut repeated = grants.clone();
         repeated.push(grants[0].clone());
-        for (what, g) in [("more grants than the scopes", &more), ("fewer", &fewer), ("a repeated grant", &repeated), ("none", &Vec::new())] {
-            if what == "more grants than the scopes" && grants.iter().any(|x| x == "assistance_respond") {
-                continue; // the recorded scopes already hold it: nothing is added
-            }
-            assert!(adm.check_against(g, &peer).is_err(), "{}: {what}", case.s("name"));
+        adm.check_against(&repeated, &peer).expect("a repeat in the receipt's list adds nothing to the set");
+        // The receipt signed less than the admission carries: the relay added a scope by itself. Each scope in turn is the one that was never signed.
+        for missing in 0..grants.len() {
+            let mut signed = grants.clone();
+            let scope = signed.remove(missing);
+            assert!(adm.check_against(&signed, &peer).is_err(), "{}: {scope} was never signed", case.s("name"));
         }
+        assert!(adm.check_against(&[], &peer).is_err(), "{}: no grants at all", case.s("name"));
         let other_peer = "Zq7e1o0c2mS4N5t-XvB9aLkJ3dYhPfRwU6iGg8TnQpA";
         assert_ne!(other_peer, peer);
         assert!(adm.check_against(&grants, other_peer).is_err(), "{}: another desktop", case.s("name"));

@@ -12,7 +12,7 @@ import PairingPrompt from './PairingPrompt';
 let container: HTMLDivElement;
 let root: Root;
 const saved = { id: 'saved-1', product: 'FormLogic', label: 'My workspace', origin: 'https://workspace.example', createdAtMs: Date.parse('2026-09-12T01:02:03Z') };
-const request = { pairingId: 'new-1', product: 'New workspace', origin: 'https://new.example', code: '123456', status: 'pending', createdAtMs: saved.createdAtMs };
+const request = { pairingId: 'new-1', product: 'formlogic', label: 'New workspace', origin: 'https://new.example', code: '123456', status: 'pending', createdAtMs: saved.createdAtMs };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -48,14 +48,43 @@ describe('PairingPrompt', () => {
     pending.mockResolvedValue({ pending: [request] });
     await mount();
     const prompt = container.querySelector('[role="alert"]')!;
-    expect(prompt.textContent).toContain('New workspace wants to connect');
+    expect(prompt.textContent).toContain('An app wants to connect');
     expect(prompt.textContent).toContain('123456');
     expect(container.textContent).not.toContain('Connected apps');
     await act(async () => buttonIn(prompt, 'Approve').click());
     expect(approve).toHaveBeenCalledWith('new-1');
     expect(deny).not.toHaveBeenCalled();
     expect(revoke).not.toHaveBeenCalled();
-    expect(push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Approved New workspace' }));
+    expect(push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Approved formlogic' }));
+  });
+
+  it('says who asks by the address the request came from, on a line of its own, and what it calls itself as its own words', async () => {
+    // The label was the heading and the product stood in bold before the address: a page that called itself
+    // "https://formlogic.com" read as that site, with its real address after it in grey.
+    const posing = { ...request, origin: 'https://evil.example', label: 'https://formlogic.com' };
+    pending.mockResolvedValue({ pending: [posing] });
+    await mount();
+    let prompt = container.querySelector('[role="alert"]')!;
+    expect(prompt.querySelector('.pairing-who')!.textContent).toBe('From https://evil.example');
+    expect(prompt.querySelector('.pairing-who b')!.textContent).toBe('https://evil.example');
+    expect(prompt.querySelector('.pairing-head')!.textContent).toBe('An app wants to connect');
+    expect(prompt.textContent).toContain('It calls itself “https://formlogic.com” (formlogic).');
+    // Nothing the asker wrote is in bold or in the heading: only the address is.
+    expect(Array.from(prompt.querySelectorAll('b, strong')).map((el) => el.textContent)).toEqual(['An app wants to connect', 'https://evil.example']);
+
+    // FormLogic gives its own address as its label: said once, as who asks.
+    pending.mockResolvedValue({ pending: [{ ...request, origin: 'https://formlogic.com', label: 'https://formlogic.com' }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    prompt = container.querySelector('[role="alert"]')!;
+    expect(prompt.querySelector('.pairing-who')!.textContent).toBe('From https://formlogic.com');
+    expect(prompt.textContent).toContain('It calls itself “formlogic”. It wants to run your flows');
+
+    // A program on this computer has no address, and no label is no claim.
+    pending.mockResolvedValue({ pending: [{ ...request, origin: undefined, label: undefined, product: 'oaiy-cli' }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    prompt = container.querySelector('[role="alert"]')!;
+    expect(prompt.querySelector('.pairing-who')!.textContent).toBe('From a program on this computer');
+    expect(prompt.textContent).toContain('It calls itself “oaiy-cli”.');
   });
 
   it('says what is granted: an app may run flows, which can run programs; an Agent reaches the phone and settings too', async () => {

@@ -137,6 +137,15 @@ fn ip_blocked(ip: IpAddr, allow_local: bool) -> bool {
     }
 }
 
+/// [`ip_blocked`] for an address a NAME resolved to, where 198.18.0.0/15 is let through. It is the pool "fake-IP"
+/// DNS answers from (a system proxy or VPN in TUN mode gives every public name an address in it and carries the
+/// connection on itself), so refusing it refused every provider for a person behind one. Nothing of this computer or
+/// its network answers there, and a URL that writes such an address itself is still refused.
+fn resolved_ip_blocked(ip: IpAddr, allow_local: bool) -> bool {
+    let fake_ip_pool = matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18);
+    !fake_ip_pool && ip_blocked(ip, allow_local)
+}
+
 fn check_scheme_and_creds(url: &reqwest::Url, allow_local: bool) -> Result<(), String> {
     let ok_scheme = url.scheme() == "https" || (allow_local && url.scheme() == "http");
     if !ok_scheme {
@@ -229,7 +238,7 @@ pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest
         .map_err(|e| format!("cannot resolve provider host '{host}': {e}"))?;
     for addr in addrs {
         saw_any = true;
-        if ip_blocked(addr.ip(), allow_local) {
+        if resolved_ip_blocked(addr.ip(), allow_local) {
             return Err(format!(
                 "provider host '{host}' resolves to a disallowed address ({})",
                 addr.ip()
@@ -287,7 +296,7 @@ pub(super) async fn target(base_url: &str, path: &str, allow_local: bool) -> Res
     if addrs.is_empty() {
         return Err(format!("provider host '{host}' did not resolve"));
     }
-    if let Some(bad) = addrs.iter().find(|a| ip_blocked(a.ip(), allow_local)) {
+    if let Some(bad) = addrs.iter().find(|a| resolved_ip_blocked(a.ip(), allow_local)) {
         return Err(format!("provider host '{host}' resolves to a disallowed address ({})", bad.ip()));
     }
     Ok(Target { url, pinned: Some((host, addrs)) })
@@ -442,5 +451,18 @@ mod tests {
         for ip in ["1.1.1.1", "2606:4700:4700::1111", "64:ff9b::1.1.1.1", "2002:0101:0101::"] {
             assert!(!is_disallowed_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be allowed");
         }
+        // What a name resolved to: the fake-IP pool is let through (a proxy's DNS answers every public name from it),
+        // and nothing else that is refused when written is.
+        for ip in ["198.18.0.1", "198.19.255.254"] {
+            assert!(!resolved_ip_blocked(ip.parse::<IpAddr>().unwrap(), false), "{ip} should be allowed when resolved");
+        }
+        for ip in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "::ffff:198.18.0.1", "64:ff9b::127.0.0.1"] {
+            assert!(resolved_ip_blocked(ip.parse::<IpAddr>().unwrap(), false), "{ip} stays refused when resolved");
+        }
+        // (the pool's neighbours are public addresses either way)
+        for ip in ["198.17.255.255", "198.20.0.1"] {
+            assert!(!resolved_ip_blocked(ip.parse::<IpAddr>().unwrap(), false) && !is_disallowed_ip(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        assert!(resolved_ip_blocked("169.254.169.254".parse::<IpAddr>().unwrap(), true), "metadata stays refused for a local endpoint");
     }
 }

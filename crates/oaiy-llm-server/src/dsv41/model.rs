@@ -460,6 +460,11 @@ impl Model {
         if on_device && self.attend_check {
             let summary = self.attend_found.line(start_pos);
             self.attend_found.notes.push(summary);
+            // (OAIY_DSV41_GPU_ATTENTION=check is asked for to be read, and nothing reads `attend_check_report` for
+            // it: what the step found is said here, as it was)
+            for note in &self.attend_found.notes {
+                eprintln!("    {note}");
+            }
         }
         if let Some(gpu) = &self.experts.gpu {
             gpu.pass_done(t, &self.experts.cache, self.experts.store.as_ref());

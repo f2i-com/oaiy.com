@@ -1952,7 +1952,8 @@ pub fn run() {
                 // Execute the flow runs the account has queued. The other half
                 // of the flows lane: without it this desktop reserves runs and
                 // then waits for a runtime that may not exist, and every one of
-                // them sits queued until somebody's reaper calls it stale.
+                // them stays queued: a provider's reaper ends the runs that
+                // were left running, and leaves a queued one where it is.
                 crate::link::flow_runner::spawn(
                     link_for_http.clone(),
                     Some(node_for_http.clone()),

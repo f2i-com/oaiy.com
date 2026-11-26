@@ -842,3 +842,131 @@ test('4.18.8 installer web: only GET and POST are answered while it is armed', f
         eq(405, $srv->request($m, '/install.php')['status'], $m);
     }
 });
+
+// ------------------------------------------------------------------------------------------------ one at a time
+
+test('4.18.8 installer (both, and a re-key): one at a time in a data folder: while another holds data/install.claim an install and a re-key are refused as busy with nothing written, and a run takes its claim away with it', function () {
+    $root = inst_scratch();
+    $data = $root . '/data';
+    $claim = $data . '/' . Oaiy\Relay\Installer::CLAIM;
+    // Another install at work in this folder: the claim, locked, as that install holds it.
+    $hold = static function () use ($claim) {
+        $h = fopen($claim, 'c');
+        ok(flock($h, LOCK_EX | LOCK_NB), 'the test holds the claim');
+        return $h;
+    };
+    $letGo = static function ($h) use ($claim): void {
+        unlink($claim);
+        flock($h, LOCK_UN);
+        fclose($h);
+    };
+    mkdir($data, 0700, true);
+    $other = $hold();
+    $e = throws(fn() => Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com']), Oaiy\Relay\InstallRefused::class);
+    eq('busy', $e->kind);
+    contains('at work', $e->getMessage());
+    eq(['.', '..', Oaiy\Relay\Installer::CLAIM], scandir($data), 'the refused install wrote nothing, and left the claim of the other where it was');
+    // The other ends without having installed: this one may. A claim file that nobody holds keeps nobody out (a run that
+    // was killed lets go of the lock, not of the file).
+    $letGo($other);
+    file_put_contents($claim, '');
+    Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com']);
+    ok(is_file($data . '/installed.lock'), 'installed: a file without a lock is not a claim');
+    ok(!file_exists($claim), 'the claim is gone when the install has ended');
+
+    // A re-key is one of the two as well.
+    $before = (string)file_get_contents($data . '/first-key.txt');
+    $other = $hold();
+    $e = throws(fn() => Oaiy\Relay\Installer::rekey($data, ['probe' => false]), Oaiy\Relay\InstallRefused::class);
+    eq('busy', $e->kind);
+    eq($before, (string)file_get_contents($data . '/first-key.txt'), 'no key was written by the refused re-key');
+    $letGo($other);
+    Oaiy\Relay\Installer::rekey($data, ['probe' => false]);
+    neq($before, (string)file_get_contents($data . '/first-key.txt'));
+    ok(!file_exists($claim), 'the claim is gone when the re-key has ended');
+    // A second install after the first has ended is still refused for what it is.
+    $e = throws(fn() => Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com']), Oaiy\Relay\InstallRefused::class);
+    eq('installed', $e->kind);
+
+    // The claim is a file in data/, and a refused install still leaves no folder behind: not one that was refused for where
+    // data/ lies (before the claim), and not one whose canary was served (after it).
+    $fresh = inst_scratch();
+    $e = throws(fn() => Oaiy\Relay\Installer::provision($fresh . '/data', ['public_url' => 'https://relay.example.com', 'documentRoot' => $fresh]), Oaiy\Relay\InstallRefused::class);
+    eq('docroot', $e->kind);
+    ok(!file_exists($fresh . '/data'), 'no data folder after a refusal for the document root');
+    $srv = Server::start($fresh, ['prepend' => false, 'name' => 'inst-root']);
+    $e = throws(fn() => Oaiy\Relay\Installer::provision($fresh . '/data', ['public_url' => 'https://relay.example.com', 'probeUrl' => $srv->base()]), Oaiy\Relay\InstallRefused::class);
+    eq('reachable', $e->kind);
+    ok(!file_exists($fresh . '/data'), 'no data folder, and no claim, after a refusal for a served canary');
+    Tmp::after('gc_collect_cycles');
+});
+
+test('4.18.8 installer web: a second post while the first is still at work (a second press of Install) is refused and changes nothing, and the relay that is left is whole: one relay key, the first key that names it, one admin token', function () {
+    $root = inst_scratch();
+    $data = $root . '/data';
+    file_put_contents($root . '/INSTALL_ENABLED', INST_TOKEN . "\n");
+    // Two workers of one host (php -S serves one request at a time).
+    [$one, $two] = Server::fleet(2, $root . '/public', ['prepend' => false, 'name' => 'inst']);
+    // The public address is a listener of the test's own, which answers the installer's probe only when the test says so: once
+    // the probe has connected, the first post is inside the install, past every check, with no secret written yet.
+    $listener = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+    ok($listener !== false, 'a listener for the probe');
+    Tmp::after(static function () use ($listener): void {
+        @fclose($listener);
+    });
+    $address = 'http://127.0.0.1:' . (int)substr((string)strrchr((string)stream_socket_get_name($listener, false), ':'), 1);
+    $form = http_build_query(['token' => INST_TOKEN, 'public_url' => $address]);
+    $headers = ['Content-Type' => 'application/x-www-form-urlencoded'];
+    $notServed = static function ($conn): void {
+        stream_set_timeout($conn, 2);
+        fread($conn, 8192);
+        fwrite($conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        fclose($conn);
+    };
+
+    $first = $one->begin('POST', '/install.php', $headers, $form);
+    $probe = @stream_socket_accept($listener, 10.0);
+    ok($probe !== false, 'the first post is at its probe');
+    // The second press. Its answer comes while the first is still waiting for the answer to its probe.
+    $second = $two->begin('POST', '/install.php', $headers, $form)->finish(4.0);
+    eq(409, $second['status'], $second['body']);
+    contains('another run is at work', $second['body']);
+    contains('first-key.txt', $second['body']);
+    not_contains('document root', $second['body'], 'no advice that is about something else');
+    not_contains(INST_TOKEN, $second['body']);
+    ok(!$first->done(), 'the first post is still at work');
+    ok(is_file($root . '/INSTALL_ENABLED'), 'the flag is for the first post to delete');
+    foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'installed.lock', 'relay.sqlite', 'secrets'] as $f) {
+        ok(!file_exists($data . '/' . $f), "$f was not written by the refused post");
+    }
+
+    // The probe is answered (nothing is served there), at each place the installer asks, and the first post ends.
+    $notServed($probe);
+    $deadline = microtime(true) + 30.0;
+    while (!$first->done() && microtime(true) < $deadline) {
+        $conn = @stream_socket_accept($listener, 0.05);
+        if ($conn !== false) {
+            $notServed($conn);
+        }
+        $first->pump(0.05);
+    }
+    $r = $first->finish(1.0);
+    eq(200, $r['status'], $r['body']);
+    contains('Checked:', $r['body']);
+    ok(is_file($data . '/installed.lock'), 'installed');
+    ok(!file_exists($root . '/INSTALL_ENABLED'), 'INSTALL_ENABLED was deleted');
+    ok(!file_exists($data . '/' . Oaiy\Relay\Installer::CLAIM), 'the claim is gone');
+
+    // One relay, whole: the first key names the fingerprint of the relay key that is on disk, the admin token is the one
+    // whose hash is kept, and one key waits for a desktop (the second post minted none).
+    [$pk] = Oaiy\Relay\Info::loadKeys($data);
+    contains('&f=' . Oaiy\Relay\Crypto::thumbprint($pk) . '&', (string)file_get_contents($data . '/first-key.txt'));
+    $admin = json_decode((string)file_get_contents($data . '/secrets/admin.json'), true);
+    eq($admin['id'], explode('.', trim((string)file_get_contents($data . '/admin-token.txt')))[1]);
+    $db = Oaiy\Relay\Db::open(Oaiy\Relay\Config::load($data));
+    eq(1, (int)$db->val('SELECT COUNT(*) FROM enroll_keys'), 'one first key');
+    unset($db);
+    Tmp::after('gc_collect_cycles');
+    // And a post after the end is what every request to a finished installer is.
+    eq(404, $two->request('POST', '/install.php', $headers, $form)['status']);
+});

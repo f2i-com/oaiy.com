@@ -450,15 +450,17 @@ impl MobileAdmission {
         MobileAdmission::parse_with(body, expect, now, false)
     }
 
-    /// Compares the admission with what the phone holds from its pairing: the `scopes` are exactly the grants the desktop signed into the approval receipt (as sets), and
+    /// Compares the admission with what the phone holds from its pairing: every one of the `scopes` is among the grants the desktop signed into the approval receipt, and
     /// `expectedPeerKeyThumbprint` is the thumbprint of the desktop endpoint key the phone pinned from the MAC-verified offer. A relay that grants a phone more than the owner
     /// approved, or names another desktop as its peer, is refused here; [`MobileAdmission::parse`] reads the answer and does not know what was approved.
+    ///
+    /// **Fewer scopes than the receipt's grants are accepted.** The desktop may narrow a phone after the pairing (`POST /v1/devices/{id}`), the relay's next admission carries the
+    /// narrower set, and a phone that asked for the exact set of the receipt was refused every admission from then on, until it paired again. A scope the receipt does not hold
+    /// is refused all the same: nothing the desktop signed says the owner approved it, and the relay alone must not be able to add one, so a wider tier needs a new pairing for as
+    /// long as there is no grant update that the desktop signs.
     pub fn check_against(&self, grants: &[String], desktop_endpoint_thumbprint: &str) -> Result<()> {
-        let (mut a, mut b) = (self.scopes.clone(), grants.to_vec());
-        a.sort();
-        b.sort();
-        if a != b {
-            return Err(Error::Mismatch("admission: the scopes are not the grants the desktop signed"));
+        if self.scopes.iter().any(|s| !grants.contains(s)) {
+            return Err(Error::Mismatch("admission: a scope is not among the grants the desktop signed"));
         }
         if !crate::ids::is_thumbprint(desktop_endpoint_thumbprint) || self.expected_peer_thumbprint != desktop_endpoint_thumbprint {
             return Err(Error::Mismatch("admission: the expected peer is not the desktop the phone pinned"));

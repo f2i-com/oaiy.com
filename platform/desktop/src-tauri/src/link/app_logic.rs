@@ -103,7 +103,13 @@ const FETCH_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// [`AppLogicCatalogue`], a second provider is a descriptor away; read through
 /// a struct, it is a release away.
 #[derive(Debug, Clone)]
-pub struct AppEntry(Value);
+pub struct AppEntry {
+    doc: Value,
+    /// The sources whose events the account gave to this app and no other, as
+    /// the provider keeps that choice ([`fetch`] reads it with the list). It is
+    /// not in the app's own document, which only says what the app could take.
+    chosen_for: Vec<String>,
+}
 
 /// One script, once the catalogue names have been resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,9 +120,34 @@ pub struct ScriptRef<'a> {
 }
 
 impl AppEntry {
+    /// An app as the provider listed it, which the account has chosen for no
+    /// source.
+    fn listed(doc: Value) -> Self {
+        Self { doc, chosen_for: Vec::new() }
+    }
+
+    /// The sources this app says it takes events from, where the provider's
+    /// catalogue says what that list is called. None when it does not, or the
+    /// app lists none: nothing is known of what this app takes.
+    fn sources<'a>(&'a self, c: &AppLogicCatalogue) -> Vec<&'a str> {
+        let Some(list) = c.sources.as_ref() else {
+            return Vec::new();
+        };
+        self.doc
+            .get(list)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     /// A stable id for this app, for the storage file and the logs.
     fn key<'a>(&'a self, c: &AppLogicCatalogue) -> Option<&'a str> {
-        let app = self.0.get(&c.app_block)?;
+        let app = self.doc.get(&c.app_block)?;
         app.get(&c.app_id)
             .and_then(Value::as_str)
             .map(str::trim)
@@ -137,7 +168,7 @@ impl AppEntry {
     /// desktop would keep running headlessly what the browser had stopped
     /// running, and the author would have no way to tell.
     fn event_scripts<'a>(&'a self, c: &AppLogicCatalogue, hook: &str) -> Vec<ScriptRef<'a>> {
-        self.0
+        self.doc
             .get(&c.logic_block)
             .and_then(|l| l.get(&c.scripts))
             .and_then(Value::as_array)
@@ -164,7 +195,7 @@ impl AppEntry {
     /// This app's forms, as (portable key, the account's own id) pairs. Either
     /// side blank is not a form a script can name, so it is not offered.
     fn forms<'a>(&'a self, c: &AppLogicCatalogue) -> Vec<(&'a str, &'a str)> {
-        self.0
+        self.doc
             .get(&c.forms)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
@@ -177,6 +208,110 @@ impl AppEntry {
             })
             .collect()
     }
+
+    /// The id of the form a script names by that id itself, or by the name the
+    /// app shows the form under (where the provider says what that is called).
+    fn form_named<'a>(&'a self, c: &AppLogicCatalogue, key: &str) -> Option<&'a str> {
+        let forms = self.doc.get(&c.forms).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let id_of = |f: &'a Value| f.get(&c.form_id).and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty());
+        forms.iter().filter_map(id_of).find(|id| *id == key).or_else(|| {
+            let label = c.form_label.as_ref()?;
+            forms
+                .iter()
+                .find(|f| f.get(label).and_then(Value::as_str).map(str::trim) == Some(key))
+                .and_then(id_of)
+        })
+    }
+}
+
+// --- which app an event is for ---------------------------------------------
+
+/// Which of the account's apps takes the events of one source.
+///
+/// Two apps built on one plugin (the same pack installed twice, say) both
+/// carry scripts for its events. Run for both, every call wrote its records
+/// twice, once into each app, and started the flows of both. The provider's
+/// rule is that a source's events go to ONE app: the one the account chose for
+/// it, or the only one that could take them, and to none while several could
+/// and none is chosen.
+///
+/// The rule is applied only as far as the provider says who takes what. The
+/// `candidates` are the apps that carry scripts for an event AND say they take
+/// this source. With none of those (a provider that publishes no such list, an
+/// account whose apps list nothing) nothing is known, and every app's scripts
+/// run as they did before this was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route<'a> {
+    source: &'a str,
+    candidates: Vec<&'a str>,
+    chosen: Option<&'a str>,
+}
+
+impl Route<'_> {
+    /// Whether `app`'s scripts run for the event: every app's while nothing is
+    /// known, and otherwise those of the one app that takes it.
+    fn runs(&self, app: &str) -> bool {
+        self.candidates.is_empty() || self.chosen == Some(app)
+    }
+
+    /// Whether the other work `app` has on the event (a flow of its own) is
+    /// held back: the app is one of those that could take the source's events
+    /// and is not the one that does. An app nothing is known of is never held
+    /// back, which is what its flows did before.
+    pub fn holds_back(&self, app: &str) -> bool {
+        self.candidates.contains(&app) && self.chosen != Some(app)
+    }
+
+    /// Why no app takes the event, when several could and the account has
+    /// chosen none of them: in words for the one who can choose.
+    pub fn unchosen(&self) -> Option<String> {
+        if self.chosen.is_some() || self.candidates.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} of this account's apps take events from {:?} ({}) and it is assigned to none of \
+             them, so none was given this event: assign {:?} to one app on the provider's site",
+            self.candidates.len(),
+            self.source,
+            self.candidates.join(", "),
+            self.source
+        ))
+    }
+}
+
+/// Decide which app takes the events of `source`: see [`Route`].
+pub fn route<'a>(spec: &AppLogicSpec, apps: &'a [AppEntry], source: &'a str) -> Route<'a> {
+    let c = &spec.catalogue;
+    // One entry an app, however often the provider listed it (a second copy is
+    // refused where the scripts are collected, and must not make an app look
+    // like two that could take the event).
+    let mut could: Vec<&AppEntry> = Vec::new();
+    for app in apps {
+        let Some(key) = app.key(c) else { continue };
+        if app.sources(c).contains(&source)
+            && !app.event_scripts(c, &spec.event_hook).is_empty()
+            && !could.iter().any(|other| other.key(c) == Some(key))
+        {
+            could.push(app);
+        }
+    }
+    let chosen = match could.as_slice() {
+        [only] => Some(*only),
+        several => several.iter().copied().find(|app| app.chosen_for.iter().any(|s| s == source)),
+    };
+    Route {
+        source,
+        candidates: could.iter().filter_map(|app| app.key(c)).collect(),
+        chosen: chosen.and_then(|app| app.key(c)),
+    }
+}
+
+/// Whether two of `apps` could take the same source's events: only then does
+/// the account's choice between them decide anything.
+fn contested(spec: &AppLogicSpec, apps: &[AppEntry]) -> bool {
+    let listed: std::collections::BTreeSet<&str> =
+        apps.iter().flat_map(|app| app.sources(&spec.catalogue)).collect();
+    listed.into_iter().any(|source| route(spec, apps, source).candidates.len() > 1)
 }
 
 // --- what this module reports --------------------------------------------
@@ -395,20 +530,62 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("could not build the app-logic client: {e}"))
 }
 
+/// The account's apps, and which of them the account chose where two could
+/// take the same source's events.
+///
+/// The list is asked for without saying which logic languages this desktop
+/// runs, on purpose, though the flow lane says them on its own requests
+/// ([`super::heartbeat::logic_languages`]). A provider lists the scripts in the
+/// languages its caller names, and every script this lane is handed is run as
+/// JavaScript ([`script_job`]): named a second language, it would be handed
+/// scripts in that one and run them as the first. Saying nothing is read as
+/// one language, which is what this lane has.
 fn fetch(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Vec<AppEntry>, String> {
+    let c = &spec.catalogue;
+    let mut apps: Vec<AppEntry> = fetch_list(account, &spec.path, &c.apps, "app list")?
+        .into_iter()
+        .map(AppEntry::listed)
+        .collect();
+    // Which app the account chose is asked only when two of them could take
+    // the same source's events. An account with one such app runs it whatever
+    // was chosen, so it is not made to wait on a second request, or to fail
+    // with it. Where it is asked and cannot be read, neither can the list be
+    // used: run without the choice, both apps would write the event.
+    if let Some(routing) = spec.routing.as_ref().filter(|_| contested(spec, &apps)) {
+        let choices = fetch_list(account, &routing.path, &routing.list, "list of which app takes which events")?;
+        for choice in &choices {
+            let (Some(source), Some(app)) = (
+                choice.get(&routing.source).and_then(Value::as_str),
+                choice.get(&routing.app).and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            // (an app that is not in the list has no scripts to be chosen for)
+            for entry in apps.iter_mut().filter(|entry| entry.key(c) == Some(app)) {
+                entry.chosen_for.push(source.to_string());
+            }
+        }
+    }
+    Ok(apps)
+}
+
+/// GET one of the lane's lists: the array the reply at `path` holds under
+/// `key`. `what` is the list in words, for the reasons it could not be read.
+fn fetch_list(account: &LinkedAccount, path: &str, key: &str, what: &str) -> Result<Vec<Value>, String> {
     let resp = client()?
-        .get(super::oauth::join(&account.base_url, &spec.path))
+        .get(super::oauth::join(&account.base_url, path))
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the app-logic lane: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body: Value = super::net::read_json(resp).unwrap_or(Value::Null);
+        let refused = format!("the provider refused the {what}");
         let message = body
             .get("message")
             .or_else(|| body.get("error"))
             .and_then(Value::as_str)
-            .unwrap_or("the provider refused the app list");
+            .unwrap_or(&refused);
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err(format!(
                 "this desktop's key may not read the account's app logic ({message}) — link again"
@@ -416,26 +593,24 @@ fn fetch(account: &LinkedAccount, spec: &AppLogicSpec) -> Result<Vec<AppEntry>, 
         }
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    let reply: Value = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
-        .map_err(|e| format!("the app-logic lane returned an unreadable app list: {e}"))?;
+    let mut reply: Value = super::net::read_json_up_to(resp, super::net::MAX_LIST_BYTES)
+        .map_err(|e| format!("the app-logic lane returned an unreadable {what}: {e}"))?;
     // A missing array is NOT an account with no apps: it is a reply this
     // descriptor does not describe, and treating the two the same would leave
     // an install recording nothing with nothing to show for it.
-    let apps = reply.get(&spec.catalogue.apps).ok_or_else(|| {
+    let list = reply.get_mut(key).ok_or_else(|| {
         format!(
-            "the app-logic lane's reply carries no {:?}, so this connector's descriptor does not \
-             describe it",
-            spec.catalogue.apps
+            "the app-logic lane's reply carries no {key:?}, so this connector's descriptor does not \
+             describe it"
         )
     })?;
-    let apps = apps.as_array().ok_or_else(|| {
-        format!(
-            "the app-logic lane returned {:?} as a {} rather than a list of apps",
-            spec.catalogue.apps,
-            type_name(apps)
-        )
-    })?;
-    Ok(apps.iter().cloned().map(AppEntry).collect())
+    match list.take() {
+        Value::Array(list) => Ok(list),
+        other => Err(format!(
+            "the app-logic lane returned {key:?} as a {} rather than the {what}",
+            type_name(&other)
+        )),
+    }
 }
 
 // --- the storage a script dedups on ---------------------------------------
@@ -604,6 +779,8 @@ impl StorageStore {
 // --- running the scripts ---------------------------------------------------
 
 /// Every script of every app, run against one event, with its effects performed.
+/// "Every app" is every app the event is for: where the provider says which of
+/// the account's apps take its source, that is one of them ([`Route`]).
 ///
 /// Returns what happened, most useful first for a log: one [`Outcome`] per
 /// effect attempted plus one for anything that went wrong before the effects
@@ -728,7 +905,9 @@ struct AppRun<'a> {
 /// Resolve every app that has work on this event, with its markers read.
 ///
 /// Anything that stops an app before its scripts — no id, listed twice, markers
-/// that would not read — is pushed onto `out` here and the app is left out.
+/// that would not read — is pushed onto `out` here and the app is left out. An
+/// app the event is not for ([`Route`]) is left out without a word: nothing
+/// went wrong, the event is another app's.
 fn collect<'a>(
     spec: &AppLogicSpec,
     apps: &'a [AppEntry],
@@ -737,6 +916,15 @@ fn collect<'a>(
     out: &mut Vec<Outcome>,
 ) -> Vec<AppRun<'a>> {
     let mut runs = Vec::new();
+    let source = envelope.get("source").and_then(Value::as_str).unwrap_or("");
+    let routed = route(spec, apps, source);
+    // Several apps could take it and the account has chosen none: run for all
+    // of them it would be written into each, so it is run for none, and that
+    // is said ONCE, for the event, not once an app.
+    if let Some(why) = routed.unchosen() {
+        out.push(Outcome::err("-", "-", "lane", why));
+        return runs;
+    }
     let mut ran: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for entry in apps {
         let Some(app) = entry.key(&spec.catalogue) else {
@@ -753,6 +941,9 @@ fn collect<'a>(
         };
         let scripts = entry.event_scripts(&spec.catalogue, &spec.event_hook);
         if scripts.is_empty() {
+            continue;
+        }
+        if !routed.runs(app) {
             continue;
         }
         // Two entries for one app would run its scripts twice against the SAME
@@ -1139,6 +1330,11 @@ fn form_id<'a>(spec: &AppLogicSpec, entry: &'a AppEntry, effect: &Value) -> Resu
         .iter()
         .find(|(k, _)| *k == key)
         .map(|(_, id)| *id)
+        // As the provider's own page resolves a key: the portable key first,
+        // then the form's id, then the name the app shows it under. An app
+        // that was not installed from a pack has no portable keys, and the
+        // browser wrote its scripts' records where this lane refused them.
+        .or_else(|| entry.form_named(&spec.catalogue, key))
         .ok_or_else(|| {
             let known: Vec<&str> = forms.iter().map(|(k, _)| *k).collect();
             format!(
@@ -1329,14 +1525,62 @@ fn find_record(
     field: &str,
     wanted: &Value,
 ) -> Result<Option<String>, Failed> {
+    // Asked of the provider first, where it filters its listing (`matchFilterParam`): a record
+    // the newest page no longer holds is found then. The scan alone missed it, and an effect
+    // that creates on a miss made a second one (an SMS thread by its number, once 200 newer
+    // threads existed). Only for words in a plainly named field, which is what such a filter
+    // takes. A miss, or a listing the provider will not filter (a form whose records it cannot
+    // read), falls back to the scan, so nothing the scan found before is lost.
+    if let (Some(param), Value::String(text)) = (&spec.match_filter_param, wanted) {
+        let plain = !field.is_empty() && field.len() <= 64 && field.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if plain {
+            let filter = format!(
+                "{}={}",
+                param.replace("{field}", field),
+                url::form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>()
+            );
+            match scan_records(account, spec, form, field, wanted, Some(&filter)) {
+                Ok((Some(id), _)) => return Ok(Some(id)),
+                Ok((None, _)) => {}
+                // (the provider is away or busy: the event is sent again, as from the scan)
+                Err(e) if e.transient => return Err(e),
+                Err(_) => {}
+            }
+        }
+    }
+    let (found, seen) = scan_records(account, spec, form, field, wanted, None)?;
+    if found.is_none() && seen as u32 >= spec.match_scan_limit {
+        log::info!(
+            "app-logic: no record has {field}={} in the newest {} of this form, which is the              whole page — an older one would not have been seen",
+            scalar_text(wanted),
+            spec.match_scan_limit
+        );
+    }
+    Ok(found)
+}
+
+/// One page of the form's records (`filter`: a query parameter the provider narrows it by),
+/// and the id of the first whose `field` holds `wanted`, with how many records the page held.
+fn scan_records(
+    account: &LinkedAccount,
+    spec: &AppLogicSpec,
+    form: &str,
+    field: &str,
+    wanted: &Value,
+    filter: Option<&str>,
+) -> Result<(Option<String>, usize), Failed> {
     let form_seg = super::oauth::path_segment(form, "form id")?;
     let path = spec.list_path.replace("{formId}", &form_seg);
     let sep = if path.contains('?') { '&' } else { '?' };
-    let url = format!(
+    let mut url = format!(
         "{}{sep}limit={}",
         super::oauth::join(&account.base_url, &path),
         spec.match_scan_limit
     );
+    if let Some(filter) = filter {
+        url.push('&');
+        url.push_str(filter);
+    }
     let resp = client()?
         .get(&url)
         .bearer_auth(&account.credential)
@@ -1359,18 +1603,7 @@ fn find_record(
         let held = row.get(&spec.fields.record)?.get(field)?;
         same_value(held, wanted).then(|| row.get(&spec.fields.id))?
     });
-    if let Some(id) = found.and_then(Value::as_str) {
-        return Ok(Some(id.to_string()));
-    }
-    if items.len() as u32 >= spec.match_scan_limit {
-        log::info!(
-            "app-logic: no record has {field}={} in the newest {} of this form, which is the \
-             whole page — an older one would not have been seen",
-            scalar_text(wanted),
-            spec.match_scan_limit
-        );
-    }
-    Ok(None)
+    Ok((found.and_then(Value::as_str).map(str::to_string), items.len()))
 }
 
 /// Whether a stored value and a wanted one are the same.
@@ -1468,7 +1701,7 @@ mod tests {
     }
 
     fn entry(forms: Value, scripts: Value) -> AppEntry {
-        AppEntry(json!({
+        AppEntry::listed(json!({
             "app": { "id": "app-1", "slug": "receptionist" },
             "customLogic": { "version": 1, "runtime": "quickjs", "scripts": scripts },
             "forms": forms,
@@ -1503,7 +1736,7 @@ mod tests {
     #[test]
     fn the_providers_prelude_travels_with_the_app_logic_batch() {
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1", "slug": "a" },
             "customLogic": { "scripts": [
                 { "id": "s1", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
@@ -1538,14 +1771,14 @@ mod tests {
         // one true thing once per app.
         let s = spec();
         let apps = vec![
-            AppEntry(json!({
+            AppEntry::listed(json!({
                 "app": { "id": "app-1", "slug": "a" },
                 "customLogic": { "scripts": [
                     { "id": "s1", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
                 ] },
                 "forms": []
             })),
-            AppEntry(json!({
+            AppEntry::listed(json!({
                 "app": { "id": "app-2", "slug": "b" },
                 "customLogic": { "scripts": [
                     { "id": "s2", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
@@ -1715,7 +1948,7 @@ mod tests {
         // per app, which is what every event used to cost.
         let s = spec();
         let app = |id: &str| {
-            AppEntry(json!({
+            AppEntry::listed(json!({
                 "app": { "id": id },
                 "customLogic": { "scripts": [
                     { "id": "a", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
@@ -1759,7 +1992,7 @@ mod tests {
         // spawned by the first job it is asked to serve. An account whose apps
         // carry no event logic must not start one.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [{ "id": "s", "hook": "onInstall", "source": "x" }] },
             "forms": []
@@ -1788,7 +2021,7 @@ mod tests {
         // way to tell. Only an explicit `false` disables — the key is usually
         // absent, and absent is a script that runs.
         let s = spec();
-        let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": [
+        let app = AppEntry::listed(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": [
             { "id": "on",      "hook": "onConnectorEvent", "source": "function run(){}", "enabled": true },
             { "id": "default", "hook": "onConnectorEvent", "source": "function run(){}" },
             { "id": "off",     "hook": "onConnectorEvent", "source": "function run(){}", "enabled": false }
@@ -1811,7 +2044,7 @@ mod tests {
         let s = spec();
         let big = format!("function run(ctx) {{ /* {} */ return {{}}; }}", "x".repeat(MAX_SCRIPT_SOURCE_BYTES));
         assert!(big.len() > MAX_SCRIPT_SOURCE_BYTES);
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [
                 { "id": "huge",  "hook": "onConnectorEvent", "source": big },
@@ -1916,7 +2149,7 @@ mod tests {
         // The scripts did not disagree about anything; the engine was not
         // there. One line names the app and says its scripts did not run.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [
                 { "id": "a", "hook": "onConnectorEvent", "source": "function run(){}" },
@@ -1948,7 +2181,7 @@ mod tests {
         // envelope's: one fresh engine per job, so a throw cannot reach a
         // neighbour and cannot fail the batch.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [
                 { "id": "throws", "hook": "onConnectorEvent", "source": "function run(){ boom(); }" },
@@ -1999,7 +2232,7 @@ mod tests {
         // reported success.
         let mut s = spec();
         s.entry_function = None;
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [
                 { "id": "a", "hook": "onConnectorEvent", "source": "function run(){}" }
@@ -2423,12 +2656,68 @@ mod tests {
         );
         assert_eq!(out[0].detail.clone().unwrap(), "updated record resp-1");
 
+        // The provider is asked for the record by its field first (its listing filters), so one
+        // older than the newest page is found: the scan alone missed it, and an upsert then made
+        // a second record. The value is written as a query takes it.
         let (list, _) = rx.recv().unwrap();
         assert!(list.starts_with("GET /api/v1/forms/form-2/responses?limit="), "{list}");
+        assert!(list.contains("&answers.turn_key=c1%3A3 "), "{list}");
         let (put, body) = rx.recv().unwrap();
         assert!(put.starts_with("PUT /api/v1/forms/form-2/responses/resp-1 "), "{put}");
         assert!(body.contains("corrected"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_match_the_filtered_listing_misses_is_still_looked_for_in_the_newest_page() {
+        // A number held where the script wrote its text, a field a filter does not take, a value
+        // that is no text: each is found by the scan, as before there was a filter to ask.
+        let s = spec();
+        let e = entry(json!([{ "id": "form-2", "packFormId": "turns" }]), json!([]));
+        let (base, rx) = stub(NO_ROWS, "200 OK");
+        let (storage, dir) = store("match-fallback");
+        let out = apply_effects(
+            &account(base),
+            &s,
+            &e,
+            "app-1",
+            "script-1",
+            &[
+                json!({ "type": "formlogic.updateResponse", "formKey": "turns", "match": { "field": "turn_key", "value": "c9" }, "answers": { "text": "x" } }),
+                json!({ "type": "formlogic.updateResponse", "formKey": "turns", "match": { "field": "turn key", "value": "c9" }, "answers": { "text": "x" } }),
+                json!({ "type": "formlogic.updateResponse", "formKey": "turns", "match": { "field": "turn_key", "value": 9 }, "answers": { "text": "x" } }),
+            ],
+            &storage,
+            "evt-1",
+            &no_connector(),
+        );
+        assert!(out.iter().all(|o| o.detail.clone().unwrap().contains("nothing changed")), "{out:?}");
+        let mut lists = Vec::new();
+        while let Ok((line, _)) = rx.recv_timeout(Duration::from_millis(400)) {
+            lists.push(line);
+        }
+        let filtered: Vec<bool> = lists.iter().map(|l| l.contains("answers.")).collect();
+        assert_eq!(filtered, [true, false, false, false], "asked by the field once, then scanned: {lists:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_form_is_found_by_its_key_then_its_id_then_the_name_the_app_shows() {
+        // As the provider's own page resolves a key. An app that was not installed from a pack
+        // has no portable keys, and its scripts' records were refused here ("no form keyed").
+        let s = spec();
+        let e = entry(
+            json!([
+                { "id": "form-1", "packFormId": "calls", "displayName": "form-2" },
+                { "id": "form-2", "packFormId": null, "displayName": "Visits" },
+            ]),
+            json!([]),
+        );
+        let effect = |key: &str| json!({ "type": "formlogic.submitResponse", "formKey": key, "answers": {} });
+        assert_eq!(form_id(&s, &e, &effect("calls")).unwrap(), "form-1");
+        assert_eq!(form_id(&s, &e, &effect("form-2")).unwrap(), "form-2", "an id before a name");
+        assert_eq!(form_id(&s, &e, &effect("Visits")).unwrap(), "form-2");
+        assert!(form_id(&s, &e, &effect("visits")).unwrap_err().contains("no form keyed"));
     }
 
     #[test]
@@ -2575,7 +2864,7 @@ mod tests {
         });
         let c = &spec().catalogue;
         let apps = raw["apps"].as_array().unwrap().clone();
-        let e = AppEntry(apps[0].clone());
+        let e = AppEntry::listed(apps[0].clone());
         assert_eq!(e.key(c), Some("e2e19da6"));
         let scripts = e.event_scripts(c, "onConnectorEvent");
         assert_eq!(scripts.len(), 1, "only the event hook, and not the empty one");
@@ -2585,12 +2874,12 @@ mod tests {
         assert_eq!(e.forms(c), vec![("calls", "fde1f7f6")]);
 
         // An app with no logic at all is ordinary, not a failure.
-        let bare = AppEntry(json!({ "app": { "id": "x" } }));
+        let bare = AppEntry::listed(json!({ "app": { "id": "x" } }));
         assert!(bare.event_scripts(c, "onConnectorEvent").is_empty());
         assert_eq!(bare.key(c), Some("x"));
         // …and the slug stands in when there is no id.
         assert_eq!(
-            AppEntry(json!({ "app": { "id": "  ", "slug": "s" } })).key(c),
+            AppEntry::listed(json!({ "app": { "id": "  ", "slug": "s" } })).key(c),
             Some("s")
         );
     }
@@ -2616,7 +2905,7 @@ mod tests {
         // Its markers would have nowhere to live, so every event it handled
         // would be handled again on the next delivery — forever.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": {},
             "customLogic": { "scripts": [
                 { "id": "s", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
@@ -2783,7 +3072,7 @@ mod tests {
         ]);
         // Through the same reader the lane uses, so these really are the jobs
         // an event would build.
-        let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
+        let app = AppEntry::listed(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
         let s = spec();
         let refs = app.event_scripts(&s.catalogue, &s.event_hook);
         assert_eq!(refs.len(), 7, "every script here runs on the event hook");
@@ -2903,7 +3192,7 @@ mod tests {
         // it: the standard library, then an effect.
         let raw = json!([{ "id": "s1", "hook": "onConnectorEvent", "source":
             "function run(ctx) {\n  var d = (ctx.event || {}).data || {};\n  if (!validators.email(d.to)) return {};\n  return { effects: [{ type: 'storage.set', key: 'seen', value: sum(d.amounts) }] };\n}" }]);
-        let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
+        let app = AppEntry::listed(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
         let s = spec();
         let refs = app.event_scripts(&s.catalogue, &s.event_hook);
         let ctx = json!({
@@ -2998,7 +3287,7 @@ mod tests {
             ] },
             "forms": []
         });
-        let apps = vec![AppEntry(one.clone()), AppEntry(one)];
+        let apps = vec![AppEntry::listed(one.clone()), AppEntry::listed(one)];
         let (storage, dir) = store("twice");
         let out = handle_event(
             &account("http://provider.invalid".into()),
@@ -3023,7 +3312,7 @@ mod tests {
         // because the file would not read makes every one of them act again —
         // the entire recorded history, rewritten, on one unlucky read.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [
                 { "id": "s", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
@@ -3058,7 +3347,7 @@ mod tests {
         // No runner is started at all — this runs on every plugin event, and an
         // account whose apps carry no event logic must not pay a process for it.
         let s = spec();
-        let apps = vec![AppEntry(json!({
+        let apps = vec![AppEntry::listed(json!({
             "app": { "id": "app-1" },
             "customLogic": { "scripts": [{ "id": "s", "hook": "onInstall", "source": "x" }] },
             "forms": []
@@ -3077,6 +3366,246 @@ mod tests {
         assert!(out.is_empty());
         assert!(!storage.path().exists(), "nothing was written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- which app an event is for -------------------------------------------
+
+    /// An app with one event script, whose source says which app's it is, that
+    /// takes events from `sources` (none: its listing says nothing of them).
+    fn app_taking(id: &str, sources: Option<Value>) -> AppEntry {
+        let mut doc = json!({
+            "app": { "id": id },
+            "customLogic": { "scripts": [
+                { "id": "s", "hook": "onConnectorEvent", "source": format!("function run(ctx) {{ return {{}}; }} // {id}") }
+            ] },
+            "forms": []
+        });
+        if let Some(sources) = sources {
+            doc["connectors"] = sources;
+        }
+        AppEntry::listed(doc)
+    }
+
+    /// The same, chosen by the account for the events of `source`.
+    fn chosen_for(mut app: AppEntry, source: &str) -> AppEntry {
+        app.chosen_for.push(source.to_string());
+        app
+    }
+
+    /// The apps whose scripts one event from the plugin `aokie` was run for (by
+    /// what each job's source says; none when no batch was sent at all), and
+    /// what was said of it.
+    fn run_for(s: &AppLogicSpec, apps: &[AppEntry], tag: &str) -> (Vec<String>, Vec<Outcome>) {
+        let (storage, dir) = store(tag);
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            s,
+            apps,
+            &storage,
+            &json!({ "name": "aokie.call.ended", "source": "aokie", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::None,
+            &no_connector(),
+        );
+        let ran = match host.calls() {
+            0 => Vec::new(),
+            _ => host.only_request()["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|job| job["source"].as_str().unwrap().rsplit("// ").next().unwrap().to_string())
+                .collect(),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        (ran, out)
+    }
+
+    #[test]
+    fn the_shipped_connector_reads_who_takes_a_sources_events_and_whom_the_account_chose() {
+        // FormLogic's names, as data: an app lists the plugins it holds grants
+        // for under `connectors` (FlowService::getOwnerAppLogic), and the
+        // account's choice of one app for a plugin is a row of `assignments`
+        // (FlowService::getConnectorAssignments).
+        let s = spec();
+        assert_eq!(s.catalogue.sources.as_deref(), Some("connectors"));
+        let routing = s.routing.expect("the shipped connector says where the choice is read");
+        assert_eq!(
+            (routing.path.as_str(), routing.list.as_str(), routing.source.as_str(), routing.app.as_str()),
+            ("/api/v1/connector-assignments", "assignments", "connectorId", "appId")
+        );
+    }
+
+    #[test]
+    fn an_event_goes_to_the_one_app_that_takes_its_source() {
+        // Two apps carry event scripts and one of them holds the plugin's
+        // grants. Both were run, so the other wrote records of calls it has
+        // nothing to do with.
+        let apps = [
+            app_taking("app-phone", Some(json!(["aokie"]))),
+            app_taking("app-fleet", Some(json!(["vehicle"]))),
+            app_taking("app-notes", Some(json!([]))),
+        ];
+        let (ran, out) = run_for(&spec(), &apps, "route-one");
+        assert_eq!(ran, ["app-phone"], "{out:?}");
+        assert!(out.is_empty(), "an app the event is not for is not a failure: {out:?}");
+    }
+
+    #[test]
+    fn two_apps_that_take_a_source_get_its_events_in_the_one_the_account_chose() {
+        // The same pack installed twice: every call was written into both.
+        let apps = [
+            app_taking("app-old", Some(json!(["aokie"]))),
+            chosen_for(app_taking("app-new", Some(json!(["aokie"]))), "aokie"),
+            app_taking("app-notes", None),
+        ];
+        let (ran, out) = run_for(&spec(), &apps, "route-chosen");
+        assert_eq!(ran, ["app-new"], "{out:?}");
+        assert!(out.is_empty(), "{out:?}");
+
+        // Chosen for another source's events is not chosen for this one's.
+        let apps = [
+            app_taking("app-old", Some(json!(["aokie", "vehicle"]))),
+            chosen_for(app_taking("app-new", Some(json!(["aokie", "vehicle"]))), "vehicle"),
+        ];
+        let (ran, out) = run_for(&spec(), &apps, "route-chosen-elsewhere");
+        assert!(ran.is_empty() && out.len() == 1, "{ran:?} {out:?}");
+    }
+
+    #[test]
+    fn two_apps_that_take_a_source_and_no_choice_between_them_run_nothing_and_say_so_once() {
+        let apps = [
+            app_taking("app-old", Some(json!(["aokie"]))),
+            app_taking("app-new", Some(json!(["aokie"]))),
+            // (not one that could take it, and not run either: the event is not known to be its)
+            app_taking("app-notes", None),
+        ];
+        let (ran, out) = run_for(&spec(), &apps, "route-unchosen");
+        assert!(ran.is_empty(), "no batch is sent at all: {ran:?}");
+        assert_eq!(out.len(), 1, "once for the event, not once an app: {out:?}");
+        assert_eq!((out[0].effect.as_str(), out[0].transient), ("lane", false));
+        let why = out[0].detail.clone().unwrap_err();
+        assert!(why.contains("\"aokie\"") && why.contains("app-old, app-new") && why.contains("assign"), "{why}");
+    }
+
+    #[test]
+    fn where_nothing_says_who_takes_a_source_every_apps_scripts_run_as_they_did() {
+        // No app lists the plugin: nothing is known, and nothing changes.
+        let unlisted = [app_taking("app-1", None), app_taking("app-2", Some(json!([]))), app_taking("app-3", Some(json!(["vehicle"])))];
+        let (ran, out) = run_for(&spec(), &unlisted, "route-unlisted");
+        assert_eq!(ran, ["app-1", "app-2", "app-3"], "{out:?}");
+
+        // A connector that does not name the list: the same apps that would
+        // have been told apart are all run, as before the rule was read.
+        let mut legacy = spec();
+        legacy.catalogue.sources = None;
+        legacy.routing = None;
+        let both = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
+        let (ran, out) = run_for(&legacy, &both, "route-unnamed");
+        assert_eq!(ran, ["app-old", "app-new"], "{out:?}");
+
+        // An event that names no source is no plugin's, so it is nobody's in particular.
+        let (storage, dir) = store("route-no-source");
+        let host = FakeHost::always(json!({}));
+        handle_event(&account("http://provider.invalid".into()), &spec(), &both, &storage, &json!({ "name": "x", "idempotencyKey": "evt-1" }), &host, Prelude::None, &no_connector());
+        assert_eq!(host.only_request()["jobs"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_an_app_with_scripts_for_the_event_counts_as_one_that_could_take_it() {
+        // An app that holds the plugin's grants and runs nothing on its events
+        // (its scripts are for other moments, or switched off) does not make the
+        // one that does ambiguous: that one ran alone before, and still does.
+        let mut idle = app_taking("app-idle", Some(json!(["aokie"])));
+        idle.doc["customLogic"]["scripts"][0]["enabled"] = json!(false);
+        let apps = [idle, app_taking("app-phone", Some(json!(["aokie"])))];
+        let s = spec();
+        let routed = route(&s, &apps, "aokie");
+        assert_eq!((routed.candidates.clone(), routed.chosen), (vec!["app-phone"], Some("app-phone")));
+        let (ran, out) = run_for(&s, &apps, "route-idle");
+        assert_eq!(ran, ["app-phone"], "{out:?}");
+
+        // Nor does an app the provider listed twice count as two.
+        let twice = [app_taking("app-phone", Some(json!(["aokie"]))), app_taking("app-phone", Some(json!(["aokie"])))];
+        assert_eq!(route(&s, &twice, "aokie").chosen, Some("app-phone"));
+    }
+
+    #[test]
+    fn a_flow_of_an_app_is_held_back_only_when_the_app_could_have_taken_the_event_and_does_not() {
+        let s = spec();
+        let apps = [
+            app_taking("app-old", Some(json!(["aokie"]))),
+            chosen_for(app_taking("app-new", Some(json!(["aokie"]))), "aokie"),
+            app_taking("app-notes", None),
+        ];
+        let routed = route(&s, &apps, "aokie");
+        assert!(routed.holds_back("app-old"));
+        assert!(!routed.holds_back("app-new"), "the one the events go to");
+        assert!(!routed.holds_back("app-notes") && !routed.holds_back("app-unheard-of"), "nothing is known of these: as before");
+        assert!(routed.unchosen().is_none());
+
+        // No choice: both are held back, and why is said.
+        let apps = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
+        let routed = route(&s, &apps, "aokie");
+        assert!(routed.holds_back("app-old") && routed.holds_back("app-new") && !routed.holds_back("app-notes"));
+        assert!(routed.unchosen().is_some());
+        // Another plugin's events are not these apps' to take, so nothing of theirs is held back for them.
+        let other = route(&s, &apps, "vehicle");
+        assert!(!other.holds_back("app-old") && other.unchosen().is_none());
+    }
+
+    #[test]
+    fn the_accounts_choice_is_read_with_the_app_list_and_only_when_two_apps_could_take_a_source() {
+        use crate::link::testkit::{Provider, Reply};
+        let listing = |apps: &[AppEntry]| json!({ "apps": apps.iter().map(|a| a.doc.clone()).collect::<Vec<_>>() }).to_string();
+        let serve = |apps: String, choices: Reply| {
+            let choices = std::sync::Mutex::new(Some(choices));
+            Provider::start(move |req| match req.target.as_str() {
+                "/api/v1/app-logic" => Reply::ok(&apps),
+                "/api/v1/connector-assignments" => choices.lock().unwrap().take().unwrap_or_else(|| Reply::status(500, "{}")),
+                _ => Reply::status(404, "{}"),
+            })
+        };
+        let s = spec();
+        let two = [app_taking("app-old", Some(json!(["aokie"]))), app_taking("app-new", Some(json!(["aokie"])))];
+
+        // Two apps take the plugin's events: the choice is asked for, with the link's key, and kept on the app.
+        let server = serve(
+            listing(&two),
+            Reply::ok(r#"{"assignments":[{"connectorId":"aokie","appId":"app-new","appName":"New"},{"connectorId":"vehicle","appId":"app-gone"},{"appId":"app-old"}],"candidates":{},"desktops":[]}"#),
+        );
+        let apps = fetch(&account(server.base.clone()), &s).unwrap();
+        assert_eq!(server.lines(), ["GET /api/v1/app-logic", "GET /api/v1/connector-assignments"]);
+        assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_secret")));
+        assert_eq!(route(&s, &apps, "aokie").chosen, Some("app-new"));
+        assert!(apps[0].chosen_for.is_empty() && apps[1].chosen_for == ["aokie"], "{apps:?}");
+
+        // One app takes them: there is nothing to choose between, and nothing more is asked.
+        let one = [app_taking("app-phone", Some(json!(["aokie"]))), app_taking("app-fleet", Some(json!(["vehicle"]))), app_taking("app-notes", None)];
+        let server = serve(listing(&one), Reply::status(500, "{}"));
+        let apps = fetch(&account(server.base.clone()), &s).unwrap();
+        assert_eq!(server.lines(), ["GET /api/v1/app-logic"]);
+        assert_eq!(route(&s, &apps, "aokie").chosen, Some("app-phone"));
+
+        // Two apps and a choice that cannot be read: the list is not used without it (both would run), and why is said.
+        for (refusal, says) in [
+            (Reply::status(503, r#"{"message":"busy"}"#), "HTTP 503: busy"),
+            (Reply::ok(r#"{"data":[]}"#), "carries no \"assignments\""),
+            (Reply::ok(r#"{"assignments":{}}"#), "rather than the list of which app takes which events"),
+        ] {
+            let server = serve(listing(&two), refusal);
+            let why = fetch(&account(server.base.clone()), &s).unwrap_err();
+            assert!(why.contains(says), "{why}");
+        }
+
+        // A connector that names no such rule asks for nothing more, whatever the apps list.
+        let mut legacy = spec();
+        legacy.catalogue.sources = None;
+        legacy.routing = None;
+        let server = serve(listing(&two), Reply::status(500, "{}"));
+        assert_eq!(fetch(&account(server.base.clone()), &legacy).unwrap().len(), 2);
+        assert_eq!(server.lines(), ["GET /api/v1/app-logic"]);
     }
 
     #[test]

@@ -170,9 +170,20 @@ try {
         . '<p>Then run <code>php bin/doctor.php</code> if you have a shell.</p>');
 } catch (InstallRefused $e) {
     // Nothing was written. The message names what to fix; it holds no secret.
+    if ($e->kind === 'busy') {
+        // The form was sent twice (a second press of the button) and this is the second: the first is still at work, and its page
+        // is the one that says how it ended. This page is the one the browser shows, so it says where to look.
+        oaiy_web_page(409, 'Already at work', '<p>This form was sent twice, or someone else is installing this relay: another run is at work, and this one changed nothing.</p>'
+            . '<p>Give it a minute, then look in <code>' . oaiy_web_esc($data) . '</code>. When <code>' . Installer::FIRST_KEY . '</code> '
+            . ($mode === 'rekey' ? 'there was written just now (its time says so)' : 'is there beside <code>' . Installer::ADMIN_TOKEN_FILE . '</code>')
+            . ', the other run finished and that file holds the key to paste into OAIY. If not, load this page again.</p>');
+    }
     $more = $e->kind === 'reachable'
         ? '<p>A file the installer put in <code>data</code> could be fetched at your public address, so a key written there would be readable by anyone. Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>'
         : '<p>Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>';
+    if ($e->kind === 'installed') {
+        $more = ''; // the other of two posts finished first: there is nothing to set and nothing to try again
+    }
     oaiy_web_page(409, $mode === 'rekey' ? 'No key written' : 'Not installed', '<p>' . oaiy_web_esc(ucfirst(Doctor::safe($e->getMessage()))) . '.</p>' . $more);
 } catch (\Throwable $e) {
     oaiy_web_page(500, 'Not finished', '<p>The installer stopped: ' . oaiy_web_esc(Doctor::safe($e->getMessage())) . '</p>');

@@ -13,7 +13,7 @@ import {
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import { ask } from './ask';
-import { accessName, pairingFrom, pairingGrants } from './pairingWords';
+import { accessName, pairingCalls, pairingGrants, pairingWho } from './pairingWords';
 import { agoWords } from './BackupPanel';
 import { useVisiblePoll } from './useVisiblePoll';
 import LoadError from './LoadError';
@@ -352,7 +352,7 @@ export default function ConnectionsPanel() {
     const name = account?.connectorName ?? 'this account';
     if (
       !(await ask(
-        `Disconnect ${name}?\n\nThis forgets the key on this computer only — it does not revoke it at the provider. Remove this computer there too if you want the key to stop working.`,
+        `Disconnect ${name}?\n\nThis forgets the key on this computer and asks the provider to end it there. If the provider cannot be reached, or does not take that request, the key keeps working there: remove this computer in your account at the provider to be sure.`,
       ))
     )
       return;
@@ -517,11 +517,13 @@ export default function ConnectionsPanel() {
             <div key={req.pairingId} className="service-card service-card-starting">
               <div className="card-head">
                 <Link2 size={15} aria-hidden />
-                <strong className="card-title">{req.label ?? req.product} wants to connect</strong>
+                <strong className="card-title">An app wants to connect</strong>
               </div>
               <p className="card-desc card-address">
-                <b>{req.product}</b>
-                {pairingFrom(req.origin)} {pairingGrants(req.access)}
+                From <b>{pairingWho(req.origin)}</b>
+              </p>
+              <p className="card-desc card-address">
+                {pairingCalls(req.product, req.label, req.origin)} It {pairingGrants(req.access)}
               </p>
               <p className="card-desc pairing-code">
                 Only approve if this code matches what the app is showing: <code>{req.code}</code>

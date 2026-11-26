@@ -1106,7 +1106,8 @@ impl LinkStore {
         self.status()
     }
 
-    /// Forget the link. Local only — see the note on the route. With nothing linked it forgets what is left of the
+    /// Forget the link, and tell the provider it is over where its connector has a request for that
+    /// ([`tell_provider_unlinked`]): see the note on the route. With nothing linked it forgets what is left of the
     /// link and says so again if a copy cannot be removed ([`LinkError`] of kind [`LinkErrorKind::CopiesLeft`]).
     ///
     /// The file is removed FIRST, and a link that cannot be removed stays linked and says so
@@ -1123,9 +1124,9 @@ impl LinkStore {
         // The copies kept when the link could not be read can hold the key it had: forgetting the link takes them
         // too. Not when this very call put an unreadable file aside, which is the one thing kept.
         let left_behind = if put_aside { Ok(()) } else { purge_asides(&self.path) };
-        {
+        let forgotten = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.account = None;
+            let forgotten = inner.account.take();
             inner.error = left_behind.err().map(copies_left);
             inner.retry = None;
             inner.attempt = LinkPhase::Idle;
@@ -1145,6 +1146,12 @@ impl LinkStore {
             // they already approved. Only the provider's answer is forgotten.
             inner.data_node = None;
             inner.data_node_error = None;
+            forgotten
+        };
+        // The provider is told only now, of a link this machine no longer holds: one that could not be forgotten
+        // above keeps a key that still works.
+        if let Some(account) = forgotten {
+            tell_provider_unlinked(&self.data_dir, account);
         }
         // Withdrawn in the same action that forgot the link: a provider we are
         // no longer linked to must not keep reaching this machine.
@@ -1201,6 +1208,68 @@ impl LinkStore {
 
     fn end(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).in_flight = false;
+    }
+}
+
+/// How long the provider is given to answer that a link is over ([`tell_provider_unlinked`]).
+const UNLINK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Tell the provider that `account`, the link this desktop has just forgotten, is over, where its connector names a
+/// request for that ([`descriptor::Oauth2Pkce::unlink`]): the key the link had stops working there, and the
+/// connection it made goes with it. Forgetting used to be local only, so every link made and forgotten left a key
+/// for the whole account working at the provider and a connection its pages went on offering, and a provider that
+/// allows an account only so many keys refused the link that came after the last of them.
+///
+/// On a thread of its own, and only after the link is forgotten here: the one who pressed Disconnect is not kept
+/// waiting for a provider that may be away, and a provider that cannot be told changes nothing of what was
+/// forgotten. The thread holds the key until its request is over, and what it logs is why the provider was not
+/// told, which never holds the key. The handle is for the tests; nothing else waits for it.
+fn tell_provider_unlinked(data_dir: &std::path::Path, account: LinkedAccount) -> Option<std::thread::JoinHandle<()>> {
+    let descriptor::AuthSpec::Oauth2Pkce(auth) = descriptor::find(data_dir, &account.connector_id)?.auth;
+    let spec = auth.unlink?;
+    // A test opens no connection beyond this machine, and most of those that forget a link hold the fixture
+    // account of the provider's real address.
+    #[cfg(test)]
+    if !crate::origin::host_of(&account.base_url).is_some_and(|host| crate::origin::is_loopback_host(&host)) {
+        return None;
+    }
+    Some(std::thread::spawn(move || match send_unlink(&spec, &account) {
+        Ok(()) => log::info!("link: the provider was told that this desktop has unlinked"),
+        Err(why) => log::warn!(
+            "link: the provider was not told that this desktop has unlinked ({why}); the key it gave the link works there until this computer is removed on its site"
+        ),
+    }))
+}
+
+/// The request [`tell_provider_unlinked`] makes: the provider's own verb and path, the link's key, and no body.
+/// Blocking, for the length of [`UNLINK_TIMEOUT`] at most.
+fn send_unlink(spec: &descriptor::UnlinkSpec, account: &LinkedAccount) -> Result<(), String> {
+    use creds::AuthedRequest;
+    let url = oauth::join(&account.base_url, &spec.path);
+    // A credentialed client (redirects off, see `creds`) for this one request: nothing follows it to share a connection with.
+    let client = creds::client_builder(net::Keep::Never)
+        .timeout(UNLINK_TIMEOUT)
+        .build()
+        .map_err(|e| format!("no client could be built: {e}"))?;
+    let request = match spec.method {
+        descriptor::UnlinkMethod::Delete => client.delete(&url),
+        descriptor::UnlinkMethod::Post => client.post(&url),
+    };
+    // The provider's key, for the provider's origin, and refused before anything is sent if the link's address is
+    // not one a key can go to.
+    let held = creds::Creds::for_account(account).map_err(|e| e.to_string())?;
+    let reply = request
+        .with_creds(&held, creds::CredKind::Provider)
+        .map_err(|e| e.to_string())?
+        .send()
+        .map_err(|e| net::unreachable(&e))?;
+    let status = reply.status();
+    net::drain(reply);
+    // (a key the provider no longer takes has nothing left there to end)
+    if status.is_success() || status.as_u16() == 401 {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", status.as_u16()))
     }
 }
 
@@ -2776,6 +2845,131 @@ mod tests {
         std::fs::remove_dir_all(&file).unwrap();
         let after = store.unlink();
         assert!(!after.linked && after.link_error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where the shipped connector has a link ended at its provider.
+    const UNLINK_PATH: &str = "/api/v1/desktop-connections/self";
+    /// Long enough for a request made on another thread to have arrived, for a test that says none was made.
+    const NO_REQUEST_WITHIN: std::time::Duration = std::time::Duration::from_millis(400);
+
+    #[test]
+    fn forgetting_a_link_ends_it_at_the_provider_with_the_links_own_key() {
+        // Forgetting was local only: each link made and forgotten left a key for the whole account working at the
+        // provider and a connection its pages went on offering, and the provider refused the link after its 25th key.
+        use testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"success":true,"connectionRemoved":true}"#));
+        let (store, dir) = testkit::linked_to(&server.base, "unlink-told", |_| {});
+
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        let seen = server.wait_for(UNLINK_PATH, 1, std::time::Duration::from_secs(10));
+        assert_eq!(seen[0].line(), format!("DELETE {UNLINK_PATH}"));
+        assert_eq!(seen[0].header("authorization"), Some("Bearer flk_lane"), "the link's own key: it is what says which link is over");
+        assert!(seen[0].body.is_empty(), "{:?}", seen[0].body);
+
+        // Nothing is linked now, so a second forget has no key to end anything with.
+        assert!(!store.unlink().linked);
+        std::thread::sleep(NO_REQUEST_WITHIN);
+        assert_eq!(server.lines(), [format!("DELETE {UNLINK_PATH}")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_one_who_forgets_a_link_is_not_kept_waiting_for_the_provider_or_told_no_by_it() {
+        use testkit::{Provider, Reply};
+        // A provider that takes its time, then refuses: it is let go on only once the forget has answered.
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let server = Provider::start(move |_| {
+            let _ = held.lock().unwrap().recv_timeout(std::time::Duration::from_secs(20));
+            Reply::status(500, r#"{"error":true,"message":"down"}"#)
+        });
+        let (store, dir) = testkit::linked_to(&server.base, "unlink-slow", |_| {});
+        let began = Instant::now();
+        let after = store.unlink();
+        assert!(began.elapsed() < std::time::Duration::from_secs(5), "the forget waited for the provider: {:?}", began.elapsed());
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        assert!(store.account().is_none());
+        server.wait_for(UNLINK_PATH, 1, std::time::Duration::from_secs(10));
+        let_go.send(()).unwrap();
+
+        // And one that is not there at all.
+        let nobody = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let (store, dir2) = testkit::linked_to(&nobody, "unlink-away", |_| {});
+        let account = store.account().unwrap();
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        // What is said of it names the provider and not the key.
+        let descriptor::AuthSpec::Oauth2Pkce(auth) = descriptor::builtin().remove(0).auth;
+        let why = send_unlink(&auth.unlink.unwrap(), &account).unwrap_err();
+        assert!(why.contains("127.0.0.1 can't be reached") && !why.contains("flk_"), "{why}");
+        for dir in [dir, dir2] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_provider_is_told_by_its_own_verb_and_what_it_answers_is_read_as_told_or_not() {
+        use testkit::{Provider, Reply};
+        let server = Provider::start(|req| Reply::status(req.target.trim_start_matches("/end/").parse().unwrap(), ""));
+        let (store, dir) = testkit::linked_to(&server.base, "unlink-answers", |_| {});
+        let account = store.account().unwrap();
+        // 401 is a key the provider no longer takes: there is nothing left there to end.
+        for (status, told) in [(200, true), (204, true), (401, true), (403, false), (404, false), (500, false)] {
+            let spec = descriptor::UnlinkSpec { method: descriptor::UnlinkMethod::Post, path: format!("/end/{status}") };
+            let said = send_unlink(&spec, &account);
+            assert_eq!(said.is_ok(), told, "{status}: {said:?}");
+            assert!(!format!("{said:?}").contains("flk_"), "{said:?}");
+        }
+        assert!(server.requests().iter().all(|r| r.method == "POST" && r.header("authorization") == Some("Bearer flk_lane")), "{:?}", server.lines());
+        // A key is not sent to an address that is not the link's own origin, whatever the path says.
+        let elsewhere = descriptor::UnlinkSpec { method: descriptor::UnlinkMethod::Delete, path: "@127.0.0.1:9/x".into() };
+        let asked = server.requests().len();
+        assert!(send_unlink(&elsewhere, &account).is_err());
+        assert_eq!(server.requests().len(), asked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_connector_that_names_no_unlink_request_is_forgotten_here_alone() {
+        use testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let (store, dir) = testkit::linked_to(&server.base, "unlink-not-named", |d| {
+            let descriptor::AuthSpec::Oauth2Pkce(auth) = &mut d.auth;
+            auth.unlink = None;
+        });
+        assert!(tell_provider_unlinked(&dir, store.account().unwrap()).is_none(), "no request is named, so no thread is started for one");
+        let after = store.unlink();
+        assert!(!after.linked && after.link_error.is_none(), "{after:?}");
+        std::thread::sleep(NO_REQUEST_WITHIN);
+        assert!(server.requests().is_empty(), "{:?}", server.lines());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_that_could_not_be_forgotten_is_not_ended_at_the_provider() {
+        // It is still linked here and its lanes go on: a key ended at the provider would leave them all refused, with a
+        // link on the screen. The provider is told when the link is gone from this machine, and not before.
+        use testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let (store, dir) = testkit::linked_to(&server.base, "unlink-stuck", |_| {});
+        // A file that is a folder with something in it cannot be removed, on any system.
+        let file = dir.join("link").join("account.json");
+        std::fs::create_dir_all(file.join("held")).unwrap();
+
+        let after = store.unlink();
+        assert!(after.linked && after.link_error.is_some_and(|e| e.kind == LinkErrorKind::NotForgotten));
+        std::thread::sleep(NO_REQUEST_WITHIN);
+        assert!(server.requests().is_empty(), "{:?}", server.lines());
+        assert_eq!(store.account().map(|a| a.credential), Some("flk_lane".to_string()));
+
+        std::fs::remove_dir_all(&file).unwrap();
+        assert!(!store.unlink().linked);
+        server.wait_for(UNLINK_PATH, 1, std::time::Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

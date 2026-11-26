@@ -1308,7 +1308,8 @@ mod tests {
         )
         .unwrap();
         let requests = server.join().unwrap();
-        assert!(requests[2].starts_with("GET /api/v1/flows "));
+        // (with the languages this desktop runs said in its query, as the shipped connector has the graphs asked for)
+        assert!(requests[2].starts_with("GET /api/v1/flows?logicLanguages="), "{}", requests[2]);
         let completion: Value =
             serde_json::from_str(requests[3].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let opened = open_result(&identity, completion["resultEnvelope"].as_str().unwrap());

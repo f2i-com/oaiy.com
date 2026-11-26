@@ -158,10 +158,27 @@ const DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(220);
 /// …or sooner once this much text is waiting (the ChatGPT stream).
 const DELTA_FLUSH_BYTES: usize = 400;
 /// Bound on the frames one turn may emit, so a runaway stream cannot hold the
-/// lane open indefinitely. Of a provider's stream it bounds the chunks, each of
-/// which was once a frame: an answer is as long as it could be before they were
-/// gathered ([`Gathered`]), and no longer.
+/// lane open indefinitely. A provider's stream is bounded in its chunks instead
+/// ([`stream_chunk_cap`]), which are gathered into far fewer frames ([`Gathered`]).
 const MAX_STREAM_FRAMES: u64 = 4096;
+/// The most chunks one turn reads of a provider's stream whatever its request
+/// asked for: more than any model writes in one answer, and the bound of a
+/// request that names no limit, whose provider's own applies.
+const MAX_STREAM_CHUNKS: u64 = 262_144;
+
+/// How many chunks one turn reads of a provider's stream before the stream is taken to be running away.
+///
+/// A model writes a chunk a token, and OAIY's engine sends word of the turn between them (how far the prompt has
+/// got, a count for each token it thinks), so an answer as long as its request allows (`max_tokens`, from
+/// [`answer_limit`]) is that many chunks and as many again. The bound was 4,096 chunks whatever was asked, each
+/// chunk once a frame, and FormLogic asks for 8,000 tokens and more: a long answer was failed at chunk 4,097 with
+/// the model still inside its limit. It is now four times the limit over those 4,096, so no turn is allowed less
+/// than it was, and never past [`MAX_STREAM_CHUNKS`].
+fn stream_chunk_cap(max_tokens: Option<u64>) -> u64 {
+    max_tokens.map_or(MAX_STREAM_CHUNKS, |n| n.saturating_mul(4).saturating_add(MAX_STREAM_FRAMES).min(MAX_STREAM_CHUNKS))
+}
+/// What a turn whose provider's stream ran past [`stream_chunk_cap`] is failed with.
+const STREAM_RAN_ON: &str = "the provider's stream ran on past the longest answer this turn allows";
 /// How often word of a turn whose answer has not begun goes by itself (how far
 /// the prompt has got, while a long one goes in): see `stream_registry`.
 const BEFORE_THE_ANSWER_EVERY: Duration = Duration::from_secs(1);
@@ -1600,6 +1617,8 @@ impl AiTunnel {
     ) -> Result<Vec<u8>, TunnelError> {
         use futures_util::StreamExt;
 
+        // (read before the request is handed over: the limit it was sent with, when its requester named one)
+        let chunk_cap = stream_chunk_cap(chat_body.get("max_tokens").and_then(Value::as_u64));
         let upstream = crate::ai::gateway::chat_stream(provider, chat_body)
             .await
             .map_err(|e| TunnelError::new("upstream_error", e.message()))?;
@@ -1676,12 +1695,9 @@ impl AiTunnel {
                         continue;
                     };
                     chunks += 1;
-                    if chunks > MAX_STREAM_FRAMES {
+                    if chunks > chunk_cap {
                         self.post_gathered(lane, &mut waiting, &mut frames).await?;
-                        return Err(TunnelError::new(
-                            "upstream_error",
-                            "the provider's stream exceeded the frame cap",
-                        ));
+                        return Err(TunnelError::new("upstream_error", STREAM_RAN_ON));
                     }
                     if !waiting.take(&delta) {
                         // Not text to join to other text (a tool call, a second choice): what is waiting goes
@@ -1714,12 +1730,9 @@ impl AiTunnel {
                     continue;
                 };
                 chunks += 1;
-                if chunks > MAX_STREAM_FRAMES {
+                if chunks > chunk_cap {
                     self.post_gathered(lane, &mut waiting, &mut frames).await?;
-                    return Err(TunnelError::new(
-                        "upstream_error",
-                        "the provider's stream exceeded the frame cap",
-                    ));
+                    return Err(TunnelError::new("upstream_error", STREAM_RAN_ON));
                 }
                 if !waiting.take(&delta) {
                     self.post_gathered(lane, &mut waiting, &mut frames).await?;
@@ -3462,6 +3475,21 @@ mod tests {
         }
         assert_eq!(answer_limit(&json!({ "maxTokens": 64 })), Some(64));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An answer as long as its request allows is not failed as a stream running away: the bound on a provider's
+    /// chunks follows the limit the request names, is never under the fixed bound it replaces, and never past the
+    /// ceiling, which is also the bound of a request that names no limit.
+    #[test]
+    fn the_bound_on_a_providers_chunks_follows_the_answers_limit() {
+        // A chunk a token and word of the turn between them: twice the limit has to fit, with room over.
+        assert!(stream_chunk_cap(Some(8192)) >= 2 * 8192, "{}", stream_chunk_cap(Some(8192)));
+        assert!(stream_chunk_cap(Some(8192)) < MAX_STREAM_CHUNKS, "a named limit still bounds the stream");
+        assert!(stream_chunk_cap(Some(1)) >= MAX_STREAM_FRAMES, "no turn is allowed less than it was");
+        assert!(stream_chunk_cap(Some(64)) < stream_chunk_cap(Some(8192)));
+        assert_eq!(stream_chunk_cap(None), MAX_STREAM_CHUNKS);
+        assert_eq!(stream_chunk_cap(Some(MAX_ANSWER_TOKENS)), MAX_STREAM_CHUNKS);
+        assert_eq!(stream_chunk_cap(Some(u64::MAX)), MAX_STREAM_CHUNKS, "a huge limit saturates, it does not wrap");
     }
 
     /// A picture whose claim another computer won is not made: the engines are never asked, and the slot is free again.

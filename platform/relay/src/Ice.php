@@ -36,8 +36,11 @@ final class Ice
         if (!is_array($turn) || !is_array($stun)) {
             throw new \RuntimeException('config invalid: turn');
         }
-        $turnUrls = self::urls($turn['urls'] ?? null, '/^turns?:/i', 'turn.urls');
-        $stunUrls = self::urls($stun['urls'] ?? null, '/^stuns?:/i', 'stun.urls');
+        // The scheme in lower case, and something after it, as ice-server.schema.json has it. The urls go into every admission as
+        // they are written here, and the decoders tell a TURN entry from a STUN one by a lower-case prefix: with "TURN:host:3478"
+        // accepted here, the native client refused every admission of this relay (and "turn:" alone is no server at all).
+        $turnUrls = self::urls($turn['urls'] ?? null, '/^turns?:./', 'turn.urls');
+        $stunUrls = self::urls($stun['urls'] ?? null, '/^stuns?:./', 'stun.urls');
         $secret = $turn['secret'] ?? null;
         if ($secret !== null && (!is_string($secret) || strlen($secret) < 32 || strlen($secret) > 4096 || stripos($secret, 'REPLACE') !== false || stripos($secret, 'CHANGE_ME') !== false)) {
             throw new \RuntimeException('config invalid: turn.secret');

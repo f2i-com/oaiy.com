@@ -26,6 +26,10 @@
   'use strict';
   const parentWindow = window.parent;
   if (!parentWindow || parentWindow === window) return;
+  // Only ever in the sandbox OAIY frames it with, whose origin is opaque. This frame imports the engine its parent
+  // posts it: framed by another page with no sandbox, that code would run in the origin of whoever serves this file
+  // (the Agent's own, which a desktop takes for its window). So it starts nowhere else, and says nothing to that parent.
+  if (window.origin !== 'null') return;
   const MAGIC = '\u0000oaiy.agent.page:';
   /** Instructions for one entry into the page's code: a loop that never ends is stopped. */
   const BUDGET = 400_000_000;

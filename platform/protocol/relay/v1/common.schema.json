@@ -194,12 +194,12 @@
     },
     "inboxAddress": {
       "type": "string",
-      "pattern": "^(dev:dev-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22})$",
-      "description": "Where a POST /v1/items item may go: a device inbox or a reply box."
+      "pattern": "^(dev:(dev|prov)-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22})$",
+      "description": "Where a POST /v1/items item may go: a device inbox or a reply box. A provider's inbox is dev: and its prov- id (a res goes there): a provider is a device of the relay like any other."
     },
     "mailbox": {
       "type": "string",
-      "pattern": "^(dev:dev-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22}|app:[A-Za-z0-9_.:-]{1,64}@dev-[A-Za-z0-9_-]{22}/(plugin|mobile:[A-Za-z0-9_-]{43}))$",
+      "pattern": "^(dev:(dev|prov)-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22}|app:[A-Za-z0-9_.:-]{1,64}@dev-[A-Za-z0-9_-]{22}/(plugin|mobile:[A-Za-z0-9_-]{43}))$",
       "description": "Any mailbox address. The app: forms exist only behind the Aokie compatibility routes."
     },
     "from": {

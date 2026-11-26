@@ -869,8 +869,8 @@ for d, ex_ in {
         "unixTime": [0, NOW, 2 ** 53 - 1], "uint53": [0, 42], "seq": [1, 42, 2 ** 53 - 1], "lane": list(LANES), "role": ["desktop", "phone", "provider", "web"],
         "ct": ["text", "json", "sealed1", "tunnel1", "noise1"], "errorCode": ["invalid_request", "unavailable"], "grant": ["state_read", "rtc_signal"],
         "origin": ["https://app.example.com", "https://app.example.com:8443"], "publicUrl": ["https://relay.example.com", "https://relay.example.com:8443"],
-        "inboxAddress": ["dev:" + DEVID, "rbx:Ry3kq0wEo2nq1c9h5c7Zab"],
-        "mailbox": ["dev:" + DEVID, "rbx:Ry3kq0wEo2nq1c9h5c7Zab", "app:aokie@" + DEVID + "/plugin", "app:aokie@" + DEVID + "/mobile:" + PHONE_TH],
+        "inboxAddress": ["dev:" + DEVID, "dev:" + PROVID, "rbx:Ry3kq0wEo2nq1c9h5c7Zab"],
+        "mailbox": ["dev:" + DEVID, "dev:" + PROVID, "rbx:Ry3kq0wEo2nq1c9h5c7Zab", "app:aokie@" + DEVID + "/plugin", "app:aokie@" + DEVID + "/mobile:" + PHONE_TH],
         "from": [PROVID, DEVID, "rbx:Ry3kq0wEo2nq1c9h5c7Zab", "relay"],
         "hdr": [{}, {"ct": "sealed1"}, {"re": "cmd-0001", "ct": "tunnel1", "eph": "A" * 43 + "=", "kid": "k1", "prio": 1, "n": 0, "sig": "A" * 88},
                 MAX_HDR],
@@ -896,6 +896,8 @@ pos("post-request", "a command", {"items": [POST_CMD]})
 pos("post-request", "a signed ring", {"items": [POST_RING]})
 pos("post-request", "an item with no ttl and no hdr", {"items": [{"to": "dev:" + DEVID, "lane": "ctl", "id": "n1", "body": "{}"}]})
 pos("post-request", "64 items", {"items": [dict(POST_CMD, id=f"c{i}") for i in range(64)]})
+# Rule 2 of section 4: a res goes to the sender of the cmd, which is a provider, and a provider's inbox is dev: and its prov- id.
+pos("post-request", "a result, to the provider that sent the command", {"items": [{"to": "dev:" + PROVID, "lane": "res", "id": "res-0001", "hdr": {"re": "cmd-0001", "ct": "sealed1"}, "body": "AAAA"}]})
 pos("post-response", "queued, duplicate and rejected", {"v": 1, "time": NOW, "results": [
     {"id": "a", "status": "queued", "seq": 43}, {"id": "b", "status": "duplicate", "seq": 41},
     {"id": "c", "status": "rejected", "error": {"code": "quota_exceeded", "message": "Mailbox full.", "retryAfter": 5}}]})
@@ -906,6 +908,7 @@ pos("poll-response", "a superseded hold", {"v": 1, "epoch": "AQIDBAUGBwg", "curs
 pos("poll-response", "a reset", {"v": 1, "epoch": "AQIDBAUGBwg", "cursor": 7, "items": [], "more": False, "time": NOW, "reset": True})
 pos("item-state", "an acked item", {"id": "cmd-0001", "lane": "cmd", "to": "dev:" + DEVID, "state": "acked", "seq": 43, "at": NOW, "exp": NOW + 60, "deliveredAt": NOW + 1, "ackedAt": NOW + 2, "time": NOW + 3})
 pos("item-state", "a queued item", {"id": "cmd-0001", "lane": "cmd", "to": "dev:" + DEVID, "state": "queued", "seq": 43, "at": NOW, "exp": NOW + 60, "time": NOW})
+pos("item-state", "a result in the inbox of a provider", {"id": "res-0001", "lane": "res", "to": "dev:" + PROVID, "state": "queued", "seq": 7, "at": NOW, "exp": NOW + 300, "time": NOW})
 pos("slot-request", "call.current", {"body": "{}", "ttl": 120, "ct": "json", "readers": ["phone:caller_read", "provider"]})
 pos("slot-response", "a publish", {"etag": '"AQIDBAUGBwgJCgsMDQ4PEA"', "exp": NOW + 120, "time": NOW})
 pos("slot", "a read", {"name": "call.current", "dev": DEVID, "body": "{}", "ct": "json", "at": NOW, "exp": NOW + 120, "time": NOW})
@@ -1080,8 +1083,9 @@ neg("post-request", "a reserved lane (flow) is not served in v1", mut(p1("post-r
 neg("post-request", "an unknown lane", mut(p1("post-request"), "items.0.lane", "chat"), "lane")
 neg("post-request", "an upper-case lane", mut(p1("post-request"), "items.0.lane", "CMD"), "lane")
 neg("post-request", "a party mailbox is not a valid post target", mut(p1("post-request"), "items.0.to", "app:aokie@" + DEVID + "/plugin"), "to")
-neg("post-request", "a provider id cannot be a device inbox address", mut(p1("post-request"), "items.0.to", "dev:" + PROVID), "to")
 neg("post-request", "a device inbox needs the dev: scheme", mut(p1("post-request"), "items.0.to", DEVID), "to")
+neg("post-request", "so does the inbox of a provider", mut(p1("post-request"), "items.0.to", PROVID), "to")
+neg("post-request", "a relay id is the inbox of nobody", mut(p1("post-request"), "items.0.to", "dev:" + RELAYID), "to")
 neg("post-request", "an unknown hdr key", mut(p1("post-request"), "items.0.hdr.x", "1"), "hdr")
 neg("post-request", "an unknown hdr ct", mut(p1("post-request"), "items.0.hdr.ct", "xml"), "ct")
 neg("post-request", "hdr prio 2", mut(p1("post-request"), "items.0.hdr.prio", 2), "prio")
@@ -1479,6 +1483,8 @@ for d, bad, why in [
         ("epoch", "A" * 12, "12 characters"), ("errorCode", "oops", "unknown code"), ("lane", "flow.out", "reserved lane"),
         ("seq", 0, "zero"), ("etag", "AQIDBAUGBwgJCgsMDQ4PEA", "unquoted"), ("slotName", "-a", "leading dash"),
         ("from", "phone", "a bare role"), ("inboxAddress", "app:aokie@" + DEVID + "/plugin", "party address"),
+        ("inboxAddress", "dev:" + RELAYID, "a relay id"), ("inboxAddress", "prov:" + PROVID, "prov: is not a scheme"),
+        ("mailbox", "app:aokie@" + PROVID + "/plugin", "a party of a provider: the desktop of a party is a dev- id"),
         ("name60", "x" * 61, "61 characters"), ("kid", "A" * 12, "12 characters"),
 ]:
     neg("common#" + d, f"{d}: {why}", bad, "")

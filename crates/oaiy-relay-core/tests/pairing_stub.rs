@@ -90,6 +90,43 @@ fn a_whole_pairing_by_scanning_the_key_ends_with_a_phone_that_polls_and_is_admit
 }
 
 #[test]
+fn a_phone_the_desktop_narrowed_is_still_admitted_and_a_scope_the_desktop_never_signed_is_refused() {
+    // Grants are patchable (`POST /v1/devices/{id}`), and the relay's admission carries the device's grants of the moment, not the receipt's. A phone that asked for the exact set of
+    // its receipt was refused every admission once the desktop had taken one grant away, until it paired again.
+    let mut w = world(StubConfig { receipt_includes_grants: true, ..quick() });
+    let offer = w.new_offer();
+    let mut phone = w.phone(PairingInput::Key(&offer.pairing_uri), 1);
+    phone.fetch_offer(&cancel()).unwrap();
+    let sas = phone.respond(&cancel()).unwrap();
+    w.deliver();
+    let outcome = w.desktop.confirm_sas(&w.env.client, &w.token, &offer.pid, &sas.display(), &grants(), &cancel()).unwrap();
+    let SasOutcome::Approved { device_id } = outcome else { panic!("{outcome:?}") };
+    let result = paired(phone.wait_outcome(None, &cancel()).unwrap());
+    let client = common::env::client_for(&w.env.stub, &w.env.clock, &w.env.stub.public_url(), 78);
+    client.prove(&cancel()).unwrap();
+    let holder = phone.endpoint_thumbprint();
+    let admit = || client.admission_for_profile(&result.token, &result.profile, &holder, Some("Test phone"), &cancel());
+    // As it was paired: the scopes are the receipt's grants.
+    assert_eq!(admit().expect("the admission of the pairing").scopes, grants());
+    // The desktop takes four of the six away. The phone is admitted with what is left, and the admission says what that is.
+    w.env.stub.set_grants(&device_id, &["state_read", "rtc_signal"]);
+    assert_eq!(admit().expect("a narrowed phone is still admitted").scopes, ["state_read", "rtc_signal"]);
+    // A scope that the receipt does not hold is refused, whoever put it in the device row: nothing the desktop signed covers it.
+    let mut wider: Vec<&str> = common::pair::GRANTS.to_vec();
+    wider.push("takeover");
+    w.env.stub.set_grants(&device_id, &wider);
+    assert_eq!(
+        admit().err(),
+        Some(ClientError::Protocol(oaiy_relay_core::Error::Mismatch("admission: a scope is not among the grants the desktop signed")))
+    );
+    w.env.stub.set_grants(&device_id, &["state_read", "takeover"]);
+    assert!(matches!(admit().err(), Some(ClientError::Protocol(oaiy_relay_core::Error::Mismatch(_)))), "fewer scopes, and one of them never signed");
+    // Back to what was signed, and the phone is admitted again: nothing about the refusal was remembered.
+    w.env.stub.set_grants(&device_id, &common::pair::GRANTS);
+    assert_eq!(admit().expect("the signed set again").scopes, grants());
+}
+
+#[test]
 fn a_whole_pairing_by_typed_code_proves_the_relay_against_the_fingerprint_inside_the_offer() {
     let mut w = world(fixed(&world(quick())));
     let offer = w.new_offer();

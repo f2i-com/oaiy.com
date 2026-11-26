@@ -1587,8 +1587,13 @@ fn is_plugin_screen_file(path: &str) -> bool {
 }
 
 /// Whether a request was sent by a web page: it says its `Origin`, or the browser says where the fetch came from
-/// (`Sec-Fetch-Site`, which a same-origin GET carries without an `Origin`: a page on a name rebound to this computer).
-/// `Sec-Fetch-Site: none` is the person opening the address themselves.
+/// (`Sec-Fetch-Site`, which a same-origin GET carries without an `Origin`). `Sec-Fetch-Site: none` is the person
+/// opening the address themselves.
+///
+/// A browser sends `Sec-Fetch-*` only to an address it calls trustworthy (https, or this computer by `localhost` or
+/// its loopback address). A page on a name rebound to this computer (`http://evil.example:17972`) is at no such
+/// address: its same-origin GET says neither header, and reads here as a program. That page is turned away by the
+/// name it asks for instead ([`misdirected`]), before this is asked.
 fn from_a_page(req: &Request) -> bool {
     req.headers().contains_key(ORIGIN)
         || req
@@ -1733,6 +1738,39 @@ pub(super) async fn tightened(State(auth): State<AuthConfig>, req: Request, next
     }
 }
 
+/// Whether a request to the desktop's own listener asks for a name that is not this computer's: `localhost`,
+/// `127.0.0.1` or `[::1]` on any port, or a name the person gave in `OAIY_ALLOWED_HOSTS` (what the new guard answers
+/// to on a desktop, `auth::host`).
+///
+/// In `legacy` mode the desktop believes a request by what it does not say: one with no `Origin` and no
+/// `Sec-Fetch-Site` is a program on this computer ([`from_a_page`]). A page on a name rebound to this computer says
+/// neither on a same-origin GET, and read the model files' paths, the Python runtime's and the services' so. What it
+/// cannot help saying is its own name, in `Host`: the desktop listens on this computer alone, so every caller it
+/// has reaches it by one of this computer's names. (The headless server is not asked this here: it may be reached by
+/// another name, through a proxy beside it, and it believes a token, never a missing header.)
+///
+/// `GET /api/health` is answered under any name, as the new guard answers it (a probe). A request made in-process
+/// (the Agent's tools, through this router) came over no socket and names no host: it is not asked.
+fn misdirected(guard: &crate::auth::Guard, req: &Request) -> bool {
+    use crate::auth::host::{HostClass, HostName};
+    if req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().is_none() {
+        return false;
+    }
+    if matches!(*req.method(), Method::GET | Method::HEAD) && req.uri().path() == "/api/health" {
+        return false;
+    }
+    let named = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.to_string()));
+    let Some(host) = named.as_deref().and_then(HostName::parse) else {
+        return true;
+    };
+    !(host.is_loopback_name() || matches!(guard.config().hosts.classify(&host, true), Ok(HostClass::Extra)))
+}
+
 /// What the access guard decides with: the old guard's settings (what `legacy` mode judges by) and the
 /// new guard.
 #[derive(Clone)]
@@ -1748,6 +1786,9 @@ struct AccessState {
 /// unchanged), with the owner as the principal for any handler that reads one. Only a route the model
 /// adds (`since: 2` in `auth/routes.rs`) is judged by the new pipeline. In `scoped` and `shadow` mode the
 /// new pipeline judges every request, and `origin_guard` is never called.
+///
+/// One thing comes before the old guard on the desktop: a request that asks for a name that is not this computer's
+/// is turned away ([`misdirected`]), as the new pipeline turns it away in its own modes.
 async fn access_guard(
     State(s): State<AccessState>,
     mut req: Request,
@@ -1771,6 +1812,9 @@ async fn access_guard(
         }
         s.guard.handle(req, next).await
     } else {
+        if s.legacy.gui_mode && misdirected(&s.guard, &req) {
+            return crate::auth::guard::Denial::misdirected_host().into_response();
+        }
         req.extensions_mut().insert(crate::auth::principal::Principal::legacy_owner());
         match tighten(&s.legacy, req) {
             Ok(req) => origin_guard(State(s.legacy), req, next).await,
@@ -3289,11 +3333,85 @@ mod tightened_tests {
         let app = router(pairing());
         for path in ["/api/models", "/api/python"] {
             assert_eq!(ask(&app, "GET", path, &[("origin", "https://evil.example")]).await.0, 403, "{path}: another site");
-            // A page on a name rebound to this computer sends no Origin on a same-origin GET, but its browser says where it is.
-            assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "same-origin")]).await.0, 403, "{path}: a rebound name");
+            // A page served from this computer sends no Origin on a same-origin GET, but its browser says where it is.
+            // (One on a name rebound to this computer is sent no such header: its `Host` turns it away, below.)
+            assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "same-origin")]).await.0, 403, "{path}: a page of this port");
             assert_eq!(ask(&app, "GET", path, &[("origin", OWN)]).await.0, 200, "{path}: the dashboard");
             assert_eq!(ask(&app, "GET", path, &[]).await.0, 200, "{path}: the CLI, which sends neither");
             assert_eq!(ask(&app, "GET", path, &[("sec-fetch-site", "none")]).await.0, 200, "{path}: the person opening it");
+        }
+    }
+
+    /// [`ask`], as a request that came over the listener's socket (`serve` puts the peer's address on each).
+    async fn ask_over_a_socket(app: &Router, method: &str, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn a_page_on_a_name_rebound_to_this_computer_is_turned_away_by_the_name_it_asks_for() {
+        let app = router(pairing());
+        // `http://evil.example:17972`, its name pointed at 127.0.0.1 after the page loaded. Its GETs are same-origin, so
+        // they say no `Origin`; and the address is plain http on a name, so the browser sends no `Sec-Fetch-Site`. The
+        // request reads as a program's in every header but `Host`.
+        for path in ["/api/models", "/api/python", "/api/services"] {
+            for name in ["evil.example:17972", "evil.example", "127.0.0.1.evil.example:17972", "localhost.evil.example:17972", "192.168.1.20:17972", "0.0.0.0:17972", "oaiy.localhost:17972", "[::2]:17972", "not a host", ""] {
+                let (status, body) = ask_over_a_socket(&app, "GET", path, &[("host", name)]).await;
+                assert_eq!(status, 421, "{path} asked as {name:?}: {body}");
+                assert!(body.contains("misdirected_host"), "{body}");
+            }
+            assert_eq!(ask_over_a_socket(&app, "GET", path, &[]).await.0, 421, "{path}: no name at all");
+        }
+        // What it sends, too: a rebound page's POST is its own origin's, and that origin is this port under its name.
+        let rebound = [("host", "evil.example:17972"), ("origin", "http://evil.example:17972")];
+        assert_eq!(ask_over_a_socket(&app, "POST", "/api/bridge/pairing", &rebound).await.0, 421);
+        assert_eq!(ask_over_a_socket(&app, "PUT", "/api/network/settings", &[("host", "evil.example:17972"), ("origin", OWN)]).await.0, 421);
+
+        // This computer's own names, on any port: every caller the desktop has.
+        for name in ["127.0.0.1:17972", "localhost:17972", "[::1]:17972", "127.0.0.1", "LocalHost:5000"] {
+            for path in ["/api/models", "/api/python"] {
+                assert_eq!(ask_over_a_socket(&app, "GET", path, &[("host", name)]).await.0, 200, "{path} asked as {name}");
+            }
+            assert_eq!(ask_over_a_socket(&app, "GET", "/api/services", &[("host", name)]).await, (200, "full".into()), "{name}: the CLI");
+            assert_eq!(ask_over_a_socket(&app, "GET", "/api/models", &[("host", name), ("origin", OWN)]).await.0, 200, "{name}: the dashboard");
+            assert_eq!(ask_over_a_socket(&app, "GET", "/api/models", &[("host", name), ("origin", "https://evil.example")]).await.0, 403, "{name}: another site, as before");
+        }
+        // A probe is answered whatever it calls this computer, as the new guard answers it.
+        assert_eq!(ask_over_a_socket(&app, "GET", "/api/health", &[("host", "evil.example:17972")]).await.0, 200);
+        assert_eq!(ask_over_a_socket(&app, "GET", "/api/health", &[]).await.0, 200);
+        // The Agent's tools ask through the router, over no socket and under no name.
+        assert_eq!(ask(&app, "GET", "/api/models", &[]).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn the_desktop_answers_to_a_name_the_person_gave_it_and_a_headless_server_to_any_with_its_token() {
+        let unused = std::env::temp_dir().join("oaiy-tightened-nothing-is-made-here");
+        let routes = || Router::new().route("/api/models", get(ok)).route("/api/health", get(ok));
+        // `OAIY_ALLOWED_HOSTS`: the names the new guard answers to on every install, a desktop too.
+        let named = |name: &str| (name == "OAIY_ALLOWED_HOSTS").then(|| "desk.internal:17972".to_string());
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, true, None, &named).expect("a legacy guard");
+        let state = AccessState { legacy: AuthConfig { token: None, gui_mode: true, pairing: Some(pairing()) }, guard };
+        let desktop = routes().layer(middleware::from_fn_with_state(state, access_guard));
+        assert_eq!(ask_over_a_socket(&desktop, "GET", "/api/models", &[("host", "desk.internal:17972")]).await.0, 200);
+        assert_eq!(ask_over_a_socket(&desktop, "GET", "/api/models", &[("host", "desk.internal:8080")]).await.0, 421, "the name with its port, as it was given");
+        assert_eq!(ask_over_a_socket(&desktop, "GET", "/api/models", &[("host", "evil.example:17972")]).await.0, 421);
+
+        // A headless server on this computer may be reached through a proxy beside it, by whatever name that has, and
+        // it believes its token alone: a missing header opens nothing there, so a rebound page reads nothing.
+        let guard = crate::auth::build_guard(&crate::auth::AccessSettings::legacy(), &unused, 17972, false, false, Some("the-token".into()), &|_| None).expect("a legacy guard");
+        let state = AccessState { legacy: AuthConfig { token: Some("the-token".into()), gui_mode: false, pairing: Some(pairing()) }, guard };
+        let headless = routes().layer(middleware::from_fn_with_state(state, access_guard));
+        for name in ["192.168.1.50:17972", "oaiy.example.com", "127.0.0.1:17972"] {
+            assert_eq!(ask_over_a_socket(&headless, "GET", "/api/models", &[("host", name), ("authorization", "Bearer the-token")]).await.0, 200, "{name}");
+            assert_eq!(ask_over_a_socket(&headless, "GET", "/api/models", &[("host", name)]).await.0, 403, "{name}: no token");
         }
     }
 

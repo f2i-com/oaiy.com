@@ -19,6 +19,8 @@ final class Installer
     public const LOCK = 'installed.lock';
     public const FIRST_KEY = 'first-key.txt';
     public const ADMIN_TOKEN_FILE = 'admin-token.txt';
+    /** Held, locked, by the one install or re-key that is at work in a data folder (claim()); gone when it ends. */
+    public const CLAIM = 'install.claim';
 
     /**
      * What the package root and data/ carry so that a web server that serves either of them by mistake refuses everything
@@ -220,6 +222,96 @@ XML;
         if (self::isInstalled($dataDir)) {
             throw new InstallRefused('installed', 'this relay is already installed');
         }
+        $claim = self::claim($dataDir, $opts);
+        try {
+            return self::provisionClaimed($dataDir, $opts, $guard);
+        } finally {
+            self::release($claim);
+        }
+    }
+
+    /**
+     * One install or re-key at a time in a data folder. installed.lock is the last thing an install writes, after the probe
+     * (seconds) and every secret, so it keeps a second install out only once the first has ended: two posts of the web form
+     * at once (a second press of Install) both ran to the end, each with a relay key, an admin token and a first key of its
+     * own, and what was left was a mix of the two (a first-key.txt that names the fingerprint of a relay key the other run
+     * had overwritten) with the other run's key holding one of the relay's desktop places for an hour.
+     *
+     * The claim is data/install.claim under the operating system's lock (flock), taken without waiting: the one that arrives
+     * second is refused (kind `busy`) having read and written nothing. A run that dies lets go of the lock with its process,
+     * so there is no stale claim to judge. On a filesystem that has no locks nothing is held and the installers run as they
+     * did before. The checks of guard() that need no network come first, so that a data folder inside the web root is
+     * refused before the claim would create it.
+     *
+     * @param array{publicDir?:?string,documentRoot?:?string} $opts
+     * @return array{0:resource|null,1:string,2:bool} the locked handle (null where there are no locks), the file, and whether data/ was made for it
+     * @throws InstallRefused
+     */
+    private static function claim(string $dataDir, array $opts): array
+    {
+        self::guard($dataDir, ['publicDir' => $opts['publicDir'] ?? null, 'documentRoot' => $opts['documentRoot'] ?? null]);
+        $made = !is_dir($dataDir);
+        Paths::ensureDir($dataDir);
+        $file = $dataDir . '/' . self::CLAIM;
+        $opened = false;
+        for ($try = 0; $try < 3; $try++) {
+            $h = @fopen($file, 'c');
+            if ($h === false) {
+                usleep(20000); // Windows refuses to open a file that its holder has removed and not yet closed: a moment later it can be made again
+                continue;
+            }
+            $opened = true;
+            $busy = 0;
+            if (!flock($h, LOCK_EX | LOCK_NB, $busy)) {
+                fclose($h);
+                if ($busy === 1) {
+                    break;
+                }
+                return [null, $file, $made];
+            }
+            // The holder before this one removes the file as it lets go. A lock on a file that is no longer the one at this
+            // path keeps nobody out (the next one makes a new file and locks that), so it is only a claim when it still is.
+            clearstatcache(true, $file);
+            $mine = fstat($h);
+            $there = @stat($file);
+            if ($mine !== false && $there !== false && $mine['ino'] === $there['ino'] && $mine['dev'] === $there['dev']) {
+                return [$h, $file, $made];
+            }
+            fclose($h);
+        }
+        if ($made) {
+            @rmdir($dataDir);
+        }
+        if (!$opened) {
+            throw new \RuntimeException('cannot write into the data folder');
+        }
+        throw new InstallRefused('busy', 'another install or re-key of this relay is at work, so this one changed nothing');
+    }
+
+    /** @param array{0:resource|null,1:string,2:bool} $claim */
+    private static function release(array $claim): void
+    {
+        [$h, $file, $made] = $claim;
+        @unlink($file); // while it is still locked: whoever opens the path after this has a new file
+        if ($h !== null) {
+            @flock($h, LOCK_UN);
+            @fclose($h);
+        }
+        if ($made) {
+            @rmdir(dirname($file)); // a refused install leaves no folder behind (rmdir fails, harmlessly, when the install put something in it)
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $opts
+     * @param array{notes:list<string>,checked:bool}|null $guard
+     * @return array<string,string>
+     */
+    private static function provisionClaimed(string $dataDir, array $opts, ?array &$guard): array
+    {
+        if (self::isInstalled($dataDir)) {
+            throw new InstallRefused('installed', 'this relay is already installed'); // by the one that held the claim until a moment ago
+        }
         $guardOpts = ['publicDir' => $opts['publicDir'] ?? null, 'documentRoot' => $opts['documentRoot'] ?? null, 'probeUrl' => empty($opts['guarded']) ? ($opts['probeUrl'] ?? null) : null];
         $guard = self::guard($dataDir, $guardOpts);
         $url = Config::normaliseUrl((string)($opts['public_url'] ?? ''));
@@ -298,6 +390,21 @@ XML;
         if (!self::isInstalled($dataDir)) {
             throw new \RuntimeException('this relay is not installed');
         }
+        // The same claim as an install: a second press of "Write a new key" would mint a second key that no file holds.
+        $claim = self::claim($dataDir, $opts);
+        try {
+            return self::rekeyClaimed($dataDir, $opts, $guard);
+        } finally {
+            self::release($claim);
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $opts
+     * @param array{notes:list<string>,checked:bool}|null $guard
+     */
+    private static function rekeyClaimed(string $dataDir, array $opts, ?array &$guard): string
+    {
         $config = Config::load($dataDir);
         $probe = $opts['probeUrl'] ?? (($opts['probe'] ?? true) === false ? null : $config->publicUrl());
         $guard = self::guard($dataDir, ['publicDir' => $opts['publicDir'] ?? null, 'documentRoot' => $opts['documentRoot'] ?? null,

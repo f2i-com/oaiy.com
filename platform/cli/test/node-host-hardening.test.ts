@@ -145,33 +145,27 @@ async function main(): Promise<void> {
     // and `-protocol_whitelist file,pipe` is injected before `-i` (and before outputs).
     const goodConcat = path.join(tmpRoot, 'good-concat.txt');
     fs.writeFileSync(goodConcat, "ffconcat version 1.0\nfile 'clip.mp4'\n");
+    // (Node stands in for ffmpeg: `-e <script>` is a flag and its value to the builder, as it
+    // is to Node. The arguments are built apart from the run: Node would read ffmpeg's own
+    // flags as its options, and a `--` to stop it is ffmpeg's "the next argument is an output".)
     const r1 = await ffmpeg.runCommand({
       command: 'ffmpeg',
-      args: [
-        '-e',
-        'process.stdout.write(JSON.stringify({cwd:process.cwd(),argv:process.argv.slice(1)}))',
-        '--',
-        '-f',
-        'concat',
-        '-safe',
-        '1',
-        '-i',
-        goodConcat,
-      ],
+      args: ['-e', 'process.stdout.write(JSON.stringify({cwd:process.cwd(),argv:process.argv.slice(1)}))'],
     });
-    check('valid confined concat with -safe 1 spawns child cleanly', r1.code === 0, r1.stderr);
+    check('a confined run spawns its child cleanly', r1.code === 0, r1.stderr);
     const seen = JSON.parse(r1.stdout) as { cwd: string; argv: string[] };
     check(
       'runCommand pins child cwd to TMP_ROOT',
       fs.realpathSync(seen.cwd) === realTmpRoot,
       `cwd=${seen.cwd} expected=${realTmpRoot}`,
     );
-    const wlPos = seen.argv.indexOf('-protocol_whitelist');
-    const iPos = seen.argv.indexOf('-i');
+    const concatArgs = ffmpeg.buildRunCommandArgs('ffmpeg', ['-f', 'concat', '-safe', '1', '-i', goodConcat]);
+    const wlPos = concatArgs.indexOf('-protocol_whitelist');
+    const iPos = concatArgs.indexOf('-i');
     check(
       'runCommand injects -protocol_whitelist file,pipe before -i',
-      wlPos !== -1 && seen.argv[wlPos + 1] === 'file,pipe' && iPos === wlPos + 2,
-      `argv=${JSON.stringify(seen.argv)}`,
+      wlPos !== -1 && concatArgs[wlPos + 1] === 'file,pipe' && iPos === wlPos + 2,
+      `argv=${JSON.stringify(concatArgs)}`,
     );
 
     // extractVideoFrames arg builder inserts `-protocol_whitelist file,pipe` before `-i` and output when confined.
@@ -570,6 +564,34 @@ async function main(): Promise<void> {
         () => ffmpeg.runCommand({ command: 'ffmpeg', args: ['-i', dummyMp4, badOut] }),
         errPat,
       );
+    }
+
+    // ffmpeg reads the ONE argument after `--` as an output file whatever it begins with. A name
+    // beginning with `-` was no positional and no known flag, passed through unread, and was
+    // written wherever it pointed. It is confined as any positional output is.
+    for (const [label, afterDashes, errPat] of [
+      ['-a/../../../outside.raw', ['-a/../../../outside.raw'], /upward \(\.\.\) path/i],
+      ['-a/../../../outside.raw before the input', ['-a/../../../outside.raw', '-i', dummyMp4], /upward \(\.\.\) path/i],
+      ['../escape.mp4', ['../escape.mp4'], /upward \(\.\.\) path/i],
+      ['/oaiy/secrets.json', ['/oaiy/secrets.json'], /secret store is not allowed/i],
+    ] as Array<[string, string[], RegExp]>) {
+      await expectThrows(
+        `Wave-6 refuses the output named after \`--\`: ${label}`,
+        async () => ffmpeg.buildRunCommandArgs('ffmpeg', ['-y', '-f', 'u8', '-c:a', 'pcm_u8', '--', ...afterDashes]),
+        errPat,
+      );
+    }
+    {
+      const built = ffmpeg.buildRunCommandArgs('ffmpeg', ['-i', dummyMp4, '-y', '--', '-dashed-name.mp4']);
+      const expected = path.resolve(tmpRoot, '-dashed-name.mp4');
+      const pos = built.lastIndexOf(expected);
+      check(
+        'Wave-6 an output named after `--` is resolved inside TMP_ROOT, behind the protocol whitelist',
+        pos >= 3 && built[pos - 1] === '--' && built[pos - 3] === '-protocol_whitelist' && built[pos - 2] === 'file,pipe' && !built.includes('-dashed-name.mp4'),
+        `built=${JSON.stringify(built)}`,
+      );
+      const last = ffmpeg.buildRunCommandArgs('ffmpeg', ['-i', dummyMp4, 'out.mp4', '--']);
+      check('Wave-6 a last `--` names no output and is dropped', !last.includes('--'), `built=${JSON.stringify(last)}`);
     }
 
     // Directory symlink (junction on Windows, dir symlink on POSIX) escaping ALLOWED_ROOTS MUST be refused on relative output.

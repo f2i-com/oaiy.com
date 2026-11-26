@@ -93,30 +93,54 @@ export async function buildPackage(engineAbi: string, exclude?: ReadonlySet<stri
   return out;
 }
 
-const ALREADY_PROVIDED_RE = /module [`'"]([A-Za-z0-9_.]+)[`'"] of package [`'"][^`'"]+[`'"] is provided by the engine or another package already/;
+// Zipp v0.0.41 refuses a module it already has in these words (read from its build and from the engine itself):
+//   addPythonPackage: module `unittest.mock` of package `oaiy-stdlib` is provided by the engine or another package already
+// The sentence is Zipp's own and nothing promises its quoting, so the module's name is read with any marks around the
+// two names, or none.
+const ALREADY_PROVIDED = 'is provided by the engine or another package already';
+const ALREADY_PROVIDED_RE = /module\s+[^\w.]*([\w.]+?)[^\w.]*\s+of\s+package\s[\s\S]*?is provided by the engine or another package already/;
+
+/** The module a refusal of addPythonPackage says Zipp already has, when the refusal is that one and names it. */
+export function providedModule(message: string): string | undefined {
+  return ALREADY_PROVIDED_RE.exec(message)?.[1];
+}
 
 /**
  * Install OAIY's Python package into a Zipp WASM glue instance once.
  * If a newer Zipp release already provides one of the shimmed modules natively,
  * exclude that module and retry so upgrades never break Python execution.
+ *
+ * Resolves to nothing when the package went in whole, or without the modules
+ * Zipp named. When Zipp refuses a module and the refusal names none that is
+ * still in the package (its wording changed), every module is left out so that
+ * the runtime additions (stdin, the working folder) still load, and the
+ * refusal is what this resolves to, for the caller to show.
  */
 export async function installPythonPackage(glue: {
   addPythonPackage: (archive: Uint8Array, kernels: unknown) => string;
   pythonPackages: () => string;
-}): Promise<void> {
+}): Promise<string | undefined> {
   const info = JSON.parse(glue.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
-  if (info.installed.some((p) => p.name === PACKAGE_NAME)) return;
-  const modules = packageModules();
+  if (info.installed.some((p) => p.name === PACKAGE_NAME)) return undefined;
+  const names = packageModules().map((m) => m.name);
   const excluded = new Set<string>();
-  for (let attempt = 0; attempt <= modules.length; attempt++) {
+  let refusal: string | undefined;
+  // Every turn that does not end here leaves out a module that was still in, so there are at most names.length + 1.
+  for (;;) {
     try {
       glue.addPythonPackage(await buildPackage(info.engineAbi, excluded), null);
-      return;
+      return refusal;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      const match = ALREADY_PROVIDED_RE.exec(msg);
-      if (!match || excluded.has(match[1])) throw error;
-      excluded.add(match[1]);
+      // Another refusal, or this one when no module is left to leave out, is final.
+      if (!msg.includes(ALREADY_PROVIDED) || excluded.size >= names.length) throw error;
+      const named = providedModule(msg);
+      if (named !== undefined && names.includes(named) && !excluded.has(named)) {
+        excluded.add(named);
+      } else {
+        for (const name of names) excluded.add(name);
+        refusal = msg;
+      }
     }
   }
 }

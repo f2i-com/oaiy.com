@@ -347,6 +347,13 @@ fn poll_prelude(
 /// Otherwise [`ZIPP_ERA_LANGUAGE`] alone — see its comment for why an engine
 /// this desktop cannot reach must not make it look like a build from before the
 /// vocabulary.
+///
+/// A language is declared for the whole desktop: a provider that reads one
+/// here defers that language's flows AND its app scripts to this machine. The
+/// flow lane takes the first ([`logic_languages`]). The app-logic lane does not
+/// take the second: it asks for, and runs, JavaScript alone. So a CLI that
+/// reports another language must not ship before that lane can run it, or the
+/// app scripts in it are deferred here and run nowhere.
 fn languages(probe: Option<&EngineProbe>) -> Vec<String> {
     let declared = match probe {
         Some(EngineProbe::Ready(id)) => id
@@ -362,6 +369,39 @@ fn languages(probe: Option<&EngineProbe>) -> Vec<String> {
         return vec![ZIPP_ERA_LANGUAGE.to_string()];
     }
     declared
+}
+
+/// The logic languages this desktop runs, for a lane that says them in its own
+/// requests as well as in the beat ([`languages`], from the same probe).
+///
+/// A provider weighs the two against each other and a language counts only
+/// where both name it, so the request that names none is read as coming from a
+/// runtime with one language, whatever the beat said: the flow lane, whose
+/// graphs the CLI runs in every language it reports, says them on its queue,
+/// its claim and its graphs. The app-logic lane does NOT, on purpose: it runs
+/// each script it is handed as JavaScript, and a provider told of a second
+/// language would hand it scripts in that one.
+///
+/// Held to what a request can carry: a short plain word each, and a handful of
+/// them. A provider refuses the whole request over one id it cannot read, and
+/// that request is the queue.
+pub(crate) fn logic_languages() -> Vec<String> {
+    said_in_a_request(languages(ScriptHost::global().engine_probe().as_ref()))
+}
+
+/// The most language ids a request names, and the longest one it carries.
+const MAX_LANGUAGES_SAID: usize = 16;
+const MAX_LANGUAGE_ID_LEN: usize = 32;
+
+fn said_in_a_request(languages: Vec<String>) -> Vec<String> {
+    languages
+        .into_iter()
+        .filter(|id| {
+            id.len() <= MAX_LANGUAGE_ID_LEN
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'#' | b'-'))
+        })
+        .take(MAX_LANGUAGES_SAID)
+        .collect()
 }
 
 /// Can this desktop run logic right now?
@@ -497,6 +537,21 @@ mod tests {
     #[test]
     fn instance_ids_are_unique_per_install() {
         assert_ne!(new_instance_id(), new_instance_id());
+    }
+
+    #[test]
+    fn the_languages_a_request_names_are_the_beats_held_to_what_a_request_can_carry() {
+        // The same list the beat's tokens are made of, so the provider's two readings of this desktop agree.
+        let two = EngineProbe::Ready(identity(&["javascript", " python "], &[("run", 1), ("script", 1)]));
+        assert_eq!(said_in_a_request(languages(Some(&two))), ["javascript", "python"]);
+        assert_eq!(said_in_a_request(languages(None)), [ZIPP_ERA_LANGUAGE]);
+        // FormLogic answers 400 to the whole request (the queue) for one id over 32 characters or a list over 16
+        // (FlowLogicLanguages::fromCaller), and a comma would split one id into two.
+        let odd = vec!["javascript".to_string(), "x".repeat(33), "py,thon".to_string(), "c++".to_string(), "has space".to_string()];
+        assert_eq!(said_in_a_request(odd), ["javascript", "c++"]);
+        let many: Vec<String> = (0..40).map(|i| format!("lang{i}")).collect();
+        assert_eq!(said_in_a_request(many).len(), 16);
+        assert!(logic_languages().iter().any(|l| l == ZIPP_ERA_LANGUAGE), "whatever the engine is doing, the floor is said");
     }
 
     // --- what a beat declares ----------------------------------------------

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/device-patch-request.schema.json",
   "title": "Device patch",
-  "description": "POST /v1/devices/{id} (alias PATCH), desktop only. Grants are patchable so a takeover tier does not need a re-pair; the next admission carries the new scopes.",
+  "description": "POST /v1/devices/{id} (alias PATCH), desktop only. Grants are patchable and the next admission carries the new scopes. Taking a grant away needs no re-pair; a grant the phone's approval receipt does not hold is refused by the phone, so a wider tier takes effect at a new pairing (README, Interpretation 66).",
   "type": "object",
   "properties": {
     "name": {

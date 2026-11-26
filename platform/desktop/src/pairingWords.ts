@@ -11,9 +11,21 @@ export function pairingGrants(access: PairingAccess | undefined): string {
     : 'wants to run your flows, use your plugins (the phone’s commands too) and your AI models through OAIY. A flow can run programs on this computer, so approve only an app you trust.';
 }
 
-/** Who asked: the site, or a program here when no site did (a native caller sends no Origin). */
-export function pairingFrom(origin: string | null | undefined): string {
-  return origin ? ` · ${origin}` : ' · a program on this computer';
+/**
+ * Who asks: the site, by the address the browser gave for it, or a program here when no site did (a native caller
+ * sends no Origin). It is the one part of a request the asker did not write, so it is what a request is said to be
+ * from, on a line of its own; the desktop refuses a request whose address is not one (`asking_origin`, bridge/pairing.rs).
+ */
+export function pairingWho(origin: string | null | undefined): string {
+  return origin || 'a program on this computer';
+}
+
+/**
+ * What the asker calls itself: its product's name, and its label where it gave one that says more. Its own words,
+ * said as its own: they were the prompt's heading, where a page that called itself another site's name read as that site.
+ */
+export function pairingCalls(product: string, label: string | null | undefined, origin: string | null | undefined): string {
+  return label && label !== product && label !== origin ? `It calls itself “${label}” (${product}).` : `It calls itself “${product}”.`;
 }
 
 /** The kind of a connection, for its row. */

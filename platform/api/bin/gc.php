@@ -21,6 +21,14 @@
  */
 declare(strict_types=1);
 
+// Command line only. With the DocumentRoot at api/ (the README's fallback
+// layout) this file is inside the web root, and the .htaccess rule for bin/
+// would be all that stands between a GET and a round of deletions.
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit;
+}
+
 require __DIR__ . '/../vendor/autoload.php';
 
 use Oaiy\Api\Db;

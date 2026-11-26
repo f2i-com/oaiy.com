@@ -93,7 +93,9 @@ final class ItemValidator
                     $ok = is_string($v) && preg_match('#^[A-Za-z0-9+/]{43}=$#D', $v) === 1 && strlen((string)base64_decode($v, true)) === 32;
                     break;
                 case 'kid':
-                    $ok = is_string($v) && preg_match('/^[A-Za-z0-9._:-]{1,64}$/D', $v) === 1;
+                    // No colon: common#hdr has none and the native client sends none, and a header stored here is delivered as it is,
+                    // in a poll answer that would then not be one the schema allows.
+                    $ok = is_string($v) && preg_match('/^[A-Za-z0-9._-]{1,64}$/D', $v) === 1;
                     break;
                 case 'prio':
                     $ok = $v === 0 || $v === 1;

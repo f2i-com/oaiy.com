@@ -276,10 +276,21 @@ async fn checked_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr
     if addrs.is_empty() {
         return Err(format!("download host '{host}' did not resolve"));
     }
-    if let Some(bad) = addrs.iter().find(|a| is_disallowed_ip(a.ip())) {
+    // (a host that is itself an address was written, not resolved: held to the whole rule)
+    let written = host.parse::<std::net::IpAddr>().is_ok();
+    if let Some(bad) = addrs.iter().find(|a| if written { is_disallowed_ip(a.ip()) } else { is_disallowed_resolved_ip(a.ip()) }) {
         return Err(format!("download host '{host}' resolves to a disallowed address ({})", bad.ip()));
     }
     Ok(addrs)
+}
+
+/// [`is_disallowed_ip`] for an address a NAME resolved to, where 198.18.0.0/15 is let through. It is the pool
+/// "fake-IP" DNS answers from (a system proxy or VPN in TUN mode gives every public name an address in it and carries
+/// the connection on itself), so refusing it refused every download for a person behind one. Nothing of this computer
+/// or its network answers there, and a URL that writes such an address itself is still refused.
+fn is_disallowed_resolved_ip(ip: std::net::IpAddr) -> bool {
+    let fake_ip_pool = matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18);
+    !fake_ip_pool && is_disallowed_ip(ip)
 }
 
 /// What a download's client asks for every name it connects to: the first host's is pinned beforehand
@@ -349,8 +360,22 @@ async fn pin_download_host(url: &str) -> Result<Option<(String, Vec<std::net::So
 /// can never cause directory creation outside `models_dir`.
 fn ensure_dest_dir_within_root(models_dir: &Path, subdir: Option<&str>) -> Result<PathBuf, String> {
     std::fs::create_dir_all(models_dir).map_err(|e| format!("mkdir failed: {e}"))?;
-    let canon_root = std::fs::canonicalize(models_dir)
-        .map_err(|e| format!("cannot resolve models dir: {e}"))?;
+    // A volume whose paths the system cannot resolve (a RAM disk, a drive its driver gives no final name for) has no
+    // canonical root to compare with: there each component is held to being a real folder, no link of any kind,
+    // which is what the comparison rules out. Refusing such a volume refused every download to it.
+    let canon_root = std::fs::canonicalize(models_dir).ok();
+    let inside = |cur: &Path| -> Result<(), String> {
+        match &canon_root {
+            Some(root) => {
+                let canon_cur = std::fs::canonicalize(cur).map_err(|_| "path escapes models dir".to_string())?;
+                if canon_cur.starts_with(root) { Ok(()) } else { Err("path escapes models dir".into()) }
+            }
+            None => {
+                let meta = std::fs::symlink_metadata(cur).map_err(|_| "path escapes models dir".to_string())?;
+                if meta.file_type().is_symlink() || !meta.is_dir() { Err("path escapes models dir".into()) } else { Ok(()) }
+            }
+        }
+    };
     let Some(s) = subdir.filter(|s| !s.is_empty()) else {
         return Ok(models_dir.to_path_buf());
     };
@@ -373,24 +398,14 @@ fn ensure_dest_dir_within_root(models_dir: &Path, subdir: Option<&str>) -> Resul
     for part in parts {
         cur.push(part);
         match std::fs::symlink_metadata(&cur) {
-            Ok(_) => {
-                let canon_cur = std::fs::canonicalize(&cur)
-                    .map_err(|_| "path escapes models dir".to_string())?;
-                if !canon_cur.starts_with(&canon_root) {
-                    return Err("path escapes models dir".into());
-                }
-            }
+            Ok(_) => inside(&cur)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::create_dir(&cur) {
                     Ok(()) => {}
                     Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(ce) => return Err(format!("mkdir failed: {ce}")),
                 }
-                let canon_cur = std::fs::canonicalize(&cur)
-                    .map_err(|_| "path escapes models dir".to_string())?;
-                if !canon_cur.starts_with(&canon_root) {
-                    return Err("path escapes models dir".into());
-                }
+                inside(&cur)?;
             }
             Err(e) => return Err(format!("mkdir failed: {e}")),
         }
@@ -426,7 +441,7 @@ fn validate_download_url(url: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot resolve download host '{host}': {e}"))?
     {
         saw_any = true;
-        if is_disallowed_ip(addr.ip()) {
+        if is_disallowed_resolved_ip(addr.ip()) {
             return Err(format!(
                 "download host '{host}' resolves to a disallowed address ({})",
                 addr.ip()
@@ -2120,6 +2135,14 @@ mod tests {
                 !is_disallowed_ip(ip.parse::<IpAddr>().unwrap()),
                 "{ip} should be allowed"
             );
+        }
+        // What a name resolved to: the fake-IP pool is let through (a proxy's DNS answers every public name from it),
+        // and nothing else that is refused when written is.
+        for ip in ["198.18.0.1", "198.19.255.254", "1.1.1.1"] {
+            assert!(!is_disallowed_resolved_ip(ip.parse::<IpAddr>().unwrap()), "{ip} should be allowed when resolved");
+        }
+        for ip in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "198.17.255.255", "198.20.0.1", "::ffff:198.18.0.1", "64:ff9b::127.0.0.1"] {
+            assert!(is_disallowed_resolved_ip(ip.parse::<IpAddr>().unwrap()) == is_disallowed_ip(ip.parse::<IpAddr>().unwrap()), "{ip}: as when written");
         }
         // validate_download_url: scheme + IP-literal checks (no DNS needed).
         assert!(validate_download_url("http://huggingface.co/x").is_err()); // not https

@@ -511,9 +511,10 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).not.toContain('Storage node');
   });
 
-  it('warns that disconnecting is local-only before unlinking', async () => {
-    // Telling the user the key is dead when it still works at the provider
-    // would be worse than saying nothing.
+  it('says the provider is asked to end the key, and that it may still work there, before unlinking', async () => {
+    // The desktop now tells the provider (where the connector names the request), without
+    // waiting for its answer: telling the user the key is dead when it may still work at
+    // the provider would be worse than saying nothing.
     linkStatusMock.mockResolvedValue({
       linked: true,
       connectorName: 'Acme Cloud',
@@ -524,7 +525,9 @@ describe('ConnectionsPanel · Linked account', () => {
     await mount();
     await click('Disconnect');
     const msg = (globalThis.confirm as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
-    expect(msg).toContain('does not revoke it at the provider');
+    expect(msg).toContain('asks the provider to end it there');
+    expect(msg).toContain('remove this computer in your account at the provider to be sure');
+    expect(msg).not.toContain('does not revoke it at the provider');
     expect(unlinkMock).toHaveBeenCalled();
   });
 

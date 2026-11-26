@@ -339,12 +339,16 @@ pub fn dispatcher(
         }
         // The id the op acts on. `.list` needs none; everything else does, and
         // an absent one must refuse rather than act on some default.
+        // FormLogic's server sends it as `id`, for a plugin and a service alike (its
+        // DesktopOpsController: "on the wire BOTH ride the command payload as `id`");
+        // this app's own callers name the kind. Reading only the kind refused every
+        // start, stop, restart, repair and health the website asked for.
         let target = |field: &str| -> Result<String, String> {
-            payload
-                .get(field)
-                .and_then(Value::as_str)
+            [field, "id"]
+                .iter()
+                .filter_map(|name| payload.get(*name).and_then(Value::as_str))
+                .find(|s| !s.is_empty())
                 .map(str::to_string)
-                .filter(|s| !s.is_empty())
                 .ok_or_else(|| format!("{command} needs a {field}"))
         };
 
@@ -994,6 +998,29 @@ mod guard_tests {
         let from_this_computer = local(&world)("desktop", "plugins.detonate", &Value::Null, "run-1").unwrap_err();
         assert_eq!(from_the_relay, from_this_computer);
         assert_eq!(from_the_relay, not_served("plugins.detonate"));
+    }
+
+    /// FormLogic's server queues an op with its target under `id`, for a plugin and a service
+    /// alike (`DesktopOpsController::enqueue`, pinned there by `DesktopOpsTest`). The dispatcher
+    /// read only `pluginId` and `serviceId`, so every start, stop, restart, repair and health
+    /// asked for from the website came back "needs a pluginId".
+    #[test]
+    fn an_op_names_what_it_acts_on_as_the_provider_sends_it() {
+        let world = world("wire-id");
+        let ops = local(&world);
+        let as_sent = ops("desktop", "plugins.health", &json!({ "id": "aokie" }), "cmd-1").expect("the provider's shape");
+        let by_kind = ops("desktop", "plugins.health", &json!({ "pluginId": "aokie" }), "cmd-2").expect("this app's shape");
+        assert_eq!(as_sent, by_kind);
+        assert_eq!(as_sent["plugin"]["id"], "aokie");
+        // The kind's own name is the one read where both are written, and an op with neither is
+        // still refused rather than run against some default.
+        let both = ops("desktop", "plugins.health", &json!({ "pluginId": "aokie", "id": "nobody" }), "cmd-3").expect("the kind's name first");
+        assert_eq!(both, by_kind);
+        assert_eq!(ops("desktop", "plugins.health", &json!({ "id": "" }), "cmd-4").unwrap_err(), "plugins.health needs a pluginId");
+        assert_eq!(ops("desktop", "services.start", &json!({}), "cmd-5").unwrap_err(), "services.start needs a serviceId");
+        // (a service is found by the same id: the registry's answer, not "needs a serviceId")
+        let unknown = ops("desktop", "services.start", &json!({ "id": "no-such-service" }), "cmd-6").unwrap_err();
+        assert!(!unknown.contains("needs a serviceId"), "{unknown}");
     }
 
     #[test]

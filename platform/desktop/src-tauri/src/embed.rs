@@ -88,9 +88,12 @@ pub fn serve_agent_over_http<R: Runtime>(app: &AppHandle<R>) {
             let listener = tokio::net::TcpListener::from_std(listener)?;
             // (the page's files and nothing else: no route of the desktop's API is here, and the route check lists
             // these two as another listener's, `auth::route_coverage::NOT_ON_MAIN_ROUTER`)
-            let file = move |uri: axum::http::Uri| {
+            let file = move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
                 let root = root.clone();
-                async move { serve_path(Some(&root), Page::Agent, uri.path()).map(axum::body::Body::from) }
+                async move {
+                    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+                    serve_agent_http(Some(&root), uri.path(), fetch_site).map(axum::body::Body::from)
+                }
             };
             let pages = axum::Router::new().route("/", axum::routing::get(file.clone())).route("/*path", axum::routing::get(file));
             axum::serve(listener, pages).await
@@ -333,8 +336,7 @@ fn dashboard_only<R: Runtime>(webview: &tauri::Webview<R>) -> Result<(), String>
 /// The file at `uri_path` of an embedded page whose built files are in `root`, with the headers that make it
 /// cross-origin isolated: for its scheme ([`serve`]) and, on a Mac, the agent's port ([`serve_agent_over_http`]).
 fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u8>> {
-    let raw = percent_decode_str(uri_path).decode_utf8_lossy().into_owned();
-    let path = if raw == "/" || raw.is_empty() { page.start().to_string() } else { raw };
+    let path = asked_path(page, uri_path);
     // Only plain names inside the page's folder.
     let relative = Path::new(path.trim_start_matches('/'));
     if relative.components().any(|c| !matches!(c, Component::Normal(_))) {
@@ -369,6 +371,81 @@ fn serve_path(root: Option<&Path>, page: Page, uri_path: &str) -> Response<Vec<u
         response = response.header(header::CONTENT_SECURITY_POLICY, COMPILER_SANDBOX_WORKER_CSP);
     }
     response.body(bytes).expect("a response")
+}
+
+/// The path a request names, decoded, with the page's start document where it names none.
+fn asked_path(page: Page, uri_path: &str) -> String {
+    let raw = percent_decode_str(uri_path).decode_utf8_lossy().into_owned();
+    if raw == "/" || raw.is_empty() {
+        page.start().to_string()
+    } else {
+        raw
+    }
+}
+
+/// The sandbox a document of the agent's port is answered with, where it is not the Agent's own page (`None`: that
+/// one is the webview's page, and no frame).
+///
+/// Every other document there is a preview frame's: the web page preview (`/webpage/`), the 3D model viewer
+/// (`/modelview/`) and the SoftN runtime's two hosts (`/softn/`). Each runs what its parent sends it (the web page
+/// preview imports the engine it is posted), which is safe only with the opaque origin the Agent frames it for
+/// (`newFrame` in `app/src/preview/preview.ts`). Said by the answer too, the document has that origin wherever it is
+/// opened, by whatever page. Each is allowed here what the Agent's frame allows it (a test holds the two together),
+/// so the Agent's own frames are as they were; a document nobody has said how to frame is allowed nothing.
+///
+/// The folder is matched whatever its case: a Mac's disk finds `webpage/` under `/WEBPAGE/` too. A spelling of the
+/// Agent's own page other than its address is taken for a frame's, which errs on the closed side.
+fn preview_sandbox(path: &str) -> Option<&'static str> {
+    if path == Page::Agent.start() {
+        return None;
+    }
+    let folder = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    Some(if folder.eq_ignore_ascii_case("webpage") {
+        "sandbox allow-scripts allow-forms"
+    } else if folder.eq_ignore_ascii_case("softn") {
+        "sandbox allow-scripts allow-forms allow-modals"
+    } else if folder.eq_ignore_ascii_case("modelview") {
+        "sandbox allow-scripts"
+    } else {
+        "sandbox"
+    })
+}
+
+/// A file of the agent's page from its own port ([`serve_agent_over_http`]): [`serve_path`]'s answer, kept from other
+/// sites' pages. Any browser on this computer can ask this port, and the desktop's API takes the port's origin for the
+/// Agent's window ([`crate::http::is_embedded_origin`]), so nothing another site steers may run in that origin:
+///
+/// - No answer may be framed by another origin (`frame-ancestors 'self'`; `X-Frame-Options` says the same to an engine
+///   that reads only that). The Agent's own frames are its page's, on this origin.
+/// - A document that is not the Agent's own page is answered sandboxed ([`preview_sandbox`]).
+/// - The Agent's own page is not handed to a request another site caused (`Sec-Fetch-Site: cross-site`): its webview
+///   opens it itself, which a browser calls `none` as it does a person typing the address, and the page loads itself
+///   again as `same-origin`. A program that is no browser, or an engine that does not say, sends no such header and
+///   is answered. The frames' files are not refused so: a sandboxed frame's origin is opaque, so a browser calls every
+///   file it loads, and its own reload, `cross-site`.
+fn serve_agent_http(root: Option<&Path>, uri_path: &str, fetch_site: Option<&str>) -> Response<Vec<u8>> {
+    let mut response = serve_path(root, Page::Agent, uri_path);
+    let document = response.status() == StatusCode::OK
+        && response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("text/html"));
+    let sandbox = if document { preview_sandbox(&asked_path(Page::Agent, uri_path)) } else { None };
+    if document && sandbox.is_none() && fetch_site.is_some_and(|site| site.trim().eq_ignore_ascii_case("cross-site")) {
+        response = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(b"OAIY's Agent opens in OAIY's own window, not from another site".to_vec())
+            .expect("a response");
+    }
+    let policy = match sandbox {
+        Some(sandbox) => format!("frame-ancestors 'self'; {sandbox}"),
+        None => "frame-ancestors 'self'".to_string(),
+    };
+    let headers = response.headers_mut();
+    // (beside a policy the file already has, not in its place: a browser holds a page to every policy it is sent)
+    headers.append(header::CONTENT_SECURITY_POLICY, policy.parse().expect("a policy is a header's value"));
+    headers.insert(header::X_FRAME_OPTIONS, tauri::http::HeaderValue::from_static("SAMEORIGIN"));
+    response
 }
 
 /// What each embedded page knows from its first line: where the desktop is, a token for it, and the theme.
@@ -1779,5 +1856,121 @@ mod tests {
         let agent_resp = serve_path(Some(&root), Page::Agent, "/assets/compiler-sandbox-worker-abc123.js");
         assert_eq!(agent_resp.status(), StatusCode::OK);
         assert!(agent_resp.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+    }
+
+    /// The Agent's files as its port has them: its page, the three previews' documents and a file of each.
+    fn agent_files(scratch: &Scratch) -> PathBuf {
+        for file in ["index.html", "assets/main.js", "webpage/index.html", "webpage/page-host.js", "modelview/index.html", "softn/index.html", "softn/host.html", "softn/assets/entry.js", "other/page.html"] {
+            scratch.file(&format!("app/{file}"));
+        }
+        scratch.path("app")
+    }
+
+    fn policy_of(response: &Response<Vec<u8>>) -> Vec<String> {
+        response.headers().get_all(header::CONTENT_SECURITY_POLICY).iter().map(|v| v.to_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn nothing_the_agents_port_serves_may_be_framed_by_another_site() {
+        let scratch = Scratch::new("port-framing");
+        let root = agent_files(&scratch);
+        // Its page, a file, a preview's document, something that is not there, and a refusal: none may be framed elsewhere.
+        for (path, site, status) in [
+            ("/", None, StatusCode::OK),
+            ("/index.html", Some("same-origin"), StatusCode::OK),
+            ("/assets/main.js", Some("cross-site"), StatusCode::OK),
+            ("/webpage/index.html", Some("cross-site"), StatusCode::OK),
+            ("/nope.html", None, StatusCode::NOT_FOUND),
+            ("/index.html", Some("cross-site"), StatusCode::FORBIDDEN),
+        ] {
+            let response = serve_agent_http(Some(&root), path, site);
+            assert_eq!(response.status(), status, "{path} {site:?}");
+            let policy = policy_of(&response);
+            assert_eq!(policy.len(), 1, "{path}");
+            assert!(policy[0].split(';').any(|d| d.trim() == "frame-ancestors 'self'"), "{path}: {policy:?}");
+            assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "SAMEORIGIN", "{path}");
+        }
+        // The scheme's own handler (Windows, and where the port is taken) is as it was: no browser but the window's reaches it.
+        assert!(serve_path(Some(&root), Page::Agent, "/webpage/index.html").headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+    }
+
+    #[test]
+    fn a_preview_document_has_an_opaque_origin_wherever_it_is_opened_and_the_agents_page_has_its_own() {
+        let scratch = Scratch::new("port-sandbox");
+        let root = agent_files(&scratch);
+        let sandbox = |path: &str| -> Option<String> {
+            let response = serve_agent_http(Some(&root), path, None);
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            policy_of(&response)[0].split(';').map(str::trim).find(|d| d.split(' ').next() == Some("sandbox")).map(String::from)
+        };
+        // The Agent's own page is the webview's page: sandboxed, it would have no storage and no desktop.
+        for own in ["/", "", "/index.html"] {
+            assert_eq!(sandbox(own), None, "{own:?}");
+        }
+        // A page framing one of these with no sandbox of its own ran its code in this port's origin, which the
+        // desktop's API takes for the Agent's window.
+        assert_eq!(sandbox("/webpage/index.html").as_deref(), Some("sandbox allow-scripts allow-forms"));
+        assert_eq!(sandbox("/webpage/").as_deref(), Some("sandbox allow-scripts allow-forms"));
+        assert_eq!(sandbox("/modelview/index.html").as_deref(), Some("sandbox allow-scripts"));
+        assert_eq!(sandbox("/softn/index.html").as_deref(), Some("sandbox allow-scripts allow-forms allow-modals"));
+        assert_eq!(sandbox("/softn/host.html").as_deref(), Some("sandbox allow-scripts allow-forms allow-modals"));
+        // However the address is spelt: percent-encoded, and a document nobody has said how to frame runs nothing.
+        assert_eq!(sandbox("/%77ebpage/index.html").as_deref(), Some("sandbox allow-scripts allow-forms"));
+        assert_eq!(sandbox("/other/page.html").as_deref(), Some("sandbox"));
+        // No same-origin, ever: that flag is what would give a framed document this port's origin back.
+        for path in ["/webpage/index.html", "/modelview/index.html", "/softn/index.html", "/softn/host.html", "/other/page.html"] {
+            assert!(!sandbox(path).unwrap().contains("allow-same-origin"), "{path}");
+        }
+        // The folder whatever its case (a Mac's disk finds the file either way), and a spelling of the Agent's own
+        // page that is not its address is a frame's.
+        assert_eq!(preview_sandbox("/WebPage/index.html"), Some("sandbox allow-scripts allow-forms"));
+        assert_eq!(preview_sandbox("/SOFTN/host.html"), Some("sandbox allow-scripts allow-forms allow-modals"));
+        assert_eq!(preview_sandbox("/INDEX.HTML"), Some("sandbox"));
+        assert_eq!(preview_sandbox("//index.html"), Some("sandbox"));
+        // A file that is no document is not a frame's to be: only its answer's type decides.
+        assert_eq!(sandbox("/webpage/page-host.js"), None);
+        assert_eq!(sandbox("/softn/assets/entry.js"), None);
+    }
+
+    #[test]
+    fn a_preview_is_allowed_by_its_answer_what_the_agents_frame_allows_it() {
+        // `this.newFrame(title, `${import.meta.env.BASE_URL}<folder>/index.html?…`, '<flags>')` in the Agent: the frame's
+        // attribute and the answer's directive are both applied, so a flag only one of them had would be lost.
+        let agent = include_str!("../../../../app/src/preview/preview.ts");
+        let mut framed = 0;
+        for line in agent.lines().filter(|l| l.contains("this.newFrame(")) {
+            let folder = ["webpage", "modelview", "softn"]
+                .into_iter()
+                .find(|f| line.contains(&format!("BASE_URL}}{f}/")))
+                .unwrap_or_else(|| panic!("the Agent frames a document the port's sandbox does not know: {line}"));
+            let flags = line.rsplit('\'').nth(1).unwrap_or_else(|| panic!("the frame's sandbox is the last text of {line}"));
+            assert_eq!(preview_sandbox(&format!("/{folder}/index.html")), Some(format!("sandbox {flags}").as_str()), "{folder}");
+            assert!(!flags.contains("allow-same-origin"), "{folder}: the Agent's frame is opaque");
+            framed += 1;
+        }
+        assert_eq!(framed, 3, "the web page preview, the 3D model viewer and the SoftN preview");
+    }
+
+    #[test]
+    fn the_agents_own_page_is_not_handed_to_a_request_another_site_caused() {
+        let scratch = Scratch::new("port-fetch-site");
+        let root = agent_files(&scratch);
+        let status = |path: &str, site: Option<&str>| serve_agent_http(Some(&root), path, site).status();
+        // Another site's page opening it, framing it or fetching it.
+        for path in ["/", "/index.html"] {
+            assert_eq!(status(path, Some("cross-site")), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(status(path, Some(" Cross-Site ")), StatusCode::FORBIDDEN, "{path}");
+        }
+        let refused = serve_agent_http(Some(&root), "/index.html", Some("cross-site"));
+        assert_ne!(refused.body(), b"<!doctype html>");
+        // The webview opening it and a person typing the address (`none`), the page loading itself again, a program
+        // that is no browser and an engine that does not say.
+        for site in [Some("none"), Some("same-origin"), Some("same-site"), None] {
+            assert_eq!(status("/index.html", site), StatusCode::OK, "{site:?}");
+        }
+        // A sandboxed frame's origin is opaque: its own files, and its own reload, are "cross-site" to a browser.
+        for path in ["/webpage/page-host.js", "/softn/assets/entry.js", "/assets/main.js", "/webpage/index.html", "/softn/index.html", "/modelview/index.html"] {
+            assert_eq!(status(path, Some("cross-site")), StatusCode::OK, "{path}");
+        }
     }
 }

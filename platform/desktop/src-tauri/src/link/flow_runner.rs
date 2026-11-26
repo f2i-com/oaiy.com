@@ -430,6 +430,30 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// which is one deadline for the whole exchange, and they are read at once.
 const RESEND_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The logic languages this desktop runs, under the name the provider reads
+/// them by on this lane ([`FlowsSpec::languages_field`]); none when it reads
+/// none. Said on the queue, the claim and the graphs, which a provider answers
+/// by what the caller runs: a caller that names no language is shown the runs
+/// and the flows of a runtime with one, whatever its heartbeat declared, so a
+/// run in a second language was deferred to this desktop and never listed for
+/// it.
+fn languages_said(spec: &FlowsSpec) -> Option<(&str, Vec<String>)> {
+    Some((spec.languages_field.as_deref()?, super::heartbeat::logic_languages()))
+}
+
+/// A GET of this lane's that says those languages in its query, joined by
+/// commas, where the provider reads them.
+fn get_saying_languages(
+    http: &reqwest::blocking::Client,
+    url: String,
+    spec: &FlowsSpec,
+) -> reqwest::blocking::RequestBuilder {
+    match languages_said(spec) {
+        Some((name, ids)) => http.get(url).query(&[(name, ids.join(","))]),
+        None => http.get(url),
+    }
+}
+
 /// One look at the queue, and at most one run.
 ///
 /// One at a time deliberately: a flow run is a whole process with a five minute
@@ -448,8 +472,7 @@ fn poll_once(
     held: &Held,
 ) -> Result<(usize, Option<String>), String> {
     let http = HTTP.get()?;
-    let resp = http
-        .get(super::oauth::join(&account.base_url, lane.queued))
+    let resp = get_saying_languages(&http, super::oauth::join(&account.base_url, lane.queued), spec)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the flow queue: {e}"))?;
@@ -511,7 +534,8 @@ fn serve(
     // account — the provider's own browser polls for claimable queued runs and
     // takes them, with the prelude, which is the whole point of dropping the
     // engine token in the same state. A run this desktop CLAIMED and could not
-    // start is one nobody else is offered until something sweeps it up.
+    // start is one nobody else is offered again: the provider's sweep of stale
+    // runs ends it as failed, it does not put it back in the queue.
     //
     // So: refuse before the claim, and go on polling. The reason reaches the
     // link status through the caller, which is where an operator would look.
@@ -526,13 +550,17 @@ fn serve(
     // twice.
     let run_seg = super::oauth::path_segment(&run.id, "run id")?;
     let claim_url = super::oauth::join(&account.base_url, &lane.claim.replace("{id}", &run_seg));
+    // `runtime` says which kind of runtime took it, `instanceId` says which
+    // machine. The provider binds the completion to the same instance, so
+    // the two legs must present the same id.
+    let mut claim = json!({ "runtime": "desktop", "instanceId": instance });
+    if let Some((name, ids)) = languages_said(spec) {
+        claim[name] = json!(ids);
+    }
     let claimed = match http
         .post(&claim_url)
         .bearer_auth(&account.credential)
-        // `runtime` says which kind of runtime took it, `instanceId` says which
-        // machine. The provider binds the completion to the same instance, so
-        // the two legs must present the same id.
-        .json(&json!({ "runtime": "desktop", "instanceId": instance }))
+        .json(&claim)
         .send()
     {
         Ok(r) => r,
@@ -574,13 +602,18 @@ fn serve(
     }
     // What the BINDING asked for with the answer, before the run is reported.
     //
-    // Inside the claimed window on purpose. Reporting first and acting after
-    // would leave a crash in between with the run already terminal, so nothing
-    // would ever retry it and the writes would be lost for good; acting first
-    // leaves the run claimed, which the provider's own reaper returns to the
-    // queue. The provider's exactly-once gates are what make the retry safe —
-    // a run is reserved under a unique key and claimed atomically — and each
-    // side effect additionally carries a key of its own.
+    // Inside the claimed window on purpose: the report is what says how the
+    // actions went (their failures ride in the result), and a run reported
+    // done first would stay done whatever became of them.
+    //
+    // A crash in between is not retried in either order. The provider's reaper
+    // does not put a run that was left claimed back in its queue: once the run
+    // is stale it ends it as failed, with nothing run again. So what a crash
+    // cut short is seen there as a run that failed, not as one that finished
+    // with its writes missing, and the actions already performed are not
+    // performed a second time. Each write still carries a key of its own, for
+    // the request that is sent twice inside the one execution (its answer lost
+    // on the way back).
     let outcome = match outcome {
         Ok(result) => cap_result(result).map(|result| apply_result_actions(account, spec, run, result)),
         other => other,
@@ -750,7 +783,7 @@ fn execute(
         // helper call throwing inside a node that then reports its own failure.
         return Err(Failure::new(FailureCode::RunnerUnavailable, why.clone()));
     }
-    let graph = fetch_graph(account, lane, run)?;
+    let graph = fetch_graph(account, spec, lane, run)?;
 
     // Everything travels by file. Values can be large and the connector config
     // carries this desktop's credential — argv is visible to every process
@@ -1002,14 +1035,14 @@ fn write_file(path: &Path, body: &str) -> Result<(), Failure> {
 /// share a name would be silent and wrong rather than loud and wrong.
 fn fetch_graph(
     account: &LinkedAccount,
+    spec: &FlowsSpec,
     lane: &Lane,
     run: &QueuedRun,
 ) -> Result<Value, Failure> {
     let http = HTTP.get().map_err(|e| {
         Failure::new(FailureCode::RunnerUnavailable, e)
     })?;
-    let resp = http
-        .get(super::oauth::join(&account.base_url, lane.graph))
+    let resp = get_saying_languages(&http, super::oauth::join(&account.base_url, lane.graph), spec)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| {
@@ -1051,7 +1084,9 @@ fn fetch_graph(
         // the ones with code. Reading that as a broken graph would file a
         // permanent failure against an automation that is fine and send its
         // author looking for a step to fix, when the fix is on this machine and
-        // another runtime could take the run as it stands.
+        // another runtime would have run the flow as it stands. (This run is
+        // ended either way: a claimed run that is reported failed is not
+        // queued again.)
         None if reply.flows.is_empty() => {
             return Err(Failure::new(
                 FailureCode::RunnerUnavailable,
@@ -1102,8 +1137,9 @@ fn select_flow<'a>(flows: &'a [FlowDoc], run: &QueuedRun) -> Option<&'a FlowDoc>
 ///
 /// Retried, because this is the one leg whose loss is unrecoverable from here:
 /// the run stays `running`, no other runtime will claim it, and it waits for
-/// somebody's reaper. A 409 is not retried — it means the run was already
-/// finalised, so there is nothing left to say.
+/// somebody's reaper, which ends it as failed whatever it really did. A 409 is
+/// not retried — it means the run was already finalised, so there is nothing
+/// left to say.
 fn report(
     account: &LinkedAccount,
     lane: &Lane,
@@ -1730,6 +1766,7 @@ mod tests {
             claim_path: None,
             complete_path: None,
             graph_path: None,
+            languages_field: None,
             nodes: Vec::new(),
             selectors: None,
             input_map_field: None,
@@ -1847,6 +1884,7 @@ mod tests {
             claim_path: Some("/runs/{id}/claim".into()),
             complete_path: Some("/runs/{id}".into()),
             graph_path: Some("/flows".into()),
+            languages_field: None,
             nodes: Vec::new(),
             selectors: None,
             input_map_field: None,
@@ -1925,7 +1963,8 @@ mod tests {
     #[test]
     fn a_run_is_not_claimed_when_the_providers_prelude_is_missing() {
         // A claim is a promise: a claimed run is one no other runtime will
-        // touch until the provider's reaper returns it. Without the library
+        // touch again (left claimed, the provider's reaper ends it as failed;
+        // it does not queue it for another). Without the library
         // this provider's flow scripts are written against, this desktop cannot
         // keep that promise — so the run is left in the queue, where the
         // provider's own runtime can still have it.
@@ -1979,6 +2018,42 @@ mod tests {
             complete_raw.contains("oaiy-test"),
             "the completion must present the same instance as the claim: {complete_raw}"
         );
+    }
+
+    #[test]
+    fn the_queue_the_claim_and_the_graphs_say_which_logic_languages_this_desktop_runs() {
+        // The heartbeat names them, and the provider counts a language only where the request names it too: a
+        // request that named none was answered as a runtime with one language is, so once the CLI gained a second
+        // the runs in it would have been deferred to this desktop and never shown to it.
+        let shipped = descriptor::builtin().remove(0).flows.unwrap();
+        assert_eq!(shipped.languages_field.as_deref(), Some("logicLanguages"), "the name FormLogic reads on all three");
+        let mut named = spec();
+        named.languages_field = shipped.languages_field;
+        let said = crate::link::heartbeat::logic_languages();
+        assert!(said.iter().any(|l| l == "javascript"), "{said:?}");
+        let query = format!("?logicLanguages={} ", said.join("%2C"));
+
+        let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
+        poll_once(&account(base), &named, &Lane::of(&named).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
+        let (queue, _) = rx.recv().unwrap();
+        assert!(queue.starts_with(&format!("GET /runs/queued{query}")), "{queue}");
+        let (claim, claim_raw) = rx.recv().unwrap();
+        assert!(claim.starts_with("POST /runs/r1/claim "), "{claim}");
+        let body: Value = serde_json::from_str(claim_raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, json!({ "runtime": "desktop", "instanceId": "oaiy-test", "logicLanguages": said }), "a list, in the body");
+        let (graph, _) = rx.recv().unwrap();
+        assert!(graph.starts_with(&format!("GET /flows{query}")), "{graph}");
+
+        // A provider that reads none is told nothing: the requests are what they were.
+        let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
+        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
+        let (queue, _) = rx.recv().unwrap();
+        assert!(queue.starts_with("GET /runs/queued "), "{queue}");
+        let (_, claim_raw) = rx.recv().unwrap();
+        let body: Value = serde_json::from_str(claim_raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, json!({ "runtime": "desktop", "instanceId": "oaiy-test" }));
+        let (graph, _) = rx.recv().unwrap();
+        assert!(graph.starts_with("GET /flows "), "{graph}");
     }
 
     #[test]
@@ -2117,7 +2192,7 @@ mod tests {
         let (claim, _) = rx.recv().unwrap();
         assert!(claim.starts_with("POST /runs/r1/claim "), "{claim}");
         // The whole point: a completion follows anyway, so a run that WAS
-        // claimed comes back rather than sitting at `running`.
+        // claimed is ended, as failed, rather than left sitting at `running`.
         let (release, release_raw) = rx.recv().unwrap();
         assert!(release.starts_with("PATCH /runs/r1 "), "{release}");
         assert!(release_raw.contains("runner_unavailable"), "{release_raw}");

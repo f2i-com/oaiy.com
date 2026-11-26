@@ -3,7 +3,7 @@ import { useVisiblePoll } from './useVisiblePoll';
 import { Check, X, Link2 } from 'lucide-react';
 import { pairing, type PendingPairing } from './api';
 import { useToast } from './Toasts';
-import { pairingFrom, pairingGrants } from './pairingWords';
+import { pairingCalls, pairingGrants, pairingWho } from './pairingWords';
 
 /**
  * App-wide pairing prompt.
@@ -81,14 +81,15 @@ export default function PairingPrompt() {
         >
           <div className="pairing-head">
             <Link2 size={16} aria-hidden />
-            <strong id={`pairing-title-${req.pairingId}`}>
-              {req.label ?? req.product} wants to connect
-            </strong>
+            <strong id={`pairing-title-${req.pairingId}`}>An app wants to connect</strong>
           </div>
           <div className="pairing-body">
+            {/* Who really asks, on a line of its own; then what it calls itself, as its own words. */}
+            <span className="pairing-who">
+              From <b>{pairingWho(req.origin)}</b>
+            </span>
             <span>
-              <b>{req.product}</b>
-              {pairingFrom(req.origin)} {pairingGrants(req.access)}
+              {pairingCalls(req.product, req.label, req.origin)} It {pairingGrants(req.access)}
             </span>
             <span className="pairing-code">
               Confirm the code matches: <code>{req.code}</code>

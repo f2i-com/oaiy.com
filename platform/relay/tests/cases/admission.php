@@ -326,6 +326,11 @@ test('4.14.3 the TURN and STUN configuration fails closed: bad urls, a missing o
         'a secret that is a number' => ['turn' => ['secret' => 12345678901234567890123456789012]], 'ttl 59' => ['turn' => ['ttl' => 59]], 'ttl 3601' => ['turn' => ['ttl' => 3601]],
         'ttl a string' => ['turn' => ['ttl' => '600']], 'ttl a float' => ['turn' => ['ttl' => 600.5]], 'relay_only as a string' => ['turn' => ['relay_only' => 'true']],
         'relay_only without any TURN url' => ['turn' => ['urls' => [], 'relay_only' => true]],
+        // The scheme is lower case (ice-server.schema.json, and the decoders, which know a TURN entry by "turn:"): a url that
+        // passed here in upper case went into every admission and the native client refused each one.
+        'an upper-case TURN scheme' => ['turn' => ['urls' => ['TURN:t.example.com:3478']]], 'a mixed-case turns scheme' => ['turn' => ['urls' => ['turn:t.example.com', 'Turns:t.example.com:5349']]],
+        'an upper-case STUN scheme' => ['stun' => ['urls' => ['STUN:s.example.com']]], 'a mixed-case stuns scheme' => ['stun' => ['urls' => ['stunS:s.example.com']]],
+        'a turn url that is the scheme alone' => ['turn' => ['urls' => ['turn:']]], 'a stun url that is the scheme alone' => ['stun' => ['urls' => ['stuns:']]],
     ];
     foreach ($bad as $label => $over) {
         $e = throws(fn() => $cfg($over), \RuntimeException::class);
@@ -335,6 +340,7 @@ test('4.14.3 the TURN and STUN configuration fails closed: bad urls, a missing o
     ok($cfg(['turn' => ['ttl' => 3600]]) instanceof Config, 'ttl 3600');
     ok($cfg(['turn' => ['urls' => [], 'secret' => null], 'stun' => ['urls' => []]]) instanceof Config, 'no ICE servers at all');
     ok($cfg(['turn' => ['secret' => str_repeat('s', 32)]]) instanceof Config, 'a secret of exactly 32 bytes');
+    ok($cfg(['turn' => ['urls' => ['turn:t.example.com:3478?transport=udp', 'turns:T.Example.com:5349']], 'stun' => ['urls' => ['stun:s.example.com', 'stuns:S.example.com:5349']]]) instanceof Config, 'the four schemes; a host is in any case');
     eq(600, $cfg([])->turn()['ttl']);
 });
 

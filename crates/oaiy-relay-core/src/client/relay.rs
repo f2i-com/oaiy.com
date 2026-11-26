@@ -624,8 +624,9 @@ impl RelayClient {
     }
 
     /// `POST /v1/admission` for a paired phone: the request and the expectation are made from the phone's profile, and the answer is **also** compared with what the owner approved
-    /// (the profile's grants are the receipt's signed grants; its peer is the desktop pinned from the offer): scopes that are not those grants, or another expected peer, are an
-    /// error ([`MobileAdmission::check_against`]). `holder_thumbprint` is the thumbprint of the phone's endpoint key.
+    /// (the profile's grants are the receipt's signed grants; its peer is the desktop pinned from the offer): a scope that is not one of those grants, or another expected peer, is
+    /// an error ([`MobileAdmission::check_against`]). Fewer scopes are not: the desktop may have narrowed the phone since the pairing, and the admission's own `scopes` are then what
+    /// the phone has now. `holder_thumbprint` is the thumbprint of the phone's endpoint key.
     pub fn admission_for_profile(
         &self,
         token: &Token,

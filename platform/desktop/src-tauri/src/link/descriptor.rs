@@ -60,6 +60,32 @@ pub struct Oauth2Pkce {
     /// provider has no such codes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_code: Option<LinkCodeSpec>,
+    /// How the provider is told that this desktop has unlinked, so that the key
+    /// it gave the link stops working there and the connection it made goes
+    /// with it. None: the provider has no such request, and unlinking forgets
+    /// the key on this machine alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlink: Option<UnlinkSpec>,
+}
+
+/// The request that ends a link at the provider ([`Oauth2Pkce::unlink`]). It is
+/// made with the link's own key and carries nothing else, so the provider can
+/// only read it as the end of the link that makes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnlinkSpec {
+    pub method: UnlinkMethod,
+    /// Joined to the base URL.
+    pub path: String,
+}
+
+/// The verbs a provider may take its unlink request by. Closed, as the
+/// operations are: a descriptor chooses between them and cannot name another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum UnlinkMethod {
+    Delete,
+    Post,
 }
 
 /// Where and how a one-time link code is redeemed ([`super::oauth::redeem_link_code`]).
@@ -222,10 +248,24 @@ pub struct AppLogicSpec {
     /// too large turns every correction into a large download.
     #[serde(default = "default_app_logic_scan")]
     pub match_scan_limit: u32,
+    /// The query parameter that makes the provider's listing answer only the
+    /// records whose field holds a value, `{field}` substituted
+    /// (`answers.{field}`). With it a match on words is asked of the provider
+    /// first, so a record is found however old it is; the scan of the newest
+    /// page stays as the fallback. Absent: the listing is only ever scanned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_filter_param: Option<String>,
     /// What the fields of an effect — and of a record on the wire — are called.
     pub fields: AppLogicFields,
     /// What the parts of the fetched app list are called.
     pub catalogue: AppLogicCatalogue,
+    /// Where the account says which ONE app takes a source's events, for a
+    /// provider whose apps say which sources they take
+    /// ([`AppLogicCatalogue::sources`]). Named together with that list or not
+    /// at all: absent, every app's scripts run for every event, as they did
+    /// before the provider's rule was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<AppLogicRouting>,
     /// The effect types this provider's scripts emit, and what each one means
     /// in terms this desktop can actually perform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -257,6 +297,26 @@ pub struct AppLogicSpec {
 
 fn default_app_logic_scan() -> u32 {
     200
+}
+
+/// The account's choice of one app for a source of events, where two of its
+/// apps could take them.
+///
+/// A provider that lets an account build two apps on one plugin has to say
+/// which of them a call or a text belongs to: run for both, every event writes
+/// its records twice, once into each. The choice is the account's and is kept
+/// by the provider, so it is read from there, with the app list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicRouting {
+    /// GET: the account's choices. No placeholder: it is one list an account.
+    pub path: String,
+    /// In the reply: the array of choices.
+    pub list: String,
+    /// On one of those: the source, and the id of the app chosen for it (the
+    /// id [`AppLogicCatalogue::app_id`] names on an app).
+    pub source: String,
+    pub app: String,
 }
 
 /// One effect type a provider's scripts emit.
@@ -376,6 +436,21 @@ pub struct AppLogicCatalogue {
     pub forms: String,
     pub form_id: String,
     pub form_key: String,
+    /// On a form: the name the app shows it under. A script may name a form by
+    /// it (after the portable key and the form's own id, as the provider's own
+    /// page resolves a key), which is the only way an app that was not
+    /// installed from a pack can: its forms have no portable key. Absent: a
+    /// form is found by its key or its id alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_label: Option<String>,
+    /// On an app: the list of the sources whose events the app takes (a
+    /// plugin's id, as an event's envelope names its source). With it, an
+    /// event goes to the one app that takes its source, or to the one the
+    /// account chose among several ([`AppLogicSpec::routing`]). Absent, or on
+    /// an app that lists nothing: nothing is known of who takes what, and
+    /// every app's scripts run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<String>,
 }
 
 impl AppLogicCatalogue {
@@ -476,6 +551,18 @@ pub struct FlowsSpec {
     /// whatever runtime the provider already has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_path: Option<String>,
+    /// The name under which this lane says which logic languages this desktop
+    /// runs: a query parameter on the queue and on the graphs (the ids joined
+    /// by commas), and a field of the claim's body (a list).
+    ///
+    /// The heartbeat says the same thing in its own vocabulary
+    /// ([`HeartbeatSpec::language_capability_prefix`]), and a provider that
+    /// hears a language there and none here takes the request for one from a
+    /// runtime with a single language: the run in the second is deferred to
+    /// this desktop by one half of the provider and hidden from it by the
+    /// other. Absent: nothing is said, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages_field: Option<String>,
     /// The node types this provider's graphs are written in, and what each one
     /// means in terms this desktop can actually perform.
     ///
@@ -658,6 +745,13 @@ pub struct ResultActionFields {
     /// (as [`FlowNodeSpec::run_field`]; a binding's write goes the same way).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+    /// In a record write's body: the key the write is made under, where the
+    /// provider reads one there (as [`AppLogicFields::write_key`]), so the same
+    /// action sent again finds the record it made the first time. The key
+    /// also goes in the `Idempotency-Key` header, which a provider that reads
+    /// only its body never sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_key: Option<String>,
     /// On a notify action: what to say.
     pub message: String,
     /// On a connector action: whose command, which command, and its body.
@@ -1105,6 +1199,7 @@ impl ConnectorDescriptor {
         ]
         .into_iter()
         .chain(o.link_code.as_ref().map(|c| ("linkCode.path", &c.path)))
+        .chain(o.unlink.as_ref().map(|u| ("unlink.path", &u.path)))
         {
             if !path.starts_with('/') {
                 return Err(format!(
@@ -1119,6 +1214,16 @@ impl ConnectorDescriptor {
         if let Some(c) = &o.link_code {
             if c.code_field.trim().is_empty() || c.device_field.as_deref().is_some_and(|f| f.trim().is_empty()) {
                 return Err(format!("connector {:?} linkCode names an empty field", self.id));
+            }
+        }
+        // It is the link's own request and names no record: a placeholder in it
+        // would be sent to the provider as it is written.
+        if let Some(u) = &o.unlink {
+            if u.path.contains('{') {
+                return Err(format!(
+                    "connector {:?} unlink.path takes no placeholder, got {:?}",
+                    self.id, u.path
+                ));
             }
         }
         if let Some(h) = &self.heartbeat {
@@ -1352,6 +1457,16 @@ impl ConnectorDescriptor {
                     self.id, f.queued_idle_seconds
                 ));
             }
+            // A NAME, written into a query and into a body: nothing a query
+            // could be bent with, and not blank.
+            if let Some(name) = &f.languages_field {
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+                    return Err(format!(
+                        "connector {:?} flows languagesField {name:?} must be a plain parameter name",
+                        self.id
+                    ));
+                }
+            }
             // Claiming is only meaningful with somewhere to report the outcome:
             // a run taken and never completed is worse than one left queued,
             // because it looks to everyone else like it is being worked on.
@@ -1493,6 +1608,17 @@ impl ConnectorDescriptor {
                     self.id, a.match_scan_limit
                 ));
             }
+            // A parameter NAME with the field's own name in it, and nothing a
+            // query could be bent with: it is written into a URL.
+            if let Some(param) = &a.match_filter_param {
+                let plain = param.replace("{field}", "f");
+                if !param.contains("{field}") || plain.is_empty() || !plain.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+                    return Err(format!(
+                        "connector {:?} appLogic matchFilterParam {param:?} must be a query parameter name holding {{field}}",
+                        self.id
+                    ));
+                }
+            }
             for (label, name) in a.fields.all() {
                 if name.trim().is_empty() {
                     return Err(format!(
@@ -1512,6 +1638,36 @@ impl ConnectorDescriptor {
                          key called \"\" in the app list",
                         self.id
                     ));
+                }
+            }
+            // The two halves of one rule. A list of who takes a source with
+            // nowhere to read the account's choice would leave two apps that
+            // take the same one with no way to be told apart, and a choice
+            // with no such list would be fetched and never used.
+            if a.catalogue.sources.is_some() != a.routing.is_some() {
+                return Err(format!(
+                    "connector {:?} appLogic names one of catalogue.sources/routing without the other",
+                    self.id
+                ));
+            }
+            if a.catalogue.sources.as_ref().is_some_and(|name| name.trim().is_empty()) {
+                return Err(format!("connector {:?} appLogic catalogue.sources is blank", self.id));
+            }
+            if let Some(r) = &a.routing {
+                if !r.path.starts_with('/') || r.path.contains('{') {
+                    return Err(format!(
+                        "connector {:?} appLogic routing.path must begin with '/' and takes no placeholder, got {:?}",
+                        self.id, r.path
+                    ));
+                }
+                for (label, name) in [("list", &r.list), ("source", &r.source), ("app", &r.app)] {
+                    if name.trim().is_empty() {
+                        return Err(format!(
+                            "connector {:?} appLogic routing.{label} is blank, which would read a \
+                             key called \"\" in the account's choices",
+                            self.id
+                        ));
+                    }
                 }
             }
             let mut seen = std::collections::BTreeSet::new();
@@ -1643,6 +1799,40 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_provider_names_the_request_that_ends_a_link_and_a_bad_one_is_refused() {
+        // FormLogic's own: `DELETE /api/v1/desktop-connections/self` removes the connection the calling key was
+        // made for and revokes that key (backend/public/index.php, FlowController::deleteOwnDesktopConnection).
+        let AuthSpec::Oauth2Pkce(o) = builtin().remove(0).auth;
+        assert_eq!(o.unlink, Some(UnlinkSpec { method: UnlinkMethod::Delete, path: "/api/v1/desktop-connections/self".into() }));
+
+        let with = |edit: &dyn Fn(&mut UnlinkSpec)| {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            let AuthSpec::Oauth2Pkce(o) = &mut d.auth;
+            edit(o.unlink.as_mut().unwrap());
+            d.validate()
+        };
+        // An address in it would take the link's key to a host the base URL never named.
+        assert!(with(&|u| u.path = "https://evil.example/unlink".into()).unwrap_err().contains("unlink.path"));
+        assert!(with(&|u| u.path = "/api/v1/desktop-connections/{id}".into()).unwrap_err().contains("unlink.path"));
+        with(&|u| *u = UnlinkSpec { method: UnlinkMethod::Post, path: "/api/unlink".into() }).unwrap();
+
+        // The verb is one of two, by its own name, and a request the code does not make cannot be named.
+        let spec = |method: &str| serde_json::from_value::<UnlinkSpec>(serde_json::json!({ "method": method, "path": "/x" }));
+        assert_eq!(spec("POST").unwrap().method, UnlinkMethod::Post);
+        assert_eq!(spec("DELETE").unwrap().method, UnlinkMethod::Delete);
+        for bad in ["GET", "delete", "PUT", ""] {
+            assert!(spec(bad).is_err(), "{bad:?}");
+        }
+
+        // A provider with no such request is valid, and is written back out without the key.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let AuthSpec::Oauth2Pkce(o) = &mut d.auth;
+        o.unlink = None;
+        d.validate().unwrap();
+        assert!(serde_json::to_value(&d).unwrap()["auth"].get("unlink").is_none());
+    }
+
+    #[test]
     fn the_shipped_provider_sets_the_engine_budget_for_both_lanes() {
         // FormLogic policy, carried as data: its flows and app-logic scripts run
         // with 200M ZIPP instruction steps, the figure its own host uses. Left
@@ -1742,6 +1932,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(bare.queued_idle_seconds, 3);
+    }
+
+    #[test]
+    fn the_name_the_flow_lane_says_its_languages_under_is_a_plain_name_or_absent() {
+        let with = |name: Option<&str>| {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.flows.as_mut().unwrap().languages_field = name.map(str::to_string);
+            d.validate()
+        };
+        for bad in ["", " ", "logic languages", "a&b=c", "x?y"] {
+            assert!(with(Some(bad)).unwrap_err().contains("languagesField"), "{bad:?}");
+        }
+        for good in ["logicLanguages", "languages", "logic_languages"] {
+            with(Some(good)).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        // A provider that reads none says nothing of it, and is told nothing.
+        with(None).unwrap();
+        let bare: FlowsSpec = serde_json::from_value(serde_json::json!({ "bindingsPath": "/b", "reservePath": "/r" })).unwrap();
+        assert_eq!(bare.languages_field, None);
     }
 
     #[test]
@@ -2059,6 +2268,46 @@ mod tests {
         // …and every name is filled in, because a blank one reads a field
         // called "" on every effect and finds nothing, silently.
         assert!(a.fields.all().iter().all(|(_, v)| !v.trim().is_empty()));
+    }
+
+    #[test]
+    fn who_takes_a_sources_events_and_whom_the_account_chose_are_named_together_or_not_at_all() {
+        // The two halves of one rule: the list on an app of the sources it takes, and where the account's choice
+        // between two apps that take the same one is read.
+        let base: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let a = base.app_logic.as_ref().unwrap();
+        assert!(a.catalogue.sources.is_some() && a.routing.is_some(), "the shipped provider names both");
+
+        let mut list_only = base.clone();
+        list_only.app_logic.as_mut().unwrap().routing = None;
+        assert!(list_only.validate().unwrap_err().contains("catalogue.sources/routing"));
+        let mut choice_only = base.clone();
+        choice_only.app_logic.as_mut().unwrap().catalogue.sources = None;
+        assert!(choice_only.validate().unwrap_err().contains("catalogue.sources/routing"));
+
+        // Neither: a provider with no such rule, whose descriptor is written out and read back without the keys.
+        let mut neither = base.clone();
+        let logic = neither.app_logic.as_mut().unwrap();
+        logic.routing = None;
+        logic.catalogue.sources = None;
+        neither.validate().unwrap();
+        let written = serde_json::to_value(&neither).unwrap();
+        assert!(written["appLogic"].get("routing").is_none() && written["appLogic"]["catalogue"].get("sources").is_none());
+        assert_eq!(serde_json::from_value::<ConnectorDescriptor>(written).unwrap(), neither);
+
+        // And each name is one, and the path a path.
+        let with = |edit: &dyn Fn(&mut AppLogicSpec)| {
+            let mut d = base.clone();
+            edit(d.app_logic.as_mut().unwrap());
+            d.validate()
+        };
+        assert!(with(&|a| a.catalogue.sources = Some(" ".into())).unwrap_err().contains("catalogue.sources"));
+        assert!(with(&|a| a.routing.as_mut().unwrap().list = String::new()).unwrap_err().contains("routing.list"));
+        assert!(with(&|a| a.routing.as_mut().unwrap().source = " ".into()).unwrap_err().contains("routing.source"));
+        assert!(with(&|a| a.routing.as_mut().unwrap().app = String::new()).unwrap_err().contains("routing.app"));
+        for bad in ["api/v1/connector-assignments", "https://evil.example/x", "/api/v1/apps/{id}/assignments"] {
+            assert!(with(&|a| a.routing.as_mut().unwrap().path = bad.into()).unwrap_err().contains("routing.path"), "{bad}");
+        }
     }
 
     #[test]

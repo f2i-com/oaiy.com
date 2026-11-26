@@ -379,6 +379,15 @@ impl StubRelay {
         self.0.cv.notify_all();
     }
 
+    /// Replaces a device's grants, as the desktop's `POST /v1/devices/{id}` does on the real relay (the stub has no route for it): the next admission carries them, whatever the
+    /// receipt of the pairing signed.
+    pub fn set_grants(&self, device: &str, grants: &[&str]) {
+        let mut st = self.lock();
+        for d in st.devices.iter_mut().filter(|d| d.id == device) {
+            d.grants = grants.iter().map(|g| g.to_string()).collect();
+        }
+    }
+
     /// Every request received, in order, with the status it was answered.
     pub fn log(&self) -> Vec<LoggedRequest> {
         self.lock().log.clone()

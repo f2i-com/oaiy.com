@@ -17,10 +17,10 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
 | Transport | Plain HTTP to `http://127.0.0.1:17972` (`OAIY_BASE_URL`); events are polled |
 | Detection | `GET /api/health`, no auth; `product === 'oaiy-desktop'` and protocol major `oaiy-bridge/1`; every 10 s, every 30 s after 3 failures |
 | Pairing | `POST /api/bridge/pairing {product, label}` → `{pairingId, code, access: "apps"}`; the person approves in OAIY; FormLogic polls `GET /api/bridge/pairing/{id}` every 1.5 s for `{status: pending/approved/denied/expired, token}` (404 means expired; it waits 3 min, OAIY keeps requests 5 min) |
-| Auth | `Authorization: Bearer <token>`, kept in `sessionStorage` under `oaiy.token:<baseUrl>`; OAIY's own webview and `oaiy.com` are trusted by Origin, FormLogic uses the token, which works only from the origin that paired (and is forgotten after 90 days unused) and reaches an app's routes (`access: "apps"`: every call below) |
+| Auth | `Authorization: Bearer <token>`, kept for the signed-in FormLogic account in `localStorage` under `oaiy.token:<baseUrl>:<account id>`, so a new tab or a restarted browser reconnects without a new code (a page with no sign-in keeps it for its tab, in `sessionStorage` under `oaiy.token:<baseUrl>`; disconnecting, or OAIY refusing it, forgets it); OAIY's own webview and `oaiy.com` are trusted by Origin, FormLogic uses the token, which works only from the origin that paired (and is forgotten after 90 days unused) and reaches an app's routes (`access: "apps"`: every call below) |
 | Commands | `POST /api/bridge/connectors/{id}/request {command, payload, idempotencyKey}` → `{ok:true, result}`, where `result` is the plugin's `{ok, data}` |
 | Other calls | `GET /api/bridge/capabilities` (ids like `connector.<id>.*`), `GET /api/plugins`, `POST /api/plugins/{id}/start` and `/stop`, `GET /api/services`, `GET /api/ai/sources`, `POST /api/ai/providers/{id}/v1/chat/completions` |
-| Events | `GET /api/bridge/events?since=<seq>&limit=500` → `{events:[{seq, envelope}], next}`, every 2 s; the first poll only records the position, so old events never trigger flows |
+| Events | `GET /api/bridge/events?since=<seq>&limit=500` → `{events:[{seq, envelope}], next}`, every 2 s; the first poll only records the position, so old events never trigger flows. FormLogic sets its position to `next` at every poll and does not notice OAIY restarting, and `seq` starts again at 1 with each start: a `since` past the newest `seq` this process has given out is read as 0, so the page is answered what has happened since the restart and `next` is this process's own position (echoed back, it was answered nothing until the new process had passed the old one's count) |
 | Envelope | `docs/contracts/desktop-event.schema.json`: `{schemaVersion:1, source, name, correlationId, idempotencyKey, occurredAt, data}` |
 
 - Errors: 401 → `auth_required`; 403 → `auth_required` unless the code is
@@ -41,11 +41,45 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
   `connector:relay`, `aokie:realtime` (optional `flows:relay`, `ai:relay`).
 - **Heartbeat:** `POST /api/v1/desktop-connections` about every 45 s with a `capabilities`
   list; live for 90 s. The server reads `logic-language:javascript`,
-  `logic-language:python`, `logic-engine:zipp`. `DELETE /api/v1/desktop-connections/self`
-  unlinks.
+  `logic-language:python`, `logic-engine:zipp`.
+- **Unlinking:** `DELETE /api/v1/desktop-connections/self` (`flows:write`, no body) removes
+  the connection the calling key was made for and revokes that key
+  (`FlowController::deleteOwnDesktopConnection`). OAIY sends it when a link is disconnected
+  (the descriptor's `auth.unlink`), after the link is forgotten on the computer and without
+  waiting for the answer: with FormLogic away, the key stays valid there until the computer
+  is removed on the site. A key with no connection row is left alone by the server.
+- **Which app an event is for:** a connector's events go to ONE of the account's apps: the
+  one it is assigned to, or the only candidate; with two candidates and no assignment a
+  runtime runs none (`connector_assignments`, `FlowService::getConnectorAssignments`). Each
+  app in `GET /api/v1/app-logic` lists the connectors it holds grants for (`connectors`), and
+  `GET /api/v1/connector-assignments` answers `{assignments:[{connectorId, appId, …}],
+  candidates, desktops}`. OAIY reads the event's connector from the envelope's `source`
+  and counts as candidates the apps that list it and have an enabled `onConnectorEvent`
+  script: one candidate runs alone; several run the assigned one, or none (said once in the
+  log); no candidate at all runs every app, as before the rule was read. The assignments are
+  fetched with the app list, and only when two apps list the same connector. A flow binding
+  with an `appId` is held back when its app is a candidate and not the one chosen; bindings
+  of other apps, and those with no `appId`, fire as before (the app list is read for this
+  only when bindings of two apps wait on the event, and while it cannot be read the event
+  is kept and tried again). Not covered: two apps with flows on one connector and no
+  `customLogic` are not in `/app-logic`, so nothing tells them apart and both fire; and one
+  candidate runs even when the assignment names another app. (Descriptor:
+  `appLogic.catalogue.sources`, `appLogic.routing`.)
+- **Logic languages:** besides the heartbeat, the server asks each caller which languages it
+  runs: `?logicLanguages=javascript,python` on `GET /api/v1/flow-runs/queued` and
+  `GET /api/v1/flows`, a `logicLanguages` list in the claim's body, `?languages=` on
+  `GET /api/v1/app-logic` (`FlowLogicLanguages::fromCaller`; more than 16 ids, or one over 32
+  characters, is a 400). A caller that says nothing is read as JavaScript only, and a
+  language counts only where the heartbeat and the request both name it (`reconcile`). OAIY
+  sends the languages its CLI reports (`capabilities --json` → `run.languages`, the list the
+  heartbeat's tokens are made of) on the queue, the claim and the graphs (descriptor
+  `flows.languagesField`). It sends none on `/app-logic`, on purpose: it runs every app
+  script it is handed as JavaScript, so it must not be handed one in another language.
+  **Open:** the day the CLI reports Python, the heartbeat says `logic-language:python` for
+  the whole computer and FormLogic's browser defers Python app scripts to it, which it
+  neither asks for nor runs. The app-logic lane has to run Python before such a CLI ships.
 - **Also:** `GET /api/v1/script-profile` (ETag/304; check `preambleSha256`),
-  `GET /api/v1/app-logic?languages=`, `GET /api/v1/flows?logicLanguages=`,
-  `GET`/`PUT /api/v1/connector-assignments`, `GET /api/v1/connector-capabilities/{token}`.
+  `PUT /api/v1/connector-assignments`, `GET /api/v1/connector-capabilities/{token}`.
 
 ## Automations
 
@@ -61,7 +95,11 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
   `POST /api/v1/flow-runs/{id}/claim {runtime:'desktop', instanceId, logicLanguages}` (409 for
   the loser), `PATCH /api/v1/flow-runs/{id}`. Statuses `queued, running, done, error, timeout,
   cancelled`; error codes `node_failed, timeout, cancelled, capability_denied, invalid_flow,
-  runner_unavailable`; refusals `409 language_unsupported`, `409 engine_unavailable`.
+  runner_unavailable`; refusals `409 language_unsupported`, `409 engine_unavailable`. A run
+  left `running` for 10 minutes is ended by the reaper as `error` / `runner_unavailable`
+  (`FlowService::reclaimStuckRuns`, from cron `bin/flow-runs-reclaim.php`). It is never
+  queued again, and a `queued` run is never reaped: a claim that is not completed loses the
+  run.
 - **Encrypted flow relay** (`DesktopFlowRelayController.php`): the web side
   `POST /api/desktop/flows/run {flowId, ephPub, envelope, idempotencyKey}`; the desktop
   `GET /api/v1/desktop-flows/pending`, `…/claim`, `…/frames`, `…/complete {instanceId, status,
@@ -69,7 +107,10 @@ Code: `formlogic/ui/src/client-runtime/oaiy/` (`oaiyRuntime.ts`, `oaiyPairing.ts
   `not_claimed`. The server stores only sealed bytes.
 - **Remote command relay:** `POST /api/app/{slug}/connector-commands`; the desktop long-polls
   `GET /api/v1/connector-commands/pending?wait=25000`, claims, completes; commands expire
-  after 60 s.
+  after 60 s. The site's own controls for a computer (`POST /api/desktop/ops`, connector
+  `desktop`, commands `services.*` and `plugins.*`) go down the same lane, and name what
+  they act on as `id` in the command's payload, for a plugin and a service alike
+  (`DesktopOpsController`): OAIY reads `id` as well as its own `pluginId` / `serviceId`.
 - For `aokie.*` events the browser hands work to a desktop only when it advertises the needed
   languages (`flowDispatcher.ts`); otherwise the browser runs it. The server only enqueues:
   no user code runs server-side.

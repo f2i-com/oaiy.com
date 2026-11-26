@@ -86,7 +86,9 @@ Three promises, and what the crate does so that a host that breaks one of them c
    (returns the SAS to show), `wait_outcome(grants_from_the_desktop)` (verifies the receipt before a profile exists, opens the sealed token), then `store_paired`. A phone whose
    response the desktop rejected answers afresh (new claims, signature and MAC) and never resends the lapsed text.
 3. `PollLoop` with the paired token, and `RelayClient::admission_for_profile` for the phone's admission: it is read as the shipped phone reads it **and** compared with what the owner
-   approved (its scopes are the receipt's signed grants, its expected peer is the desktop that was pinned from the offer).
+   approved (each of its scopes is one of the receipt's signed grants, its expected peer is the desktop that was pinned from the offer). Fewer scopes than the receipt's grants are a
+   phone the desktop narrowed after the pairing (`POST /v1/devices/{id}`) and are accepted, with the admission's own `scopes` as what the phone has now; a scope the receipt does not hold
+   is refused, because the relay alone must not be able to add one, so a wider tier needs a new pairing for as long as there is no grant update that the desktop signs.
 
 **The receipt's grants.** The desktop signs `{appId, grants, issuedAt, phoneThumbprint, pid}` into the receipt, and the relay returns the grants with it (`receipt: {issuedAt, signature, grants}`; the
 schema of the answer requires them: the sorted set, without a repeat). The phone verifies the signature over exactly those grants and builds its profile from them, so **a phone pairs
@@ -336,4 +338,4 @@ phone's device record, the shape of an ICE server (a TURN server without a `user
   (a phone paired to a personal relay has none), and takes `relayOnly` as it is: the carrier compares them.
 
 `expectedPeerKeyThumbprint` is advisory when the admission is read alone, because the shipped phone's pin comes only from the MAC-verified offer; `admission_for_profile` compares it
-with the pin, and the scopes with the receipt's grants.
+with the pin, and refuses a scope that is not one of the receipt's grants (fewer scopes are the desktop's narrowing of the phone, and are accepted).
