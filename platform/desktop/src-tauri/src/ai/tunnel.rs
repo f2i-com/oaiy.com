@@ -1700,6 +1700,33 @@ impl AiTunnel {
                 last_frame = std::time::Instant::now();
             }
         }
+        // Drain any trailing SSE event left in `buf` if the upstream closed without a final blank line.
+        if !buf.is_empty() {
+            for line in buf.split(|b| *b == b'\n') {
+                let Some(data) = trim_ascii(line).strip_prefix(b"data:") else {
+                    continue;
+                };
+                let data = trim_ascii(data);
+                if data == b"[DONE]" || data.is_empty() {
+                    continue;
+                }
+                let Ok(delta) = serde_json::from_slice::<Value>(data) else {
+                    continue;
+                };
+                chunks += 1;
+                if chunks > MAX_STREAM_FRAMES {
+                    self.post_gathered(lane, &mut waiting, &mut frames).await?;
+                    return Err(TunnelError::new(
+                        "upstream_error",
+                        "the provider's stream exceeded the frame cap",
+                    ));
+                }
+                if !waiting.take(&delta) {
+                    self.post_gathered(lane, &mut waiting, &mut frames).await?;
+                    self.post_delta(lane, delta, &mut frames).await?;
+                }
+            }
+        }
         // The stream is over: the last of it goes before the final frame.
         self.post_gathered(lane, &mut waiting, &mut frames).await?;
         if chunks == 0 {

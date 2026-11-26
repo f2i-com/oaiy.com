@@ -372,6 +372,9 @@ pub(crate) fn normalize_in(text: &str, tools: &[Json], started_in_thought: bool)
     if text.contains(DSML) {
         return Err("unexpected DSML in LFM2 output".into());
     }
+    if tools.is_empty() {
+        return Ok(text.to_owned());
+    }
     let mut prose = String::new();
     let mut calls = Vec::new();
     let mut i = 0usize;

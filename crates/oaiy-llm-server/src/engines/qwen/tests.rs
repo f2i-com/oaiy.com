@@ -144,6 +144,22 @@ fn tool_call_mentions_inside_thinking_neither_stall_streaming_nor_fail() {
 }
 
 #[test]
+fn text_protocol_tool_calls_pass_through_unchanged_when_no_tools_are_declared() {
+    let raw = "<think>Planning.</think>\n<tool_call name=\"edit_file\">\n<arg name=\"path\">index.html</arg>\n</tool_call>\n<tool_call>\n{\"name\":\"finish\",\"arguments\":{\"summary\":\"ok\"}}\n</tool_call>";
+    let mut stream = NativeStream::default();
+    let mut emitted = String::new();
+    for end in raw.char_indices().map(|(at, c)| at + c.len_utf8()) {
+        emitted.push_str(&stream.push(&raw[..end], &[], false).unwrap());
+        assert!(stream.tool_preview(&raw[..end]).unwrap().is_none());
+    }
+    emitted.push_str(&stream.push(raw, &[], true).unwrap());
+    assert_eq!(emitted, raw);
+    assert_eq!(normalize(raw, &[]).unwrap(), raw);
+    // Raw DSML still remains rejected even when no tools are declared.
+    assert!(normalize(&format!("hi <{DSML} calls>"), &[]).is_err());
+}
+
+#[test]
 fn json_call_preserves_null_for_nullable_string_union_and_rejects_escaped_dsml() {
     let nullable_tools = vec![Json::parse(
         br#"{"function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":["string","null"]},"tags":{"type":"array"}}}}}"#,

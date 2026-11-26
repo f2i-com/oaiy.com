@@ -390,6 +390,11 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
 
 fn normalize_in(text: &str, tools: &[Json], started_in_thought: bool) -> Result<String, String> {
     if text.contains(DSML) { return Err("unexpected DSML in Qwen output".into()); }
+    // Text-protocol callers (no declared OpenAI `tools`) may instruct the model to emit
+    // `<tool_call ...>` blocks in plain text; never hijack or reject them as native Qwen calls.
+    if tools.is_empty() {
+        return Ok(text.to_owned());
+    }
     let Some(at) = find_call_outside_thinking(text, started_in_thought)? else {
         return Ok(text.to_owned());
     };
@@ -555,8 +560,16 @@ impl NativeStream {
         }
         self.dsml_checked = decoded.len();
 
-        let (tag, start) = self.calls.open();
         let clean = decoded.trim_end_matches('\u{fffd}');
+        if tools.is_empty() {
+            if clean.len() < self.sent_len {
+                return Err("Qwen decoded text changed after streaming".into());
+            }
+            let delta = clean[self.sent_len..].to_owned();
+            self.sent_len = clean.len();
+            return Ok(delta);
+        }
+        let (tag, start) = self.calls.open();
         if self.call_start_at.is_none() {
             const THINK_OPEN: &str = "<think>";
             const THINK_CLOSE: &str = "</think>";

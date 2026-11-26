@@ -158,6 +158,13 @@ fn implicit_thought_tool_call_is_never_promoted_to_live_dsml() {
     );
 }
 
+#[test]
+fn text_protocol_output_passes_through_when_no_tools_are_declared() {
+    let raw = "Done.<|tool_call_start|>[edit_file(path='index.html')]<|tool_call_end|>";
+    assert_eq!(normalize(raw, &[]).unwrap(), raw);
+    assert!(normalize(&format!("hi <{DSML} calls>"), &[]).is_err());
+}
+
 /// Deeply nested Python literals in LFM2 tool call arguments fail cleanly instead of overflowing the stack.
 #[test]
 fn deeply_nested_py_value_rejects_without_stack_overflow() {
