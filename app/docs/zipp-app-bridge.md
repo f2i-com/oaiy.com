@@ -5,7 +5,7 @@ OAIY's sandbox gives guest programs synchronous file and network access (Node's 
 ## Status
 
 The bridge is in ZIPP since v0.0.22 (`crates/zipp-wasm`, with the boundary check `tests/node/app-bridge.cjs`), and
-OAIY installs v0.0.41 (`scripts/fetch-zipp.mjs`: from v0.0.26 a release publishes each engine as one `.wasm` that
+OAIY installs v0.0.42 (`scripts/fetch-zipp.mjs`: from v0.0.26 a release publishes each engine as one `.wasm` that
 carries its bindings in a `zipp.glue` section, installed as `zipp_wasm.js` beside the module).
 
 The sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
@@ -28,7 +28,7 @@ where it names another, the preview says which two releases to bring together, `
 given instead; from v0.0.35 it carries none, so the two pins move together). SoftN v0.0.18 was built with ZIPP v0.0.21, v0.0.19 with v0.0.22, v0.0.20 with
 v0.0.23, v0.0.21 with v0.0.24, v0.0.22 with v0.0.25, v0.0.23 with v0.0.26, v0.0.24 with v0.0.27, v0.0.25 and v0.0.26
 with v0.0.29, v0.0.27 to v0.0.31 with v0.0.32, and v0.0.32 to v0.0.38 with v0.0.33. SoftN v0.0.39 through
-v0.0.47 use ZIPP v0.0.35, v0.0.48 uses ZIPP v0.0.36, v0.0.49–v0.0.50 use ZIPP v0.0.37, and SoftN v0.0.52 and the OAIY Agent use the same ZIPP v0.0.41 module.
+v0.0.47 use ZIPP v0.0.35, v0.0.48 uses ZIPP v0.0.36, v0.0.49–v0.0.50 use ZIPP v0.0.37, v0.0.52 uses ZIPP v0.0.41, and SoftN v0.0.53 and the OAIY Agent use the same ZIPP v0.0.42 module.
 
 ## The API (zipp-wasm)
 

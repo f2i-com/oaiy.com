@@ -1,4 +1,4 @@
-// Copied by scripts/generate-softn-knowledge.mjs from softn.com (packages/@softn/editor-shared/src/starters and apps/softn-site/public/examples at 391aca2bbc83),
+// Copied by scripts/generate-softn-knowledge.mjs from softn.com (packages/@softn/editor-shared/src/starters and apps/softn-site/public/examples at 95c9a5fd802a),
 // Copyright f2i-com, Apache License 2.0. Do not edit by hand.
 
 import type { SoftnExample } from './examples.generated';
