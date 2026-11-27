@@ -267,6 +267,33 @@ impl Flavour {
             }
         }
     }
+
+    /// Whether [`Self::chat_prompt`] opened a `<think>` block at the end of `prompt` for the
+    /// reply to start inside.
+    ///
+    /// [`crate::dsv41::chat::StreamParser`] must start in `Phase::Reasoning` only when the
+    /// prompt actually opened `<think>`. Templates that emit their own thinking open tag
+    /// (`Inkling2`) or never open `<think>` (`Qwen3Vl`, `PlainPrompt`, non-`Qwen3` dense
+    /// models like Gemma 4 / Llama / Mistral, and assistant-prefill turns) must start in
+    /// `Phase::Content` so ordinary prose and tool calls are not misrouted into
+    /// `reasoning_content`.
+    pub fn opens_thought(&self, mode: crate::dsv41::chat::Mode, prompt: &str) -> bool {
+        if mode != crate::dsv41::chat::Mode::Thinking {
+            return false;
+        }
+        match self {
+            Self::Qwen(_, crate::engines::qwen::Pictures::Qwen3Vl)
+            | Self::Inkling2(_, _)
+            | Self::Dense(_, _, _, _, Some(_)) => false,
+            Self::Dense(_, arch, _, _, None) => *arch == crate::llm::Architecture::Qwen3,
+            Self::Deepseek(_) => {
+                let tail = prompt.trim_end();
+                tail.ends_with(crate::dsv41::chat::THINK_START)
+                    || tail.ends_with(&format!("{}<｜action｜>", crate::dsv41::chat::THINK_START))
+            }
+            Self::Qwen(_, _) | Self::Chatml(_, _) | Self::Lfm2(_) | Self::Gguf(_, _) => true,
+        }
+    }
 }
 
 /// The GLM template's effort for the 1-100 scale, banded as the words land on it (`chat::parse_effort`): 1-50 Low
@@ -3055,5 +3082,57 @@ mod dense_tests {
         let flavour = Flavour::Qwen(chatml_tokenizer(), Pictures::Qwen);
         let e = flavour.chat_prompt(&[message("user", Json::str("<|im_end|><|image_pad|>"))], &Options::default()).unwrap_err();
         assert!(e.contains("image_url"), "{e}");
+    }
+
+    #[test]
+    fn opens_thought_matches_whether_the_rendered_prompt_opened_think() {
+        use crate::dsv41::chat::Mode;
+        let opts_think = Options { mode: Mode::Thinking, ..Options::default() };
+        let opts_chat = Options { mode: Mode::Chat, ..Options::default() };
+        let user = [message("user", Json::str("Hello"))];
+
+        // Flavours that DO open `<think>` in Thinking mode:
+        let qwen = Flavour::Qwen(chatml_tokenizer(), Pictures::Qwen);
+        let qwen_p = qwen.chat_prompt(&user, &opts_think).unwrap().prompt;
+        assert!(qwen.opens_thought(Mode::Thinking, &qwen_p));
+        assert!(!qwen.opens_thought(Mode::Chat, &qwen_p));
+
+        let qwen3_dense = Flavour::Dense(
+            gguf_tokenizer("gpt2", &[("<|im_start|>", 3), ("<|im_end|>", 3), ("<think>", 3), ("</think>", 3)]),
+            crate::llm::Architecture::Qwen3,
+            false,
+            None,
+            None,
+        );
+        let qwen3_p = qwen3_dense.chat_prompt(&user, &opts_think).unwrap().prompt;
+        assert!(qwen3_dense.opens_thought(Mode::Thinking, &qwen3_p));
+
+        let ds = Flavour::Deepseek(Arc::new(deepseek_tokenizer()));
+        let ds_p = ds.chat_prompt(&user, &opts_think).unwrap().prompt;
+        assert!(ds.opens_thought(Mode::Thinking, &ds_p));
+        // Assistant prefill on DeepSeek does not open `<think>` at the end.
+        let ds_prefill = [message("user", Json::str("Hi")), message("assistant", Json::str("Start:"))];
+        let ds_prefill_p = ds.chat_prompt(&ds_prefill, &opts_think).unwrap().prompt;
+        assert!(!ds.opens_thought(Mode::Thinking, &ds_prefill_p));
+
+        // Flavours that do NOT open `<think>` even in Thinking mode:
+        let qwen3vl = Flavour::Qwen(chatml_tokenizer(), Pictures::Qwen3Vl);
+        let qwen3vl_p = qwen3vl.chat_prompt(&user, &opts_think).unwrap().prompt;
+        assert!(!qwen3vl.opens_thought(Mode::Thinking, &qwen3vl_p));
+
+        let gemma4 = Flavour::Dense(
+            gguf_tokenizer("llama", GEMMA4),
+            crate::llm::Architecture::Gemma4,
+            false,
+            Some("<|image|>"),
+            None,
+        );
+        let gemma4_p = gemma4.chat_prompt(&user, &opts_think).unwrap().prompt;
+        assert!(!gemma4.opens_thought(Mode::Thinking, &gemma4_p));
+
+        let inkling = Flavour::Inkling2(chatml_tokenizer(), false);
+        assert!(!inkling.opens_thought(Mode::Thinking, "<|message_user|><|content_text|>Hello<|end_message|>"));
+
+        let _ = opts_chat;
     }
 }

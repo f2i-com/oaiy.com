@@ -954,7 +954,12 @@ impl Server {
         } else {
             None
         };
-        let mut parser = chat::StreamParser::new(mode);
+        let initial_mode = if a.flavour.opens_thought(mode, &encoded.prompt) {
+            chat::Mode::Thinking
+        } else {
+            chat::Mode::Chat
+        };
+        let mut parser = chat::StreamParser::new(initial_mode);
         let mut stop = StopFilter::new(stops);
         let (mut reasoning, mut content) = (String::new(), String::new());
         let mut send_err = false;

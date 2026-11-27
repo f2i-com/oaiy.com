@@ -454,14 +454,14 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.end_sampling {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             self.flush_tool_calls(&mut out);
             return (out, true);
         }
 
         if Some(tok_id) == self.ids.msg_model {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             self.seg = Segment::Header;
             self.header_buf.clear();
             return (out, false);
@@ -469,7 +469,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_thinking {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             self.flush_tool_calls(&mut out);
             self.seg = Segment::Thinking;
             self.closed_thinking = false;
@@ -479,7 +479,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_text {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             self.flush_tool_calls(&mut out);
             if !self.closed_thinking {
                 out.push("</think>".into());
@@ -491,7 +491,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.content_invoke_tool {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             if !self.closed_thinking {
                 out.push("</think>".into());
                 self.closed_thinking = true;
@@ -503,7 +503,7 @@ impl Inkling2Translator {
 
         if Some(tok_id) == self.ids.end_message {
             self.flush_pending_utf8(&mut out);
-            self.flush_segment_close(&mut out);
+            self.flush_segment_close();
             self.seg = Segment::Idle;
             return (out, false);
         }
@@ -522,7 +522,7 @@ impl Inkling2Translator {
     pub fn finish(&mut self, _tok: &Tokenizer) -> Vec<String> {
         let mut out = Vec::new();
         self.flush_pending_utf8(&mut out);
-        self.flush_segment_close(&mut out);
+        self.flush_segment_close();
         self.flush_tool_calls(&mut out);
         out
     }
@@ -560,11 +560,14 @@ impl Inkling2Translator {
         }
     }
 
-    fn flush_segment_close(&mut self, out: &mut Vec<String>) {
+    fn flush_segment_close(&mut self) {
         match self.seg {
             Segment::Thinking => {
-                out.push("</think>".into());
-                self.closed_thinking = true;
+                // Defer emitting `</think>` until a non-thinking segment (`content_text`,
+                // `content_invoke_tool`, or `Segment::Idle` fallback text) actually begins.
+                // Closing `</think>` here on `<|end_message|>` / `<|content_model_end_sampling|>`
+                // / `finish()` when the model emitted only thinking would transition `StreamParser`
+                // out of `Phase::Reasoning` and defeat `answer_left_in_thought` recovery.
             }
             Segment::ToolJson => {
                 match format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
@@ -1733,6 +1736,70 @@ mod tests {
             Json::parse(calls3[1].arguments.as_bytes()).unwrap(),
             Json::parse(br#"{"msg":"hi"}"#).unwrap()
         );
+
+        // 4. Thinking-only stop keeps StreamParser in reasoning so api.rs can recover an answer
+        // written inside `<|content_thinking|>`, even when initialized in Chat mode (since
+        // Inkling-2 prompts do not open `<think>`).
+        let raw_thought_only = format!(
+            "{MSG_MODEL}{CONTENT_THINKING}Only thinking text.{END_MESSAGE}{END_SAMPLING}"
+        );
+        let mut tr4 = Inkling2Translator::new(ids);
+        let mut p4 = StreamParser::new(Mode::Chat);
+        let (mut r4, mut c4) = (String::new(), String::new());
+        for id in tok.encode(&raw_thought_only, false).unwrap() {
+            let (chunks, stop) = tr4.push(id, &tok);
+            for c in chunks {
+                for d in p4.push(&c) {
+                    match d {
+                        Delta::Reasoning(s) => r4.push_str(&s),
+                        Delta::Content(s) => c4.push_str(&s),
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        assert!(p4.is_reasoning(), "thinking-only completion must remain in reasoning phase");
+        let (rest4, calls4) = p4.finish();
+        for d in rest4 {
+            match d {
+                Delta::Reasoning(s) => r4.push_str(&s),
+                Delta::Content(s) => c4.push_str(&s),
+            }
+        }
+        assert_eq!(r4, "Only thinking text.");
+        assert_eq!(c4, "");
+        assert!(calls4.is_empty());
+
+        // 5. Thinking + Text when StreamParser starts in Chat mode (matching Flavour::opens_thought == false)
+        let mut tr5 = Inkling2Translator::new(ids);
+        let mut p5 = StreamParser::new(Mode::Chat);
+        let (mut r5, mut c5) = (String::new(), String::new());
+        for id in tok.encode(&raw, false).unwrap() {
+            let (chunks, stop) = tr5.push(id, &tok);
+            for c in chunks {
+                for d in p5.push(&c) {
+                    match d {
+                        Delta::Reasoning(s) => r5.push_str(&s),
+                        Delta::Content(s) => c5.push_str(&s),
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        assert!(!p5.is_reasoning());
+        let (rest5, _) = p5.finish();
+        for d in rest5 {
+            match d {
+                Delta::Reasoning(s) => r5.push_str(&s),
+                Delta::Content(s) => c5.push_str(&s),
+            }
+        }
+        assert_eq!(r5, "Let me check.");
+        assert_eq!(c5, "Paris.");
     }
 
     #[test]
