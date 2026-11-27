@@ -419,8 +419,10 @@ pub struct Inkling2Translator {
     tool_buf: String,
     pending_calls: Vec<String>,
     tool_error: Option<String>,
+    seen_thinking: bool,
     closed_thinking: bool,
     emitted_text: bool,
+    seen_output: bool,
     pending_bytes: Vec<u8>,
 }
 
@@ -438,8 +440,10 @@ impl Inkling2Translator {
             tool_buf: String::new(),
             pending_calls: Vec::new(),
             tool_error: None,
+            seen_thinking: false,
             closed_thinking: false,
             emitted_text: false,
+            seen_output: false,
             pending_bytes: Vec::new(),
         }
     }
@@ -454,6 +458,26 @@ impl Inkling2Translator {
 
     pub fn in_text(&self) -> bool {
         self.seg == Segment::Text
+    }
+
+    pub fn in_header(&self) -> bool {
+        self.seg == Segment::Header
+    }
+
+    pub fn in_tool(&self) -> bool {
+        self.seg == Segment::ToolJson
+    }
+
+    pub fn seen_thinking(&self) -> bool {
+        self.seen_thinking
+    }
+
+    pub fn closed_thinking(&self) -> bool {
+        self.closed_thinking
+    }
+
+    pub fn has_output(&self) -> bool {
+        self.seen_output
     }
 
     /// Feed one generated token ID. Returns translated UTF-8 chunks to emit as `Event::Text`
@@ -481,6 +505,7 @@ impl Inkling2Translator {
             self.flush_segment_close();
             self.flush_tool_calls(&mut out);
             self.seg = Segment::Thinking;
+            self.seen_thinking = true;
             self.closed_thinking = false;
             out.push("<think>".into());
             return (out, false);
@@ -549,7 +574,28 @@ impl Inkling2Translator {
 
     fn push_decoded(&mut self, text: &str, out: &mut Vec<String>) {
         match self.seg {
-            Segment::Header => self.header_buf.push_str(text),
+            Segment::Header => {
+                self.header_buf.push_str(text);
+                // Valid Inkling-2 headers are either empty (before `<|content_text|>`) or a short
+                // tool identifier (before `<|content_invoke_tool_json|>`). If prose or `<tool_call>`
+                // markup arrives here without `<|content_text|>`, promote it to `Segment::Text` so
+                // the reply is never swallowed silently into `header_buf`.
+                if self.header_buf.len() > 64
+                    || self.header_buf.bytes().any(|b| b.is_ascii_whitespace() || b == b'<' || b == b'{')
+                {
+                    if !self.closed_thinking {
+                        out.push("</think>".into());
+                        self.closed_thinking = true;
+                    }
+                    let promoted = std::mem::take(&mut self.header_buf);
+                    self.seg = Segment::Text;
+                    self.emitted_text = true;
+                    if !promoted.trim().is_empty() {
+                        self.seen_output = true;
+                    }
+                    out.push(promoted);
+                }
+            }
             Segment::ToolJson => self.tool_buf.push_str(text),
             Segment::Thinking => {
                 if !text.is_empty() {
@@ -559,6 +605,9 @@ impl Inkling2Translator {
             Segment::Text => {
                 if !text.is_empty() {
                     self.emitted_text = true;
+                    if !text.trim().is_empty() {
+                        self.seen_output = true;
+                    }
                     out.push(text.to_string());
                 }
             }
@@ -570,6 +619,9 @@ impl Inkling2Translator {
                         self.closed_thinking = true;
                     }
                     self.emitted_text = true;
+                    if !text.trim().is_empty() {
+                        self.seen_output = true;
+                    }
                     out.push(text.to_string());
                 }
             }
@@ -588,7 +640,10 @@ impl Inkling2Translator {
             Segment::ToolJson => {
                 if self.has_tools {
                     match format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
-                        Ok(dsml_invoke) => self.pending_calls.push(dsml_invoke),
+                        Ok(dsml_invoke) => {
+                            self.pending_calls.push(dsml_invoke);
+                            self.seen_output = true;
+                        }
                         Err(e) => {
                             if self.tool_error.is_none() {
                                 self.tool_error = Some(e);
@@ -602,7 +657,10 @@ impl Inkling2Translator {
                     // `validate_tools` with `missing tool catalog`) or reject non-JSON payloads
                     // as `tool_contract_error` — emit plain-text `<tool_call>` markup instead.
                     match format_tool_call_as_text(&self.header_buf, &self.tool_buf) {
-                        Ok(Some(text_call)) => self.pending_calls.push(text_call),
+                        Ok(Some(text_call)) => {
+                            self.pending_calls.push(text_call);
+                            self.seen_output = true;
+                        }
                         Ok(None) => {}
                         Err(e) => {
                             if self.tool_error.is_none() {
@@ -637,6 +695,66 @@ impl Inkling2Translator {
                 out.push(body);
             }
             self.emitted_text = true;
+        }
+    }
+}
+
+/// Mask structural stop/re-think tokens that would otherwise let Inkling-2 terminate with only
+/// reasoning (no text or tool call) or reopen an unbudgeted second thinking block in the same turn.
+fn mask_post_thinking_logits(
+    logits: &mut [f32],
+    ids: SpecialIds,
+    translator: &Inkling2Translator,
+    room_left: bool,
+    think_budget_exhausted: bool,
+) {
+    if room_left && !translator.has_output() && !translator.in_tool() {
+        if translator.seen_thinking() {
+            if let Some(es) = ids.end_sampling {
+                if (es as usize) < logits.len() {
+                    logits[es as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        if !translator.in_thinking() {
+            if let Some(em) = ids.end_message {
+                if (em as usize) < logits.len() {
+                    logits[em as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        if translator.in_text() || translator.in_header() {
+            if let Some(mm) = ids.msg_model {
+                if (mm as usize) < logits.len() {
+                    logits[mm as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+    // `ThinkBudget` only budgets a single thinking block (`seen` stays true once the first block
+    // closes). Never allow Inkling-2 to open a second unbudgeted `<|content_thinking|>` block in
+    // the same turn — whether the first closed naturally or via `think_budget`.
+    let forbid_rethink =
+        think_budget_exhausted || (translator.seen_thinking() && !translator.in_thinking());
+    if forbid_rethink && !translator.in_tool() {
+        if let Some(ct) = ids.content_thinking {
+            if (ct as usize) < logits.len() {
+                logits[ct as usize] = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
+/// Queue the Inkling-2 message opener tokens that must immediately follow a budget-forced
+/// `<|end_message|>` so the model enters the answer channel (just like `</think>` in Qwen/DeepSeek)
+/// instead of remaining idle where it can sample `<|content_model_end_sampling|>` or reopen thinking.
+fn enqueue_forced_reply_opener(queue: &mut VecDeque<u32>, ids: SpecialIds, has_tools: bool) {
+    if let Some(mm) = ids.msg_model {
+        queue.push_back(mm);
+    }
+    if !has_tools {
+        if let Some(ct) = ids.content_text {
+            queue.push_back(ct);
         }
     }
 }
@@ -1469,10 +1587,14 @@ impl Inkling2Engine {
         let _ = job.events.send(Event::Prefilled { cached: start });
 
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
-        let mut translator = Inkling2Translator::with_tools(self.specials, !job.tools.is_empty());
+        let has_tools = !job.tools.is_empty();
+        let mut translator = Inkling2Translator::with_tools(self.specials, has_tools);
         let mut budget = ThinkBudget::new(false, self.specials.end_message, job.think_budget)
             .closing(&job.think_closing)
             .opens_with(self.specials.content_thinking);
+        let mut forced_after_think: VecDeque<u32> = VecDeque::new();
+        let mut think_budget_exhausted = false;
+        let mut thinking_done_pending: Option<(usize, Option<usize>)> = None;
         let mut reply_hist: VecDeque<u32> = VecDeque::new();
         let max_seq = self.model.cfg.context_length.min(self.max_seq);
 
@@ -1483,22 +1605,46 @@ impl Inkling2Engine {
             if translator.in_text() && !reply_hist.is_empty() {
                 penalize_reply(&mut logits, &reply_hist, &job.sampling);
             }
-            let sampled = sample(&logits, &job.sampling, &mut rng);
-            let was_thinking = budget.thinking;
-            let (next, forced) = budget.pass(sampled);
-            if forced && !budget.thinking && self.log {
-                eprintln!(
-                    "  reasoning ended at its budget ({} tokens)",
-                    job.think_budget.unwrap_or(0)
+            let next = if let Some(forced_tok) = forced_after_think.pop_front() {
+                forced_tok
+            } else {
+                let room_left = n + 4 < job.max_tokens && pos + 4 < max_seq;
+                mask_post_thinking_logits(
+                    &mut logits,
+                    self.specials,
+                    &translator,
+                    room_left,
+                    think_budget_exhausted,
                 );
-            }
-            if budget.reports(was_thinking) {
-                let _ = job.events.send(Event::Thinking {
-                    used: budget.used,
-                    budget: budget.budget,
-                    done: !budget.thinking,
-                });
-            }
+                let sampled = sample(&logits, &job.sampling, &mut rng);
+                let was_thinking = budget.thinking;
+                let (tok_next, forced) = budget.pass(sampled);
+                if forced && !budget.thinking {
+                    think_budget_exhausted = true;
+                    if self.log {
+                        eprintln!(
+                            "  reasoning ended at its budget ({} tokens)",
+                            job.think_budget.unwrap_or(0)
+                        );
+                    }
+                    enqueue_forced_reply_opener(&mut forced_after_think, self.specials, has_tools);
+                }
+                if budget.reports(was_thinking) {
+                    if !budget.thinking {
+                        // Defer `Event::Thinking { done: true }` until a non-thinking segment
+                        // actually opens (matching `Inkling2Translator`'s deferred `</think>`),
+                        // because `api.rs` calls `parser.end_reasoning()` on `done: true`.
+                        thinking_done_pending = Some((budget.used, budget.budget));
+                    } else {
+                        let _ = job.events.send(Event::Thinking {
+                            used: budget.used,
+                            budget: budget.budget,
+                            done: false,
+                        });
+                    }
+                }
+                tok_next
+            };
 
             let (chunks, stop) = translator.push(next, &self.tok);
             let mut disconnected = false;
@@ -1506,6 +1652,16 @@ impl Inkling2Engine {
                 if job.events.send(Event::Text(chunk)).is_err() {
                     disconnected = true;
                     break;
+                }
+            }
+            if let Some((used, b)) = thinking_done_pending {
+                if translator.closed_thinking() {
+                    thinking_done_pending = None;
+                    let _ = job.events.send(Event::Thinking {
+                        used,
+                        budget: b,
+                        done: true,
+                    });
                 }
             }
             if stop || disconnected {
@@ -2181,5 +2337,88 @@ mod tests {
         // 4. Raw DSML remains rejected even without a tool catalog.
         assert!(format_tool_call_as_text("", &format!("{{\"name\":\"x\",\"args\":{{\"a\":\"{DSML}\"}}}}")).is_err());
         assert!(format_tool_call_as_text("", r#"{"name":"x","args":{"a":"\uFF5CDSML\uFF5C"}}"#).is_err());
+    }
+
+    #[test]
+    fn post_thinking_guards_block_empty_stop_and_force_reply_opener_at_budget() {
+        let tok = test_tokenizer();
+        let ids = SpecialIds::from_tokenizer(&tok);
+        let vocab_len = tok.vocab_size();
+
+        // After `<|content_thinking|>...<|end_message|>`, translator has seen thinking with no
+        // output yet, and `closed_thinking()` stays false so `Event::Thinking { done: true }`
+        // stays deferred. `end_sampling` must be masked to prevent an empty reasoning-only reply.
+        let mut tr = Inkling2Translator::with_tools(ids, false);
+        let raw_thought = format!("{MSG_MODEL}{CONTENT_THINKING}Planning the edit.{END_MESSAGE}");
+        for id in tok.encode(&raw_thought, false).unwrap() {
+            let _ = tr.push(id, &tok);
+        }
+        assert!(tr.seen_thinking());
+        assert!(!tr.closed_thinking());
+        assert!(!tr.has_output());
+
+        let mut logits = vec![1.0f32; vocab_len];
+        mask_post_thinking_logits(&mut logits, ids, &tr, true, false);
+        assert!(logits[ids.end_sampling.unwrap() as usize].is_infinite());
+        assert!(logits[ids.end_message.unwrap() as usize].is_infinite());
+        assert!(
+            logits[ids.content_thinking.unwrap() as usize].is_infinite(),
+            "reopening a second unbudgeted thinking block must be masked even after natural close"
+        );
+
+        // Once think_budget closes thinking, `enqueue_forced_reply_opener` opens
+        // `<|message_model|><|content_text|>` on text protocol (and `<|message_model|>` when
+        // native tools are declared), and `content_thinking` is also masked.
+        let mut q_text = VecDeque::new();
+        enqueue_forced_reply_opener(&mut q_text, ids, false);
+        assert_eq!(q_text, VecDeque::from([ids.msg_model.unwrap(), ids.content_text.unwrap()]));
+        let mut q_tools = VecDeque::new();
+        enqueue_forced_reply_opener(&mut q_tools, ids, true);
+        assert_eq!(q_tools, VecDeque::from([ids.msg_model.unwrap()]));
+
+        // Feeding `<|message_model|><|content_text|>` closes thinking (releasing deferred
+        // `Event::Thinking { done: true }`), while `end_message`, `end_sampling`, and `msg_model`
+        // stay masked until at least one non-whitespace token is generated.
+        for tok_id in q_text {
+            let _ = tr.push(tok_id, &tok);
+        }
+        assert!(tr.closed_thinking());
+        assert!(tr.in_text());
+        assert!(!tr.has_output());
+        let mut logits2 = vec![1.0f32; vocab_len];
+        mask_post_thinking_logits(&mut logits2, ids, &tr, true, true);
+        assert!(logits2[ids.end_sampling.unwrap() as usize].is_infinite());
+        assert!(logits2[ids.end_message.unwrap() as usize].is_infinite());
+        assert!(logits2[ids.msg_model.unwrap() as usize].is_infinite());
+        assert!(logits2[ids.content_thinking.unwrap() as usize].is_infinite());
+
+        // Once non-whitespace text is emitted, `end_message`, `end_sampling`, and `msg_model` are unmasked.
+        for id in tok.encode("Done.", false).unwrap() {
+            let _ = tr.push(id, &tok);
+        }
+        assert!(tr.has_output());
+        let mut logits3 = vec![1.0f32; vocab_len];
+        mask_post_thinking_logits(&mut logits3, ids, &tr, true, true);
+        assert!(logits3[ids.end_sampling.unwrap() as usize].is_finite());
+        assert!(logits3[ids.end_message.unwrap() as usize].is_finite());
+        assert!(logits3[ids.msg_model.unwrap() as usize].is_finite());
+        assert!(logits3[ids.content_thinking.unwrap() as usize].is_infinite());
+
+        // If the model writes prose or `<tool_call>` directly after `<|message_model|>` without
+        // emitting `<|content_text|>`, `Segment::Header` promotes it to `Segment::Text`.
+        let mut tr_hdr = Inkling2Translator::with_tools(ids, false);
+        let raw_hdr = format!("{MSG_MODEL}{CONTENT_THINKING}Plan.{END_MESSAGE}{MSG_MODEL}Hello world!{END_MESSAGE}{END_SAMPLING}");
+        let mut out_hdr = String::new();
+        for id in tok.encode(&raw_hdr, false).unwrap() {
+            let (chunks, stop) = tr_hdr.push(id, &tok);
+            for c in chunks {
+                out_hdr.push_str(&c);
+            }
+            if stop {
+                break;
+            }
+        }
+        assert!(tr_hdr.has_output());
+        assert_eq!(out_hdr, "<think>Plan.</think>Hello world!");
     }
 }
