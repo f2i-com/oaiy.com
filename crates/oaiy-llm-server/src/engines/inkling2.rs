@@ -409,28 +409,37 @@ enum Segment {
 }
 
 /// Translates Inkling-2's native token stream (`<|message_model|>...<|end_message|>`)
-/// into OAIY's `<think>...</think>` + DSML `<｜DSML｜ calls>` event stream.
+/// into OAIY's `<think>...</think>` + DSML `<｜DSML｜ calls>` event stream (or plain-text
+/// `<tool_call>` blocks when no OpenAI `tools` catalog was declared).
 pub struct Inkling2Translator {
     ids: SpecialIds,
+    has_tools: bool,
     seg: Segment,
     header_buf: String,
     tool_buf: String,
     pending_calls: Vec<String>,
     tool_error: Option<String>,
     closed_thinking: bool,
+    emitted_text: bool,
     pending_bytes: Vec<u8>,
 }
 
 impl Inkling2Translator {
     pub fn new(ids: SpecialIds) -> Self {
+        Self::with_tools(ids, true)
+    }
+
+    pub fn with_tools(ids: SpecialIds, has_tools: bool) -> Self {
         Self {
             ids,
+            has_tools,
             seg: Segment::Idle,
             header_buf: String::new(),
             tool_buf: String::new(),
             pending_calls: Vec::new(),
             tool_error: None,
             closed_thinking: false,
+            emitted_text: false,
             pending_bytes: Vec::new(),
         }
     }
@@ -542,8 +551,14 @@ impl Inkling2Translator {
         match self.seg {
             Segment::Header => self.header_buf.push_str(text),
             Segment::ToolJson => self.tool_buf.push_str(text),
-            Segment::Thinking | Segment::Text => {
+            Segment::Thinking => {
                 if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+            Segment::Text => {
+                if !text.is_empty() {
+                    self.emitted_text = true;
                     out.push(text.to_string());
                 }
             }
@@ -554,6 +569,7 @@ impl Inkling2Translator {
                         out.push("</think>".into());
                         self.closed_thinking = true;
                     }
+                    self.emitted_text = true;
                     out.push(text.to_string());
                 }
             }
@@ -570,11 +586,28 @@ impl Inkling2Translator {
                 // out of `Phase::Reasoning` and defeat `answer_left_in_thought` recovery.
             }
             Segment::ToolJson => {
-                match format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
-                    Ok(dsml_invoke) => self.pending_calls.push(dsml_invoke),
-                    Err(e) => {
-                        if self.tool_error.is_none() {
-                            self.tool_error = Some(e);
+                if self.has_tools {
+                    match format_tool_call_as_dsml(&self.header_buf, &self.tool_buf) {
+                        Ok(dsml_invoke) => self.pending_calls.push(dsml_invoke),
+                        Err(e) => {
+                            if self.tool_error.is_none() {
+                                self.tool_error = Some(e);
+                            }
+                        }
+                    }
+                } else {
+                    // Text-protocol callers (no declared OpenAI `tools`, e.g. FormLogic Site AI
+                    // on OAIY) instruct the model in prose to emit `<tool_call>` blocks. Never
+                    // convert Inkling-2's native tool channel into DSML (which would fail
+                    // `validate_tools` with `missing tool catalog`) or reject non-JSON payloads
+                    // as `tool_contract_error` — emit plain-text `<tool_call>` markup instead.
+                    match format_tool_call_as_text(&self.header_buf, &self.tool_buf) {
+                        Ok(Some(text_call)) => self.pending_calls.push(text_call),
+                        Ok(None) => {}
+                        Err(e) => {
+                            if self.tool_error.is_none() {
+                                self.tool_error = Some(e);
+                            }
                         }
                     }
                 }
@@ -595,7 +628,81 @@ impl Inkling2Translator {
         }
         let body = self.pending_calls.join("\n");
         self.pending_calls.clear();
-        out.push(format!("\n\n<{DSML} calls>\n{body}\n</{DSML} calls>"));
+        if self.has_tools {
+            out.push(format!("\n\n<{DSML} calls>\n{body}\n</{DSML} calls>"));
+        } else {
+            if self.emitted_text {
+                out.push(format!("\n\n{body}"));
+            } else {
+                out.push(body);
+            }
+            self.emitted_text = true;
+        }
+    }
+}
+
+/// Convert one Inkling-2 `<|content_invoke_tool_json|>` segment into plain-text `<tool_call>`
+/// markup when no OpenAI `tools` catalog was declared by the caller.
+fn format_tool_call_as_text(header_name: &str, raw: &str) -> std::result::Result<Option<String>, String> {
+    let header = header_name.trim();
+    let trimmed = raw.trim();
+    if header.contains(DSML) || trimmed.contains(DSML) {
+        return Err("unexpected DSML in Inkling-2 output".into());
+    }
+    if trimmed.is_empty() && header.is_empty() {
+        return Ok(None);
+    }
+    // Model already wrote text-protocol `<tool_call ...>...</tool_call>` inside the tool channel.
+    if trimmed.contains("<tool_call") {
+        return Ok(Some(trimmed.to_string()));
+    }
+    if let Ok(parsed) = Json::parse(trimmed.as_bytes()) {
+        if let Json::Obj(members) = &parsed {
+            let explicit_name = parsed.get("name").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty());
+            let name = explicit_name.or_else(|| (!header.is_empty()).then_some(header));
+            if let Some(name) = name {
+                let raw_args = parsed
+                    .get("args")
+                    .or_else(|| parsed.get("arguments"))
+                    .or_else(|| parsed.get("parameters"));
+                let arguments = match raw_args {
+                    Some(Json::Obj(obj)) => Json::Obj(obj.clone()),
+                    Some(Json::Str(s)) => {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            Json::Obj(Vec::new())
+                        } else if let Ok(Json::Obj(obj)) = Json::parse(t.as_bytes()) {
+                            Json::Obj(obj)
+                        } else {
+                            Json::Str(s.clone())
+                        }
+                    }
+                    None | Some(Json::Null) => {
+                        let flat: Vec<(String, Json)> = members
+                            .iter()
+                            .filter(|(k, _)| !matches!(k.as_str(), "name" | "args" | "arguments" | "parameters"))
+                            .cloned()
+                            .collect();
+                        Json::Obj(flat)
+                    }
+                    Some(other) => other.clone(),
+                };
+                let call_json = Json::obj([
+                    ("name", Json::str(name)),
+                    ("arguments", arguments),
+                ])
+                .to_json();
+                if call_json.contains(DSML) {
+                    return Err("unexpected DSML in Inkling-2 output".into());
+                }
+                return Ok(Some(format!("<tool_call>\n{call_json}\n</tool_call>")));
+            }
+        }
+    }
+    if !header.is_empty() && valid_dsml_attr(header) {
+        Ok(Some(format!("<tool_call name=\"{header}\">\n{trimmed}\n</tool_call>")))
+    } else {
+        Ok(Some(format!("<tool_call>\n{trimmed}\n</tool_call>")))
     }
 }
 
@@ -1362,7 +1469,7 @@ impl Inkling2Engine {
         let _ = job.events.send(Event::Prefilled { cached: start });
 
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
-        let mut translator = Inkling2Translator::new(self.specials);
+        let mut translator = Inkling2Translator::with_tools(self.specials, !job.tools.is_empty());
         let mut budget = ThinkBudget::new(false, self.specials.end_message, job.think_budget)
             .closing(&job.think_closing)
             .opens_with(self.specials.content_thinking);
@@ -1454,9 +1561,10 @@ impl Inkling2Engine {
         }
         if let Some(err) = translator.tool_error() {
             if !job.cancel.load(Ordering::Relaxed) {
-                return Err(oaiy_engine::Error::Arg(format!(
+                let _ = job.events.send(Event::Error(format!(
                     "tool_contract_error: {err}; no tool from this batch was executed"
                 )));
+                return Ok(());
             }
         }
 
@@ -1988,5 +2096,90 @@ mod tests {
                 "expected error for header={hdr:?} payload={payload}"
             );
         }
+    }
+
+    #[test]
+    fn translator_emits_plain_text_tool_calls_when_no_tools_catalog_is_declared() {
+        let tok = test_tokenizer();
+        let ids = SpecialIds::from_tokenizer(&tok);
+
+        // 1. Valid Inkling-2 JSON tool call with no declared OpenAI tools must emit plain-text
+        // `<tool_call>` markup (never DSML, which would fail `validate_tools` with `missing tool catalog`).
+        let raw_valid = format!(
+            "{MSG_MODEL}{CONTENT_THINKING}Let me inspect index.html.{END_MESSAGE}\
+             {MSG_MODEL}read_file{CONTENT_INVOKE_TOOL_JSON}{{\"name\":\"read_file\",\"args\":{{\"path\":\"index.html\"}}}}{END_MESSAGE}{END_SAMPLING}"
+        );
+        let mut tr = Inkling2Translator::with_tools(ids, false);
+        let mut p = StreamParser::new(Mode::Chat);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for id in tok.encode(&raw_valid, false).unwrap() {
+            let (chunks, stop) = tr.push(id, &tok);
+            for c in chunks {
+                assert!(!c.contains(DSML), "text-protocol output must never emit DSML: {c}");
+                for d in p.push(&c) {
+                    match d {
+                        Delta::Reasoning(s) => reasoning.push_str(&s),
+                        Delta::Content(s) => content.push_str(&s),
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        assert_eq!(tr.tool_error(), None);
+        assert!(!p.tool_calls_ready());
+        let (rest, calls) = p.finish();
+        for d in rest {
+            match d {
+                Delta::Reasoning(s) => reasoning.push_str(&s),
+                Delta::Content(s) => content.push_str(&s),
+            }
+        }
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, "Let me inspect index.html.");
+        assert_eq!(
+            content,
+            "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"index.html\"}}\n</tool_call>"
+        );
+
+        // 2. Malformed JSON in `<|content_invoke_tool_json|>` without a tool catalog must pass
+        // through as plain-text `<tool_call>` instead of failing with `tool_contract_error`.
+        let raw_bad = format!(
+            "{MSG_MODEL}edit_file{CONTENT_INVOKE_TOOL_JSON}{{\"name\":\"edit_file\" broken}}{END_MESSAGE}{END_SAMPLING}"
+        );
+        let mut tr_bad = Inkling2Translator::with_tools(ids, false);
+        let mut out_bad = String::new();
+        for id in tok.encode(&raw_bad, false).unwrap() {
+            let (chunks, stop) = tr_bad.push(id, &tok);
+            for c in chunks {
+                out_bad.push_str(&c);
+            }
+            if stop {
+                break;
+            }
+        }
+        assert_eq!(tr_bad.tool_error(), None);
+        assert!(!out_bad.contains(DSML));
+        assert!(out_bad.contains("<tool_call name=\"edit_file\">"), "{out_bad}");
+        assert!(out_bad.contains("{\"name\":\"edit_file\" broken}"), "{out_bad}");
+
+        // 3. Header-only tool name + arguments object, flat args alongside "name", and already-wrapped `<tool_call>` markup.
+        assert_eq!(
+            format_tool_call_as_text("read_file", r#"{"path":"main.js"}"#).unwrap().as_deref(),
+            Some("<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"main.js\"}}\n</tool_call>")
+        );
+        assert_eq!(
+            format_tool_call_as_text("", r#"{"name":"read_file","path":"main.js"}"#).unwrap().as_deref(),
+            Some("<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"main.js\"}}\n</tool_call>")
+        );
+        assert_eq!(
+            format_tool_call_as_text("", "<tool_call name=\"list_files\" />").unwrap().as_deref(),
+            Some("<tool_call name=\"list_files\" />")
+        );
+
+        // 4. Raw DSML remains rejected even without a tool catalog.
+        assert!(format_tool_call_as_text("", &format!("{{\"name\":\"x\",\"args\":{{\"a\":\"{DSML}\"}}}}")).is_err());
+        assert!(format_tool_call_as_text("", r#"{"name":"x","args":{"a":"\uFF5CDSML\uFF5C"}}"#).is_err());
     }
 }
